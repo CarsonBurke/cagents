@@ -375,6 +375,32 @@ fn insertion_indices(
 }
 
 impl Cagents {
+    /// The mounted strip orders its channel; unmounted members retain their
+    /// saved order until the strip has finished restoring them.
+    pub(super) fn active_channel_order(&self) -> Option<(ChannelId, Vec<CardId>)> {
+        let id = self.durable.active_channel?;
+        let channel = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)?;
+        let members = channel.cards.iter().copied().collect::<HashSet<_>>();
+        let mut order = self
+            .workspace
+            .order()
+            .filter(|card| members.contains(card))
+            .collect::<Vec<_>>();
+        let mounted = order.iter().copied().collect::<HashSet<_>>();
+        order.extend(
+            channel
+                .cards
+                .iter()
+                .copied()
+                .filter(|card| !mounted.contains(card)),
+        );
+        Some((id, order))
+    }
+
     /// Merge navigation into the full descriptor; never snapshot the projected
     /// strip over durable cards belonging to a hidden scope.
     ///
@@ -385,29 +411,7 @@ impl Cagents {
             return false;
         }
         let focused = self.workspace.focused();
-        let active_order = self.durable.active_channel.and_then(|id| {
-            self.durable
-                .channels
-                .iter()
-                .find(|channel| channel.id == id)
-                .map(|channel| {
-                    let members = channel.cards.iter().copied().collect::<HashSet<_>>();
-                    let mut order = self
-                        .workspace
-                        .order()
-                        .filter(|card| members.contains(card))
-                        .collect::<Vec<_>>();
-                    let mounted = order.iter().copied().collect::<HashSet<_>>();
-                    order.extend(
-                        channel
-                            .cards
-                            .iter()
-                            .copied()
-                            .filter(|card| !mounted.contains(card)),
-                    );
-                    (id, order)
-                })
-        });
+        let active_order = self.active_channel_order();
         if let Some(id) = self.durable.active_channel {
             self.channel_offsets
                 .insert(id, self.workspace.camera().offset());
@@ -952,7 +956,7 @@ impl Cagents {
             return (
                 true,
                 if !has_terminal {
-                    self.add_default_pane(path, self.settings.default_worktree_pane)
+                    self.ensure_default_pane()
                 } else {
                     Task::none()
                 },
@@ -1012,7 +1016,7 @@ impl Cagents {
         let offset = self.worktree_offsets.get(&path).copied();
         let scope = self.install_workspace_scope(scoped, path.clone(), offset, change);
         let terminal = if create_if_empty && !has_terminal {
-            self.add_default_pane(path, self.settings.default_worktree_pane)
+            self.ensure_default_pane()
         } else {
             Task::none()
         };
@@ -1736,7 +1740,7 @@ mod tests {
     }
 
     fn register_worktrees(app: &mut Cagents, paths: &[&str]) {
-        app.sidebar_model.projects = vec![SidebarProject::new(
+        *app.sidebar_model.projects = vec![SidebarProject::new(
             ProjectId::new(),
             RepositoryId::new(),
             "repo".into(),
@@ -1760,6 +1764,17 @@ mod tests {
         )];
     }
 
+    fn acknowledge_empty_default_scope(app: &mut Cagents) {
+        let directory = app.active_workspace.clone().unwrap();
+        let scope = app.default_pane_scope(&directory).unwrap();
+        if app.workspace_model.identity == crate::workspace_model::NO_REGISTRY {
+            app.workspace_model.identity = uuid::Uuid::new_v4();
+        }
+        app.workspace_model.views = vec![crate::workspace_model::views::View::empty(scope.clone())];
+        app.acknowledge_view_edit(scope, None);
+        drop(app.reconcile_shared_views());
+    }
+
     #[test]
     fn default_pane_is_recreated_when_its_empty_scope_is_restored() {
         for channel in [false, true] {
@@ -1770,6 +1785,7 @@ mod tests {
                 let _ = app.handle_channel_ui(channel_ui::Action::Create(project));
             } else {
                 let _ = app.select_worktree("/repo".into(), true);
+                acknowledge_empty_default_scope(&mut app);
             }
             let previous = app.workspace.focused().unwrap();
             let saved = app.persistent_workspace();
@@ -1786,6 +1802,8 @@ mod tests {
             let _ = restored.restore_worktree_scope();
             let _ = restored.initialize_runtimes();
             let _ = restored.ensure_default_pane();
+            assert!(restored.workspace.cards().is_empty());
+            acknowledge_empty_default_scope(&mut restored);
             let fresh = restored.workspace.focused().unwrap();
             assert_ne!(fresh, previous);
             assert!(matches!(
@@ -1829,6 +1847,10 @@ mod tests {
             let _ = app.handle_channel_ui(channel_ui::Action::Create(project));
             let channel_id = app.durable.active_channel.unwrap();
             let channel_card = app.workspace.focused().unwrap();
+            app.shared_views.initialize(
+                crate::workspace_model::views::Scope::Channel(channel_id),
+                Vec::new(),
+            );
             assert_eq!(
                 matches!(
                     app.card_state(channel_card).unwrap().kind,
@@ -1837,6 +1859,7 @@ mod tests {
                 channel == settings::DefaultPane::NativeChat
             );
             let _ = app.select_worktree("/repo".into(), true);
+            acknowledge_empty_default_scope(&mut app);
             let worktree_card = app.workspace.focused().unwrap();
             assert_ne!(worktree_card, channel_card);
             assert_eq!(
@@ -2146,6 +2169,10 @@ mod tests {
     #[test]
     fn legacy_unscoped_terminals_remain_accessible_without_owning_new_worktrees() {
         let mut app = super::super::tests::context_inspector_test_app(false);
+        // A connected publisher keeps the new scope's seed pending until the
+        // registry answers, as a running window's does.
+        let (tx, _requests) = super::super::workspace_model_sync::test_model_channel();
+        app.workspace_model_tx = tx;
         // These selection checks run after the shared registry has hydrated.
         app.workspace_model.identity = uuid::Uuid::new_v4();
         app.settings.default_worktree_pane = settings::DefaultPane::Terminal;
@@ -2161,6 +2188,9 @@ mod tests {
         let _ = app.select_worktree("/repo".into(), false);
         assert!(app.workspace.card(legacy.id).is_none());
         let _ = app.select_worktree("/other".into(), true);
+        // The default terminal waits until the new scope's shared panes load.
+        assert!(app.workspace.cards().is_empty());
+        acknowledge_empty_default_scope(&mut app);
         assert!(app.workspace.card(legacy.id).is_none());
         assert!(app.workspace.card(owned.id).is_none());
         let focused = app.card_state(app.workspace.focused().unwrap()).unwrap();
@@ -2289,7 +2319,7 @@ mod tests {
             card_scopes: HashMap::from([(source.id, root.clone())]),
             ..WorkspaceState::default()
         });
-        app.sidebar_model.projects = vec![SidebarProject::new(
+        *app.sidebar_model.projects = vec![SidebarProject::new(
             ProjectId::new(),
             RepositoryId::new(),
             "repo".into(),
@@ -2632,7 +2662,7 @@ mod tests {
             focused: Some(a_focused.id),
             ..WorkspaceState::default()
         });
-        app.sidebar_model.projects = vec![SidebarProject::new(
+        *app.sidebar_model.projects = vec![SidebarProject::new(
             ProjectId::new(),
             RepositoryId::new(),
             "repo".into(),
@@ -2739,7 +2769,7 @@ mod tests {
             focused: Some(a.id),
             ..WorkspaceState::default()
         });
-        app.sidebar_model.projects = vec![SidebarProject::new(
+        *app.sidebar_model.projects = vec![SidebarProject::new(
             ProjectId::new(),
             RepositoryId::new(),
             "repo".into(),
@@ -2806,7 +2836,9 @@ mod tests {
         );
         let _ = app.select_worktree("/b".into(), false);
         assert!(app.workspace.card(editor.id).is_none());
-        let _ = app.update(Message::WindowCloseRequested(window::Id::unique()));
+        let main = window::Id::unique();
+        app.core.set_main_window_id(Some(main));
+        let _ = app.update(Message::WindowCloseRequested(main));
         assert_eq!(
             app.dirty_repository_close.as_ref().map(|close| close.card),
             Some(editor.id)
@@ -2855,6 +2887,10 @@ mod tests {
         let nested = root.path().join("worktrees/topic");
         let project = ProjectId::new();
         let mut app = super::super::tests::context_inspector_test_app(false);
+        // A connected publisher keeps the new scope's seed pending until the
+        // registry answers, as a running window's does.
+        let (tx, _requests) = super::super::workspace_model_sync::test_model_channel();
+        app.workspace_model_tx = tx;
         // These selection checks run after the shared registry has hydrated.
         app.workspace_model.identity = uuid::Uuid::new_v4();
         app.settings.default_worktree_pane = settings::DefaultPane::Terminal;
@@ -2864,7 +2900,7 @@ mod tests {
             focused: Some(parent_terminal.id),
             ..WorkspaceState::default()
         });
-        app.sidebar_model.projects = vec![SidebarProject::new(
+        *app.sidebar_model.projects = vec![SidebarProject::new(
             project,
             RepositoryId::new(),
             "repo".into(),
@@ -2900,6 +2936,8 @@ mod tests {
                 warnings: Vec::new(),
             }),
         });
+        assert!(app.workspace.cards().is_empty());
+        acknowledge_empty_default_scope(&mut app);
         assert_eq!(app.terminal_directory(), Some(nested.clone()));
         assert_eq!(
             app.sidebar_state.active_worktree().unwrap().canonical_path,
@@ -3017,7 +3055,7 @@ mod tests {
         let older = repository.join("worktrees/alpha-old");
         let project = ProjectId::new();
         let mut app = super::super::tests::context_inspector_test_app(false);
-        app.sidebar_model.projects = vec![SidebarProject::new(
+        *app.sidebar_model.projects = vec![SidebarProject::new(
             project,
             RepositoryId::new(),
             "repo".into(),

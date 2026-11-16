@@ -5289,8 +5289,31 @@ impl Runtime {
         )
     }
 
+    /// Install the answer being written in the update that staged it, so
+    /// each streamed chunk costs one frame rather than two. Waiting for the
+    /// parse, rather than drawing the old text meanwhile, costs the UI
+    /// thread less than that frame would.
+    fn settle_streaming_answer(&mut self) -> Task<Message> {
+        /// Streamed publications parse in under a millisecond at the 95th
+        /// percentile, and a frame of the transcript costs about 3 ms.
+        const BUDGET: Duration = Duration::from_millis(2);
+        // Only a chat on screen parses, as only it has subscriptions.
+        if !self.presents() || !self.visible.load(Ordering::Relaxed) {
+            return Task::none();
+        }
+        match self.preparation.settle_tail(self.target, BUDGET) {
+            preparation::Settled::Idle => Task::none(),
+            preparation::Settled::Ready(id, run, ready) => {
+                self.markdown_prepared(self.target, &id, run, ready);
+                Task::none()
+            }
+            preparation::Settled::Pending(task) => task,
+        }
+    }
+
     fn markdown_prepared(&mut self, target: Target, id: &str, run: u64, ready: preparation::Ready) {
         if !self.presents() {
+            self.preparation.unclaim(id, run);
             return;
         }
         // Observe any replacement already published by the client before
@@ -8197,10 +8220,12 @@ impl Cagents {
     ) -> Task<Message> {
         match pane {
             settings::DefaultPane::Terminal => {
-                if self.workspace_model.identity == crate::workspace_model::NO_REGISTRY
+                if self.shared_registry_connecting()
                     && self.worktree_view_scope(&directory).is_some()
                 {
-                    self.shared_views.deferred_default = Some(directory.clone());
+                    self.shared_views.deferred_default = self
+                        .default_pane_scope(&directory)
+                        .map(|scope| (scope, directory.clone()));
                     return Task::none();
                 }
                 self.shared_views.creating_default =
@@ -8218,6 +8243,42 @@ impl Cagents {
     }
 
     pub(super) fn ensure_default_pane(&mut self) -> Task<Message> {
+        self.ensure_default_pane_after_loading(true)
+    }
+
+    /// A channel created by this window is known to be empty. Opening an
+    /// existing channel instead waits for its shared panes before offering an
+    /// automatic composer that could receive typing intended for those panes.
+    pub(super) fn ensure_new_channel_default_pane(&mut self) -> Task<Message> {
+        self.ensure_default_pane_after_loading(false)
+    }
+
+    /// Offers the automatic pane a loading scope deferred, once that scope
+    /// is still the one shown. Its shared panes, if any, are on the strip by
+    /// now, so the pane appears only when the scope proved to be empty.
+    pub(super) fn run_deferred_default_pane(&mut self) -> Task<Message> {
+        let Some((scope, path)) = self.shared_views.deferred_default.take() else {
+            return Task::none();
+        };
+        if self.active_workspace.as_ref() != Some(&path)
+            || self.default_pane_scope(&path).as_ref() != Some(&scope)
+        {
+            return Task::none();
+        }
+        self.ensure_default_pane()
+    }
+
+    pub(super) fn default_pane_scope(
+        &self,
+        directory: &std::path::Path,
+    ) -> Option<crate::workspace_model::views::Scope> {
+        self.durable
+            .active_channel
+            .map(crate::workspace_model::views::Scope::Channel)
+            .or_else(|| self.worktree_view_scope(directory))
+    }
+
+    fn ensure_default_pane_after_loading(&mut self, wait_for_shared: bool) -> Task<Message> {
         let Some(directory) = self.active_workspace.clone() else {
             return Task::none();
         };
@@ -8227,6 +8288,17 @@ impl Cagents {
                     && matches!(state.kind, CardKind::Terminal(_) | CardKind::Chat(_))
             })
         }) {
+            return Task::none();
+        }
+        // A daemon without a shared model never admits the scope, so its
+        // windows keep offering the pane at once, as before.
+        if wait_for_shared
+            && let Some(scope) = self.default_pane_scope(&directory)
+            && (self.shared_registry_connecting()
+                || (self.workspace_model.identity != crate::workspace_model::NO_REGISTRY
+                    && !self.shared_views.scope_settled(&scope)))
+        {
+            self.shared_views.deferred_default = Some((scope, directory));
             return Task::none();
         }
         let pane = if self.durable.active_channel.is_some() {
@@ -9804,7 +9876,7 @@ impl Cagents {
         if self.chat_awaiting_admission(card) {
             return Task::none();
         }
-        self.start_chat_with_upgrade(card, session, intent, source, terminate_source, None)
+        self.start_chat_with_upgrade(card, session, intent, source, terminate_source, None, None)
     }
 
     pub(in crate::app) fn start_shared_chat_upgrade(
@@ -9820,6 +9892,7 @@ impl Cagents {
             None,
             false,
             Some(canonical),
+            None,
         )
     }
 
@@ -9831,6 +9904,7 @@ impl Cagents {
         source: Option<HostSessionProof>,
         terminate_source: bool,
         upgrade_admission: Option<chat::Session>,
+        pane_start: Option<crate::terminal_ipc::PaneChatStart>,
     ) -> Task<Message> {
         // A fenced pane's saved session is unconfirmed: reconnecting or
         // resuming it could act for an agent that is no longer this pane's.
@@ -9893,14 +9967,17 @@ impl Cagents {
                             Some(canonical) => ClientHandle::connect_upgrade_with_intent(
                                 session, canonical, intent, wake,
                             ),
-                            None => ClientHandle::connect(
-                                session,
-                                intent,
-                                source,
-                                terminate_source,
-                                selection,
-                                wake,
-                            ),
+                            None => match pane_start {
+                                Some(pane) => ClientHandle::connect_in_pane(pane, session, wake),
+                                None => ClientHandle::connect(
+                                    session,
+                                    intent,
+                                    source,
+                                    terminate_source,
+                                    selection,
+                                    wake,
+                                ),
+                            },
                         }
                         .map(|handle| {
                             // Background restorations must not queue full bodies
@@ -10444,12 +10521,21 @@ impl Cagents {
         // Only the accepted checkpoint authorizes B's public projection and
         // the first provider handshake. No fallback or first prompt precedes it.
         self.commit_chat_session(target.card, pending.candidate.clone());
-        self.start_chat(
+        let pane_start = Some(crate::terminal_ipc::PaneChatStart {
+            registry: pending.registry,
+            card: target.card,
+            source: pending.source,
+            allow_local: pending.scope.is_none()
+                || self.durable.local_only_cards.contains(&target.card),
+        });
+        self.start_chat_with_upgrade(
             target.card,
             pending.candidate,
             chat::Intent::Start,
             None,
             false,
+            None,
+            pane_start,
         )
     }
 
@@ -11622,7 +11708,10 @@ impl Cagents {
                         }
                         return self.retire_chat(target.card, Some(handle), None);
                     }
-                    return Task::none();
+                    // A winning peer may have gained proof while this start
+                    // was pending. Its model edge deferred attachment until
+                    // the losing start answered; finish that catch-up now.
+                    return self.adopt_stored_draft_session(target.card);
                 }
                 self.startup_gate.initial_panes.settled(
                     target.card,
@@ -12292,6 +12381,7 @@ impl Cagents {
                         let previous_limit = runtime.failure_ui.limit_occurrence;
                         let rehydrating = runtime.presentation_evicted;
                         runtime.refresh();
+                        let settled = runtime.settle_streaming_answer();
                         // First hydration can load historical provider errors
                         // never classified in this window. Current Snapshot/
                         // Local rejection handoff is recorded by refresh itself.
@@ -12353,6 +12443,7 @@ impl Cagents {
                         }
                         let refresh_limits = self.refresh_chat_limit_accounts();
                         return Task::batch([
+                            settled,
                             refresh_limits,
                             self.list_chat_models(target.card),
                             self.resume_current_find(target, true),
@@ -20681,6 +20772,7 @@ mod tests {
                 }
             }
             let window = cosmic::iced::window::Id::unique();
+            app.core.set_main_window_id(Some(window));
             drop(app.update(Message::WindowCloseRequested(window)));
             assert!(app.exit.is_none());
             assert_eq!(app.transient_work_close, Some(window));

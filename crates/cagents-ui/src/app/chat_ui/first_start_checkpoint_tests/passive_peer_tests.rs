@@ -745,32 +745,7 @@ fn run(initialized: bool) {
         accepted.launch.session_id
     );
 
-    if initialized {
-        // Actual creator publication now supplies initialized B. A passive peer
-        // receiving this descriptor goes to ordinary Restore/Starting, never
-        // auto-retirement. Do not poll that guarded daemon-discovery task.
-        let initialized_pane = std::iter::from_fn(|| published.try_recv().ok())
-            .filter_map(|edit| match edit {
-                ModelEdit::ChangeView {
-                    change: Change::Update { pane, .. },
-                    ..
-                } if matches!(&pane.kind, CardKind::Chat(session) if session == &accepted) => {
-                    Some(pane)
-                }
-                _ => None,
-            })
-            .last()
-            .expect("creator must really publish initialized B");
-        view.panes = vec![initialized_pane];
-        peer.workspace_model.views = vec![view];
-        let attach = peer.reconcile_shared_views();
-        assert!(
-            peer.chat_ui.retiring.is_empty(),
-            "initialized peer Restore must not schedule retirement"
-        );
-        assert!(peer.chat_start_matches(card, &accepted));
-        drop(attach);
-    } else {
+    if !initialized {
         for message in outputs(delayed.unwrap(), false) {
             assert!(
                 matches!(
@@ -784,6 +759,37 @@ fn run(initialized: bool) {
             drop(peer.update(message));
         }
     }
+    if let Some(CardRuntime::Chat(runtime)) = peer.cards.get_mut(&card) {
+        runtime.replace_draft(text_editor::Content::with_text("Unsent peer prompt"));
+    }
+    // Actual creator publication now supplies initialized B. A passive peer
+    // receiving this descriptor goes to ordinary Restore/Starting, never
+    // auto-retirement. Do not poll that guarded daemon-discovery task.
+    let initialized_pane = std::iter::from_fn(|| published.try_recv().ok())
+        .filter_map(|edit| match edit {
+            ModelEdit::ChangeView {
+                change: Change::Update { pane, .. },
+                ..
+            } if matches!(&pane.kind, CardKind::Chat(session) if session == &accepted) => {
+                Some(pane)
+            }
+            _ => None,
+        })
+        .last()
+        .expect("creator must really publish initialized B");
+    view.panes = vec![initialized_pane];
+    peer.workspace_model.views = vec![view];
+    let attach = peer.reconcile_shared_views();
+    assert!(
+        peer.chat_ui.retiring.is_empty(),
+        "initialized peer Restore must not schedule retirement"
+    );
+    assert!(peer.chat_start_matches(card, &accepted));
+    drop(attach);
+    assert_eq!(
+        peer.chat_ui.drafts.get(&card).map(String::as_str),
+        Some("Unsent peer prompt")
+    );
     cleanup.finish();
     creator_wire.finish();
     let seen = observed.lock().unwrap();

@@ -790,6 +790,10 @@ mod tests {
                     rusqlite::types::Value::Integer(prior_sequence + 1);
                 migrated_binding = Some(bindings);
             }
+            // Schema 28 adds private pane chat ownership, which starts empty.
+            for table in ["pane_chat_starts", "pane_chat_allocations"] {
+                assert_eq!(after.remove(table).unwrap(), Vec::<Vec<_>>::new());
+            }
             assert_eq!(
                 after, before,
                 "every original table value, including audit/outbox/view receipts, must remain exact"

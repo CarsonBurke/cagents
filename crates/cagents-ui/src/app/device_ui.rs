@@ -1521,7 +1521,7 @@ mod tests {
         std::os::unix::fs::symlink(&local_target, &path).unwrap();
         let project_id = ProjectId::new();
         let repository = path.join(".git");
-        app.sidebar_model.projects = vec![SidebarProject::new(
+        *app.sidebar_model.projects = vec![SidebarProject::new(
             project_id,
             RepositoryId(project_id.as_uuid()),
             "Remote".into(),
@@ -2071,6 +2071,7 @@ mod tests {
     fn window_close_preserves_device_edits_until_explicit_resolution() {
         let mut app = loaded_file();
         let window = cosmic::iced::window::Id::unique();
+        app.core.set_main_window_id(Some(window));
         drop(app.update(Message::WindowCloseRequested(window)));
         assert!(app.exit.is_none());
         assert_eq!(app.transient_work_close, Some(window));

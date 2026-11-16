@@ -229,8 +229,10 @@ mod tests {
         (scopes[0].clone(), empty_channel.unwrap())
     }
 
+    /// Every table but channel work and the later schema 28 pane chat
+    /// ownership, which starts empty and which `pane_chat_starts` covers.
     fn rows(db: &Connection) -> BTreeMap<String, Vec<Vec<Value>>> {
-        let names: Vec<String> = db.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT GLOB 'sqlite_*' AND name NOT GLOB 'channel_work*' ORDER BY name").unwrap().query_map([],|row|row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        let names: Vec<String> = db.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT GLOB 'sqlite_*' AND name NOT GLOB 'channel_work*' AND name NOT GLOB 'pane_chat_*' ORDER BY name").unwrap().query_map([],|row|row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
         names
             .into_iter()
             .map(|name| {

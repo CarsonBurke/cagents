@@ -24,6 +24,8 @@ use crate::file_manager::open_system_url_with_opener;
 mod browser_backend;
 mod browser_host;
 mod file_ui;
+#[cfg(any(debug_assertions, feature = "development"))]
+mod fixture_seed;
 mod git_ui;
 mod history_ui;
 #[cfg(feature = "latency-harness")]
@@ -66,6 +68,26 @@ mod worktree_dialog;
 mod worktree_operations;
 mod worktree_ui;
 pub use daemon_stop::run_daemon_stop_confirmation;
+
+/// Fills the `slot` window's empty session store from a fixture plan and
+/// returns what it wrote as one JSON line. Refused by production builds and
+/// while that window is open. See docs/fixture-workspace.md.
+pub fn seed_fixture_window(
+    plan: &Path,
+    slot: &str,
+    workspace_model_identity: Option<uuid::Uuid>,
+) -> Result<String, String> {
+    #[cfg(any(debug_assertions, feature = "development"))]
+    {
+        let seeded = fixture_seed::seed(plan, slot, workspace_model_identity)?;
+        serde_json::to_string(&seeded).map_err(|error| error.to_string())
+    }
+    #[cfg(not(any(debug_assertions, feature = "development")))]
+    {
+        let _ = (plan, slot, workspace_model_identity);
+        Err(crate::fixture_workspace::refusal())
+    }
+}
 use worktree_dialog::{
     WorktreeDialog, WorktreeDraft, WorktreeField, WorktreeInputError, worktree_dialog_focus_id,
 };
@@ -14550,12 +14572,14 @@ impl Cagents {
         {
             let font = crate::terminal::monospace_font(self.settings.editor_font_family());
             let size = self.settings.editor_font_size();
-            for runtime in self.cards.values_mut() {
-                match runtime {
-                    CardRuntime::Repository(runtime) => runtime.set_editor_font(font, size),
-                    CardRuntime::PullRequests(pane) => pane.runtime.set_editor_font(font, size),
-                    _ => {}
-                }
+            for (&card, runtime) in self.cards.iter_mut() {
+                let runtime = match runtime {
+                    CardRuntime::Repository(runtime) => runtime,
+                    CardRuntime::PullRequests(pane) => &mut pane.runtime,
+                    _ => continue,
+                };
+                runtime.set_editor_font(font, size);
+                tasks.push(repository_task(runtime.refresh_diff_presentation(card)));
             }
         }
         if previous.editor_find_options != self.settings.editor_find_options
@@ -14605,19 +14629,21 @@ impl Cagents {
         );
         if previous.editor_wrap_lines != wrap_lines || previous.editor_syntax_theme != syntax_theme
         {
-            for runtime in self.cards.values_mut() {
-                match runtime {
-                    CardRuntime::Repository(runtime) => {
-                        runtime.set_wrap_lines(wrap_lines);
+            for (&card, runtime) in self.cards.iter_mut() {
+                let runtime = match runtime {
+                    CardRuntime::Repository(runtime) => runtime,
+                    CardRuntime::PullRequests(pane) => &mut pane.runtime,
+                    CardRuntime::Chat(runtime) => {
                         runtime.set_syntax_theme(syntax_theme);
+                        continue;
                     }
-                    CardRuntime::PullRequests(pane) => {
-                        pane.runtime.set_wrap_lines(wrap_lines);
-                        pane.runtime.set_syntax_theme(syntax_theme);
-                    }
-                    CardRuntime::Chat(runtime) => runtime.set_syntax_theme(syntax_theme),
-                    _ => {}
-                }
+                    _ => continue,
+                };
+                runtime.set_wrap_lines(wrap_lines);
+                runtime.set_syntax_theme(syntax_theme);
+                // A comparison recoloured in the new palette is requested
+                // again rather than left empty until the next refresh.
+                tasks.push(repository_task(runtime.refresh_diff_presentation(card)));
             }
             self.chat_ui.set_parked_syntax_theme(syntax_theme);
         }
@@ -17320,6 +17346,11 @@ impl Application for Cagents {
                 Task::none()
             }
             Message::WindowCloseRequested(window) => {
+                // libcosmic also reports auxiliary surface teardown here.
+                // Closing a popup must not begin main-window shutdown.
+                if self.core.main_window_id() != Some(window) {
+                    return Task::none();
+                }
                 // libcosmic reports the closed window through this same
                 // request, and a second close must not reopen the exit.
                 if self.exit.is_some() || self.dirty_repository_close.is_some() {
@@ -18427,23 +18458,11 @@ impl Application for Cagents {
                     && self.terminal_find.get(&card).is_some_and(|find| find.open)
                     && let keyboard::Event::KeyPressed {
                         key: keyboard::Key::Named(key),
-                        modifiers,
                         ..
                     } = &event
                 {
                     if *key == keyboard::key::Named::Escape && !captured {
                         return self.handle_terminal_find(terminal_ui::Action::Close(card));
-                    }
-                    if *key == keyboard::key::Named::Enter
-                        && self
-                            .terminal_find
-                            .get(&card)
-                            .is_some_and(|find| find.focused)
-                    {
-                        return self.handle_terminal_find(terminal_ui::Action::Next(
-                            card,
-                            modifiers.shift(),
-                        ));
                     }
                 }
                 if let keyboard::Event::KeyPressed {
@@ -19634,19 +19653,19 @@ impl Application for Cagents {
                     .into(),
             );
         }
-        rows.push(dialog_ui::confirmation_actions(
+        let actions = dialog_ui::confirmation_actions(
             crate::ui_controls::button::secondary("Cancel").on_press(Message::CancelDialog),
             crate::ui_controls::button::primary("Create").on_press_maybe(
                 self.pull_request_submission_allowed()
                     .then_some(Message::SubmitPullRequest),
             ),
-        ));
+        );
         Some(dialog_ui::overlay(
-            dialog_ui::scrolling_surface(
+            dialog_ui::scrolling_surface_with_actions(
                 widget::column::with_children(rows).spacing(space::M),
+                actions,
                 620.0,
-                (self.window_height - 112.0).clamp(120.0, 620.0),
-                Length::Shrink,
+                620.0,
             ),
             Some(Message::CancelDialog),
             1.0,
@@ -20862,7 +20881,7 @@ mod tests {
             },
         );
         let selected = PathBuf::from("/repo/selected");
-        app.sidebar_model.projects = vec![SidebarProject::new(
+        *app.sidebar_model.projects = vec![SidebarProject::new(
             project_id,
             crate::repository::RepositoryId::new(),
             "repo".into(),
@@ -21568,6 +21587,86 @@ mod tests {
         );
     }
 
+    #[test]
+    fn popup_close_callbacks_and_requests_preserve_the_main_window() {
+        let mut app = context_inspector_test_app(true);
+        let main = window::Id::unique();
+        let popup = window::Id::unique();
+        app.core.set_main_window_id(Some(main));
+        let order = app.workspace.order().collect::<Vec<_>>();
+        let focused = app.workspace.focused();
+        let activation_closed = app.activation_rx.is_closed();
+
+        // The real libcosmic SurfaceClosed path calls this callback for
+        // popups too; the raw event subscription can also report a close.
+        if let Some(message) = app.on_close_requested(popup) {
+            drop(app.update(message));
+        }
+        drop(app.update(Message::WindowCloseRequested(popup)));
+
+        assert!(app.exit.is_none());
+        assert!(app.dirty_repository_close.is_none());
+        assert!(app.transient_work_close.is_none());
+        assert_eq!(app.core.main_window_id(), Some(main));
+        assert_eq!(app.workspace.order().collect::<Vec<_>>(), order);
+        assert_eq!(app.workspace.focused(), focused);
+        assert_eq!(app.activation_rx.is_closed(), activation_closed);
+
+        let close = app
+            .on_close_requested(main)
+            .expect("main close is admitted");
+        drop(app.update(close));
+        assert_eq!(
+            app.exit,
+            Some(ApplicationExit {
+                closing: Some(main),
+                servers_reaped: false,
+            })
+        );
+        assert_eq!(app.core.main_window_id(), None);
+    }
+
+    #[test]
+    fn popup_close_preserves_unsaved_work_without_opening_application_confirmation() {
+        let mut app = context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let main = window::Id::unique();
+        let popup = window::Id::unique();
+        app.core.set_main_window_id(Some(main));
+        app.cards.insert(
+            card,
+            CardRuntime::Repository(Box::new(RepositoryRuntime::dirty_fixture(card))),
+        );
+
+        if let Some(message) = app.on_close_requested(popup) {
+            drop(app.update(message));
+        }
+        drop(app.update(Message::WindowCloseRequested(popup)));
+
+        assert!(app.exit.is_none());
+        assert!(app.dirty_repository_close.is_none());
+        assert!(app.transient_work_close.is_none());
+        assert_eq!(app.core.main_window_id(), Some(main));
+        assert!(
+            matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime))
+            if runtime.blocks_navigation())
+        );
+
+        let close = app
+            .on_close_requested(main)
+            .expect("main close is admitted");
+        drop(app.update(close));
+        assert!(app.exit.is_none());
+        assert_eq!(app.core.main_window_id(), Some(main));
+        let confirmation = app.dirty_repository_close.as_ref().unwrap();
+        assert_eq!(confirmation.card, card);
+        assert_eq!(confirmation.intent, DirtyCloseIntent::Application(main));
+        assert!(
+            matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime))
+            if runtime.blocks_navigation())
+        );
+    }
+
     /// The window is the only part of an exit anyone sees, so it closes as
     /// soon as the exit is committed; the language-server reap, the final
     /// session flush and the process teardown all happen after it has gone.
@@ -21967,6 +22066,7 @@ mod tests {
         let mut app = context_inspector_test_app(true);
         let card = app.workspace.focused().unwrap();
         let window = window::Id::unique();
+        app.core.set_main_window_id(Some(window));
         let runtime = RepositoryRuntime::post_persist_warning_fixture(card);
         assert!(runtime.is_dirty(), "the buffer has edited back from B to A");
         assert!(runtime.has_durability_warning());
@@ -22814,6 +22914,30 @@ mod tests {
 
         assert_eq!(app.notification_ui.pending_preferences(), None);
         assert_eq!(app.settings, AppSettings::default());
+    }
+
+    /// A palette or font family change drops comparisons styled the old
+    /// way; whichever settings path makes it must request them again, or
+    /// the diff on screen reads "Nothing to compare".
+    #[test]
+    fn presentation_settings_request_the_comparison_on_screen_again() {
+        let fields = [
+            (SettingsField::EditorSyntaxTheme, "mocha"),
+            (SettingsField::EditorFontFamily, "DejaVu Serif"),
+        ];
+        for (field, value) in fields {
+            let mut app = context_inspector_test_app(false);
+            let card = CardId::new();
+            app.cards.insert(
+                card,
+                CardRuntime::Repository(Box::new(RepositoryRuntime::shown_diff_fixture(card))),
+            );
+            drop(app.apply_setting_input(field, value.into()));
+            let CardRuntime::Repository(runtime) = &app.cards[&card] else {
+                unreachable!()
+            };
+            assert!(runtime.requests_shown_diff(), "{field:?}");
+        }
     }
 
     #[test]
@@ -24220,6 +24344,7 @@ mod tests {
             CardRuntime::Repository(Box::new(RepositoryRuntime::dirty_fixture(second))),
         );
         let window = window::Id::unique();
+        app.core.set_main_window_id(Some(window));
 
         let _ = app.update(Message::WindowCloseRequested(window));
         let _ = app.update(Message::DiscardAndCloseRepository(first));
@@ -27074,7 +27199,7 @@ mod tests {
 
     fn workspace_switcher_test_app(count: usize) -> Cagents {
         let mut app = context_inspector_test_app(false);
-        app.sidebar_model.projects = (0..count)
+        *app.sidebar_model.projects = (0..count)
             .map(|index| {
                 SidebarProject::new(
                     ProjectId::new(),
@@ -27560,7 +27685,7 @@ mod tests {
         let broken = ProjectId::new();
         let healthy = ProjectId::new();
         let healthy_path = PathBuf::from("/repositories/healthy");
-        app.sidebar_model.projects = vec![
+        *app.sidebar_model.projects = vec![
             restored_sidebar_project(broken, "broken", Path::new("/repositories/broken")),
             restored_sidebar_project(healthy, "healthy", &healthy_path),
         ];
@@ -32650,7 +32775,7 @@ mod tests {
         let git = ProjectId::new();
         let worktree = crate::model::WorktreeId::new();
         let channel = crate::model::ChannelId::new();
-        app.sidebar_model.projects = vec![
+        *app.sidebar_model.projects = vec![
             SidebarProject::new(
                 folder,
                 RepositoryId::new(),
@@ -32869,7 +32994,7 @@ mod tests {
         let expected_project = app.sidebar_model.projects[0].clone();
         for loaded in [aliased, linked_load] {
             drop(app.update(complete(loaded, 1)));
-            assert_eq!(app.sidebar_model.projects, vec![expected_project.clone()]);
+            assert_eq!(*app.sidebar_model.projects, vec![expected_project.clone()]);
             assert_eq!(
                 app.durable
                     .cards
@@ -32888,7 +33013,7 @@ mod tests {
         drop(app.update(Message::RepositorySelected(Ok(root))));
         assert_eq!(app.repository_generations[&first_id], 2);
         drop(app.update(complete(first, 1)));
-        assert_eq!(app.sidebar_model.projects, vec![expected_project]);
+        assert_eq!(*app.sidebar_model.projects, vec![expected_project]);
         assert_eq!(app.active_workspace.as_ref(), Some(&canonical_linked));
     }
 

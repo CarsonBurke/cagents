@@ -8,6 +8,7 @@ use crate::{
                 pointer_button_to_native,
             },
             keymap::{self, keysym_to_key},
+            keyboard_grab::KeyboardGrabs,
             subsurface_widget::SubsurfaceState,
         },
     },
@@ -247,13 +248,14 @@ pub enum WindowEventVariant {
 
 #[derive(Debug, Clone)]
 pub enum PopupEventVariant {
-    /// Popup Created
+    /// Popup Created; the flag records whether it took an `xdg_popup` grab.
     Created(
         QueueHandle<SctkState>,
         CommonSurface,
         SurfaceId,
         Arc<Mutex<Common>>,
         WlDisplay,
+        bool,
     ),
     /// <https://wayland.app/protocols/xdg-shell#xdg_popup:event:popup_done>
     Done,
@@ -346,6 +348,7 @@ impl SctkEvent {
         events: &mut Vec<(Option<window::Id>, iced_runtime::core::Event)>,
         clipboard: &mut Clipboard,
         subsurface_state: &mut Option<SubsurfaceState>,
+        keyboard_grabs: &mut KeyboardGrabs,
         create_compositor_data: CreateCompositor<'b, P>,
     ) where
         P: Program,
@@ -705,6 +708,7 @@ impl SctkEvent {
             } => match variant {
                 LayerSurfaceEventVariant::Done => {
                     if let Some(id) = surface_ids.remove(&surface.id()) {
+                        forget_accessibility(control_sender, id.inner());
                         if let Some(w) = window_manager.remove(id.inner()) {
                             clipboard.register_dnd_destination(
                                 DndSurface(Arc::new(Box::new(w.raw.clone()))),
@@ -910,6 +914,7 @@ impl SctkEvent {
             },
             SctkEvent::PopupEvent {
                 variant,
+                toplevel_id,
                 id: surface,
                 ..
             } => {
@@ -917,6 +922,8 @@ impl SctkEvent {
                     PopupEventVariant::Done => {
                         if let Some(e) =
                             surface_ids.remove(&surface.id()).map(|id| {
+                                keyboard_grabs.remove(id.inner());
+                                forget_accessibility(control_sender, id.inner());
                                 if let Some(w) =
                                     window_manager.remove(id.inner())
                                 {
@@ -958,11 +965,33 @@ impl SctkEvent {
                         surface_id,
                         common,
                         display,
+                        grab,
                     ) => {
                         let wl_surface = surface.wl_surface();
                         let wrapper = SurfaceIdWrapper::Popup(surface_id);
                         _ = surface_ids
                             .insert(wl_surface.id(), wrapper.clone());
+                        if grab {
+                            // A layer surface or session lock surface is an
+                            // SCTK surface; a window belongs to winit, whose
+                            // window id is its `wl_surface` pointer.
+                            let toplevel = surface_ids
+                                .get(&toplevel_id.id())
+                                .map(SurfaceIdWrapper::inner)
+                                .or_else(|| {
+                                    window_manager
+                                        .get_mut_alias(
+                                            winit::window::WindowId::from_raw(
+                                                toplevel_id.id().as_ptr()
+                                                    as usize,
+                                            ),
+                                        )
+                                        .map(|(id, _)| id)
+                                });
+                            if let Some(toplevel) = toplevel {
+                                keyboard_grabs.insert(toplevel, surface_id);
+                            }
+                        }
                         let sctk_winit = SctkWinitWindow::new(
                             sctk_tx.clone(),
                             common,
@@ -1374,6 +1403,7 @@ impl SctkEvent {
             }
             SctkEvent::SessionLockSurfaceDone { surface } => {
                 if let Some(id) = surface_ids.remove(&surface.id()) {
+                    forget_accessibility(control_sender, id.inner());
                     _ = window_manager.remove(id.inner());
                 }
             }
@@ -1649,6 +1679,7 @@ impl SctkEvent {
                     if let Some(id_wrapper) =
                         surface_ids.remove(&instance.wl_surface.id())
                     {
+                        forget_accessibility(control_sender, id_wrapper.inner());
                         _ = user_interfaces.remove(&id_wrapper.inner());
 
                         if let Some(w) =
@@ -1748,6 +1779,25 @@ fn keysym_to_vkey_location(keysym: Keysym) -> (Key, Location) {
 
     let location = keymap::keysym_location(raw);
     (key, location)
+}
+
+/// Drops the accessibility adapter of an SCTK surface that is gone, as closing
+/// a window does. The adapter holds the surface's window, which owns its
+/// Wayland objects, so keeping it would keep them alive: a popup would never
+/// send `xdg_popup.destroy` and would stay mapped, holding its grab, after the
+/// application destroyed it.
+fn forget_accessibility(
+    control_sender: &mut mpsc::UnboundedSender<Control>,
+    id: window::Id,
+) {
+    #[cfg(feature = "a11y")]
+    {
+        _ = control_sender.start_send(Control::Cleanup(id));
+    }
+    #[cfg(not(feature = "a11y"))]
+    {
+        _ = (control_sender, id);
+    }
 }
 
 #[cfg(test)]

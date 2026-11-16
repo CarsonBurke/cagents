@@ -55,6 +55,7 @@ both use the same fixture data and selected providers.
         [--startup-timeout SECONDS]
         [--portal gtk|kde|gnome|cosmic] [--codex tool-rows|child-errors|terminal-escape|usage-resets]
         [--instance NAME] [--ui-trace] [--workspace-trace] [--ui-scoped-fixture]
+        [--wayland-debug]
                   Take one of the host's native slots and start a headless
                   session at the requested logical width and height (default
                   1500x900). The slot is released by stop, or after --limit
@@ -78,6 +79,9 @@ both use the same fixture data and selected providers.
                   --workspace-trace logs shared-model update timing, scope
                   projection choices and activity redraw intervals. Both trace
                   options persist through relaunch, until the session stops.
+                  --wayland-debug sets WAYLAND_DEBUG=client for the app, so its
+                  Wayland requests and events, such as popup grabs and keyboard
+                  focus, go to logs/ui-SIDE.log; it persists like the traces.
   cli ARGS...     Run this side's cagents CLI in the fixture environment.
   env CMD...      Run a command in the fixture environment, which keeps nothing
                   from this shell beyond locale and terminal settings and
@@ -102,6 +106,12 @@ both use the same fixture data and selected providers.
   stop            End the session, its daemon and its processes; release its slot.
                   Also ends what remains of a session whose supervisor was killed.
   save-seed       Keep the stopped fixture as the data every later start restores.
+  seed --profile NAME [--seed N] [--side SIDE]
+                  Generate a workspace with scripts/fixture-workspace (see
+                  docs/fixture-workspace.md) into the fixture, load it through
+                  SIDE's executables (default after), and save it as the seed.
+                  Uses SIDE's own checkout's generator, which matches its
+                  executables. Replaces the fixture and any saved seed.
   status          Report the session and the host's native slots.
 
 --task may also come from CAGENTS_EVIDENCE_TASK.
@@ -511,6 +521,13 @@ fixture_env() {
 # fixture's when the seed was saved, kept in $seed_home.
 seeded_home_identity() {
     stat -c '%d:%i' -- "$fixture/home/.claude" 2>/dev/null || :
+}
+
+# Keep the stopped fixture as the seed every later start restores.
+save_seed() {
+    rm -rf -- "$seed" "$seed_home"
+    cp -a --reflink=auto -- "$fixture" "$seed"
+    seeded_home_identity >"$seed_home"
 }
 
 restore_seed_in_place() {
@@ -1062,6 +1079,7 @@ run_app() {
     fi
     [ -z "${chat_stage_output:-}" ] || stage_environment+=("CAGENTS_CHAT_STAGE_OUTPUT=$chat_stage_output")
     [ "$(cat "$state/ui-trace" 2>/dev/null)" != 1 ] || stage_environment+=(CAGENTS_UI_TRACE=1)
+    [ "$(cat "$state/wayland-debug" 2>/dev/null)" != 1 ] || stage_environment+=(WAYLAND_DEBUG=client)
     if [ "$(cat "$state/ui-scoped-fixture" 2>/dev/null)" = 1 ]; then
         # Start the isolated daemon as User before adding the synthetic caller
         # to the UI runner. It must not inherit even this invalid capability.
@@ -1247,7 +1265,7 @@ cmd_relaunch() {
 }
 
 cmd_start() {
-    local side=${1:-} width=1500 height=900 keep_state=false wait_lock=1800 limit=$default_limit startup_timeout=180 portal= codex= codex_executable= ui_trace= ui_scoped_fixture= workspace_trace=
+    local side=${1:-} width=1500 height=900 keep_state=false wait_lock=1800 limit=$default_limit startup_timeout=180 portal= codex= codex_executable= ui_trace= ui_scoped_fixture= workspace_trace= wayland_debug=
     require_side "$side"
     shift
     while [ "$#" -gt 0 ]; do
@@ -1267,6 +1285,7 @@ cmd_start() {
             --ui-trace) ui_trace=1; shift ;;
             --ui-scoped-fixture) ui_scoped_fixture=1; shift ;;
             --workspace-trace) workspace_trace=1; shift ;;
+            --wayland-debug) wayland_debug=1; shift ;;
             *) die "unknown start option: $1" 2 ;;
         esac
     done
@@ -1318,6 +1337,7 @@ cmd_start() {
     printf '%s\n' "$ui_trace" >"$state/ui-trace"
     printf '%s\n' "$ui_scoped_fixture" >"$state/ui-scoped-fixture"
     printf '%s\n' "$workspace_trace" >"$state/workspace-trace"
+    printf '%s\n' "$wayland_debug" >"$state/wayland-debug"
     printf 'waiting for the native session (lock wait up to %ss)\n' "$wait_lock"
     # The session outlives this command, so it starts in its own process session.
     setsid nohup "$self" --task "$task" __session "$side" "$width" "$keep_state" "$wait_lock" "$limit" "$$" "$height" "$startup_timeout" \
@@ -1345,6 +1365,46 @@ cmd_start() {
     if [ -s "$state/notice" ]; then
         sed 's/^/native-evidence: /' "$state/notice" >&2
     fi
+}
+
+cmd_seed() {
+    local side=after profile= number=1
+    while [ "$#" -gt 0 ]; do
+        case $1 in
+            --profile) profile=${2:?--profile needs a name}; shift 2 ;;
+            --seed) number=${2:?--seed needs a number}; shift 2 ;;
+            --side) side=${2:?--side needs before or after}; shift 2 ;;
+            *) die "unknown seed option: $1" 2 ;;
+        esac
+    done
+    [ -n "$profile" ] || die 'seed needs --profile NAME; scripts/fixture-workspace generate --help lists them' 2
+    [[ $number =~ ^[0-9]+$ ]] || die '--seed must be a whole number' 2
+    require_side "$side"
+    live_session && die 'stop the session before seeding its fixture'
+    # A lost session's daemon or window may still have the fixture's stores
+    # open; replacing them underneath it would hand it another workspace.
+    [ -z "$(session_processes)" ] ||
+        die 'processes of a lost session still use the fixture; run: stop'
+    mark_used
+    load_side "$side"
+    source_is_current || die "$checkout changed since its build; run: build $side $checkout"
+    local generator=$checkout/scripts/fixture-workspace
+    [ -x "$generator" ] ||
+        die "$checkout has no scripts/fixture-workspace; seed through a side built from a checkout that has it: --side before|after"
+    # The fixture's own directories hold every store, and nothing from this
+    # shell reaches the generator or the executables beyond fixture_env's.
+    rm -rf -- "$fixture"
+    fixture_env "$generator" generate --profile "$profile" --seed "$number" --root "$fixture" ||
+        die "generating the $profile workspace failed; the fixture is incomplete, so seed again"
+    # A task that selected a named instance starts that instance's stores, so
+    # the seed must write them; fixture_env keeps them inside the fixture.
+    local seed_instance=()
+    [ -z "$instance_name" ] || seed_instance=(--instance "$instance_name")
+    fixture_env "$generator" apply --root "$fixture" --bin-dir "$target/dev-runtime" "${seed_instance[@]}" ||
+        die "loading the $profile workspace through $side's executables failed; the fixture is incomplete, so seed again"
+    save_seed
+    printf 'seeded %s with the %s workspace (seed %s) through %s at %s\n' \
+        "$seed" "$profile" "$number" "$side" "$built_revision"
 }
 
 nested_session_env() {
@@ -1535,11 +1595,10 @@ case $command in
     save-seed)
         live_session && die 'stop the session before saving its fixture'
         [ -d "$fixture" ] || die 'there is no fixture to save yet'
-        rm -rf -- "$seed" "$seed_home"
-        cp -a --reflink=auto -- "$fixture" "$seed"
-        seeded_home_identity >"$seed_home"
+        save_seed
         printf 'saved %s\n' "$seed"
         ;;
+    seed) cmd_seed "$@" ;;
     status) cmd_status ;;
     __build) run_build "$@" ;;
     __session) run_session "$@" ;;

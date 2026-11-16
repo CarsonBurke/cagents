@@ -1023,7 +1023,9 @@ impl Cagents {
         );
         // Fence what this snapshot fences before anything publishes against
         // it. Only projection lifts a fence, with the aliases it recomputes.
-        let fenced = super::shared_views::quarantined_managed_panes(&model, &model.views);
+        let display_index = crate::workspace_model::views::ManagedDisplayIndex::new(&model);
+        let fenced =
+            super::shared_views::quarantined_managed_panes(&model, &model.views, &display_index);
         self.shared_views.quarantined.extend(fenced);
         self.workspace_model = model;
         true
@@ -1552,7 +1554,9 @@ impl Cagents {
                 self.shared_views.registry_unavailable = true;
                 let attach = self.attach_next_restored_agent();
                 let release = self.release_held_terminals();
-                Task::batch([attach, release, self.attach_next_restored_agent()])
+                // No shared panes are coming for a scope that waited on them.
+                let default = self.run_deferred_default_pane();
+                Task::batch([attach, release, self.attach_next_restored_agent(), default])
             }
             ModelUpdate::Connected(model) => {
                 if model.identity == self.workspace_model.identity
@@ -2101,7 +2105,12 @@ impl Cagents {
         }
         self.materialize_replica_snapshot();
         let failed_seeds = std::mem::take(&mut self.shared_views.seed_failures);
+        // A pending automatic composer is a window navigation intent, not
+        // authority from the old registry. The new scope must initialize
+        // before that exact still-selected intent can open anything.
+        let deferred_default = self.shared_views.deferred_default.take();
         self.shared_views = super::shared_views::State::for_workspace(&self.durable);
+        self.shared_views.deferred_default = deferred_default;
         self.clear_closed_chat_drafts();
         let durable = Arc::make_mut(&mut self.durable);
         durable.workspace_model_identity = Some(identity);
@@ -2229,10 +2238,10 @@ impl Cagents {
         // Admission uses this incoming snapshot, not fences left by a previous
         // projection. A stale sibling pane is fenced by itself: it must not
         // defer an unrelated fresh actor's admission to the same scope.
+        let display_index = crate::workspace_model::views::ManagedDisplayIndex::new(&model);
         self.shared_views.blocked.clear();
         self.shared_views.quarantined =
-            super::shared_views::quarantined_managed_panes(&model, &model.views);
-        let display_index = crate::workspace_model::views::ManagedDisplayIndex::new(&model);
+            super::shared_views::quarantined_managed_panes(&model, &model.views, &display_index);
         let mut new_managed_panes = Vec::new();
         let mut adopted_scopes = HashSet::new();
         for agent in &model.agents {
@@ -7503,6 +7512,93 @@ mod tests {
     }
 
     #[test]
+    fn repository_refresh_relocates_managed_display_into_a_worktree_without_changing_its_source() {
+        use crate::workspace_model::views::{Pane, Scope, View};
+        let (mut app, agent, mut pane, unrelated) = managed_display_fixture();
+        let mut original_only = app.workspace_model.clone();
+        original_only.views.clear();
+        let display =
+            crate::workspace_model::views::managed_display(&original_only, &agent).unwrap();
+        assert!(app.adopt_execution_agent_display(&agent, display).is_some());
+        let source = app.card_state(pane.id).unwrap().kind.clone();
+        let path = PathBuf::from("/repo/relocated-worktree");
+        let scope = Scope::Worktree {
+            repository: agent.spec.target.repository.clone(),
+            path: path.clone(),
+        };
+        pane.scope = Some(path.clone());
+        app.workspace_model.views[1].scope = scope.clone();
+        app.workspace_model.views[1].panes = vec![pane.clone()];
+        let sentinel = app.workspace.focused().unwrap();
+        assert_ne!(sentinel, pane.id);
+        let sentinel_pane = Pane::from_card(
+            app.card_state(sentinel).unwrap(),
+            app.durable.card_scopes.get(&sentinel).cloned(),
+        )
+        .unwrap();
+        let mut unrelated_view = View::empty(unrelated);
+        unrelated_view.panes.push(sentinel_pane.clone());
+        app.workspace_model.views.push(unrelated_view);
+        let channel = Arc::make_mut(&mut app.durable)
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == unrelated)
+            .unwrap();
+        channel.cards = vec![sentinel];
+        channel.focused = Some(sentinel);
+        app.shared_views
+            .initialize(Scope::Channel(unrelated), vec![sentinel_pane]);
+        app.sidebar_model.projects[0].worktrees.push(
+            crate::sidebar::SidebarWorktree::from_durable(
+                crate::model::WorktreeId::new(),
+                path.clone(),
+                Some("relocated".into()),
+            ),
+        );
+        app.known_worktree_roots.insert(path.clone());
+        app.shared_views
+            .initialize(scope.clone(), vec![pane.clone()]);
+        Arc::make_mut(&mut app.durable).active_channel = Some(unrelated);
+        let before = (
+            app.workspace.focused(),
+            app.workspace.camera().offset(),
+            app.workspace.order().collect::<Vec<_>>(),
+        );
+        let (tx, rx) = test_model_channel();
+        app.workspace_model_tx = tx;
+
+        drop(app.reconcile_workspace_model_for_repository(Path::new("/unrelated")));
+
+        let current = app.card_state(pane.id).unwrap();
+        assert_eq!(current.kind, source);
+        assert_eq!(current.title, pane.title);
+        assert_eq!(current.width_fraction, pane.width_fraction);
+        assert_eq!(app.durable.card_scopes.get(&pane.id), Some(&path));
+        assert_eq!(app.worktree_owners.get(&pane.id), Some(&path));
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .all(|channel| !channel.cards.contains(&pane.id))
+        );
+        assert!(matches!(
+            app.cards.get(&pane.id),
+            Some(CardRuntime::Loading)
+        ));
+        assert_eq!(app.durable.active_channel, Some(unrelated));
+        assert_eq!(
+            (
+                app.workspace.focused(),
+                app.workspace.camera().offset(),
+                app.workspace.order().collect::<Vec<_>>()
+            ),
+            before
+        );
+        assert!(!std::iter::from_fn(|| rx.try_recv().ok()).any(|edit|
+            matches!(edit, ModelEdit::ChangeView { scope: edited, .. } | ModelEdit::SeedView { scope: edited, .. } if edited == scope)));
+    }
+
+    #[test]
     fn observed_managed_terminal_exit_projects_without_live_adoption_or_relaunch() {
         for relaunch_available in [false, true] {
             let (mut app, agent, mut pane, destination) = managed_display_fixture();
@@ -8995,6 +9091,10 @@ mod tests {
                 .collect()
         }
         let (mut app, project, repository) = app_with_project();
+        // A connected publisher keeps a channel's seed pending until the
+        // registry answers, as a running window's does.
+        let (tx, _requests) = test_model_channel();
+        app.workspace_model_tx = tx;
         let storage = tempfile::tempdir().unwrap();
         let database = storage.path().join("channel-order.sqlite3");
         let boot = crate::model::BootId::new("channel-order-reopen");
@@ -9046,6 +9146,13 @@ mod tests {
                 saved[2].id,
             ))),
         );
+        // Its composer waits until the channel's shared panes are admitted.
+        assert!(app.workspace.cards().is_empty());
+        app.acknowledge_view_edit(
+            crate::workspace_model::views::Scope::Channel(saved[2].id),
+            None,
+        );
+        drop(app.reconcile_shared_views());
         let draft_card = app.workspace.focused().expect("the old composer opens");
         let target = match app.cards.get(&draft_card) {
             Some(CardRuntime::Chat(runtime)) => runtime.target,
