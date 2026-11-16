@@ -152,12 +152,12 @@ impl TurnReview {
             // Closing the connection removes every subscription. A changed
             // owner never inherits another chat's accepted-turn observation.
             self.clear();
-            self.source = Some(super::super::source_client_for(daemon)?);
         }
-        let Some(Client::Current { client, peer }) = self.source.as_mut() else {
-            // Older frozen clients have no qualified resident-snapshot reader.
-            return Ok(preview);
+        let source = match self.source.take() {
+            Some(source) => source,
+            None => super::super::source_client_for(daemon)?,
         };
+        let Client { client, peer } = self.source.insert(source);
         peer.verify(client.proof())?;
         if self.observations.is_empty() {
             let chats = client

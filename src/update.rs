@@ -4057,7 +4057,7 @@ sys.exit(7)
         })
         .unwrap();
         let mut other_reply = postcard::to_stdvec(&127u16).unwrap();
-        // Deliberately not a current, candidate-line or protocol77 envelope. Entry routing
+        // Deliberately not a current or candidate-line envelope. Entry routing
         // must never decode this unknown source's response DTO.
         other_reply.extend_from_slice(b"opaque-unqualified-source-dto");
         let script = root.join("source.py");

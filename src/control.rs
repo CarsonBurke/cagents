@@ -934,7 +934,7 @@ impl ControlClient {
         deadline: Instant,
         protocol: u16,
     ) -> Result<Self, ControlError> {
-        if !crate::update::source::current_client_supports(protocol) {
+        if !crate::update::source::is_qualified_source(protocol) {
             return Err(ControlError::UnsupportedVersion { actual: protocol });
         }
         Self::from_stream_at(stream, deadline, deadline, protocol)
@@ -6799,7 +6799,7 @@ mod tests {
 
     #[test]
     fn update_source_confirm_preserves_every_shutdown_outcome() {
-        for protocol in crate::update::source::current_client_protocols() {
+        for protocol in crate::update::source::protocols() {
             let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
             let pinned = proof("source", "boot", "incarnation");
             let capability = ShutdownCapability {
@@ -7889,7 +7889,7 @@ mod tests {
 
     #[test]
     fn update_source_client_speaks_and_requires_the_sources_own_protocol() {
-        for source in crate::update::source::current_client_protocols() {
+        for source in crate::update::source::protocols() {
             if source == PROTOCOL_VERSION {
                 continue;
             }
