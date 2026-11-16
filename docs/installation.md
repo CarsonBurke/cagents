@@ -327,14 +327,17 @@ ownership checks as `--stage-only`, and it refuses when:
   the staged build;
 - an application update is in progress, or an interrupted update's recovery
   is still pending;
-- the version is a candidate the installer retained after its readiness could
-  not be verified. Install that release again to verify it;
+- the version is a candidate the installer has not verified, for example one
+  kept after an update rolled back or could not verify it was ready. Builds
+  that an earlier release installed through an application update are
+  refused the same way unless they are current or running. Install that
+  release again to verify it;
 - `current` changed while the selection was being prepared.
 
-With no window or daemon running, any complete installed version can be
-selected. Selecting an older version this way is like installing an older
-release on purpose: its daemon cannot open a shared workspace store that a
-newer release converted (see [Daemon](daemon.md)).
+With no window or daemon running, any complete installed version other than
+such a candidate can be selected. Selecting an older version this way is like
+installing an older release on purpose: its daemon cannot open a shared
+workspace store that a newer release converted (see [Daemon](daemon.md)).
 
 A withdrawn build stays installed, so windows do not offer to download that
 release again; select it to restore it.

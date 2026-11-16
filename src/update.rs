@@ -369,10 +369,21 @@ pub(crate) fn exclude_update_jobs(
 
 /// Left by `install.sh` in a version tree whose readiness it could not
 /// verify; a later install of that release revalidates the tree.
-pub(crate) const RETAINED_CANDIDATE_MARKER: &str = ".cagents-retained-candidate-v1.json";
-/// Left by `install.sh` in a tree it extracted for an update worker. It
-/// remains after that tree is published.
+const RETAINED_CANDIDATE_MARKER: &str = ".cagents-retained-candidate-v1.json";
+/// Left by `install.sh` in a tree it extracted for an update worker, including
+/// one kept after that worker's installation failed and rolled back.
 const PREPARED_CANDIDATE_MARKER: &str = ".cagents-prepared-candidate-v1.json";
+
+/// Whether `install.sh` left the version tree at `root` as a candidate it has
+/// not verified, such as one kept after a failed or rolled-back update. It
+/// removes both markers once it verifies a publication; a later install of that
+/// release revalidates a marked tree. Releases before that removal left the
+/// prepared marker on trees they published, which are refused here too.
+pub(crate) fn is_unverified_candidate(root: &Path) -> bool {
+    [RETAINED_CANDIDATE_MARKER, PREPARED_CANDIDATE_MARKER]
+        .iter()
+        .any(|marker| fs::symlink_metadata(root.join(marker)).is_ok())
+}
 
 /// Whether `install.sh` would refuse to install `version` again because this
 /// installation already holds it as an ordinary tree, served or not, such as
@@ -380,10 +391,7 @@ const PREPARED_CANDIDATE_MARKER: &str = ".cagents-prepared-candidate-v1.json";
 /// reinstalled, which revalidates them.
 fn holds_installed_tree(prefix: &Path, version: &str) -> bool {
     let root = prefix.join("versions").join(version);
-    fs::symlink_metadata(&root).is_ok()
-        && [RETAINED_CANDIDATE_MARKER, PREPARED_CANDIDATE_MARKER]
-            .iter()
-            .all(|marker| fs::symlink_metadata(root.join(marker)).is_err())
+    fs::symlink_metadata(&root).is_ok() && !is_unverified_candidate(&root)
 }
 
 fn invalid(message: impl Into<String>) -> UpdateError {
@@ -1366,7 +1374,10 @@ fn failed_job_is_superseded(
             || matches!(
                 Path::new(&job.version).components().collect::<Vec<_>>()[..],
                 [std::path::Component::Normal(_)]
-            ) && window.prefix.join("versions").join(&job.version).is_dir())
+            ) && {
+                let root = window.prefix.join("versions").join(&job.version);
+                root.is_dir() && !is_unverified_candidate(&root)
+            })
 }
 
 /// The installed UI executable, when the installation this window runs from has
@@ -4690,6 +4701,15 @@ finally:
             "a newer build withdrawn by selecting this one no longer applies"
         );
         assert!(!superseded(&job, false), "nor is a rollback a withdrawal");
+        fs::write(
+            root.join("versions/0.1.4").join(PREPARED_CANDIDATE_MARKER),
+            b"{}",
+        )
+        .unwrap();
+        assert!(
+            !superseded(&job, true),
+            "a candidate kept after its update failed was never withdrawn"
+        );
         job.version = "0.1.2".into();
         assert!(superseded(&job, true));
         job.version = "invalid".into();

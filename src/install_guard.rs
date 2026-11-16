@@ -450,7 +450,8 @@ fn record_staged_owner(prefix: &Path, version_root: &Path) -> io::Result<()> {
 /// selecting it again restores exactly the routing staging established; this
 /// coordinator never rewrites a marker it could not have produced. Every tree
 /// and marker is kept. With no runtime owner nothing can be routed, and any
-/// complete tree of this installation may be served.
+/// complete tree of this installation other than an unverified candidate may
+/// be served.
 pub(crate) fn select_staged(
     prefix: &Path,
     version_root: &Path,
@@ -466,11 +467,9 @@ pub(crate) fn select_staged(
     let target = selectable_root(&prefix, version_root)?;
     // Obsolete routing may be ignored, but a present marker must be valid.
     let marker = read_staged_owner(&target)?;
-    // A prepared candidate's marker survives its publication, and an
-    // unpublished one carries no routing marker for the owner check below.
-    // A retained one was never proven ready and is removed once it is.
-    let unpublished =
-        std::fs::symlink_metadata(target.join(crate::update::RETAINED_CANDIDATE_MARKER)).is_ok();
+    // The installer removes its candidate markers once it verifies a
+    // publication. Check them here even when a routing marker is present.
+    let unverified = crate::update::is_unverified_candidate(&target);
     let _jobs = crate::update::exclude_update_jobs(&prefix).map_err(|error| match error {
         crate::update::UpdateError::Busy => io::Error::other(
             "an application update is in progress; finish or cancel it, then retry; installation was not changed",
@@ -520,12 +519,12 @@ pub(crate) fn select_staged(
     // proven ready to serve. Withdrawing to the tree that already runs, or
     // keeping the one already served, publishes nothing new.
     let link = Path::new("versions").join(target.file_name().unwrap());
-    if unpublished
+    if unverified
         && link != expected_current
         && owner.as_deref() != Some(target.join("bin").as_path())
     {
         return Err(io::Error::other(format!(
-            "version {} is an unverified update candidate the installer retained; install that release again to verify it; installation was not changed",
+            "version {} is an update candidate the installer has not verified, or one an earlier cagents release installed through an application update; install that release again to verify it; installation was not changed",
             target.file_name().unwrap().to_string_lossy()
         )));
     }

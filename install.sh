@@ -1751,6 +1751,11 @@ TRANSACTION_COMMITTED=1
 if [ "$NEW_VERSION_RETAINED" -eq 1 ]; then
     rm -f "$NEW_VERSION_DIR/$RETAINED_MARKER"
 fi
+# A published candidate is an ordinary installed tree. Markers left on a tree
+# that failed or rolled back keep it from being selected without revalidation.
+if [ "$NEW_VERSION_PREPARED" -eq 1 ]; then
+    rm -f "$NEW_VERSION_DIR/$PREPARED_MARKER"
+fi
 refresh_launcher_caches
 
 

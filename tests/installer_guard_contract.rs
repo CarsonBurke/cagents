@@ -2714,12 +2714,12 @@ fn selection_withdraws_and_restores_a_staged_build_without_touching_live_owners(
     assert_eq!(fs::read(&marker).unwrap(), recorded);
     assert_eq!(fs::read(&obsolete).unwrap(), obsolete_recorded);
     fs::remove_file(&unstaged_marker).unwrap();
-    // A tree retained after its readiness could not be verified was never
-    // proven ready, even with nothing running to route by. A prepared
-    // candidate's marker outlives its publication, so it does not refuse.
-    for (version, candidate, selectable) in [
-        ("9.9.2", ".cagents-retained-candidate-v1.json", false),
-        ("9.9.3", ".cagents-prepared-candidate-v1.json", true),
+    // Neither a tree retained after its readiness could not be verified nor
+    // a prepared candidate left behind by a failed update was proven ready,
+    // even with nothing running to route by. Publication removes both markers.
+    for (version, candidate) in [
+        ("9.9.2", ".cagents-retained-candidate-v1.json"),
+        ("9.9.3", ".cagents-prepared-candidate-v1.json"),
     ] {
         let bin = prefix.join("versions").join(version).join("bin");
         fs::create_dir_all(&bin).unwrap();
@@ -2730,17 +2730,21 @@ fn selection_withdraws_and_restores_a_staged_build_without_touching_live_owners(
         fs::write(&marker, r#"{"version":1}"#).unwrap();
         fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
         let output = select(version);
-        if selectable {
-            assert!(output.status.success(), "{version}: {output:?}");
-            assert_eq!(current(), Path::new("versions").join(version));
-        } else {
-            assert!(!output.status.success(), "{version}: {output:?}");
-            assert!(
-                String::from_utf8_lossy(&output.stderr).contains("unverified update candidate"),
-                "{version}: {output:?}"
-            );
-            assert_eq!(current(), Path::new("versions").join(staged));
-        }
+        assert!(!output.status.success(), "{version}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("update candidate the installer has not verified"),
+            "{version}: {output:?}"
+        );
+        assert_eq!(current(), Path::new("versions").join(staged));
+        // Keeping the tree that is already served publishes nothing new.
+        let served_marker = prefix.join("versions").join(staged).join(candidate);
+        fs::write(&served_marker, r#"{"version":1}"#).unwrap();
+        fs::set_permissions(&served_marker, fs::Permissions::from_mode(0o600)).unwrap();
+        let output = select(staged);
+        assert!(output.status.success(), "{version}: {output:?}");
+        assert_eq!(current(), Path::new("versions").join(staged));
+        fs::remove_file(&served_marker).unwrap();
     }
     let output = select("9.9.7");
     assert!(output.status.success(), "{output:?}");
