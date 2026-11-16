@@ -1090,6 +1090,7 @@ impl Cagents {
         }
     }
 
+    #[cfg(test)]
     /// The local views that list `card`, as `local_view_cards` would,
     /// without resolving every view's cards to find one.
     fn local_scopes_listing(&self, card: CardId) -> Vec<Scope> {
@@ -2517,6 +2518,7 @@ impl Cagents {
         }
     }
 
+    #[cfg(test)]
     /// A full canonical snapshot already supplies view authority. A seed is
     /// needed only when local migration could change that view, not as a
     /// per-client handshake. Keep exact membership and field equality here:
@@ -2526,6 +2528,7 @@ impl Cagents {
         self.admit_existing_views_in(None);
     }
 
+    #[cfg(test)]
     fn admit_existing_views_in(&mut self, selected: Option<&HashSet<Scope>>) {
         self.admit_existing_views_with_topology(selected, None);
     }
@@ -2654,6 +2657,7 @@ impl Cagents {
         );
     }
 
+    #[cfg(test)]
     /// A repository load changes ownership boundaries, not registry authority.
     /// Follow pane ownership across local, baseline and canonical scopes so a
     /// discovered child root, transfer or rekeyed alias settles both ends.
@@ -2813,7 +2817,7 @@ impl Cagents {
         {
             return self.reconcile_shared_views();
         }
-        self.reconcile_shared_views_for(ViewProjection::Selected(scopes))
+        self.reconcile_shared_views_with(ViewProjection::Selected(scopes), None)
     }
 
     pub(super) fn reconcile_shared_views_for_repository(
@@ -2849,31 +2853,19 @@ impl Cagents {
         )
     }
 
-    fn reconcile_shared_views_for(&mut self, projection: ViewProjection<'_>) -> Task<Message> {
-        self.reconcile_shared_views_with(projection, None)
-    }
-
-    /// A structural pass without `topology` builds its own; a
-    /// presentation-only pass needs none.
+    /// A structural pass reads roots and authority from its caller's
+    /// `topology`; a presentation-only pass needs none.
     fn reconcile_shared_views_with(
         &mut self,
         projection: ViewProjection<'_>,
         topology: Option<&ViewScopeTopology<'_>>,
     ) -> Task<Message> {
         let presentation = matches!(projection, ViewProjection::Selected(_));
-        let root_paths;
-        let built;
-        let topology = match topology {
-            _ if presentation => None,
-            Some(topology) => Some(topology),
-            None => {
-                root_paths = self.worktree_root_paths();
-                built = self.view_scope_topology(worktree_ui::WorktreeRoots::new(
-                    root_paths.iter().map(PathBuf::as_path),
-                ));
-                Some(&built)
-            }
-        };
+        debug_assert_eq!(
+            topology.is_none(),
+            presentation,
+            "only a structural pass shares its caller's topology"
+        );
         let selected = match projection {
             ViewProjection::Structural(scopes) => Some(scopes),
             _ => None,
@@ -3155,6 +3147,7 @@ impl Cagents {
         Task::batch(tasks)
     }
 
+    #[cfg(test)]
     fn prepare_shared_aliases(&mut self, views: &[View], owned: &HashSet<CardId>) {
         let root_paths = self.worktree_root_paths();
         let topology = self.view_scope_topology(worktree_ui::WorktreeRoots::new(
@@ -3335,6 +3328,7 @@ impl Cagents {
             .insert(pane.id, terminal.id);
     }
 
+    #[cfg(test)]
     fn project_shared_view(&mut self, view: &View, owned: &HashSet<CardId>) -> Task<Message> {
         let current = self.local_view_cards(&view.scope);
         self.project_shared_view_with_cards(view, owned, current)
@@ -8401,6 +8395,44 @@ mod tests {
             assert!(!app.terminal_start_in_flight(pane.id));
             assert!(app.durable.pending_terminal_creations.is_empty());
         }
+    }
+
+    /// A structural pass decides whether an unlisted held terminal's view
+    /// has been admitted from the topology it already built, rather than
+    /// rebuilding roots and authority in its release tail.
+    #[test]
+    fn a_structural_pass_releases_held_terminals_through_its_own_topology() {
+        let (mut app, _, other, listed) = listed_passive_release_fixture();
+        let mut unlisted = listed.clone();
+        unlisted.id = CardId::new();
+        unlisted.kind = moving_terminal_kind();
+        Arc::make_mut(&mut app.durable).cards.push(CardState {
+            id: unlisted.id,
+            generation: 0,
+            title: unlisted.title.clone(),
+            width_fraction: unlisted.width_fraction,
+            existence: Existence::Open,
+            kind: unlisted.kind.clone(),
+        });
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .iter_mut()
+            .find(|row| row.id == other)
+            .unwrap()
+            .cards
+            .push(unlisted.id);
+        app.cards.insert(unlisted.id, CardRuntime::Loading);
+        app.register_presence(unlisted.id, Exposure::Offscreen, Residency::Cold);
+        app.shared_views.attached.insert(unlisted.id);
+        app.shared_views.topology_build_count.set(0);
+        app.shared_views.held_descriptor_clones.set(0);
+        drop(app.reconcile_shared_views());
+        assert!(
+            app.shared_views.held_descriptor_clones.get() > 0,
+            "the pass reaches its release tail with the unlisted terminal held"
+        );
+        assert!(!app.listed_in_registry(unlisted.id));
+        assert_eq!(app.shared_views.topology_build_count.get(), 1);
     }
 
     #[test]
