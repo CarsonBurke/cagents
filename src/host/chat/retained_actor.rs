@@ -243,10 +243,15 @@ mod outcome_broker_tests {
         let host = crate::host::service::test_host();
         let inbox = inbox();
         let (acknowledged, acknowledgements) = mpsc::channel();
-        let (failing, batched, later) = (TerminalId::new(), TerminalId::new(), TerminalId::new());
+        // Ordered ids: a step drains `failing` first, then `batched`.
+        let [failing, batched, later] =
+            [1, 2, 3].map(|id| TerminalId::from_uuid(uuid::Uuid::from_u128(id)));
+        let attempts = Arc::new(Mutex::new(Vec::new()));
         let mut outcomes = Outcomes::new(Arc::downgrade(&host), inbox.clone(), {
+            let attempts = attempts.clone();
             let mut failures = 0;
             move |_: &SharedHost, id: TerminalId| {
+                attempts.lock().unwrap().push(id);
                 if id == failing && failures < 2 {
                     failures += 1;
                     panic!("drain fixture panics for {id}");
@@ -268,6 +273,11 @@ mod outcome_broker_tests {
         inbox.pending.lock().unwrap().extend([failing, batched]);
         inbox.wake.notify_one();
         assert_eq!(acknowledgements.recv_timeout(PROMPT), Ok(batched));
+        assert_eq!(
+            attempts.lock().unwrap()[..2],
+            [failing, batched],
+            "the batch-mate is drained after the panic in the same step"
+        );
         inbox.push(later);
         // The panicked actor is retried after its backoff, without another
         // wake, until it drains.
