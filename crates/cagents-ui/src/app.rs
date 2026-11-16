@@ -26824,10 +26824,8 @@ mod tests {
         assert_ne!(fresh_terminal_relaunch(session).id, identity);
     }
 
-    /// Workspace previews freeze visit order until Alt is released, including
-    /// channel identities that share their project's worktree directory.
-    #[test]
-    fn alt_tab_previews_workspace_history_and_commits_only_a_choice() {
+    /// A channel and a repository with two worktrees, each holding a terminal.
+    fn alt_tab_test_app() -> (Cagents, crate::model::ChannelId) {
         use crate::model::{ChannelId, ProjectChannel, WorktreeId};
         use crate::sidebar::{SidebarProject, SidebarWorktree};
 
@@ -26878,6 +26876,66 @@ mod tests {
             Vec::new(),
         ));
         app.refresh_sidebar_channels();
+        (app, channel)
+    }
+
+    /// Committing a switcher choice is navigation, saved within
+    /// [`NAVIGATION_SAVE_DELAY`] like a sidebar click rather than at once on
+    /// the UI thread, and the deferred save carries the visit order.
+    #[test]
+    fn committing_a_switcher_choice_saves_with_the_navigation_burst() {
+        use super::terminal_output_tests::persists;
+        use keyboard::key::{Code, Named};
+
+        let (mut app, _) = alt_tab_test_app();
+        let destinations = sidebar::workspace_cycle(&app.sidebar_model, &app.sidebar_state);
+        for destination in &destinations {
+            drop(app.update(Message::Sidebar(destination.clone())));
+        }
+        drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
+        assert!(app.navigation_save.is_none());
+        let saved = persists();
+        let previous = app.active_workspace_destination();
+
+        let alt = keyboard::Modifiers::ALT;
+        drop(app.update(Message::KeyEvent {
+            event: keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(Named::Tab),
+                modified_key: keyboard::Key::Named(Named::Tab),
+                physical_key: keyboard::key::Physical::Code(Code::Tab),
+                location: keyboard::Location::Standard,
+                modifiers: alt,
+                text: None,
+                repeat: false,
+            },
+            captured: true,
+        }));
+        let since = app.chrome_ui.workspace_preview_since.unwrap();
+        drop(app.update(Message::KeyEvent {
+            event: keyboard::Event::ModifiersChanged(keyboard::Modifiers::empty()),
+            captured: false,
+        }));
+        drop(app.update(Message::WorkspaceSwitcherReleased(since)));
+        let chosen = app.active_workspace_destination();
+        assert_ne!(chosen, previous, "the switcher opened its choice");
+        assert_eq!(persists(), saved, "the switch waits for the burst's save");
+        assert_eq!(app.navigation_save, Some(DeferredSave::Views));
+
+        drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
+        assert_eq!(persists(), saved + 1, "the burst is saved once");
+        assert!(app.navigation_save.is_none());
+        assert_eq!(
+            app.durable.workspace_history.first().copied(),
+            chosen,
+            "the saved history leads with the workspace chosen"
+        );
+    }
+
+    /// Workspace previews freeze visit order until Alt is released, including
+    /// channel identities that share their project's worktree directory.
+    #[test]
+    fn alt_tab_previews_workspace_history_and_commits_only_a_choice() {
+        let (mut app, channel) = alt_tab_test_app();
 
         let destinations = sidebar::workspace_cycle(&app.sidebar_model, &app.sidebar_state);
         let root = workspace_destination(&destinations[1]).unwrap();

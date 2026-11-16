@@ -314,13 +314,25 @@ enum Open {
 ///
 /// `presented` reads what an item did to work with other agents, where a
 /// message or a launch is drawn as a card among the prose rather than as a
-/// step, and the titles that name a group of one tool call.
+/// step, and the titles that name a group of one tool call. It also says
+/// where a message must not join the prompt before it, as when that prompt
+/// failed and its notice, kept outside `items`, is drawn after its group.
 pub(super) fn group<'c, T: Borrow<Item>>(
     items: &[T],
     asked_after: &HashSet<String>,
     presented: impl Presented<'c>,
 ) -> Vec<Turn> {
     let coordinated = |item: &Item| presented.coordinated(item);
+    // A notice kept outside `items` is drawn after its prompt's group, so a
+    // later message joining that group would put the old notice below it.
+    let follows_retained_notice = |turn: &Turn, incoming: &Item| {
+        turn.prompt
+            .iter()
+            .rev()
+            .map(|&index| items[index].borrow())
+            .find(|prompt| !matches!(prompt.content, ItemContent::Delivery { .. }))
+            .is_some_and(|typed| presented.separates(typed, incoming))
+    };
     let mut turns: Vec<Turn> = Vec::new();
     let mut state = Open::Closed;
     let mut newest_running = None;
@@ -335,7 +347,11 @@ pub(super) fn group<'c, T: Borrow<Item>>(
         // attributed to it and not to whatever was running when it landed.
         if item.role == Role::User && !item.content.is_step() {
             match turns.last_mut() {
-                Some(turn) if state == Open::Taking && turn.awaiting_activity() => {
+                Some(turn)
+                    if state == Open::Taking
+                        && turn.awaiting_activity()
+                        && !follows_retained_notice(turn, item) =>
+                {
                     turn.prompt.push(index);
                     turn.spans(item);
                 }
@@ -449,6 +465,12 @@ pub(super) trait Presented<'c> {
     fn coordinated(&self, item: &Item) -> Option<&'c Coordinated>;
     fn titled(&self, _item: &Item) -> Option<&'c Title> {
         None
+    }
+    /// Whether `incoming` opens a group of its own rather than joining the
+    /// prompt whose latest typed message is `typed`, which has no activity
+    /// yet. Parts of one message still share their prompt.
+    fn separates(&self, _typed: &Item, _incoming: &Item) -> bool {
+        false
     }
 }
 

@@ -264,8 +264,11 @@ impl Cagents {
             .finish(self.active_workspace_destination());
         self.workspace_history
             .truncate_recent(WORKSPACE_HISTORY_LIMIT);
-        self.persist();
-        task
+        // Where the window is and the order it was visited in are navigation,
+        // saved within NAVIGATION_SAVE_DELAY as a sidebar click is. The
+        // workspace opened above already armed a save that publishes views;
+        // the history alone needs only the snapshot, which captures it.
+        Task::batch([task, self.save_snapshot_soon()])
     }
 
     pub(super) fn cancel_workspace_preview(&mut self) {

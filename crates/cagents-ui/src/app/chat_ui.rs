@@ -82,6 +82,8 @@ mod close_refusal;
 mod closed_draft;
 mod completion;
 mod coordination;
+#[cfg(test)]
+mod diagnostic_chronology_tests;
 mod disclosure;
 mod failure;
 mod find;
@@ -1839,6 +1841,26 @@ impl<'c> turn::Presented<'c> for Presentations<'c> {
     }
     fn titled(&self, item: &chat::Item) -> Option<&'c tool_title::Title> {
         self.0.get(&item.id)?.title_of(item)
+    }
+}
+
+/// What a live transcript's grouping reads: its presentations, and the
+/// failure notices it retains outside its items.
+struct Grouping<'c> {
+    presentations: Presentations<'c>,
+    provider: Provider,
+    failures: &'c [failure::Note],
+}
+
+impl<'c> turn::Presented<'c> for Grouping<'c> {
+    fn coordinated(&self, item: &chat::Item) -> Option<&'c coordination::Coordinated> {
+        self.presentations.coordinated(item)
+    }
+    fn titled(&self, item: &chat::Item) -> Option<&'c tool_title::Title> {
+        self.presentations.titled(item)
+    }
+    fn separates(&self, typed: &chat::Item, incoming: &chat::Item) -> bool {
+        failure::separates_prompt(self.provider, self.failures, &typed.id, &incoming.id)
     }
 }
 
@@ -4212,6 +4234,18 @@ impl Runtime {
         failure::prompt_anchor(self.session.launch.provider, &snapshot.items)
             .or_else(|| turns.last().map(|turn| turn.key.as_str()))
     }
+    /// Groups `snapshot`'s items as this transcript draws them.
+    fn transcript_turns(&self, snapshot: &Snapshot) -> Vec<turn::Turn> {
+        turn::group(
+            &snapshot.items,
+            &self.asked_after,
+            Grouping {
+                presentations: Presentations(&self.cache),
+                provider: self.session.launch.provider,
+                failures: &self.failures,
+            },
+        )
+    }
     /// Records a notice in the transcript, after the message it concerns.
     fn note(&mut self, notice: String) {
         if self.snapshot.has_later {
@@ -5310,11 +5344,7 @@ impl Runtime {
         }
         self.resume_preparation();
         if regroup && self.selected_subagent.is_none() {
-            let turns = turn::group(
-                &self.snapshot.items,
-                &self.asked_after,
-                Presentations(&self.cache),
-            );
+            let turns = self.transcript_turns(&self.snapshot);
             carry_step_disclosures(
                 &mut self.opened,
                 &mut self.find_disclosure,
@@ -5753,10 +5783,9 @@ impl Runtime {
             }
         }
         self.source_clock = source_clock;
-        let cache = &self.cache;
         let turns = (grouping_dirty
             || !turn::same_structure(&self.snapshot.items, &snapshot.items))
-        .then(|| turn::group(&snapshot.items, &self.asked_after, Presentations(cache)));
+        .then(|| self.transcript_turns(&snapshot));
         if let Some(turns) = &turns {
             carry_step_disclosures(
                 &mut self.opened,
