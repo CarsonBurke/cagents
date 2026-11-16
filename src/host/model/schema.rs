@@ -238,6 +238,12 @@ pub(super) fn downgrade(path: &Path, target: u32) -> Result<Option<u32>, String>
     require_open_layout(&tx, version)?;
     for step in (target + 1..=version).rev() {
         match step {
+            28 => {
+                // Pane chat ownership only serializes first sends in a
+                // running daemon; an older one admits them as it always did.
+                tx.execute_batch("DROP TABLE pane_chat_allocations; DROP TABLE pane_chat_starts;")
+                    .map_err(|error| error.to_string())?;
+            }
             27 => super::retired_channel_work::restore(&tx)?,
             26 => {
                 // Source stamps own no process or recovery custody. The
@@ -382,6 +388,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
     static TWENTY_FIVE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static TWENTY_SIX: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static TWENTY_SEVEN: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
+    static TWENTY_EIGHT: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     let published = match version {
         12 => &TWELVE,
         13 => &THIRTEEN,
@@ -399,6 +406,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
         25 => &TWENTY_FIVE,
         26 => &TWENTY_SIX,
         27 => &TWENTY_SEVEN,
+        28 => &TWENTY_EIGHT,
         _ => return Err(format!("unsupported published registry layout {version}")),
     };
     published
@@ -896,6 +904,8 @@ mod tests {
             (24, "DROP TABLE console_relaunches;"),
             (25, "DROP TABLE session_channels;"),
             (26, "DROP TABLE terminal_pane_bindings;"),
+            (28, "DROP TABLE pane_chat_starts;"),
+            (28, "DROP TABLE pane_chat_allocations;"),
             (22, "DROP TABLE automation_retired_manual_requests;"),
             (22, "DROP INDEX automation_removed_history;"),
             (22, "DROP INDEX automation_firing_successors;"),
@@ -1335,8 +1345,8 @@ mod tests {
             );
             // This current opener also applies retention20, run-attention21,
             // history22, the empty console recovery ledger24, session
-            // channel history25 and source bindings26, and schema 27 drops
-            // channel work.
+            // channel history25 and source bindings26, schema 27 drops
+            // channel work, and schema 28 adds private pane chat ownership.
             // Admit only those known objects here; every predecessor object
             // and the exact lifecycle outbox assertion stay intact.
             let retention_names = [
@@ -1351,6 +1361,8 @@ mod tests {
                 "console_relaunches",
                 "session_channels",
                 "terminal_pane_bindings",
+                "pane_chat_starts",
+                "pane_chat_allocations",
             ];
             for name in retention_names {
                 let index = inventory
@@ -1368,6 +1380,8 @@ mod tests {
                 "console_relaunches",
                 "session_channels",
                 "terminal_pane_bindings",
+                "pane_chat_starts",
+                "pane_chat_allocations",
             ] {
                 assert_eq!(
                     registry
@@ -1394,7 +1408,7 @@ mod tests {
             firing.3.drain(start..start + column.len());
             assert_eq!(
                 inventory, old_layout,
-                "only lifecycle/run outboxes, retention objects, source bindings, the console ledger and the exact history column may be added, and only channel work removed"
+                "only lifecycle/run outboxes, retention objects, source bindings, the console ledger, pane chat ownership and the exact history column may be added, and only channel work removed"
             );
             assert!(
                 registry
@@ -1726,7 +1740,7 @@ mod tests {
         let _clear = Clear;
         for step in [
             1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
-            26, 27,
+            26, 27, 28,
         ] {
             let dir = fixture_dir();
             let path = dir.path().join("rollback.sqlite3");

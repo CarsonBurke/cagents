@@ -9804,7 +9804,7 @@ impl Cagents {
         if self.chat_awaiting_admission(card) {
             return Task::none();
         }
-        self.start_chat_with_upgrade(card, session, intent, source, terminate_source, None)
+        self.start_chat_with_upgrade(card, session, intent, source, terminate_source, None, None)
     }
 
     pub(in crate::app) fn start_shared_chat_upgrade(
@@ -9820,6 +9820,7 @@ impl Cagents {
             None,
             false,
             Some(canonical),
+            None,
         )
     }
 
@@ -9831,6 +9832,7 @@ impl Cagents {
         source: Option<HostSessionProof>,
         terminate_source: bool,
         upgrade_admission: Option<chat::Session>,
+        pane_start: Option<crate::terminal_ipc::PaneChatStart>,
     ) -> Task<Message> {
         // A fenced pane's saved session is unconfirmed: reconnecting or
         // resuming it could act for an agent that is no longer this pane's.
@@ -9893,14 +9895,17 @@ impl Cagents {
                             Some(canonical) => ClientHandle::connect_upgrade_with_intent(
                                 session, canonical, intent, wake,
                             ),
-                            None => ClientHandle::connect(
-                                session,
-                                intent,
-                                source,
-                                terminate_source,
-                                selection,
-                                wake,
-                            ),
+                            None => match pane_start {
+                                Some(pane) => ClientHandle::connect_in_pane(pane, session, wake),
+                                None => ClientHandle::connect(
+                                    session,
+                                    intent,
+                                    source,
+                                    terminate_source,
+                                    selection,
+                                    wake,
+                                ),
+                            },
                         }
                         .map(|handle| {
                             // Background restorations must not queue full bodies
@@ -10444,12 +10449,21 @@ impl Cagents {
         // Only the accepted checkpoint authorizes B's public projection and
         // the first provider handshake. No fallback or first prompt precedes it.
         self.commit_chat_session(target.card, pending.candidate.clone());
-        self.start_chat(
+        let pane_start = Some(crate::terminal_ipc::PaneChatStart {
+            registry: pending.registry,
+            card: target.card,
+            source: pending.source,
+            allow_local: pending.scope.is_none()
+                || self.durable.local_only_cards.contains(&target.card),
+        });
+        self.start_chat_with_upgrade(
             target.card,
             pending.candidate,
             chat::Intent::Start,
             None,
             false,
+            None,
+            pane_start,
         )
     }
 
@@ -11622,7 +11636,10 @@ impl Cagents {
                         }
                         return self.retire_chat(target.card, Some(handle), None);
                     }
-                    return Task::none();
+                    // A winning peer may have gained proof while this start
+                    // was pending. Its model edge deferred attachment until
+                    // the losing start answered; finish that catch-up now.
+                    return self.adopt_stored_draft_session(target.card);
                 }
                 self.startup_gate.initial_panes.settled(
                     target.card,

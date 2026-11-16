@@ -22,6 +22,7 @@ pub(super) use owned_listener::{
     Roots as CodexListenerRoots, keep_legacy_listeners_fresh as keep_legacy_codex_listeners_fresh,
 };
 mod paired_close;
+pub(in crate::host) mod pane_start;
 pub(super) mod retained_actor;
 #[cfg(test)]
 mod retained_actor_tests;
@@ -903,6 +904,7 @@ fn start(
         execution_environment,
         None,
         None,
+        None,
     )
 }
 
@@ -921,6 +923,7 @@ pub(super) fn start_execution(
         None,
         Default::default(),
         Some(context),
+        None,
         None,
     )
 }
@@ -1967,6 +1970,7 @@ fn start_with_execution(
     execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
     execution: Option<Arc<chat::protocol::ExecutionContext>>,
     restart_launch: Option<&chat::Launch>,
+    pane: Option<crate::terminal_ipc::PaneChatStart>,
 ) -> Result<ServerResponse, ProtocolError> {
     if crate::upgrade::floor::load()
         .map_err(unavailable)?
@@ -2015,6 +2019,13 @@ fn start_with_execution(
     // Reserve before provider/account initialization. Pending owners recovered above
     // use their own exact reservation through restore.
     let mut admission = capacity::Reservation::new_with_source(host, &session, source.as_ref())?;
+    if pane.is_none() {
+        pane_start::validate_known_allocation(host, &session)?;
+    }
+    let _pane_start = pane
+        .as_ref()
+        .map(|pane| pane_start::Reservation::new(host, pane, &session))
+        .transpose()?;
     let reservation_id = session.id;
     super::account_lifecycle::ensure_launch(
         host,
@@ -3950,6 +3961,22 @@ fn process_inner(
             );
             Ok(ServerResponse::ChatListed { sessions })
         }
+        ClientRequest::ChatStartInPane {
+            pane,
+            session,
+            execution_environment,
+        } => start_with_execution(
+            host,
+            client,
+            client_session(host, session),
+            None,
+            false,
+            None,
+            execution_environment,
+            None,
+            None,
+            Some(pane),
+        ),
         ClientRequest::ChatStart {
             session,
             source,
@@ -5035,6 +5062,7 @@ pub(super) fn restore_upgrade(
         Default::default(),
         None,
         restart_launch,
+        None,
     )
     .map_err(|error| error.message)?;
     let id = match response {

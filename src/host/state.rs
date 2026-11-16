@@ -19,7 +19,7 @@ use std::{
 
 use crate::{
     model::{
-        HostSessionProof, TerminalContinuity, TerminalExit, TerminalId, TerminalSession,
+        CardId, HostSessionProof, TerminalContinuity, TerminalExit, TerminalId, TerminalSession,
         TranscriptMetadata,
     },
     terminal::{RenderSnapshot, TerminalConfig, TerminalEvent, TerminalHandle, TerminalSendError},
@@ -370,6 +370,7 @@ pub(crate) struct HostState {
     pub(super) chat_spawning: BTreeMap<TerminalId, crate::chat::Session>,
     /// Subset of transition reservations that retire an exact original source.
     pub(super) chat_close_reservations: BTreeMap<TerminalId, crate::chat::Session>,
+    pub(super) pane_chat_starts: BTreeMap<CardId, super::chat::pane_start::Claim>,
     /// Private inventory exclusions for exact historical cleanup reservations.
     pub(super) historical_chat_retirements: BTreeMap<TerminalId, crate::chat::Session>,
     pub(super) chat_bindings: BTreeMap<TerminalId, super::chat::PendingBinding>,
@@ -509,6 +510,7 @@ impl HostState {
             chat_handoffs: BTreeMap::new(),
             chat_spawning: BTreeMap::new(),
             chat_close_reservations: BTreeMap::new(),
+            pane_chat_starts: BTreeMap::new(),
             historical_chat_retirements: BTreeMap::new(),
             chat_bindings: BTreeMap::new(),
             native_closing: BTreeMap::new(),
@@ -1457,6 +1459,21 @@ impl HostState {
                 .is_some_and(|record| !record.handle.is_completed())
             || self.chat_spawning.contains_key(id)
             || self.chat_handoffs.contains_key(id)
+    }
+
+    /// Whether anything in this daemon still holds conversation `id`'s
+    /// provider: a record owning work or returning to its terminal, a start,
+    /// handoff or native startup in flight, or a close or retirement under
+    /// way. A pane's first-send owner is kept while any of these does.
+    pub(super) fn holds_chat_work(&self, id: &TerminalId) -> bool {
+        self.chats
+            .get(id)
+            .is_some_and(|record| record.handle.owns_work() || record.returning_terminal)
+            || self.chat_spawning.contains_key(id)
+            || self.chat_handoffs.contains_key(id)
+            || self.native_actor_startups.contains_key(id)
+            || self.native_closing.contains_key(id)
+            || self.historical_chat_retirements.contains_key(id)
     }
 
     pub(crate) fn cancel_spawn(&mut self, terminal_id: TerminalId) {
