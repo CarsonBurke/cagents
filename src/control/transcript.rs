@@ -29,9 +29,39 @@ pub struct TranscriptArgs {
     /// Show messages and tool output whole, instead of clipped.
     #[arg(long)]
     full: bool,
+    #[arg(long, value_name = "FIELDS", value_delimiter = ',', help = super::fields::HELP,
+        value_parser = clap::builder::PossibleValuesParser::new(FIELDS))]
+    fields: Vec<String>,
 }
 
+impl TranscriptArgs {
+    pub(super) fn selects_fields(&self) -> bool {
+        !self.fields.is_empty()
+    }
+}
+
+/// The fields `--json` reports for an entry, which `--fields` selects from.
+const FIELDS: &[&str] = &[
+    "id",
+    "at",
+    "kind",
+    "from",
+    "summary",
+    "name",
+    "status",
+    "text",
+    "omitted",
+    "commentary",
+    "output",
+    "output_omitted",
+    "calls",
+    "failed",
+    "edited",
+    "more_edited",
+];
+
 pub(super) fn read(arguments: TranscriptArgs) -> Result<CommandOutput, AppError> {
+    let selected = arguments.fields;
     let query = Query {
         session: arguments.session,
         before: arguments.before,
@@ -60,9 +90,88 @@ pub(super) fn read(arguments: TranscriptArgs) -> Result<CommandOutput, AppError>
     let human = human(&page, &query, &format::program(), sessions::now_ms());
     Ok(CommandOutput {
         command: "transcript",
-        data: json!(page),
+        data: page_json(&page, &selected),
         human,
     })
+}
+
+/// The page as `--json` reports it: the session as a listing's row, with
+/// its account, each entry as a compact row, oldest first, and `earlier`,
+/// the cursor of the page before, when there is one. Entries are named by
+/// their cursor, which `--before` takes. With `selected` fields, only the
+/// entries, with only those fields.
+fn page_json(page: &Page, selected: &[String]) -> Value {
+    let entries = page.entries.iter().map(entry_json).collect();
+    if !selected.is_empty() {
+        return json!({ "entries": super::fields::select(entries, selected) });
+    }
+    let mut data = json!({
+        "session": sessions::session_row(&page.session, None),
+        "entries": entries,
+    });
+    let accounts = sessions::accounts_json(vec![&page.session]);
+    if !accounts.is_empty() {
+        data["accounts"] = Value::Object(accounts);
+    }
+    if let Some(earlier) = &page.earlier {
+        data["earlier"] = json!(cursor(earlier));
+    }
+    data
+}
+
+/// One entry as a compact row: its `kind` (user, assistant, message,
+/// report, notice, tool or tools) and what that kind carries. `omitted`
+/// counts the bytes clipped from `text`.
+fn entry_json(entry: &Entry) -> Value {
+    use super::fields::{Row, word};
+    let row = Row::new().put("id", cursor(&entry.id)).put("at", entry.at);
+    let text = |row: Row, text: &Text| {
+        row.put("text", &text.text)
+            .count("omitted", text.omitted as u64)
+    };
+    match &entry.content {
+        Content::User(body) => text(row.put("kind", "user"), body),
+        Content::Assistant {
+            text: body,
+            commentary,
+        } => text(row.put("kind", "assistant"), body).put("commentary", commentary),
+        Content::Delivery {
+            kind,
+            from,
+            summary,
+            body,
+        } => text(
+            row.put("kind", word(kind))
+                .put("from", from)
+                .put("summary", summary),
+            body,
+        ),
+        Content::Tool(tool) => row
+            .put("kind", "tool")
+            .put("name", &tool.name)
+            .put("summary", &tool.summary)
+            .put("status", word(tool.status))
+            .put("output", tool.output.as_ref().map(|output| &output.text))
+            .count(
+                "output_omitted",
+                tool.output
+                    .as_ref()
+                    .map_or(0, |output| output.omitted as u64),
+            ),
+        Content::Tools(run) => row
+            .put("kind", "tools")
+            .put(
+                "calls",
+                run.calls
+                    .iter()
+                    .map(|call| (call.name.clone(), json!(call.count)))
+                    .collect::<serde_json::Map<_, _>>(),
+            )
+            .count("failed", run.failed)
+            .put("edited", &run.edited)
+            .count("more_edited", run.more_edited),
+    }
+    .into_value()
 }
 
 /// The page oldest first, as a conversation reads, under a line naming the
@@ -404,6 +513,69 @@ mod tests {
                 .starts_with("Session 00000000-0 (codex"),
             "{}",
             human(&page, &query("00000000-"), "cagents", 120_000)
+        );
+    }
+
+    #[test]
+    fn page_json_names_entries_by_cursor_and_states_only_what_they_carry() {
+        let page = Page {
+            session: session(),
+            entries: vec![
+                entry("u1", Content::User(text("Fix the build", 0))),
+                entry(
+                    "r1",
+                    Content::Tools(ToolRun {
+                        calls: vec![ToolCount {
+                            name: "Run".into(),
+                            count: 12,
+                        }],
+                        failed: 0,
+                        edited: vec![],
+                        more_edited: 0,
+                    }),
+                ),
+                entry(
+                    "a1",
+                    Content::Assistant {
+                        text: text("Done", 40),
+                        commentary: false,
+                    },
+                ),
+                entry(
+                    "n1",
+                    Content::Delivery {
+                        kind: DeliveryKind::Notice,
+                        from: String::new(),
+                        summary: "Context compacted".into(),
+                        body: Text::default(),
+                    },
+                ),
+            ],
+            earlier: Some("u0".into()),
+        };
+        assert_eq!(
+            page_json(&page, &[]),
+            json!({
+                "session": {
+                    "id": "00000000-0000-4000-8000-000000000001",
+                    "provider": "codex",
+                    "state": "exited",
+                    "title": "fix\u{1b}[31m build",
+                    "failure": "You've hit your usage limit",
+                    "active_at": 60_000,
+                },
+                "entries": [
+                    {"id": cursor("u1"), "kind": "user", "text": "Fix the build"},
+                    {"id": cursor("r1"), "kind": "tools", "calls": {"Run": 12}},
+                    {"id": cursor("a1"), "kind": "assistant", "text": "Done", "omitted": 40},
+                    {"id": cursor("n1"), "kind": "notice", "summary": "Context compacted"},
+                ],
+                "earlier": cursor("u0"),
+            })
+        );
+        assert_eq!(
+            page_json(&page, &["kind".into(), "text".into()])["entries"][2],
+            json!({"kind": "assistant", "text": "Done"})
         );
     }
 

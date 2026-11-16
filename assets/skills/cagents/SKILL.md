@@ -3,7 +3,7 @@ name: cagents
 description: Use when working through the cagents CLI, for separate agent sessions, messaging other sessions, or Linear tickets.
 ---
 
-- `cagents <command> --help` is the reference. Use `--json` when you will parse the output.
+- `cagents <command> --help` is the reference. Use `--json` when you will parse the output; on `ls`, `whoami`, `transcript`, `work` and `agent list`, `--fields id,state` returns only the fields you name, as JSON.
 - Your own subagents are usually the better choice for work that belongs to this conversation. A cagents session is for another provider, another project, or work the user should be able to watch, take over, or have outlive you.
 - `cagents whoami` and `cagents ls` show who else is working in the checkout. Message them rather than editing around them or guessing what they are doing.
 - Listings show session, agent and run IDs by their shortest unique prefix, which `send`, `transcript` and `agent` accept. A `hint: …` line names the commands that usually come next: last in a listing, and for a run waiting for input or one that failed or stopped, before its result (after them all for several runs).

@@ -30,6 +30,7 @@ mod chat;
 #[cfg(test)]
 mod project_channel_authority_tests;
 pub use chat::ChatCommand;
+mod fields;
 mod format;
 mod gh;
 pub use agents::{AgentCommand, PlacedIn};
@@ -183,6 +184,26 @@ fn note_global_options(command: clap::Command) -> clap::Command {
         .mut_subcommands(note_global_options)
 }
 
+impl TopCommand {
+    /// Whether this is a listing given `--fields`.
+    fn selects_fields(&self) -> bool {
+        match self {
+            Self::Sessions(arguments) => arguments.selects_fields(),
+            Self::Whoami(fields) => fields.selected(),
+            Self::Transcript(arguments) => arguments.selects_fields(),
+            Self::Agent {
+                command: AgentCommand::List { fields },
+            } => !fields.is_empty(),
+            Self::Work { command, list } => match command {
+                Some(WorkCommand::List(list)) => list.selects_fields(),
+                Some(_) => false,
+                None => list.selects_fields(),
+            },
+            _ => false,
+        }
+    }
+}
+
 impl Cli {
     /// What the grammar alone cannot refuse. `work`'s list options sit beside
     /// its subcommands so `cagents work` lists, but mean nothing to one.
@@ -225,7 +246,7 @@ pub enum TopCommand {
     },
     /// Show this session and the sessions related to it.
     #[command(after_help = "Lists its parent and agents, and peers in its channel or checkout.")]
-    Whoami,
+    Whoami(sessions::FieldsArgs),
     /// Inspect account plan allowances and the calling session’s context.
     Account {
         #[command(subcommand)]
@@ -3064,7 +3085,7 @@ where
         emit_error(wants_json, &AppError::new("daemon_startup", error));
         return ExitCode::FAILURE;
     }
-    let cli = match Cli::try_parse_from(arguments.clone()).and_then(Cli::validated) {
+    let mut cli = match Cli::try_parse_from(arguments.clone()).and_then(Cli::validated) {
         Ok(cli) => cli,
         Err(error)
             if matches!(
@@ -3080,6 +3101,8 @@ where
             return ExitCode::from(2);
         }
     };
+    // As with `gh --json FIELDS`, naming the fields asks for JSON.
+    cli.global.json |= cli.command.selects_fields();
 
     // Grammar-only output must work without device selection, installer routing,
     // daemon startup, or a reachable backend.
@@ -3440,7 +3463,7 @@ fn staged_command_requires_daemon(command: &TopCommand) -> bool {
         | TopCommand::Work { .. }
         | TopCommand::Account { .. }
         | TopCommand::Chat { .. }
-        | TopCommand::Whoami
+        | TopCommand::Whoami(_)
         | TopCommand::Sessions(_)
         | TopCommand::Transcript(_)
         | TopCommand::Send(_)
@@ -3545,7 +3568,7 @@ fn execute_with_model_context(
             Some(context) => agents::execute_with_context(command, &context),
             None => agents::execute(command),
         },
-        TopCommand::Whoami => sessions::whoami(),
+        TopCommand::Whoami(arguments) => sessions::whoami(arguments),
         TopCommand::Account { command } => accounts::execute(command),
         TopCommand::Chat { command } => chat::execute(command),
         TopCommand::Sessions(arguments) => sessions::list(arguments),

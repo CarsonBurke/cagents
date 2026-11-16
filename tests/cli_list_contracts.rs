@@ -367,6 +367,11 @@ impl Listing {
 }
 
 fn output(listing: Listing, populated: bool, json: bool) -> String {
+    output_with(listing, populated, json, &[])
+}
+
+/// [`output`], with `extra` arguments after the listing's own.
+fn output_with(listing: Listing, populated: bool, json: bool, extra: &[&str]) -> String {
     let root = tempfile::tempdir().unwrap();
     let runtime = root.path().join("run");
     fs::create_dir(&runtime).unwrap();
@@ -475,6 +480,7 @@ fn output(listing: Listing, populated: bool, json: bool) -> String {
     let mut command = CommandSpec::new(executable)
         .args(["--device", "local"])
         .args(listing.arguments().iter().copied())
+        .args(extra.iter().copied())
         .env("HOME", root.path())
         .env("XDG_RUNTIME_DIR", &runtime)
         .env("XDG_CONFIG_HOME", root.path().join("config"))
@@ -954,6 +960,38 @@ fn agent_list_names_its_project_and_the_next_step() {
 }
 
 #[test]
+fn agent_list_fields_select_from_a_compact_row() {
+    let value: serde_json::Value = serde_json::from_str(&output_with(
+        Listing::Agents,
+        true,
+        false,
+        &["--fields", "name,state,project,provider"],
+    ))
+    .unwrap();
+    assert_eq!(value["command"], "agent.list");
+    let agents = value["data"]["agents"].as_array().unwrap();
+    assert!(!agents.is_empty());
+    for agent in agents {
+        let keys: Vec<&str> = agent
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert!(
+            keys.iter()
+                .all(|key| ["name", "state", "project", "provider"].contains(key)),
+            "{agent}"
+        );
+        assert_eq!(agent["project"], "Fixture", "{agent}");
+    }
+    // Without fields, `--json` keeps each agent's whole record.
+    let full: serde_json::Value =
+        serde_json::from_str(&output(Listing::Agents, true, true)).unwrap();
+    assert!(full["data"]["agents"][0]["agent"]["spec"].is_object());
+}
+
+#[test]
 fn work_alone_lists_the_board_in_its_json_envelope() {
     let human = output(Listing::Work, true, false);
     // One project's cards name it once, with the checkout their worktrees
@@ -968,14 +1006,79 @@ fn work_alone_lists_the_board_in_its_json_envelope() {
         serde_json::from_str(&output(Listing::Work, true, true)).unwrap();
     assert_eq!(value["ok"], true);
     assert_eq!(value["command"], "work.list");
+    // Each project is described once and each card is a compact row: the
+    // project's base is not repeated, and facts a card lacks are left out.
     assert_eq!(
-        value["data"]["board"]["items"][0]["branch"],
-        "fixture/branch"
+        value["data"],
+        serde_json::json!({
+            // The scope says what the board covers: here every project, since
+            // none of them contains this directory.
+            "scope": "All",
+            "projects": [{
+                "name": "Fixture",
+                "root": "/fixture",
+                "base": "origin/main",
+                "forge": "not_github"
+            }],
+            "stale_after_days": 7,
+            "cards": [{
+                "card": "fixture/branch",
+                "project": "Fixture",
+                "column": "in_progress",
+                "worktree": "/fixture/.worktrees/branch",
+                "ahead": 2
+            }]
+        })
     );
-    // The scope says what the board covers: here every project, since none
-    // of them contains this directory.
-    assert_eq!(value["data"]["scope"], "All");
-    assert!(value["data"].get("omitted").is_none());
+    // Naming fields asks for JSON and keeps only them.
+    let selected: serde_json::Value = serde_json::from_str(&output_with(
+        Listing::Work,
+        true,
+        false,
+        &["--fields", "column,card"],
+    ))
+    .unwrap();
+    assert_eq!(
+        selected["data"],
+        serde_json::json!({"cards": [{"column": "in_progress", "card": "fixture/branch"}]})
+    );
+}
+
+#[test]
+fn session_listings_report_compact_rows_and_selected_fields() {
+    let value: serde_json::Value =
+        serde_json::from_str(&output(Listing::Sessions, true, true)).unwrap();
+    assert_eq!(value["command"], "sessions");
+    // The checkout is the directory, the project its name, and nothing
+    // unknown or default is spelled out.
+    assert_eq!(
+        value["data"],
+        serde_json::json!({
+            "scope": "All",
+            "sessions": [{
+                "id": "00000000-0000-4000-8000-000000000001",
+                "provider": "claude",
+                "state": "working",
+                "title": "Fixture session",
+                "project": "Fixture",
+                "directory": "/fixture"
+            }]
+        })
+    );
+    let selected: serde_json::Value = serde_json::from_str(&output_with(
+        Listing::Sessions,
+        true,
+        false,
+        &["--fields", "id,state"],
+    ))
+    .unwrap();
+    assert_eq!(
+        selected["data"],
+        serde_json::json!({"sessions": [{
+            "id": "00000000-0000-4000-8000-000000000001",
+            "state": "working"
+        }]})
+    );
 }
 
 #[test]

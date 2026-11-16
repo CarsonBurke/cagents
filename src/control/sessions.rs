@@ -1,7 +1,11 @@
+use super::fields::{self, Row as Fields};
 use super::*;
 use crate::agent_execution::{
     Authority, Operation, Reply,
-    directory::{Entry, Member, Members, Relation, Scope, SessionAccount, Sessions, UsageLimit},
+    directory::{
+        Entry, Member, Members, Owner, Relation, Scope, SessionAccount, Sessions, Surface,
+        UsageLimit,
+    },
 };
 use crate::model::ChannelId;
 
@@ -18,20 +22,43 @@ pub struct SessionsArgs {
     /// with how recently each was active. Includes chats whose provider exited.
     #[arg(long, value_name = "CHANNEL", num_args = 0..=1, default_missing_value = "")]
     channel: Option<String>,
+    #[command(flatten)]
+    fields: FieldsArgs,
+}
+
+impl SessionsArgs {
+    pub(super) fn selects_fields(&self) -> bool {
+        self.fields.selected()
+    }
+}
+
+/// `--fields` on a listing of sessions.
+#[derive(Debug, Clone, Default, PartialEq, Eq, clap::Args)]
+pub struct FieldsArgs {
+    #[arg(long, value_name = "FIELDS", value_delimiter = ',', help = fields::HELP,
+        value_parser = clap::builder::PossibleValuesParser::new(FIELDS))]
+    pub(super) fields: Vec<String>,
+}
+
+impl FieldsArgs {
+    pub(super) fn selected(&self) -> bool {
+        !self.fields.is_empty()
+    }
 }
 
 /// Who is calling, and which other sessions share its channel or checkout.
-pub(super) fn whoami() -> Result<CommandOutput, AppError> {
+pub(super) fn whoami(arguments: FieldsArgs) -> Result<CommandOutput, AppError> {
     let directory = read(Scope::Containing(current_directory()?))?;
     let peers = related(&directory);
     Ok(CommandOutput {
         command: "whoami",
         human: whoami_human(&directory, &peers, &super::format::program(), now_ms()),
-        data: json!({
-            "me": directory.caller.as_ref().map(session_json),
-            "scope": directory.scope,
-            "sessions": peers.into_iter().map(session_json).collect::<Vec<_>>(),
-        }),
+        data: listing_json(
+            json!({ "scope": directory.scope }),
+            directory.caller.iter().chain(peers.iter().copied()),
+            None,
+            &arguments.fields,
+        ),
     })
 }
 
@@ -117,7 +144,7 @@ pub(super) fn list(arguments: SessionsArgs) -> Result<CommandOutput, AppError> {
                     AppError::new("target", format!("{channel} is not a channel UUID"))
                 })?)
             };
-        return members(channel);
+        return members(channel, &arguments.fields.fields);
     }
     let scope = if arguments.all {
         Scope::All
@@ -130,11 +157,12 @@ pub(super) fn list(arguments: SessionsArgs) -> Result<CommandOutput, AppError> {
     Ok(CommandOutput {
         command: "sessions",
         human: sessions_human(&directory, &super::format::program(), now_ms()),
-        data: json!({
-            "me": directory.caller.as_ref().map(session_json),
-            "scope": directory.scope,
-            "sessions": directory.sessions.iter().map(session_json).collect::<Vec<_>>(),
-        }),
+        data: listing_json(
+            json!({ "scope": directory.scope }),
+            directory.caller.iter().chain(&directory.sessions),
+            None,
+            &arguments.fields.fields,
+        ),
     })
 }
 
@@ -174,14 +202,204 @@ pub(super) fn session_json(member: &Member) -> Value {
     value
 }
 
-/// A channel member as `--json` reports it, with its session's `state` as
-/// [`session_json`] names it.
-fn member_json(member: &Member) -> Value {
-    let mut value = json!(member);
-    if member.limit.is_some() {
-        value["session"]["state"] = json!("Limited");
+/// The fields `--json` reports for a listed session, which `--fields`
+/// selects from.
+pub(super) const FIELDS: &[&str] = &[
+    "id",
+    "relation",
+    "provider",
+    "surface",
+    "state",
+    "title",
+    "project",
+    "directory",
+    "worktree",
+    "worktree_view",
+    "channel",
+    "channel_repository",
+    "lineage",
+    "lineage_channel",
+    "agent",
+    "owner",
+    "run",
+    "run_state",
+    "account",
+    "limit",
+    "failure",
+    "active_at",
+];
+
+/// A listing of `members` as `--json` reports it: `data`, which names the
+/// listing's scope, with a row for each member, the caller first, and each
+/// account they run on once, with what is left of it. `channel` is the
+/// one the listing names, which its rows then leave out. With `selected`
+/// fields, only the rows, with only those fields.
+pub(super) fn listing_json<'a>(
+    mut data: Value,
+    members: impl IntoIterator<Item = &'a Member>,
+    channel: Option<ChannelId>,
+    selected: &[String],
+) -> Value {
+    let members: Vec<&Member> = members.into_iter().collect();
+    let rows = members
+        .iter()
+        .map(|member| session_row(member, channel))
+        .collect();
+    if !selected.is_empty() {
+        return json!({ "sessions": fields::select(rows, selected) });
     }
-    value
+    data["sessions"] = Value::Array(rows);
+    let accounts = accounts_json(members);
+    if !accounts.is_empty() {
+        data["accounts"] = Value::Object(accounts);
+    }
+    data
+}
+
+/// A listed session as `--json` reports it, with only the facts it has.
+/// The caller's `relation` is `me`. `state` is the one a listing shows:
+/// `exited` or `limited` outrank the provider's last activity. `project`
+/// is the open project's name, `worktree` the checkout containing
+/// `directory` where that is not `directory` itself, and `account` the ID
+/// the listing's `accounts` describe. `channel` is left out where the
+/// listing names it, and `lineage` where it is the session's own ID.
+pub(super) fn session_row(member: &Member, channel: Option<ChannelId>) -> Value {
+    let entry = &member.session;
+    let delegation = entry.delegation.as_ref();
+    let relation = match entry.relation {
+        Relation::Myself => Some("me"),
+        Relation::Parent => Some("parent"),
+        Relation::Child => Some("child"),
+        Relation::Peer => None,
+    };
+    let worktree_view = match &entry.view_scope {
+        Some(crate::agent_execution::Placement::Worktree { path, .. }) => Some(path),
+        _ => None,
+    };
+    // An agent the caller owns needs no owner named.
+    let owner = delegation
+        .filter(|_| entry.relation != Relation::Child)
+        .map(|delegation| match &delegation.owner {
+            Owner::User => json!("user"),
+            Owner::Session(lineage) => json!(lineage),
+            Owner::Automation(id) => json!({ "automation": id }),
+        });
+    Fields::new()
+        .put("id", entry.id)
+        .put("relation", relation)
+        .put(
+            "provider",
+            entry.provider.map(|provider| provider.executable()),
+        )
+        .put(
+            "surface",
+            (entry.surface == Surface::Terminal).then_some("terminal"),
+        )
+        .put("state", member.state_label())
+        .put("title", &entry.title)
+        .put("project", &entry.project_name)
+        .put("directory", &entry.directory)
+        .put(
+            "worktree",
+            entry
+                .worktree
+                .as_ref()
+                .filter(|worktree| entry.directory.as_ref() != Some(*worktree)),
+        )
+        .put("worktree_view", worktree_view)
+        .put("channel", entry.channel.filter(|id| Some(*id) != channel))
+        .put(
+            "channel_repository",
+            entry
+                .channel_repository
+                .as_ref()
+                .filter(|repository| entry.project.as_ref() != Some(*repository)),
+        )
+        .put(
+            "lineage",
+            (entry.lineage.0 != entry.id).then_some(entry.lineage),
+        )
+        .put(
+            "lineage_channel",
+            entry.lineage_channel.as_ref().map(|home| {
+                Fields::new()
+                    .put("id", home.id)
+                    .put(
+                        "repository",
+                        (entry.project.as_ref() != Some(&home.repository))
+                            .then_some(&home.repository),
+                    )
+                    .into_value()
+            }),
+        )
+        .put("agent", delegation.map(|delegation| delegation.agent))
+        .put("owner", owner)
+        .put("run", delegation.and_then(|delegation| delegation.run))
+        .put(
+            "run_state",
+            delegation
+                .and_then(|delegation| delegation.run_state)
+                .map(fields::word),
+        )
+        .put(
+            "account",
+            member.account.as_ref().map(|account| &account.id),
+        )
+        .put(
+            "limit",
+            member.limit.as_ref().map(|limit| {
+                Fields::new()
+                    .put("summary", &limit.summary)
+                    .put("reset", &limit.reset)
+                    .put("resets_at", limit.resets_at)
+                    .into_value()
+            }),
+        )
+        .put("failure", &member.failure)
+        .put("active_at", member.active_at)
+        .into_value()
+}
+
+/// Each account `members` run on, once, by its ID: its label, how it
+/// stands, and what each of its windows has left as a whole percentage,
+/// with when it resets in Unix seconds. `stale` marks a reading too old to
+/// plan on.
+pub(super) fn accounts_json(members: Vec<&Member>) -> serde_json::Map<String, Value> {
+    let mut accounts = serde_json::Map::new();
+    for account in members
+        .into_iter()
+        .filter_map(|member| member.account.as_ref())
+    {
+        if accounts.contains_key(account.id.as_str()) {
+            continue;
+        }
+        let windows: Vec<Value> = account
+            .remaining
+            .iter()
+            .map(|window| {
+                Fields::new()
+                    .put("window", &window.window.label)
+                    .put("left_percent", fields::percent(window.remaining_fraction))
+                    .put("resets_at", window.window.resets_at)
+                    .put("binding", window.window.binding)
+                    .put("reset", window.reset_elapsed)
+                    .into_value()
+            })
+            .collect();
+        // An account nothing is known of yet still gets an entry, so every
+        // row's `account` names one.
+        accounts.insert(
+            account.id.as_str().to_owned(),
+            Fields::new()
+                .put("label", &account.label)
+                .put("status", account.status.map(fields::word))
+                .put("windows", windows)
+                .put("stale", account.stale)
+                .put("ordinary_usage_allowed", account.ordinary_usage_allowed)
+                .into_value(),
+        );
+    }
+    accounts
 }
 
 /// A usage limit in a phrase: "Claude weekly limit reached, resets in 9 hr".
@@ -249,8 +467,8 @@ fn allowance(account: &SessionAccount, now: u64) -> (String, Option<String>) {
         );
     };
     let left = format!(
-        "{:.0}% of {}",
-        (window.remaining_fraction * 100.0).floor(),
+        "{}% of {}",
+        fields::percent(window.remaining_fraction),
         window.window.label
     );
     let resets = window
@@ -262,7 +480,7 @@ fn allowance(account: &SessionAccount, now: u64) -> (String, Option<String>) {
 }
 
 /// Everyone in a channel, with how recently each worked and how it ended.
-fn members(channel: Option<ChannelId>) -> Result<CommandOutput, AppError> {
+fn members(channel: Option<ChannelId>, selected: &[String]) -> Result<CommandOutput, AppError> {
     let members = request(Operation::Members(channel), |reply| match reply {
         Reply::Members(members) => Some(members),
         _ => None,
@@ -275,11 +493,12 @@ fn members(channel: Option<ChannelId>) -> Result<CommandOutput, AppError> {
     } = &members;
     Ok(CommandOutput {
         command: "sessions",
-        data: json!({
-            "channel": channel,
-            "me": caller.as_ref().map(member_json),
-            "sessions": sessions.iter().map(member_json).collect::<Vec<_>>(),
-        }),
+        data: listing_json(
+            json!({ "channel": channel }),
+            caller.iter().chain(sessions),
+            Some(*channel),
+            selected,
+        ),
         human,
     })
 }
@@ -732,9 +951,98 @@ mod tests {
                 .is_none()
         );
         let sessions = decoded.into_sessions();
+        // Its repository is the session's project, so it is not repeated.
         assert_eq!(
-            session_json(sessions.caller.as_ref().unwrap())["lineage_channel"],
-            json!(home)
+            session_row(sessions.caller.as_ref().unwrap(), None)["lineage_channel"],
+            json!({ "id": home.id })
+        );
+    }
+
+    #[test]
+    fn listing_json_states_each_fact_once() {
+        let mut first = live(entry());
+        first.account = Some(account(0.74, false));
+        first.limit = Some(UsageLimit {
+            summary: "Claude weekly limit reached".into(),
+            reset: None,
+            resets_at: Some(3 * 3600),
+        });
+        let mut second = live(Entry {
+            id: "00000000-0000-4000-8000-000000000005".parse().unwrap(),
+            lineage: Lineage("00000000-0000-4000-8000-000000000005".parse().unwrap()),
+            relation: Relation::Peer,
+            directory: Some("/fixture/linked/src".into()),
+            view_scope: None,
+            channel: Some(ChannelId::new()),
+            channel_repository: Some("/fixture/.git".into()),
+            title: None,
+            ..entry()
+        });
+        second.account = first.account.clone();
+        second.exited = true;
+        second.active_at = Some(60_000);
+        let data = listing_json(json!({ "scope": "All" }), [&first, &second], None, &[]);
+        assert_eq!(
+            data,
+            json!({
+                "scope": "All",
+                "sessions": [
+                    {
+                        "id": "00000000-0000-4000-8000-000000000001",
+                        "relation": "child",
+                        "provider": "claude",
+                        "state": "limited",
+                        "title": "review\n\u{1b}title",
+                        "project": "Fixture",
+                        "directory": "/fixture/linked",
+                        "worktree_view": "/fixture/linked",
+                        "lineage": "00000000-0000-4000-8000-000000000003",
+                        "agent": "00000000-0000-4000-8000-000000000002",
+                        "run": "00000000-0000-4000-8000-000000000004",
+                        "run_state": "interrupted",
+                        "account": "claude/system",
+                        "limit": {"summary": "Claude weekly limit reached", "resets_at": 3 * 3600},
+                    },
+                    {
+                        "id": "00000000-0000-4000-8000-000000000005",
+                        "provider": "claude",
+                        "state": "exited",
+                        "project": "Fixture",
+                        "directory": "/fixture/linked/src",
+                        "worktree": "/fixture/linked",
+                        "channel": second.session.channel,
+                        "agent": "00000000-0000-4000-8000-000000000002",
+                        "owner": "user",
+                        "run": "00000000-0000-4000-8000-000000000004",
+                        "run_state": "interrupted",
+                        "account": "claude/system",
+                        "active_at": 60_000,
+                    },
+                ],
+                // The account both run on, once, as whole percentages.
+                "accounts": {"claude/system": {
+                    "label": "work",
+                    "status": "warning",
+                    "windows": [{
+                        "window": "Weekly",
+                        "left_percent": 74,
+                        "resets_at": 3 * 3600,
+                        "binding": true,
+                    }],
+                }},
+            })
+        );
+        // Selected fields alone, from every row; one listing a channel
+        // leaves that channel out of its rows.
+        let channel = second.session.channel;
+        assert_eq!(
+            listing_json(
+                json!({}),
+                [&first, &second],
+                channel,
+                &["state".into(), "channel".into()]
+            ),
+            json!({"sessions": [{"state": "limited"}, {"state": "exited"}]})
         );
     }
 
