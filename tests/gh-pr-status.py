@@ -398,6 +398,21 @@ print(json.dumps(dict(reason='compiler-artifact',target=dict(name='cagents',kind
         self.assertEqual(report["limitations"], [])
         self.assertIn("startedAt", saved["snapshot"]["checks"][0], "the cache itself is left as it was")
 
+    def test_the_fallback_and_land_pr_agree_on_which_checks_passed(self):
+        land_loader = importlib.machinery.SourceFileLoader("land_pr", str(ROOT / "scripts/land-pr"))
+        land_spec = importlib.util.spec_from_loader(land_loader.name, land_loader)
+        land = importlib.util.module_from_spec(land_spec)
+        land_loader.exec_module(land)
+        runs = [{"__typename": "CheckRun", "status": status, "conclusion": conclusion}
+                for status in ("COMPLETED", "IN_PROGRESS", "QUEUED")
+                for conclusion in ("SUCCESS", "NEUTRAL", "SKIPPED", "FAILURE", "CANCELLED", "TIMED_OUT", None)]
+        contexts = [{"__typename": "StatusContext", "state": state}
+                    for state in ("SUCCESS", "FAILURE", "ERROR", "PENDING", "EXPECTED")]
+        for check in runs + contexts:
+            with self.subTest(check=check):
+                self.assertEqual(status.check_passed(check), land.passed(check))
+        self.assertEqual(sum(map(status.check_passed, runs + contexts)), 4)
+
     def test_an_account_switch_during_a_cache_hit_discards_the_private_snapshot(self):
         key = status.target("o/r", "github.com", 7)
         first = status.credentials()

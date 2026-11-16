@@ -145,6 +145,12 @@ fn human(report: &pr_status::Report) -> String {
         {
             result.push_str(&format!(" {link}"));
         }
+        if let Some(description) = check["description"]
+            .as_str()
+            .filter(|description| finished && !description.is_empty())
+        {
+            result.push_str(&format!(" ({description})"));
+        }
     }
     result
 }
@@ -195,6 +201,8 @@ mod tests {
             serde_json::json!({"__typename":"CheckRun","name":"Formatting","status":"COMPLETED","conclusion":"SUCCESS"}),
             serde_json::json!({"__typename":"CheckRun","name":"Suites (tooling)","status":"COMPLETED","conclusion":"FAILURE","detailsUrl":link}),
             serde_json::json!({"__typename":"CheckRun","name":"Script contracts","status":"IN_PROGRESS","conclusion":null,"detailsUrl":link}),
+            serde_json::json!({"__typename":"StatusContext","context":"lint","state":"ERROR","targetUrl":link,"description":"Lint crashed"}),
+            serde_json::json!({"__typename":"StatusContext","context":"deploy","state":"PENDING","targetUrl":link,"description":"Waiting"}),
         ];
         let report = pr_status::Report {
             target: key,
@@ -218,7 +226,8 @@ mod tests {
             format!(
                 "github.com/Owner/Repo #7: OPEN\nFix it\nHead: {}\nChecks: FAILURE, 2 passed\n\
                  Review: none reported · Merge: BLOCKED\nhttps://github.com/Owner/Repo/pull/7 (cache, snapshot 5s old)\n  \
-                 FAILURE: Suites (tooling) {link}\n  IN_PROGRESS: Script contracts",
+                 FAILURE: Suites (tooling) {link}\n  IN_PROGRESS: Script contracts\n  \
+                 ERROR: lint {link} (Lint crashed)\n  PENDING: deploy",
                 "a".repeat(40)
             )
         );
