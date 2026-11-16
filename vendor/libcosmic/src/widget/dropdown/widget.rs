@@ -443,6 +443,9 @@ pub struct State {
     selections: Vec<crate::Plain>,
     popup_id: window::Id,
     focused: bool,
+    /// Whether the focus ring shows: focus that arrived from the keyboard,
+    /// or a pointer-focused dropdown the keyboard has since been used on.
+    focus_visible: bool,
     source: Vec<String>,
     selected: Option<usize>,
     selection_metrics: Option<(crate::font::Font, Pixels, text::LineHeight)>,
@@ -467,6 +470,7 @@ impl State {
             close_operation: false,
             open_operation: false,
             focused: false,
+            focus_visible: false,
             source: Vec::new(),
             selected: None,
             selection_metrics: None,
@@ -488,9 +492,11 @@ impl iced_core::widget::operation::Focusable for State {
     }
     fn focus(&mut self) {
         self.focused = true;
+        self.focus_visible = true;
     }
     fn unfocus(&mut self) {
         self.focused = false;
+        self.focus_visible = false;
         if self.is_open.load(Ordering::SeqCst) {
             self.close_operation = true;
             self.source_epoch.fetch_add(1, Ordering::SeqCst);
@@ -753,6 +759,7 @@ pub fn update<
             repeat,
             ..
         }) if state.focused && modifiers.is_empty() && menu::activation_key(key) => {
+            state.focus_visible = true;
             if !repeat && !state.is_open.load(Ordering::SeqCst) {
                 open(shell, state, on_selected);
             }
@@ -764,6 +771,7 @@ pub fn update<
             modifiers,
             ..
         }) if state.focused && modifiers.is_empty() => {
+            state.focus_visible = true;
             if !state.is_open.load(Ordering::SeqCst) {
                 open(shell, state, on_selected);
             }
@@ -779,6 +787,7 @@ pub fn update<
             let is_open = state.is_open.load(Ordering::Relaxed);
             if !cursor.is_over(layout.bounds()) {
                 state.focused = false;
+                state.focus_visible = false;
             }
             if is_open {
                 // Event wasn't processed by overlay, so cursor was clicked either outside it's
@@ -792,6 +801,7 @@ pub fn update<
                 shell.capture_event();
             } else if cursor.is_over(layout.bounds()) {
                 state.focused = !selections.is_empty();
+                state.focus_visible = false;
                 open(shell, state, on_selected);
                 shell.capture_event();
             }
@@ -1002,7 +1012,7 @@ pub fn draw<'a, S>(
         theme.style(&(), pick_list::Status::Active)
     };
 
-    if state.focused {
+    if state.focused && state.focus_visible {
         style.border.width = style.border.width.max(2.0);
         style.border.color = theme.cosmic().accent_color().into();
     }

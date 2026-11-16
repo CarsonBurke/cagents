@@ -220,8 +220,7 @@ struct Overlay<'a, Message> {
     position: Point,
     keyboard: Option<Keyboard>,
     hovered_option: Arc<Mutex<Option<usize>>>,
-    row_height: f32,
-    padding_top: f32,
+    rows: Rows,
 }
 
 impl<'a, Message: Clone + 'a> Overlay<'a, Message> {
@@ -281,9 +280,11 @@ impl<'a, Message: Clone + 'a> Overlay<'a, Message> {
             position,
             keyboard,
             hovered_option,
-            row_height: f32::from(text_line_height.to_absolute(Pixels(text_size.unwrap_or(14.0))))
-                + padding.y(),
-            padding_top: padding.top,
+            rows: Rows {
+                text_size,
+                line_height: text_line_height,
+                padding,
+            },
         }
     }
 
@@ -338,7 +339,8 @@ impl<'a, Message: Clone + 'a> Overlay<'a, Message> {
                 );
             }
         }
-        let top = self.padding_top + index as f32 * self.row_height;
+        let row_height = self.rows.height(renderer);
+        let top = self.rows.padding.top + index as f32 * row_height;
         self.state.with_data_mut(|tree| {
             self.container.operate(
                 tree,
@@ -346,7 +348,7 @@ impl<'a, Message: Clone + 'a> Overlay<'a, Message> {
                 renderer,
                 &mut Reveal {
                     top,
-                    bottom: top + self.row_height,
+                    bottom: top + row_height,
                     requested: keyboard.reveal.swap(false, Ordering::SeqCst),
                     follow_highlight: keyboard.follow_highlight.load(Ordering::SeqCst),
                     viewport_size: &keyboard.viewport_size,
@@ -613,6 +615,37 @@ where
     text_line_height: text::LineHeight,
 }
 
+impl<S: AsRef<str>, Message> List<'_, S, Message>
+where
+    [S]: std::borrow::ToOwned,
+{
+    fn rows(&self) -> Rows {
+        Rows {
+            text_size: self.text_size,
+            line_height: self.text_line_height,
+            padding: self.padding,
+        }
+    }
+}
+
+/// The metrics of an option row. Layout, hit testing, drawing and revealing
+/// the highlighted row must agree on its height.
+#[derive(Clone, Copy)]
+struct Rows {
+    text_size: Option<f32>,
+    line_height: text::LineHeight,
+    padding: Padding,
+}
+
+impl Rows {
+    fn height(self, renderer: &crate::Renderer) -> f32 {
+        let size = self
+            .text_size
+            .unwrap_or_else(|| text::Renderer::default_size(renderer).0);
+        f32::from(self.line_height.to_absolute(Pixels(size))) + self.padding.y()
+    }
+}
+
 impl<S: AsRef<str>, Message> Widget<Message, crate::Theme, crate::Renderer> for List<'_, S, Message>
 where
     [S]: std::borrow::ToOwned,
@@ -631,16 +664,11 @@ where
         use std::f32;
 
         let limits = limits.width(Length::Fill).height(Length::Shrink);
-        let text_size = self
-            .text_size
-            .unwrap_or_else(|| text::Renderer::default_size(renderer).0);
-
-        let text_line_height = self.text_line_height.to_absolute(Pixels(text_size));
 
         let size = {
             let intrinsic = Size::new(
                 0.0,
-                (f32::from(text_line_height) + self.padding.y()) * self.options.len() as f32,
+                self.rows().height(renderer) * self.options.len() as f32,
             );
 
             limits.resolve(Length::Fill, Length::Shrink, intrinsic)
@@ -764,12 +792,7 @@ where
         match event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 if let Some(cursor_position) = cursor.position_in(layout.bounds()) {
-                    let text_size = self
-                        .text_size
-                        .unwrap_or_else(|| text::Renderer::default_size(renderer).0);
-                    let option_height =
-                        f32::from(self.text_line_height.to_absolute(Pixels(text_size)))
-                            + self.padding.y();
+                    let option_height = self.rows().height(renderer);
                     // Keyboard navigation and scrolling can change the row
                     // beneath a stationary pointer without a CursorMoved event.
                     let index = (cursor_position.y / option_height) as usize;
@@ -791,13 +814,7 @@ where
             }
             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
                 if let Some(cursor_position) = cursor.position_in(layout.bounds()) {
-                    let text_size = self
-                        .text_size
-                        .unwrap_or_else(|| text::Renderer::default_size(renderer).0);
-
-                    let option_height =
-                        f32::from(self.text_line_height.to_absolute(Pixels(text_size)))
-                            + self.padding.y();
+                    let option_height = self.rows().height(renderer);
 
                     let new_hovered_option = (cursor_position.y / option_height) as usize;
                     let mut hovered_guard = self.hovered_option.lock().unwrap();
@@ -830,13 +847,7 @@ where
             }
             Event::Touch(touch::Event::FingerPressed { .. }) => {
                 if let Some(cursor_position) = cursor.position_in(layout.bounds()) {
-                    let text_size = self
-                        .text_size
-                        .unwrap_or_else(|| text::Renderer::default_size(renderer).0);
-
-                    let option_height =
-                        f32::from(self.text_line_height.to_absolute(Pixels(text_size)))
-                            + self.padding.y();
+                    let option_height = self.rows().height(renderer);
                     let mut hovered_guard = self.hovered_option.lock().unwrap();
 
                     *hovered_guard = Some((cursor_position.y / option_height) as usize);
@@ -895,8 +906,7 @@ where
         let text_size = self
             .text_size
             .unwrap_or_else(|| text::Renderer::default_size(renderer).0);
-        let option_height =
-            f32::from(self.text_line_height.to_absolute(Pixels(text_size))) + self.padding.y();
+        let option_height = self.rows().height(renderer);
 
         let offset = viewport.y - bounds.y;
         let start = (offset / option_height) as usize;
@@ -914,12 +924,15 @@ where
                 height: option_height,
             };
 
-            let hovered_guard = self.hovered_option.lock().unwrap();
+            // The fill marks the highlighted row, where Enter or a click
+            // lands; the check and accent text mark the current choice, so a
+            // keyboard highlight is never mistaken for the selection.
+            let highlighted = *self.hovered_option.lock().unwrap() == Some(i);
+            let selected = self.selected_option == Some(i);
+            let item_x = bounds.x + appearance.border_width;
+            let item_width = appearance.border_width.mul_add(-2.0, bounds.width);
 
-            let (color, font) = if self.selected_option == Some(i) {
-                let item_x = bounds.x + appearance.border_width;
-                let item_width = appearance.border_width.mul_add(-2.0, bounds.width);
-
+            if highlighted {
                 renderer.fill_quad(
                     renderer::Quad {
                         bounds: Rectangle {
@@ -934,9 +947,15 @@ where
                         shadow: Shadow::default(),
                         snap: true,
                     },
-                    appearance.selected_background,
+                    if selected {
+                        appearance.selected_background
+                    } else {
+                        appearance.hovered_background
+                    },
                 );
+            }
 
+            let (color, font) = if selected {
                 let svg_handle =
                     iced_core::Svg::new(crate::widget::common::object_select().clone())
                         .color(appearance.selected_text_color)
@@ -951,27 +970,7 @@ where
                 svg::Renderer::draw_svg(renderer, svg_handle, bounds, bounds);
 
                 (appearance.selected_text_color, crate::font::semibold())
-            } else if *hovered_guard == Some(i) {
-                let item_x = bounds.x + appearance.border_width;
-                let item_width = appearance.border_width.mul_add(-2.0, bounds.width);
-
-                renderer.fill_quad(
-                    renderer::Quad {
-                        bounds: Rectangle {
-                            x: item_x,
-                            width: item_width,
-                            ..bounds
-                        },
-                        border: Border {
-                            radius: appearance.border_radius,
-                            ..Default::default()
-                        },
-                        shadow: Shadow::default(),
-                        snap: true,
-                    },
-                    appearance.hovered_background,
-                );
-
+            } else if highlighted {
                 (appearance.hovered_text_color, crate::font::default())
             } else {
                 (appearance.text_color, crate::font::default())
