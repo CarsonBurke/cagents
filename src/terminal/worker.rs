@@ -1045,6 +1045,11 @@ impl RenderStreamFixture {
         self.handle.inner.published.publish(Arc::new(snapshot));
     }
 
+    /// Publishes a caller-built grid, so row identity can be controlled.
+    pub(crate) fn publish_snapshot(&self, snapshot: RenderSnapshot) {
+        self.handle.inner.published.publish(Arc::new(snapshot));
+    }
+
     pub(crate) fn emit(&self, event: TerminalEvent) {
         self.handle.inner.published.emit_event(&self.events, event);
     }
