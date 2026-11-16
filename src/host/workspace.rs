@@ -148,12 +148,7 @@ fn edit_then<T>(
         }
     }
     if super::chat::pane_start::requires_edit_check(&edit) {
-        super::chat::pane_start::validate_edit(
-            host,
-            &registry,
-            &registry.model().map_err(unavailable)?,
-            &edit,
-        )?;
+        super::chat::pane_start::validate_edit(host, &registry, &edit)?;
     }
     let applied = if matches!(
         &edit,

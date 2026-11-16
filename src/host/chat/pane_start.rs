@@ -279,7 +279,6 @@ pub(in crate::host) fn requires_edit_check(edit: &ModelEdit) -> bool {
 pub(in crate::host) fn validate_edit(
     host: &SharedHost,
     registry: &crate::host::model::Registry,
-    model: &crate::workspace_model::WorkspaceModel,
     edit: &ModelEdit,
 ) -> Result<(), ProtocolError> {
     let desired: Vec<&Pane> = match edit {
@@ -309,11 +308,11 @@ pub(in crate::host) fn validate_edit(
                 "This pane's conversation is starting or running; attach to it before replacing its source",
             ));
         }
-        let current = model
-            .views
-            .iter()
-            .flat_map(|view| &view.panes)
-            .find(|current| current.id == pane.id);
+        // Only the pane's own view: routine pane edits never read the whole model.
+        let view = registry.pane_view(pane.id).map_err(unavailable)?;
+        let current = view
+            .as_ref()
+            .and_then(|view| view.panes.iter().find(|current| current.id == pane.id));
         let (claimed, resident) = {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
             let claimed = state
