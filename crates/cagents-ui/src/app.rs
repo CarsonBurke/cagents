@@ -6587,7 +6587,7 @@ impl Cagents {
             }
             Err(error) => {
                 self.fail_runtime(card, error.clone());
-                let notice = self.missing_terminal_notice(card).map(str::to_owned);
+                let notice = self.missing_terminal_notice(card);
                 self.status = Some(
                     TransientNotice::error(notice.unwrap_or(error))
                         .with_key(NoticeKey::TerminalStart(card)),
@@ -20247,8 +20247,18 @@ fn attach_initial_terminal(
     let mut client =
         crate::control::ControlClient::connect(&socket).map_err(|error| error.to_string())?;
     let proof = client.proof().clone();
-    let terminals = client.list().map_err(|error| error.to_string())?;
-    let session = initial_terminal_or_missing(&source, &terminals, &proof)?;
+    let session = initial_terminal_proving_absence(
+        &source,
+        &proof,
+        &mut client,
+        |client| client.list().map_err(|error| error.to_string()),
+        |client| {
+            client
+                .daemon_version()
+                .map(drop)
+                .map_err(|error| error.to_string())
+        },
+    )?;
     saved_terminal::attach_existing(
         card,
         daemon_recovery::RecoveredTerminal {
@@ -20263,8 +20273,26 @@ fn attach_initial_terminal(
     )
 }
 
-/// The terminal an initial pane attaches to. When its daemon no longer lists
-/// it, the pane is kept and the error says what Retry will find.
+/// The terminal an initial pane attaches to. A listing taken while the daemon
+/// is still restoring can be partial, so it can attach to what it lists but
+/// can't show that a terminal is gone: absence is read again after admission
+/// readiness, as a shared pane's open does.
+fn initial_terminal_proving_absence<C>(
+    source: &TerminalSession,
+    proof: &HostSessionProof,
+    client: &mut C,
+    list: impl Fn(&mut C) -> Result<Vec<crate::terminal::ipc::TerminalDescriptor>, String>,
+    ready: impl Fn(&mut C) -> Result<(), String>,
+) -> Result<TerminalSession, String> {
+    if let Some(session) = initial_terminal_attachment(source, &list(client)?, proof)? {
+        return Ok(session);
+    }
+    ready(client)?;
+    initial_terminal_or_missing(source, &list(client)?, proof)
+}
+
+/// When its daemon no longer lists an initial pane's terminal, the pane is
+/// kept and the error says what Retry will find.
 fn initial_terminal_or_missing(
     source: &TerminalSession,
     terminals: &[crate::terminal::ipc::TerminalDescriptor],
