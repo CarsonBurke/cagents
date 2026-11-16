@@ -23,13 +23,24 @@ pub struct SessionsArgs {
 /// Who is calling, and which other sessions share its channel or checkout.
 pub(super) fn whoami() -> Result<CommandOutput, AppError> {
     let directory = read(Scope::Containing(current_directory()?))?;
+    let peers = related(&directory);
+    Ok(CommandOutput {
+        command: "whoami",
+        human: whoami_human(&directory, &peers, now_ms()),
+        data: json!({
+            "me": directory.caller.as_ref().map(session_json),
+            "scope": directory.scope,
+            "sessions": peers.into_iter().map(session_json).collect::<Vec<_>>(),
+        }),
+    })
+}
+
+/// The sessions `whoami` lists beside the caller: its relatives, and peers
+/// in its channel or checkout; everyone in scope for a caller outside
+/// cagents.
+fn related(directory: &Sessions) -> Vec<&Member> {
     let channel = directory.caller.as_ref().and_then(|me| me.session.channel);
-    let now = now_ms();
-    let mut human = match &directory.caller {
-        Some(me) => list_human(std::iter::once(me).map(Row::from), channel, now),
-        None => "Not running inside a cagents session".to_owned(),
-    };
-    let peers: Vec<_> = directory
+    directory
         .sessions
         .iter()
         .filter(|member| {
@@ -37,31 +48,48 @@ pub(super) fn whoami() -> Result<CommandOutput, AppError> {
             directory.caller.is_none()
                 || entry.relation != Relation::Peer
                 || channel.is_some() && entry.channel == channel
-                || shares_checkout(&directory, entry)
+                || shares_checkout(directory, entry)
         })
-        .collect();
+        .collect()
+}
+
+/// The caller first, then `peers`, in one listing.
+fn whoami_human(directory: &Sessions, peers: &[&Member], now: u64) -> String {
+    let channel = directory.caller.as_ref().and_then(|me| me.session.channel);
+    let listed = list_human(
+        directory
+            .caller
+            .iter()
+            .chain(peers.iter().copied())
+            .map(Row::from),
+        channel,
+        now,
+    );
+    let human = match &directory.caller {
+        Some(_) => listed,
+        None if peers.is_empty() => "Not running inside a cagents session".to_owned(),
+        None => format!("Not running inside a cagents session\n\n{listed}"),
+    };
+    let mut steps = Vec::new();
     if !peers.is_empty() {
-        human.push_str("\n\nRelated sessions:\n");
-        human.push_str(&list_human(
-            peers.iter().copied().map(Row::from),
-            channel,
-            now,
-        ));
+        steps.push(("cagents transcript SESSION", "reads one"));
     }
     if channel.is_some() {
-        human.push_str(
-            "\n\n`cagents ls --channel` lists your channel, including ended sessions; `cagents transcript SESSION` reads one.",
-        );
+        steps.push((
+            "cagents ls --channel",
+            "lists your channel, including ended sessions",
+        ));
     }
-    Ok(CommandOutput {
-        command: "whoami",
-        data: json!({
-            "me": directory.caller.as_ref().map(session_json),
-            "scope": directory.scope,
-            "sessions": peers.into_iter().map(session_json).collect::<Vec<_>>(),
-        }),
-        human,
-    })
+    with_hint(human, &steps)
+}
+
+/// `human`, then a line of `steps` where there are any.
+fn with_hint(mut human: String, steps: &[(&str, &str)]) -> String {
+    if !steps.is_empty() {
+        human.push('\n');
+        human.push_str(&super::format::hint(steps));
+    }
+    human
 }
 
 pub(super) fn list(arguments: SessionsArgs) -> Result<CommandOutput, AppError> {
@@ -84,31 +112,38 @@ pub(super) fn list(arguments: SessionsArgs) -> Result<CommandOutput, AppError> {
         Scope::Containing(current_directory()?)
     };
     let directory = read(scope)?;
+    Ok(CommandOutput {
+        command: "sessions",
+        human: sessions_human(&directory, now_ms()),
+        data: json!({
+            "me": directory.caller.as_ref().map(session_json),
+            "scope": directory.scope,
+            "sessions": directory.sessions.iter().map(session_json).collect::<Vec<_>>(),
+        }),
+    })
+}
+
+/// The caller and every session in scope, then what to run next.
+fn sessions_human(directory: &Sessions, now: u64) -> String {
     let channel = directory.caller.as_ref().and_then(|me| me.session.channel);
-    let mut human = list_human(
+    let human = list_human(
         directory
             .caller
             .iter()
             .chain(directory.sessions.iter())
             .map(Row::from),
         channel,
-        now_ms(),
+        now,
     );
-    if let Scope::Project(project) = &directory.scope {
-        human.push_str(&format!(
-            "\n(project {}; --all for every project, --channel for yours)",
-            super::format::plain(&project.display().to_string())
-        ));
+    let mut steps = Vec::new();
+    if !directory.sessions.is_empty() {
+        steps.push(("cagents transcript SESSION", "reads one"));
+        steps.push(("cagents send SESSION MESSAGE", "messages one"));
     }
-    Ok(CommandOutput {
-        command: "sessions",
-        data: json!({
-            "me": directory.caller.as_ref().map(session_json),
-            "scope": directory.scope,
-            "sessions": directory.sessions.iter().map(session_json).collect::<Vec<_>>(),
-        }),
-        human,
-    })
+    if matches!(directory.scope, Scope::Project(_)) {
+        steps.push(("cagents ls --all", "lists every project"));
+    }
+    with_hint(human, &steps)
 }
 
 /// A listed session as `--json` reports it: its directory entry, with its
@@ -165,28 +200,52 @@ pub(super) fn account_phrase(account: &SessionAccount, now: u64) -> String {
         Some(label) => format!("{} ({label})", account.id),
         None => account.id.to_string(),
     };
+    format!("{name}: {}", allowance_phrase(account, now))
+}
+
+/// What is left of an account: "17% of Weekly left, resets in 3 days".
+fn allowance_phrase(account: &SessionAccount, now: u64) -> String {
+    match (account.tightest(), allowance(account, now)) {
+        (None, (unknown, _)) => unknown,
+        (Some(_), (left, resets)) => {
+            let mut phrase = format!("{left} left");
+            if let Some(resets) = resets {
+                phrase.push_str(&format!(", resets {resets}"));
+            }
+            if account.stale {
+                phrase.push_str(" (as last read; may be out of date)");
+            }
+            phrase
+        }
+    }
+}
+
+/// What is left of an account's tightest window, as a whole percentage
+/// rounded down, such as "17% of Weekly", or why that is not known; and
+/// when the window resets, such as "in 3 days". A listing marks a stale
+/// reading after the percentage.
+fn allowance(account: &SessionAccount, now: u64) -> (String, Option<String>) {
     let Some(window) = account.tightest() else {
-        return match account.status {
-            Some(crate::account::UsageStatus::NeedsLogin) => format!("{name}: needs sign-in"),
-            _ => format!("{name}: allowance unknown"),
-        };
+        return (
+            match account.status {
+                Some(crate::account::UsageStatus::NeedsLogin) => "needs sign-in",
+                _ => "allowance unknown",
+            }
+            .into(),
+            None,
+        );
     };
-    let mut phrase = format!(
-        "{name}: {:.0}% of {} left",
+    let left = format!(
+        "{:.0}% of {}",
         (window.remaining_fraction * 100.0).floor(),
         window.window.label
     );
-    if let Some(at) = window.window.resets_at.filter(|at| *at >= 0) {
-        phrase.push_str(", resets ");
-        phrase.push_str(&super::format::relative_time(
-            (at as u64).saturating_mul(1000),
-            now,
-        ));
-    }
-    if account.stale {
-        phrase.push_str(" (as last read; may be out of date)");
-    }
-    phrase
+    let resets = window
+        .window
+        .resets_at
+        .filter(|at| *at >= 0)
+        .map(|at| super::format::relative_time((at as u64).saturating_mul(1000), now));
+    (left, resets)
 }
 
 /// Everyone in a channel, with how recently each worked and how it ended.
@@ -228,9 +287,11 @@ fn members_human(members: &Members, now: u64) -> String {
     } else {
         "channel"
     };
-    human.push_str(&format!(
-        "\n({whose} {channel}; read a conversation with `cagents transcript SESSION`)"
-    ));
+    human.push_str(&format!("\n({whose} {channel})\n"));
+    human.push_str(&super::format::hint(&[(
+        "cagents transcript SESSION",
+        "reads one",
+    )]));
     human
 }
 
@@ -263,78 +324,218 @@ pub(super) fn now_ms() -> u64 {
         .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
 
-/// `channel` is the caller's, so a session sharing it is marked.
+/// Session rows, then each account they run on and what is left of it,
+/// once however many rows share it. IDs are the shortest prefixes that tell
+/// them apart. A project every row shares is named once, after the rows,
+/// rather than on each; so is a session's directory where it is that
+/// project's primary checkout. `channel` is the caller's, so a session
+/// sharing it is marked.
 pub(super) fn list_human<'a>(
     rows: impl IntoIterator<Item = Row<'a>>,
     channel: Option<crate::model::ChannelId>,
     now: u64,
 ) -> String {
-    use crate::agent_execution::directory::Owner;
-    super::format::table(
-        ["SESSION", "PROVIDER", "STATE", "CONTEXT"],
-        rows.into_iter()
+    let rows: Vec<Row<'a>> = rows.into_iter().collect();
+    let Some(first) = rows.first() else {
+        return "No live sessions".into();
+    };
+    let ids: Vec<String> = rows
+        .iter()
+        .flat_map(|row| {
+            std::iter::once(row.entry.id.to_string()).chain(
+                row.entry
+                    .delegation
+                    .as_ref()
+                    .map(|delegation| delegation.agent.to_string()),
+            )
+        })
+        .collect();
+    let length = super::format::abbreviation(ids.iter().map(String::as_str));
+    let shared = first
+        .entry
+        .project
+        .as_ref()
+        .filter(|project| {
+            rows.iter()
+                .all(|row| row.entry.project.as_ref() == Some(*project))
+        })
+        .map(|_| first.entry.project_name.as_deref().unwrap_or_default());
+    let mut accounts: Vec<&SessionAccount> = Vec::new();
+    for account in rows.iter().filter_map(|row| row.account) {
+        if !accounts.iter().any(|known| known.id == account.id) {
+            accounts.push(account);
+        }
+    }
+    let keys = AccountKeys::of(&accounts);
+    let mut human = super::format::sparse_table(
+        ["SESSION", "PROVIDER", "STATE", "ACCOUNT", "CONTEXT"],
+        rows.iter()
             .map(|row| {
-                let entry = row.entry;
-                let mut context = Vec::new();
-                if let Some(limit) = row.limit {
-                    context.push(format!("stopped: {}", limit_phrase(limit, now)));
-                }
-                if let Some(project) = &entry.project_name {
-                    context.push(format!("[{project}]"));
-                }
-                if let Some(directory) = &entry.directory {
-                    context.push(directory.display().to_string());
-                }
-                if let Some(title) = entry.title.as_deref().filter(|title| !title.is_empty()) {
-                    context.push(format!("\"{title}\""));
-                }
-                if let Some(crate::agent_execution::Placement::Worktree { path, .. }) =
-                    &entry.view_scope
-                {
-                    context.push(format!("worktree view {}", path.display()));
-                }
-                if entry.relation != Relation::Myself
-                    && channel.is_some()
-                    && entry.channel == channel
-                {
-                    context.push("my channel".into());
-                }
-                match (entry.relation, entry.delegation.as_ref().map(|d| &d.owner)) {
-                    (Relation::Myself, _) => context.push("me".into()),
-                    (Relation::Parent, _) => context.push("my parent".into()),
-                    (Relation::Child, Some(Owner::User)) => context.push("user agent".into()),
-                    (Relation::Child, _) => context.push("my agent".into()),
-                    (Relation::Peer, _) => {}
-                }
-                if entry.lineage.0 != entry.id {
-                    context.push(format!("lineage {}", entry.lineage));
-                }
-                if let Some(delegation) = &entry.delegation {
-                    context.push(format!("agent {}", delegation.agent));
-                    if let Some(state) = delegation.run_state {
-                        context.push(format!("latest run {}", super::agents::state_label(state)));
-                    }
-                }
-                if let Some(at) = row.active_at {
-                    context.push(format!("active {}", super::format::relative_time(at, now)));
-                }
-                // A limit already says what failed.
-                if let Some(failure) = row.failure.filter(|_| row.limit.is_none()) {
-                    context.push(format!("failed: {failure}"));
-                }
-                if let Some(account) = row.account {
-                    context.push(format!("account {}", account_phrase(account, now)));
-                }
                 [
-                    entry.id.to_string(),
-                    entry.provider.map_or("shell", |p| p.executable()).into(),
+                    super::format::prefix(&row.entry.id.to_string(), length).to_owned(),
+                    row.entry
+                        .provider
+                        .map_or("shell", |p| p.executable())
+                        .into(),
                     row.state.into(),
-                    context.join("; "),
+                    row.account
+                        .map(|account| keys.key(&account.id))
+                        .unwrap_or_default(),
+                    context(row, length, shared.is_none(), channel, now),
                 ]
             })
             .collect(),
         "No live sessions",
-    )
+    );
+    if !accounts.is_empty() {
+        human.push_str("\n\n");
+        human.push_str(&super::format::table(
+            ["ACCOUNT", "LEFT", "RESETS"],
+            accounts
+                .iter()
+                .map(|account| {
+                    let (mut left, resets) = allowance(account, now);
+                    if account.stale {
+                        left.push_str(" (stale)");
+                    }
+                    [
+                        keys.name(account),
+                        left,
+                        resets.unwrap_or_else(|| "-".into()),
+                    ]
+                })
+                .collect(),
+            "",
+        ));
+    }
+    if let Some(project) = shared.filter(|project| !project.is_empty()) {
+        human.push_str(&format!("\n(project {})", super::format::plain(project)));
+    }
+    human
+}
+
+/// What a row adds beyond its ID, provider, state and account, most
+/// pressing first. `projects` says whether rows span projects, so each
+/// names its own.
+fn context(
+    row: &Row<'_>,
+    length: usize,
+    projects: bool,
+    channel: Option<crate::model::ChannelId>,
+    now: u64,
+) -> String {
+    use crate::agent_execution::directory::Owner;
+    let entry = row.entry;
+    let root = entry.project.as_deref().and_then(primary_checkout);
+    let mut context = Vec::new();
+    if let Some(limit) = row.limit {
+        context.push(format!("stopped: {}", limit_phrase(limit, now)));
+    }
+    if projects && let Some(project) = &entry.project_name {
+        context.push(format!("[{project}]"));
+    }
+    if let Some(directory) = &entry.directory {
+        let shown = super::format::location(directory, root);
+        if shown != "." {
+            context.push(shown);
+        }
+    }
+    if let Some(title) = entry.title.as_deref().filter(|title| !title.is_empty()) {
+        context.push(format!("\"{}\"", super::format::clip(title, TITLE_WIDTH)));
+    }
+    if let Some(crate::agent_execution::Placement::Worktree { path, .. }) = &entry.view_scope
+        && entry.directory.as_ref() != Some(path)
+    {
+        context.push(format!("view {}", super::format::location(path, root)));
+    }
+    if entry.relation != Relation::Myself && channel.is_some() && entry.channel == channel {
+        context.push("my channel".into());
+    }
+    // Only an agent the caller owns can be controlled by its ID.
+    let owned = |who: &str, delegation: &crate::agent_execution::directory::Delegation| {
+        let agent = delegation.agent.to_string();
+        let agent = super::format::prefix(&agent, length);
+        match delegation.run_state {
+            Some(state) => format!(
+                "{who} {agent} {}",
+                super::agents::state_label(state).to_lowercase()
+            ),
+            None => format!("{who} {agent}"),
+        }
+    };
+    match (entry.relation, entry.delegation.as_ref()) {
+        (Relation::Myself, _) => context.push("me".into()),
+        (Relation::Parent, _) => context.push("my parent".into()),
+        (Relation::Child, Some(delegation)) if delegation.owner == Owner::User => {
+            context.push(owned("user agent", delegation));
+        }
+        (Relation::Child, Some(delegation)) => context.push(owned("my agent", delegation)),
+        (Relation::Child, None) => context.push("my agent".into()),
+        (Relation::Peer, _) => {}
+    }
+    if let Some(at) = row.active_at {
+        context.push(format!("active {}", super::format::relative_time(at, now)));
+    }
+    // A limit already says what failed.
+    if let Some(failure) = row.failure.filter(|_| row.limit.is_none()) {
+        context.push(format!("failed: {failure}"));
+    }
+    context.join("; ")
+}
+
+/// How many columns of a title a row shows; the whole title is in `--json`.
+const TITLE_WIDTH: usize = 60;
+
+/// The primary checkout of the project whose repository key is `project`,
+/// where that key is the checkout's own `.git`.
+fn primary_checkout(project: &std::path::Path) -> Option<&std::path::Path> {
+    (project.file_name()? == ".git")
+        .then(|| project.parent())
+        .flatten()
+}
+
+/// Names for the accounts one listing shows. A row names its account by
+/// its key alone, since its provider column already says whose it is, and
+/// an opaque key shortened as IDs are; the lines after the rows name each
+/// in full.
+struct AccountKeys {
+    length: usize,
+}
+
+impl AccountKeys {
+    fn of(accounts: &[&SessionAccount]) -> Self {
+        let keys: Vec<&str> = accounts
+            .iter()
+            .filter_map(|account| Self::opaque(account.id.as_str()))
+            .collect();
+        Self {
+            length: super::format::abbreviation(keys),
+        }
+    }
+
+    /// The part of an account ID after its provider, when it is a UUID.
+    fn opaque(id: &str) -> Option<&str> {
+        let (_, key) = id.split_once('/')?;
+        uuid::Uuid::parse_str(key).is_ok().then_some(key)
+    }
+
+    fn key(&self, id: &crate::account::AccountId) -> String {
+        let id = id.as_str();
+        match Self::opaque(id) {
+            Some(key) => super::format::prefix(key, self.length).to_owned(),
+            None => id.split_once('/').map_or(id, |(_, key)| key).to_owned(),
+        }
+    }
+
+    fn name(&self, account: &SessionAccount) -> String {
+        let id = account.id.as_str();
+        let provider = id.split_once('/').map_or(id, |(provider, _)| provider);
+        let mut name = format!("{provider}/{}", self.key(&account.id));
+        if let Some(label) = &account.label {
+            name.push_str(&format!(" ({})", super::format::plain(label)));
+        }
+        name
+    }
 }
 
 /// Peers in the caller's own checkout are the ones most likely to collide.
@@ -500,8 +701,13 @@ mod tests {
         });
         member.account = Some(account(0.0, false));
         let human = list_human(std::iter::once(Row::from(&member)), None, 3600 * 1000);
-        let row = human.lines().nth(1).unwrap();
-        assert!(row.contains(" limited "), "{row}");
+        let lines: Vec<&str> = human.lines().collect();
+        assert_eq!(
+            lines[0].split_whitespace().collect::<Vec<_>>(),
+            ["SESSION", "PROVIDER", "STATE", "ACCOUNT", "CONTEXT"]
+        );
+        let row = lines[1];
+        assert!(row.contains(" limited  system "), "{row}");
         assert!(
             row.contains("stopped: Claude weekly limit reached, resets in 2 hr"),
             "{row}"
@@ -510,9 +716,14 @@ mod tests {
             !row.contains("failed:"),
             "the limit already says what failed: {row}"
         );
-        assert!(
-            row.ends_with("; account claude/system (work): 0% of Weekly left, resets in 2 hr"),
-            "{row}"
+        assert_eq!(
+            lines[2..],
+            [
+                "",
+                "ACCOUNT               LEFT          RESETS",
+                "claude/system (work)  0% of Weekly  in 2 hr",
+                "(project Fixture)"
+            ]
         );
 
         let value = session_json(&member);
@@ -553,6 +764,52 @@ mod tests {
     }
 
     #[test]
+    fn each_account_is_listed_once_after_the_rows_that_run_on_it() {
+        let opaque = "claude/a84362d7-c93d-4130-af49-34e6fd23b531";
+        let mut shared = account(0.06, false);
+        shared.id = opaque.parse().unwrap();
+        shared.label = None;
+        let rows: Vec<Member> = (1..=3)
+            .map(|index| {
+                let mut session = entry();
+                session.id = format!("{index}0000000-0000-4000-8000-000000000001")
+                    .parse()
+                    .unwrap();
+                session.delegation = None;
+                session.title = None;
+                let mut member = live(session);
+                member.account = Some(if index == 2 {
+                    account(0.73, true)
+                } else {
+                    shared.clone()
+                });
+                member
+            })
+            .collect();
+        let human = list_human(rows.iter().map(Row::from), None, 3600 * 1000);
+        let lines: Vec<&str> = human.lines().collect();
+        assert!(
+            lines[1].starts_with("10000000  claude    waiting  a84362d7  "),
+            "{human}"
+        );
+        assert!(
+            lines[2].starts_with("20000000  claude    waiting  system    "),
+            "{human}"
+        );
+        assert_eq!(
+            lines[4..],
+            [
+                "",
+                "ACCOUNT               LEFT                   RESETS",
+                "claude/a84362d7       6% of Weekly           in 2 hr",
+                "claude/system (work)  73% of Weekly (stale)  in 2 hr",
+                "(project Fixture)",
+            ],
+            "{human}"
+        );
+    }
+
+    #[test]
     fn a_channel_lists_how_each_member_ended_and_when_it_last_worked() {
         let mut session = entry();
         session.relation = Relation::Peer;
@@ -584,7 +841,7 @@ mod tests {
         assert!(!row.contains("my channel"), "{row}");
         assert!(
             human.ends_with(&format!(
-                "\n(channel {channel}; read a conversation with `cagents transcript SESSION`)"
+                "\n(channel {channel})\nhint: `cagents transcript SESSION` reads one"
             )),
             "{human}"
         );
@@ -592,7 +849,7 @@ mod tests {
         let mut me = members.sessions[0].clone();
         me.session.relation = Relation::Myself;
         members.caller = Some(me);
-        assert!(members_human(&members, 0).contains(&format!("\n(your channel {channel};")));
+        assert!(members_human(&members, 0).contains(&format!("\n(your channel {channel})\n")));
 
         members.caller = None;
         members.sessions.clear();
@@ -603,40 +860,124 @@ mod tests {
     }
 
     #[test]
-    fn readable_session_rows_keep_original_identity_and_delegation_context() {
+    fn readable_session_rows_keep_identity_and_delegation_context_without_repeating_scope() {
         let entry = entry();
         let before = serde_json::to_value(&entry).unwrap();
         let member = live(entry.clone());
         let human = list_human(std::iter::once(Row::from(&member)), None, 0);
-        assert_eq!(human.lines().count(), 2);
+        let lines: Vec<&str> = human.lines().collect();
         assert_eq!(
-            human
-                .lines()
-                .next()
-                .unwrap()
-                .split_whitespace()
-                .collect::<Vec<_>>(),
+            lines[0].split_whitespace().collect::<Vec<_>>(),
             ["SESSION", "PROVIDER", "STATE", "CONTEXT"]
         );
-        for expected in [
-            "00000000-0000-4000-8000-000000000001",
-            "claude",
-            "waiting",
-            "[Fixture]",
-            "\"review  title\"",
-            "worktree view /fixture/linked",
-            "user agent",
-            "lineage 00000000-0000-4000-8000-000000000003",
-            "agent 00000000-0000-4000-8000-000000000002",
-            "latest run Outcome uncertain",
-        ] {
-            assert!(human.contains(expected), "{human}");
-        }
-        for debug in ["Some(", "None", "Interrupted", "{ ", "_ms"] {
-            assert!(!human.contains(debug));
+        // The session and its agent share eight digits, so both are shown
+        // until they differ.
+        assert_eq!(
+            lines[1],
+            "00000000-0000-4000-8000-000000000001  claude    waiting  \
+             linked; \"review  title\"; \
+             user agent 00000000-0000-4000-8000-000000000002 outcome uncertain"
+        );
+        // The project is named once; the view is the session's own directory.
+        assert_eq!(lines[2..], ["(project Fixture)"]);
+        for debug in ["Some(", "None", "Interrupted", "{ ", "_ms", "lineage"] {
+            assert!(!human.contains(debug), "{human}");
         }
         assert!(!human.contains('\u{1b}'));
         assert_eq!(serde_json::to_value(&entry).unwrap(), before);
+    }
+
+    #[test]
+    fn rows_across_projects_name_their_own_and_place_directories_in_them() {
+        let mut primary = entry();
+        primary.directory = Some("/fixture".into());
+        primary.view_scope = None;
+        primary.delegation = None;
+        primary.relation = Relation::Peer;
+        primary.title = Some("x".repeat(80));
+        let mut other = primary.clone();
+        other.id = "10000000-0000-4000-8000-000000000001".parse().unwrap();
+        other.project = Some("/other/.git".into());
+        other.project_name = Some("Other".into());
+        other.directory = Some("/other/.worktrees/fix".into());
+        other.title = None;
+        other.view_scope = Some(Placement::Worktree {
+            repository: "/other/.git".into(),
+            path: "/other/.worktrees/view".into(),
+        });
+        let rows = [live(primary), live(other)];
+        let human = list_human(rows.iter().map(Row::from), None, 0);
+        let lines: Vec<&str> = human.lines().collect();
+        assert_eq!(
+            lines[1],
+            format!(
+                "00000000  claude    waiting  [Fixture]; \"{}…\"",
+                "x".repeat(TITLE_WIDTH - 1)
+            )
+        );
+        assert_eq!(
+            lines[2],
+            "10000000  claude    waiting  [Other]; .worktrees/fix; view .worktrees/view"
+        );
+        assert_eq!(lines.len(), 3, "rows span projects, so none is named after");
+    }
+
+    #[test]
+    fn listings_end_with_the_commands_that_follow_from_them() {
+        let mut me = live(entry());
+        me.session.relation = Relation::Myself;
+        me.session.channel = Some("00000000-0000-4000-8000-0000000000c1".parse().unwrap());
+        me.session.delegation = None;
+        let mut peer = live(entry());
+        peer.session.id = "10000000-0000-4000-8000-000000000001".parse().unwrap();
+        peer.session.relation = Relation::Peer;
+        let directory = Sessions {
+            caller: Some(me),
+            scope: Scope::Project("/fixture/.git".into()),
+            sessions: vec![peer],
+        };
+        let listed = sessions_human(&directory, 0);
+        assert!(
+            listed.ends_with(
+                "\nhint: `cagents transcript SESSION` reads one; \
+                 `cagents send SESSION MESSAGE` messages one; \
+                 `cagents ls --all` lists every project"
+            ),
+            "{listed}"
+        );
+
+        let peers: Vec<&Member> = directory.sessions.iter().collect();
+        let who = whoami_human(&directory, &peers, 0);
+        let rows: Vec<&str> = who.lines().skip(1).take(2).collect();
+        assert!(rows[0].contains("; me"), "{who}");
+        assert!(rows[1].starts_with("10000000"), "{who}");
+        assert!(
+            who.ends_with(
+                "\nhint: `cagents transcript SESSION` reads one; \
+                 `cagents ls --channel` lists your channel, including ended sessions"
+            ),
+            "{who}"
+        );
+
+        let outside = Sessions {
+            caller: None,
+            scope: Scope::All,
+            sessions: Vec::new(),
+        };
+        // With no one else listed, nothing follows but a wider listing.
+        assert_eq!(
+            whoami_human(&outside, &[], 0),
+            "Not running inside a cagents session"
+        );
+        assert_eq!(sessions_human(&outside, 0), "No live sessions");
+        let alone = Sessions {
+            scope: Scope::Project("/fixture/.git".into()),
+            ..outside
+        };
+        assert_eq!(
+            sessions_human(&alone, 0),
+            "No live sessions\nhint: `cagents ls --all` lists every project"
+        );
     }
 
     #[test]
@@ -658,7 +999,7 @@ mod tests {
         let member = live(entry);
         assert_eq!(
             list_human(std::iter::once(Row::from(&member)), None, 0),
-            "SESSION                               PROVIDER  STATE    CONTEXT\n00000000-0000-4000-8000-000000000001  shell     unknown  me"
+            "SESSION   PROVIDER  STATE    CONTEXT\n00000000  shell     unknown  me"
         );
     }
 }
