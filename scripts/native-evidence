@@ -55,6 +55,7 @@ both use the same fixture data and selected providers.
         [--startup-timeout SECONDS]
         [--portal gtk|kde|gnome|cosmic] [--codex tool-rows|child-errors|terminal-escape|usage-resets]
         [--instance NAME] [--ui-trace] [--workspace-trace] [--ui-scoped-fixture]
+        [--wayland-debug]
                   Take one of the host's native slots and start a headless
                   session at the requested logical width and height (default
                   1500x900). The slot is released by stop, or after --limit
@@ -78,6 +79,9 @@ both use the same fixture data and selected providers.
                   --workspace-trace logs shared-model update timing, scope
                   projection choices and activity redraw intervals. Both trace
                   options persist through relaunch, until the session stops.
+                  --wayland-debug sets WAYLAND_DEBUG=client for the app, so its
+                  Wayland requests and events, such as popup grabs and keyboard
+                  focus, go to logs/ui-SIDE.log; it persists like the traces.
   cli ARGS...     Run this side's cagents CLI in the fixture environment.
   env CMD...      Run a command in the fixture environment, which keeps nothing
                   from this shell beyond locale and terminal settings and
@@ -1062,6 +1066,7 @@ run_app() {
     fi
     [ -z "${chat_stage_output:-}" ] || stage_environment+=("CAGENTS_CHAT_STAGE_OUTPUT=$chat_stage_output")
     [ "$(cat "$state/ui-trace" 2>/dev/null)" != 1 ] || stage_environment+=(CAGENTS_UI_TRACE=1)
+    [ "$(cat "$state/wayland-debug" 2>/dev/null)" != 1 ] || stage_environment+=(WAYLAND_DEBUG=client)
     if [ "$(cat "$state/ui-scoped-fixture" 2>/dev/null)" = 1 ]; then
         # Start the isolated daemon as User before adding the synthetic caller
         # to the UI runner. It must not inherit even this invalid capability.
@@ -1247,7 +1252,7 @@ cmd_relaunch() {
 }
 
 cmd_start() {
-    local side=${1:-} width=1500 height=900 keep_state=false wait_lock=1800 limit=$default_limit startup_timeout=180 portal= codex= codex_executable= ui_trace= ui_scoped_fixture= workspace_trace=
+    local side=${1:-} width=1500 height=900 keep_state=false wait_lock=1800 limit=$default_limit startup_timeout=180 portal= codex= codex_executable= ui_trace= ui_scoped_fixture= workspace_trace= wayland_debug=
     require_side "$side"
     shift
     while [ "$#" -gt 0 ]; do
@@ -1267,6 +1272,7 @@ cmd_start() {
             --ui-trace) ui_trace=1; shift ;;
             --ui-scoped-fixture) ui_scoped_fixture=1; shift ;;
             --workspace-trace) workspace_trace=1; shift ;;
+            --wayland-debug) wayland_debug=1; shift ;;
             *) die "unknown start option: $1" 2 ;;
         esac
     done
@@ -1318,6 +1324,7 @@ cmd_start() {
     printf '%s\n' "$ui_trace" >"$state/ui-trace"
     printf '%s\n' "$ui_scoped_fixture" >"$state/ui-scoped-fixture"
     printf '%s\n' "$workspace_trace" >"$state/workspace-trace"
+    printf '%s\n' "$wayland_debug" >"$state/wayland-debug"
     printf 'waiting for the native session (lock wait up to %ss)\n' "$wait_lock"
     # The session outlives this command, so it starts in its own process session.
     setsid nohup "$self" --task "$task" __session "$side" "$width" "$keep_state" "$wait_lock" "$limit" "$$" "$height" "$startup_timeout" \

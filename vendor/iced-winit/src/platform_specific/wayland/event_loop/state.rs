@@ -1440,13 +1440,14 @@ impl SctkState {
                                         TimeoutAction::Drop
                                     }
                                 } else {
+                                    let grab = popup.grab;
                                     match state.get_popup(popup) {
                                         Ok((id, parent_id, toplevel_id, surface, common)) => {
                                             let wl_surface = surface.wl_surface().clone();
                                             receive_frame(&mut state.frame_status, &wl_surface);
                                             send_event(&state.events_sender, &state.proxy,
                                                 SctkEvent::PopupEvent {
-                                                    variant: crate::platform_specific::wayland::sctk_event::PopupEventVariant::Created(queue_handle.clone(), surface, id, common, state.connection.display()),
+                                                    variant: crate::platform_specific::wayland::sctk_event::PopupEventVariant::Created(queue_handle.clone(), surface, id, common, state.connection.display(), grab),
                                                     toplevel_id, parent_id, id: wl_surface });
                                         }
                                         Err(err) => {
@@ -1459,12 +1460,13 @@ impl SctkState {
                         }
                     } else {
                         self.pending_popup = None;
+                        let grab = settings.grab;
                         match self.get_popup(settings) {
                             Ok((id, parent_id, toplevel_id, surface, common)) => {
                                 let wl_surface = surface.wl_surface().clone();
                                 send_event(&self.events_sender, &self.proxy,
                                     SctkEvent::PopupEvent {
-                                        variant: crate::platform_specific::wayland::sctk_event::PopupEventVariant::Created(self.queue_handle.clone(), surface, id, common, self.connection.display()),
+                                        variant: crate::platform_specific::wayland::sctk_event::PopupEventVariant::Created(self.queue_handle.clone(), surface, id, common, self.connection.display(), grab),
                                         toplevel_id, parent_id, id: wl_surface });
                             }
                             Err(err) => {

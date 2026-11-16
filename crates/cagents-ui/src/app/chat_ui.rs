@@ -20681,6 +20681,7 @@ mod tests {
                 }
             }
             let window = cosmic::iced::window::Id::unique();
+            app.core.set_main_window_id(Some(window));
             drop(app.update(Message::WindowCloseRequested(window)));
             assert!(app.exit.is_none());
             assert_eq!(app.transient_work_close, Some(window));

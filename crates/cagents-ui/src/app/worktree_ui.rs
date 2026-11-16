@@ -2810,7 +2810,9 @@ mod tests {
         );
         let _ = app.select_worktree("/b".into(), false);
         assert!(app.workspace.card(editor.id).is_none());
-        let _ = app.update(Message::WindowCloseRequested(window::Id::unique()));
+        let main = window::Id::unique();
+        app.core.set_main_window_id(Some(main));
+        let _ = app.update(Message::WindowCloseRequested(main));
         assert_eq!(
             app.dirty_repository_close.as_ref().map(|close| close.card),
             Some(editor.id)
