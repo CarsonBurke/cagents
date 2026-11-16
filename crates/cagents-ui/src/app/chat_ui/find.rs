@@ -205,10 +205,12 @@ pub(super) fn matched_pattern_checked(
     }
     current().then_some(matcher.result)
 }
+#[cfg(test)]
 pub(super) fn first(text: &str, query: &str) -> Option<Range<usize>> {
     matched_ranges(text, query, 1).ranges.into_iter().next()
 }
 
+#[cfg(test)]
 pub(super) fn contains(text: &str, query: &str) -> bool {
     matched_ranges(text, query, 0).truncated
 }

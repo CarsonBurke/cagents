@@ -131,7 +131,7 @@ fn joining_the_first_registry_keeps_the_selected_scope_default_intent() {
 
 #[test]
 fn a_daemon_without_a_shared_model_still_opens_the_waiting_default() {
-    let (mut app, channel, _, _requests) = loading_channel();
+    let (mut app, _, _, _requests) = loading_channel();
     drop(app.ensure_default_pane());
     assert!(app.workspace.cards().is_empty());
     // This daemon will never admit the scope, so the window stops waiting.

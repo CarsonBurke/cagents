@@ -5,9 +5,9 @@ use std::sync::Weak;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct IntentEpoch(u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct DocumentEpoch(u64);
+pub struct DocumentEpoch(u64);
 #[derive(Clone)]
-pub(super) struct Intent {
+pub struct Intent {
     clock: Arc<AtomicU64>,
     epoch: IntentEpoch,
     document: Arc<AtomicU64>,
@@ -124,7 +124,7 @@ struct Pending {
     _deadline: iced::task::Handle,
 }
 #[derive(Clone, PartialEq, Eq)]
-pub(super) struct Hit {
+pub struct Hit {
     item: String,
     identity: u64,
     byte: usize,
@@ -613,7 +613,10 @@ enum Input {
     Raw(RawInput),
     Catalog(Vec<(Arc<str>, u64, Arc<str>)>),
     Highlight(Arc<str>),
-    Output(Box<dyn Send + Sync>),
+    /// A finished result, held only so it drops here with its admission.
+    Output {
+        _value: Box<dyn Send + Sync>,
+    },
 }
 pub(super) struct RetiredWork {
     input: Input,
@@ -726,7 +729,7 @@ struct ItemPlan {
     expand: bool,
     parts: Vec<String>,
 }
-pub(super) struct Ready<T: Send + Sync + 'static>(Arc<Mutex<Option<Admitted<T>>>>);
+pub struct Ready<T: Send + Sync + 'static>(Arc<Mutex<Option<Admitted<T>>>>);
 struct Admitted<T: Send + Sync + 'static> {
     value: Option<T>,
     _permit: Option<Slot>,
@@ -740,7 +743,9 @@ impl<T: Send + Sync + 'static> Drop for Admitted<T> {
 }
 fn retire_value<T: Send + Sync + 'static>(value: T, permit: Option<Slot>) {
     let work = RetiredWork {
-        input: Input::Output(Box::new(value)),
+        input: Input::Output {
+            _value: Box::new(value),
+        },
         _permit: permit,
     };
     if preparation::reclaiming_find() {
@@ -766,7 +771,7 @@ impl<T: Send + Sync + 'static> Ready<T> {
 pub(super) type RawResult = Ready<Result<RawOutput, RawFailure>>;
 pub(super) type CatalogResult = Ready<Result<Option<Hit>, RawFailure>>;
 #[derive(Clone)]
-pub(super) struct RawOutput(Arc<RawOwner>);
+pub struct RawOutput(Arc<RawOwner>);
 struct RawOwner(Option<RawData>);
 impl Drop for RawOwner {
     fn drop(&mut self) {
@@ -781,8 +786,7 @@ impl std::ops::Deref for RawOutput {
         self.0.0.as_ref().expect("live Find plan")
     }
 }
-pub(super) struct RawData {
-    epoch: u64,
+pub struct RawData {
     query_epoch: u64,
     pattern: Arc<find::Pattern>,
     context: Option<String>,
@@ -989,7 +993,6 @@ impl Runtime {
                 && let Ok((groups, tools, metadata, pattern)) = raw_scan(&input, query, &|| true)
             {
                 let result = RawOutput(Arc::new(RawOwner(Some(RawData {
-                    epoch: self.find_navigation.raw.clock.load(Ordering::Acquire),
                     query_epoch: self.find_navigation.search.load(Ordering::Acquire),
                     pattern,
                     context: self.selected_subagent.clone(),
@@ -1126,7 +1129,7 @@ impl Runtime {
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum RawFailure {
+pub enum RawFailure {
     Canceled,
     TooLarge,
     Pressure(u64),
@@ -1462,7 +1465,6 @@ impl Cagents {
                 .unwrap_or(Err(RawFailure::Worker))
                 .map(|(groups, tools, metadata, pattern)| {
                     RawOutput(Arc::new(RawOwner(Some(RawData {
-                        epoch,
                         query_epoch,
                         pattern,
                         context,
@@ -1641,7 +1643,7 @@ pub(super) fn tool_uncapped(target: Target, identity: u64, text: &Arc<str>) -> b
         })
     })
 }
-pub(super) struct Highlight {
+pub struct Highlight {
     clock: Arc<AtomicU64>,
     epoch: u64,
     source: Weak<str>,

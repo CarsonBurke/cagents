@@ -6,11 +6,6 @@
 //! draws, its widgets are kept in its tree between frames, and its layout is
 //! reused while it is given the same room.
 //!
-//! The same wrapper also carries an exchange that cannot be kept - one showing
-//! an open step, whose read-only editor borrows from the cache - so that
-//! opening or closing a step keeps the exchange's tree: the focus on the header
-//! just pressed, and the scroll offsets of its code blocks, survive it.
-//!
 //! A widget inside that changes its own size asks for a new layout through the
 //! shell, which is honored here. An overlay (a tooltip) that asks for one only
 //! lays out itself, never the exchange beneath it, so it needs nothing here.
@@ -23,7 +18,7 @@ use iced::advanced::{
     Clipboard, Layout, Shell, Widget,
     clipboard::DndDestinationRectangles,
     layout, mouse, overlay, renderer,
-    widget::{Id, Operation, Tree, tree},
+    widget::{Operation, Tree, tree},
 };
 use iced::{Event, Rectangle, Size, Vector};
 use std::cell::RefCell;
@@ -37,28 +32,10 @@ pub(super) fn kept<'a>(
     build: impl Fn() -> Element<'static, Message> + 'a,
 ) -> Element<'a, Message> {
     Element::new(Retained {
-        source: Source::Kept {
-            fingerprint,
-            build: Box::new(build),
-        },
+        fingerprint,
+        build: Box::new(build),
         pending: RefCell::new(None),
     })
-}
-
-/// An exchange drawn afresh this frame, in the same place a kept one would be.
-pub(super) fn fresh<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
-    Element::new(Retained {
-        source: Source::Fresh(content.into()),
-        pending: RefCell::new(None),
-    })
-}
-
-enum Source<'a> {
-    Kept {
-        fingerprint: u64,
-        build: Box<dyn Fn() -> Element<'static, Message> + 'a>,
-    },
-    Fresh(Element<'a, Message>),
 }
 
 /// Bracket an exchange so an operation that changes descendant layout can
@@ -69,7 +46,8 @@ pub(super) enum LayoutInvalidation {
 }
 
 struct Retained<'a> {
-    source: Source<'a>,
+    fingerprint: u64,
+    build: Box<dyn Fn() -> Element<'static, Message> + 'a>,
     /// The tree of an element built by `state`, handed to `children`, which
     /// iced asks for next when it mounts the widget.
     pending: RefCell<Option<Tree>>,
@@ -95,27 +73,15 @@ impl<'a> Retained<'a> {
         let Tree {
             state, children, ..
         } = tree;
-        let child = &mut children[0];
-        match &mut self.source {
-            Source::Fresh(element) => (element.as_widget_mut(), child),
-            Source::Kept { .. } => {
-                let memo = state.downcast_mut::<Memo>();
-                let (_, element) = memo.kept.as_mut().expect("a kept exchange is built");
-                (element.as_widget_mut(), child)
-            }
-        }
+        let memo = state.downcast_mut::<Memo>();
+        let (_, element) = memo.kept.as_mut().expect("a kept exchange is built");
+        (element.as_widget_mut(), &mut children[0])
     }
 
     fn parts_ref<'t>(&'t self, tree: &'t Tree) -> (&'t Dyn<'t>, &'t Tree) {
-        let child = &tree.children[0];
-        match &self.source {
-            Source::Fresh(element) => (element.as_widget(), child),
-            Source::Kept { .. } => {
-                let memo = tree.state.downcast_ref::<Memo>();
-                let (_, element) = memo.kept.as_ref().expect("a kept exchange is built");
-                (element.as_widget(), child)
-            }
-        }
+        let memo = tree.state.downcast_ref::<Memo>();
+        let (_, element) = memo.kept.as_ref().expect("a kept exchange is built");
+        (element.as_widget(), &tree.children[0])
     }
 }
 
@@ -125,30 +91,16 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Retained<'_> {
     }
 
     fn state(&self) -> tree::State {
-        let mut memo = Memo::default();
-        let child = match &self.source {
-            Source::Fresh(element) => Tree::new(element),
-            Source::Kept { fingerprint, build } => {
-                let element = build();
-                let child = Tree::new(&element);
-                memo.kept = Some((*fingerprint, element));
-                child
-            }
-        };
-        *self.pending.borrow_mut() = Some(child);
-        tree::State::new(memo)
+        let element = (self.build)();
+        *self.pending.borrow_mut() = Some(Tree::new(&element));
+        tree::State::new(Memo {
+            kept: Some((self.fingerprint, element)),
+            laid_out: None,
+        })
     }
 
     fn children(&self) -> Vec<Tree> {
-        vec![
-            self.pending
-                .borrow_mut()
-                .take()
-                .unwrap_or_else(|| match &self.source {
-                    Source::Fresh(element) => Tree::new(element),
-                    Source::Kept { .. } => Tree::empty(),
-                }),
-        ]
+        vec![self.pending.borrow_mut().take().unwrap_or_else(Tree::empty)]
     }
 
     fn diff(&mut self, tree: &mut Tree) {
@@ -156,31 +108,19 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Retained<'_> {
             state, children, ..
         } = tree;
         let memo = state.downcast_mut::<Memo>();
-        match &mut self.source {
-            Source::Fresh(element) => {
-                memo.kept = None;
-                memo.laid_out = None;
-                children[0].diff(element.as_widget_mut());
-            }
-            Source::Kept { fingerprint, build } => {
-                if memo.fingerprint() == Some(*fingerprint) {
-                    return;
-                }
-                let mut element = build();
-                children[0].diff(element.as_widget_mut());
-                memo.kept = Some((*fingerprint, element));
-                memo.laid_out = None;
-            }
+        if memo.fingerprint() == Some(self.fingerprint) {
+            return;
         }
+        let mut element = (self.build)();
+        children[0].diff(element.as_widget_mut());
+        memo.kept = Some((self.fingerprint, element));
+        memo.laid_out = None;
     }
 
     fn size(&self) -> Size<Length> {
-        match &self.source {
-            Source::Fresh(element) => element.as_widget().size(),
-            // A transcript row fills the width and takes the height it needs,
-            // whatever it holds; the column asks before the tree is at hand.
-            Source::Kept { .. } => Size::new(Length::Fill, Length::Shrink),
-        }
+        // A transcript row fills the width and takes the height it needs,
+        // whatever it holds; the column asks before the tree is at hand.
+        Size::new(Length::Fill, Length::Shrink)
     }
 
     fn layout(
@@ -189,9 +129,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Retained<'_> {
         renderer: &cosmic::Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
-        let kept = matches!(self.source, Source::Kept { .. });
-        if kept
-            && let Some((kept_limits, node)) = &tree.state.downcast_ref::<Memo>().laid_out
+        if let Some((kept_limits, node)) = &tree.state.downcast_ref::<Memo>().laid_out
             && kept_limits == limits
         {
             let _stage = chat_stage::scope(Stage::RetainedClone);
@@ -199,9 +137,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Retained<'_> {
         }
         let (element, child) = self.parts(tree);
         let node = element.layout(child, renderer, limits);
-        if kept {
-            tree.state.downcast_mut::<Memo>().laid_out = Some((*limits, node.clone()));
-        }
+        tree.state.downcast_mut::<Memo>().laid_out = Some((*limits, node.clone()));
         node
     }
 
@@ -298,19 +234,6 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Retained<'_> {
         element.a11y_nodes(layout, child, cursor)
     }
 
-    fn id(&self) -> Option<Id> {
-        match &self.source {
-            Source::Fresh(element) => element.as_widget().id(),
-            Source::Kept { .. } => None,
-        }
-    }
-
-    fn set_id(&mut self, id: Id) {
-        if let Source::Fresh(element) = &mut self.source {
-            element.as_widget_mut().set_id(id);
-        }
-    }
-
     fn drag_destinations(
         &self,
         tree: &Tree,
@@ -333,38 +256,20 @@ mod tests {
 
     /// A fixed-size leaf that counts its layouts, and asks for a new one when
     /// it receives any event, the way a widget that changed its own size does.
-    /// Its state is numbered when it is mounted, so a test can tell a kept
-    /// tree from a new one.
-    struct Counting(Rc<Cell<usize>>, Rc<Cell<usize>>);
-
-    thread_local! {
-        static MOUNTS: Cell<usize> = const { Cell::new(0) };
-    }
+    struct Counting(Rc<Cell<usize>>);
 
     impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Counting {
-        fn tag(&self) -> tree::Tag {
-            tree::Tag::of::<usize>()
-        }
-
-        fn state(&self) -> tree::State {
-            tree::State::new(MOUNTS.with(|mounts| {
-                mounts.set(mounts.get() + 1);
-                mounts.get()
-            }))
-        }
-
         fn size(&self) -> Size<Length> {
             Size::new(Length::Fill, Length::Fixed(20.0))
         }
 
         fn layout(
             &mut self,
-            tree: &mut Tree,
+            _: &mut Tree,
             _: &cosmic::Renderer,
             limits: &layout::Limits,
         ) -> layout::Node {
             self.0.set(self.0.get() + 1);
-            self.1.set(*tree.state.downcast_ref::<usize>());
             layout::Node::new(limits.resolve(Length::Fill, 20.0, Size::ZERO))
         }
 
@@ -399,7 +304,6 @@ mod tests {
         renderer: cosmic::Renderer,
         cache: Cache,
         layouts: Rc<Cell<usize>>,
-        mount: Rc<Cell<usize>>,
     }
 
     impl Frames {
@@ -408,21 +312,15 @@ mod tests {
                 renderer: crate::app::tests::headless_renderer(),
                 cache: Cache::new(),
                 layouts: Rc::default(),
-                mount: Rc::default(),
             }
         }
 
-        /// Builds one frame of a leaf, kept under `fingerprint` or drawn
-        /// fresh without one, and says how many times it was laid out.
-        fn frame(&mut self, fingerprint: Option<u64>, width: f32, events: &[Event]) -> usize {
+        /// Builds one frame of a leaf kept under `fingerprint`, and says how
+        /// many times it was laid out.
+        fn frame(&mut self, fingerprint: u64, width: f32, events: &[Event]) -> usize {
             let before = self.layouts.get();
-            let (layouts, mount) = (self.layouts.clone(), self.mount.clone());
-            let element = match fingerprint {
-                Some(fingerprint) => kept(fingerprint, move || {
-                    Element::new(Counting(layouts.clone(), mount.clone()))
-                }),
-                None => fresh(Element::new(Counting(layouts, mount))),
-            };
+            let layouts = self.layouts.clone();
+            let element = kept(fingerprint, move || Element::new(Counting(layouts.clone())));
             let mut ui = UserInterface::build(
                 element,
                 Size::new(width, 100.0),
@@ -446,51 +344,20 @@ mod tests {
     #[test]
     fn an_unchanged_exchange_is_laid_out_once() {
         let mut frames = Frames::new();
-        assert_eq!(frames.frame(Some(1), 400.0, &[]), 1);
-        assert_eq!(frames.frame(Some(1), 400.0, &[]), 0, "the same frame again");
-        assert_eq!(
-            frames.frame(Some(2), 400.0, &[]),
-            1,
-            "what it draws changed"
-        );
-        assert_eq!(
-            frames.frame(Some(2), 300.0, &[]),
-            1,
-            "the room it has changed"
-        );
-        assert_eq!(frames.frame(Some(2), 300.0, &[]), 0);
+        assert_eq!(frames.frame(1, 400.0, &[]), 1);
+        assert_eq!(frames.frame(1, 400.0, &[]), 0, "the same frame again");
+        assert_eq!(frames.frame(2, 400.0, &[]), 1, "what it draws changed");
+        assert_eq!(frames.frame(2, 300.0, &[]), 1, "the room it has changed");
+        assert_eq!(frames.frame(2, 300.0, &[]), 0);
     }
 
     #[test]
     fn a_widget_that_resizes_itself_is_laid_out_again() {
         let mut frames = Frames::new();
-        assert_eq!(frames.frame(Some(1), 400.0, &[]), 1);
+        assert_eq!(frames.frame(1, 400.0, &[]), 1);
         let event = Event::Mouse(mouse::Event::CursorLeft);
         // The update's own relayout, inside the same frame.
-        assert_eq!(frames.frame(Some(1), 400.0, &[event]), 1);
-        assert_eq!(frames.frame(Some(1), 400.0, &[]), 0);
-    }
-
-    /// Opening a step turns a kept exchange into a fresh one and closing it
-    /// turns it back; the widgets' state lives through both.
-    #[test]
-    fn a_kept_exchange_and_a_fresh_one_share_their_tree() {
-        let mut frames = Frames::new();
-        assert_eq!(frames.frame(Some(1), 400.0, &[]), 1);
-        let mounted = frames.mount.get();
-        assert_eq!(
-            frames.frame(None, 400.0, &[]),
-            1,
-            "a fresh exchange is laid out"
-        );
-        assert_eq!(frames.frame(None, 400.0, &[]), 1, "every frame");
-        assert_eq!(frames.mount.get(), mounted);
-        assert_eq!(
-            frames.frame(Some(1), 400.0, &[]),
-            1,
-            "kept again, rebuilt once"
-        );
-        assert_eq!(frames.frame(Some(1), 400.0, &[]), 0);
-        assert_eq!(frames.mount.get(), mounted);
+        assert_eq!(frames.frame(1, 400.0, &[event]), 1);
+        assert_eq!(frames.frame(1, 400.0, &[]), 0);
     }
 }

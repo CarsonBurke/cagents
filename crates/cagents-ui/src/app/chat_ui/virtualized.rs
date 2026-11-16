@@ -1297,7 +1297,9 @@ mod tests {
 
     #[test]
     fn evicted_reusable_rows_release_element_owners_and_can_mount_again() {
-        struct Lease(Arc<()>);
+        struct Lease {
+            _owner: Arc<()>,
+        }
         impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Lease {
             fn size(&self) -> Size<Length> {
                 Size::new(Length::Fill, Length::Fixed(20.0))
@@ -1336,7 +1338,7 @@ mod tests {
                     Row::new(index, 0, 20.0, None, move || {
                         let owner = Arc::new(());
                         owners.borrow_mut().push(Arc::downgrade(&owner));
-                        Element::new(Lease(owner))
+                        Element::new(Lease { _owner: owner })
                     })
                 })
                 .collect(),

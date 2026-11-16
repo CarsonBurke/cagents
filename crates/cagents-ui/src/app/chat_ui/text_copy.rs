@@ -381,7 +381,7 @@ pub(super) fn write_shared_literal(text: Arc<str>) -> Task<Message> {
 /// joins the shared intent order: starting one supersedes older copies, and
 /// any newer copy (including a widget's own selection copy) supersedes it.
 #[derive(Clone)]
-pub(super) struct Intent {
+pub struct Intent {
     context: ClipboardContext,
     intent: u64,
 }

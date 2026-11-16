@@ -148,6 +148,8 @@ enum SourceData {
         highlight: Option<prose::Highlight>,
         source: reader_source::Source,
     },
+    /// Spans given whole, as tests lay them out.
+    #[cfg(test)]
     Styled(Arc<[Span<'static, markdown::Uri>]>),
 }
 // Requests and Action clones share immutable backing with one final-owner
@@ -161,6 +163,7 @@ impl SourceData {
     fn len(&self) -> usize {
         match self {
             Self::Markdown { text, .. } => text.len(),
+            #[cfg(test)]
             Self::Styled(spans) => spans.iter().map(|span| span.text.len()).sum(),
             Self::Code { range, .. } => range.len(),
         }
@@ -174,6 +177,7 @@ impl SourceData {
                     style: old_style,
                 },
             ) => style == old_style && text.append_proven(old),
+            #[cfg(test)]
             (Self::Styled(spans), Self::Styled(previous)) => Arc::ptr_eq(spans, previous),
             (
                 Self::Code { range, source, .. },
@@ -196,7 +200,9 @@ impl SourceData {
     fn inlines(&self) -> Option<Arc<markdown::Inlines>> {
         match self {
             Self::Markdown { text, .. } => text.inlines(),
-            Self::Styled(_) | Self::Code { .. } => None,
+            #[cfg(test)]
+            Self::Styled(_) => None,
+            Self::Code { .. } => None,
         }
     }
     fn presentation_changed(&self, previous: &Self) -> bool {
@@ -217,6 +223,7 @@ impl SourceData {
     fn materialize(&self) -> (Arc<[Span<'static, markdown::Uri>]>, Arc<str>) {
         match self {
             Self::Markdown { text, style } => (text.spans(*style), text.plain()),
+            #[cfg(test)]
             Self::Styled(spans) => (
                 spans.clone(),
                 spans
@@ -572,7 +579,7 @@ impl Entry {
 }
 
 #[derive(Clone)]
-pub(super) struct Request {
+pub struct Request {
     pub(super) id: u64,
     target: Option<Target>,
     attempt: u64,
@@ -833,7 +840,7 @@ impl Fonts {
 /// Immutable source/width/font-specific geometry. Retaining this is more
 /// expensive than a scroll bookmark; release it with active transcript caches.
 #[derive(Debug)]
-pub(super) struct Prepared {
+pub struct Prepared {
     owned: Option<Box<Geometry>>,
     admission: Mutex<Option<Arc<OutputAdmission>>>,
 }
@@ -866,7 +873,7 @@ impl Drop for Prepared {
 }
 
 #[derive(Debug)]
-pub(super) struct Geometry {
+pub struct Geometry {
     #[cfg(test)]
     retired_on: Option<std::sync::mpsc::Sender<std::thread::ThreadId>>,
     pub(super) snapshot: cosmic_text::LayoutSnapshot,

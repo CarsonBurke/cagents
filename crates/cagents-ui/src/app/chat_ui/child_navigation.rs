@@ -4,7 +4,7 @@ use super::*;
 mod reveal;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(super) enum Filter {
+pub enum Filter {
     #[default]
     All,
     Working,

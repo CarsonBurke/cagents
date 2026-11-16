@@ -581,6 +581,7 @@ fn visible_notice_body(body: &str, expanded: bool) -> String {
     }
 }
 
+#[cfg(test)]
 fn notice_identity(anchor: Option<&str>, message: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hash = std::hash::DefaultHasher::new();
@@ -588,6 +589,7 @@ fn notice_identity(anchor: Option<&str>, message: &str) -> u64 {
     hash.finish()
 }
 
+#[cfg(test)]
 fn notice_entry(message: &str, target: Target, identity: u64) -> Element<'static, Message> {
     widget::container(
         widget::row::with_children(vec![
@@ -969,7 +971,7 @@ pub(super) fn completion_scroll(target: Target, offset: f32) -> Task<Message> {
 /// is waiting on at the edge the rows will appear at, so the direction has to
 /// travel with the request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Page {
+pub enum Page {
     Earlier,
     Newer,
     Latest,

@@ -3126,26 +3126,6 @@ impl RepositoryRuntime {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn failed_active_save_completion(&self) -> RepositoryAction {
-        let DocumentState::Editable(document) = &self.document else {
-            panic!("test fixture requires an editable document");
-        };
-        let ticket = document
-            .active_save
-            .as_ref()
-            .expect("test fixture requires an active save");
-        RepositoryAction::SaveFinished {
-            identity: ticket.identity.clone(),
-            ticket: ticket.id,
-            revision: ticket.revision,
-            saved_text: ticket.snapshot.clone(),
-            result: Err(FileIoError::Io(
-                "injected retry failure before persist".into(),
-            )),
-        }
-    }
-
     /// A card whose file list is loaded and whose `notes.txt` selection is
     /// still in flight, plus the identity that selection's load will carry.
     ///
@@ -13141,7 +13121,7 @@ mod tests {
         #[derive(Clone)]
         enum ShellMessage {
             Preview,
-            Repository(RepositoryAction),
+            Repository,
         }
         let card = CardId::new();
         let mut runtime = RepositoryRuntime::dirty_fixture(card);
@@ -13155,7 +13135,7 @@ mod tests {
                     .on_press(ShellMessage::Preview)
                     .into(),
             ),
-            ShellMessage::Repository,
+            |_| ShellMessage::Repository,
         )
         .unwrap();
         let mut tree = Tree::new(toolbar.as_widget());

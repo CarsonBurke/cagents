@@ -16,6 +16,7 @@ use std::{cell::Cell, rc::Rc};
 
 /// `anchors` names direct children of the transcript column. Only their bounds
 /// and stable identities are retained; the transcript's layout tree is not.
+#[cfg(test)]
 pub(super) fn transcript<'a>(
     content: impl Into<Element<'a, Message>>,
     target: Target,
@@ -191,14 +192,6 @@ impl Memory {
             state.reported = None;
         }
     }
-    pub fn reader_width(&self, context: Option<&str>, identity: u64) -> f32 {
-        self.1
-            .borrow()
-            .entries
-            .get(&(context.map(str::to_owned), identity))
-            .map_or(0.0, |saved| saved.content_width)
-            .max(0.0)
-    }
     pub fn reader_width_for(
         &self,
         context: Option<&str>,
@@ -310,6 +303,7 @@ impl Memory {
             .collect();
     }
 
+    #[cfg(test)]
     pub fn retained_rows(&self) -> usize {
         self.0
             .borrow()
@@ -453,11 +447,11 @@ pub(super) fn steps_id(id: &str) -> Id {
 /// for the resulting layout, and retries until `exact` or its bounded limit.
 /// Wheel/drag navigation must cancel that pending correction in the caller.
 #[derive(Clone, Debug)]
-pub(super) struct LogicalLocation {
+pub struct LogicalLocation {
     pub offset: f32,
     pub exact: bool,
     pub stage: u8,
-    pub shape_pending: Option<flow_layout::PendingGeometry>,
+    pub(super) shape_pending: Option<flow_layout::PendingGeometry>,
     horizontal: Vec<(Id, f32)>,
 }
 

@@ -1118,6 +1118,7 @@ impl SnapshotStore {
 
     /// Binds `doc` to `uri`, seeding or extending the URI's version stream.
     /// `None` when the URI's version stream is exhausted.
+    #[cfg(test)]
     fn register(
         &self,
         doc: LspDocumentId,
@@ -4338,6 +4339,7 @@ impl LspManager {
         Some(status)
     }
 
+    #[cfg(test)]
     fn open_at_root(
         &mut self,
         doc: LspDocumentId,

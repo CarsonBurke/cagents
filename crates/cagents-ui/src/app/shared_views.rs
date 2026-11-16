@@ -6560,7 +6560,7 @@ mod tests {
             observe_rename(&mut app, channel, &format!("Renamed {index}"));
         }
         assert_eq!(app.replica_capture.offers, offers, "nothing is saved yet");
-        drop(std::iter::from_fn(|| rx.try_recv().ok()).count());
+        std::iter::from_fn(|| rx.try_recv().ok()).for_each(drop);
         app.shared_views.local_projection_count.set(0);
         drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
         assert_eq!(app.shared_views.local_projection_count.get(), 0);

@@ -18,6 +18,7 @@ pub(in crate::app::chat_ui) struct Catalog(Option<Box<CatalogData>>);
 pub(in crate::app::chat_ui) struct CatalogData {
     read: Read,
     positions: HashMap<u64, usize>,
+    #[cfg(test)]
     plain_bytes: usize,
     prefix_hashes: HashMap<u64, Arc<Vec<[u8; 32]>>>,
     owners: HashMap<u64, Arc<str>>,
@@ -36,11 +37,13 @@ impl Drop for Catalog {
     }
 }
 impl Catalog {
+    #[cfg(test)]
     pub fn retained_plain_bytes(&self) -> usize {
         self.plain_bytes
     }
     /// Cheap immutable input for background Find indexing. This clones Arc
     /// handles only, and never creates styled spans or font paragraphs.
+    #[cfg(test)]
     pub fn search_blocks(&self) -> Vec<(u64, Arc<str>)> {
         self.read
             .blocks
@@ -310,6 +313,7 @@ impl Builder {
             }
         }
     }
+    #[cfg(test)]
     pub fn finish(self) -> Arc<Catalog> {
         self.finish_reusing(None)
     }
@@ -321,6 +325,7 @@ impl Builder {
             .enumerate()
             .map(|(index, block)| (block.identity, index))
             .collect();
+        #[cfg(test)]
         let plain_bytes = self.read.blocks.iter().map(|block| block.plain.len()).sum();
         let prefix_hashes = self
             .read
@@ -350,6 +355,7 @@ impl Builder {
         Arc::new(Catalog(Some(Box::new(CatalogData {
             read: self.read,
             positions,
+            #[cfg(test)]
             plain_bytes,
             prefix_hashes,
             owners: self.owners,

@@ -1809,7 +1809,6 @@ mod keyboard_table_tests {
             updates: update_ui::UpdateSummary {
                 status: String::new(),
                 failed: false,
-                checking: false,
                 can_check: false,
                 available: None,
                 apply_blocker: None,

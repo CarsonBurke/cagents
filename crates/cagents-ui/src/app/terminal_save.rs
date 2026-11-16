@@ -24,7 +24,7 @@ pub(super) struct Failure {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct SaveError {
+pub struct SaveError {
     reason: String,
     diagnostics: String,
 }
@@ -56,7 +56,7 @@ pub(super) struct State {
 }
 
 #[derive(Debug, Clone)]
-pub(super) enum Action {
+pub enum Action {
     Retry(CardId, TerminalId),
     Finished {
         card: CardId,

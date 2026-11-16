@@ -67,19 +67,8 @@ impl Stats {
         }
     }
 }
-#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
-enum Kind {
-    #[default]
-    Items,
-    Item,
-    Bullet,
-    TableRow,
-    Cell,
-    ImageText,
-}
 #[derive(Default)]
 struct Metadata {
-    kind: Kind,
     stats: Stats,
     outline: std::ops::Range<usize>,
     children: Vec<Metadata>,
@@ -94,12 +83,7 @@ struct Binding {
     prefix: Box<[u32]>,
 }
 impl Metadata {
-    fn items(
-        items: &[markdown::Item],
-        path: &mut Vec<u32>,
-        outline: &mut Vec<Leaf>,
-        kind: Kind,
-    ) -> Self {
+    fn items(items: &[markdown::Item], path: &mut Vec<u32>, outline: &mut Vec<Leaf>) -> Self {
         let start = outline.len();
         let mut stats = Stats::default();
         let children = items
@@ -115,20 +99,18 @@ impl Metadata {
             .collect();
         stats.nodes = stats.nodes.saturating_add(1);
         Self {
-            kind,
             stats,
             outline: start..outline.len(),
             children,
         }
     }
-    fn text(bytes: usize, path: &[u32], outline: &mut Vec<Leaf>, kind: Kind) -> Self {
+    fn text(bytes: usize, path: &[u32], outline: &mut Vec<Leaf>) -> Self {
         let start = outline.len();
         outline.push(Leaf {
             path: path.into(),
             bytes,
         });
         Self {
-            kind,
             stats: Stats {
                 bytes,
                 leaves: 1,
@@ -146,11 +128,9 @@ impl Metadata {
         use markdown::Item;
         let start = outline.len();
         match item {
-            Item::Paragraph(text) | Item::Heading(_, text) => {
-                Self::text(text.len(), path, outline, Kind::Item)
-            }
+            Item::Paragraph(text) | Item::Heading(_, text) => Self::text(text.len(), path, outline),
             Item::CodeBlock { code, .. } => {
-                let mut metadata = Self::text(code.len(), path, outline, Kind::Item);
+                let mut metadata = Self::text(code.len(), path, outline);
                 metadata.stats.prose_bytes = 0;
                 metadata.stats.prose_rows = 0;
                 metadata.stats.code_rows = code
@@ -161,7 +141,7 @@ impl Metadata {
                     .max(1);
                 metadata
             }
-            Item::Quote(items) => Self::items(items, path, outline, Kind::Item),
+            Item::Quote(items) => Self::items(items, path, outline),
             Item::List { bullets, .. } => {
                 let mut stats = Stats::default();
                 let children = bullets
@@ -171,7 +151,7 @@ impl Metadata {
                         let (markdown::Bullet::Point { items }
                         | markdown::Bullet::Task { items, .. }) = bullet;
                         path.push(index as u32);
-                        let metadata = Self::items(items, path, outline, Kind::Bullet);
+                        let metadata = Self::items(items, path, outline);
                         path.pop();
                         stats.vertical(metadata.stats);
                         metadata
@@ -179,7 +159,6 @@ impl Metadata {
                     .collect();
                 stats.nodes = stats.nodes.saturating_add(1);
                 Self {
-                    kind: Kind::Item,
                     stats,
                     outline: start..outline.len(),
                     children,
@@ -205,7 +184,7 @@ impl Metadata {
                                         .map_or(&[][..], Vec::as_slice)
                                 };
                                 path.push(column as u32);
-                                let metadata = Self::items(items, path, outline, Kind::Cell);
+                                let metadata = Self::items(items, path, outline);
                                 path.pop();
                                 row_stats.horizontal(metadata.stats);
                                 metadata
@@ -215,7 +194,6 @@ impl Metadata {
                         row_stats.nodes = row_stats.nodes.saturating_add(1);
                         stats.vertical(row_stats);
                         Self {
-                            kind: Kind::TableRow,
                             stats: row_stats,
                             outline: row_start..outline.len(),
                             children: cells,
@@ -224,7 +202,6 @@ impl Metadata {
                     .collect();
                 stats.nodes = stats.nodes.saturating_add(1);
                 Self {
-                    kind: Kind::Item,
                     stats,
                     outline: start..outline.len(),
                     children,
@@ -244,7 +221,7 @@ impl Metadata {
                 let caption = if title.is_empty() {
                     Self::default()
                 } else {
-                    Self::text(title_text.len(), path, outline, Kind::ImageText)
+                    Self::text(title_text.len(), path, outline)
                 };
                 path.pop();
                 stats.vertical(caption.stats);
@@ -256,14 +233,12 @@ impl Metadata {
                 }
                 stats.nodes = stats.nodes.saturating_add(1);
                 Self {
-                    kind: Kind::Item,
                     stats,
                     outline: start..outline.len(),
                     children,
                 }
             }
             Item::Rule => Self {
-                kind: Kind::Item,
                 stats: Stats {
                     nodes: 1,
                     prose_rows: 1,
@@ -296,7 +271,7 @@ impl Data {
     }
     pub(super) fn items(items: Vec<markdown::Item>) -> Self {
         let mut outline = Vec::new();
-        let metadata = Metadata::items(&items, &mut Vec::new(), &mut outline, Kind::Items);
+        let metadata = Metadata::items(&items, &mut Vec::new(), &mut outline);
         Self {
             items,
             metadata,
@@ -588,14 +563,6 @@ mod tests {
             .iter()
             .position(|item| matches!(item, markdown::Item::Table { .. }))
             .unwrap();
-        assert_eq!(
-            document.metadata(&[table as u32, 0]).unwrap().kind,
-            Kind::TableRow
-        );
-        assert_eq!(
-            document.metadata(&[table as u32, 0, 0]).unwrap().kind,
-            Kind::Cell
-        );
         let chunk = document.logical_ranges(&id, &[0], &[table as u32, 0, 0], true);
         assert!(chunk.iter().all(|logical| logical.chunk));
         assert!(chunk.iter().all(|logical| {
