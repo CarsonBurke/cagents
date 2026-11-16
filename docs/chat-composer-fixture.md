@@ -166,7 +166,7 @@ multiline Bash command. It records complete tool inputs and results in the
 synthetic provider history, so the same transcript can be reopened.
 
 In the native chat, expand the activity group and check that the closed MCP
-row says `src/app.rs`, the Skill row says `writing-copy`, and neither shows
+row says `crates/cagents-ui/src/app.rs`, the Skill row says `writing-copy`, and neither shows
 internal framing. The failed `private.txt` step must retain `Permission denied`.
 The shell preview must show `cat <<EOF` without its heredoc payload. Expand
 individual steps and verify their complete Input/Output remains selectable
