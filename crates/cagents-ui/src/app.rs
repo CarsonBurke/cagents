@@ -210,7 +210,7 @@ pub fn application_window_icon() -> window::Icon {
     .expect("embedded application icon dimensions must match its RGBA pixels")
 }
 
-#[cfg(any(feature = "integrated-browser", test))]
+#[cfg(feature = "integrated-browser")]
 const INITIAL_HYDRATION_EPOCH: u64 = 1;
 
 #[cfg(feature = "integrated-browser")]
@@ -331,6 +331,7 @@ enum NoticeKey {
     /// Closing this chat, which the daemon refused.
     ChatClose(CardId),
     /// Finding the integrated browser, which the last check could not.
+    #[cfg(feature = "integrated-browser")]
     BrowserUnavailable,
     /// Saving the reservation for this already running terminal.
     TerminalSave(CardId, TerminalId),
@@ -1879,19 +1880,16 @@ pub(crate) fn display_path(path: &Path) -> Cow<'_, str> {
     }
 }
 
-/// The process's starting directory, already formatted for display.
+/// The process's starting directory, resolved once.
 ///
 /// Nothing in this application calls `set_current_dir`, so this value cannot
-/// change while the process runs. The empty-workspace surface is the default
-/// first-run view and `view` re-runs on every redraw, so resolving this there
-/// cost a blocking `getcwd` plus three allocations per frame.
+/// change while the process runs. Views that re-run on every redraw read it,
+/// so resolving it there would cost a blocking `getcwd` per frame.
 static STARTING_DIRECTORY: LazyLock<PathBuf> = LazyLock::new(|| {
     crate::device::home()
         .cloned()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")))
 });
-static STARTING_DIRECTORY_CAPTION: LazyLock<String> =
-    LazyLock::new(|| format!("Starting directory: {}", display_path(&STARTING_DIRECTORY)));
 
 /// A terminal that has never run, under a new identity, waiting to launch `launch`.
 pub(super) fn fresh_terminal_session(launch: LaunchRecipe) -> TerminalSession {
@@ -2640,21 +2638,6 @@ struct InspectorTransition {
     started_at: Instant,
     from: f32,
     to: f32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ContextOverlayChange {
-    Entered,
-    Exited,
-    Unchanged,
-}
-
-const fn context_overlay_change(was_overlay: bool, is_overlay: bool) -> ContextOverlayChange {
-    match (was_overlay, is_overlay) {
-        (false, true) => ContextOverlayChange::Entered,
-        (true, false) => ContextOverlayChange::Exited,
-        _ => ContextOverlayChange::Unchanged,
-    }
 }
 
 impl InspectorTransition {
@@ -5087,6 +5070,7 @@ impl BrowserAddress {
     /// redacted presentation. A restored or reported location therefore keeps
     /// its complete URL when the user submits the unchanged address, while a
     /// submitted draft is immediately replaced by its safe presentation.
+    #[cfg(test)]
     fn submit(&mut self) -> Result<Url, ()> {
         self.submit_with_search("https://duckduckgo.com/?q={query}")
     }
@@ -20598,13 +20582,6 @@ mod tests {
             panic!("New terminal must create a terminal without a project");
         };
         assert_eq!(terminal.launch.working_directory, *STARTING_DIRECTORY);
-        assert_eq!(
-            *STARTING_DIRECTORY_CAPTION,
-            format!(
-                "Starting directory: {}",
-                display_path(&terminal.launch.working_directory)
-            ),
-        );
         assert!(app.sidebar_model.projects.is_empty());
     }
 

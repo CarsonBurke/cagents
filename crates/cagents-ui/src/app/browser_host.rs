@@ -27,18 +27,22 @@ pub(super) fn presentation_title<'a>(kind: &CardKind, title: &'a str) -> &'a str
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LoadState {
     Loading,
+    #[cfg(any(feature = "integrated-browser", test))]
     Ready,
     Failed,
     Unavailable,
+    #[cfg(any(feature = "integrated-browser", test))]
     Suspended,
 }
 impl LoadState {
     fn label(self) -> &'static str {
         match self {
             Self::Loading => "Loading",
+            #[cfg(any(feature = "integrated-browser", test))]
             Self::Ready => "Ready",
             Self::Failed => "Failed",
             Self::Unavailable => "Unavailable",
+            #[cfg(any(feature = "integrated-browser", test))]
             Self::Suspended => "Suspended",
         }
     }

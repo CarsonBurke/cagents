@@ -1289,7 +1289,7 @@ impl Cagents {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(feature = "integrated-browser")))]
     pub(super) fn remember_channel_name_for_test(&mut self, id: ChannelId, title: String) {
         self.remember_channel_name(id, title, crate::model::ChannelTitleSource::Provider);
     }

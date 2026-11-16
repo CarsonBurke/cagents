@@ -367,6 +367,7 @@ impl Preview {
         self.spans = prose::CodeBlock::drawn(self.language.token(), &self.text, theme);
     }
 
+    #[cfg(test)]
     pub(super) fn view(&self) -> Element<'static, Message> {
         let text =
             iced::widget::rich_text(self.spans[usize::from(cosmic::theme::is_dark())].clone())
@@ -389,6 +390,7 @@ impl Preview {
     }
 
     /// The step's latest output, on one muted line under what it is.
+    #[cfg(test)]
     pub(super) fn tail_view(&self) -> Option<Element<'static, Message>> {
         (!self.tail.is_empty()).then(|| {
             crate::ui_controls::FadeText::caption(self.tail.clone())
@@ -481,6 +483,7 @@ impl ToolText {
     }
 
     /// Bounded output follows its last line; matching uses original text bytes.
+    #[cfg(test)]
     pub(super) fn view(
         &self,
         theme: crate::settings::EditorSyntaxTheme,
@@ -507,17 +510,6 @@ impl ToolText {
         find: Option<&str>,
     ) -> Element<'static, Message> {
         self.surface(theme, Some((height, false)), target, find, None, None)
-    }
-
-    pub(super) fn view_logical(
-        &self,
-        theme: crate::settings::EditorSyntaxTheme,
-        limit: Option<(f32, bool)>,
-        target: Target,
-        find: Option<&str>,
-        logical: selectable_prose::Logical,
-    ) -> Element<'static, Message> {
-        self.surface(theme, limit, target, find, Some(logical), None)
     }
 
     /// `limit` is the height the text scrolls within and whether it follows

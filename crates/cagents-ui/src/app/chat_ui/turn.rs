@@ -593,6 +593,7 @@ pub(super) fn command_description(content: &ItemContent) -> Option<&str> {
 
 /// A description the closed row keeps beside a command whose first line is
 /// not the whole of it: a heredoc, a script, or a continued line.
+#[cfg(test)]
 pub(super) fn script_description(content: &ItemContent) -> Option<&str> {
     let ItemContent::Command { command, .. } = content else {
         return None;

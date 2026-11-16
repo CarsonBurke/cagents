@@ -545,17 +545,6 @@ impl From<&str> for KeptPane {
 /// own conversation, which the daemon no longer hosts, is closed with that
 /// agent as the conversation's own Close would, and only once every check has
 /// let the pane go.
-pub(super) fn prove_not_hosted(
-    session: &TerminalSession,
-    leave: &[UnreadableProcess],
-) -> Result<super::shared_views::TerminalRemovalReceipt, KeptPane> {
-    prove_not_hosted_for(
-        session,
-        leave,
-        &super::shared_views::TerminalCleanupAuthority::Local,
-    )
-}
-
 pub(super) fn prove_not_hosted_for(
     session: &TerminalSession,
     leave: &[UnreadableProcess],

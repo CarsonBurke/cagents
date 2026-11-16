@@ -31,7 +31,7 @@ pub(super) struct Entry {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) enum Directory {
+pub enum Directory {
     Available,
     Missing,
     Unknown,
@@ -45,7 +45,7 @@ enum Disposition {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) enum Command {
+pub enum Command {
     Reconnect,
     Relaunch,
     CopyDetails,
@@ -56,7 +56,7 @@ pub(super) enum Command {
 }
 
 #[derive(Debug, Clone)]
-pub(super) enum Action {
+pub enum Action {
     User {
         card: CardId,
         request: uuid::Uuid,

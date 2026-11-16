@@ -25,6 +25,7 @@ pub(super) use document::{
 static NEXT: AtomicU64 = AtomicU64::new(1);
 application_atomic!(fn active() -> AtomicU64);
 
+#[cfg(test)]
 pub(super) fn transcript<'a>(
     content: impl Into<Element<'a, Message>>,
     target: Target,
@@ -243,6 +244,7 @@ struct Block {
     plain: Arc<str>,
     /// What parts of `plain` copy as instead; see [`markdown::Inlines`].
     copies: Option<Arc<markdown::Inlines>>,
+    #[cfg(test)]
     bounds: Rectangle,
     visible: Option<Rectangle>,
     hit: usize,
@@ -897,6 +899,7 @@ impl Operation for Read {
             cell,
             plain,
             copies,
+            #[cfg(test)]
             bounds,
             visible: mounted
                 .then(|| {
@@ -2686,7 +2689,6 @@ mod tests {
                 code: Arc::from(content),
                 source: Arc::from(content),
                 reader_source: Box::new(super::reader_source::Source::new(content)),
-                lines: Vec::new(),
             }];
         });
         let mut tree = Tree::new(element.as_widget());
@@ -2711,7 +2713,6 @@ mod tests {
                     code: Arc::from(code),
                     source: Arc::from(code),
                     reader_source: Box::new(super::reader_source::Source::new(code)),
-                    lines: Vec::new(),
                 })
                 .collect();
         });

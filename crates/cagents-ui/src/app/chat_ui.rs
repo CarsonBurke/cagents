@@ -1497,6 +1497,7 @@ impl ChangeToken {
     }
     /// The item's body when the only change since this token was taken is bytes
     /// appended to it, so the cached parse can be extended instead of redone.
+    #[cfg(test)]
     fn appended<'a>(&self, previous: &str, content: &'a ItemContent) -> Option<&'a str> {
         self.appended_known(previous, content, false)
     }
@@ -2536,6 +2537,7 @@ impl CachedItem {
 
     /// The fence whose info string is `language` and whose text is `code`,
     /// where the cache holds it.
+    #[cfg(test)]
     fn block(&self, language: Option<&str>, code: &str) -> Option<&prose::CodeBlock> {
         if code.len() > Self::HIGHLIGHT_LIMIT {
             return None;
@@ -2691,7 +2693,7 @@ impl ComposerRow {
 
 /// One entry of the `+` menu: an action of the composer's own, or a command
 /// or skill it names into the draft exactly as slash completion would.
-pub(super) enum MenuEntry<'a> {
+enum MenuEntry<'a> {
     Row(ComposerRow),
     Named(completion::Candidate<'a>),
 }
@@ -4577,7 +4579,7 @@ impl Runtime {
     /// search. Commands are offered only for an empty draft, the one place
     /// the provider reads them as commands, as completion offers them only
     /// at the head of a message. Compaction has a row of its own.
-    pub(super) fn composer_menu_names(&self) -> Vec<completion::Candidate<'_>> {
+    fn composer_menu_names(&self) -> Vec<completion::Candidate<'_>> {
         let blank = self.attachments.is_empty()
             && self
                 .composer
@@ -4624,7 +4626,7 @@ impl Runtime {
 
     /// The `+` menu in the order it lists its entries, narrowed by its
     /// search, each with whether it can be pressed now.
-    pub(super) fn composer_menu(&self, transitioning: bool) -> Vec<(MenuEntry<'_>, bool)> {
+    fn composer_menu(&self, transitioning: bool) -> Vec<(MenuEntry<'_>, bool)> {
         let query = self.composer_actions_search();
         // Every word searched for starts a word of what the row does.
         let found = |row: ComposerRow| {
@@ -4849,7 +4851,7 @@ impl Runtime {
             None => self.unfolded.contains(key),
         }
     }
-    pub(super) fn prepared_prompt(&self, item: &chat::Item) -> Option<&prompt::Prepared> {
+    fn prepared_prompt(&self, item: &chat::Item) -> Option<&prompt::Prepared> {
         self.presentation_cache()
             .get(&item.id)
             .filter(|cached| {
@@ -5313,13 +5315,6 @@ impl Runtime {
             self.find_navigation.changed_document();
         }
         retired_metadata
-    }
-
-    pub(super) fn preparation_metrics(&self) -> (usize, usize) {
-        (
-            self.preparation.queued_bytes(),
-            preparation::State::global_queued_bytes(),
-        )
     }
 
     /// Install the answer being written in the update that staged it, so

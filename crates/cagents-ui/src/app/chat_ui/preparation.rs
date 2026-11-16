@@ -789,6 +789,7 @@ impl State {
             })
             .map(|canonical| canonical.parsed.markdown.parsed_work_bytes())
     }
+    #[cfg(test)]
     pub(super) fn queued_bytes(&self) -> usize {
         self.entries
             .values()
@@ -799,9 +800,6 @@ impl State {
                     .map(|(_, entry)| entry.shared.lease.bytes()),
             )
             .sum()
-    }
-    pub(super) fn global_queued_bytes() -> usize {
-        reserved().load(Ordering::Relaxed)
     }
     pub(super) fn error(&self) -> Option<&str> {
         self.errors
@@ -1187,9 +1185,6 @@ impl Prepared {
     }
     pub(super) fn item(&self) -> &Arc<chat::Item> {
         self.request.input.transcript().expect("transcript output")
-    }
-    pub(super) fn growing(&self) -> bool {
-        self.request.growing
     }
     pub(super) fn discard(self) {
         retire(Retired {
@@ -1668,7 +1663,7 @@ impl Drop for Handoff {
     }
 }
 #[derive(Clone)]
-pub(super) struct Ready(Arc<ReplySlot>);
+pub struct Ready(Arc<ReplySlot>);
 impl Ready {
     fn new(result: Result<Prepared, String>) -> Self {
         Self(Arc::new(ReplySlot(Mutex::new(Some(result)))))

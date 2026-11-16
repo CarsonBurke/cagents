@@ -15,7 +15,7 @@ const PNG: &str = "image/png";
 
 /// Which displayed image an action refers to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(in crate::app) enum ImageRef {
+pub enum ImageRef {
     /// A transcript preview of the conversation `Target` shows.
     Transcript(Target, Id),
     /// An entry of the open image viewer.
@@ -23,7 +23,7 @@ pub(in crate::app) enum ImageRef {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(in crate::app) enum ImageCommand {
+pub enum ImageCommand {
     Open,
     Copy,
     CopyPath,
@@ -44,7 +44,7 @@ pub(in crate::app) struct Resolved {
 /// through messages. Each paste request receives its own copy on the clipboard
 /// worker thread.
 #[derive(Clone)]
-pub(in crate::app) struct Png(std::sync::Arc<[u8]>);
+pub struct Png(std::sync::Arc<[u8]>);
 
 impl AsMimeTypes for Png {
     fn available(&self) -> Cow<'static, [String]> {

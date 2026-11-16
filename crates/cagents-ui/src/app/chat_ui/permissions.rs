@@ -3,7 +3,7 @@
 use super::*;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(super) enum Page {
+pub enum Page {
     #[default]
     Blocked,
     Rules,

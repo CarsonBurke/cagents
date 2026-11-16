@@ -621,7 +621,7 @@ impl std::fmt::Debug for SessionRuntime {
 }
 
 impl SessionRuntime {
-    #[cfg(test)]
+    #[cfg(all(test, not(feature = "integrated-browser")))]
     pub(crate) fn poison_queue_for_test(&self) {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = self.queue.0.lock().unwrap();

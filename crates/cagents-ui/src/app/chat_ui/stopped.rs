@@ -45,6 +45,7 @@ impl Press {
 }
 
 impl Runtime {
+    #[cfg(test)]
     pub(super) fn stopped(&self, transitioning: bool, resuming: bool) -> Stopped {
         self.stopped_with_offer(transitioning, resuming, self.offers_fresh_conversation())
     }

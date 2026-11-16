@@ -661,32 +661,6 @@ std::thread_local! {
 /// The replacement is prepared privately, then the actual current destination
 /// is acquired and verified. Publication and error restoration never replace
 /// an entry another writer installed at the destination.
-fn publish_replacement(
-    parent: &Root,
-    name: &Path,
-    destination: &File,
-    bytes: &[u8],
-    permissions: Permissions,
-    baseline: &SaveBaseline,
-    context: &FilesystemRecoveryContext,
-    before_publish: impl FnOnce() -> io::Result<()>,
-    sync_parent: impl FnOnce(&Root) -> io::Result<()>,
-) -> Result<SaveDurability, FileIoError> {
-    publish_with_hooks(
-        parent,
-        name,
-        destination,
-        bytes,
-        permissions,
-        baseline,
-        context,
-        before_publish,
-        |_, _| Ok(()),
-        |_, _| Ok(()),
-        sync_parent,
-    )
-}
-
 fn publish_with_hooks(
     parent: &Root,
     name: &Path,

@@ -94,6 +94,7 @@ impl SearchSnapshot {
             .filter_map(|index| self.source.line(index).map(|line| line.text))
     }
 
+    #[cfg(test)]
     pub(crate) fn find_matches(
         &self,
         query: &str,
@@ -293,6 +294,7 @@ impl SearchSnapshot {
     }
 
     /// Build a replacement in source order: each source byte is copied once.
+    #[cfg(test)]
     pub(crate) fn replace_matches(
         &self,
         matches: impl IntoIterator<Item = impl std::borrow::Borrow<(Position, Position)>>,
