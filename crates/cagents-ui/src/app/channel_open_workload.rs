@@ -466,6 +466,49 @@ fn channel_open_timing() {
     }
 }
 
+/// Opening worktrees from the sidebar, each holding a terminal so that none
+/// opens a default pane: the `update` that handles the click, whose share of
+/// the work grows with the worktrees the window has known when ownership is
+/// resolved against every one of them.
+#[test]
+#[ignore = "timing workload; run optimized with --ignored --nocapture"]
+fn worktree_open_timing() {
+    let (mut app, _channels, _directory) = large_workspace(&Scale::LARGE);
+    let project = &app.sidebar_model.projects[0];
+    let rows = &project.worktrees;
+    let row_count = rows.len();
+    // The worktrees `large_workspace` gives a loose terminal.
+    let targets = (0..Scale::LARGE.loose_terminals)
+        .map(|index| {
+            let row = &rows[1 + index * 7 % (rows.len() - 1)];
+            SidebarAction::OpenWorktree {
+                project_id: project.id,
+                worktree_id: row.id,
+                path: row.path.clone(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut updates = Vec::new();
+    for round in 0..4 {
+        for (index, action) in targets.iter().enumerate() {
+            let started = Instant::now();
+            drop(app.update(Message::Sidebar(action.clone())));
+            let elapsed = started.elapsed();
+            assert!(app.navigation_save.is_some(), "the click defers its save");
+            drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
+            if round > 0 || index >= 5 {
+                updates.push(elapsed);
+            }
+        }
+    }
+    eprintln!(
+        "worktree open workload: {} known worktree roots, {} rows",
+        app.known_worktree_roots.len(),
+        row_count,
+    );
+    summary("update(OpenWorktree)", &mut updates);
+}
+
 /// What the save a channel click defers costs the UI thread when it comes
 /// due, clicking channels in `channel_open_timing`'s order. The whole
 /// `NavigationSaveDue` update is timed untraced: the save, then the full
