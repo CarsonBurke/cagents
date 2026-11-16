@@ -1080,10 +1080,7 @@ mod tests {
                 };
                 let child = late_original.child.take().unwrap();
                 match reservation.retain(child, pidfd) {
-                    Ok(()) => {
-                        late_original.armed = false;
-                        Ok(())
-                    }
+                    Ok(()) => Ok(()),
                     Err((error, child, _, reservation)) => {
                         late_original.child = Some(child);
                         // Reap via the original cleanup owner before returning
