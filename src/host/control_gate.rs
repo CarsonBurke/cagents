@@ -11,14 +11,27 @@
 //! writer that only polls for a free gate, lets a steady stream of readers
 //! starve shutdown instead. So the gate separates two kinds of shared holder:
 //!
-//! - Ordinary requests yield to a waiting exclusive request, so it is admitted
+//! - Ordinary requests yield to a queued exclusive request, so it is admitted
 //!   as soon as the requests already inside finish.
-//! - Terminal I/O, which is short and launches nothing, only waits while an
-//!   exclusive holder is inside, never while one waits.
+//! - Terminal I/O, which holds the gate for microseconds and launches nothing,
+//!   does not wait behind the requests a queued exclusive request is waiting
+//!   for. It waits only while an exclusive holder is inside, and at the moment
+//!   the gate empties with one queued, so the queued request takes the first
+//!   empty gate instead of losing it to the next keystroke.
 //!
-//! A waiting exclusive request gives up at its deadline, so ordinary requests
-//! wait for it at most that long. Only daemon exit, which has to win, waits
-//! without one.
+//! Exclusive requests choose how they wait:
+//!
+//! - Operations that must eventually win (shutdown, upgrade, chat release,
+//!   return and account recovery, daemon exit) queue with
+//!   [`ControlGate::exclusive_until`], holding back new ordinary requests
+//!   until their deadline.
+//! - Routine operations (closing a terminal, reserving a worktree removal)
+//!   wait with [`ControlGate::exclusive_when_free_until`] without queuing, so
+//!   they never hold anyone back; under steady traffic they may refuse at
+//!   their deadline instead.
+//!
+//! Every wait but daemon exit's, which has no client to ask to retry, ends at
+//! a deadline.
 //!
 //! The gate sits first in the daemon's lock order: control gate, agent gate,
 //! registry, HostState. Its own mutex is held only to update the counts, never
@@ -37,13 +50,36 @@ use crate::terminal_ipc::{ProtocolError, ProtocolErrorCode};
 struct Counts {
     shared: usize,
     exclusive: bool,
-    /// Exclusive requests waiting for the gate; ordinary requests yield to them.
-    waiting: usize,
+    /// Queued exclusive requests; ordinary requests yield to them.
+    queued: usize,
+    /// Exclusive requests waiting without queuing; nobody yields to them.
+    unqueued: usize,
 }
 
 impl Counts {
     fn admits_exclusive(&self) -> bool {
         !self.exclusive && self.shared == 0
+    }
+
+    fn admits_ordinary(&self) -> bool {
+        !self.exclusive && self.queued == 0
+    }
+
+    /// An empty gate with a request queued is that request's to take.
+    fn admits_terminal_io(&self) -> bool {
+        !self.exclusive && !(self.queued > 0 && self.shared == 0)
+    }
+
+    fn waiters(&mut self, queued: bool) -> &mut usize {
+        if queued {
+            &mut self.queued
+        } else {
+            &mut self.unqueued
+        }
+    }
+
+    fn exclusive_waiters(&self) -> bool {
+        self.queued > 0 || self.unqueued > 0
     }
 }
 
@@ -74,9 +110,9 @@ impl ControlGate {
         self.changed.wait(counts).unwrap_or_else(|p| p.into_inner())
     }
 
-    fn enter_shared(&self, yields: bool) -> Shared<'_> {
+    fn enter_shared(&self, admits: fn(&Counts) -> bool) -> Shared<'_> {
         let mut counts = self.counts();
-        while counts.exclusive || (yields && counts.waiting > 0) {
+        while !admits(&counts) {
             counts = self.wait(counts);
         }
         counts.shared += 1;
@@ -84,21 +120,21 @@ impl ControlGate {
     }
 
     /// Ordinary shared admission. Waits while an exclusive request holds the
-    /// gate or is waiting for it.
+    /// gate or is queued for it.
     pub(super) fn shared(&self) -> Shared<'_> {
-        self.enter_shared(true)
+        self.enter_shared(Counts::admits_ordinary)
     }
 
-    /// Shared admission for terminal I/O. Waits only while an exclusive
-    /// request holds the gate, so a waiting one never delays a keystroke.
+    /// Shared admission for terminal I/O. Never waits behind the requests a
+    /// queued exclusive request is waiting for, only for that request itself.
     pub(super) fn terminal_io(&self) -> Shared<'_> {
-        self.enter_shared(false)
+        self.enter_shared(Counts::admits_terminal_io)
     }
 
     /// Ordinary shared admission only if it would not wait.
     pub(super) fn try_shared(&self) -> Option<Shared<'_>> {
         let mut counts = self.counts();
-        if counts.exclusive || counts.waiting > 0 {
+        if !counts.admits_ordinary() {
             return None;
         }
         counts.shared += 1;
@@ -115,25 +151,31 @@ impl ControlGate {
         Some(Exclusive(self))
     }
 
-    /// Exclusive admission once the shared holders inside have left, or `None`
-    /// at `deadline`. While it waits, new ordinary requests wait for it.
+    /// Queued exclusive admission once the shared holders inside have left, or
+    /// `None` at `deadline`. While it waits, new ordinary requests wait for it.
     pub(super) fn exclusive_until(&self, deadline: Instant) -> Option<Exclusive<'_>> {
-        self.enter_exclusive(Some(deadline))
+        self.enter_exclusive(Some(deadline), true)
     }
 
-    /// Exclusive admission without a deadline. Only for daemon exit, which
-    /// must win and has no client to ask to retry.
+    /// Exclusive admission whenever the gate is next free, or `None` at
+    /// `deadline`. It holds back no other request while it waits.
+    pub(super) fn exclusive_when_free_until(&self, deadline: Instant) -> Option<Exclusive<'_>> {
+        self.enter_exclusive(Some(deadline), false)
+    }
+
+    /// Queued exclusive admission without a deadline. Only for daemon exit,
+    /// which must win and has no client to ask to retry.
     pub(super) fn exclusive(&self) -> Exclusive<'_> {
-        self.enter_exclusive(None)
+        self.enter_exclusive(None, true)
             .expect("an exclusive wait without a deadline cannot expire")
     }
 
-    fn enter_exclusive(&self, deadline: Option<Instant>) -> Option<Exclusive<'_>> {
+    fn enter_exclusive(&self, deadline: Option<Instant>, queue: bool) -> Option<Exclusive<'_>> {
         let mut counts = self.counts();
-        counts.waiting += 1;
+        *counts.waiters(queue) += 1;
         loop {
             if counts.admits_exclusive() {
-                counts.waiting -= 1;
+                *counts.waiters(queue) -= 1;
                 counts.exclusive = true;
                 return Some(Exclusive(self));
             }
@@ -153,11 +195,11 @@ impl ControlGate {
                 }
             };
         }
-        counts.waiting -= 1;
-        let released = counts.waiting == 0;
+        *counts.waiters(queue) -= 1;
+        let released = queue && counts.queued == 0;
         drop(counts);
         if released {
-            // Ordinary requests held back for this one may enter now.
+            // Requests held back for this one may enter now.
             self.changed.notify_all();
         }
         None
@@ -168,7 +210,7 @@ impl Drop for Shared<'_> {
     fn drop(&mut self) {
         let mut counts = self.0.counts();
         counts.shared -= 1;
-        let empty = counts.shared == 0 && counts.waiting > 0;
+        let empty = counts.shared == 0 && counts.exclusive_waiters();
         drop(counts);
         if empty {
             self.0.changed.notify_all();

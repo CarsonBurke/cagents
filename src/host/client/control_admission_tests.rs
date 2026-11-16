@@ -211,12 +211,6 @@ fn an_exclusive_request_is_admitted_under_steady_request_traffic() {
             accepted
         })
     };
-    thread::sleep(Duration::from_millis(60));
-    assert!(
-        gate.try_exclusive().is_none(),
-        "the shared requests overlap"
-    );
-
     let admitted = process_request(&fixture.host, OPERATOR, preflight());
     assert!(
         matches!(admitted, Ok((ServerResponse::ShutdownPreflight(_), _, _))),

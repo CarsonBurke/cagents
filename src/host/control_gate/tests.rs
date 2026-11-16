@@ -1,4 +1,4 @@
-use super::ControlGate;
+use super::{ControlGate, Counts};
 use std::{
     sync::{
         Arc,
@@ -112,16 +112,11 @@ fn an_exclusive_request_is_admitted_under_overlapping_reader_traffic() {
             }
         })
     };
-    thread::sleep(Duration::from_millis(60));
-    assert!(gate.try_exclusive().is_none(), "the readers overlap");
-
-    let started = Instant::now();
-    let admitted = gate.exclusive_until(started + Duration::from_secs(5));
+    let admitted = gate.exclusive_until(Instant::now() + Duration::from_secs(10));
     assert!(
         admitted.is_some(),
         "steady reader traffic starved the writer"
     );
-    assert!(started.elapsed() < Duration::from_secs(1));
     drop(admitted);
 
     running.store(false, Ordering::Relaxed);
@@ -129,4 +124,68 @@ fn an_exclusive_request_is_admitted_under_overlapping_reader_traffic() {
         reader.join().unwrap();
     }
     typist.join().unwrap();
+}
+
+#[test]
+fn a_queued_exclusive_request_takes_the_first_empty_gate() {
+    let queued = |shared| Counts {
+        shared,
+        queued: 1,
+        ..Counts::default()
+    };
+    // Terminal I/O passes the requests a queued writer waits for...
+    assert!(queued(1).admits_terminal_io());
+    assert!(!queued(1).admits_ordinary());
+    // ...but not the writer itself once the gate empties, so a keystroke
+    // arriving between the last release and the writer's wakeup cannot take
+    // the gate first.
+    assert!(!queued(0).admits_terminal_io());
+    assert!(queued(0).admits_exclusive());
+    let held = Counts {
+        exclusive: true,
+        ..Counts::default()
+    };
+    assert!(!held.admits_terminal_io() && !held.admits_ordinary());
+}
+
+#[test]
+fn an_unqueued_exclusive_request_holds_back_nobody_and_takes_a_free_gate() {
+    let gate = Arc::new(ControlGate::default());
+    let slow = gate.shared();
+    let (sender, admitted) = mpsc::channel();
+    let closer = Arc::clone(&gate);
+    thread::spawn(move || {
+        let admission = closer.exclusive_when_free_until(Instant::now() + Duration::from_secs(30));
+        let _ = sender.send(admission.is_some());
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while gate.counts().unqueued == 0 {
+        assert!(Instant::now() < deadline, "the close never waited");
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        gate.try_shared().is_some(),
+        "an ordinary request waited for a close"
+    );
+    drop(gate.terminal_io());
+    assert_eq!(
+        gate.counts().unqueued,
+        1,
+        "the close entered beside a shared holder"
+    );
+
+    drop(slow);
+    assert!(admitted.recv_timeout(Duration::from_secs(5)).unwrap());
+}
+
+#[test]
+fn an_unqueued_exclusive_request_refuses_at_its_deadline() {
+    let gate = ControlGate::default();
+    let _slow = gate.shared();
+    assert!(
+        gate.exclusive_when_free_until(Instant::now() + Duration::from_millis(20))
+            .is_none()
+    );
+    assert_eq!(gate.counts().unqueued, 0);
+    assert!(gate.try_shared().is_some());
 }

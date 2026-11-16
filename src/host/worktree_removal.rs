@@ -25,7 +25,8 @@ pub(super) type Reservations = Arc<Mutex<BTreeMap<uuid::Uuid, Arc<Scope>>>>;
 /// check them.
 const MAX_RESERVATIONS: usize = 16;
 
-/// How long installation waits for the requests already admitted to finish.
+/// How long installation waits for a free gate. It does not queue, so it
+/// holds back no other request while it waits.
 const INSTALL_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long a process found in the worktree gets to leave before it refuses
@@ -118,7 +119,7 @@ impl Reservation {
             (state.control_gate.clone(), state.worktree_removals.clone())
         };
         let writer = gate
-            .exclusive_until(std::time::Instant::now() + patience)
+            .exclusive_when_free_until(std::time::Instant::now() + patience)
             .ok_or_else(super::control_gate::busy)?;
         super::client::ensure_control_open(host)?;
         let mut entries = map.lock().unwrap_or_else(|p| p.into_inner());

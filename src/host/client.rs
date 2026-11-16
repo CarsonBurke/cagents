@@ -164,23 +164,35 @@ fn peer_pid(stream: &UnixStream) -> Option<u32> {
 /// here costs one maintenance pass, while the reverse would strand a worker.
 /// Startup reservations can also drop off the request path, so they wake too.
 fn may_release_retention(request: &ClientRequest) -> bool {
-    !terminal_io_request(request)
-        && !matches!(
-            request,
-            ClientRequest::List
-                | ClientRequest::ChatCommand { .. }
-                | ClientRequest::ChatVisibility { .. }
-                | ClientRequest::ChatRead { .. }
-                | ClientRequest::ChatAcknowledge { .. }
-                | ClientRequest::ChatList
-                | ClientRequest::ReadWorkspaceModel
-                | ClientRequest::ReadWorkspaceView { .. }
-                | ClientRequest::ReadWorkspaceSnapshot
-                | ClientRequest::ReadWorkspaceMetadata { .. }
-                | ClientRequest::ReadTerminalRemovalBasis { .. }
-                | ClientRequest::ReadCapturedTerminalRemovalBasis { .. }
-                | ClientRequest::ReadNotifications
-        )
+    !matches!(
+        request,
+        ClientRequest::List
+            | ClientRequest::Input { .. }
+            | ClientRequest::Key { .. }
+            | ClientRequest::Mouse { .. }
+            | ClientRequest::Focus { .. }
+            | ClientRequest::Scroll { .. }
+            | ClientRequest::Resize { .. }
+            | ClientRequest::Paste { .. }
+            | ClientRequest::SetVisibility { .. }
+            | ClientRequest::Snapshot { .. }
+            | ClientRequest::AcknowledgeRedraw { .. }
+            | ClientRequest::TerminalAcknowledge { .. }
+            | ClientRequest::SearchTerminal { .. }
+            | ClientRequest::CopyTerminalSelection { .. }
+            | ClientRequest::ChatCommand { .. }
+            | ClientRequest::ChatVisibility { .. }
+            | ClientRequest::ChatRead { .. }
+            | ClientRequest::ChatAcknowledge { .. }
+            | ClientRequest::ChatList
+            | ClientRequest::ReadWorkspaceModel
+            | ClientRequest::ReadWorkspaceView { .. }
+            | ClientRequest::ReadWorkspaceSnapshot
+            | ClientRequest::ReadWorkspaceMetadata { .. }
+            | ClientRequest::ReadTerminalRemovalBasis { .. }
+            | ClientRequest::ReadCapturedTerminalRemovalBasis { .. }
+            | ClientRequest::ReadNotifications
+    )
 }
 
 /// Whether the peer process runs the `cagents` CLI, the only client this
@@ -740,9 +752,10 @@ fn close_busy() -> ProtocolError {
     )
 }
 
-/// Take the writer and read the saved pin under it. Waiting for the writer
-/// never delays terminal input (see `control_gate`), but a held writer must not
-/// wait out another thread's durable commit, so it is released while the
+/// Take the writer and read the saved pin under it. A close is routine, so it
+/// waits for a free gate without queuing: it holds back no other request, and
+/// under steady traffic it refuses at its deadline instead. A held writer must
+/// not wait out another thread's durable commit, so it is released while the
 /// registry is busy.
 fn close_fence<'gate>(
     host: &SharedHost,
@@ -752,7 +765,9 @@ fn close_fence<'gate>(
 ) -> Result<(Exclusive<'gate>, Result<Option<String>, String>), ProtocolError> {
     let registry = super::agent_execution::registry(host);
     loop {
-        let admission = gate.exclusive_until(deadline).ok_or_else(close_busy)?;
+        let admission = gate
+            .exclusive_when_free_until(deadline)
+            .ok_or_else(close_busy)?;
         let registry = match &registry {
             Ok(registry) => registry,
             Err(cause) => return Ok((admission, Err(cause.clone()))),
@@ -1086,7 +1101,8 @@ pub(super) fn process_request(
 }
 
 /// No client sends this yet; its GitHub read has already spent part of the
-/// 120-second device-operation deadline before the writer is wanted.
+/// 120-second device-operation deadline before the writer is wanted. Cleanup is
+/// routine, so it waits for a free gate without holding anyone back.
 const MERGED_WORKTREE_REMOVAL_PATIENCE: Duration = Duration::from_secs(10);
 
 /// The requests that hold the control gate exclusively, and how long each waits
@@ -1113,8 +1129,11 @@ fn exclusive_patience(request: &ClientRequest) -> Option<Duration> {
 }
 
 /// Requests answered from HostState and a non-blocking send to the terminal
-/// worker. They launch nothing and change no ownership, so they are admitted
-/// beside a waiting exclusive request instead of behind it.
+/// worker, so each holds the gate for microseconds. They launch nothing and
+/// change no ownership, so they are admitted beside a queued exclusive request
+/// instead of behind the requests it waits for. A request that waits for the
+/// worker, such as Snapshot's viewport capture, could keep the gate shared
+/// across overlapping holds and starve that request, so it stays ordinary.
 fn terminal_io_request(request: &ClientRequest) -> bool {
     matches!(
         request,
@@ -1126,7 +1145,6 @@ fn terminal_io_request(request: &ClientRequest) -> bool {
             | ClientRequest::Resize { .. }
             | ClientRequest::Paste { .. }
             | ClientRequest::SetVisibility { .. }
-            | ClientRequest::Snapshot { .. }
             | ClientRequest::AcknowledgeRedraw { .. }
             | ClientRequest::TerminalAcknowledge { .. }
             | ClientRequest::SearchTerminal { .. }
@@ -1160,7 +1178,7 @@ fn process_wire_request(
         let removed = match prepared {
             Ok(prepared) => {
                 let _exclusive = gate
-                    .exclusive_until(Instant::now() + MERGED_WORKTREE_REMOVAL_PATIENCE)
+                    .exclusive_when_free_until(Instant::now() + MERGED_WORKTREE_REMOVAL_PATIENCE)
                     .ok_or_else(control_gate::busy)?;
                 ensure_control_open(host)?;
                 super::account_lifecycle::ensure_idle(host)?;
@@ -3494,13 +3512,10 @@ pub(in crate::host) mod tests {
         let gate = control_gate(&host);
         let registry = super::super::agent_execution::registry(&host).unwrap();
         let input_can_enter = || {
-            let (entered, entry) = std::sync::mpsc::channel();
-            let gate = Arc::clone(&gate);
-            thread::spawn(move || {
-                drop(gate.terminal_io());
-                let _ = entered.send(());
-            });
-            entry.recv_timeout(Duration::from_millis(500)).is_ok()
+            (0..500).any(|_| {
+                thread::sleep(Duration::from_millis(1));
+                gate.try_shared().is_some()
+            })
         };
         let slow_request = gate.shared();
         let worker = {
