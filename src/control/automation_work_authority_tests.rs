@@ -131,6 +131,29 @@ impl Peer {
                 );
                 request = next(&mut peer);
             }
+            // A listing first reads the open projects, to cover the one
+            // containing the current directory; this fixture has none.
+            if matches!(business, Business::List) {
+                assert!(matches!(
+                    &request.request,
+                    ClientRequest::ReadWorkspaceMetadata {
+                        query: crate::workspace_model::metadata::Query::Projects
+                    }
+                ));
+                reply(
+                    &mut peer,
+                    &request,
+                    ServerMessage::Response {
+                        response: ServerResponse::WorkspaceMetadata(
+                            crate::workspace_model::metadata::Reply::Projects {
+                                identity: uuid::Uuid::nil(),
+                                projects: vec![],
+                            },
+                        ),
+                    },
+                );
+                request = next(&mut peer);
+            }
             match business {
                 Business::Proposal => assert!(matches!(&request.request,
                     ClientRequest::Automation { authority: actual, operation: AutomationRequest::Proposal { id } }

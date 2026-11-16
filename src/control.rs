@@ -51,7 +51,7 @@ pub use messages::{Arrival, AskArgs, InboxArgs, ReplyArgs, SendArgs};
 mod linear;
 pub use linear::LinearCommand;
 mod work;
-pub use work::WorkCommand;
+pub use work::{WorkCommand, WorkListArgs};
 #[cfg(feature = "ui")]
 pub(crate) mod invocation;
 
@@ -138,6 +138,29 @@ pub struct Cli {
     pub command: TopCommand,
 }
 
+impl Cli {
+    /// What the grammar alone cannot refuse. `work`'s list options sit beside
+    /// its subcommands so `cagents work` lists, but mean nothing to one.
+    /// Clap's own conflict would also refuse the global options there.
+    fn validated(self) -> Result<Self, clap::Error> {
+        if let TopCommand::Work {
+            command: Some(_),
+            list,
+        } = &self.command
+            && *list != WorkListArgs::default()
+        {
+            use clap::CommandFactory;
+            return Err(Self::command().error(
+                ClapErrorKind::ArgumentConflict,
+                "the list options of `cagents work` cannot be used with a subcommand; \
+                 give a subcommand its own options after it, as in \
+                 `cagents work rm CARD --project PROJECT`",
+            ));
+        }
+        Ok(self)
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub enum TopCommand {
     /// Generate a shell completion script without contacting services.
@@ -181,10 +204,12 @@ pub enum TopCommand {
     Reply(ReplyArgs),
     /// Read the messages left for this session.
     Inbox(InboxArgs),
-    /// Show every worktree and branch in progress, newest activity first.
+    /// List this project's worktrees and branches in progress, newest activity first; or pin or remove one.
     Work {
         #[command(subcommand)]
-        command: WorkCommand,
+        command: Option<WorkCommand>,
+        #[command(flatten)]
+        list: WorkListArgs,
     },
     /// Manage recurring daemon-owned work and its durable run history.
     #[command(alias = "automations")]
@@ -2947,7 +2972,7 @@ where
         emit_error(wants_json, &AppError::new("daemon_startup", error));
         return ExitCode::FAILURE;
     }
-    let cli = match Cli::try_parse_from(arguments.clone()) {
+    let cli = match Cli::try_parse_from(arguments.clone()).and_then(Cli::validated) {
         Ok(cli) => cli,
         Err(error)
             if matches!(
@@ -3396,10 +3421,13 @@ fn execute_with_model_context(
             Some(context) => automations::execute_with_context(command, &context),
             None => automations::execute(command),
         },
-        TopCommand::Work { command } => match service_context {
-            Some(context) => work::execute_with_context(command, &context),
-            None => work::execute(command),
-        },
+        TopCommand::Work { command, list } => {
+            let command = command.unwrap_or(WorkCommand::List(list));
+            match service_context {
+                Some(context) => work::execute_with_context(command, &context),
+                None => work::execute(command),
+            }
+        }
         TopCommand::Agent { command } => match service_context {
             Some(context) => agents::execute_with_context(command, &context),
             None => agents::execute(command),

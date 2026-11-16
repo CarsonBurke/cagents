@@ -116,7 +116,6 @@ fn has_git_metadata(directory: &Path) -> Result<bool, String> {
 /// Where a directory sits: the checkout containing it and the open project it
 /// belongs to. Read from the filesystem as Git discovers a repository, without
 /// running Git, so listing many sessions stays cheap.
-#[cfg(feature = "host")]
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Placement {
     pub worktree: Option<PathBuf>,
@@ -125,19 +124,30 @@ pub(crate) struct Placement {
 
 #[cfg(feature = "host")]
 pub(crate) fn place(path: &Path, model: &crate::workspace_model::WorkspaceModel) -> Placement {
+    place_among(path, &model.projects)
+}
+
+/// [`place`] among `projects`, for a client that read the open projects
+/// rather than the whole workspace model.
+pub(crate) fn place_among(
+    path: &Path,
+    projects: &[crate::workspace_model::ModelProject],
+) -> Placement {
     let Ok(directory) = fs::canonicalize(path) else {
         return Placement::default();
     };
-    placed(&directory, model)
+    placed(&directory, &|candidate: &Path| {
+        projects
+            .iter()
+            .any(|project| project.repository == candidate)
+    })
 }
 
-#[cfg(feature = "host")]
-fn placed(directory: &Path, model: &crate::workspace_model::WorkspaceModel) -> Placement {
+fn placed(directory: &Path, opened: &dyn Fn(&Path) -> bool) -> Placement {
     let checkout = checkout(directory);
     // An open folder keeps its own identity, as in `resolve`, and the nearest
     // open project wins over an enclosing one: a folder inside the checkout,
     // then the checkout's repository, then a folder that encloses it.
-    let opened = |candidate: &Path| model.project(candidate).is_some();
     let (inner, outer) = match &checkout {
         Some((worktree, _)) => directory
             .ancestors()
@@ -167,13 +177,12 @@ fn placed(directory: &Path, model: &crate::workspace_model::WorkspaceModel) -> P
         worktree
             .as_deref()
             .and_then(Path::parent)
-            .and_then(|parent| placed(parent, model).project)
+            .and_then(|parent| placed(parent, opened).project)
     });
     Placement { worktree, project }
 }
 
 /// The working tree that contains `directory` and its Git common directory.
-#[cfg(feature = "host")]
 fn checkout(directory: &Path) -> Option<(PathBuf, PathBuf)> {
     directory.ancestors().find_map(|ancestor| {
         let marker = ancestor.join(".git");

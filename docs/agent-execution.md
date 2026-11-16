@@ -151,14 +151,24 @@ cagents whoami
 ```
 
 ```text
-7c0fba49-2f0e-4b8e-9d0a-1c2b3d4e5f60  claude idle     [cagents] /repo/.worktrees/fix  "Fix flaky login test" (my agent)
-    agent 51c3e8a2-6d7f-4a1b-8c9d-0e1f2a3b4c5d, latest run Succeeded
-3e81d0aa-9b8c-4d7e-a6f5-e4d3c2b1a090  codex  working  [cagents] /repo
+SESSION   PROVIDER  STATE    ACCOUNT   CONTEXT
+9f005968  claude    working  system    me
+7c0fba49  claude    idle     a84362d7  .worktrees/fix; "Fix flaky login test"; my agent 51c3e8a2, run succeeded
+3e81d0aa  codex     working  09f8da2b
+(project cagents at ~/src/cagents)
+
+ACCOUNT   LEFT           RESETS     LABEL
+system    73% of Weekly  in 2 days
+a84362d7  6% of Weekly   in 3 days  work
+09f8da2b  11% of Weekly  in 4 days
+hint: `cagents transcript SESSION` reads one; `cagents send SESSION MESSAGE` messages one; `cagents ls --all` lists every project
 ```
+
+A row shows a session or agent ID by its shortest prefix that is unique in the listing, at least eight characters. `send`, `ask`, `transcript` and the `agent` commands accept that prefix. A plain shell's ID is shown in full, because only the `terminal` commands take it and they need the whole ID. When every row is in one project, the listing names it once, with its primary checkout, and shows directories relative to that checkout. Rows from several projects name their own and show directories in full. Each account is listed once, below the rows, with what is left of it. The last line suggests what to run next. `--json` carries every field in full.
 
 Each entry carries the live session ID, provider, `Idle`/`Working`/`Waiting` state, working directory, checkout (repository or linked worktree), project, and, for delegated agents, the owner and latest run. `relation` places it relative to the caller: `Myself`, `Parent` (a session of the lineage that owns the caller), `Child` (an agent the caller may control; one started by a CLI outside cagents is shown as a user agent, because every such caller shares it), or `Peer`. A plain shell appears only as the caller or as the owner of a listed agent. `whoami` reports the calling session, its relatives, and peers working in the same checkout, which are the sessions most likely to collide with its edits.
 
-The caller's identity comes from its daemon-issued capability, never from an environment variable a process could set. A CLI outside cagents has no session of its own. Listing is read-only: the agent commands below remain restricted to an agent's owner. Inside a hosted session the lower-level `cagents terminal` commands are restricted too. That includes a plain shell, since an agent may be running in it. They still list, snapshot and wait on any terminal, but `write` and `close` reach only the terminals the session's lineage controls: its own session, the terminals it started with `cagents terminal spawn`, and the sessions and consoles of the agents it delegated to. To reach anyone else's, message its owner. The daemon records which lineage started each terminal, from registry schema version 6, so this survives a reconnect and a daemon restart; a terminal relaunched in its card keeps its owner. A spawn from inside a session may start a new terminal but not relaunch an existing one. The check applies to the connection the CLI authenticates with the session's capability, which also refuses everything outside the terminal surface. Like a CLI outside cagents, a process that reaches the daemon socket without authenticating acts for the user. So does a command run with `CAGENTS_AGENT_AUTHORITY` unset, which a person at a hosted shell can use to act as themselves. Session IDs address the live process; a relaunched or recovered conversation is listed under a new ID. Its `lineage`, printed beneath a session whose lineage differs from its ID, names the root session it succeeds and stays the same across those relaunches and recoveries.
+The caller's identity comes from its daemon-issued capability, never from an environment variable a process could set. A CLI outside cagents has no session of its own. Listing is read-only: the agent commands below remain restricted to an agent's owner. Inside a hosted session the lower-level `cagents terminal` commands are restricted too. That includes a plain shell, since an agent may be running in it. They still list, snapshot and wait on any terminal, but `write` and `close` reach only the terminals the session's lineage controls: its own session, the terminals it started with `cagents terminal spawn`, and the sessions and consoles of the agents it delegated to. To reach anyone else's, message its owner. The daemon records which lineage started each terminal, from registry schema version 6, so this survives a reconnect and a daemon restart; a terminal relaunched in its card keeps its owner. A spawn from inside a session may start a new terminal but not relaunch an existing one. The check applies to the connection the CLI authenticates with the session's capability, which also refuses everything outside the terminal surface. Like a CLI outside cagents, a process that reaches the daemon socket without authenticating acts for the user. So does a command run with `CAGENTS_AGENT_AUTHORITY` unset, which a person at a hosted shell can use to act as themselves. Session IDs address the live process; a relaunched or recovered conversation is listed under a new ID. Its `lineage`, in `--json`, names the root session it succeeds and stays the same across those relaunches and recoveries.
 
 ## Reading your channel
 
@@ -309,8 +319,9 @@ Their `--json` payloads retain the original API fields and pagination metadata.
 Human pages indicate when more results are available; use `--after` to continue.
 Comments appear in a single table row; use JSON to preserve Markdown line breaks.
 
-Session directory tables keep full session IDs, lineage, view and delegation
-context. Session and whoami JSON retain their original directory metadata.
+Session directory tables abbreviate session and agent IDs and name a shared
+project once; see [Finding other sessions](#finding-other-sessions). Session
+and whoami JSON retain their original directory metadata.
 
 ## Terminal inventory output
 
