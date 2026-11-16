@@ -5617,7 +5617,7 @@ pub struct Cagents {
     worktree_offsets: HashMap<PathBuf, f32>,
     channel_offsets: HashMap<crate::model::ChannelId, f32>,
     worktree_owners: HashMap<CardId, PathBuf>,
-    known_worktree_roots: HashSet<PathBuf>,
+    known_worktree_roots: worktree_ui::KnownWorktreeRoots,
     worktree_paths: worktree_ui::WorktreePathIndex,
     /// What the projects list of pull requests, by repository and number,
     /// which every chat labels its pull request links from.
@@ -31603,7 +31603,7 @@ mod tests {
             channel_offsets: HashMap::new(),
             worktree_offsets: HashMap::new(),
             worktree_owners: HashMap::new(),
-            known_worktree_roots: HashSet::new(),
+            known_worktree_roots: worktree_ui::KnownWorktreeRoots::default(),
             worktree_paths: worktree_ui::WorktreePathIndex::default(),
             pull_request_board: chat_ui::PullRequestBoard::default(),
             workspace_view_generation: 0,
