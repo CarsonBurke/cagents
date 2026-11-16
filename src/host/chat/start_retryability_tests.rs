@@ -461,6 +461,59 @@ fn surviving_claude_process_keeps_retry_until_its_owned_process_exits() {
     assert_repaired_resume_prepares(&host, &source);
 }
 
+/// A pane whose ended actor ran a different launch cannot prove that actor
+/// was its only writer this boot. The client reads that refusal as one a
+/// restart lifts, and says the conversation is not reopened yet.
+#[test]
+fn an_unmatched_ended_actor_waits_for_a_restart_rather_than_a_retry() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
+    let Some(root) = isolated("an_unmatched_ended_actor_waits_for_a_restart_rather_than_a_retry")
+    else {
+        return;
+    };
+    let (host, proof) = setup(&root, "unmatched-restart");
+    let source = retained_claude_source(&root, &proof);
+    let mut issued = source.clone();
+    issued
+        .launch
+        .recipe
+        .arguments
+        .push("--different-recipe".into());
+    let mut provider = FixtureServer(
+        Command::new("/bin/sleep")
+            .arg("120")
+            .process_group(0)
+            .spawn()
+            .unwrap(),
+    );
+    let process = crate::daemon::holder_registry::Process::read(provider.0.id() as i32).unwrap();
+    provider.0.kill().unwrap();
+    provider.0.wait().unwrap();
+    ended_claude_census(&host, &issued, process);
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+    let _wire = super::retained_admission_tests::HostClientWire::start_native(&host, &proof);
+    let failure = resume_refused(&source);
+    assert_eq!(
+        failure.recovery,
+        chat::Recovery::AfterRestart,
+        "{}",
+        failure.message
+    );
+    assert_eq!(
+        failure.message,
+        format!(
+            "The saved conversation could not be reopened yet, so nothing was restarted or resent. {}",
+            chat::UNPROVEN_OWNER_REFUSAL
+        )
+    );
+    assert!(host.lock().unwrap().chats.is_empty());
+    assert!(host.lock().unwrap().chat_spawning.is_empty());
+    assert!(host.lock().unwrap().native_actor_startups.is_empty());
+}
+
 #[test]
 fn missing_captured_claude_home_keeps_retry_until_same_inode_is_restored() {
     if crate::retained_fixture::run_isolated() {
@@ -664,6 +717,14 @@ fn invalid_resume_continuity_stays_blocked_through_prepare_handshake() {
             .contains("Saved conversation has invalid continuity evidence"),
         "the real preparation refusal must reach the client: {}",
         failure.message,
+    );
+    // Nothing later reopens it, so the client does not say "yet".
+    assert!(
+        failure
+            .message
+            .starts_with("The saved conversation could not be reopened, so"),
+        "{}",
+        failure.message
     );
     assert!(host.lock().unwrap().chats.is_empty());
     assert!(host.lock().unwrap().chat_spawning.is_empty());

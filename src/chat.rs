@@ -355,6 +355,11 @@ pub enum Recovery {
     /// The daemon refused this start and reported that repeating it cannot help.
     /// Keep the saved conversation and diagnostic without offering a retry.
     Blocked,
+    /// A [`Self::Blocked`] refusal that a restart of this computer lifts: the
+    /// daemon cannot prove that an earlier process of this boot no longer
+    /// holds the conversation, and a new boot proves every such process gone.
+    /// Nothing reopens it before then, so it is offered no retry either.
+    AfterRestart,
     /// The daemon has no free resident chat slots. Retrying preserves this
     /// conversation; capacity must become available before it can start.
     Capacity,
@@ -374,6 +379,20 @@ pub enum Recovery {
     /// or a round trip that is not there.
     Fresh,
 }
+
+impl Recovery {
+    /// Whether repeating the same start cannot help until something outside
+    /// this card changes.
+    pub fn is_blocked(self) -> bool {
+        matches!(self, Self::Blocked | Self::AfterRestart)
+    }
+}
+
+/// The daemon's refusal of a retained Claude conversation whose earlier
+/// process ended without recording its close. Only a later boot proves that
+/// process gone, so a client reads this exact sentence as
+/// [`Recovery::AfterRestart`]. The protocol has no code of its own for it.
+pub const UNPROVEN_OWNER_REFUSAL: &str = "This conversation's earlier Claude process ended without recording its close, and cagents cannot prove that nothing else still holds the conversation, so nothing was started in its place. It can be resumed after this computer restarts";
 
 impl StartFailure {
     pub fn retry(message: impl Into<String>) -> Self {

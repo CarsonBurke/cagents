@@ -195,7 +195,7 @@ fn a_blocked_restore_uses_normal_interest_and_eviction_without_a_source_pin() {
         }),
     );
     let state = app.chat_runtime_mut(target).unwrap();
-    assert!(state.start_retry_blocked);
+    assert!(state.start_blocked.is_some());
     assert!(!state.resume_source_pinned);
     assert!(!state.retains_source_body());
     assert!(handle.resident_snapshot_with_clock().is_some());
@@ -446,7 +446,7 @@ fn the_warm_budget_cools_frozen_resume_rendering_without_losing_the_source() {
                 assert!(state.cache.is_empty());
                 assert_eq!(state.error.as_deref(), Some(REFUSAL));
                 assert_eq!(
-                    state.start_retry_blocked,
+                    state.start_blocked.is_some(),
                     recovery == chat::Recovery::Blocked
                 );
                 assert_frozen_window(state, &frozen, &clock, &old);
@@ -690,7 +690,7 @@ fn reconnect_before_the_disconnect_wake_releases_only_the_retired_raw_source() {
             if failed {
                 assert_eq!(state.error.as_deref(), Some(REFUSAL));
                 assert_eq!(
-                    state.start_retry_blocked,
+                    state.start_blocked.is_some(),
                     recovery == chat::Recovery::Blocked
                 );
             }

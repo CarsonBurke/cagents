@@ -11,7 +11,7 @@ impl Runtime {
     pub(super) fn auth_error(&self) -> Option<&str> {
         // A permanent start refusal has no typed sign-in remedy. Raw local
         // or older snapshot text is diagnostic, not authority to retry it.
-        if self.start_retry_blocked {
+        if self.start_blocked.is_some() {
             return None;
         }
         self.snapshot

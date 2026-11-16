@@ -1486,15 +1486,15 @@ impl Runtime {
         let current_local_error = incident.sources.iter().any(|source| {
             matches!(source, Source::Local(text) if Some(text.as_ref()) == self.error.as_deref())
         });
-        let blocked_start = self.start_retry_blocked && current_local_error;
+        let blocked_start = self.start_blocked.filter(|_| current_local_error);
         let mut rows = vec![
             widget::row::with_children(vec![
                 crate::ui_controls::passive_icon(Icon::Warning, design::COMPACT_ICON_SIZE),
-                design::body(if blocked_start {
+                design::body(if let Some(reopen) = blocked_start {
                     if self.is_draft() {
                         blocked_recovery::DRAFT_HEADLINE
                     } else {
-                        blocked_recovery::HEADLINE
+                        reopen.headline()
                     }
                     .to_owned()
                 } else {
@@ -1507,7 +1507,7 @@ impl Runtime {
             .align_y(Alignment::Start)
             .into(),
         ];
-        if !cleared && !blocked_start {
+        if !cleared && blocked_start.is_none() {
             rows.push(
                 design::caption(reset_controls.as_ref().map_or_else(
                     || incident.guidance.to_owned(),

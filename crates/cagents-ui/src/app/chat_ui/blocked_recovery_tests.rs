@@ -102,6 +102,20 @@ fn labels(tree: &A11yTree) -> Vec<&str> {
 }
 
 fn blocked_app(named: bool, valid_recipe: bool, runtime: bool) -> (Cagents, CardId) {
+    blocked_app_with(
+        named,
+        valid_recipe,
+        runtime,
+        blocked_recovery::Reopen::Unproven,
+    )
+}
+
+fn blocked_app_with(
+    named: bool,
+    valid_recipe: bool,
+    runtime: bool,
+    reopen: blocked_recovery::Reopen,
+) -> (Cagents, CardId) {
     let mut app = crate::app::tests::context_inspector_test_app(false);
     app.workspace.resize_viewport(1200.0);
     let card = live_chat(&mut app, named.then_some(KNOWN_THREAD));
@@ -113,14 +127,16 @@ fn blocked_app(named: bool, valid_recipe: bool, runtime: bool) -> (Cagents, Card
     app.card_state_mut(card).unwrap().kind = CardKind::Chat(source.clone());
     let view = app.chat_runtime_mut(target).unwrap();
     view.session = source.clone();
-    view.start_retry_blocked = true;
+    view.start_blocked = Some(reopen);
     view.error = Some("Daemon proof changed".into());
     view.replace_draft(text_editor::Content::with_text("Keep this unsent note."));
     if !runtime {
         app.chat_forget(card);
         app.cards
             .insert(card, CardRuntime::Failed("Daemon proof changed".into()));
-        app.chat_ui.blocked_starts.insert(card, source);
+        app.chat_ui
+            .blocked_starts
+            .insert(card, blocked_recovery::BlockedStart { source, reopen });
     }
     (app, card)
 }
@@ -180,11 +196,7 @@ fn blocked_recovery_actions_are_enabled_and_dispatch_for_every_settled_surface()
                 } else {
                     let (tree, _) = frame(app.card_view(card, true, false), width, None);
                     assert!(!labels(&tree).contains(&"Start a new conversation"));
-                    assert!(
-                        labels(&tree)
-                            .iter()
-                            .any(|text| text.contains("new tab (+) menu"))
-                    );
+                    assert!(labels(&tree).contains(&blocked_recovery::CLOSE_GUIDANCE));
                     drop(app.handle_chat_ui(Action::StartFresh(card)));
                     assert!(!app.chat_start_pending(card));
                 }
@@ -414,7 +426,7 @@ fn blocked_saved_history_loading_keeps_enabled_close() {
     app.card_state_mut(card).unwrap().kind = CardKind::Chat(source.clone());
     let runtime = app.chat_runtime_mut(target).unwrap();
     runtime.session = source.clone();
-    runtime.start_retry_blocked = true;
+    runtime.start_blocked = Some(blocked_recovery::Reopen::Unproven);
     let snapshot = Arc::make_mut(&mut runtime.snapshot);
     snapshot.exited = true;
     snapshot.history_loading = true;
@@ -593,7 +605,7 @@ fn typed_remediable_first_message_keeps_send_enabled() {
                 recovery,
             }),
         );
-        assert!(!chat_runtime(&app, card).start_retry_blocked);
+        assert!(!chat_runtime(&app, card).start_blocked.is_some());
         let (tree, _) = frame(app.card_view(card, true, false), 900.0, None);
         assert!(tree.root().iter().chain(tree.children()).any(|node| {
             node.node().role() == Role::Button
@@ -619,7 +631,7 @@ fn choosing_another_model_lifts_a_blocked_first_start() {
     let target = chat_runtime(&app, card).target;
     let provider = chat_runtime(&app, card).session.launch.provider;
     let runtime = app.chat_runtime_mut(target).unwrap();
-    runtime.start_retry_blocked = true;
+    runtime.start_blocked = Some(blocked_recovery::Reopen::Unproven);
     runtime.error = Some("permanent launch refusal".into());
     runtime.replace_draft(text_editor::Content::with_text("Keep this unsent note."));
     assert!(app.chat_retry_blocked(card));
@@ -657,7 +669,7 @@ fn blocked_attachment_only_draft_close_requires_discard_and_cancel_keeps_it() {
     let card = tests::draft_chat(&mut app);
     let target = chat_runtime(&app, card).target;
     let runtime = app.chat_runtime_mut(target).unwrap();
-    runtime.start_retry_blocked = true;
+    runtime.start_blocked = Some(blocked_recovery::Reopen::Unproven);
     runtime
         .attachments
         .push(Attachment::file("/project/unsent.txt"));
@@ -680,7 +692,7 @@ fn blocked_saved_source_cannot_retry_through_auth_text_or_stale_account_recovery
         let target = chat_runtime(&app, card).target;
         let raw = "Codex RPC error: Not logged in";
         let runtime = app.chat_runtime_mut(target).unwrap();
-        runtime.start_retry_blocked = false;
+        runtime.start_blocked = None;
         runtime.disconnected = true;
         if snapshot_auth {
             Arc::make_mut(&mut runtime.snapshot).error = Some(raw.into());
@@ -715,7 +727,7 @@ fn blocked_saved_source_cannot_retry_through_auth_text_or_stale_account_recovery
             "known remediable sign-in remains accessible"
         );
         let runtime = app.chat_runtime_mut(target).unwrap();
-        runtime.start_retry_blocked = true;
+        runtime.start_blocked = Some(blocked_recovery::Reopen::Unproven);
         let source = runtime.return_session();
         // Exercise the replay handler before display assertions: the negative
         // control must reach the actual forbidden retry, not stop at a label.
@@ -822,34 +834,82 @@ fn blocked_saved_source_cannot_retry_through_auth_text_or_stale_account_recovery
     }
 }
 
+/// Each permanent refusal's visible headline and caption say what the reason
+/// does, and none promises Resume conversation from the new tab (+) menu: it
+/// prepares or starts the same saved conversation and meets the same refusal.
 #[test]
-fn blocked_saved_fresh_guidance_renders_both_instructions_with_and_without_inspector() {
-    const REOPEN: &str = "Close this card, then use Resume conversation in the new tab (+) menu to reopen the conversation.";
-    for runtime in [false, true] {
-        for (width, inspector) in [(900.0, false), (1280.0, false), (1280.0, true)] {
-            let (mut app, card) = blocked_app(true, true, runtime);
-            app.workspace.resize_viewport(width);
-            assert!(app.chat_retry_blocked(card));
-            assert!(app.chat_offers_fresh_conversation(card));
-            let (tree, _) = if inspector {
-                drop(app.set_pane_inspector_open(card, true));
-                assert!(app.pane_inspectors.is_visible(card));
-                frame(cosmic::Application::view(&app), width, None)
-            } else {
-                frame(app.card_view(card, true, false), width, None)
-            };
-            assert!(
-                labels(&tree).iter().any(|text| {
-                    text.contains(blocked_recovery::FRESH_EXPLANATION) && text.contains(REOPEN)
-                }),
-                "one rendered caption keeps both approved instructions (runtime={runtime}, inspector={inspector}, width={width})"
-            );
+fn each_blocked_refusal_kind_renders_its_own_headline_and_caption() {
+    use blocked_recovery::{
+        CLOSE_GUIDANCE, FRESH_EXPLANATION, HEADLINE, RESTART_GUIDANCE, RESTART_HEADLINE, Reopen,
+    };
+    let fresh_restart = format!("{RESTART_GUIDANCE} {FRESH_EXPLANATION}");
+    for (recovery, reopen, headline, fresh, close_only) in [
+        (
+            chat::Recovery::Blocked,
+            Reopen::Unproven,
+            HEADLINE,
+            FRESH_EXPLANATION,
+            CLOSE_GUIDANCE,
+        ),
+        (
+            chat::Recovery::AfterRestart,
+            Reopen::AfterRestart,
+            RESTART_HEADLINE,
+            fresh_restart.as_str(),
+            RESTART_GUIDANCE,
+        ),
+    ] {
+        assert_eq!(Reopen::of(recovery), Some(reopen));
+        assert_eq!(reopen.headline(), headline);
+        for (valid_recipe, caption) in [(true, fresh), (false, close_only)] {
+            for runtime in [false, true] {
+                for (width, inspector) in [(900.0, false), (1280.0, false), (1280.0, true)] {
+                    let (mut app, card) = blocked_app_with(true, valid_recipe, runtime, reopen);
+                    app.workspace.resize_viewport(width);
+                    assert!(app.chat_retry_blocked(card));
+                    assert_eq!(app.chat_offers_fresh_conversation(card), valid_recipe);
+                    let (tree, _) = if inspector {
+                        drop(app.set_pane_inspector_open(card, true));
+                        assert!(app.pane_inspectors.is_visible(card));
+                        frame(cosmic::Application::view(&app), width, None)
+                    } else {
+                        frame(app.card_view(card, true, false), width, None)
+                    };
+                    let mut labels = labels(&tree);
+                    // A runtime puts the headline on its failure incident.
+                    let incident_tree;
+                    if runtime {
+                        let target = chat_runtime(&app, card).target;
+                        let runtime = app.chat_runtime_mut(target).unwrap();
+                        runtime.refresh_failure_ui();
+                        let incident = runtime.failure_ui.incidents.last().unwrap();
+                        incident_tree = frame(runtime.failure_view(incident), width, None).0;
+                        labels.extend(self::labels(&incident_tree));
+                    }
+                    let case = format!(
+                        "{reopen:?}, fresh={valid_recipe}, runtime={runtime}, inspector={inspector}, width={width}: {labels:?}"
+                    );
+                    assert!(labels.contains(&headline), "{case}");
+                    assert!(labels.contains(&caption), "{case}");
+                    assert!(
+                        labels
+                            .iter()
+                            .all(|label| !label.contains("Resume conversation")),
+                        "{case}"
+                    );
+                }
+            }
         }
     }
-    // The Close-only alternative must not inherit the Fresh caveat.
-    let (app, card) = blocked_app(true, false, false);
-    assert_eq!(app.blocked_failure_guidance(card).as_deref(), Some(REOPEN));
-    assert_eq!(blocked_recovery::guidance(false), REOPEN);
+    // Every other recovery has an action of its own and is no refusal kind.
+    for recovery in [
+        chat::Recovery::Account,
+        chat::Recovery::Retry,
+        chat::Recovery::Capacity,
+        chat::Recovery::Fresh,
+    ] {
+        assert_eq!(Reopen::of(recovery), None, "{recovery:?}");
+    }
 }
 
 /// Run the actual abandoned Fresh task in an isolated process: no daemon can
@@ -912,7 +972,7 @@ fn blocked_fresh_abandoned_cleanup_keeps_captured_pair_receipt_required() {
     app.card_state_mut(card).unwrap().kind = CardKind::Chat(source.clone());
     let runtime = app.chat_runtime_mut(target).unwrap();
     runtime.session = source.clone();
-    runtime.start_retry_blocked = true;
+    runtime.start_blocked = Some(blocked_recovery::Reopen::Unproven);
     Arc::make_mut(&mut runtime.snapshot).exited = true;
     // Close consults the attached client's publication even while another
     // operation is pending; establish the same stopped pair there too.
@@ -1041,7 +1101,7 @@ fn a_failed_empty_pane_does_not_invite_a_first_message() {
     assert!(!labels(&tree).contains(&INVITATION));
 
     let runtime = app.chat_runtime_mut(target).unwrap();
-    runtime.start_retry_blocked = false;
+    runtime.start_blocked = None;
     runtime.error = None;
     runtime.refresh_failure_ui();
     let (tree, _) = frame(app.card_view(card, true, false), 1200.0, None);

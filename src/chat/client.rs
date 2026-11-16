@@ -48,14 +48,17 @@ fn chat_socket(intent: Intent) -> Result<std::path::PathBuf, StartFailure> {
 }
 
 fn start_failure(error: ipc::ProtocolError) -> StartFailure {
+    let recovery = match error.code {
+        ipc::ProtocolErrorCode::AccountRemoved => super::Recovery::Account,
+        ipc::ProtocolErrorCode::ChatCapacity => super::Recovery::Capacity,
+        _ if error.retryable => super::Recovery::Retry,
+        // Only the daemon's own whole sentence, never text that quotes it.
+        _ if error.message == super::UNPROVEN_OWNER_REFUSAL => super::Recovery::AfterRestart,
+        _ => super::Recovery::Blocked,
+    };
     StartFailure {
         message: error.message,
-        recovery: match error.code {
-            ipc::ProtocolErrorCode::AccountRemoved => super::Recovery::Account,
-            ipc::ProtocolErrorCode::ChatCapacity => super::Recovery::Capacity,
-            _ if error.retryable => super::Recovery::Retry,
-            _ => super::Recovery::Blocked,
-        },
+        recovery,
     }
 }
 
@@ -1645,8 +1648,14 @@ fn resume_retained_claude(
         Ok(ServerResponse::ChatResumePrepared { session: prepared }) => prepared,
         Ok(_) => return Err("The daemon did not answer the saved conversation's resume".into()),
         Err(mut failure) => {
+            // "Yet" only where a later attempt can succeed.
             failure.message = format!(
-                "The saved conversation could not be reopened yet, so nothing was restarted or resent. {}",
+                "The saved conversation could not be reopened{}, so nothing was restarted or resent. {}",
+                if failure.recovery == super::Recovery::Blocked {
+                    ""
+                } else {
+                    " yet"
+                },
                 failure.message
             );
             return Err(failure);
@@ -2681,9 +2690,7 @@ impl ClientHandle {
                         continue;
                     }
                     let mut failure = start_failure(error);
-                    if intent == Intent::RestoreExisting
-                        && failure.recovery != super::Recovery::Blocked
-                    {
+                    if intent == Intent::RestoreExisting && !failure.recovery.is_blocked() {
                         // An ordinary recovery attachment cannot enter the
                         // account-recovery path, whose callback starts a
                         // provider. Account changes remain explicit actions.
@@ -3996,6 +4003,33 @@ mod tests {
                 assert_eq!(failure.message, "the daemon's exact reason");
             }
         }
+    }
+
+    #[test]
+    fn only_the_daemons_whole_unproven_owner_refusal_waits_for_a_restart() {
+        use super::super::{Recovery, UNPROVEN_OWNER_REFUSAL};
+        use ipc::ProtocolErrorCode;
+
+        let recovery = |message: &str, retryable| {
+            start_failure(ipc::ProtocolError::new(
+                ProtocolErrorCode::InvalidRequest,
+                message,
+                retryable,
+            ))
+            .recovery
+        };
+        assert_eq!(
+            recovery(UNPROVEN_OWNER_REFUSAL, false),
+            Recovery::AfterRestart
+        );
+        assert!(Recovery::AfterRestart.is_blocked());
+        // A provider or wrapper quoting the sentence names no restart.
+        assert_eq!(
+            recovery(&format!("Provider said: {UNPROVEN_OWNER_REFUSAL}"), false),
+            Recovery::Blocked
+        );
+        // Retryability still wins: a retry is a nearer way back.
+        assert_eq!(recovery(UNPROVEN_OWNER_REFUSAL, true), Recovery::Retry);
     }
 
     #[test]

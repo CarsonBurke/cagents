@@ -1219,7 +1219,7 @@ pub(super) struct State {
     /// Capacity failures before a chat runtime exists (saved-pane hydration).
     capacity_offers: HashSet<CardId>,
     /// Starts refused as nonretryable before a runtime exists.
-    blocked_starts: HashMap<CardId, chat::Session>,
+    blocked_starts: HashMap<CardId, blocked_recovery::BlockedStart>,
     /// Expanded diagnostics belong to the exact failed source, never a replacement.
     blocked_details: HashMap<CardId, chat::Session>,
     removed_accounts: HashSet<CardId>,
@@ -3083,8 +3083,9 @@ pub(super) struct Runtime {
     /// Resuming this card's stopped provider failed; the reason stands in
     /// `error`, and retry is offered only while it can help.
     resume_failed: bool,
-    /// The daemon says repeating this start cannot help.
-    start_retry_blocked: bool,
+    /// The daemon says repeating this start cannot help, and when the
+    /// conversation can come back.
+    start_blocked: Option<blocked_recovery::Reopen>,
     /// Resume may retire this actor before its replacement answers. Keep the
     /// source body until a successful attachment supplies its successor.
     resume_source_pinned: bool,
@@ -4180,7 +4181,7 @@ impl Runtime {
             capacity_refused: false,
             close_refusal: None,
             resume_failed: false,
-            start_retry_blocked: false,
+            start_blocked: None,
             resume_source_pinned: false,
             failures: Vec::new(),
             unplaced_failures: Vec::new(),
@@ -4743,7 +4744,7 @@ impl Runtime {
     /// Lift a permanent first-start refusal once the draft names a different
     /// launch. That refusal and its diagnostic answered the previous one.
     fn release_start_block(&mut self) {
-        if std::mem::take(&mut self.start_retry_blocked) {
+        if self.start_blocked.take().is_some() {
             self.error = None;
         }
     }
@@ -6309,7 +6310,7 @@ impl Runtime {
     fn offers_fresh_conversation(&self) -> bool {
         let source = self.return_session();
         source.launch.session_id.is_some()
-            && (self.start_retry_blocked
+            && (self.start_blocked.is_some()
                 || (self.snapshot.exited && self.snapshot.session_id != source.launch.session_id))
             && source.fresh_start().is_some()
     }
@@ -9372,15 +9373,15 @@ impl Cagents {
 
     pub(super) fn chat_retry_blocked(&self, card: CardId) -> bool {
         match self.cards.get(&card) {
-            Some(CardRuntime::Chat(runtime)) => runtime.start_retry_blocked,
+            Some(CardRuntime::Chat(runtime)) => runtime.start_blocked.is_some(),
             _ => self
                 .chat_ui
                 .blocked_starts
                 .get(&card)
-                .is_some_and(|source| {
-                    self.card_state(card).is_some_and(
-                        |state| matches!(&state.kind, CardKind::Chat(current) if current == source),
-                    )
+                .is_some_and(|blocked| {
+                    self.card_state(card).is_some_and(|state| {
+                        matches!(&state.kind, CardKind::Chat(current) if *current == blocked.source)
+                    })
                 }),
         }
     }
@@ -12130,7 +12131,7 @@ impl Cagents {
                             runtime.error = None;
                             runtime.capacity_refused = false;
                             runtime.resume_failed = false;
-                            runtime.start_retry_blocked = false;
+                            runtime.start_blocked = None;
                             runtime.logical_prose.release();
                             runtime.resume_source_pinned = false;
                             runtime.show(visible);
@@ -12265,8 +12266,7 @@ impl Cagents {
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
                             runtime.unqueue();
                             runtime.capacity_refused = failure.recovery == chat::Recovery::Capacity;
-                            runtime.start_retry_blocked =
-                                failure.recovery == chat::Recovery::Blocked;
+                            runtime.start_blocked = blocked_recovery::Reopen::of(failure.recovery);
                             runtime.error = Some(failure.message);
                         }
                         let restore = if failure.recovery == chat::Recovery::Account {
@@ -12311,11 +12311,15 @@ impl Cagents {
                         ]);
                     }
                     Err(failure) => {
-                        let retry_blocked = failure.recovery == chat::Recovery::Blocked;
-                        if retry_blocked {
-                            self.chat_ui
-                                .blocked_starts
-                                .insert(target.card, attempt.session.clone());
+                        let blocked = blocked_recovery::Reopen::of(failure.recovery);
+                        if let Some(reopen) = blocked {
+                            self.chat_ui.blocked_starts.insert(
+                                target.card,
+                                blocked_recovery::BlockedStart {
+                                    source: attempt.session.clone(),
+                                    reopen,
+                                },
+                            );
                         } else {
                             self.chat_ui.blocked_starts.remove(&target.card);
                         }
@@ -12345,7 +12349,7 @@ impl Cagents {
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
                             runtime.capacity_refused = failure.recovery == chat::Recovery::Capacity;
                             runtime.error = Some(failure.message);
-                            runtime.start_retry_blocked = retry_blocked;
+                            runtime.start_blocked = blocked;
                             // A resume that failed leaves its card where it
                             // was, stopped with its conversation kept, so it
                             // tries again. Reconnecting instead would look for
@@ -13111,7 +13115,7 @@ impl Cagents {
                 };
                 // Match the disabled Send control before account routing,
                 // paste deferral or queue mutation can consume the draft.
-                if runtime.start_retry_blocked
+                if runtime.start_blocked.is_some()
                     || (!runtime.is_draft()
                         && (runtime.disconnected
                             || runtime.snapshot.exited
@@ -31050,6 +31054,66 @@ mod tests {
         assert!(!app.chat_retry_blocked(card));
     }
 
+    /// A refusal a restart lifts reaches both blocked surfaces, the failed
+    /// card of a restore and the stopped runtime of a resume, as that kind.
+    #[test]
+    fn a_refusal_a_restart_lifts_says_so_on_the_failed_and_stopped_card() {
+        let reason = format!(
+            "The saved conversation could not be reopened yet, so nothing was restarted or resent. {}",
+            chat::UNPROVEN_OWNER_REFUSAL
+        );
+        for intent in [chat::Intent::Restore, chat::Intent::Resume] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat(&mut app, Some(KNOWN_THREAD));
+            let source = chat_runtime(&app, card).session.clone();
+            if intent == chat::Intent::Restore {
+                app.chat_forget(card);
+                app.cards.insert(card, CardRuntime::Loading);
+                drop(app.open_chat(card, source.clone(), intent));
+            } else {
+                drop(app.start_chat(card, source.clone(), intent, None, false));
+            }
+            let attempt = chat_runtime_attempt(&app, card);
+            answer_start(
+                &mut app,
+                attempt,
+                Err(chat::StartFailure {
+                    message: reason.clone(),
+                    recovery: chat::Recovery::AfterRestart,
+                }),
+            );
+            assert!(app.chat_retry_blocked(card), "{intent:?}");
+            assert!(!app.chat_start_pending(card), "{intent:?}");
+            let mut labels = capacity_recovery_labels(&app, card);
+            if let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) {
+                // A runtime puts the headline on its failure incident.
+                runtime.refresh_failure_ui();
+                let incident = runtime.failure_ui.incidents.last().unwrap();
+                labels.extend(recovery_labels(runtime.failure_view(incident)));
+            }
+            assert!(
+                labels
+                    .iter()
+                    .any(|label| label == blocked_recovery::RESTART_HEADLINE),
+                "{intent:?}: {labels:?}"
+            );
+            assert!(
+                labels
+                    .iter()
+                    .any(|label| label.starts_with(blocked_recovery::RESTART_GUIDANCE)),
+                "{intent:?}: {labels:?}"
+            );
+            assert!(
+                labels
+                    .iter()
+                    .all(|label| !label.contains("Retry") && !label.contains("Resume conversation")),
+                "{intent:?}: {labels:?}"
+            );
+            drop(app.update(Message::RetryCard(card)));
+            assert!(!app.chat_start_pending(card), "{intent:?}");
+        }
+    }
+
     #[test]
     fn nonretryable_failed_resume_preserves_an_explicit_fresh_start_offer() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -31079,7 +31143,8 @@ mod tests {
         let stopped = runtime.stopped(false, false);
         assert_eq!(
             stopped.guidance,
-            "Starts a new conversation in this card. The old one stays on disk, but this card stops pointing at it. Your draft is kept. Close this card, then use Resume conversation in the new tab (+) menu to reopen the conversation."
+            blocked_recovery::FRESH_EXPLANATION,
+            "a permanent refusal promises no reopening step"
         );
         assert_eq!(
             stopped.primary,
@@ -31211,7 +31276,7 @@ mod tests {
             app.card_state_mut(card).unwrap().kind = CardKind::Chat(source.clone());
             let runtime = app.chat_runtime_mut(target).unwrap();
             runtime.session = source.clone();
-            runtime.start_retry_blocked = true;
+            runtime.start_blocked = Some(blocked_recovery::Reopen::Unproven);
             runtime.replace_draft(text_editor::Content::with_text("keep the chosen draft"));
             let snapshot = Arc::make_mut(&mut runtime.snapshot);
             snapshot.exited = true;
@@ -31310,7 +31375,7 @@ mod tests {
             app.card_state_mut(card).unwrap().kind = CardKind::Chat(source.clone());
             let runtime = app.chat_runtime_mut(target).unwrap();
             runtime.session = source.clone();
-            runtime.start_retry_blocked = true;
+            runtime.start_blocked = Some(blocked_recovery::Reopen::Unproven);
             runtime.replace_draft(text_editor::Content::with_text("keep the draft"));
             assert!(!app.chat_offers_fresh_conversation(card));
             drop(app.handle_chat_ui(Action::StartFresh(card)));
@@ -31358,7 +31423,8 @@ mod tests {
         let stopped = runtime.stopped(false, false);
         assert_eq!(
             stopped.guidance,
-            "Starts a new conversation in this card. The old one stays on disk, but this card stops pointing at it. Your draft is kept. Close this card, then use Resume conversation in the new tab (+) menu to reopen the conversation."
+            blocked_recovery::FRESH_EXPLANATION,
+            "a permanent refusal promises no reopening step"
         );
         assert_eq!(
             stopped.primary,

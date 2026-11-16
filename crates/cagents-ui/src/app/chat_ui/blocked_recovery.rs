@@ -2,17 +2,68 @@
 use super::*;
 
 pub(in crate::app) const HEADLINE: &str = "This conversation can't be reopened safely.";
+pub(in crate::app) const RESTART_HEADLINE: &str =
+    "This conversation can't be reopened until this computer restarts.";
 pub(super) const DRAFT_HEADLINE: &str = "This conversation couldn't start.";
 pub(super) const DRAFT_GUIDANCE: &str = "Your message is kept. Copy it into a new conversation, or see Details for why this one couldn't start.";
 pub(super) const FRESH_EXPLANATION: &str = "Starts a new conversation in this card. The old one stays on disk, but this card stops pointing at it. Your draft is kept.";
-const REOPEN_GUIDANCE: &str = "Close this card, then use Resume conversation in the new tab (+) menu to reopen the conversation.";
+pub(super) const RESTART_GUIDANCE: &str =
+    "Keep this card, and it reopens the conversation after the restart.";
+pub(super) const CLOSE_GUIDANCE: &str =
+    "Details say why. Closing this card keeps the conversation on disk.";
 
-pub(super) fn guidance(fresh: bool) -> String {
-    if fresh {
-        [FRESH_EXPLANATION, REOPEN_GUIDANCE].join(" ")
-    } else {
-        REOPEN_GUIDANCE.to_owned()
+/// When a permanently refused saved conversation can come back, as far as
+/// the daemon's typed refusal says. Nothing here promises Resume conversation
+/// in the new tab (+) menu: it asks the daemon to prepare the same saved
+/// conversation, or starts the same saved launch, so it meets the same
+/// refusal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::app) enum Reopen {
+    /// No later step is known to reopen it; the reason is under Details.
+    Unproven,
+    /// A new boot proves the conversation's earlier process gone, and this
+    /// card's own restore then prepares it again.
+    AfterRestart,
+}
+
+impl Reopen {
+    /// The permanent refusals; `None` for every recovery that has an action.
+    pub(in crate::app) fn of(recovery: chat::Recovery) -> Option<Self> {
+        match recovery {
+            chat::Recovery::Blocked => Some(Self::Unproven),
+            chat::Recovery::AfterRestart => Some(Self::AfterRestart),
+            chat::Recovery::Account
+            | chat::Recovery::Retry
+            | chat::Recovery::Capacity
+            | chat::Recovery::Fresh => None,
+        }
     }
+
+    pub(in crate::app) fn headline(self) -> &'static str {
+        match self {
+            Self::Unproven => HEADLINE,
+            Self::AfterRestart => RESTART_HEADLINE,
+        }
+    }
+
+    /// The caption under a saved conversation's refusal, with the
+    /// explanation of Start a new conversation when this card offers it.
+    pub(super) fn guidance(self, fresh: bool) -> String {
+        match (self, fresh) {
+            (Self::Unproven, true) => FRESH_EXPLANATION.to_owned(),
+            (Self::Unproven, false) => CLOSE_GUIDANCE.to_owned(),
+            (Self::AfterRestart, true) => [RESTART_GUIDANCE, FRESH_EXPLANATION].join(" "),
+            (Self::AfterRestart, false) => RESTART_GUIDANCE.to_owned(),
+        }
+    }
+}
+
+/// A start refused before a chat runtime exists, kept with the exact source
+/// it refused so a replacement never inherits its diagnostics.
+#[derive(Clone, Debug)]
+pub(in crate::app) struct BlockedStart {
+    pub(in crate::app) source: chat::Session,
+    pub(in crate::app) reopen: Reopen,
 }
 
 impl Cagents {
@@ -22,20 +73,24 @@ impl Cagents {
         };
         // Every blocked surface says the draft is kept, and nothing restores
         // it once its card closes: a reopened conversation gets a new card.
-        (runtime.start_retry_blocked
+        (runtime.start_blocked.is_some()
             && (!runtime.composer.text().trim().is_empty() || !runtime.attachments.is_empty()))
         .then_some(runtime.session.id)
     }
 
     /// Failed-card diagnostics are authorized by the same exact source as the
     /// refusal. A stale Details or Copy press cannot expose a replacement.
-    pub(in crate::app) fn blocked_failure_source(&self, card: CardId) -> Option<&chat::Session> {
-        self.chat_ui.blocked_starts.get(&card).filter(|source| {
+    pub(in crate::app) fn blocked_failure(&self, card: CardId) -> Option<&BlockedStart> {
+        self.chat_ui.blocked_starts.get(&card).filter(|blocked| {
             matches!(self.cards.get(&card), Some(CardRuntime::Failed(_)))
-                && self.card_state(card).is_some_and(
-                    |state| matches!(&state.kind, CardKind::Chat(current) if current == *source),
-                )
+                && self.card_state(card).is_some_and(|state| {
+                    matches!(&state.kind, CardKind::Chat(current) if *current == blocked.source)
+                })
         })
+    }
+
+    pub(in crate::app) fn blocked_failure_source(&self, card: CardId) -> Option<&chat::Session> {
+        self.blocked_failure(card).map(|blocked| &blocked.source)
     }
 
     pub(in crate::app) fn blocked_failure_diagnostics(&self, card: CardId) -> Element<'_, Message> {
@@ -68,8 +123,11 @@ impl Cagents {
     }
 
     pub(in crate::app) fn blocked_failure_guidance(&self, card: CardId) -> Option<String> {
-        self.blocked_failure_source(card)
-            .map(|_| guidance(self.chat_offers_fresh_conversation(card)))
+        self.blocked_failure(card).map(|blocked| {
+            blocked
+                .reopen
+                .guidance(self.chat_offers_fresh_conversation(card))
+        })
     }
 
     pub(super) fn begin_fresh_conversation(&mut self, card: CardId) -> Task<Message> {

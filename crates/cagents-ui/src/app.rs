@@ -11490,8 +11490,8 @@ impl Cagents {
                             } else {
                                 std::borrow::Cow::Borrowed("This build does not include the integrated browser. Open the saved page in your system browser.")
                             }
-                        } else if self.blocked_failure_source(id).is_some() {
-                            std::borrow::Cow::Borrowed(chat_ui::blocked_recovery::HEADLINE)
+                        } else if let Some(blocked) = self.blocked_failure(id) {
+                            std::borrow::Cow::Borrowed(blocked.reopen.headline())
                         } else { std::borrow::Cow::Borrowed(message.message()) })
                             .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                             .width(Length::Fill)

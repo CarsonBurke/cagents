@@ -267,7 +267,7 @@ const SURVIVOR: &str = "A process from this conversation's earlier Claude sessio
 
 /// Also the answer for a pane whose conversation had an open CLI view, since
 /// that view's terminal could still hold the conversation.
-const UNMATCHED: &str = "This conversation's earlier Claude process ended without recording its close, and cagents cannot prove that nothing else still holds the conversation, so nothing was started in its place. It can be resumed after this computer restarts";
+const UNMATCHED: &str = crate::chat::UNPROVEN_OWNER_REFUSAL;
 
 /// An actor that ended without retirement grants disk resume only when no
 /// writer of it can survive: its exact helper and provider are gone in this

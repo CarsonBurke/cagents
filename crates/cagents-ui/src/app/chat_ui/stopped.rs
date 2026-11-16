@@ -61,12 +61,12 @@ impl Runtime {
             && self.attachment_chooser_pending.is_none()
             && self.pastes_pending == 0
             && (!saved_history || !snapshot.history_loading);
-        if self.start_retry_blocked {
+        if let Some(reopen) = self.start_blocked {
             return Stopped {
                 guidance: if self.is_draft() {
                     blocked_recovery::DRAFT_GUIDANCE.to_owned()
                 } else {
-                    blocked_recovery::guidance(unresumable)
+                    reopen.guidance(unresumable)
                 },
                 primary: Some(if unresumable {
                     ("Start a new conversation", Press::StartFresh, enabled)

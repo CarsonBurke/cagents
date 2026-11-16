@@ -3041,7 +3041,7 @@ impl Runtime {
                 .spacing(space::S)
                 .into(),
             );
-        } else if self.start_retry_blocked
+        } else if self.start_blocked.is_some()
             || ((self.disconnected || snapshot.exited) && self.auth_error().is_none())
         {
             content.push(self.stopped_controls(
@@ -3335,7 +3335,7 @@ impl Runtime {
         // contents. The action handler checks the current draft before sending;
         // tying the binding to a view-time draft snapshot can leave Enter
         // inserting a newline until another pointer event redraws the pane.
-        let key_submit = if available && !self.start_retry_blocked {
+        let key_submit = if available && !self.start_blocked.is_some() {
             (modes.first().copied(), modes.get(1).copied())
         } else {
             (None, None)
@@ -3516,7 +3516,7 @@ impl Runtime {
                             }))
                             .on_press_maybe(
                                 (available
-                                    && !self.start_retry_blocked
+                                    && !self.start_blocked.is_some()
                                     && !self.provider_coming_up())
                                 .then(|| action(Action::SubmitControl(target, mode))),
                             )
