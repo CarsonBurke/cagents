@@ -38,21 +38,26 @@ CONFLICT, HEAD_MOVED, REFUSED, CI_FAILED, TIMED_OUT = 3, 4, 5, 6, 7
 GIT_LOCATION = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
                 "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_PREFIX")
 
-AI = r"\b(claude|anthropic|openai|codex|chatgpt|gpt)(?![a-z])"
-# Lines removed from commit messages. Only whole trailer and footer lines go:
-# commit bodies here often discuss Claude and Codex as providers.
+AI = r"\b(claude|anthropic|openai|codex|chatgpt|gpt|copilot)(?![a-z])"
+# Lines removed from commit messages. Only lines shaped as a whole trailer or
+# footer go: commit bodies here often discuss Claude and Codex as providers,
+# and wrapped prose can start a line with "written by Codex ...".
 ATTRIBUTION = [re.compile(pattern, re.IGNORECASE) for pattern in (
-    rf"^\s*[a-z]+(-[a-z]+)*-by:.*{AI}",  # Co-Authored-By, Generated-by, Assisted-by ...
-    rf"^\W*(generated|made|created|written|built)\s+(with|by|using)\s+\W*{AI}",
+    # Co-Authored-By, Generated-by, Assisted-by ... whose value is an AI.
+    rf"^\s*[a-z]+(-[a-z]+)*-by:\s*\W*{AI}",
+    rf"^\s*ai(-[a-z]+)+:",  # AI-Assisted: and the like.
+    # A footer that is the whole line, with an optional emoji and link.
+    rf"^\W*(generated|made|created|built|written)\s+(with|by|using)\s+\W*(openai\s+)?{AI}"
+    r"([\s-]+(code|cli|opus|sonnet|haiku|agent|[\d.]+[a-z]?))*\W*(\([^)]*\))?\W*$",
     r"noreply@(anthropic|openai)\.com",
     r"claude\.com/claude-code",
 )]
-# Attribution that may not remain anywhere, including the title, which is
-# never stripped. Prose that only mentions a provider or a trailer passes.
+# Attribution that may not remain anywhere: the title, which is never
+# stripped, and trailers quoted or indented mid-line. Prose that only
+# mentions a provider, a trailer or a footer passes.
 SURVIVORS = [re.compile(pattern, re.IGNORECASE) for pattern in (
     *(pattern.pattern for pattern in ATTRIBUTION),
-    rf"[a-z]+-by:\s*\W*{AI}[^\n]*<[^>\s]+@[^>\s]+>",  # A trailer quoted or indented mid-line.
-    rf"generated (with|by)\s+\W*claude code",
+    rf"\b[a-z]+-by:\s*\W*{AI}[^\n]*<[^>\s]+@[^>\s]+>",
 )]
 # Subjects of merges that only bring main into the branch.
 MAIN_SYNC = re.compile(rf"Merge (remote-tracking )?(branch )?'?(origin/)?{BASE}'?( of \S+)?( into \S+)?\s*",
@@ -206,6 +211,8 @@ def check_local(root, branch, head):
         raise Stop(REFUSED, f"local {branch} has commits the PR does not; push or drop them first")
     for path, checked_out in worktrees(root):
         # A rebase detaches HEAD; its state names the branch it will rewrite.
+        if not Path(path).is_dir():
+            continue  # A locked worktree whose directory is gone holds no work here.
         for state in ("rebase-merge/head-name", "rebase-apply/head-name"):
             name = Path(path, git(path, "rev-parse", "--git-path", state).stdout.strip())
             if name.is_file() and name.read_text().strip() == ref:
@@ -269,7 +276,8 @@ def sync(root, branch, head, update, dry_run):
         return head
     main = git(root, "rev-parse", f"refs/remotes/origin/{BASE}").stdout.strip()
     # The same merge commit `git merge` would make, built without a checkout.
-    commit = git(root, "commit-tree", tree, "-p", head, "-p", main,
+    sign = git(root, "config", "--bool", "commit.gpgsign", check=False).stdout.strip() == "true"
+    commit = git(root, "commit-tree", *(["-S"] if sign else []), tree, "-p", head, "-p", main,
                  "-m", f"Merge origin/{BASE} into {branch}").stdout.strip()
     if dry_run:
         say(f"would push {commit[:12]}, {branch} with {BASE} merged in")
@@ -314,8 +322,9 @@ def assess(report, head, since, superseded=()):
         return "closed", pr["state"].lower()
     if pr.get("isDraft"):
         return "closed", "converted to draft"
-    if pr.get("mergeable") == "CONFLICTING" and current:
-        return "conflict", "GitHub reports a conflict with main"
+    if pr.get("mergeable") == "CONFLICTING":
+        # Only a current read decides; an older one may predate main's move.
+        return ("conflict", "GitHub reports a conflict with main") if current else ("wait", "mergeability unsettled")
     state = snapshot.get("checks_state")
     if report.get("limitations") or state is None:
         return "wait", "checks unknown" if report.get("limitations") else "no checks reported yet"
@@ -396,8 +405,12 @@ def land(root, repository, number, update=False, dry_run=False, timeout=60):
                 since = int(time.time())
             title, body = squash_message(number, pr["title"], pr_commits(repository, number))
             if dry_run:
-                verdict, detail = assess(read_status(root, repository, number), head, 0)
-                say(f"dry run: CI on {head[:12]}: {detail}; would merge {target[:12]} as:")
+                if target != head:
+                    verdict, detail = "wait", f"would push it, then wait for CI on {target[:12]}"
+                else:
+                    verdict, detail = assess(read_status(root, repository, number), head, since)
+                    detail = f"CI on {head[:12]}: " + (f"moved to {detail[:12]}" if verdict == "moved" else detail)
+                say(f"dry run: {detail}; would merge {target[:12]} as:")
                 print(f"\n{title}\n\n{body}\n", flush=True)
                 return DRY_RUN_STATUS.get(verdict, 0)
             verdict, detail = wait_for_ci(root, repository, number, target, since, deadline, superseded)
@@ -415,6 +428,8 @@ def land(root, repository, number, update=False, dry_run=False, timeout=60):
                 raise Stop(REFUSED, f"#{number} is {detail}")
             # GitHub sees a conflict: main may have moved. Look again once it can have settled.
             if attempt + 1 < SYNC_ROUNDS:
+                if time.time() + REFRESH >= deadline:
+                    raise Stop(TIMED_OUT, f"GitHub still reports #{number} conflicting with {BASE}")
                 sleep(REFRESH)
         raise Stop(CONFLICT, f"GitHub still reports #{number} conflicting with {BASE} after {SYNC_ROUNDS} checks")
 
