@@ -488,6 +488,34 @@ class LandTests(unittest.TestCase):
         self.assertEqual(self.merge_attempts(), [old, new])
         self.assertIn("now conflicts with main", self.output)
 
+    def test_a_conflict_github_was_still_computing_takes_the_conflict_path(self):
+        old = self.remote_head()
+        self.advance_main("unrelated.txt", "x\n")
+        (self.root / "merge-errors.json").write_text(json.dumps([
+            {"error": self.BASE_MOVED},
+            {"error": "gh: Pull Request is not mergeable (HTTP 405)", "dirty": True}]))
+        self.assertEqual(self.run_land(), 0, self.output)
+        new = self.remote_head()
+        self.assertEqual(self.merge_attempts(), [old, old, new])
+        self.assertEqual(self.git(self.origin, "rev-parse", f"{new}^1"), old)
+
+    def test_a_head_that_moved_with_main_is_not_merged_again(self):
+        (self.root / "merge-errors.json").write_text(json.dumps([{"error": self.BASE_MOVED}]))
+        original = land.read_pr
+        reads = []
+
+        def moved(repository, number):
+            pr = original(repository, number)
+            reads.append(pr)
+            if len(reads) > 1:  # Someone pushed while the merge was refused.
+                pr["head"]["sha"] = "e" * 40
+            return pr
+
+        with patch.object(land, "read_pr", moved):
+            self.assertEqual(self.run_land(), land.HEAD_MOVED, self.output)
+        self.assertEqual(len(self.merge_attempts()), 1)
+        self.assertIsNone(self.merged())
+
     def test_main_moving_during_both_merges_is_refused_without_looping(self):
         head = self.remote_head()
         (self.root / "merge-errors.json").write_text(json.dumps([{"error": self.BASE_MOVED}] * 3))

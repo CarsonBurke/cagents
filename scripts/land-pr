@@ -410,6 +410,12 @@ def merge_after_base_moved(repository, number, head, title, body, error):
         return merge(repository, number, head, title, body)
     except BaseMoved as again:
         raise Stop(REFUSED, f"GitHub refused the merge again, {BASE} keeps moving: {again}") from None
+    except Stop as refusal:
+        # GitHub had not finished computing the conflict when it was read.
+        if refusal.status == REFUSED and "not mergeable" in str(refusal):
+            say(f"#{number} is not mergeable with the new {BASE}")
+            return None
+        raise
 
 
 DRY_RUN_STATUS = {"failed": CI_FAILED, "moved": HEAD_MOVED, "closed": REFUSED, "conflict": CONFLICT}
