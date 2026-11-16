@@ -681,8 +681,8 @@ To show what the header offers when a newer release exists, also copy
 `tests/fixtures/update-release.json` to `home/.config/fixture-update-release.json`
 (mode 0600) before starting. The development build's update check, which
 otherwise never runs, reports that release as available at startup and on
-"Check again". `apply` refuses it, so "Update to" and "Retry update to" fail
-without installing anything.
+"Check again". Under native evidence, `apply` refuses every release, so
+"Update to" and "Retry update to" fail without installing anything.
 
 This loads data into the actual native dialog and supports scrolling and Copy
 details. It does not run providers, inspect a live update inventory, perform an

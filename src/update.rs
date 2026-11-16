@@ -115,7 +115,7 @@ pub enum UpdateError {
     Cancelled,
     /// The review was closed, or expired, while something it named had to
     /// be resolved by hand first. Unlike a cancellation, this says what.
-    #[error("{}", .0.message())]
+    #[error("{}", .0.report())]
     Refused(Box<impact::Refusal>),
     #[error("{0} timed out")]
     Timeout(&'static str),
@@ -205,6 +205,15 @@ impl UpdateError {
         match self {
             Self::Refused(refusal) => Some((**refusal).clone()),
             _ => None,
+        }
+    }
+
+    /// The job's message for this failure. A refusal keeps every reason on
+    /// one line there, the form readers of other versions parse.
+    fn record_message(&self) -> String {
+        match self {
+            Self::Refused(refusal) => refusal.message(),
+            error => error.to_string(),
         }
     }
 }
@@ -491,9 +500,13 @@ pub fn discovers_releases() -> bool {
 }
 
 pub fn apply(release: &Release) -> Result<UpdateJob, UpdateError> {
+    // A native evidence session may be offered the fixture's release, and
+    // never installs any release.
     #[cfg(all(feature = "ui", feature = "development"))]
-    if let Some(root) = std::env::var_os("CAGENTS_EVIDENCE_FIXTURE") {
-        review_fixture::refuse_fixture_release(Path::new(&root), release)?;
+    if std::env::var_os("CAGENTS_EVIDENCE_FIXTURE").is_some() {
+        return Err(invalid(
+            "a native evidence session never installs a release",
+        ));
     }
     recovery::inspect_pending_current()?;
     let installation = Installation::detect()?;
@@ -915,8 +928,9 @@ fn drive_terminal_review_with(
                                 }
                                 continue;
                             }
-                            let _ =
-                                terminal.decide(&job.id, &confirmation.nonce, UpdateChoice::Cancel);
+                            // A failed read is not the person's answer, so
+                            // it ends the update as the stop list's does.
+                            let _ = terminal.cancel(&job.id);
                             return Err(error.into());
                         }
                     }
@@ -1481,7 +1495,7 @@ pub fn run_worker(job_id: &str) -> Result<(), UpdateError> {
     job.message = match &result {
         Ok(()) => "Update installed; saved windows reopened".into(),
         Err(_) if settled_failure => job.message.clone(),
-        Err(error) => error.to_string(),
+        Err(error) => error.record_message(),
     };
     if !job.message.contains("Ended or stopped:") {
         job.message.push_str(&survivors.recovery_report());
@@ -2088,7 +2102,7 @@ fn record_primary_failure(
     };
     job.confirmation = None;
     job.refusal = error.refusal();
-    job.message = error.to_string();
+    job.message = error.record_message();
     if !job.message.contains("Ended or stopped:") {
         job.message.push_str(recovery_report);
     }
@@ -5479,6 +5493,43 @@ sys.stdin.buffer.read(1)
         }
     }
 
+    #[test]
+    fn a_refusal_is_recorded_failed_with_its_reasons_for_every_reader() {
+        let refusal = impact::tests::blocked_preview().refusal().unwrap();
+        let mut job = UpdateJob {
+            id: uuid::Uuid::new_v4().to_string(),
+            version: "9.8.7".into(),
+            phase: UpdatePhase::AwaitingConfirmation,
+            message: "Review the update".into(),
+            log_path: "/fake/update-worker.log".into(),
+            confirmation: None,
+            refusal: None,
+        };
+        record_primary_failure(
+            &mut job,
+            &UpdateError::Refused(Box::new(refusal.clone())),
+            "",
+            "",
+        );
+        assert_eq!(job.phase, UpdatePhase::Failed);
+        assert_eq!(job.refusal.as_ref(), Some(&refusal));
+        // Readers that predate `refusal` find every reason in the message.
+        assert_eq!(job.message, refusal.message());
+        let mut record = serde_json::to_value(&job).unwrap();
+        assert_eq!(
+            serde_json::from_value::<UpdateJob>(record.clone())
+                .unwrap()
+                .refusal,
+            Some(refusal)
+        );
+        // A record written before the field still reads.
+        record.as_object_mut().unwrap().remove("refusal");
+        assert_eq!(
+            serde_json::from_value::<UpdateJob>(record).unwrap().refusal,
+            None
+        );
+    }
+
     /// Answering n at a blocked review tells the person what the worker
     /// records: nothing was installed, and what held it back.
     #[test]
@@ -5554,10 +5605,24 @@ sys.stdin.buffer.read(1)
             matches!(&error, UpdateError::Refused(refusal) if !refusal.sessions.is_empty()),
             "{error:?}"
         );
-        assert!(
-            error.to_string().starts_with("Update not installed: "),
-            "{error}"
+        // One reason per line, where the record keeps them on one.
+        let UpdateError::Refused(refusal) = &error else {
+            unreachable!()
+        };
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Update not installed: {}.\n{}",
+                refusal.summary(),
+                refusal
+                    .details()
+                    .iter()
+                    .map(|detail| format!("  {detail}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
         );
+        assert_eq!(error.record_message(), refusal.message());
     }
 
     #[test]

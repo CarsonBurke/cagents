@@ -291,6 +291,16 @@ impl Refusal {
             .collect()
     }
 
+    /// What the CLI prints: the summary, then each reason on its own line.
+    pub fn report(&self) -> String {
+        let mut report = format!("Update not installed: {}.", self.summary());
+        for detail in self.details() {
+            report.push_str("\n  ");
+            report.push_str(&detail);
+        }
+        report
+    }
+
     /// The job's message: the summary, then every reason after the details
     /// label, so a reader that predates `refusal` still shows them.
     pub fn message(&self) -> String {

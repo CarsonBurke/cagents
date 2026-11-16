@@ -95,6 +95,10 @@ impl Snapshot {
             Some(UpdatePhase::ClosingWindows) => "Saving and closing your windows",
             Some(UpdatePhase::Installing) => "Installing cagents",
             Some(UpdatePhase::Complete) => "Finishing the update",
+            // Nothing was changed, so there is nothing to recover.
+            Some(UpdatePhase::Failed) if self.job.as_ref().is_some_and(|job| job.refused) => {
+                "The update was not installed"
+            }
             Some(UpdatePhase::Failed) => "Waiting for update recovery to finish",
             Some(UpdatePhase::Cancelled) => "Finishing update cancellation",
             _ => "Checking update progress",
@@ -141,13 +145,18 @@ impl Snapshot {
     }
     pub fn technical_summary(&self) -> String {
         format!(
-            "Installation: {}. Helper: {}. Recorded phase: {}.",
+            "Installation: {}. Helper: {}. Recorded phase: {}{}.",
             lock_label(self.installation_lock),
             lock_label(self.helper_lock),
             self.job
                 .as_ref()
                 .map(|job| phase_label(&job.phase))
-                .unwrap_or("unavailable")
+                .unwrap_or("unavailable"),
+            if self.job.as_ref().is_some_and(|job| job.refused) {
+                " (held back, not installed)"
+            } else {
+                ""
+            }
         )
     }
 }

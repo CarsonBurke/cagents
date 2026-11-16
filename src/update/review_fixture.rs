@@ -28,7 +28,8 @@ pub(super) fn read(root: &Path) -> Result<Option<UpdateJob>, UpdateError> {
 
 /// The release a development build's update check offers while
 /// `home/.config/fixture-update-release.json` is present, so the header can
-/// show what it says about an available update. `apply` refuses it.
+/// show what it says about an available update. `apply` refuses every
+/// release while a native evidence fixture is in use.
 pub(super) fn release(root: &Path) -> Result<Option<Release>, UpdateError> {
     read_fixture(&root.join(RELEASE))?
         .map(|bytes| serde_json::from_slice(&bytes).map_err(Into::into))
@@ -37,14 +38,6 @@ pub(super) fn release(root: &Path) -> Result<Option<Release>, UpdateError> {
 
 pub(super) fn offers_release(root: &Path) -> bool {
     root.join(RELEASE).exists()
-}
-
-/// A release the fixture offered is never handed to the installer.
-pub(super) fn refuse_fixture_release(root: &Path, offered: &Release) -> Result<(), UpdateError> {
-    if release(root)?.is_some_and(|fixture| &fixture == offered) {
-        return Err(invalid("the update fixture's release cannot be installed"));
-    }
-    Ok(())
 }
 
 const RELEASE: &str = "home/.config/fixture-update-release.json";
@@ -113,7 +106,7 @@ mod tests {
     }
 
     #[test]
-    fn the_release_fixture_is_offered_but_cannot_be_installed() {
+    fn the_release_fixture_is_offered_as_a_release() {
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("home/.config");
         fs::create_dir_all(&directory).unwrap();
@@ -130,9 +123,5 @@ mod tests {
         assert!(offers_release(root.path()));
         let offered = release(root.path()).unwrap().unwrap();
         assert_eq!(offered.version, "9.8.7");
-        assert!(matches!(
-            refuse_fixture_release(root.path(), &offered),
-            Err(UpdateError::Invalid(_))
-        ));
     }
 }

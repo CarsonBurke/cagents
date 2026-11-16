@@ -159,6 +159,14 @@ fn failed_or_terminal_status_does_not_override_real_held_or_unknown_ownership() 
     refused.job.as_mut().unwrap().refused = true;
     assert_eq!(refused.heading(), "The update was not installed");
     assert!(refused.explanation().contains("nothing was installed"));
+    assert!(
+        refused
+            .technical_summary()
+            .contains("held back, not installed")
+    );
+    // While its helper is still exiting, there is no recovery to wait for.
+    refused.helper_lock = LockState::Held;
+    assert_eq!(refused.heading(), "The update was not installed");
 }
 
 #[test]
