@@ -842,6 +842,7 @@ pub(crate) fn standalone_editor_protection_ready() -> io::Result<()> {
 /// An older independent editor has no interpretable directory inventory.
 /// Preserve all candidates while any local editor cannot prove readiness.
 /// Never inspect its buffers, environment, cwd or command arguments.
+#[cfg(feature = "host")]
 pub(crate) fn verified_running_editors() -> io::Result<Vec<VerifiedWindow>> {
     verified_editors_in(&runtime_directory()?, Path::new("/proc"))
 }
@@ -895,6 +896,7 @@ pub(crate) fn editor_executable(
     }
 }
 
+#[cfg(any(feature = "host", test))]
 fn verified_editors_in(runtime: &Path, proc_root: &Path) -> io::Result<Vec<VerifiedWindow>> {
     use std::os::fd::FromRawFd;
     let mut editors = Vec::new();
@@ -989,6 +991,7 @@ pub(crate) struct VerifiedWindow {
 }
 
 impl VerifiedWindow {
+    #[cfg(feature = "host")]
     pub(crate) fn protects_worktrees(&self) -> io::Result<bool> {
         let name = self
             .lease_path
@@ -1012,6 +1015,7 @@ impl VerifiedWindow {
             )?)
     }
 
+    #[cfg(any(feature = "host", test))]
     pub(crate) fn pid(&self) -> u32 {
         self.pid
     }
@@ -1925,6 +1929,7 @@ pub fn relaunch_failure(windows: usize, errors: &[(&str, String)]) -> String {
 }
 
 pub(crate) const INSTALL_GUARD_ENV: &str = "CAGENTS_UI_UPDATE_GUARD_FD";
+#[cfg(feature = "host")]
 pub(crate) fn update_recovery_fences() -> io::Result<(PathBuf, PathBuf)> {
     let runtime = runtime_directory()?;
     Ok((

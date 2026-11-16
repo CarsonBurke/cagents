@@ -86,11 +86,13 @@ const MODEL_EDGES_WITH_EFFECTS: u16 = 175;
 /// The `ServerMessage` variants that changed shape in place for clients before
 /// [`MODEL_EDGES_WITH_EFFECTS`]. The wire format proof skips exactly these.
 // Wire shape tracing uses Serde variant names, including rename_all.
+#[cfg(test)]
 const MODEL_EDGES: &[&str] = &["workspace_model_edited"];
 
 /// Work boards include the expanded check counts from this protocol onward.
 const WORK_CHECK_COUNTS: u16 = 176;
 const WORK_CHECK_REPLIES: &[&str] = &["Board", "Pinned", "Watching"];
+#[cfg(test)]
 const WORK_BOARD_MESSAGES: &[&str] = &["work_board"];
 
 /// The first protocol with `ToolStatus::Waiting`. An older client is told such

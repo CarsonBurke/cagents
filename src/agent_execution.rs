@@ -128,6 +128,7 @@ impl Authority {
 }
 
 /// Internal acceptance failures; these are never serialized onto the wire.
+#[cfg(feature = "host")]
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum AcceptanceError {
     #[error("{0}")]
@@ -138,12 +139,14 @@ pub(crate) enum AcceptanceError {
     StoreBusy(String),
 }
 
+#[cfg(feature = "host")]
 impl From<String> for AcceptanceError {
     fn from(value: String) -> Self {
         Self::Invalid(value)
     }
 }
 
+#[cfg(feature = "host")]
 impl From<&str> for AcceptanceError {
     fn from(value: &str) -> Self {
         Self::Invalid(value.into())
@@ -505,12 +508,14 @@ impl Agent {
 /// Private launch policy stored with the accepted agent, not a path-based
 /// replacement authority. A restart can reconstruct checks without opening a
 /// replacement directory or blocking interruption of an existing provider.
+#[cfg(feature = "host")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct DirectoryIdentity {
     pub device: u64,
     pub inode: u64,
 }
 
+#[cfg(feature = "host")]
 impl DirectoryIdentity {
     pub(crate) fn from_metadata(metadata: &std::fs::Metadata) -> Self {
         use std::os::unix::fs::MetadataExt;

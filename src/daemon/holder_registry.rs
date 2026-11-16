@@ -3,7 +3,7 @@
 
 use std::{
     fs::{self, OpenOptions},
-    io::{self, Read, Write},
+    io::{self, Read},
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
 };
@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{BootId, TerminalId};
 
+#[cfg(feature = "host")]
 mod connection;
 #[cfg(feature = "host")]
 pub(crate) use connection::connect_until;
@@ -78,6 +79,7 @@ pub(crate) struct BuildIdentity {
 }
 
 impl BuildIdentity {
+    #[cfg(any(feature = "host", test))]
     pub(crate) fn current(kind: Kind) -> Self {
         Self {
             version: crate::version().into(),
@@ -110,11 +112,13 @@ pub(crate) struct Record {
     pub root: Process,
 }
 
+#[cfg(feature = "host")]
 pub(crate) const RETAINED_CLAUDE_CAPABILITY: &str = "claude-actor-v2";
 
 /// Retained Claude discovery visibility only. Attachment still requires the
 /// original record, authenticated peer, daemon lease and actor epoch. Ordinary
 /// terminal discovery and native Codex matching remain application-exact.
+#[cfg(feature = "host")]
 pub(crate) fn record_application_matches(record: &Record) -> bool {
     record_application_matches_for(
         record,
@@ -123,6 +127,7 @@ pub(crate) fn record_application_matches(record: &Record) -> bool {
     )
 }
 
+#[cfg(feature = "host")]
 fn record_application_matches_for(record: &Record, current: &str, development: bool) -> bool {
     record.application == current
         || (!development
@@ -139,10 +144,12 @@ fn record_application_matches_for(record: &Record, current: &str, development: b
 /// Read-only recovery intake may inspect the other production package's original
 /// holder. This is not adoption or cleanup authority: those paths must retain
 /// an authenticated exact-record transition after checking live issued lineage.
+#[cfg(feature = "host")]
 fn recovery_role(application: &str) -> bool {
     production_role_pair(application, crate::instance::APPLICATION_ID)
 }
 
+#[cfg(feature = "host")]
 pub(crate) fn production_role_pair(original: &str, successor: &str) -> bool {
     matches!(
         (original, successor),
@@ -153,6 +160,7 @@ pub(crate) fn production_role_pair(original: &str, successor: &str) -> bool {
 
 /// Private, process-local custody established only after authenticated Inspect
 /// or an exact durable cleanup receipt, and exact issued-source matching. It never changes the original Record.
+#[cfg(feature = "host")]
 #[derive(Clone)]
 pub(crate) struct OriginalRole {
     record: Record,
@@ -161,6 +169,7 @@ pub(crate) struct OriginalRole {
     application: &'static str,
 }
 
+#[cfg(feature = "host")]
 impl OriginalRole {
     pub(crate) fn authenticated(
         record: &Record,
@@ -218,12 +227,14 @@ pub(crate) fn directory(kind: Kind) -> Result<PathBuf, String> {
         .map_err(|error| error.to_string())
 }
 
+#[cfg(any(feature = "host", feature = "ui"))]
 pub(crate) fn socket(directory: &Path, terminal: TerminalId) -> PathBuf {
     directory.join(terminal.to_string())
 }
 
 /// A Unix address includes its terminating NUL. Filesystem paths have no such
 /// small limit; Linux can resolve a long endpoint through a held directory FD.
+#[cfg(feature = "host")]
 pub(crate) fn socket_fits(path: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
     // SAFETY: sockaddr_un is plain data and only its field length is read.
@@ -233,6 +244,7 @@ pub(crate) fn socket_fits(path: &Path) -> bool {
     path.as_os_str().as_bytes().len() < capacity
 }
 
+#[cfg(feature = "host")]
 pub(crate) fn with_socket_address<T>(
     path: &Path,
     operation: impl FnOnce(&Path) -> io::Result<T>,
@@ -278,12 +290,14 @@ pub(crate) fn with_socket_address<T>(
     operation(&address)
 }
 
+#[cfg(feature = "host")]
 pub(crate) fn bind(path: &Path) -> io::Result<std::os::unix::net::UnixListener> {
     with_socket_address(path, |address| {
         std::os::unix::net::UnixListener::bind(address)
     })
 }
 
+#[cfg(feature = "host")]
 pub(crate) fn connect(path: &Path) -> io::Result<std::os::unix::net::UnixStream> {
     with_socket_address(path, |address| {
         std::os::unix::net::UnixStream::connect(address)
@@ -361,7 +375,9 @@ impl Record {
     /// accepts it after an OS crash, and the page cache serves every reader in
     /// this boot. An fsync on a disk-backed runtime directory can instead hold
     /// a holder's launch for seconds under write load (#2180).
+    #[cfg(any(feature = "host", test))]
     pub fn create(&self, directory: &Path) -> io::Result<()> {
+        use std::io::Write;
         let path = self.path(directory);
         let mut file = OpenOptions::new()
             .write(true)
@@ -384,6 +400,7 @@ impl Record {
         result
     }
 
+    #[cfg(feature = "host")]
     pub fn remove(&self, directory: &Path) {
         // A stale cleanup can never erase the evidence of a replacement.
         if read(&self.path(directory)).is_ok_and(|record| record == *self) {
@@ -394,6 +411,7 @@ impl Record {
 
     /// Retire discovery after the owner has independently unlinked its exact
     /// socket inode. Never touch a successor endpoint published in between.
+    #[cfg(feature = "host")]
     pub fn remove_record(&self, directory: &Path) -> io::Result<()> {
         let path = self.path(directory);
         match read(&path) {
@@ -463,6 +481,7 @@ fn read_checked(
 /// teardown receipt. A just-opened record may already be unlinked when fstat
 /// runs; reading that held inode still reports pending until the next poll.
 /// It never grants adoption authority or turns unsafe evidence into absence.
+#[cfg(feature = "host")]
 pub(crate) fn retirement_pending(expected: &Record) -> io::Result<bool> {
     let path = expected.path(&directory(expected.kind).map_err(io::Error::other)?);
     let file = match OpenOptions::new()
@@ -477,12 +496,14 @@ pub(crate) fn retirement_pending(expected: &Record) -> io::Result<bool> {
     read_file(file, true).map(|actual| actual == *expected)
 }
 
+#[cfg(feature = "host")]
 pub(crate) fn evidence(socket: &Path, kind: Kind) -> Result<Option<Record>, String> {
     evidence_inner(socket, kind, false)
 }
 
 /// Untrusted routing evidence for the recovery Inspect handshake only. Ordinary
 /// discovery stays application-exact; no caller may infer adoption from this.
+#[cfg(feature = "host")]
 pub(crate) fn recovery_candidate(socket: &Path, kind: Kind) -> Result<Option<Record>, String> {
     evidence_inner(socket, kind, true)
 }
@@ -490,6 +511,7 @@ pub(crate) fn recovery_candidate(socket: &Path, kind: Kind) -> Result<Option<Rec
 /// Read execution evidence without granting discovery or adoption authority.
 /// Old boots and foreign holders still describe execution; callers must check
 /// the boot before interpreting process identities that the kernel can reuse.
+#[cfg(feature = "host")]
 pub(crate) fn execution_record(socket: &Path) -> io::Result<Option<Record>> {
     let record = match read(&socket.with_extension("json")) {
         Ok(record) => record,
@@ -502,6 +524,7 @@ pub(crate) fn execution_record(socket: &Path) -> io::Result<Option<Record>> {
     Ok(Some(record))
 }
 
+#[cfg(feature = "host")]
 fn evidence_inner(socket: &Path, kind: Kind, recovery: bool) -> Result<Option<Record>, String> {
     let path = socket.with_extension("json");
     let record = match read(&path) {
@@ -594,20 +617,19 @@ fn holding_process_in(directory: &Path, terminal: TerminalId) -> io::Result<Opti
 /// record is the only evidence of which session and process group its
 /// conversation ran in, and its Close needs that evidence for as long as a
 /// provider or tool of it runs on (see [`crate::daemon::lost_processes`]).
+#[cfg(feature = "host")]
 fn ended_with_holder(record: &Record) -> bool {
-    #[cfg(feature = "host")]
-    if record.kind == Kind::Native {
-        return crate::daemon::lost_processes::census(&record.holder, &record.root)
-            .is_ok_and(|left| left.iter().all(|survivor| survivor.zombie));
-    }
-    let _ = record;
-    true
+    record.kind != Kind::Native
+        || crate::daemon::lost_processes::census(&record.holder, &record.root)
+            .is_ok_and(|left| left.iter().all(|survivor| survivor.zombie))
 }
 
+#[cfg(feature = "host")]
 pub(crate) fn discover(directory: &Path, boot: &BootId, kind: Kind) -> Result<Vec<Record>, String> {
     discover_inner(directory, boot, kind, false)
 }
 
+#[cfg(feature = "host")]
 pub(crate) fn recovery_candidates(
     directory: &Path,
     boot: &BootId,
@@ -616,6 +638,7 @@ pub(crate) fn recovery_candidates(
     discover_inner(directory, boot, kind, true)
 }
 
+#[cfg(feature = "host")]
 fn discover_inner(
     directory: &Path,
     boot: &BootId,
@@ -699,7 +722,7 @@ mod tests {
         let removed = read_current(|| {
             let file = open()?;
             if !std::mem::replace(&mut unlinked, true) {
-                record.remove(&directory);
+                fs::remove_file(&path)?;
             }
             Ok(file)
         });
@@ -737,6 +760,7 @@ mod tests {
         assert_eq!(read_checked(file, &metadata, false).unwrap(), successor);
     }
 
+    #[cfg(feature = "host")]
     #[test]
     fn retained_claude_family_visibility_keeps_original_record_and_codex_isolation() {
         const FULL: &str = "dev.cagents.Cagents";
@@ -816,6 +840,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "host")]
     #[test]
     fn recovery_roles_are_only_the_two_distinct_production_packages() {
         let full = "dev.cagents.Cagents";
@@ -833,6 +858,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "host")]
     #[test]
     fn retained_role_capability_cannot_move_to_another_record_or_daemon() {
         // Pure capability/data oracle. This does not impersonate a production
@@ -875,6 +901,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "host")]
     #[test]
     fn ordinary_discovery_refuses_other_production_role_without_mutating_it() {
         // This is on-disk untrusted evidence, never a spawned/renamed helper.
@@ -1031,6 +1058,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "host")]
     fn endpoint_with_byte_length(root: &Path, length: usize) -> PathBuf {
         use std::os::unix::ffi::OsStrExt;
         let prefix = root.as_os_str().as_bytes().len() + 1;
@@ -1042,6 +1070,7 @@ mod tests {
         endpoint
     }
 
+    #[cfg(feature = "host")]
     #[test]
     fn unix_address_boundary_preserves_full_endpoint_and_discovery_identity() {
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
@@ -1082,6 +1111,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "host")]
     #[test]
     fn long_endpoints_reject_public_or_symlinked_directories() {
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
@@ -1138,6 +1168,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "host")]
     #[test]
     fn record_only_retirement_preserves_replacement_endpoint_and_evidence() {
         let directory = tempfile::tempdir().unwrap();
@@ -1158,6 +1189,7 @@ mod tests {
         assert!(endpoint.exists());
     }
 
+    #[cfg(feature = "host")]
     #[test]
     fn terminal_receipt_protocol_and_known_native_build_are_discovered_but_unknown_native_is_refused()
      {
@@ -1196,6 +1228,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "host")]
     #[test]
     fn terminal_directory_pin_protocol_is_discovered_but_future_evidence_is_preserved() {
         let directory = tempfile::tempdir().unwrap();
@@ -1227,6 +1260,7 @@ mod tests {
         assert_eq!(fs::read(future.path(directory.path())).unwrap(), before);
     }
 
+    #[cfg(feature = "host")]
     #[test]
     fn discovery_rejects_foreign_unsafe_and_reused_process_evidence() {
         let directory = tempfile::tempdir().unwrap();
@@ -1264,6 +1298,7 @@ mod tests {
         assert_eq!(fs::read_to_string(target).unwrap(), "foreign file");
     }
 
+    #[cfg(feature = "host")]
     #[test]
     fn discovery_keeps_native_and_legacy_terminal_ownership_separate() {
         let directory = tempfile::tempdir().unwrap();

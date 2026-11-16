@@ -797,15 +797,6 @@ impl Preview {
         })
     }
 
-    pub(super) fn inspection(&self) -> super::source_inspection::SourceInspection {
-        super::source_inspection::SourceInspection {
-            details: self.labels.details.clone(),
-            stopped: self.stopped.clone(),
-            stopped_windows: self.stopped_windows.clone(),
-            labels: self.labels.names.clone(),
-        }
-    }
-
     pub(super) fn with_inspection(
         mut self,
         inspection: &super::source_inspection::SourceInspection,

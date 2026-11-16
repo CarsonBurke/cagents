@@ -87,6 +87,7 @@ impl LeaseHandoff {
     pub(crate) fn duplicate_for_recovery(&self) -> io::Result<File> {
         self.lock.try_clone()
     }
+    #[cfg(test)]
     pub(crate) fn wait(paths: &RuntimePaths, expected_pid: u32) -> Result<Self, PlatformError> {
         Self::wait_cancellable(paths, expected_pid, &AtomicBool::new(false))?
             .ok_or_else(|| io::Error::other("daemon lease wait cancelled").into())

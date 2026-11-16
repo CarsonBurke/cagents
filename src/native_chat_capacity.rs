@@ -1,4 +1,5 @@
 //! Daemon-owned resident admission preference, separate from window settings.
+#[cfg(feature = "host")]
 pub const DEFAULT_LIMIT: u32 = 128;
 pub const MIN_LIMIT: u32 = 1;
 /// An operator-selected safety bound, not a promise that 4096 providers fit in RAM.

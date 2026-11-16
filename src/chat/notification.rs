@@ -1,7 +1,10 @@
 //! A bounded live-turn excerpt, independent of transcript paging.
+#[cfg(feature = "host")]
 use super::{Event, ItemContent, Phase, Role, Snapshot, ToolStatus};
+#[cfg(feature = "host")]
 use crate::notifications::{Content, Kind, RequestType, presentation};
 
+#[cfg(feature = "host")]
 const RETAINED_BYTES: usize = 8192;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -14,11 +17,11 @@ pub struct Preview {
     keep_at_start: bool,
 }
 
+#[cfg(feature = "host")]
 impl Preview {
     /// A decoder has just proved this buffered context belongs to the start
     /// in the same step. Consume exactly that reset, then resume normal turn
     /// boundaries; a later acknowledgement must not restore this older copy.
-    #[cfg(feature = "host")]
     pub(super) fn at_observed_start(mut self) -> Self {
         self.keep_at_start = true;
         self
@@ -105,9 +108,7 @@ impl Preview {
             _ => {}
         }
     }
-}
 
-impl Preview {
     fn conversation(&self, provider_title: Option<&str>) -> String {
         let title = presentation::title(provider_title.unwrap_or_default());
         if title.is_empty() {
@@ -118,6 +119,7 @@ impl Preview {
     }
 }
 
+#[cfg(feature = "host")]
 fn tool_verb(status: ToolStatus, noun: &str) -> String {
     format!(
         "{noun} {}",
@@ -134,6 +136,7 @@ fn tool_verb(status: ToolStatus, noun: &str) -> String {
     )
 }
 
+#[cfg(feature = "host")]
 fn bounded(text: &str, bytes: usize) -> String {
     let mut end = text.len().min(bytes);
     while !text.is_char_boundary(end) {
@@ -223,6 +226,7 @@ impl FrameContext {
     }
 }
 
+#[cfg(feature = "host")]
 fn response_preview(preview: &Preview, error: Option<&str>, kind: Kind) -> String {
     if matches!(kind, Kind::Failed | Kind::Interrupted) {
         presentation::preview(error.unwrap_or_default())
@@ -239,6 +243,7 @@ fn response_preview(preview: &Preview, error: Option<&str>, kind: Kind) -> Strin
 /// Public prompts are provider-neutral here: Claude puts its question in the
 /// field label and Codex puts it in the description. Retain both, without
 /// copying field defaults or answers, under the same bounded Markdown scan.
+#[cfg(feature = "host")]
 fn public_question_preview(request: &super::Request) -> Option<String> {
     if request.kind != super::RequestKind::Question {
         return None;
@@ -276,6 +281,7 @@ fn public_question_preview(request: &super::Request) -> Option<String> {
     (!preview.is_empty()).then_some(preview)
 }
 
+#[cfg(feature = "host")]
 impl Snapshot {
     /// Stream the actionable request metadata into a fixed-size fingerprint.
     /// Do not truncate identity, clone its payload, or include secret answers
@@ -360,7 +366,7 @@ impl Snapshot {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "host"))]
 mod tests {
     use super::*;
     use std::sync::Arc;
