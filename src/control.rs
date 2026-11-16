@@ -33,11 +33,13 @@ mod project_channel_authority_tests;
 pub use chat::ChatCommand;
 mod format;
 mod gh;
-pub use agents::AgentCommand;
+pub use agents::{AgentCommand, PlacedIn};
 pub use gh::GhCommand;
 mod automations;
 mod completions;
 pub use automations::AutomationCommand;
+#[cfg(all(test, feature = "host"))]
+mod daemon_stop_tests;
 mod sessions;
 mod terminal_list;
 #[cfg(test)]
@@ -79,6 +81,7 @@ use crate::{
 };
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+const DAEMON_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 // A live close may outlast a slow commit or shared request at the daemon's fence
 // before its own teardown. Timing out earlier would call that wait unresponsive.
 const TERMINAL_CLOSE_TIMEOUT: Duration = Duration::from_secs(20);
@@ -90,6 +93,9 @@ const NOTIFICATION_PRESENCE_TIMEOUT: Duration = Duration::from_secs(20);
 // claim are durable. Each waits on an fsync, which a heavily loaded disk can
 // hold for several seconds; that wait is not an unresponsive daemon.
 const AGENT_SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
+// A prompt or message for an agent whose process stopped first reopens its
+// conversation, which waits for the provider to confirm it, then submits.
+const AGENT_RESUME_TIMEOUT: Duration = Duration::from_secs(90);
 // Close is acknowledged only after interruption and process teardown. Allow
 // those grace periods plus time to schedule the worker and deliver its reply.
 const CHAT_CLOSE_TIMEOUT: Duration = crate::chat::INTERRUPT_TIMEOUT
@@ -109,7 +115,7 @@ const UI_LAUNCH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// then flushes its session.
 const UI_PREDECESSOR_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 const UI_PREDECESSOR_EXIT_POLL: Duration = Duration::from_millis(200);
-pub(crate) const MAX_UI_LAUNCH_HANDSHAKE_BYTES: usize = 4096;
+pub const MAX_UI_LAUNCH_HANDSHAKE_BYTES: usize = 4096;
 const MAX_WAIT_SECONDS: f64 = 24.0 * 60.0 * 60.0;
 
 #[derive(Debug, Parser)]
@@ -374,7 +380,7 @@ pub enum DaemonCommand {
         #[arg(long)]
         interrupt: bool,
     },
-    /// Request daemon termination (use --confirm for a counted confirmation).
+    /// Stop the daemon and wait up to 30 seconds for exit (use --confirm for counted confirmation).
     Stop {
         #[arg(long, conflicts_with = "confirm")]
         #[arg(help = "Refuse shutdown while hosted sessions remain.")]
@@ -388,6 +394,9 @@ pub enum DaemonCommand {
         /// same counted authority `cagents-ui --confirm-daemon-stop` uses.
         #[arg(long, value_name = "CAPABILITY_JSON", num_args = 0..=1)]
         confirm: Option<Option<String>>,
+        /// Return when shutdown is accepted, before the daemon has exited.
+        #[arg(long)]
+        no_wait: bool,
     },
     /// Print a short-lived shutdown capability for `daemon stop --confirm`.
     Preflight,
@@ -660,6 +669,15 @@ impl Hangup {
     }
 }
 
+/// One shared-model edit another client applied, as a watcher receives it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelEdge {
+    /// The registry's sequence after the edit.
+    pub sequence: u64,
+    pub edit: ModelEdit,
+    pub effects: crate::workspace_model::delta::EditEffects,
+}
+
 /// A bounded, synchronous client for the current cagents daemon protocol.
 pub struct ControlClient {
     stream: UnixStream,
@@ -676,7 +694,7 @@ pub struct ControlClient {
     observed: VecDeque<TerminalDescriptor>,
     /// Shared-model edges that arrived while a correlated response was pending,
     /// buffered for the same reason `observed` buffers an inventory edge.
-    observed_model: VecDeque<(u64, ModelEdit)>,
+    observed_model: VecDeque<ModelEdge>,
     observed_notifications: VecDeque<crate::notifications::Update>,
     /// The newest Work board pushed while a correlated response was pending.
     /// Each carries the whole board, so only the newest matters.
@@ -782,7 +800,7 @@ impl ControlClient {
         result
     }
 
-    pub(crate) fn from_stream(stream: UnixStream) -> Result<Self, ControlError> {
+    pub fn from_stream(stream: UnixStream) -> Result<Self, ControlError> {
         let deadline = Instant::now() + Self::handshake_timeout();
         Self::from_stream_inner(stream, deadline, deadline.min(Instant::now() + IO_TIMEOUT))
     }
@@ -976,7 +994,92 @@ impl ControlClient {
     /// the subscription with the model itself, so there is no gap between
     /// subscribing and reading for an edit to fall into.
     pub fn watch_workspace_model(&mut self) -> Result<WorkspaceModel, ControlError> {
-        self.expect_model(ClientRequest::WatchWorkspaceModel)
+        self.watch_workspace_state().map(|(model, _)| model)
+    }
+
+    /// Subscribe and read the model and closed identities from one snapshot.
+    pub fn watch_workspace_state(
+        &mut self,
+    ) -> Result<(WorkspaceModel, Vec<crate::model::CardId>), ControlError> {
+        match self.request_strict(ClientRequest::WatchWorkspaceModel)? {
+            ServerResponse::WorkspaceSnapshot { model, closed } => Ok((model, closed)),
+            response => Err(unexpected_response("a workspace snapshot", &response)),
+        }
+    }
+
+    /// Read the same coherent baseline as a subscription, without a watch.
+    pub fn read_workspace_state(
+        &mut self,
+    ) -> Result<(WorkspaceModel, Vec<crate::model::CardId>), ControlError> {
+        match self.request_strict(ClientRequest::ReadWorkspaceSnapshot)? {
+            ServerResponse::WorkspaceSnapshot { model, closed } => Ok((model, closed)),
+            response => Err(unexpected_response("a workspace snapshot", &response)),
+        }
+    }
+
+    pub fn workspace_registry_identity(&mut self) -> Result<uuid::Uuid, ControlError> {
+        match self.request_strict(ClientRequest::ReadWorkspaceMetadata {
+            query: crate::workspace_model::metadata::Query::Identity,
+        })? {
+            ServerResponse::WorkspaceMetadata(
+                crate::workspace_model::metadata::Reply::Identity(identity),
+            ) => Ok(identity),
+            response => Err(unexpected_response(
+                "the workspace registry identity",
+                &response,
+            )),
+        }
+    }
+
+    pub fn read_workspace_projects(
+        &mut self,
+    ) -> Result<(uuid::Uuid, Vec<ModelProject>), ControlError> {
+        match self.request_strict(ClientRequest::ReadWorkspaceMetadata {
+            query: crate::workspace_model::metadata::Query::Projects,
+        })? {
+            ServerResponse::WorkspaceMetadata(
+                crate::workspace_model::metadata::Reply::Projects { identity, projects },
+            ) => Ok((identity, projects)),
+            response => Err(unexpected_response("workspace projects", &response)),
+        }
+    }
+
+    pub fn read_workspace_agents(
+        &mut self,
+    ) -> Result<(uuid::Uuid, Vec<crate::agent_execution::Agent>), ControlError> {
+        match self.request_strict(ClientRequest::ReadWorkspaceMetadata {
+            query: crate::workspace_model::metadata::Query::Agents,
+        })? {
+            ServerResponse::WorkspaceMetadata(
+                crate::workspace_model::metadata::Reply::Agents { identity, agents },
+            ) => Ok((identity, agents)),
+            response => Err(unexpected_response("workspace agents", &response)),
+        }
+    }
+
+    /// Stable names for managed agents, without loading their conversations.
+    pub fn read_agent_labels(
+        &mut self,
+    ) -> Result<(uuid::Uuid, Vec<(crate::model::AgentId, String)>), ControlError> {
+        match self.request_strict(ClientRequest::ReadWorkspaceMetadata {
+            query: crate::workspace_model::metadata::Query::AgentLabels,
+        })? {
+            ServerResponse::WorkspaceMetadata(
+                crate::workspace_model::metadata::Reply::AgentLabels { identity, labels },
+            ) => Ok((identity, labels)),
+            response => Err(unexpected_response("agent labels", &response)),
+        }
+    }
+
+    /// Commit an edit without reading or transporting unrelated model state.
+    pub fn apply_workspace_edit(
+        &mut self,
+        edit: ModelEdit,
+    ) -> Result<crate::workspace_model::delta::EditReceipt, ControlError> {
+        match self.request_strict(ClientRequest::ApplyWorkspaceEdit { edit })? {
+            ServerResponse::WorkspaceEdit(receipt) => Ok(receipt),
+            response => Err(unexpected_response("a workspace edit receipt", &response)),
+        }
     }
 
     pub fn watch_notifications(
@@ -1075,6 +1178,11 @@ impl ControlClient {
                 ServerMessage::NotificationActivated { target } => {
                     return Ok(crate::notifications::Update::Activated(target));
                 }
+                ServerMessage::AutomationProposalsChanged { repository } => {
+                    return Ok(crate::notifications::Update::AutomationProposalsChanged(
+                        repository,
+                    ));
+                }
                 ServerMessage::HostShuttingDown => return Err(ControlError::ConnectionClosed),
                 ServerMessage::Error(error) => {
                     return Err(ControlError::Remote {
@@ -1094,6 +1202,21 @@ impl ControlClient {
         self.expect_model(ClientRequest::ReadWorkspaceModel)
     }
 
+    /// Reads one scope of the shared model: its view, `None` when the registry
+    /// has no such scope, and the model sequence it is consistent with.
+    pub fn read_workspace_view(
+        &mut self,
+        scope: crate::workspace_model::views::Scope,
+    ) -> Result<(Option<crate::workspace_model::views::View>, u64), ControlError> {
+        self.stream
+            .set_read_timeout(Some(IO_TIMEOUT))
+            .map_err(ControlError::Configure)?;
+        match self.request_strict(ClientRequest::ReadWorkspaceView { scope })? {
+            ServerResponse::WorkspaceView { view, sequence } => Ok((view, sequence)),
+            response => Err(unexpected_response("a workspace view", &response)),
+        }
+    }
+
     /// Applies one edit and returns the resulting model, which is how the
     /// client that minted a channel learns the rank the registry gave it.
     pub fn edit_workspace_model(
@@ -1108,7 +1231,7 @@ impl ControlClient {
     /// A model edge has no deadline, so this drops the read timeout rather than
     /// polling: a timeout expiring mid-frame would desynchronize the stream, and
     /// a subscribed connection issues no further requests.
-    pub fn next_workspace_model_edit(&mut self) -> Result<(u64, ModelEdit), ControlError> {
+    pub fn next_workspace_model_edit(&mut self) -> Result<ModelEdge, ControlError> {
         if let Some(edge) = self.observed_model.pop_front() {
             return Ok(edge);
         }
@@ -1119,8 +1242,16 @@ impl ControlClient {
             let envelope = self.read_envelope()?;
             self.validate_pinned_envelope(&envelope)?;
             match envelope.message {
-                ServerMessage::WorkspaceModelEdited { sequence, edit } => {
-                    return Ok((sequence, edit));
+                ServerMessage::WorkspaceModelEdited {
+                    sequence,
+                    edit,
+                    effects,
+                } => {
+                    return Ok(ModelEdge {
+                        sequence,
+                        edit,
+                        effects,
+                    });
                 }
                 // The daemon is about to close this connection. Reporting it as
                 // a closed connection is what makes a watcher reconnect and
@@ -1470,12 +1601,30 @@ impl ControlClient {
         Ok(terminal)
     }
 
+    pub fn retry_pending_terminal_save(
+        &mut self,
+        pane: crate::model::CardId,
+        terminal_id: TerminalId,
+    ) -> Result<(), ControlError> {
+        match self.request_strict(ClientRequest::RetryPendingTerminalSave { pane, terminal_id })? {
+            ServerResponse::Accepted => Ok(()),
+            response => Err(unexpected_response(
+                "a terminal save acknowledgement",
+                &response,
+            )),
+        }
+    }
+
     pub fn complete_pending_terminal(
         &mut self,
         pane: crate::model::CardId,
         terminal_id: TerminalId,
         options: TerminalSpawnOptions,
     ) -> Result<TerminalDescriptor, ControlError> {
+        // Persistence can fail after publication subscribed this connection.
+        // Keep receiving this exact worker's output during recovery RPCs even
+        // when completion returns an error; envelope and foreign-ID checks stay.
+        self.terminal_streams.insert(terminal_id);
         let response = self.request_attached(
             ClientRequest::CompletePendingTerminal {
                 pane,
@@ -1494,7 +1643,6 @@ impl ControlClient {
             }
             response => return Err(unexpected_response("a reserved terminal", &response)),
         };
-        self.terminal_streams.insert(terminal_id);
         self.read_attachment_replay(terminal_id)?;
         Ok(terminal)
     }
@@ -1545,6 +1693,96 @@ impl ControlClient {
                 outcome,
             } if terminal_id == id => Ok(outcome),
             response => Err(unexpected_response("completed terminal release", &response)),
+        }
+    }
+
+    pub fn terminal_removal_basis(
+        &mut self,
+        source: crate::model::TerminalSession,
+    ) -> Result<crate::workspace_model::views::TerminalRemovalBasis, ControlError> {
+        match self.request_strict(ClientRequest::ReadTerminalRemovalBasis { source })? {
+            ServerResponse::TerminalRemovalBasis(basis) => Ok(basis),
+            response => Err(unexpected_response("terminal removal basis", &response)),
+        }
+    }
+
+    pub fn captured_terminal_removal_basis(
+        &mut self,
+        capture: crate::workspace_model::views::CapturedTerminalSource,
+    ) -> Result<crate::workspace_model::views::TerminalRemovalBasis, ControlError> {
+        match self.request_strict(ClientRequest::ReadCapturedTerminalRemovalBasis { capture })? {
+            ServerResponse::TerminalRemovalBasis(basis) => Ok(basis),
+            response => Err(unexpected_response("captured terminal source", &response)),
+        }
+    }
+
+    pub fn close_terminal_source(
+        &mut self,
+        session: crate::model::TerminalSession,
+        basis: crate::workspace_model::views::TerminalRemovalBasis,
+        completed_only: bool,
+        allow_active: bool,
+    ) -> Result<terminal::ipc::TerminalCloseResult, ControlError> {
+        self.close_captured_terminal_source(session, basis, completed_only, allow_active, None)
+    }
+
+    pub fn close_captured_terminal_source(
+        &mut self,
+        session: crate::model::TerminalSession,
+        basis: crate::workspace_model::views::TerminalRemovalBasis,
+        completed_only: bool,
+        allow_active: bool,
+        capture: Option<crate::workspace_model::views::CapturedTerminalSource>,
+    ) -> Result<terminal::ipc::TerminalCloseResult, ControlError> {
+        let terminal_id = session.id;
+        if !completed_only {
+            if let Err(error) = self.attach_and_synchronize(terminal_id) {
+                // The cleanup request has not been sent. Keep disappearance
+                // distinct from an unconfirmed reply after cleanup admission.
+                return Err(match error {
+                    ControlError::Remote {
+                        code: ProtocolErrorCode::TerminalNotFound,
+                        retryable: false,
+                        ..
+                    } => ControlError::Remote {
+                        code: ProtocolErrorCode::TerminalNotFound,
+                        message: terminal::ipc::TERMINAL_CLOSE_SOURCE_ABSENT.into(),
+                        retryable: false,
+                    },
+                    error => error,
+                });
+            }
+        }
+        let request = ClientRequest::CloseTerminalSource {
+            session,
+            basis,
+            completed_only,
+            allow_active,
+            capture,
+        };
+        let result = (if completed_only {
+            self.request_with_deadline(request, Instant::now() + CHAT_CLOSE_TIMEOUT)
+        } else {
+            self.request_attached_with_deadline(
+                request,
+                terminal_id,
+                Instant::now() + TERMINAL_CLOSE_TIMEOUT,
+            )
+        })
+        .and_then(|response| match response {
+            ServerResponse::TerminalCloseChecked {
+                terminal_id: actual,
+                outcome,
+            } if actual == terminal_id => Ok(outcome),
+            response => Err(unexpected_response(
+                "a source-checked terminal close",
+                &response,
+            )),
+        });
+        if completed_only || matches!(result, Ok(terminal::ipc::TerminalCloseResult::Closed)) {
+            result
+        } else {
+            self.finish_attachment(terminal_id, result)
         }
     }
 
@@ -1880,7 +2118,11 @@ impl ControlClient {
                 });
             }
             match envelope.message {
-                ServerMessage::Redraw {
+                ServerMessage::TerminalWorker {
+                    terminal_id: actual,
+                    ..
+                }
+                | ServerMessage::Redraw {
                     terminal_id: actual,
                     ..
                 }
@@ -2156,9 +2398,18 @@ impl ControlClient {
     /// request they interrupt.
     fn absorb(&mut self, message: ServerMessage) -> Result<(), ServerMessage> {
         match message {
+            ServerMessage::TerminalWorker { .. } => {}
             ServerMessage::TerminalCreated { terminal } => self.observed.push_back(terminal),
-            ServerMessage::WorkspaceModelEdited { sequence, edit } => {
-                self.observed_model.push_back((sequence, edit));
+            ServerMessage::WorkspaceModelEdited {
+                sequence,
+                edit,
+                effects,
+            } => {
+                self.observed_model.push_back(ModelEdge {
+                    sequence,
+                    edit,
+                    effects,
+                });
             }
             ServerMessage::NotificationsChanged => {
                 if !self
@@ -2173,6 +2424,12 @@ impl ControlClient {
                 if self.observed_notifications.len() < 32 {
                     self.observed_notifications
                         .push_back(crate::notifications::Update::Activated(target));
+                }
+            }
+            ServerMessage::AutomationProposalsChanged { repository } => {
+                let update = crate::notifications::Update::AutomationProposalsChanged(repository);
+                if !self.observed_notifications.contains(&update) {
+                    self.observed_notifications.push_back(update);
                 }
             }
             ServerMessage::WorkBoard { revision, board } => {
@@ -2202,6 +2459,8 @@ impl ControlClient {
             | ServerMessage::ChatActivity { chat_id, .. }
             | ServerMessage::ChatAccountUsage { chat_id, .. }
             | ServerMessage::ChatLimit { chat_id, .. }
+            | ServerMessage::ChatAgentAddresses { chat_id, .. }
+            | ServerMessage::ChatActiveModel { chat_id, .. }
                 if self.attached_chats.contains(&chat_id) => {}
             ServerMessage::Redraw { terminal_id, .. }
             | ServerMessage::Snapshot { terminal_id, .. }
@@ -2382,7 +2641,7 @@ fn reply_error(error: FrameError, timeout: Option<Duration>) -> ControlError {
         ControlError::Frame(error)
     }
 }
-fn is_timeout_error(error: &ControlError) -> bool {
+pub(crate) fn is_timeout_error(error: &ControlError) -> bool {
     matches!(error, ControlError::ReplyTimeout { .. })
         || matches!(
             error,
@@ -2408,7 +2667,8 @@ fn response_from_message(message: ServerMessage) -> Result<ServerResponse, Contr
 
 fn message_targets(message: &ServerMessage, expected: TerminalId) -> bool {
     match message {
-        ServerMessage::Redraw { terminal_id, .. }
+        ServerMessage::TerminalWorker { terminal_id, .. }
+        | ServerMessage::Redraw { terminal_id, .. }
         | ServerMessage::Snapshot { terminal_id, .. }
         | ServerMessage::TerminalObserved { terminal_id, .. }
         | ServerMessage::Event { terminal_id, .. } => *terminal_id == expected,
@@ -2426,12 +2686,16 @@ fn message_targets(message: &ServerMessage, expected: TerminalId) -> bool {
         | ServerMessage::WorkBoard { .. }
         | ServerMessage::ConversationPullRequests { .. }
         | ServerMessage::ChatLimit { .. }
+        | ServerMessage::ChatAgentAddresses { .. }
+        | ServerMessage::AutomationProposalsChanged { .. }
+        | ServerMessage::ChatActiveModel { .. }
         | ServerMessage::Error(_) => false,
     }
 }
 
 fn message_name(message: &ServerMessage) -> &'static str {
     match message {
+        ServerMessage::TerminalWorker { .. } => "terminal_worker",
         ServerMessage::Response { .. } => "response",
         ServerMessage::Redraw { .. } => "redraw",
         ServerMessage::Snapshot { .. } => "snapshot",
@@ -2447,15 +2711,19 @@ fn message_name(message: &ServerMessage) -> &'static str {
         ServerMessage::WorkspaceModelEdited { .. } => "workspace_model_edited",
         ServerMessage::ChatAccountUsage { .. } => "chat_account_usage",
         ServerMessage::ChatLimit { .. } => "chat_limit",
+        ServerMessage::ChatAgentAddresses { .. } => "chat_agent_addresses",
+        ServerMessage::ChatActiveModel { .. } => "chat_active_model",
         ServerMessage::NotificationsChanged => "notifications_changed",
         ServerMessage::NotificationActivated { .. } => "notification_activated",
         ServerMessage::WorkBoard { .. } => "work_board",
         ServerMessage::ConversationPullRequests { .. } => "conversation_pull_requests",
+        ServerMessage::AutomationProposalsChanged { .. } => "automation_proposals_changed",
     }
 }
 
 fn response_name(response: &ServerResponse) -> &'static str {
     match response {
+        ServerResponse::TerminalRemovalBasis(_) => "terminal_removal_basis",
         ServerResponse::Automation(_) => "automation",
         ServerResponse::Agent(_) => "agent",
         ServerResponse::Notifications { .. } => "notifications",
@@ -2488,6 +2756,10 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::UpgradePrepared { .. } => "upgrade_prepared",
         ServerResponse::UpgradeChatResolved { .. } => "upgrade_chat_resolved",
         ServerResponse::WorkspaceModel { .. } => "workspace_model",
+        ServerResponse::WorkspaceView { .. } => "workspace_view",
+        ServerResponse::WorkspaceSnapshot { .. } => "workspace_snapshot",
+        ServerResponse::WorkspaceEdit(_) => "workspace_edit",
+        ServerResponse::WorkspaceMetadata(_) => "workspace_metadata",
         ServerResponse::ChatResumePrepared { .. } => "chat_resume_prepared",
         ServerResponse::ChatUpdate { .. } => "chat_update",
         ServerResponse::ChatFileChanges { .. } => "chat_file_changes",
@@ -2615,7 +2887,7 @@ impl AppError {
 
 static NO_START: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-pub(crate) fn daemon_autostart_disabled() -> bool {
+pub fn daemon_autostart_disabled() -> bool {
     NO_START.load(std::sync::atomic::Ordering::Relaxed)
         || std::env::var("CAGENTS_NO_START")
             .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
@@ -2777,7 +3049,8 @@ where
             command:
                 AccountCommand::Link { .. }
                 | AccountCommand::Default { .. }
-                | AccountCommand::Remove { .. },
+                | AccountCommand::Remove { .. }
+                | AccountCommand::Reset { .. },
         } => Some("Account changes require your own terminal".into()),
         _ => None,
     };
@@ -3897,71 +4170,18 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
             require_empty,
             expected_generation,
             confirm,
+            no_wait,
         } => {
             let socket =
                 daemon_socket_path().map_err(|error| AppError::new("socket_path", error))?;
-            let mut client = match ControlClient::connect(&socket) {
-                Ok(client) => client,
-                Err(ControlError::Connect(error)) if daemon_missing(&error) => {
-                    confirm_daemon_absent(&socket)?;
-                    return Ok(already_stopped());
-                }
-                Err(error) => return Err(protocol_error(error)),
-            };
-            let outcome = match confirm {
-                // A capability is already a counted, daemon-bound, expiring
-                // authority over one observed inventory, so a script that
-                // obtained one has confirmed exactly what a prompt would.
-                Some(Some(capability)) => {
-                    let capability: ShutdownCapability = serde_json::from_str(&capability)
-                        .map_err(|error| {
-                            AppError::new(
-                                "invalid_capability",
-                                format!(
-                                    "--confirm value is not a capability from `cagents daemon preflight`: {error}"
-                                ),
-                            )
-                        })?;
-                    client
-                        .confirm_shutdown(capability)
-                        .map_err(protocol_error)?
-                }
-                Some(None) => {
-                    if !io::stdin().is_terminal() {
-                        return Err(AppError::new(
-                            "confirmation_required",
-                            "interactive confirmation requires a terminal; pass a capability from `cagents daemon preflight` to --confirm, or use --require-empty",
-                        ));
-                    }
-                    let preflight = client.shutdown_preflight().map_err(protocol_error)?;
-                    eprint!(
-                        "Stop daemon and terminate {} hosted terminal/chat sessions and all their background subagents ({} currently running or waiting on their own background work; includes pending spawns and unconfirmed provider work)? Type yes to confirm: ",
-                        preflight.capability.live_terminals,
-                        preflight.capability.background_subagents
-                    );
-                    io::stderr()
-                        .flush()
-                        .map_err(|error| AppError::new("confirmation_input", error))?;
-                    let mut answer = String::new();
-                    io::stdin()
-                        .read_line(&mut answer)
-                        .map_err(|error| AppError::new("confirmation_input", error))?;
-                    if answer.trim() != "yes" {
-                        return Ok(CommandOutput {
-                            command: "daemon.stop",
-                            data: json!({ "outcome": "cancelled", "termination_requested": false }),
-                            human: "Shutdown cancelled; no termination requested".into(),
-                        });
-                    }
-                    client
-                        .confirm_shutdown(preflight.capability)
-                        .map_err(protocol_error)?
-                }
-                None => client
-                    .shutdown_with_policy(require_empty, expected_generation)
-                    .map_err(protocol_error)?,
-            };
-            shutdown_output(outcome)
+            stop_daemon_at(
+                &socket,
+                require_empty,
+                expected_generation,
+                confirm,
+                no_wait,
+                DAEMON_STOP_TIMEOUT,
+            )
         }
         DaemonCommand::Preflight => {
             let socket =
@@ -4097,6 +4317,128 @@ fn run_store_maintenance_at(daemon: &Path, arguments: &[&str]) -> Result<String,
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn stop_daemon_at(
+    socket: &Path,
+    require_empty: bool,
+    expected_generation: Option<u64>,
+    confirm: Option<Option<String>>,
+    no_wait: bool,
+    timeout: Duration,
+) -> Result<CommandOutput, AppError> {
+    let mut client = match ControlClient::connect(socket) {
+        Ok(client) => client,
+        Err(ControlError::Connect(error)) if daemon_missing(&error) => {
+            confirm_daemon_absent(socket)?;
+            return Ok(already_stopped());
+        }
+        Err(error) => return Err(protocol_error(error)),
+    };
+    // Try to pin before requesting termination: neither a closed socket nor
+    // an unlocked lease proves this exact process exited. Older daemons may
+    // not expose a recognizable lease, so inability to wait must not prevent
+    // the authenticated shutdown request itself.
+    let target = (!no_wait).then(|| crate::daemon::ShutdownTarget::pin(socket, client.proof()));
+    let outcome = match confirm {
+        // A capability is already a counted, daemon-bound, expiring
+        // authority over one observed inventory, so a script that
+        // obtained one has confirmed exactly what a prompt would.
+        Some(Some(capability)) => {
+            let capability: ShutdownCapability = serde_json::from_str(&capability)
+                .map_err(|error| {
+                    AppError::new(
+                        "invalid_capability",
+                        format!(
+                            "--confirm value is not a capability from `cagents daemon preflight`: {error}"
+                        ),
+                    )
+                })?;
+            client
+                .confirm_shutdown(capability)
+                .map_err(protocol_error)?
+        }
+        Some(None) => {
+            if !io::stdin().is_terminal() {
+                return Err(AppError::new(
+                    "confirmation_required",
+                    "interactive confirmation requires a terminal; pass a capability from `cagents daemon preflight` to --confirm, or use --require-empty",
+                ));
+            }
+            let preflight = client.shutdown_preflight().map_err(protocol_error)?;
+            eprint!(
+                "Stop daemon and terminate {} hosted terminal/chat sessions and all their background subagents ({} currently running or waiting on their own background work; includes pending spawns and unconfirmed provider work)? Type yes to confirm: ",
+                preflight.capability.live_terminals, preflight.capability.background_subagents
+            );
+            io::stderr()
+                .flush()
+                .map_err(|error| AppError::new("confirmation_input", error))?;
+            let mut answer = String::new();
+            io::stdin()
+                .read_line(&mut answer)
+                .map_err(|error| AppError::new("confirmation_input", error))?;
+            if answer.trim() != "yes" {
+                return Ok(CommandOutput {
+                    command: "daemon.stop",
+                    data: json!({ "outcome": "cancelled", "termination_requested": false }),
+                    human: "Shutdown cancelled; no termination requested".into(),
+                });
+            }
+            client
+                .confirm_shutdown(preflight.capability)
+                .map_err(protocol_error)?
+        }
+        None => client
+            .shutdown_with_policy(require_empty, expected_generation)
+            .map_err(protocol_error)?,
+    };
+    drop(client);
+    finish_daemon_stop(outcome, target, timeout)
+}
+
+fn finish_daemon_stop(
+    outcome: ShutdownOutcome,
+    target: Option<Result<crate::daemon::ShutdownTarget, crate::daemon::PlatformError>>,
+    timeout: Duration,
+) -> Result<CommandOutput, AppError> {
+    let mut output = shutdown_output(outcome)?;
+    if let Some(target) = target {
+        let target = match target {
+            Ok(target) => target,
+            Err(error) => {
+                output.data["stopped"] = Value::Null;
+                output.human = format!(
+                    "Shutdown accepted; could not identify the daemon process to wait for: {error}"
+                );
+                return Ok(output);
+            }
+        };
+        if io::stderr().is_terminal() {
+            eprintln!(
+                "Shutdown accepted; waiting up to {} seconds for the daemon to exit…",
+                timeout.as_secs()
+            );
+        }
+        let stopped = target
+            .wait(timeout)
+            .map_err(|error| AppError::new("daemon_process", error))?;
+        output.data["stopped"] = json!(stopped);
+        if !stopped {
+            return Err(AppError {
+                kind: "shutdown_timeout",
+                message: format!(
+                    "Shutdown was accepted, but the daemon did not exit within {} seconds; it may still be draining. Check `cagents daemon status` before restarting.",
+                    timeout.as_secs()
+                ),
+                details: Some(output.data),
+            });
+        }
+        output.human = format!(
+            "Daemon stopped: live_terminals_before={}, termination_requested={}",
+            output.data["live_terminals_before"], output.data["termination_requested"]
+        );
+    }
+    Ok(output)
 }
 
 fn shutdown_output(outcome: ShutdownOutcome) -> Result<CommandOutput, AppError> {
@@ -5271,6 +5613,10 @@ mod tests {
 
     #[test]
     fn inherited_daemon_lease_is_not_a_serving_daemon() {
+        #[cfg(target_os = "linux")]
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
         const CHILD: &str = "CAGENTS_TEST_INHERITED_STATUS";
@@ -6058,7 +6404,7 @@ mod tests {
         for command in [
             vec!["preflight"],
             vec!["prepare-upgrade", "--yes", "--no-relaunch-agents"],
-            vec!["stop", "--require-empty"],
+            vec!["stop", "--require-empty", "--no-wait"],
         ] {
             let mut argv = vec!["cagents", "--json", "--no-start", "daemon"];
             argv.extend(command);
@@ -6415,7 +6761,7 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_cli_policies_and_results_preserve_acceptance_not_completion() {
+    fn shutdown_cli_policies_and_no_wait_results_preserve_acceptance_not_completion() {
         let cli = Cli::try_parse_from([
             "cagents",
             "daemon",
@@ -6431,7 +6777,8 @@ mod tests {
                 command: DaemonCommand::Stop {
                     require_empty: true,
                     expected_generation: Some(9),
-                    confirm: None
+                    confirm: None,
+                    no_wait: false,
                 }
             }
         ));
@@ -6450,6 +6797,13 @@ mod tests {
             Some(None)
         );
         assert_eq!(parsed_confirm(["cagents", "daemon", "stop"]), None);
+        let cli = Cli::try_parse_from(["cagents", "daemon", "stop", "--no-wait"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            TopCommand::Daemon {
+                command: DaemonCommand::Stop { no_wait: true, .. }
+            }
+        ));
         let output = shutdown_output(ShutdownOutcome::Accepted {
             live_terminals_before: 7,
             termination_requested: true,
@@ -7637,6 +7991,95 @@ mod tests {
         server.join().unwrap();
     }
     #[test]
+    fn pending_save_failure_keeps_its_stream_legal_during_recovery_reads() {
+        for foreign in [false, true] {
+            let (stream, mut peer) = UnixStream::pair().unwrap();
+            let pinned = proof("pending-save-stream", "boot", "incarnation");
+            let terminal = TerminalId::new();
+            let server = thread::spawn(move || {
+                let connect: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                write_frame(
+                    &mut peer,
+                    &connected_envelope(connect.request_id, pinned.clone(), pinned.clone()),
+                )
+                .unwrap();
+                let complete: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                assert!(
+                    matches!(complete.request, ClientRequest::CompletePendingTerminal { terminal_id, .. } if terminal_id == terminal)
+                );
+                write_frame(
+                    &mut peer,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(complete.request_id),
+                        proof: pinned.clone(),
+                        message: ServerMessage::Error(ProtocolError::new(
+                            ProtocolErrorCode::Internal,
+                            "fixture refused completion save",
+                            false,
+                        )),
+                    },
+                )
+                .unwrap();
+                let list: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                assert!(matches!(list.request, ClientRequest::List));
+                // Publication succeeded before persistence failed. Its output
+                // still arrives during the fallback's view/inventory reads.
+                write_frame(
+                    &mut peer,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: None,
+                        proof: pinned.clone(),
+                        message: ServerMessage::Redraw {
+                            terminal_id: if foreign { TerminalId::new() } else { terminal },
+                            generation: 1,
+                        },
+                    },
+                )
+                .unwrap();
+                write_frame(
+                    &mut peer,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(list.request_id),
+                        proof: pinned,
+                        message: ServerMessage::Response {
+                            response: ServerResponse::Listed { terminals: vec![] },
+                        },
+                    },
+                )
+                .unwrap();
+            });
+            let mut client = ControlClient::from_stream(stream).unwrap();
+            assert!(matches!(
+                client.complete_pending_terminal(
+                    crate::model::CardId::new(),
+                    terminal,
+                    TerminalSpawnOptions::default()
+                ),
+                Err(ControlError::Remote {
+                    code: ProtocolErrorCode::Internal,
+                    ..
+                })
+            ));
+            let result = client.list();
+            if foreign {
+                assert!(matches!(
+                    result,
+                    Err(ControlError::UnexpectedMessage { .. })
+                ));
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "published worker output interrupted its recovery read: {result:?}"
+                );
+            }
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
     fn requested_terminal_streams_do_not_break_later_rpc_or_accept_foreign_frames() {
         for invalid in ["unknown", "proof", "request-id"] {
             let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
@@ -8213,6 +8656,14 @@ mod tests {
         checked: bool,
         case: &str,
     ) -> Result<terminal::ipc::TerminalCloseResult, ControlError> {
+        public_terminal_close_exchange_source(checked, case, false)
+    }
+
+    fn public_terminal_close_exchange_source(
+        checked: bool,
+        case: &str,
+        source_checked: bool,
+    ) -> Result<terminal::ipc::TerminalCloseResult, ControlError> {
         use terminal::ipc::TerminalCloseResult;
         fn reply(
             stream: &mut UnixStream,
@@ -8262,6 +8713,13 @@ mod tests {
             None,
         );
         let id = terminal.session.id;
+        let source = terminal.session.clone();
+        let basis = crate::workspace_model::views::TerminalRemovalBasis::Worker {
+            owner: pinned.clone(),
+            instance: uuid::Uuid::new_v4(),
+        };
+        let peer_source = source.clone();
+        let peer_basis = basis.clone();
         let case = case.to_owned();
         let peer_case = case.clone();
         let server = thread::spawn(move || {
@@ -8282,6 +8740,28 @@ mod tests {
                     after_event_sequence: 0,
                 } if terminal_id == id
             ));
+            if peer_case == "attach-missing" {
+                reply(
+                    &mut server_stream,
+                    &pinned,
+                    Some(2),
+                    ServerMessage::Error(ProtocolError::new(
+                        ProtocolErrorCode::TerminalNotFound,
+                        "fixture terminal disappeared before Attach",
+                        false,
+                    )),
+                );
+                assert_eq!(request(&mut server_stream, &pinned, 3), ClientRequest::List);
+                reply(
+                    &mut server_stream,
+                    &pinned,
+                    Some(3),
+                    ServerMessage::Response {
+                        response: ServerResponse::Listed { terminals: vec![] },
+                    },
+                );
+                return;
+            }
             reply(
                 &mut server_stream,
                 &pinned,
@@ -8303,7 +8783,15 @@ mod tests {
             let close = request(&mut server_stream, &pinned, 3);
             assert_eq!(
                 close,
-                if checked {
+                if source_checked {
+                    ClientRequest::CloseTerminalSource {
+                        session: peer_source,
+                        basis: peer_basis,
+                        completed_only: false,
+                        allow_active: false,
+                        capture: None,
+                    }
+                } else if checked {
                     ClientRequest::CloseTerminalChecked {
                         terminal_id: id,
                         allow_active: false,
@@ -8354,6 +8842,17 @@ mod tests {
                 "wrong-request" => envelope.request_id = Some(999),
                 _ => {}
             }
+            if source_checked {
+                reply(
+                    &mut server_stream,
+                    &pinned,
+                    None,
+                    ServerMessage::Redraw {
+                        terminal_id: id,
+                        generation: 1,
+                    },
+                );
+            }
             write_frame(&mut server_stream, &envelope).unwrap();
             let mut next = 4;
             if !matches!(peer_case.as_str(), "closed" | "late-closed") {
@@ -8398,7 +8897,9 @@ mod tests {
             );
         });
         let mut client = ControlClient::from_stream(client_stream).unwrap();
-        let result = if checked {
+        let result = if source_checked {
+            client.close_terminal_source(source, basis, false, false)
+        } else if checked {
             client.close_terminal_checked(id, false)
         } else {
             client
@@ -8410,6 +8911,19 @@ mod tests {
         }
         server.join().unwrap();
         result
+    }
+
+    #[test]
+    fn source_checked_terminal_close_accepts_streaming_before_its_reply() {
+        for case in ["closed", "active", "unknown", "remote-error"] {
+            let result = public_terminal_close_exchange_source(true, case, true);
+            assert_eq!(result.is_ok(), case != "remote-error", "{case}: {result:?}");
+        }
+        assert!(
+            matches!(public_terminal_close_exchange_source(true, "attach-missing", true),
+            Err(ControlError::Remote { code: ProtocolErrorCode::TerminalNotFound, message, retryable: false })
+                if message == crate::terminal_ipc::TERMINAL_CLOSE_SOURCE_ABSENT)
+        );
     }
 
     #[test]
@@ -8997,7 +9511,9 @@ mod tests {
         assert!(
             matches!(error, ControlError::ReplyTimeout { timeout, .. } if timeout <= Duration::from_millis(100))
         );
-        assert!(started.elapsed() < Duration::from_secs(1));
+        // Sooner than the connection's own I/O timeout, which a request that
+        // ignored its deadline would fall back to.
+        assert!(started.elapsed() < IO_TIMEOUT);
         assert_eq!(client.stream.read_timeout().unwrap(), Some(IO_TIMEOUT));
         assert_eq!(client.stream.write_timeout().unwrap(), Some(IO_TIMEOUT));
         drop(client);
@@ -9156,7 +9672,9 @@ mod tests {
                 3 => assert!(matches!(error, ControlError::ProofMismatch)),
                 _ => assert!(matches!(error, ControlError::ConnectionClosed)),
             }
-            assert!(started.elapsed() < Duration::from_secs(1));
+            // Sooner than the connection's own I/O timeout, which a request that
+            // ignored its deadline would fall back to.
+            assert!(started.elapsed() < IO_TIMEOUT);
             assert_eq!(client.stream.read_timeout().unwrap(), Some(IO_TIMEOUT));
             assert_eq!(client.stream.write_timeout().unwrap(), Some(IO_TIMEOUT));
             drop(client);
@@ -9183,11 +9701,18 @@ mod tests {
                     .is_none()
             );
         });
-        let mut client = ControlClient::from_stream(client_stream).unwrap();
-        let started = Instant::now();
-        let error = client
-            .request_with_deadline(ClientRequest::List, started + Duration::from_millis(6100))
-            .unwrap_err();
+        let client = ControlClient::from_stream(client_stream).unwrap();
+        // The reported budget tells the full deadline apart from a single
+        // read's IO_TIMEOUT; a client that enforced neither never returns.
+        let error = crate::test_timing::returns("a request with a long deadline", move || {
+            let mut client = client;
+            client
+                .request_with_deadline(
+                    ClientRequest::List,
+                    Instant::now() + Duration::from_millis(6100),
+                )
+                .unwrap_err()
+        });
         assert!(
             matches!(&error, ControlError::ReplyTimeout { timeout, .. } if *timeout > IO_TIMEOUT && *timeout <= Duration::from_millis(6100)),
             "{error}"
@@ -9198,8 +9723,6 @@ mod tests {
                 .contains("the daemon did not answer within 6."),
             "{error}"
         );
-        assert!(started.elapsed() < Duration::from_secs(8));
-        drop(client);
         server.join().unwrap();
     }
 
@@ -9234,7 +9757,9 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, FrameError::Io(error)
             if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)));
-        assert!(started.elapsed() < Duration::from_secs(1));
+        // Sooner than the connection's own I/O timeout, which a request that
+        // ignored its deadline would fall back to.
+        assert!(started.elapsed() < IO_TIMEOUT);
     }
 
     #[test]
@@ -9256,7 +9781,9 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, FrameError::Io(error)
             if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)));
-        assert!(started.elapsed() < Duration::from_secs(1));
+        // Sooner than the connection's own I/O timeout, which a request that
+        // ignored its deadline would fall back to.
+        assert!(started.elapsed() < IO_TIMEOUT);
         drop(client_stream);
         server.join().unwrap();
     }

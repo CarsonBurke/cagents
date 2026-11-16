@@ -157,32 +157,28 @@ mod tests {
     use super::*;
     #[test]
     fn partial_frame_progress_does_not_extend_the_absolute_deadline() {
+        // The peer announces a frame and then trickles its body a byte at a
+        // time without end. A deadline that each byte renewed would never
+        // expire, so returning at all proves it is absolute.
         let (reader, mut writer) = UnixStream::pair().unwrap();
         let (release, wait) = crossbeam_channel::bounded(1);
         let peer = std::thread::spawn(move || {
-            let bytes = serde_json::to_vec(&"x".repeat(128)).unwrap();
             writer
-                .write_all(&(bytes.len() as u32).to_le_bytes())
+                .write_all(&(super::super::MAX_FRAME as u32).to_le_bytes())
                 .unwrap();
-            for byte in bytes {
-                if writer.write_all(&[byte]).is_err() {
-                    break;
-                }
+            while writer.write_all(b" ").is_ok() {
                 if wait.recv_timeout(Duration::from_millis(5)).is_ok() {
                     break;
                 }
             }
         });
-        let started = Instant::now();
-        let error =
-            receive_until::<serde_json::Value>(&reader, started + Duration::from_millis(40))
-                .unwrap_err();
-        let elapsed = started.elapsed();
+        let error = crate::test_timing::returns("a trickled receive", move || {
+            receive_until::<serde_json::Value>(&reader, Instant::now() + Duration::from_millis(40))
+                .unwrap_err()
+        });
         let _ = release.send(());
-        drop(reader);
         peer.join().unwrap();
-        assert!(error.contains("deadline"));
-        assert!(elapsed < Duration::from_millis(250));
+        assert!(error.contains("deadline"), "{error}");
     }
     #[test]
     fn stalled_frame_write_is_bounded_and_oversized_response_is_refused_before_body_read() {
@@ -200,19 +196,18 @@ mod tests {
             },
             0
         );
-        let started = Instant::now();
-        assert!(
+        // Nobody reads, so the write stalls once the buffer fills. A write
+        // that waited for the reader would never return.
+        let error = crate::test_timing::returns("a stalled send", move || {
             send_until(
                 &writer,
                 &"x".repeat(1024 * 1024),
-                started + Duration::from_millis(40)
+                Instant::now() + Duration::from_millis(40),
             )
             .unwrap_err()
-            .contains("deadline")
-        );
-        assert!(started.elapsed() < Duration::from_millis(250));
+        });
+        assert!(error.contains("deadline"), "{error}");
         drop(reader);
-        drop(writer);
         let (reader, mut writer) = UnixStream::pair().unwrap();
         writer
             .write_all(&((super::super::MAX_FRAME + 1) as u32).to_le_bytes())

@@ -1,6 +1,6 @@
 //! Daemon-owned, non-PTY provider actor. Detaching never stops its transport.
 use super::{
-    Command, Event, Item, ItemContent, Phase, Snapshot, Subagent, ToolStatus,
+    AgentAddress, Command, Event, Item, ItemContent, Phase, Snapshot, Subagent, ToolStatus,
     protocol::{Adapter, ProcessSpec, Step, TransportSpec},
 };
 use crate::account::LiveReport;
@@ -183,6 +183,14 @@ pub(crate) enum Update {
         /// Unix milliseconds at which the runtime read the report.
         observed_at: u64,
     },
+    /// The provider said how it addresses another of the conversation's
+    /// subagents. Every address known so far, which only accumulate; the
+    /// snapshot, whose layout older peers share, holds none.
+    AgentAddresses(Vec<AgentAddress>),
+    ActiveModel {
+        revision: u64,
+        model: Option<super::ActiveModel>,
+    },
 }
 
 #[derive(Clone)]
@@ -209,11 +217,42 @@ pub(crate) enum TitleUnavailable {
     Poisoned,
 }
 
+/// How the provider addresses a conversation's subagents, shared between its
+/// actor, which learns them, and its handle, which reports them.
+#[derive(Clone, Default)]
+struct AgentAddresses(Arc<Mutex<BTreeMap<String, String>>>);
+
+impl AgentAddresses {
+    /// Records an address, and says whether it was news. An address keeps
+    /// the agent it first named.
+    fn learn(&self, address: AgentAddress) -> bool {
+        let mut known = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if known.contains_key(&address.address) {
+            return false;
+        }
+        known.insert(address.address, address.subagent);
+        true
+    }
+
+    fn list(&self) -> Vec<AgentAddress> {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .map(|(address, subagent)| AgentAddress {
+                address: address.clone(),
+                subagent: subagent.clone(),
+            })
+            .collect()
+    }
+}
+
 struct Inner {
     commands: crossbeam_channel::Sender<CommandRequest>,
     wake: Mutex<UnixStream>,
     state: Arc<Mutex<Snapshot>>,
     confirmed_session: Arc<Mutex<Option<String>>>,
+    agent_addresses: AgentAddresses,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -395,7 +434,7 @@ impl LocalHandle {
         resident_changed: Option<Arc<dyn Fn() + Send + Sync>>,
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
-        spec.remove_unset_environment();
+        spec.withhold_environment();
         // Compare the reconstructible launch context, before the daemon adds
         // its transient capability and matched CLI path. Never persist those
         // additions or weaken comparisons of the user's selected environment.
@@ -483,6 +522,7 @@ impl LocalHandle {
         let failure = Arc::new(Mutex::new(None));
         let store = Arc::new(Mutex::new(store));
         let confirmed_session = Arc::new(Mutex::new(None));
+        let agent_addresses = AgentAddresses::default();
         let preserve_native = Arc::new(AtomicBool::new(false));
         let release_native = Arc::new(AtomicBool::new(false));
         let retain_cleanup_receipt = Arc::new(AtomicBool::new(false));
@@ -495,6 +535,7 @@ impl LocalHandle {
             wake: Mutex::new(wake),
             state: state.clone(),
             confirmed_session: confirmed_session.clone(),
+            agent_addresses: agent_addresses.clone(),
             visible: visible.clone(),
             observe_next: observe_next.clone(),
             stop: stop.clone(),
@@ -543,6 +584,7 @@ impl LocalHandle {
                     adapter,
                     state,
                     confirmed_session,
+                    agent_addresses,
                     store,
                     visible,
                     observe_next,
@@ -1428,6 +1470,16 @@ impl LocalHandle {
             .unwrap_or_else(|p| p.into_inner())
             .work_hold()
     }
+    /// Provider-confirmed model status without hydrating the transcript.
+    pub(crate) fn active_model(&self) -> (u64, Option<super::ActiveModel>) {
+        let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        (state.active_model_revision, state.active_model.clone())
+    }
+    /// How the provider addresses this conversation's subagents, where that
+    /// is not by the IDs its snapshot lists them under.
+    pub(crate) fn agent_addresses(&self) -> Vec<AgentAddress> {
+        self.0.agent_addresses.list()
+    }
     pub(crate) fn background_subagents(&self) -> Vec<String> {
         let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
         state
@@ -1767,7 +1819,13 @@ fn spawn_provider(
         .args(&spec.arguments)
         .current_dir(&spec.working_directory)
         .env_clear()
-        .envs(&spec.environment)
+        // Callers withhold these already; no path may hand a provider the
+        // session its daemon or a saved recipe came from.
+        .envs(
+            spec.environment
+                .iter()
+                .filter(|(name, _)| !crate::agent::is_session_variable(name)),
+        )
         .stdin(if pipes { Stdio::piped() } else { Stdio::null() })
         .stdout(if pipes { Stdio::piped() } else { Stdio::null() })
         .stderr(if pipes { Stdio::piped() } else { Stdio::null() })
@@ -2136,6 +2194,7 @@ struct Actor {
     adapter: Box<dyn Adapter>,
     state: Arc<Mutex<Snapshot>>,
     confirmed_session: Arc<Mutex<Option<String>>>,
+    agent_addresses: AgentAddresses,
     store: Arc<Mutex<Store>>,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
@@ -2422,6 +2481,10 @@ impl Actor {
             .stderr
             .take()
             .ok_or("Provider stderr unavailable")?;
+        // Every read and write of the provider's pipes below pokes the scope.
+        if let Some(scope) = self.child.as_ref().and_then(|c| c.scope.as_ref()) {
+            scope.reports_activity();
+        }
         nonblocking(&stdin)?;
         nonblocking(&stdout)?;
         nonblocking(&stderr)?;
@@ -2685,6 +2748,9 @@ impl Actor {
                     match stdin.write(&line[self.offset..]) {
                         Ok(0) => return Err("Provider closed stdin".into()),
                         Ok(n) => {
+                            // Input can start a command before any output,
+                            // such as a hook run on a submitted prompt.
+                            self.poke_scope();
                             self.offset += n;
                             self.queued -= n;
                             if self.offset == line.len() {
@@ -2716,9 +2782,7 @@ impl Actor {
                         reserve_frame(&mut self.output, n)?;
                         self.output.extend_from_slice(&buffer[..n]);
                         // Output often announces a command: move it soon.
-                        if let Some(scope) = self.child.as_ref().and_then(|c| c.scope.as_ref()) {
-                            scope.poke();
-                        }
+                        self.poke_scope();
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(e) => return Err(format!("Provider stdout: {e}")),
@@ -2728,6 +2792,7 @@ impl Actor {
                 match stderr.read(&mut buffer) {
                     Ok(0) => stderr_eof = true,
                     Ok(n) => {
+                        self.poke_scope();
                         for byte in &buffer[..n] {
                             if self.stderr.len() == 16384 {
                                 self.stderr.pop_front();
@@ -2741,6 +2806,14 @@ impl Actor {
             }
         }
     }
+    /// The provider read input or wrote output, so it may be about to start
+    /// a command: move it to a leaf of its own soon.
+    fn poke_scope(&self) {
+        if let Some(scope) = self.child.as_ref().and_then(|c| c.scope.as_ref()) {
+            scope.poke();
+        }
+    }
+
     /// Say so when the system stopped one of the provider's commands
     /// because memory ran out. The provider is still running.
     fn report_command_stops(&mut self) {
@@ -3078,7 +3151,7 @@ impl Actor {
         let observed = step
             .events
             .iter()
-            .any(|event| !matches!(event, Event::AccountUsage(_)));
+            .any(|event| !matches!(event, Event::AccountUsage(_) | Event::AgentAddress(_)));
         let identity = step.events.iter().rev().find_map(|event| match event {
             Event::Session { id, .. } => Some(Some(id.clone())),
             Event::Reset { .. } => Some(None),
@@ -3218,6 +3291,28 @@ impl Actor {
                     report,
                     observed_at: observed_at().unwrap_or_default(),
                 });
+                continue;
+            }
+            if let Event::ActiveModel(model) = event {
+                let changed = {
+                    let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                    if state.active_model != model {
+                        state.active_model = model.clone();
+                        state.active_model_revision = state.active_model_revision.saturating_add(1);
+                        Some(state.active_model_revision)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(revision) = changed {
+                    (self.notify)(Update::ActiveModel { revision, model });
+                }
+                continue;
+            }
+            if let Event::AgentAddress(address) = event {
+                if self.agent_addresses.learn(address) {
+                    (self.notify)(Update::AgentAddresses(self.agent_addresses.list()));
+                }
                 continue;
             }
             let fatal = match &event {
@@ -3645,6 +3740,20 @@ fn recover_history_error(
     }
 }
 
+/// Protocol regressions project through the same reducer as a resident actor.
+#[cfg(test)]
+pub(crate) fn project_events_for_test(state: &mut Snapshot, events: Vec<Event>) {
+    let mut indices = state
+        .items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| (item.id.clone(), index))
+        .collect();
+    for event in events {
+        apply_event(state, &mut indices, event);
+    }
+}
+
 #[cfg(test)]
 fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, event: Event) {
     apply_projected_event(state, indices, event, false);
@@ -3765,6 +3874,7 @@ fn apply_projected_event(
         // About the account rather than the conversation: `step` forwards it
         // to the surfaces before the store, so it never reaches a snapshot.
         Event::AccountUsage(_)
+        | Event::AgentAddress(_)
         | Event::LoginRecovered { .. }
         | Event::LoginVerificationFailed { .. } => {}
         Event::Capabilities(value) => state.capabilities = value,
@@ -3814,6 +3924,7 @@ fn apply_projected_event(
                 state.reasoning = reasoning;
             }
         }
+        Event::ActiveModel(model) => state.active_model = model,
         Event::FastMode(value) => state.fast_mode = Some(value),
         Event::Commands(value) => state.commands = value,
         Event::Skills(value) => state.skills = value,
@@ -5761,7 +5872,7 @@ mod tests {
         let mut state = Snapshot::default();
         let subagent = |id: &str, description: &str, status| super::super::Subagent {
             id: id.into(),
-            kind: "general-purpose".into(),
+            kind: description.into(),
             description: description.into(),
             status,
             model: None,
@@ -5850,7 +5961,7 @@ mod tests {
                                     waiting: None,
                                     detail: None,
                                     id: format!("late-background-{index}"),
-                                    kind: "Explore".into(),
+                                    kind: "Started after the caller observed idle".into(),
                                     description: "Started after the caller observed idle".into(),
                                     status: Some(ToolStatus::Running),
                                     background: Some(true),
@@ -7819,6 +7930,90 @@ mod tests {
         assert!(handle.snapshot(None).unwrap().items.is_empty());
         handle.close().unwrap();
     }
+    /// How the provider addresses a subagent reaches the surfaces as every
+    /// address known so far, once each is learned, and never the snapshot,
+    /// whose layout older peers share.
+    #[test]
+    fn an_agent_address_reaches_the_surfaces_once_and_never_the_snapshot() {
+        fn address(address: &str, subagent: &str) -> Event {
+            Event::AgentAddress(AgentAddress {
+                address: address.into(),
+                subagent: subagent.into(),
+            })
+        }
+        struct Addresser;
+        impl Adapter for Addresser {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step {
+                    suppress_current_notification: false,
+                    notification_preview: None,
+                    writes: vec![json!({})],
+                    // As a reopened history says of the agents it started.
+                    events: vec![address("a1892b93e88999a7d", "toolu_relocate")],
+                })
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Err("fixture takes no commands".into())
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Ok(Step {
+                    suppress_current_notification: false,
+                    notification_preview: None,
+                    writes: Vec::new(),
+                    events: vec![
+                        // Said again, and a later agent's first word.
+                        address("a1892b93e88999a7d", "toolu_relocate"),
+                        address("a77f00d1e2b3c4d5a", "toolu_review"),
+                    ],
+                })
+            }
+        }
+        let spec = ProcessSpec {
+            stdout_noise: None,
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: std::env::temp_dir(),
+            environment: BTreeMap::new(),
+        };
+        let mut adapter: Box<dyn Adapter> = Box::new(Addresser);
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let (notify, notified) = crossbeam_channel::unbounded();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, move |update| {
+            if let Update::AgentAddresses(addresses) = update {
+                let _ = notify.send(addresses);
+            }
+        })
+        .unwrap();
+        let listed = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(address, subagent)| AgentAddress {
+                    address: (*address).into(),
+                    subagent: (*subagent).into(),
+                })
+                .collect::<Vec<_>>()
+        };
+        let first = listed(&[("a1892b93e88999a7d", "toolu_relocate")]);
+        let both = listed(&[
+            ("a1892b93e88999a7d", "toolu_relocate"),
+            ("a77f00d1e2b3c4d5a", "toolu_review"),
+        ]);
+        let timeout = Duration::from_secs(2);
+        assert_eq!(notified.recv_timeout(timeout).unwrap(), first);
+        assert_eq!(notified.recv_timeout(timeout).unwrap(), both);
+        assert!(
+            notified.recv_timeout(Duration::from_millis(200)).is_err(),
+            "an address already known is not news"
+        );
+        assert_eq!(handle.agent_addresses(), both);
+        assert!(handle.snapshot(None).unwrap().subagents.is_empty());
+        handle.close().unwrap();
+    }
     /// The host records a run's outcome the moment it is announced and then
     /// asks the handle which conversation produced it.
     #[test]
@@ -8136,6 +8331,8 @@ mod tests {
                 Update::Presentation => panic!("hidden close must not request presentation"),
                 Update::Observed { .. }
                 | Update::AccountUsage { .. }
+                | Update::AgentAddresses(_)
+                | Update::ActiveModel { .. }
                 | Update::Attention(_)
                 | Update::AttentionContext { .. }
                 | Update::Ready
@@ -8246,8 +8443,11 @@ mod tests {
         (directory, handle)
     }
 
-    fn finish_initialization_pipe(handle: &LocalHandle, timeout: Duration) -> Snapshot {
-        let deadline = Instant::now() + timeout;
+    /// Wait for the fixture's initialization to end, however it ends. The
+    /// error says which deadline or failure ended it, so how long it took is
+    /// not part of any assertion.
+    fn finish_initialization_pipe(handle: &LocalHandle) -> Snapshot {
+        let deadline = Instant::now() + IO_TIMEOUT + crate::test_timing::EVENTUALLY;
         while !handle.is_completed() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
@@ -8266,7 +8466,7 @@ mod tests {
              print(json.dumps({'type': 'future_advisory'}), flush=True)\n\
              sys.stdin.read()\n",
         );
-        let snapshot = finish_initialization_pipe(&handle, IO_TIMEOUT + Duration::from_secs(5));
+        let snapshot = finish_initialization_pipe(&handle);
         assert!(!snapshot.ready);
         assert!(
             snapshot.error.as_deref().is_some_and(|error| error
@@ -8286,7 +8486,7 @@ mod tests {
                     advisory = if advisory { "True" } else { "False" },
                 );
                 let (_directory, handle) = claude_initialization_pipe(&body);
-                let snapshot = finish_initialization_pipe(&handle, Duration::from_secs(5));
+                let snapshot = finish_initialization_pipe(&handle);
                 assert!(!snapshot.ready);
                 assert!(
                     snapshot.error.as_deref().is_some_and(
@@ -8302,7 +8502,7 @@ mod tests {
              for _ in range(7):\n    print('wrapper diagnostic', flush=True)\n\
              print(json.dumps({'type': 'control_response', 'response': {'subtype': 'success', 'request_id': request['request_id'], 'response': {}}}), flush=True)\n",
         );
-        let snapshot = finish_initialization_pipe(&handle, Duration::from_secs(5));
+        let snapshot = finish_initialization_pipe(&handle);
         assert!(snapshot.error.is_none(), "{snapshot:?}");
         assert!(handle.failure().is_none());
 
@@ -8572,7 +8772,9 @@ for line in sys.stdin:
              print(json.dumps({'type': 'control_response', 'response': {'subtype': 'success', 'request_id': request['request_id'], 'response': {}}}), flush=True)\n\
              sys.stdin.read()\n",
         );
-        let deadline = Instant::now() + Duration::from_secs(50);
+        // The fixture alone takes 40 seconds; a deadline it failed to renew
+        // ends the loop early with an error.
+        let deadline = Instant::now() + Duration::from_secs(40) + crate::test_timing::EVENTUALLY;
         let snapshot = loop {
             let snapshot = handle.snapshot(None).unwrap();
             if snapshot.ready || snapshot.error.is_some() || Instant::now() > deadline {
@@ -8586,14 +8788,13 @@ for line in sys.stdin:
 
     #[test]
     fn claude_garbage_only_startup_still_fails_at_the_first_deadline_with_its_preview() {
-        let started = Instant::now();
+        // Wrapper output never stops, so a deadline that it renewed would
+        // never expire.
         let (_directory, handle) = claude_initialization_pipe(
             "import time\n\
-             for _ in range(5):\n    print('wrapper diagnostic', flush=True)\n    time.sleep(7)\n\
-             print('wrapper diagnostic', flush=True)\n\
-             sys.stdin.read()\n",
+             while True:\n    print('wrapper diagnostic', flush=True)\n    time.sleep(7)\n",
         );
-        let snapshot = finish_initialization_pipe(&handle, IO_TIMEOUT + Duration::from_secs(5));
+        let snapshot = finish_initialization_pipe(&handle);
         let error = snapshot.error.as_deref().unwrap();
         assert!(
             error.contains("timed out without a JSON protocol frame"),
@@ -8603,7 +8804,6 @@ for line in sys.stdin:
             error.contains("Last ignored output: wrapper diagnostic"),
             "{error}"
         );
-        assert!(started.elapsed() < IO_TIMEOUT + Duration::from_secs(5));
     }
 
     #[test]
@@ -8623,7 +8823,7 @@ for line in sys.stdin:
             ),
         ] {
             let (_directory, handle) = claude_initialization_pipe(body);
-            let snapshot = finish_initialization_pipe(&handle, Duration::from_secs(5));
+            let snapshot = finish_initialization_pipe(&handle);
             let error = snapshot.error.as_deref().unwrap();
             assert!(error.contains(expected), "{error}");
             assert!(
@@ -8639,18 +8839,17 @@ for line in sys.stdin:
             "'wrapper diag' + json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False})",
             "json.dumps({'type': 'control_request', 'request_id': 'r', 'request': {}}) + ' wrapper tail'",
         ] {
-            let started = Instant::now();
             let (_directory, handle) = claude_initialization_pipe(&format!(
                 "print({line}, flush=True)\nsys.stdin.read()\n"
             ));
-            let snapshot = finish_initialization_pipe(&handle, Duration::from_secs(5));
+            let snapshot = finish_initialization_pipe(&handle);
             let error = snapshot.error.as_deref().unwrap();
             assert!(
                 error.contains("inside one of its conversation messages"),
                 "{error}"
             );
+            // Waiting out the deadline instead would report a timeout.
             assert!(error.contains("type"), "{error}");
-            assert!(started.elapsed() < Duration::from_secs(5));
         }
     }
 
@@ -9231,6 +9430,50 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn a_provider_is_never_handed_a_parent_session() {
+        use std::io::Read;
+        let spec = ProcessSpec {
+            stdout_noise: None,
+            execution: None,
+            messages: None,
+            transport: TransportSpec::JsonLines,
+            program: "/usr/bin/env".into(),
+            arguments: Vec::new(),
+            working_directory: std::env::current_dir().unwrap(),
+            environment: [
+                ("CLAUDECODE".into(), "1".into()),
+                (
+                    "CLAUDE_CODE_MESSAGING_SOCKET".into(),
+                    "/run/parent.sock".into(),
+                ),
+                ("CLAUDE_CONFIG_DIR".into(), "/home/a/.claude".into()),
+            ]
+            .into(),
+            unset_environment: Default::default(),
+        };
+        let mut provider = spawn_provider(&spec, &AtomicBool::new(false), None)
+            .unwrap()
+            .unwrap();
+        let mut output = String::new();
+        provider
+            .child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut output)
+            .unwrap();
+        provider.terminate().unwrap();
+        let received = output.lines().collect::<Vec<_>>();
+        assert!(received.contains(&"CLAUDE_CONFIG_DIR=/home/a/.claude"));
+        for name in ["CLAUDECODE=", "CLAUDE_CODE_MESSAGING_SOCKET="] {
+            assert!(
+                !received.iter().any(|line| line.starts_with(name)),
+                "{name} reached the provider"
+            );
+        }
+    }
+
+    #[test]
     fn direct_provider_scope_preserves_pipes_and_process_group() {
         use std::io::{BufRead, Write};
         let spec = ProcessSpec {
@@ -9361,28 +9604,22 @@ for line in sys.stdin:
             stdout.read_line(&mut line).unwrap();
             pids.push(line.trim().parse::<u32>().unwrap());
         }
-        let is_shell =
-            |pid: u32| std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap() == "sh\n";
-        let find = |wanted: &dyn Fn(u32) -> bool| {
-            *pids
+        // A shell prints a command's PID when it forks it, and a fork runs as
+        // `sh` until it execs, so wait for both sleeps to have started.
+        let command = |pid: u32| std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap();
+        let (alone, shell, inner) = crate::test_timing::wait_for("the command tree", || {
+            let find = |wanted: &dyn Fn(u32) -> bool| pids.iter().copied().find(|pid| wanted(*pid));
+            let alone = find(&|pid| parent(pid) == root && command(pid) == "sleep\n")?;
+            let shell = find(&|pid| pid != alone && parent(pid) == root)?;
+            let inner = find(&|pid| parent(pid) == shell && command(pid) == "sleep\n")?;
+            Some((alone, shell, inner))
+        });
+        assert_eq!(command(shell), "sh\n");
+        crate::test_timing::eventually("commands leaving the provider's cgroup", || {
+            [alone, shell, inner]
                 .iter()
-                .find(|pid| wanted(**pid))
-                .unwrap_or_else(|| panic!("unexpected command tree: {pids:?}"))
-        };
-        let alone = find(&|pid| parent(pid) == root && !is_shell(pid));
-        let shell = find(&|pid| parent(pid) == root && is_shell(pid));
-        let inner = find(&|pid| parent(pid) == shell);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while [alone, shell, inner]
-            .iter()
-            .any(|pid| cgroup(*pid) == provider_leaf)
-        {
-            assert!(
-                Instant::now() < deadline,
-                "commands stayed in the provider's cgroup"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+                .all(|pid| cgroup(*pid) != provider_leaf)
+        });
         let alone_leaf = cgroup(alone);
         let shell_leaf = cgroup(shell);
         for leaf in [&alone_leaf, &shell_leaf] {
@@ -9398,18 +9635,9 @@ for line in sys.stdin:
         assert_eq!(cgroup(root), provider_leaf, "the provider stays alone");
 
         mark_and_kill(&alone_leaf);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let stops = loop {
-            let stops = scope.take_command_stops();
-            if !stops.is_empty() {
-                break stops;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the stopped command was never reported"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        };
+        let stops = crate::test_timing::wait_for("the stopped command's report", || {
+            Some(scope.take_command_stops()).filter(|stops| !stops.is_empty())
+        });
         assert_eq!(
             stops,
             vec![crate::daemon::process_scope::CommandStop {
@@ -9419,7 +9647,7 @@ for line in sys.stdin:
         );
         let mut byte = [0];
         woken
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(crate::test_timing::EVENTUALLY))
             .unwrap();
         woken.read_exact(&mut byte).unwrap();
         let report = command_stop_report(&stops, 0);
@@ -9452,18 +9680,9 @@ for line in sys.stdin:
         std::fs::write(leaf_path.join("cgroup.procs"), hog.id().to_string()).unwrap();
         hog.stdin.take().unwrap().write_all(b"x").unwrap();
         assert_eq!(hog.wait().unwrap().signal(), Some(libc::SIGKILL));
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let stops = loop {
-            let stops = scope.take_command_stops();
-            if !stops.is_empty() {
-                break stops;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the kernel's kill was never reported"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        };
+        let stops = crate::test_timing::wait_for("the kernel's kill being reported", || {
+            Some(scope.take_command_stops()).filter(|stops| !stops.is_empty())
+        });
         assert_eq!(
             stops,
             vec![crate::daemon::process_scope::CommandStop {
@@ -9476,14 +9695,9 @@ for line in sys.stdin:
 
         // The provider's own leaf, and with it the provider.
         mark_and_kill(&provider_leaf);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let status = loop {
-            if let Some(status) = provider.observed_exit_status().unwrap() {
-                break status;
-            }
-            assert!(Instant::now() < deadline, "the provider outlived its kill");
-            std::thread::sleep(Duration::from_millis(10));
-        };
+        let status = crate::test_timing::wait_for("the provider exiting from its kill", || {
+            provider.observed_exit_status().unwrap()
+        });
         assert_eq!(status.signal(), Some(libc::SIGKILL));
         let report = exit_report(&provider, status);
         assert!(

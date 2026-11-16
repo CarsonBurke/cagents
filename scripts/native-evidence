@@ -10,6 +10,10 @@ self=$(readlink -f "$0")
 tool_root=${self%/scripts/*}
 session_name=evidence
 native_lock=${CAGENTS_EVIDENCE_NATIVE_LOCK:-/var/tmp/cagents-fw16-native.lock}
+# A session holds one of the host's few native slots while it runs, so it is
+# short by default and can never run long enough to keep the others waiting.
+default_limit=900
+maximum_limit=1800
 # Builds go to the build host's shared slots, even from the build host itself:
 # a slot keeps the build output and reuses it for the next build, whichever
 # checkout that is, and only the executables come back to the task.
@@ -24,6 +28,9 @@ export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-8}
 export CAGENTS_BUILD_SEED=0
 # The session's own commands run below a compositor with a private HOME.
 real_home=${CAGENTS_EVIDENCE_REAL_HOME:-$HOME}
+# Executables scripts/main-build-sentinel keeps for recent main commits, one
+# directory per commit.
+main_builds=${CAGENTS_EVIDENCE_MAIN_BUILDS:-$real_home/.local/state/cagents-main-sentinel/builds}
 
 usage() {
     cat <<'USAGE'
@@ -32,19 +39,26 @@ Usage: scripts/native-evidence --task DIR COMMAND
 Sides are "before" and "after". Each has its own checkout and target directory;
 both use the same fixture data and selected providers.
 
-  build SIDE CHECKOUT
+  build SIDE CHECKOUT [--integrated | --executables DIR]
                   Build the runner's three browserless executables in one of
                   the build host's shared slots, and keep them in the side's
-                  target. scripts/prune-build-dirs reclaims a task's targets
+                  target. A clean checkout of a main commit that
+                  scripts/main-build-sentinel built takes its executables
+                  instead, without compiling. --executables moves those in DIR,
+                  built elsewhere from exactly this checkout, into the target.
+                  --integrated builds the UI with the embedded browser instead,
+                  always in a slot, and the side's sessions run the runner
+                  without --browserless. scripts/prune-build-dirs reclaims a task's targets
                   once no build or session has used them for 12 hours, or 1
                   hour while the disk is low.
   start SIDE [--width PX] [--height PX] [--keep-state] [--wait-lock SECONDS] [--limit SECONDS]
         [--startup-timeout SECONDS]
-        [--portal gtk|kde|gnome|cosmic] [--codex tool-rows|child-errors|terminal-escape]
-        [--instance NAME] [--ui-trace]
-                  Take the native lock and start a headless session at the
-                  requested logical width and height (default 1500x900). The lock is
-                  released by stop, or after --limit seconds (default 2700).
+        [--portal gtk|kde|gnome|cosmic] [--codex tool-rows|child-errors|terminal-escape|usage-resets]
+        [--instance NAME] [--ui-trace] [--workspace-trace] [--ui-scoped-fixture]
+                  Take one of the host's native slots and start a headless
+                  session at the requested logical width and height (default
+                  1500x900). The slot is released by stop, or after --limit
+                  seconds (default 900, at most 1800).
                   --startup-timeout bounds the wait for the app window (default
                   180, range 1-3600 seconds); it does not extend --limit.
                   --portal runs xdg-desktop-portal with that backend inside the
@@ -57,20 +71,35 @@ both use the same fixture data and selected providers.
                   every 5 seconds: updates by message, view, subscription,
                   layout, draw, events, overlays and the rest of the widget
                   tree's work, and every call over 50 ms.
+                  --ui-scoped-fixture starts the fixture daemon as User, then
+                  launches only the UI runner with a hardcoded invalid synthetic
+                  session authority. Fixture env and cli commands remain User;
+                  inherited caller authority is still refused.
+                  --workspace-trace logs shared-model update timing, scope
+                  projection choices and activity redraw intervals. Both trace
+                  options persist through relaunch, until the session stops.
   cli ARGS...     Run this side's cagents CLI in the fixture environment.
   env CMD...      Run a command in the fixture environment, which keeps nothing
                   from this shell beyond locale and terminal settings and
                   where Cargo and rustup live. Between sessions it runs under
                   the side the last session ran, with no daemon running.
   drive ARGS...   Run niri-harness against the session (observe, click, key...).
-  nested CMD...   Run a command in the nested compositor's environment.
+  nested CMD...   Run a command in the nested compositor's environment, on the
+                  app's bus, so with --portal, gsettings set changes what the
+                  session's portal reports to the app.
   shot NAME       Capture shots/SIDE-NAME.webp and record its source revision.
+  open-window SLOT
+                  Open a saved secondary window in this session through the
+                  matched development runner. Waits for a new mapped window,
+                  then stays in the foreground until that window exits. Writes
+                  logs/ui-SIDE-SLOT.log and session/window-SLOT with its native
+                  window ID. Uses the session's trace flags and never compiles.
   relaunch [--chat-stages]
                   After closing the app window, run the same built UI again in
                   this session, keeping its daemon and providers alive. Runs in
                   the foreground; stop still ends the complete session.
                   --chat-stages records UI stage timings on normal close.
-  stop            End the session, its daemon and its processes; release the lock.
+  stop            End the session, its daemon and its processes; release its slot.
                   Also ends what remains of a session whose supervisor was killed.
   save-seed       Keep the stopped fixture as the data every later start restores.
   seed --profile NAME [--seed N] [--side SIDE]
@@ -79,7 +108,7 @@ both use the same fixture data and selected providers.
                   SIDE's executables (default after), and save it as the seed.
                   Uses SIDE's own checkout's generator, which matches its
                   executables. Replaces the fixture and any saved seed.
-  status          Report the session and the native lock.
+  status          Report the session and the host's native slots.
 
 --task may also come from CAGENTS_EVIDENCE_TASK.
 USAGE
@@ -198,15 +227,27 @@ zig_executable() (
         -e 's/^[[:space:]]*\.zig_exe[[:space:]]*=[[:space:]]*"\([^"]*\)",\{0,1\}[[:space:]]*$/\1/p'
 )
 
-# What `build` compiles, and all a session's cargo accepts. Keep these in step with
-# scripts/run-development's browserless builds, which cannot be asked to only build: the
+# What `build` compiles, and all a session's cargo accepts, for the lane in $1:
+# browserless, or integrated for the UI with the embedded browser, in the
+# checkout in $2, by default the current directory. Keep these in step with
+# scripts/run-development's builds, which cannot be asked to only build: the
 # before side may predate any option. A real-runner test fails if they drift.
+# A checkout from before the UI became its own package builds it from the root package.
 build_arguments() {
+    local lane=${1:-browserless} checkout=${2:-.} ui
     local common='--locked --profile dev-runtime --no-default-features --features'
     printf '%s\n' \
         "$common development --bin cagents" \
-        "$common development,host --bin cagentsd" \
-        "$common development,ui --bin cagents-ui"
+        "$common development,host --bin cagentsd"
+    if [ -e "$checkout/crates/cagents-ui/Cargo.toml" ]; then
+        ui='--locked --profile dev-runtime -p cagents-ui --features development'
+        [ "$lane" != integrated ] || ui+=',integrated-browser'
+    elif [ "$lane" = integrated ]; then
+        ui='--locked --profile dev-runtime --features development,integrated-browser'
+    else
+        ui="$common development,ui"
+    fi
+    printf '%s\n' "$ui --bin cagents-ui"
 }
 
 refuse_running_side() {
@@ -215,13 +256,71 @@ refuse_running_side() {
     fi
 }
 
+# The executables a build makes, one per line.
+built_executables() {
+    build_arguments | sed 's/.* //'
+}
+
+# The directory of main's prebuilt executables for CHECKOUT: a clean checkout
+# of a commit scripts/main-build-sentinel built with these build arguments.
+main_build_of() {
+    local checkout=$1 directory
+    [ -z "$(cd -- "$checkout" && GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+        git -c core.excludesFile=/dev/null status --porcelain=v1)" ] || return 1
+    directory=$main_builds/$(git -C "$checkout" rev-parse HEAD) || return 1
+    [ "$(cat -- "$directory/arguments" 2>/dev/null)" = "$(build_arguments browserless "$checkout")" ] || return 1
+    printf '%s\n' "$directory"
+}
+
+# Puts executables built elsewhere from CHECKOUT in the side's target, as a
+# build there would have: copied from main's prebuilt ones, which stay, or
+# moved from a directory given to build. Either holds an arguments file, what
+# build_arguments printed where they were built.
+take_built() {
+    local side=$1 checkout=$2 from=$3 how=$4 zig=$5 cargo_bin=$6 target revision executable
+    target=$(target_of "$side")
+    mkdir -p -- "$target/dev-runtime" || die "could not create $target"
+    exec 8<"$target"
+    rm -f -- "$target/evidence-source"
+    revision=$(source_state "$checkout")
+    [ "$(cat -- "$from/arguments" 2>/dev/null)" = "$(build_arguments browserless "$checkout")" ] ||
+        die "$from was not built as this native-evidence builds; build it again"
+    # Main's are of one commit, which the checkout must still be at.
+    [ "$how" != copy ] || [ "$(main_build_of "$checkout")" = "$from" ] ||
+        die "$checkout changed while its executables were taken; build it again"
+    while IFS= read -r executable; do
+        [ -f "$from/$executable" ] && [ -x "$from/$executable" ] ||
+            die "$from has no $executable; build it again"
+        if [ "$how" = copy ]; then
+            cp --reflink=auto -- "$from/$executable" "$target/dev-runtime/.$executable.new" &&
+                mv -f -- "$target/dev-runtime/.$executable.new" "$target/dev-runtime/$executable" ||
+                die "could not copy $from/$executable into $target"
+        else
+            mv -f -- "$from/$executable" "$target/dev-runtime/$executable" ||
+                die "could not move $from/$executable into $target"
+        fi
+    done < <(built_executables)
+    [ "$(source_state "$checkout")" = "$revision" ] ||
+        die "$checkout changed while its executables were taken; build it again"
+    {
+        printf '%s\n' "$checkout" "$zig" "$cargo_bin"
+        printf '%s\n' "$revision"
+        printf 'lane browserless\n'
+    } >"$target/evidence-source"
+}
+
 cmd_build() {
-    local side=${1:-} checkout=${2:-}
+    local side=${1:-} checkout=${2:-} lane=browserless executables=''
     require_side "$side"
     [ -n "$checkout" ] || die 'build needs a checkout' 2
     shift 2
     while [ "$#" -gt 0 ]; do
         case $1 in
+            --integrated) lane=integrated; shift ;;
+            --executables)
+                executables=${2:?--executables needs a directory}
+                shift 2
+                ;;
             --seed-target)
                 # A slot already holds a nearby build; a copied target adds only disk.
                 : "${2:?--seed-target needs a directory}"
@@ -231,6 +330,9 @@ cmd_build() {
             *) die "unknown build option: $1" 2 ;;
         esac
     done
+    # Executables built elsewhere, and main's prebuilt ones, are browserless.
+    [ "$lane" = browserless ] || [ -z "$executables" ] ||
+        die '--executables takes browserless executables; build --integrated in a slot' 2
     refuse_running_side "$side"
     checkout=$(cd -- "$checkout" && pwd -P)
     git -C "$checkout" rev-parse --git-dir >/dev/null
@@ -254,6 +356,26 @@ cmd_build() {
     # The other side stays in use while this one builds, even if the guard
     # below starts the pruner.
     mark_used
+    if [ -n "$executables" ]; then
+        take_built "$side" "$checkout" "$executables" move "$zig" "${cargo_path%/*}"
+        rm -f -- "$executables/arguments"
+        rmdir -- "$executables" 2>/dev/null || :
+        printf 'took %s at %s from %s\n' "$side" "$(git -C "$checkout" rev-parse HEAD)" "$executables"
+        return
+    fi
+    local prebuilt
+    if [ "$lane" = browserless ] && prebuilt=$(main_build_of "$checkout") && [ -f "$main_builds/.lock" ]; then
+        # The sentinel removes old builds only while nothing reads them. A
+        # copy that fails says why, and the side is compiled instead.
+        if (
+            flock -s 9 || exit 1
+            [ -d "$prebuilt" ] || exit 1
+            take_built "$side" "$checkout" "$prebuilt" copy "$zig" "${cargo_path%/*}"
+        ) 9<"$main_builds/.lock"; then
+            printf 'took %s at %s from main'"'"'s prebuilt executables\n' "$side" "$(git -C "$checkout" rev-parse HEAD)"
+            return
+        fi
+    fi
     # Builds in shared slots skip the gate's disk guard, which starts the
     # pruner on its schedule and refuses a build when the disk is too full.
     # When the slots are this host's, they share its disk, so run it here; a
@@ -266,7 +388,7 @@ cmd_build() {
     # CAGENTS_BUILD_REMOTE=local here. The hold is the checkout's, whose
     # builds alone can use it.
     (cd -- "$checkout" && "$tool_root/scripts/cargo-gate" exec --hold "$self" --task "$task" \
-        __build "$side" "$checkout" "$zig" "${cargo_path%/*}")
+        __build "$side" "$checkout" "$zig" "${cargo_path%/*}" "$lane")
 }
 
 # Whether this build compiles on this host: in its own slots, reached by
@@ -291,7 +413,7 @@ mark_used() {
 }
 
 run_build() {
-    local side=$1 checkout=$2 zig=$3 cargo_bin=$4 target revision
+    local side=$1 checkout=$2 zig=$3 cargo_bin=$4 lane=${5:-browserless} target revision
     # A session may have started during the wait for this slot.
     refuse_running_side "$side"
     target=$(target_of "$side")
@@ -313,15 +435,16 @@ run_build() {
         while IFS= read -r arguments; do
             # shellcheck disable=SC2086 # Deliberately one word per argument.
             cargo build $arguments 8<&-
-        done < <(build_arguments)
+        done < <(build_arguments "$lane" "$checkout")
     )
     [ "$(source_state "$checkout")" = "$revision" ] ||
         die "$checkout changed during the build; build it again"
     {
         printf '%s\n' "$checkout" "$zig" "$cargo_bin"
         printf '%s\n' "$revision"
+        printf 'lane %s\n' "$lane"
     } >"$target/evidence-source"
-    printf 'built %s at %s\n' "$side" "$(head -n1 <<<"$revision")"
+    printf 'built %s (%s) at %s\n' "$side" "$lane" "$(head -n1 <<<"$revision")"
 }
 
 # What a side without a build says. scripts/prune-build-dirs reclaims one that
@@ -341,7 +464,11 @@ load_side() {
         read -r cargo_bin
         read -r built_revision
         read -r built_tree
+        # A record from before lanes has no such line: it was browserless.
+        read -r lane || :
     } <"$record"
+    lane=${lane#lane }
+    [ "$lane" = integrated ] || lane=browserless
     target=$(target_of "$side")
 }
 
@@ -399,6 +526,10 @@ save_seed() {
     seeded_home_identity >"$seed_home"
 }
 
+restore_seed_in_place() {
+    /usr/bin/python3 -I "$tool_root/scripts/native-evidence-seed.py" "$seed" "$fixture"
+}
+
 prepare_fixture() {
     local keep_state=$1
     if [ "$keep_state" = false ]; then
@@ -409,7 +540,7 @@ prepare_fixture() {
             # and a transcript's location records its file's. Syncing in
             # place keeps every directory and file both share, so a
             # conversation saved in the seed reopens on either side.
-            if ! rsync -aH --inplace --delete --force -- "$seed/" "$fixture/" 2>"$logs/seed.log"; then
+            if ! restore_seed_in_place 2>"$logs/seed.log"; then
                 printf 'could not restore the seed into the fixture; see %s\n' "$logs/seed.log" >"$state/failed"
                 return 1
             fi
@@ -437,6 +568,8 @@ prepare_fixture() {
     # Avatars come only from the seeds the forge copies into the app's cache.
     printf '#!/bin/sh\necho "curl: (7) the fixture has no network access" >&2\nexit 7\n' >"$fixture/bin/curl"
     chmod 755 "$fixture/bin/curl"
+    # Links the app opens are recorded in state/opened-urls, not shown in a browser.
+    install -m 755 "$tool_root/tests/fixtures/fixture-xdg-open.sh" "$fixture/bin/xdg-open"
     install_codex
     if [ ! -e "$fixture/project/.git" ]; then
         (
@@ -558,7 +691,7 @@ install_codex() {
     [ -n "$peer" ] || return 0
     mkdir -p -- "$peers" "$fixture/home/.codex"
     # The peers load their transport from beside them.
-    install -m 644 -t "$peers" -- "$tool_root"/tests/fixtures/{terminal-escape-codex,codex-tool-rows,codex-child-errors}.py
+    install -m 644 -t "$peers" -- "$tool_root"/tests/fixtures/{terminal-escape-codex,codex-tool-rows,codex-child-errors,codex-usage-resets,usage-reset-fixture}.py
     printf '%s\n' "$peer" >"$peers/peer"
     install -m 755 "$tool_root/tests/fixtures/fixture-codex.sh" "$fixture/bin/codex"
 }
@@ -628,53 +761,75 @@ path_without_shims() {
     printf '%s\n' "$path"
 }
 
-# Gives up if asked to stop, or if the start command that wanted this session is
-# gone: nobody would drive or stop a session that began after that.
+# The slot files a session may take, slot 0 first. See scripts/native_slots.py.
+native_slot_paths() {
+    /usr/bin/python3 -I "$tool_root/scripts/native_slots.py" paths "$native_lock"
+}
+
+# Waits in line for one of the host's native slots and keeps it on
+# descriptor 9; every other descriptor it opened is closed again. Gives up if
+# asked to stop, or if the start command that wanted this session is gone:
+# nobody would drive or stop a session that began after that.
 wait_for_native_lock() {
-    local wait_lock=$1 starter=$2 waited=0
-    if [ "$wait_lock" -eq 0 ]; then
-        # A zero budget still tries the idle lock. Starting a queued helper
-        # and immediately cancelling it races the helper's first scheduling.
-        if flock -n 9; then
-            :
-        else
-            local status=$?
-            if [ "$status" -eq 1 ]; then
-                printf 'the native lock stayed busy for 0 seconds (see scripts/lock-holders %s)\n' "$native_lock" >"$state/failed"
-            else
-                printf 'could not take the native lock\n' >"$state/failed"
-            fi
-            return 1
-        fi
-    else
-        # Stay in the kernel's queue the whole time: retrying with a short timeout
-        # loses to every blocked waiter, and could wait out the limit behind them.
-        # The child shares this descriptor, so the lock outlives it.
-        flock 9 &
-        lock_waiter=$!
-        local waiter=$lock_waiter
-        while kill -0 "$waiter" 2>/dev/null; do
-            if [ -e "$state/stop" ] || ! kill -0 "$starter" 2>/dev/null; then
-                kill -KILL "$waiter" 2>/dev/null || true
-                wait "$waiter" 2>/dev/null || true
-                printf 'stopped while waiting for the native lock\n' >"$state/failed"
-                return 1
-            fi
-            if [ "$waited" -ge "$wait_lock" ]; then
-                kill -KILL "$waiter" 2>/dev/null || true
-                wait "$waiter" 2>/dev/null || true
-                printf 'the native lock stayed busy for %s seconds (see scripts/lock-holders %s)\n' "$wait_lock" "$native_lock" >"$state/failed"
-                return 1
-            fi
-            sleep 1
-            waited=$((waited + 1))
-        done
-        wait "$waiter" || {
-            printf 'could not take the native lock\n' >"$state/failed"
+    local wait_lock=$1 starter=$2 path descriptor queue_descriptor slot_descriptors=() arguments=() status=0 index
+    native_slot_paths >"$state/slot-paths" || {
+        printf 'could not list the native slots; see %s\n' "$logs/session-$(cat "$state/side").log" >"$state/failed"
+        return 1
+    }
+    exec {queue_descriptor}>>"$native_lock.queue" || {
+        printf 'could not open %s\n' "$native_lock.queue" >"$state/failed"
+        return 1
+    }
+    arguments+=(--queue-fd "$queue_descriptor")
+    while IFS= read -r path; do
+        exec {descriptor}>>"$path" || {
+            printf 'could not open %s\n' "$path" >"$state/failed"
+            for descriptor in "$queue_descriptor" "${slot_descriptors[@]}"; do
+                exec {descriptor}>&-
+            done
             return 1
         }
-        lock_waiter=
+        slot_descriptors+=("$descriptor")
+        arguments+=(--slot-fd "$descriptor")
+    done <"$state/slot-paths"
+    # In the background, so a signal reaches this shell's trap at once. The
+    # waiter stays in the kernel's queue the whole time: retrying with a short
+    # timeout loses to every blocked waiter. Its parent is this shell, which
+    # the background job replaces with it.
+    local parent=$BASHPID
+    /usr/bin/python3 -I "$tool_root/scripts/native_slots.py" acquire "${arguments[@]}" \
+        --wait "$wait_lock" --stop "$state/stop" --starter "$starter" --parent-pid "$parent" \
+        >"$state/slot" 9>&- &
+    lock_waiter=$!
+    wait "$lock_waiter" || status=$?
+    lock_waiter=
+    index=$(cat "$state/slot" 2>/dev/null) || index=
+    if [ "$status" -eq 0 ]; then
+        if [[ $index =~ ^[0-9]+$ ]] && [ "$index" -lt "${#slot_descriptors[@]}" ]; then
+            exec 9>&"${slot_descriptors[$index]}"
+        else
+            status=2
+        fi
     fi
+    for descriptor in "$queue_descriptor" "${slot_descriptors[@]}"; do
+        exec {descriptor}>&-
+    done
+    case $status in
+        0) ;;
+        69)
+            printf 'every native slot stayed busy for %s seconds (see scripts/lock-holders %s)\n' \
+                "$wait_lock" "$(tr '\n' ' ' <"$state/slot-paths" | sed 's/ $//')" >"$state/failed"
+            return 1
+            ;;
+        75)
+            printf 'stopped while waiting for the native lock\n' >"$state/failed"
+            return 1
+            ;;
+        *)
+            printf 'could not take the native lock\n' >"$state/failed"
+            return 1
+            ;;
+    esac
     if [ -e "$state/stop" ] || ! kill -0 "$starter" 2>/dev/null; then
         printf 'stopped while waiting for the native lock\n' >"$state/failed"
         return 1
@@ -706,12 +861,13 @@ run_session() {
         not_built "$side" "$checkout" >"$state/failed"
         return 1
     }
-    exec 9>"$native_lock"
     compositor=
     lock_waiter=
     # A waiter left in the queue would take the lock for a moment later on.
     trap '[ -z "$lock_waiter" ] || kill -KILL "$lock_waiter" 2>/dev/null; end_session; mark_used; exit 143' TERM INT HUP
     wait_for_native_lock "$wait_lock" "$starter" || return 1
+    # The limit runs from taking the slot, so preparing the session counts.
+    local deadline=$((SECONDS + limit)) stop_deadline=
     settle_session_processes 9>&-
     # A document portal can leave a FUSE mount in the runtime directory.
     if [ -d "$runtime" ]; then
@@ -774,7 +930,6 @@ RULES
         "$self --task $task __inner $side $width $startup_timeout" \
         >"$logs/kwin-$side.log" 2>&1 8<&- 9>&- &
     compositor=$!
-    local deadline=$((SECONDS + limit)) stop_deadline=
     while kill -0 "$compositor" 2>/dev/null; do
         # A session that can't start has nothing to wait for.
         if [ -e "$state/failed" ]; then
@@ -843,7 +998,7 @@ write_session_cargo() {
         printf '#!/bin/bash\n'
         printf 'state=%q\nadvice=%q\nreal_cargo=%q\nprofile=dev-runtime\n' \
             "$state" "run: build $side $checkout" "$cargo_bin/cargo"
-        printf 'recorded=%q\n' "$(build_arguments)"
+        printf 'recorded=%q\n' "$(build_arguments "$lane" "$checkout")"
         cat <<'CARGO'
 [ ! -e "$state/ready" ] || [ -e "$state/replaying" ] || exec "$real_cargo" "$@"
 refuse() {
@@ -887,7 +1042,8 @@ CARGO
 }
 
 run_app() {
-    local side=$1
+    local side=$1 slot=${2:-} ui_log
+    ui_log=$logs/ui-$side${slot:+-$slot}.log
     load_side "$side" "$state/source"
     # A session holds the native lock while others queue, so it must not wait on
     # Cargo, whose shared locks and fingerprints make even a no-op build uncertain.
@@ -897,23 +1053,60 @@ run_app() {
         exit 1
     fi
     cd -- "$checkout"
+    record_app_env
     session_variables='WAYLAND_DISPLAY DBUS_SESSION_BUS_ADDRESS NIRI_SOCKET XDG_CURRENT_DESKTOP XDG_SESSION_TYPE XCURSOR_THEME XCURSOR_SIZE'
     write_session_cargo "$side" "$checkout"
     session_path=$state/session-bin:
-    # The runner still calls scripts/cargo-gate, which must not join the shared queue.
+    # The runner still calls scripts/cargo-gate, which must not join the shared queue,
+    # nor the build host's slice and jobserver: it builds in place.
     # Its builds replay the recorded ones through the session's cargo, here.
     # They write nothing, so their disk guard is off: it would start the
     # pruner, under this private HOME, beside the app being captured, and
     # sync the file system for each one while the disk is low. Builds run
     # inside the session once it is ready are not disk-guarded either.
-    local status=0 stage_environment=() runner_instance=()
+    local status=0 stage_environment=() runner_instance=() runner_lifecycle=() window_arguments=() runner_lane=(--browserless)
+    [ "$lane" != integrated ] || runner_lane=()
     [ -z "$instance_name" ] || runner_instance=(--instance "$instance_name" --in-session)
+    [ -z "$slot" ] || window_arguments=(-- --window "$slot")
+    # A new evidence session must use the matched daemon just built. Additional
+    # windows and UI-only relaunches deliberately retain that session's actors.
+    if [ -z "$slot" ] && [ ! -e "$state/replaying" ]; then
+        runner_lifecycle=(--fresh-daemon)
+    fi
     [ -z "${chat_stage_output:-}" ] || stage_environment+=("CAGENTS_CHAT_STAGE_OUTPUT=$chat_stage_output")
     [ "$(cat "$state/ui-trace" 2>/dev/null)" != 1 ] || stage_environment+=(CAGENTS_UI_TRACE=1)
+    if [ "$(cat "$state/ui-scoped-fixture" 2>/dev/null)" = 1 ]; then
+        # Start the isolated daemon as User before adding the synthetic caller
+        # to the UI runner. It must not inherit even this invalid capability.
+        if [ "${#runner_lifecycle[@]}" -gt 0 ]; then
+            if ! fixture_env timeout -k 5 "$(cat "$state/startup-timeout")" "$target/dev-runtime/cagents" daemon stop-for-rebuild --including-subagents; then
+                printf 'could not reset the User fixture daemon for the scoped UI; see %s\n' "$harness_root/session.log" >"$state/failed"
+                return 1
+            fi
+            local scoped_socket="$runtime/cagents-development${instance_name:+-$instance_name}/cagentsd.sock" remaining=100
+            while [ -e "$scoped_socket" ]; do
+                if [ "$remaining" -eq 0 ]; then
+                    printf 'the scoped fixture daemon did not stop within 5 seconds\n' >"$state/failed"
+                    return 1
+                fi
+                remaining=$((remaining - 1))
+                sleep 0.05
+            done
+        fi
+        runner_lifecycle=()
+        if ! fixture_env timeout -k 5 "$(cat "$state/startup-timeout")" "$target/dev-runtime/cagents" daemon start; then
+            printf 'could not start the User fixture daemon for the scoped UI; see %s\n' "$harness_root/session.log" >"$state/failed"
+            return 1
+        fi
+        stage_environment+=(CAGENTS_AGENT_AUTHORITY=native-evidence-invalid-session)
+    fi
+    [ "$(cat "$state/workspace-trace" 2>/dev/null)" != 1 ] || stage_environment+=(
+        RUST_LOG=cagents=debug,cagentsd=debug,cagents::workspace_pipeline=debug,cagents::workspace_projection=trace,warn
+    )
     fixture_env env "${stage_environment[@]}" CAGENTS_BUILD_LOCK="$state/session-build.lock" CAGENTS_BUILD_SLOTS=1 CAGENTS_BUILD_SEED=0 \
-        CAGENTS_BUILD_REMOTE=local CAGENTS_BUILD_FREE_FLOOR_GIB=0 \
-        scripts/run-development --browserless "${runner_instance[@]}" \
-            --debug --log-file "$logs/ui-$side.log" || status=$?
+        CAGENTS_BUILD_REMOTE=local CAGENTS_BUILD_SCOPE=0 CAGENTS_BUILD_FREE_FLOOR_GIB=0 \
+        scripts/run-development "${runner_lane[@]}" "${runner_instance[@]}" "${runner_lifecycle[@]}" \
+            --debug --log-file "$ui_log" "${window_arguments[@]}" || status=$?
     # Don't leave the lock held until the harness gives up on a window.
     if [ ! -e "$state/ready" ] && [ ! -e "$state/failed" ]; then
         printf 'the runner exited with status %s before the app window appeared; see %s and %s\n' \
@@ -924,6 +1117,14 @@ run_app() {
 
 # Query the isolated compositor, which represents a closed window as [].
 app_window_is_open() {
+    local ids
+    ids=$(app_window_ids) || return 2
+    [ -n "$ids" ]
+}
+
+# Window IDs belong to this private compositor. A pre-existing primary
+# window must never satisfy an additional window's startup barrier.
+app_window_ids() {
     local observed
     observed=$(timeout -k 1 10 niri msg --json windows 2>/dev/null) || return 2
     /usr/bin/python3 -c 'import json,sys
@@ -931,15 +1132,77 @@ try:
     windows=json.load(sys.stdin)
     if not isinstance(windows,list):
         sys.exit(2)
+    ids=[]
     for window in windows:
         if not isinstance(window,dict) or "app_id" not in window:
             sys.exit(2)
         if window["app_id"] is not None and not isinstance(window["app_id"],str):
             sys.exit(2)
-    sys.exit(0 if any(window["app_id"] == "dev.cagents.Cagents.Development" for window in windows) else 1)
+        if window["app_id"] == "dev.cagents.Cagents.Development":
+            identity=window.get("id")
+            if type(identity) is not int or identity < 0 or identity in ids:
+                sys.exit(2)
+            ids.append(identity)
+    print("\n".join(map(str,sorted(ids))))
 except (ValueError,AttributeError):
     sys.exit(2)
 ' <<<"$observed"
+}
+
+cmd_open_window() {
+    local slot=${1:-} side original watcher receipt status=0
+    [ "$#" -eq 1 ] && [[ $slot =~ ^[A-Za-z0-9_-]{1,40}$ ]] && [ "$slot" != primary ] && [ "$slot" != update ] && [[ $slot != device-* ]] ||
+        die 'open-window needs a secondary slot: 1-40 letters, digits, underscores or hyphens; primary, update and device-* are reserved' 2
+    side=$(current_side)
+    exec 7>"$state/relaunch.lock"
+    flock -n 7 || die 'another window launch or relaunch is active'
+    nested_session_env
+    local session_environment
+    session_environment=$(timeout -k 5 30 niri-harness --session "$session_name" session env)
+    eval "$session_environment"
+    original=$(app_window_ids) || die 'could not observe the current native windows'
+    # Probe the actual window lease before launching: a duplicate slot would
+    # activate its existing window and could never produce a new native ID.
+    if [ -e "$runtime/cagents-development-ui.lock.$slot" ]; then
+        exec 6<"$runtime/cagents-development-ui.lock.$slot"
+        flock -n -x 6 || die "window $slot is already open"
+        exec 6<&-
+    fi
+    rm -f -- "$state/window-$slot"
+    receipt=$state/window-$slot.new-$$
+    # Product-only targets have no dependency lists. Replay only the exact
+    # builds already recorded by build, as for relaunch; never join Cargo here.
+    touch "$state/replaying"
+    (
+        local ids identity
+        for _ in {1..300}; do
+            live_session || exit 1
+            ids=$(app_window_ids) || break
+            for identity in $ids; do
+                if ! grep -qxF -- "$identity" <<<"$original"; then
+                    printf '%s\n' "$identity" >"$receipt"
+                    rm -f -- "$state/replaying"
+                    mv -f -- "$receipt" "$state/window-$slot"
+                    printf 'window %s ready: native ID %s; log %s\n' "$slot" "$identity" "$logs/ui-$side-$slot.log"
+                    exit 0
+                fi
+            done
+            sleep 0.1
+        done
+        printf 'the additional window did not appear; see %s\n' "$logs/ui-$side-$slot.log" >"$state/failed"
+        touch "$state/stop"
+    ) 7>&- &
+    watcher=$!
+    trap 'kill "$watcher" 2>/dev/null || :; rm -f -- "$state/replaying" "$receipt" "$state/window-$slot"' EXIT
+    trap 'exit 143' TERM HUP
+    run_app "$side" "$slot" 7>&- || status=$?
+    kill "$watcher" 2>/dev/null || :
+    wait "$watcher" 2>/dev/null || :
+    if [ ! -s "$state/window-$slot" ]; then
+        printf 'the additional app exited before a new window appeared; see %s\n' "$logs/ui-$side-$slot.log" >&2
+        [ "$status" -ne 0 ] || status=1
+    fi
+    exit "$status"
 }
 
 cmd_relaunch() {
@@ -962,6 +1225,7 @@ cmd_relaunch() {
     local session_environment
     session_environment=$(timeout -k 5 30 niri-harness --session "$session_name" session env)
     eval "$session_environment"
+    join_app_env
     app_window_is_open && observed=0 || observed=$?
     case $observed in
         0) die 'close the app window before relaunching it' ;;
@@ -996,7 +1260,7 @@ cmd_relaunch() {
 }
 
 cmd_start() {
-    local side=${1:-} width=1500 height=900 keep_state=false wait_lock=1800 limit=2700 startup_timeout=180 portal= codex= codex_executable= ui_trace=
+    local side=${1:-} width=1500 height=900 keep_state=false wait_lock=1800 limit=$default_limit startup_timeout=180 portal= codex= codex_executable= ui_trace= ui_scoped_fixture= workspace_trace=
     require_side "$side"
     shift
     while [ "$#" -gt 0 ]; do
@@ -1011,19 +1275,23 @@ cmd_start() {
                 [ "$#" -ge 2 ] || die '--startup-timeout needs seconds' 2
                 startup_timeout=$2; shift 2 ;;
             --portal) portal=${2:?--portal needs a backend: gtk, kde, gnome or cosmic}; shift 2 ;;
-            --codex) codex=${2:?--codex needs a peer: tool-rows, child-errors or terminal-escape}; shift 2 ;;
+            --codex) codex=${2:?--codex needs a peer: tool-rows, child-errors, terminal-escape or usage-resets}; shift 2 ;;
             --codex-executable) codex_executable=${2:?--codex-executable needs an absolute ELF path}; shift 2 ;;
             --ui-trace) ui_trace=1; shift ;;
+            --ui-scoped-fixture) ui_scoped_fixture=1; shift ;;
+            --workspace-trace) workspace_trace=1; shift ;;
             *) die "unknown start option: $1" 2 ;;
         esac
     done
     [[ $width =~ ^[1-9][0-9]*$ && $height =~ ^[1-9][0-9]*$ && $wait_lock =~ ^[0-9]+$ && $limit =~ ^[1-9][0-9]*$ ]] ||
         die 'width and height must be positive pixels; lock wait and session limit must be whole numbers' 2
+    [ "$limit" -le "$maximum_limit" ] ||
+        die "a session may hold a native slot for at most $maximum_limit seconds, so one session cannot keep others waiting; --limit $limit is longer. Capture in one short session, or stop and start again for a separate measurement." 2
     require_startup_timeout "$startup_timeout"
     [[ -z $portal || $portal =~ ^(gtk|kde|gnome|cosmic)$ ]] ||
         die "unknown portal backend: $portal; use gtk, kde, gnome or cosmic" 2
-    [[ -z $codex || $codex =~ ^(tool-rows|child-errors|terminal-escape)$ ]] ||
-        die "unknown Codex peer: $codex; use tool-rows, child-errors or terminal-escape" 2
+    [[ -z $codex || $codex =~ ^(tool-rows|child-errors|terminal-escape|usage-resets)$ ]] ||
+        die "unknown Codex peer: $codex; use tool-rows, child-errors, terminal-escape or usage-resets" 2
     [[ -z $codex || -z $codex_executable ]] ||
         die '--codex and --codex-executable are mutually exclusive' 2
     [[ $self =~ ^/[A-Za-z0-9._/-]+$ ]] || die "the tool's path has unsupported characters: $self" 2
@@ -1046,7 +1314,10 @@ cmd_start() {
         rm -f -- "$state/codex-executable" "$state/codex-executable.json"
     fi
     rm -f -- "$state/codex-executable-installed.json"
-    rm -f -- "$state/ready" "$state/failed" "$state/stop" "$state/env" "$state/over-limit" "$state/notice"
+    rm -f -- "$state/ready" "$state/failed" "$state/stop" "$state/env" "$state/app-env" "$state/over-limit" "$state/notice"
+    # Readiness belongs to one live session and one additional-window command.
+    # A previous side must not satisfy a caller waiting for this side to map.
+    rm -f -- "$state"/window-* "$state/replaying"
     # Fix what this session runs: everything it reports reads this copy.
     cp -- "$(target_of "$side")/evidence-source" "$state/source" 2>/dev/null ||
         die "$(not_built "$side" "$checkout")"
@@ -1058,6 +1329,8 @@ cmd_start() {
     printf '%s\n' "$portal" >"$state/portal"
     printf '%s\n' "$codex" >"$state/codex"
     printf '%s\n' "$ui_trace" >"$state/ui-trace"
+    printf '%s\n' "$ui_scoped_fixture" >"$state/ui-scoped-fixture"
+    printf '%s\n' "$workspace_trace" >"$state/workspace-trace"
     printf 'waiting for the native session (lock wait up to %ss)\n' "$wait_lock"
     # The session outlives this command, so it starts in its own process session.
     setsid nohup "$self" --task "$task" __session "$side" "$width" "$keep_state" "$wait_lock" "$limit" "$$" "$height" "$startup_timeout" \
@@ -1135,6 +1408,26 @@ nested_session_env() {
     export XDG_RUNTIME_DIR=$runtime
 }
 
+# The bus and configuration directory the app started with. With --portal the
+# harness gives the app a private bus, where its portal and dconf run, which the
+# compositor's environment does not name. A command run in the session joins
+# them, so gsettings changes what the portal reports and a relaunched app reads
+# the same portal.
+record_app_env() {
+    local name
+    for name in DBUS_SESSION_BUS_ADDRESS XDG_CONFIG_HOME; do
+        [ -z "${!name:-}" ] || printf '%s=%s\n' "$name" "${!name}"
+    done >"$state/app-env"
+}
+
+join_app_env() {
+    local name value
+    [ -f "$state/app-env" ] || return 0
+    while IFS='=' read -r name value; do
+        export "$name=$value"
+    done <"$state/app-env"
+}
+
 cmd_drive() {
     current_side >/dev/null
     nested_session_env
@@ -1148,6 +1441,7 @@ cmd_nested() {
     local session_environment
     session_environment=$(timeout -k 5 30 niri-harness --session "$session_name" session env)
     eval "$session_environment"
+    join_app_env
     exec "$@"
 }
 
@@ -1223,12 +1517,28 @@ cmd_status() {
         printf 'session: none\n'
         [ ! -e "$state/over-limit" ] || printf 'last session: %s\n' "$(cat "$state/over-limit")"
     fi
-    if (exec 9>"$native_lock" && flock -n 9); then
-        printf 'native lock: free\n'
+    local paths busy count
+    paths=$(native_slot_paths) || die 'could not list the native slots'
+    count=$(wc -l <<<"$paths")
+    busy=$(/usr/bin/python3 -I "$tool_root/scripts/native_slots.py" held "$native_lock") ||
+        die 'could not read the native slots'
+    if [ -z "$busy" ]; then
+        printf 'native slots: %s free of %s\n' "$count" "$count"
     else
-        printf 'native lock: held\n'
+        printf 'native slots: %s free of %s; held: %s (see scripts/lock-holders %s)\n' \
+            "$((count - $(wc -w <<<"$busy")))" "$count" "$busy" "$(tr '\n' ' ' <<<"$paths" | sed 's/ $//')"
+    fi
+    if live_session && [ -s "$state/slot" ]; then
+        printf 'this session: slot %s\n' "$(cat "$state/slot")"
     fi
 }
+
+# What build compiles, for builds made elsewhere: in the caller's own checkout
+# by native-evidence-remote, and of main by scripts/main-build-sentinel.
+if [ "${1:-}" = __build-arguments ]; then
+    build_arguments
+    exit 0
+fi
 
 # On another host, over SSH; nothing native runs here. See native-evidence-remote.
 # Only as a leading option, beside --task: a later --remote is a command's.
@@ -1253,6 +1563,7 @@ case $command in
     build) cmd_build "$@" ;;
     start) cmd_start "$@" ;;
     relaunch) cmd_relaunch "$@" ;;
+    open-window) cmd_open_window "$@" ;;
     cli)
         side=$(current_side)
         load_side "$side" "$state/source"

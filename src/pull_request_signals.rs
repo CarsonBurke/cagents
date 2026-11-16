@@ -823,9 +823,12 @@ fn hash_references(line: &str, signals: &mut Vec<Signal>) {
             continue;
         }
         let before = &line[..index];
+        // The token starts after the last character outside it, which may
+        // take more than one byte, as a dash in `#1084–#1090` does.
         let token_start = before
-            .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.')))
-            .map_or(0, |at| at + 1);
+            .char_indices()
+            .rfind(|&(_, c)| !(c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.')))
+            .map_or(0, |(at, c)| at + c.len_utf8());
         let token = &before[token_start..];
         if token.is_empty() {
             let previous = before.chars().next_back();

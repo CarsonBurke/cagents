@@ -224,7 +224,46 @@ use crate::{
 /// Version 172 appends the worktrees a conversation edited to
 /// `ConversationPullRequests`. 167 to 171 are reserved for parallel branches
 /// and are not adopted here.
-pub const PROTOCOL_VERSION: u16 = 172;
+/// Version 173 appends `ServerMessage::ChatAgentAddresses`, which says how a
+/// provider addresses a chat's subagents. Snapshots keep their layout, which
+/// the update sources share.
+/// Version 174 appends the agent operations `Prompt` and `Deliver`, which say
+/// whether an existing agent took a prompt or message as a run now or holds
+/// it behind its current work, and their replies `Prompted` and `Handed`.
+/// Version 175 adds scope revisions, closed pane identities and canonical
+/// changed rows to `WorkspaceModelEdited`. Windows apply matching revisions or
+/// read only the affected scope with `ReadWorkspaceView`; reconnect snapshots,
+/// typed edit receipts and narrow metadata reads have appended requests/replies.
+/// The changed watch snapshot and edge shape require matched windows; older
+/// carried CLIs retain explicit whole-model reads/edits but cannot watch.
+/// Version 176 separates cancelled and skipped Work check counts from failures
+/// and passes. Board reads, pins and subscriptions require a matching client.
+/// Version 177 appends `ToolStatus::Ended` for earlier delegated runs.
+/// Version 178 appends `ServerMessage::AutomationProposalsChanged`, which tells
+/// a window watching notifications that a project's pending automation
+/// requests changed, so it reads them then rather than polling.
+/// Version 179 appends retryable `StoreBusy` errors for mailbox contention.
+/// Older clients cannot decode the new error code; replace the matched set.
+/// Version 180 appends agent placement context and a narrow read of managed
+/// agents' accepted task labels, preserving the carried CLI directory layout.
+/// Version 181 appends `RetryPendingTerminalSave` to persist an already
+/// running terminal without launching another worker.
+/// Version 182 appends provider-confirmed active model status independently of
+/// chat snapshots, whose inspector encoding stays frozen for update sources.
+/// Version 183 fences shared Close on its original pane and terminal worker,
+/// with attachment metadata, captured-source reads and source-checked cleanup.
+/// Version 184 adds reset inventories and reported plan display names and
+/// tiers to account readings, which older CLIs are sent without, and appends
+/// the account-reset and after-sign-in probe device operations, with a
+/// JSON-framed reset reply that older CLIs cannot request.
+/// Replace the matched daemon/window set.
+pub const PROTOCOL_VERSION: u16 = 184;
+/// A correlated refusal issued before source-checked cleanup has any effect.
+pub const TERMINAL_CLOSE_SOURCE_CONFLICT: &str =
+    "The terminal changed or still owns work; nothing was closed";
+/// No resident was selected; disappearance is not a successor publication.
+pub const TERMINAL_CLOSE_SOURCE_ABSENT: &str =
+    "The captured terminal is no longer resident; nothing was closed";
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
 /// inspector's frozen and saved-history requests) has this release's
@@ -236,8 +275,10 @@ pub const PROTOCOL_VERSION: u16 = 172;
 pub const CANDIDATE_LINE_PROTOCOL: u16 = 128;
 
 mod older_clients;
+pub(crate) use older_clients::{
+    ENDED_TOOL_STATUS, PLAN_AND_RESET_READINGS, WAITING_TOOL_STATUS, encoding_before,
+};
 pub use older_clients::{OlderClient, is_cli_peer, older_client};
-pub(crate) use older_clients::{WAITING_TOOL_STATUS, encoding_before};
 
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
@@ -612,6 +653,47 @@ pub enum ClientRequest {
         session: crate::chat::Session,
         end: Vec<ProcessStart>,
     },
+    /// Read one scope of the shared model, for a watcher that cannot apply an
+    /// edge to the copy it holds. Answered with
+    /// [`ServerResponse::WorkspaceView`].
+    ReadWorkspaceView {
+        scope: crate::workspace_model::views::Scope,
+    },
+    /// Commit an edit and return only its authoritative effects.
+    ApplyWorkspaceEdit {
+        edit: crate::workspace_model::ModelEdit,
+    },
+    /// Read a reconnect baseline including closed identities, without subscribing.
+    ReadWorkspaceSnapshot,
+    /// Read only the metadata needed for an ownership or identity check.
+    ReadWorkspaceMetadata {
+        query: crate::workspace_model::metadata::Query,
+    },
+    /// Save only a resident worker's retained automatic-start intent. This
+    /// request never allocates or replays a worker after retirement.
+    RetryPendingTerminalSave {
+        pane: crate::model::CardId,
+        terminal_id: TerminalId,
+    },
+    /// An exact source worker, or an absence stamp captured before Close's
+    /// process proof. This never closes, starts or attaches a terminal.
+    ReadTerminalRemovalBasis {
+        source: TerminalSession,
+    },
+    /// Close only the worker captured by the original pane gesture. Completed
+    /// release and checked live close share the same resident-generation fence.
+    CloseTerminalSource {
+        session: TerminalSession,
+        basis: crate::workspace_model::views::TerminalRemovalBasis,
+        completed_only: bool,
+        allow_active: bool,
+        #[serde(default)]
+        capture: Option<crate::workspace_model::views::CapturedTerminalSource>,
+    },
+    /// Resolve only the canonical generation from the original complete view.
+    ReadCapturedTerminalRemovalBasis {
+        capture: crate::workspace_model::views::CapturedTerminalSource,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -841,10 +923,14 @@ pub enum ServerMessage {
     /// The edit travels rather than the whole model so an edge stays the size
     /// of what changed, and `sequence` is the registry's value after applying
     /// it, which is what lets a receiver tell an edge it has already seen from
-    /// one it has not.
+    /// one it has not. `effects` names each scope the edit changed with its
+    /// revision before and after, the panes it closed, and the channel and
+    /// agent rows it changed beyond what the edit says, so a receiver can
+    /// apply the edit to its copy instead of reading the model.
     WorkspaceModelEdited {
         sequence: u64,
         edit: crate::workspace_model::ModelEdit,
+        effects: crate::workspace_model::delta::EditEffects,
     },
     /// What a native chat's provider reported about the account the chat runs
     /// on, delivered to every subscriber whatever its visibility. It names no
@@ -882,6 +968,33 @@ pub enum ServerMessage {
     ChatLimit {
         chat_id: TerminalId,
         limit: Option<crate::agent_execution::directory::UsageLimit>,
+    },
+    /// Every address the provider gave a native chat's subagents, such as the
+    /// agent IDs Claude Code's `SendMessage` names them by, with the ID its
+    /// snapshot lists each under. Addresses only accumulate, so a receiver
+    /// keeps every one it was sent. Delivered to every subscriber whatever its
+    /// visibility, whenever one is learned and once to each new subscriber.
+    ChatAgentAddresses {
+        chat_id: TerminalId,
+        addresses: Vec<crate::chat::AgentAddress>,
+    },
+    /// The project gained or resolved a pending automation request.
+    /// Notification subscribers read the pending requests again.
+    AutomationProposalsChanged {
+        repository: std::path::PathBuf,
+    },
+    /// Provider-confirmed model and effort, independently of a staged model
+    /// selection. Each subscriber receives the current revision on attachment.
+    ChatActiveModel {
+        chat_id: TerminalId,
+        revision: u64,
+        model: Option<crate::chat::ActiveModel>,
+    },
+    /// Exact attachment metadata, separate from the frozen descriptor used by
+    /// historical update sources. This UUID never authorizes process cleanup.
+    TerminalWorker {
+        terminal_id: TerminalId,
+        instance: uuid::Uuid,
     },
 }
 
@@ -1008,6 +1121,20 @@ pub enum ServerResponse {
     ChatLostProcesses {
         processes: Vec<LostProcess>,
     },
+    /// One scope of the shared model and the model sequence it is consistent
+    /// with. `view` is `None` when the registry has no such scope.
+    WorkspaceView {
+        view: Option<crate::workspace_model::views::View>,
+        sequence: u64,
+    },
+    /// Initial subscriber state and the closed identities that fence adoption.
+    WorkspaceSnapshot {
+        model: crate::workspace_model::WorkspaceModel,
+        closed: Vec<crate::model::CardId>,
+    },
+    WorkspaceEdit(crate::workspace_model::delta::EditReceipt),
+    WorkspaceMetadata(crate::workspace_model::metadata::Reply),
+    TerminalRemovalBasis(crate::workspace_model::views::TerminalRemovalBasis),
 }
 
 /// The daemon's startup recovery, as [`ClientRequest::StartupState`] reports it.
@@ -1148,11 +1275,32 @@ pub enum ShutdownOutcome {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct ProtocolError {
     pub code: ProtocolErrorCode,
     pub message: String,
     pub retryable: bool,
+}
+
+impl Serialize for ProtocolError {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        // Carried CLIs know Internal for transient daemon contention. Preserve
+        // the diagnostic and retryability without sending a new enum variant.
+        let code = match self.code {
+            ProtocolErrorCode::StoreBusy
+                if older_clients::encoding_before(older_clients::STORE_BUSY_ERROR) =>
+            {
+                ProtocolErrorCode::Internal
+            }
+            code => code,
+        };
+        let mut error = serializer.serialize_struct("ProtocolError", 3)?;
+        error.serialize_field("code", &code)?;
+        error.serialize_field("message", &self.message)?;
+        error.serialize_field("retryable", &self.retryable)?;
+        error.end()
+    }
 }
 
 impl ProtocolError {
@@ -1182,6 +1330,7 @@ pub enum ProtocolErrorCode {
     Internal,
     ViewConflict,
     ChatCapacity,
+    StoreBusy,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2288,6 +2437,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn active_model_sidechannel_round_trips_without_changing_snapshot_encoding() {
+        let model = crate::chat::ActiveModel {
+            id: "claude-opus-5-5".into(),
+            label: "Opus 5.5".into(),
+            reasoning: Some("high".into()),
+            default_reasoning: None,
+            aliases: vec!["opusplan".into()],
+        };
+        let mut snapshot = crate::chat::Snapshot::default();
+        let before = postcard::to_allocvec(&snapshot).unwrap();
+        snapshot.active_model = Some(model.clone());
+        snapshot.active_model_revision = 3;
+        assert_eq!(postcard::to_allocvec(&snapshot).unwrap(), before);
+        let message = ServerMessage::ChatActiveModel {
+            chat_id: TerminalId::new(),
+            revision: 3,
+            model: Some(model),
+        };
+        let encoded = postcard::to_allocvec(&message).unwrap();
+        let decoded: ServerMessage = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(decoded, message);
+        assert!(
+            !older_client(CANDIDATE_LINE_PROTOCOL)
+                .unwrap()
+                .admits_message(&message)
+        );
+    }
+
+    #[test]
     fn scrollback_options_keep_legacy_json_and_positional_wire_bytes() {
         #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
         struct LegacyOptions {
@@ -2691,6 +2869,16 @@ mod tests {
             .unwrap();
             bytes
         };
+        let ended = message(ToolStatus::Ended);
+        let stopped = message(ToolStatus::Stopped);
+        assert_eq!(
+            encode(CANDIDATE_LINE_PROTOCOL, &ended),
+            encode(CANDIDATE_LINE_PROTOCOL, &stopped)
+        );
+        assert_ne!(
+            encode(PROTOCOL_VERSION, &ended),
+            encode(PROTOCOL_VERSION, &stopped)
+        );
         let waiting = message(ToolStatus::Waiting);
         let running = message(ToolStatus::Running);
         assert_eq!(

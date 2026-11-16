@@ -32,7 +32,7 @@ class LinuxUiFontExports(unittest.TestCase):
             cls.directory.mkdir(mode=0o700, parents=True)
         cls.commands = []
         cls.script = cls.directory / "actual-build-script"
-        cls.command(["rustc", "--edition=2024", str(ROOT / "build.rs"), "-o", str(cls.script)], timeout=30)
+        cls.command(["rustc", "--edition=2024", str(ROOT / "crates/cagents-ui/build.rs"), "-o", str(cls.script)], timeout=30)
 
     @classmethod
     def command(cls, arguments, *, timeout, env=None):

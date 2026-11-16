@@ -175,8 +175,8 @@ as the runner does, one feature set per invocation:
 ```sh
 scripts/cargo-gate build --locked --profile dev-runtime --no-default-features \
     --features development,host --bin cagentsd
-scripts/cargo-gate build --locked --profile dev-runtime --no-default-features \
-    --features development,ui --bin cagents-ui
+scripts/cargo-gate build --locked --profile dev-runtime -p cagents-ui \
+    --features development --bin cagents-ui
 scripts/fixture-workspace apply --root "$root" --bin-dir target/dev-runtime --instance seeded
 scripts/run-development --browserless --instance seeded
 ```
@@ -255,6 +255,6 @@ Tests: `python3 -I -B tests/fixture_workspace.py -v` for the generator, and
 the round trips through the real readers, which generate `small` and load it:
 
 ```sh
-scripts/cargo-gate test --locked --no-default-features --features host --lib fixture
-scripts/cargo-gate test --locked --no-default-features --features ui --lib fixture
+mise run test:host -- --lib fixture_
+mise run test:ui -- --lib fixture_
 ```

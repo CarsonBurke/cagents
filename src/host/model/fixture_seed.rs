@@ -45,17 +45,7 @@ pub(crate) struct Seeded {
 pub(crate) fn seed(plan: &Path) -> Result<Seeded, String> {
     let plan = Plan::load(plan)?;
     let instance = Instance::admit(&plan, Directories::current()?)?;
-    let paths = crate::daemon::RuntimePaths::discover().map_err(|error| error.to_string())?;
-    let _lease =
-        crate::daemon::HostLease::acquire_for_seeding(&paths).map_err(|error| match error {
-            crate::daemon::PlatformError::AlreadyRunning { path } => format!(
-                "A cagents daemon is running for this instance ({}). Stop it before seeding: \
-             `scripts/run-development --stop-instance NAME` for an instance, or stop the \
-             native-evidence session.",
-                path.display()
-            ),
-            error => error.to_string(),
-        })?;
+    let _lease = crate::daemon::HostLease::acquire_for_seeding()?;
     let destination = instance.claim(&plan, Part::Daemon)?;
     let path = destination.store();
     let mut seeded = destination.write(|staging| seed_at(&plan, staging))?;
@@ -176,8 +166,10 @@ pub(crate) fn seed_at(plan: &Plan, path: &Path) -> Result<Seeded, String> {
     })
 }
 
-fn seed_commit(registry: &mut Registry, edit: &ModelEdit) -> Result<(u64, bool), String> {
-    registry.commit_checked(edit, false)
+/// Commits one edit through the registry's own path, without the per-edit
+/// schema check `seed_at` already made once.
+fn seed_commit(registry: &mut Registry, edit: &ModelEdit) -> Result<(), String> {
+    registry.commit_delta(edit, |_, _| Ok(()), false).map(drop)
 }
 
 /// Records `view.edits` operations on the view, leaving its panes as seeded,

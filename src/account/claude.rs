@@ -41,9 +41,123 @@ pub fn parse_auth_status(status: &Value) -> Result<Identity, UsageStatus> {
     Ok(Identity {
         email: text("email"),
         organization: text("orgName"),
-        plan: text("subscriptionType"),
+        plan: plan_metadata(status).name(),
         disputed_by: None,
     })
+}
+
+/// A reported name and tier, without assuming a fixed set of subscriptions.
+/// Claude's profile name takes precedence over its older subscription enum.
+/// A multiplier belongs only to the family named by the tier: a legacy Max
+/// tier must never turn a reported Ultra (or future plan) back into Max.
+pub fn plan_name(
+    subscription_type: Option<&str>,
+    display_name: Option<&str>,
+    rate_limit_tier: Option<&str>,
+) -> Option<String> {
+    let name = display_name.and_then(valid_plan_display_name).or_else(|| {
+        subscription_type
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+    });
+    let Some(name) = name else {
+        // A tier-only response still names what the account reports. This is
+        // a display fallback, never an enum or an estimate of allowance hours.
+        return rate_limit_tier
+            .map(str::trim)
+            .filter(|tier| !tier.is_empty())
+            .map(|tier| {
+                tier.strip_prefix("default_claude_")
+                    .unwrap_or(tier)
+                    .split(['_', '-', ' '])
+                    .filter(|word| !word.is_empty())
+                    .map(humanize)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .filter(|label| !label.is_empty());
+    };
+    let multiplier = rate_limit_tier
+        .map(str::trim)
+        .and_then(|tier| tier.strip_prefix("default_claude_"))
+        .and_then(|tier| tier.rsplit_once('_'))
+        .filter(|(family, _)| {
+            let words = |value: &str| {
+                value
+                    .split(['_', '-', ' '])
+                    .filter(|word| !word.is_empty())
+                    .map(str::to_lowercase)
+                    .collect::<Vec<_>>()
+            };
+            words(family) == words(name)
+        })
+        .and_then(|(_, multiplier)| {
+            multiplier
+                .strip_suffix('x')
+                .filter(|digits| digits.bytes().all(|byte| byte.is_ascii_digit()))
+                .and_then(|digits| digits.parse::<u64>().ok())
+                .filter(|number| *number > 0)
+                .map(|_| multiplier)
+        });
+    Some(match multiplier {
+        Some(multiplier) => format!("{name} {multiplier}"),
+        None => name.to_owned(),
+    })
+}
+
+fn valid_plan_display_name(name: &str) -> Option<&str> {
+    let name = name.trim();
+    (!name.is_empty() && name.len() <= 256 && !name.chars().any(char::is_control)).then_some(name)
+}
+
+/// Temporary probe metadata keeps explicit names distinct from legacy enums
+/// while the verified profile and the control response are reconciled.
+#[derive(Debug, Default, Clone)]
+pub(super) struct PlanMetadata {
+    pub subscription_type: Option<String>,
+    pub display_name: Option<String>,
+    pub rate_limit_tier: Option<String>,
+}
+
+impl PlanMetadata {
+    pub(super) fn name(&self) -> Option<String> {
+        plan_name(
+            self.subscription_type.as_deref(),
+            self.display_name.as_deref(),
+            self.rate_limit_tier.as_deref(),
+        )
+    }
+
+    pub(super) fn or(self, fallback: Self) -> Self {
+        Self {
+            subscription_type: self.subscription_type.or(fallback.subscription_type),
+            display_name: self.display_name.or(fallback.display_name),
+            rate_limit_tier: self.rate_limit_tier.or(fallback.rate_limit_tier),
+        }
+    }
+}
+
+/// Newer usage/login responses may carry profile metadata directly. Prefer
+/// that report's explicit name, including unknown future names, to its enum.
+pub(super) fn plan_metadata(report: &Value) -> PlanMetadata {
+    let limits = &report["rate_limits"];
+    let text = |names: &[&str]| {
+        [report, limits].into_iter().find_map(|value| {
+            names.iter().find_map(|name| {
+                value[*name]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+            })
+        })
+    };
+    PlanMetadata {
+        subscription_type: text(&["subscription_type", "subscriptionType"]).map(str::to_owned),
+        display_name: text(&["plan_display_name", "planDisplayName"])
+            .and_then(valid_plan_display_name)
+            .map(str::to_owned),
+        rate_limit_tier: text(&["rate_limit_tier", "rateLimitTier"]).map(str::to_owned),
+    }
 }
 
 /// What a Claude Code configuration records of who its login is, as
@@ -162,10 +276,8 @@ pub fn settle_dispute(
 /// when that list is absent, and every other key in `rate_limits` - of which
 /// the CLI carries a growing set of internal codenames - is ignored.
 pub fn parse_usage(response: &Value, observed_at: u64) -> UsageSnapshot {
-    let plan = response["subscription_type"]
-        .as_str()
-        .filter(|plan| !plan.is_empty())
-        .map(str::to_owned);
+    let metadata = plan_metadata(response);
+    let plan = metadata.name();
     let limits = &response["rate_limits"];
     if response["rate_limits_available"].as_bool() == Some(false) || !limits.is_object() {
         let mut snapshot = UsageSnapshot::state(
@@ -174,6 +286,8 @@ pub fn parse_usage(response: &Value, observed_at: u64) -> UsageSnapshot {
             observed_at,
         );
         snapshot.plan = plan;
+        snapshot.plan_display_name = metadata.display_name;
+        snapshot.rate_limit_tier = metadata.rate_limit_tier;
         return snapshot;
     }
     let mut provider_warning = false;
@@ -203,6 +317,7 @@ pub fn parse_usage(response: &Value, observed_at: u64) -> UsageSnapshot {
         (status_for(&windows, false, provider_warning), None)
     };
     UsageSnapshot {
+        resets: parse_resets(limits, observed_at / 1000),
         windows,
         credits,
         status,
@@ -210,8 +325,88 @@ pub fn parse_usage(response: &Value, observed_at: u64) -> UsageSnapshot {
         observed_at,
         source: UsageSource::Probe,
         plan,
+        plan_display_name: metadata.display_name,
+        rate_limit_tier: metadata.rate_limit_tier,
         detail,
     }
+}
+
+/// Inventory from the private usage endpoint. Only the provider's explicit
+/// `clears` list authorizes clearing a window; display labels never do.
+pub fn parse_resets(body: &Value, now_secs: u64) -> Vec<super::UsageReset> {
+    use super::{ResetKind, ResetScope, UsageReset};
+    let mut resets = Vec::new();
+    let program = &body["cedar_ember"];
+    for grant in program["grants"].as_array().into_iter().flatten().take(256) {
+        let Some(id) = grant["id"].as_str().filter(|id| valid_grant_id(id)) else {
+            continue;
+        };
+        let Some(available_count) = grant["resets_left"].as_u64() else {
+            continue;
+        };
+        let scopes = grant["clears"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|scope| {
+                Some(match scope.as_str()? {
+                    "five_hour" => ResetScope::AccountSession,
+                    "seven_day" => ResetScope::AccountWeekly,
+                    "seven_day_overage_included" => ResetScope::Model("Fable".into()),
+                    "seven_day_opus" => ResetScope::Model("Opus".into()),
+                    "seven_day_sonnet" => ResetScope::Model("Sonnet".into()),
+                    "seven_day_cowork" => ResetScope::Model("Cowork".into()),
+                    "seven_day_omelette" => ResetScope::Model("Omelette".into()),
+                    "seven_day_oauth_apps" => ResetScope::Model("OAuth apps".into()),
+                    _ => return None,
+                })
+            })
+            .collect();
+        let starts = grant["starts_at"].as_str().and_then(parse_rfc3339);
+        let expires_at = grant["ends_at"].as_str().and_then(parse_rfc3339);
+        let valid_times = ["starts_at", "ends_at"].iter().all(|key| {
+            grant.get(*key).is_none_or(|value| {
+                value.is_null() || value.as_str().and_then(parse_rfc3339).is_some()
+            })
+        });
+        let usable = valid_times
+            && program["eligible"].as_bool() == Some(true)
+            && program["next_grant_id"].as_str() == Some(id)
+            && grant["usable_now"].as_bool() == Some(true)
+            && grant["paused"].as_bool() != Some(true)
+            && starts.is_none_or(|start| start <= now_secs as i64)
+            && (!grant["use_requires_limit"].as_bool().unwrap_or(true)
+                || program["at_limit"].as_bool() == Some(true));
+        resets.push(UsageReset {
+            id: format!("cedar_ember/{id}"),
+            kind: ResetKind::Granted,
+            scopes,
+            available_count,
+            expires_at,
+            usable,
+        });
+    }
+    let session = &body["juniper_tide"];
+    if session.is_object() && session["arm"].as_str() == Some("reset") {
+        let available = session["available"].as_bool() == Some(true);
+        resets.push(UsageReset {
+            id: "juniper_tide".into(),
+            kind: ResetKind::WeeklySession,
+            scopes: vec![ResetScope::AccountSession],
+            available_count: u64::from(available),
+            expires_at: session["weekly_resets_at"].as_str().and_then(parse_rfc3339),
+            usable: available && session["eligible"].as_bool() == Some(true),
+        });
+    }
+    resets
+}
+
+pub(super) fn valid_grant_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 40
+        && id.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
 }
 
 /// A probe must distinguish a transient missing reading from the provider
@@ -538,13 +733,26 @@ const RETIRED_FABLE: &str = "weekly_overage";
 /// Whether a scoped window is Fable's, under any name Claude has given it:
 /// `Fable`, or a version of it such as `Fable 5.1`.
 fn is_fable(window: &UsageWindow) -> bool {
-    window.kind == WindowKind::Scoped
-        && window_scope(window).is_some_and(|scope| {
-            scope
-                .split_whitespace()
-                .next()
-                .is_some_and(|family| family.eq_ignore_ascii_case("fable"))
-        })
+    window.kind == WindowKind::Scoped && window_scope(window).is_some_and(is_fable_scope)
+}
+
+fn is_fable_scope(scope: &str) -> bool {
+    scope
+        .split_whitespace()
+        .next()
+        .is_some_and(|family| family.eq_ignore_ascii_case("fable"))
+}
+
+/// The key a saved choice of window names it by, which outlasts Claude's
+/// renames of it: the Fable window under its retired live key, or scoped to
+/// a version of the name such as `Fable 5.1`, is `weekly_scoped:Fable`, the
+/// key a live report gives it. Every other key is its own.
+pub fn stable_window_key(key: &str) -> &str {
+    let fable = key == RETIRED_FABLE
+        || key
+            .strip_prefix("weekly_scoped:")
+            .is_some_and(is_fable_scope);
+    if fable { FABLE } else { key }
 }
 
 /// The windows a conversation's `rate_limit_event` reports.
@@ -808,6 +1016,132 @@ mod tests {
             .join("fixtures/accounts")
             .join(name);
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn plan_fixtures_preserve_dynamic_names_tiers_and_reported_allowance() {
+        for case in fixture("claude-plans.json").as_array().unwrap() {
+            let subscription = case["auth_status"]["subscriptionType"].as_str();
+            let organization = &case["profile"]["organization"];
+            let label = organization["plan_display_name"].as_str().unwrap();
+            let tier = organization["rate_limit_tier"].as_str();
+            let expected = case["expected_label"].as_str().unwrap();
+            let plan = plan_name(subscription, Some(label), tier).unwrap();
+            assert_eq!(
+                super::super::plan_label(&plan),
+                expected,
+                "{}",
+                case["case"]
+            );
+
+            // Additive metadata from a newer login/control response follows
+            // the same rules even though 2.1.296 omits these projections.
+            let mut auth = case["auth_status"].clone();
+            auth["planDisplayName"] = label.into();
+            auth["rateLimitTier"] = organization["rate_limit_tier"].clone();
+            let identity = parse_auth_status(&auth).unwrap();
+            assert_eq!(identity.plan.as_deref(), Some(plan.as_str()));
+            let mut usage = case["usage_response"].clone();
+            usage["rate_limits"]["plan_display_name"] = label.into();
+            usage["rate_limits"]["rate_limit_tier"] = organization["rate_limit_tier"].clone();
+            let snapshot = parse_usage(&usage, 10);
+            assert_eq!(snapshot.plan.as_deref(), Some(plan.as_str()));
+            assert_eq!(snapshot.windows.len(), 2);
+            assert_eq!(snapshot.windows[0].used, 0.25);
+            assert_eq!(snapshot.windows[1].used, 0.6);
+            // These are reset-window durations, not inferred working hours.
+            assert_eq!(snapshot.windows[0].span_secs, Some(FIVE_HOURS));
+            assert_eq!(snapshot.windows[1].span_secs, Some(SEVEN_DAYS));
+            assert_eq!(snapshot.status, UsageStatus::Ok);
+        }
+    }
+
+    #[test]
+    fn plan_names_never_fall_back_to_max_or_borrow_another_plans_multiplier() {
+        assert_eq!(plan_name(None, None, None), None);
+        for (subscription, label, tier, expected) in [
+            ("max", "Ultra", "default_claude_max_20x", "Ultra"),
+            ("max", "Max 20x", "default_claude_max_5x", "Max 20x"),
+            (
+                "future",
+                "Future Horizon",
+                "default_claude_future_horizon_37x",
+                "Future Horizon 37x",
+            ),
+            ("pro", "Pro", "default_claude_pro_0x", "Pro"),
+            ("pro", "Pro", "default_claude_pro_-5x", "Pro"),
+            ("future", "未来プラン", "unrecognized_tier", "未来プラン"),
+        ] {
+            assert_eq!(
+                plan_name(Some(subscription), Some(label), Some(tier)).as_deref(),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            plan_name(Some("future_plan"), None, None).as_deref(),
+            Some("future_plan")
+        );
+        assert_eq!(
+            plan_name(Some("pro"), Some("Max\n20x"), None).as_deref(),
+            Some("pro")
+        );
+        let unknown = parse_usage(&serde_json::json!({"subscription_type":"future_plan"}), 1);
+        assert_eq!(unknown.plan.as_deref(), Some("future_plan"));
+        assert_eq!(unknown.status, UsageStatus::Unavailable);
+        assert!(
+            unknown.windows.is_empty(),
+            "a plan label never invents allowance"
+        );
+    }
+
+    #[test]
+    fn matching_family_tiers_qualify_names_without_renaming_other_plans() {
+        for (name, tier, expected) in [
+            ("Max", "default_claude_max_5x", "Max 5x"),
+            ("Max", "default_claude_max_20x", "Max 20x"),
+            ("Max 20x", "default_claude_max_5x", "Max 20x"),
+            ("Max 20x", "default_claude_max_20x", "Max 20x"),
+            ("Ultra", "default_claude_max_20x", "Ultra"),
+            (
+                "Future Horizon",
+                "default_claude_future_horizon_37x",
+                "Future Horizon 37x",
+            ),
+            (
+                "iResearch / future (beta)",
+                "unrecognized_tier",
+                "iResearch / future (beta)",
+            ),
+            ("Max", "default_claude_max_0x", "Max"),
+            ("Max", "default_claude_max_-5x", "Max"),
+        ] {
+            let usage = parse_usage(
+                &json!({
+                    "subscription_type":"max", "plan_display_name":name,
+                    "rate_limit_tier":tier
+                }),
+                1,
+            );
+            assert_eq!(usage.plan.as_deref(), Some(expected));
+            assert_eq!(usage.plan_display_name.as_deref(), Some(name));
+            assert_eq!(usage.rate_limit_tier.as_deref(), Some(tier));
+            assert!(
+                usage.windows.is_empty(),
+                "a plan tier never supplies usage hours"
+            );
+        }
+        for (tier, expected) in [
+            ("default_claude_max_5x", "Max 5x"),
+            ("default_claude_max_20x", "Max 20x"),
+            ("default_claude_zero", "Zero"),
+            ("future_research_plan", "Future Research Plan"),
+        ] {
+            assert_eq!(plan_name(None, None, Some(tier)).as_deref(), Some(expected));
+        }
+        assert_eq!(
+            plan_name(Some("max"), None, Some("default_claude_max_20x")).as_deref(),
+            Some("max 20x")
+        );
     }
 
     /// The recorded response carries a dozen codename keys beside the
@@ -1119,6 +1453,29 @@ mod tests {
         );
     }
 
+    /// A status-bar choice saved against the retired live key, or against a
+    /// versioned Fable scope, names the window a live report keys `Fable`.
+    #[test]
+    fn every_name_claude_gave_the_fable_window_is_one_stable_key() {
+        for key in [
+            RETIRED_FABLE,
+            FABLE,
+            "weekly_scoped:Fable 5.1",
+            "weekly_scoped:fable",
+        ] {
+            assert_eq!(stable_window_key(key), FABLE, "{key}");
+        }
+        for key in [
+            "session",
+            "weekly_all",
+            "weekly_scoped:Opus",
+            "weekly_scoped:Fableish",
+            "codex:primary",
+        ] {
+            assert_eq!(stable_window_key(key), key);
+        }
+    }
+
     /// A reading cached by an earlier build holds the live Fable window under
     /// its retired key and label. The next live report retires it, so an
     /// exhausted Fable allowance stops reading as an exhausted account.
@@ -1285,5 +1642,77 @@ mod tests {
         let future = parse_usage(&response, 1_002);
         assert_eq!(future.windows[0].key, "future_daily_burst");
         assert!(super::super::routing::available(&future, 1_002));
+    }
+}
+
+#[cfg(test)]
+mod reset_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn reset_inventory_keeps_counts_scope_expiry_and_next_grant() {
+        let resets = parse_resets(
+            &json!({"cedar_ember": {"eligible":true,"at_limit":true,
+            "next_grant_id":"fable", "grants":[
+                {"id":"fable","resets_left":2,"clears":["seven_day_overage_included"],"usable_now":true,"ends_at":"2030-01-01T00:00:00Z"},
+                {"id":"weekly","resets_left":1,"clears":["seven_day","five_hour"],"usable_now":true},
+                {"id":"bad/id","resets_left":99,"clears":["seven_day"],"usable_now":true}
+            ]},"juniper_tide":{"eligible":true,"arm":"reset","available":true,"resets_per_week":5}}),
+            1_000,
+        );
+        assert_eq!(resets.len(), 3);
+        assert_eq!(resets[0].available_count, 2);
+        assert_eq!(
+            resets[0].scopes,
+            [super::super::ResetScope::Model("Fable".into())]
+        );
+        assert_eq!(resets[0].expires_at, Some(1_893_456_000));
+        assert!(resets[0].is_available(1_000));
+        assert!(!resets[1].is_available(1_000));
+        assert_eq!(
+            resets[2].available_count, 1,
+            "weekly capacity is not current credit count"
+        );
+    }
+
+    #[test]
+    fn grant_labels_never_authorize_an_unknown_scope_or_paused_grant() {
+        let resets = parse_resets(
+            &json!({"cedar_ember":{"eligible":true,"at_limit":true,"next_grant_id":"grant",
+            "grants":[{"id":"grant","label":"Reset all limits","resets_left":2,"clears":["unknown"],"usable_now":true,"paused":true}]}}),
+            1,
+        );
+        assert_eq!(resets.len(), 1);
+        assert!(!resets[0].is_available(1));
+        assert!(resets[0].scopes.is_empty());
+        assert!(
+            parse_resets(
+                &json!({"cedar_ember":null,"juniper_tide":{"arm":"control","available":true}}),
+                1
+            )
+            .is_empty()
+        );
+    }
+}
+
+#[cfg(test)]
+mod reset_timestamp_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn malformed_grant_timestamps_never_authorize_spending() {
+        for field in ["starts_at", "ends_at"] {
+            for bad in [json!("tomorrow"), json!(12), json!({})] {
+                let mut grant = json!({"id":"grant","resets_left":1,"clears":["seven_day"],"usable_now":true,"use_requires_limit":false});
+                grant[field] = bad;
+                let resets = parse_resets(
+                    &json!({"cedar_ember":{"eligible":true,"next_grant_id":"grant","grants":[grant]}}),
+                    100,
+                );
+                assert_eq!(resets[0].available_count, 1);
+                assert!(!resets[0].is_available(100));
+            }
+        }
     }
 }

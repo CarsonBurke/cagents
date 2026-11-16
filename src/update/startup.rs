@@ -1,8 +1,5 @@
 //! Read-only, capability-free projection for a window waiting on an update.
 //! Status is evidence, not admission: every reopen still uses normal UI fences.
-mod window;
-pub use window::{Request, run};
-
 use super::{UpdateJob, UpdatePhase, impact::Disposition};
 use std::{
     fs,
@@ -28,20 +25,25 @@ impl From<io::Result<bool>> for LockState {
 }
 
 #[derive(Clone, Debug)]
-struct Job {
-    id: String,
-    version: Option<String>,
-    phase: UpdatePhase,
-    waiting: usize,
-    blocked: usize,
-    daemon_timeout: bool,
+#[doc(hidden)]
+pub struct Job {
+    pub id: String,
+    pub version: Option<String>,
+    pub phase: UpdatePhase,
+    pub waiting: usize,
+    pub blocked: usize,
+    pub daemon_timeout: bool,
+    /// The update was not installed because what its review found held it
+    /// back.
+    pub refused: bool,
 }
 
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     pub installation_lock: LockState,
     pub helper_lock: LockState,
-    job: Option<Job>,
+    #[doc(hidden)]
+    pub job: Option<Job>,
 }
 
 impl Snapshot {
@@ -72,6 +74,9 @@ impl Snapshot {
         }
         if self.helper_lock == LockState::Free && self.can_open() {
             return match self.job.as_ref().map(|job| &job.phase) {
+                Some(UpdatePhase::Failed) if self.job.as_ref().is_some_and(|job| job.refused) => {
+                    "The update was not installed"
+                }
                 Some(UpdatePhase::Failed) => "The update did not complete",
                 Some(UpdatePhase::Cancelled) => "The update was cancelled",
                 Some(_) => "Update completion is unconfirmed",
@@ -90,6 +95,10 @@ impl Snapshot {
             Some(UpdatePhase::ClosingWindows) => "Saving and closing your windows",
             Some(UpdatePhase::Installing) => "Installing cagents",
             Some(UpdatePhase::Complete) => "Finishing the update",
+            // Nothing was changed, so there is nothing to recover.
+            Some(UpdatePhase::Failed) if self.job.as_ref().is_some_and(|job| job.refused) => {
+                "The update was not installed"
+            }
             Some(UpdatePhase::Failed) => "Waiting for update recovery to finish",
             Some(UpdatePhase::Cancelled) => "Finishing update cancellation",
             _ => "Checking update progress",
@@ -101,6 +110,8 @@ impl Snapshot {
         }
         if self.helper_lock == LockState::Free && self.can_open() {
             return match self.job.as_ref() {
+                Some(job) if job.phase == UpdatePhase::Failed && job.refused =>
+                    "Something held the update back, so nothing was installed. Open cagents to see what, then update again.".into(),
                 Some(job) if job.phase == UpdatePhase::Failed && job.daemon_timeout =>
                     "The daemon did not finish starting. Open cagents to review recovery, or check diagnostics before trying again.".into(),
                 Some(job) if !job.phase.is_terminal() =>
@@ -134,13 +145,18 @@ impl Snapshot {
     }
     pub fn technical_summary(&self) -> String {
         format!(
-            "Installation: {}. Helper: {}. Recorded phase: {}.",
+            "Installation: {}. Helper: {}. Recorded phase: {}{}.",
             lock_label(self.installation_lock),
             lock_label(self.helper_lock),
             self.job
                 .as_ref()
                 .map(|job| phase_label(&job.phase))
-                .unwrap_or("unavailable")
+                .unwrap_or("unavailable"),
+            if self.job.as_ref().is_some_and(|job| job.refused) {
+                " (held back, not installed)"
+            } else {
+                ""
+            }
         )
     }
 }
@@ -175,13 +191,17 @@ pub struct Follow {
     auto_opened: bool,
 }
 impl Follow {
-    fn mark_opened(&mut self) {
+    pub fn mark_opened(&mut self) {
         self.auto_opened = true;
+    }
+    /// Whether this follow already opened its finished operation.
+    pub fn auto_opened(&self) -> bool {
+        self.auto_opened
     }
     pub fn observe(&mut self, snapshot: &Snapshot) -> bool {
         self.observe_when_ready(snapshot, true)
     }
-    fn observe_when_ready(&mut self, snapshot: &Snapshot, ready: bool) -> bool {
+    pub fn observe_when_ready(&mut self, snapshot: &Snapshot, ready: bool) -> bool {
         // Focus and diagnostics may defer reopening, but cannot hide an
         // observed operation change or the first leased operation.
         if self.operation_changed {
@@ -275,6 +295,7 @@ fn observe_installation(executable: &Path, installation_lock: LockState) -> Snap
                 }),
                 daemon_timeout: job.message.contains("daemon did not answer within")
                     || job.message.contains("daemon startup timed out"),
+                refused: job.refusal.is_some(),
             });
         }
     }

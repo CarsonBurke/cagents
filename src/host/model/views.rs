@@ -1,8 +1,91 @@
 use super::*;
-use crate::workspace_model::views::{Change, Scope, View};
+use crate::workspace_model::{
+    delta::{EditEffects, ViewRevision},
+    views::{Change, Scope, View},
+};
 
+pub(in crate::host::model) mod bindings;
 pub(in crate::host::model) mod store;
 pub(super) use store::{all, occupied, operation_seen, read};
+
+/// What one edit changed beyond what it says, collected while it applies and
+/// resolved into [`EditEffects`] once every row is written, so a subscriber
+/// can apply the edit to its copy instead of reading the model.
+#[derive(Default)]
+pub(super) struct Recorder {
+    views: Vec<ViewRevision>,
+    closed: Vec<crate::model::CardId>,
+    channels: Vec<ChannelId>,
+    agents: Vec<crate::model::AgentId>,
+}
+
+impl Recorder {
+    fn revised(&mut self, scope: &Scope, before: Option<u64>, after: Option<u64>) {
+        self.views.push(ViewRevision {
+            scope: scope.clone(),
+            before,
+            after,
+        });
+    }
+
+    /// A channel row the edit changed in a way the edit does not say.
+    pub(super) fn retitled(&mut self, channel: ChannelId) {
+        if !self.channels.contains(&channel) {
+            self.channels.push(channel);
+        }
+    }
+
+    /// Reads the channel rows and agent records as the edit left them, inside
+    /// its transaction.
+    pub(super) fn finish(self, db: &Connection) -> Result<EditEffects, String> {
+        // A tombstone also closes an identity the daemon had never held.
+        // Resolve after all row changes: a transfer or stale seed mentioning
+        // a pane still owned elsewhere must not close that live identity.
+        let mut closed = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for id in self.closed {
+            if !seen.insert(id) {
+                continue;
+            }
+            let active: bool = db
+                .prepare_cached("SELECT EXISTS(SELECT 1 FROM panes WHERE id = ?1)")
+                .and_then(|mut statement| statement.query_row([id.to_string()], |row| row.get(0)))
+                .map_err(|error| error.to_string())?;
+            if !active {
+                closed.push(id);
+            }
+        }
+        let channels = self
+            .channels
+            .into_iter()
+            .map(|id| super::channel_row(db, id))
+            .filter_map(Result::transpose)
+            .collect::<Result<_, _>>()?;
+        let agents = self
+            .agents
+            .into_iter()
+            .map(|id| {
+                db.query_row(
+                    "SELECT record FROM agents WHERE id = ?1 AND closed = 0",
+                    [id.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?
+                .map(|record| super::execution::decode(&record))
+                .transpose()
+            })
+            .filter_map(Result::transpose)
+            .collect::<Result<_, _>>()?;
+        Ok(EditEffects {
+            views: self.views,
+            closed,
+            channels,
+            agents,
+            ..Default::default()
+        })
+    }
+}
 
 pub(super) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
     let current: u32 = tx
@@ -105,7 +188,7 @@ fn write_terminal_source(
     Ok(())
 }
 
-fn update_terminal_source(
+pub(super) fn update_terminal_source(
     db: &Connection,
     id: crate::model::CardId,
     claimed_before: &crate::model::CardKind,
@@ -270,6 +353,7 @@ fn transfer_agent(
     pane: &crate::workspace_model::views::Pane,
     destination: &Scope,
     repository: &Path,
+    recorder: &mut Recorder,
 ) -> Result<(), String> {
     if let Some(mut agent) = pane_agent(db, pane)? {
         if !current_agent_process(&agent, pane) {
@@ -297,6 +381,7 @@ fn transfer_agent(
             ],
         )
         .map_err(|error| error.to_string())?;
+        recorder.agents.push(agent.id);
     }
     Ok(())
 }
@@ -486,13 +571,21 @@ pub(super) fn retire_agent(
     let id = crate::model::CardId::from_uuid(agent.id.as_uuid());
     view.apply(&Change::Remove { id })?;
     view.revision = store::next_revision(db)?;
-    write(db, &view)?;
+    // The connection-local execution inventory captures this scope revision
+    // and closed identity in the same transaction as the retirement.
+    write(db, &view, &mut Recorder::default())?;
     Ok(true)
 }
 
-pub(super) fn apply(
+#[cfg(test)]
+fn apply(transaction: &rusqlite::Transaction<'_>, edit: &ModelEdit) -> Result<bool, String> {
+    apply_recorded(transaction, edit, &mut Recorder::default())
+}
+
+pub(super) fn apply_recorded(
     transaction: &rusqlite::Transaction<'_>,
     edit: &ModelEdit,
+    recorder: &mut Recorder,
 ) -> Result<bool, String> {
     let scope = match edit {
         ModelEdit::SeedView { scope, .. } | ModelEdit::ChangeView { scope, .. } => scope,
@@ -502,11 +595,22 @@ pub(super) fn apply(
         if matches!(
             edit,
             ModelEdit::ChangeView {
-                change: Change::Transfer { .. },
+                change: Change::Transfer { .. } | Change::RemoveSource { .. },
                 ..
             }
         ) {
-            return Err("The source view is no longer open".into());
+            return Err(if matches!(
+                edit,
+                ModelEdit::ChangeView {
+                    change: Change::RemoveSource { .. },
+                    ..
+                }
+            ) {
+                Registry::VIEW_REMOVAL_CONFLICT
+            } else {
+                "The source view is no longer open"
+            }
+            .into());
         }
         return Ok(false);
     }
@@ -523,7 +627,10 @@ pub(super) fn apply(
             // Migration is additive, including old independent windows. Closed
             // IDs are applied first and prevent stale caches from resurrecting.
             for id in closed {
-                changed |= view.apply(&Change::Remove { id: *id })?;
+                if view.apply(&Change::Remove { id: *id })? {
+                    changed = true;
+                    recorder.closed.push(*id);
+                }
             }
             for pane in panes {
                 if view.panes.iter().any(|existing| {
@@ -546,11 +653,37 @@ pub(super) fn apply(
             change,
             ..
         } => {
+            if let Change::RemoveSource {
+                registry,
+                repository,
+                ..
+            } = change
+            {
+                let identity: String = transaction
+                    .query_row("SELECT identity FROM metadata WHERE key=0", [], |row| {
+                        row.get(0)
+                    })
+                    .map_err(|error| error.to_string())?;
+                if *registry == crate::workspace_model::NO_REGISTRY
+                    || identity != registry.to_string()
+                    || project(transaction, scope)? != *repository
+                {
+                    return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
+                }
+            }
             if operation_seen(transaction, *operation)? {
                 return Ok(false);
             }
             if view.revision != *expected_revision {
                 return Err(Registry::VIEW_REVISION_CONFLICT.into());
+            }
+            if let Change::UpdateTerminalSource { before, worker, .. } = change {
+                if bindings::read(transaction, before.id)?
+                    .and_then(|b| b.basis)
+                    .is_some_and(|original| &original != worker)
+                {
+                    return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
+                }
             }
             changed = match change {
                 Change::Transfer {
@@ -571,6 +704,8 @@ pub(super) fn apply(
                     if destination == scope {
                         false
                     } else {
+                        let destination_existed =
+                            store::scope_id(transaction, destination)?.is_some();
                         let destination_row = store::register(transaction, destination)?;
                         let mut target = read(transaction, destination)?;
                         let target_before = target.clone();
@@ -582,8 +717,8 @@ pub(super) fn apply(
                         target.revision = store::next_revision(transaction)?;
                         // Publish only after the source relinquishes its
                         // active placement, inside this same transaction.
-                        deferred_target = Some((target_before, target));
-                        transfer_agent(transaction, &pane, destination, &repository)?;
+                        deferred_target = Some((target_before, target, destination_existed));
+                        transfer_agent(transaction, &pane, destination, &repository, recorder)?;
                         // The row moves, so what hangs off the pane moves with it.
                         store::move_pane(transaction, *id, destination_row)?;
                         view.apply(&Change::Remove { id: *id })?
@@ -602,7 +737,8 @@ pub(super) fn apply(
                     }
                     view.apply(change)?
                 }
-                Change::Update { before, pane } => {
+                Change::Update { before, pane }
+                | Change::UpdateTerminalSource { before, pane, .. } => {
                     // Reject the whole edit before recording its operation ID;
                     // the client can refuse source intent and retry presentation
                     // separately against the authoritative pane.
@@ -633,6 +769,36 @@ pub(super) fn apply(
                         changed
                     }
                 }
+                Change::Remove { id } => {
+                    let changed = view.apply(change)?;
+                    if changed {
+                        recorder.closed.push(*id);
+                    }
+                    changed
+                }
+                Change::RemoveSource {
+                    before, capture, ..
+                } => {
+                    if matches!(before.kind, crate::model::CardKind::Terminal(_))
+                        && capture.is_none()
+                    {
+                        return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
+                    }
+                    if let Some(capture) = capture {
+                        if capture.scope != *scope || capture.before != *before {
+                            return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
+                        }
+                        bindings::captured(transaction, capture, None)?;
+                    }
+                    if owner(transaction, before.id)?.as_ref() != Some(scope) {
+                        return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
+                    }
+                    let changed = view.apply(change)?;
+                    if changed {
+                        recorder.closed.push(before.id);
+                    }
+                    changed
+                }
                 _ => view.apply(change)?,
             };
             store::record_operation(transaction, *operation, scope_row)?;
@@ -641,10 +807,37 @@ pub(super) fn apply(
     }
     if changed || !existed {
         view.revision = store::next_revision(transaction)?;
-        write_from(transaction, &stored, &view)?;
+        recorder.revised(
+            scope,
+            existed.then_some(stored.revision),
+            Some(view.revision),
+        );
+        // Remove/SeedView record closure intent while applying it. Transfers
+        // retire their source placement without closing its identity.
+        write_from(transaction, &stored, &view, recorder)?;
+        if let ModelEdit::ChangeView {
+            change: Change::UpdateTerminalSource { pane, worker, .. },
+            ..
+        } = edit
+        {
+            let binding =
+                bindings::read(transaction, pane.id)?.ok_or(Registry::VIEW_SOURCE_CONFLICT)?;
+            bindings::write(
+                transaction,
+                pane,
+                binding.birth_sequence,
+                binding.birth_revision,
+                Some(worker),
+            )?;
+        }
     }
-    if let Some((before, target)) = deferred_target {
-        write_from(transaction, &before, &target)?;
+    if let Some((before, target, existed)) = deferred_target {
+        recorder.revised(
+            &target.scope,
+            existed.then_some(before.revision),
+            Some(target.revision),
+        );
+        write_from(transaction, &before, &target, recorder)?;
     }
     Ok(changed || !existed)
 }
@@ -678,6 +871,8 @@ impl Registry {
     }
 
     pub(crate) const VIEW_REVISION_CONFLICT: &'static str = "workspace view revision conflict";
+    pub(crate) const VIEW_REMOVAL_CONFLICT: &'static str =
+        crate::workspace_model::views::REMOVAL_SOURCE_CONFLICT;
     pub(crate) const VIEW_SOURCE_CONFLICT: &'static str = "The pane source changed; refuse stale source intent and rebase presentation on the current pane";
 
     pub(crate) fn view_change_refusal(
@@ -686,6 +881,23 @@ impl Registry {
         change: &Change,
     ) -> Result<Option<String>, String> {
         refusal(&self.db, scope, change)
+    }
+
+    /// One scope's view, or `None` when the registry has no such scope, and
+    /// the model sequence it is consistent with, read from one WAL snapshot.
+    pub(crate) fn view_snapshot(&self, scope: &Scope) -> Result<(Option<View>, u64), String> {
+        let snapshot = self
+            .db
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        let sequence = snapshot
+            .query_row("SELECT sequence FROM metadata WHERE key = 0", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(|error| error.to_string())? as u64;
+        let view = store::read_stored(&snapshot, scope)?;
+        snapshot.commit().map_err(|error| error.to_string())?;
+        Ok((view, sequence))
     }
 
     pub(crate) fn view_revision(&self, scope: &Scope) -> Result<u64, String> {
@@ -725,7 +937,7 @@ fn resource_owner(
     store::resource_holder(db, pane)
 }
 
-fn owner(db: &Connection, id: crate::model::CardId) -> Result<Option<Scope>, String> {
+pub(super) fn owner(db: &Connection, id: crate::model::CardId) -> Result<Option<Scope>, String> {
     store::owner(db, id)
 }
 
@@ -763,7 +975,8 @@ pub(super) fn adopt_authenticated_agent_pane_with_console(
         (CardKind::Chat(current), HostedSession::Chat(next))
             if retained.contains(&HostedSession::Chat(current.clone()))
                 && (crate::chat::is_upgrade_recovery(current, next)
-                    || crate::chat::is_upgrade_identity_learning(current, next)) =>
+                    || crate::chat::is_upgrade_identity_learning(current, next)
+                    || super::execution::retained_identity_update(current, next)) =>
         {
             CardKind::Chat(next.clone())
         }
@@ -825,7 +1038,31 @@ pub(super) fn adopt_authenticated_agent_pane_with_console(
     // presentation, retirement and naming state outside the descriptor itself.
     terminal_retention::sync_view_pins(db, &view.panes)?;
     store::store(db, &view)?;
+    bindings::sync(db, &before, &view)?;
     Ok(true)
+}
+
+/// The chat an agent's pane shows, unless the pane is missing or retired.
+pub(super) fn agent_pane_chat(
+    db: &Connection,
+    agent: crate::model::AgentId,
+) -> Result<Option<crate::chat::Session>, String> {
+    let id = crate::model::CardId::from_uuid(agent.as_uuid());
+    let Some(scope) = owner(db, id)? else {
+        return Ok(None);
+    };
+    let view = read(db, &scope)?;
+    if view.retired.contains(&id) {
+        return Ok(None);
+    }
+    Ok(view
+        .panes
+        .into_iter()
+        .find(|pane| pane.id == id)
+        .and_then(|pane| match pane.kind {
+            crate::model::CardKind::Chat(session) => Some(session),
+            _ => None,
+        }))
 }
 
 /// Point a stopped agent's pane at the process that resumed it. Position,
@@ -870,41 +1107,68 @@ pub(super) fn rebind_agent_pane(
     view.revision = store::next_revision(db)?;
     channel_work::placement::observe_view_transition(db, &before, &view)?;
     store::store(db, &view)?;
+    bindings::sync(db, &before, &view)?;
     Ok(true)
 }
 
 /// Record removal before foreign-key cascades erase canonical membership.
 /// Like normal view writes, this must participate in the deleting transaction.
-pub(super) fn retire_channel_placements(db: &Connection, channel: ChannelId) -> Result<(), String> {
-    retire_scope_placements(db, &Scope::Channel(channel))
+///
+/// The scope's rows go with the channel through the foreign key's cascade; the
+/// recorder names the scope as deleted and its panes as closed.
+pub(super) fn retire_channel_placements(
+    db: &Connection,
+    channel: ChannelId,
+    recorder: &mut Recorder,
+) -> Result<(), String> {
+    retire_scope_placements(db, &Scope::Channel(channel), recorder)
 }
 
-pub(super) fn retire_project_placements(db: &Connection, repository: &Path) -> Result<(), String> {
+pub(super) fn retire_project_placements(
+    db: &Connection,
+    repository: &Path,
+    recorder: &mut Recorder,
+) -> Result<(), String> {
     if db.is_autocommit() {
         return Err("Placement removal requires the canonical view transaction".into());
     }
     for scope in store::project_scopes(db, repository_key(repository)?)? {
-        retire_scope_placements(db, &scope)?;
+        retire_scope_placements(db, &scope, recorder)?;
     }
     Ok(())
 }
 
-fn retire_scope_placements(db: &Connection, scope: &Scope) -> Result<(), String> {
-    let before = read(db, scope)?;
+fn retire_scope_placements(
+    db: &Connection,
+    scope: &Scope,
+    recorder: &mut Recorder,
+) -> Result<(), String> {
+    let Some(before) = store::read_stored(db, scope)? else {
+        return Ok(());
+    };
+    recorder.revised(scope, Some(before.revision), None);
+    recorder
+        .closed
+        .extend(before.panes.iter().map(|pane| pane.id));
     let mut after = before.clone();
     after.panes.clear();
     channel_work::placement::observe_view_transition(db, &before, &after)
 }
 
-fn write(db: &Connection, view: &View) -> Result<(), String> {
+fn write(db: &Connection, view: &View, recorder: &mut Recorder) -> Result<(), String> {
     let before = read(db, &view.scope)?;
-    write_from(db, &before, view)
+    write_from(db, &before, view, recorder)
 }
 
 /// [`write`] from a `before` read earlier in the transaction, for a transfer:
 /// its pane row has already moved, but each view's derived state must still
 /// observe the transition from what the view held.
-fn write_from(db: &Connection, before: &View, view: &View) -> Result<(), String> {
+pub(super) fn write_from(
+    db: &Connection,
+    before: &View,
+    view: &View,
+    recorder: &mut Recorder,
+) -> Result<(), String> {
     channel_work::placement::observe_view_transition(db, before, view)?;
     if let Scope::Channel(id) = &view.scope {
         let primary = |view: &View| {
@@ -918,19 +1182,38 @@ fn write_from(db: &Connection, before: &View, view: &View) -> Result<(), String>
                 _ => None,
             })
         };
-        if primary(before) != primary(view) {
+        let previous = primary(before);
+        let current = primary(view);
+        let learned_thread = matches!(
+            (&previous, &current),
+            (
+                Some((old_card, old_session, old_provider, None)),
+                Some((card, session, provider, Some(_))),
+            ) if old_card == card && old_session == session && old_provider == provider
+        );
+        if previous != current && !learned_thread {
             // A new primary conversation starts a new automatic naming choice.
             // Manual/legacy names describe the channel and survive all moves.
-            db.execute(
-                "UPDATE channels SET title='', title_source=0 WHERE id=?1 AND title_source<>2",
-                [id.to_string()],
-            )
-            .map_err(|error| error.to_string())?;
+            // The first pane realizes the task that already named an accepted
+            // agent's channel; keep that prompt fallback until useful metadata
+            // improves it. Learning its first thread ID is not a replacement.
+            let first_adoption = previous.is_none() && current.is_some();
+            if db
+                .execute(
+                    "UPDATE channels SET title='', title_source=0 WHERE id=?1 AND title_source<>2 AND (?2=0 OR title_source<>0)",
+                    params![id.to_string(), first_adoption],
+                )
+                .map_err(|error| error.to_string())?
+                > 0
+            {
+                recorder.retitled(*id);
+            }
             channel_work::renamed_in(db, *id)?;
         }
     }
     // Pins hang off pane rows, so the rows come first.
     store::store(db, view)?;
+    bindings::sync(db, before, view)?;
     terminal_retention::sync_view_pins(db, &view.panes)
 }
 
@@ -939,6 +1222,9 @@ mod tests {
     use super::*;
     use crate::model::{BrowserId, BrowserSession, CardId, CardKind};
     use crate::workspace_model::views::Pane;
+
+    mod bindings;
+    mod effects;
     fn setup() -> (Registry, tempfile::TempDir, ChannelId, ChannelId) {
         let dir = tempfile::tempdir().unwrap();
         let mut registry = Registry::at(&dir.path().join("model.sqlite3")).unwrap();
@@ -999,6 +1285,168 @@ mod tests {
             change,
         }
     }
+    #[test]
+    fn delayed_shared_close_preserves_replacement_and_operation_receipt() {
+        let (mut registry, _, channel, _) = setup();
+        let original = pane();
+        seed(&mut registry, channel, vec![original.clone()]);
+        let identity = registry.model().unwrap().identity;
+        let mut removal = edit(
+            &mut registry,
+            channel,
+            Change::RemoveSource {
+                registry: identity,
+                repository: "/repo".into(),
+                before: original.clone(),
+                terminal: None,
+                capture: None,
+            },
+        );
+        let mut replacement = original.clone();
+        replacement.kind = pane().kind;
+        let update = edit(
+            &mut registry,
+            channel,
+            Change::Update {
+                before: original,
+                pane: replacement.clone(),
+            },
+        );
+        registry.apply(&update).unwrap();
+        // The publisher retries a queued close against the latest revision.
+        let operation = match &mut removal {
+            ModelEdit::ChangeView {
+                expected_revision,
+                operation,
+                ..
+            } => {
+                *expected_revision = registry.view_revision(&Scope::Channel(channel)).unwrap();
+                *operation
+            }
+            _ => unreachable!(),
+        };
+        let before = registry.model().unwrap();
+        assert!(
+            registry.apply(&removal).is_err(),
+            "a delayed Close must refuse its replaced source"
+        );
+        assert_eq!(registry.model().unwrap(), before);
+        assert!(!registry.view_operation_seen(operation).unwrap());
+        assert_eq!(
+            read(&registry.db, &Scope::Channel(channel)).unwrap().panes,
+            vec![replacement]
+        );
+    }
+
+    #[test]
+    fn shared_close_context_scope_and_pending_start_are_atomic() {
+        for mutation in 0..4 {
+            let (mut registry, _, a, b) = setup();
+            let original = pane();
+            seed(&mut registry, a, vec![original.clone()]);
+            let identity = registry.model().unwrap().identity;
+            let mut change = Change::RemoveSource {
+                registry: identity,
+                repository: "/repo".into(),
+                before: original.clone(),
+                terminal: None,
+                capture: None,
+            };
+            match mutation {
+                0 => {
+                    if let Change::RemoveSource { registry, .. } = &mut change {
+                        *registry = Uuid::new_v4();
+                    }
+                }
+                1 => {
+                    if let Change::RemoveSource { repository, .. } = &mut change {
+                        *repository = "/other".into();
+                    }
+                }
+                2 => {
+                    let mut next = original.clone();
+                    next.pending_terminal_start = true;
+                    let update = edit(
+                        &mut registry,
+                        a,
+                        Change::Update {
+                            before: original.clone(),
+                            pane: next,
+                        },
+                    );
+                    registry.apply(&update).unwrap();
+                }
+                _ => {
+                    let transfer = edit(
+                        &mut registry,
+                        a,
+                        Change::Transfer {
+                            id: original.id,
+                            destination: Scope::Channel(b),
+                            before: None,
+                        },
+                    );
+                    registry.apply(&transfer).unwrap();
+                }
+            }
+            let removal = edit(&mut registry, a, change);
+            let before = registry.model().unwrap();
+            assert!(registry.apply(&removal).is_err(), "mutation {mutation}");
+            assert_eq!(registry.model().unwrap(), before);
+            let ModelEdit::ChangeView { operation, .. } = removal else {
+                unreachable!()
+            };
+            assert!(!registry.view_operation_seen(operation).unwrap());
+        }
+    }
+
+    #[test]
+    fn shared_close_rebases_presentation_and_replays_its_receipt() {
+        let (mut registry, _, channel, _) = setup();
+        let original = pane();
+        seed(&mut registry, channel, vec![original.clone()]);
+        let change = Change::RemoveSource {
+            registry: registry.model().unwrap().identity,
+            repository: "/repo".into(),
+            before: original.clone(),
+            terminal: None,
+            capture: None,
+        };
+        let mut removal = edit(&mut registry, channel, change);
+        let mut titled = original.clone();
+        titled.title = "Peer's title".into();
+        titled.width_fraction = 0.75;
+        let update = edit(
+            &mut registry,
+            channel,
+            Change::Update {
+                before: original,
+                pane: titled,
+            },
+        );
+        registry.apply(&update).unwrap();
+        assert!(registry.apply(&removal).is_err());
+        if let ModelEdit::ChangeView {
+            expected_revision, ..
+        } = &mut removal
+        {
+            *expected_revision = registry.view_revision(&Scope::Channel(channel)).unwrap();
+        }
+        registry.apply(&removal).unwrap();
+        let after = registry.model().unwrap();
+        registry.apply(&removal).unwrap();
+        assert_eq!(registry.model().unwrap(), after);
+        assert!(
+            after
+                .views
+                .iter()
+                .find(|view| view.scope == Scope::Channel(channel))
+                .unwrap()
+                .panes
+                .is_empty()
+        );
+    }
+
     #[test]
     fn view_listings_read_each_view_whole_and_occupied_skips_emptied_views() {
         let (mut r, _, a, b) = setup();
@@ -1245,6 +1693,208 @@ mod tests {
         }
     }
 
+    fn live_chat_pane(thread: Option<&str>) -> Pane {
+        let mut pane = live_source_pane();
+        let CardKind::Terminal(terminal) = pane.kind else {
+            unreachable!()
+        };
+        pane.kind = CardKind::Chat(crate::chat::Session {
+            id: terminal.id,
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Codex,
+                recipe: terminal.launch.clone(),
+                session_id: thread.map(str::to_owned),
+            },
+            proof: terminal.continuity.live_proof(),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+        });
+        pane
+    }
+
+    fn assert_canonical_channel_title(
+        registry: &Registry,
+        channel: ChannelId,
+        title: &str,
+        source: crate::model::ChannelTitleSource,
+    ) {
+        let model = registry.model().unwrap();
+        let canonical = model.channel(channel).unwrap();
+        assert_eq!(
+            (canonical.title.as_str(), canonical.title_source),
+            (title, source)
+        );
+        let retained: String = registry
+            .db
+            .query_row(
+                "SELECT title FROM channel_work_homes WHERE channel=?1 AND incarnation=?2",
+                params![channel.to_string(), canonical.ordinal],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            retained, title,
+            "the retained work home follows the canonical title"
+        );
+    }
+
+    #[test]
+    fn first_primary_adoption_and_thread_metadata_keep_the_accepted_channel_title() {
+        use crate::model::ChannelTitleSource::{Manual, Prompt, Provider};
+        for source in [Prompt, Provider, Manual] {
+            let (mut registry, _directory, _, _) = setup();
+            let channel = ChannelId::new();
+            registry
+                .apply(&ModelEdit::CreateChannel {
+                    id: channel,
+                    repository: "/repo".into(),
+                    title: "Review the accepted task".into(),
+                    title_source: source,
+                })
+                .unwrap();
+            let original = live_chat_pane(None);
+            seed(&mut registry, channel, vec![original.clone()]);
+            // A provider name with no previous primary is still discarded as
+            // before; only the accepted prompt fallback is newly retained.
+            assert_canonical_channel_title(
+                &registry,
+                channel,
+                if source == Provider {
+                    ""
+                } else {
+                    "Review the accepted task"
+                },
+                if source == Provider { Prompt } else { source },
+            );
+            if source == Provider {
+                registry
+                    .apply(&ModelEdit::SuggestChannelTitle {
+                        id: channel,
+                        title: "Provider named task".into(),
+                        source: Provider,
+                    })
+                    .unwrap();
+            }
+            let mut initialized = original.clone();
+            let CardKind::Chat(chat) = &mut initialized.kind else {
+                unreachable!()
+            };
+            chat.launch.session_id = Some("first-thread".into());
+            let change = edit(
+                &mut registry,
+                channel,
+                Change::Update {
+                    before: original,
+                    pane: initialized,
+                },
+            );
+            registry.apply(&change).unwrap();
+            assert_canonical_channel_title(
+                &registry,
+                channel,
+                if source == Provider {
+                    "Provider named task"
+                } else {
+                    "Review the accepted task"
+                },
+                source,
+            );
+        }
+    }
+
+    #[test]
+    fn primary_replacements_and_removal_still_reset_only_inferred_channel_titles() {
+        use crate::model::ChannelTitleSource::{Manual, Prompt, Provider};
+        for source in [Prompt, Provider, Manual] {
+            for transition in [
+                "pane",
+                "runtime",
+                "provider",
+                "thread",
+                "thread-lost",
+                "removed",
+            ] {
+                let (mut registry, _directory, _, _) = setup();
+                let channel = ChannelId::new();
+                registry
+                    .apply(&ModelEdit::CreateChannel {
+                        id: channel,
+                        repository: "/repo".into(),
+                        title: "Accepted task".into(),
+                        title_source: Prompt,
+                    })
+                    .unwrap();
+                let original = live_chat_pane(Some("first-thread"));
+                seed(&mut registry, channel, vec![original.clone()]);
+                if source == Manual {
+                    registry
+                        .apply(&ModelEdit::RetitleChannel {
+                            id: channel,
+                            title: "Chosen task".into(),
+                        })
+                        .unwrap();
+                } else if source == Provider {
+                    registry
+                        .apply(&ModelEdit::SuggestChannelTitle {
+                            id: channel,
+                            title: "Chosen task".into(),
+                            source,
+                        })
+                        .unwrap();
+                }
+                let mut replacement = original.clone();
+                let CardKind::Chat(chat) = &mut replacement.kind else {
+                    unreachable!()
+                };
+                let change = match transition {
+                    "pane" => Change::Insert {
+                        pane: live_chat_pane(Some("other-thread")),
+                        before: Some(original.id),
+                    },
+                    "runtime" => {
+                        chat.id = crate::model::TerminalId::new();
+                        Change::Update {
+                            before: original,
+                            pane: replacement,
+                        }
+                    }
+                    "provider" => {
+                        chat.launch.provider = crate::agent::Provider::Claude;
+                        Change::Update {
+                            before: original,
+                            pane: replacement,
+                        }
+                    }
+                    "thread" => {
+                        chat.launch.session_id = Some("other-thread".into());
+                        Change::Update {
+                            before: original,
+                            pane: replacement,
+                        }
+                    }
+                    "thread-lost" => {
+                        chat.launch.session_id = None;
+                        Change::Update {
+                            before: original,
+                            pane: replacement,
+                        }
+                    }
+                    "removed" => Change::Remove { id: original.id },
+                    _ => unreachable!(),
+                };
+                let update = edit(&mut registry, channel, change);
+                registry.apply(&update).unwrap();
+                assert_canonical_channel_title(
+                    &registry,
+                    channel,
+                    if source == Manual { "Chosen task" } else { "" },
+                    if source == Manual { Manual } else { Prompt },
+                );
+            }
+        }
+    }
+
     #[test]
     fn primary_chat_change_keeps_work_home_title_in_the_canonical_transaction() {
         for manual in [false, true] {
@@ -1260,22 +1910,7 @@ mod tests {
                     title_source: crate::model::ChannelTitleSource::Prompt,
                 })
                 .unwrap();
-            let mut original = live_source_pane();
-            let CardKind::Terminal(terminal) = original.kind else {
-                unreachable!()
-            };
-            original.kind = CardKind::Chat(crate::chat::Session {
-                id: terminal.id,
-                launch: crate::chat::Launch {
-                    provider: crate::agent::Provider::Codex,
-                    recipe: terminal.launch.clone(),
-                    session_id: Some("first-thread".into()),
-                },
-                proof: terminal.continuity.live_proof(),
-                terminal: None,
-                owned_codex_listener: None,
-                native_continuity: Default::default(),
-            });
+            let original = live_chat_pane(Some("first-thread"));
             seed(&mut registry, channel, vec![original.clone()]);
             registry
                 .apply(&if manual {
@@ -2488,7 +3123,12 @@ mod tests {
                 "agent failure must roll back target, source, operation and sequence"
             );
             r.db.execute_batch("DROP TRIGGER fail_agent_move;").unwrap();
-            r.apply(&transfer).unwrap();
+            let moved = r.apply(&transfer).unwrap().effects.agents;
+            assert_eq!(
+                moved,
+                vec![r.agent(original.id).unwrap()],
+                "the edge carries the placement the transfer moved"
+            );
             drop(r);
             let mut r = Registry::at(&dir.path().join("model.sqlite3")).unwrap();
             let model = r.model().unwrap();

@@ -105,13 +105,10 @@ fn install(
             });
         }
         events.push(chat::Event::ReadOnlyHistory {
-            reason: saved.limitation.clone().unwrap_or_else(|| {
-                if session.launch.session_id.is_some() {
-                    "Stopped for the update. This saved page is a transcript preview; Resume loads the full conversation. Your draft is kept."
-                } else {
-                    "Stopped for the update before a conversation was recorded. The captured transcript stays visible; start a new conversation to continue. Your draft is kept."
-                }.into()
-            }),
+            reason: saved
+                .limitation
+                .clone()
+                .unwrap_or_else(|| crate::upgrade::floor::default_limitation(&saved.source).into()),
         });
         events.push(chat::Event::Exited { code: None });
         let mut initial = Step {

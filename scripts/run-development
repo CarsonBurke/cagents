@@ -161,7 +161,7 @@ done
 
 if [ "$in_session" = true ]; then
     if [ -z "$instance" ] || [ "$stop_instance" = true ] || [ "$keep_instance" = true ] ||
-        [ -n "$instance_ttl" ] || [ "$fresh_daemon" = true ] || [ "$hot" = true ] ||
+        [ -n "$instance_ttl" ] || [ "$hot" = true ] ||
         [ "$list_instances" = true ] || [ "$collect_garbage" = true ]; then
         printf '%s\n' "--in-session requires --instance and cannot manage a session's lifetime" >&2
         exit 2
@@ -890,21 +890,29 @@ esac
 PATH=${zig_executable%/*}:$PATH
 export PATH
 
-# Whether this launch holds the native lock, on which every other native session
-# queues. An ancestor having it open covers `flock --close`, which keeps it in the
-# parent only. niri starts a session's programs detached, so ancestry stops there:
-# a launch in a nested session while the lock is held counts as under it.
+# Whether this launch holds a native slot, which other native sessions wait for:
+# the native lock itself, slot 0, or LOCK.N. An ancestor having one open covers
+# `flock --close`, which keeps it in the parent only. niri starts a session's
+# programs detached, so ancestry stops there: a launch in a nested session while
+# any slot is held counts as under it.
 under_native_lock() {
     native_lock=$(readlink -f -- "${CAGENTS_EVIDENCE_NATIVE_LOCK:-/var/tmp/cagents-fw16-native.lock}" 2>/dev/null) || return 1
     [ -f "$native_lock" ] && [ -r "$native_lock" ] || return 1
     process=$$
     while [ "${process:-0}" -gt 1 ]; do
         for descriptor in "/proc/$process/fd/"*; do
-            [ "$(readlink -- "$descriptor" 2>/dev/null)" != "$native_lock" ] || return 0
+            case $(readlink -- "$descriptor" 2>/dev/null) in
+                "$native_lock" | "$native_lock".[1-9] | "$native_lock".[1-9][0-9]) return 0 ;;
+            esac
         done
         process=$(sed -n 's/^PPid:[[:space:]]*//p' "/proc/$process/status" 2>/dev/null) || return 1
     done
-    in_nested_session && command -v flock >/dev/null 2>&1 && ! flock -n "$native_lock" true 2>/dev/null
+    in_nested_session && command -v flock >/dev/null 2>&1 || return 1
+    for slot in "$native_lock" "$native_lock".[1-9] "$native_lock".[1-9][0-9]; do
+        [ -f "$slot" ] && [ -r "$slot" ] || continue
+        flock -n "$slot" true 2>/dev/null || return 0
+    done
+    return 1
 }
 
 in_nested_session() {
@@ -945,7 +953,7 @@ without_compiling() {
         timeout "$seconds" env \
         RUSTC_WRAPPER="$root/scripts/refuse-compile" CAGENTS_NATIVE_LOCK_HELD="$native_lock" \
         CAGENTS_BUILD_LOCK="$products/.native-lock-gate" CAGENTS_BUILD_SLOTS=1 CAGENTS_BUILD_SEED=0 \
-        CAGENTS_BUILD_REMOTE=local "$@" &
+        CAGENTS_BUILD_REMOTE=local CAGENTS_BUILD_SCOPE=0 "$@" &
     wait "$!" || status=$?
     if [ "$status" -eq 124 ]; then
         printf '%s\n' "refusing to keep waiting while holding the native lock $native_lock: confirming that nothing needs compiling took over $seconds seconds. A build script may be running, or another build may be using this target." >&2
@@ -970,11 +978,12 @@ fi
 # without `full`, which selects the shipped product's application ID, peer
 # package and self-update, none of which a development build uses, so both
 # lanes share one build of each.
+# The UI is its own package, whose default is the browserless UI.
 if [ "$browserless" = true ]; then
-    ui_features='--no-default-features --features development,ui'
+    ui_features='-p cagents-ui --features development'
     ui_feature=ui
 else
-    ui_features='--features development,integrated-browser'
+    ui_features='-p cagents-ui --features development,integrated-browser'
     ui_feature=integrated-browser
 fi
 
@@ -1195,12 +1204,18 @@ instance_cli_path() {
 # the CLI's own check does not cover, so first refuse a session whose daemon
 # hosts this process or a session it descends from.
 refuse_hosting_session() {
-    harness_env=$(niri-harness --session "$harness_session" env 2>/dev/null) || return 0
-    runtime=$(
-        unset XDG_RUNTIME_DIR
-        eval "$harness_env"
-        printf '%s' "${XDG_RUNTIME_DIR-}"
-    )
+    if [ "$in_session" = true ]; then
+        # This private runtime was validated above. A daemon-only restart must
+        # not discover or stop an outer compositor with a matching name.
+        runtime=${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR must be set}
+    else
+        harness_env=$(niri-harness --session "$harness_session" env 2>/dev/null) || return 0
+        runtime=$(
+            unset XDG_RUNTIME_DIR
+            eval "$harness_env"
+            printf '%s' "${XDG_RUNTIME_DIR-}"
+        )
+    fi
     [ -n "$runtime" ] || return 0
     hosts=$(caller_host_runtimes)
     if hosts_unknown "$hosts"; then
@@ -1350,7 +1365,7 @@ fi
 if [ "$fresh_daemon" = true ]; then
     printf '%s\n' "Restarting the development daemon stops its terminal/chat jobs and all their background subagents." >&2
     run_cli daemon stop-for-rebuild --including-subagents >/dev/null
-    socket=${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR must be set}/cagents-development/cagentsd.sock
+    socket=${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR must be set}/cagents-development${instance:+-$instance}/cagentsd.sock
     remaining=100
     while [ -e "$socket" ]; do
         if [ "$remaining" -eq 0 ]; then

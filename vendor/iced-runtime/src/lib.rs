@@ -12,6 +12,7 @@
 pub mod clipboard;
 pub mod dnd;
 pub mod font;
+pub mod frame;
 pub mod image;
 pub mod keyboard;
 pub mod platform_specific;
@@ -28,7 +29,6 @@ pub use task::Task;
 pub use user_interface::UserInterface;
 pub use window::Window;
 
-use crate::core::Color;
 use crate::futures::futures::channel::oneshot;
 
 use std::borrow::Cow;

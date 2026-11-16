@@ -514,12 +514,13 @@ impl Plan {
 
 /// Generates a workspace with this checkout's scripts/fixture-workspace, for
 /// tests that load it through the stores' own readers.
-#[cfg(test)]
-pub(crate) mod test_support {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_support {
     use super::Plan;
 
     /// The small profile with every edge case, at `directory/workspace`.
-    pub(crate) fn small(directory: &std::path::Path) -> Plan {
+    pub fn small(directory: &std::path::Path) -> Plan {
         let root = directory.join("workspace");
         let generator =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/fixture-workspace");

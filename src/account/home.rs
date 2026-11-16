@@ -110,7 +110,7 @@ impl Homes {
 
     /// Serializes account creation/removal with the actual child-spawn
     /// boundary. Never wait for this while holding the daemon's state lock.
-    pub(crate) fn lifecycle_lock(&self) -> io::Result<crate::instance::OwnedLock> {
+    pub fn lifecycle_lock(&self) -> io::Result<crate::instance::OwnedLock> {
         crate::secure_file::prepare_private_directory(&self.root)?;
         crate::instance::owned_lock(&self.root.join(".lifecycle.lock"), libc::LOCK_EX)
     }
@@ -139,7 +139,7 @@ impl Homes {
     /// Whether `key` names a home of `provider` that exists as this user's
     /// own real directory, reached through no link. A removed home is parked
     /// and then deleted, so it never is.
-    pub(crate) fn is_kept(&self, provider: Provider, key: Uuid) -> bool {
+    pub fn is_kept(&self, provider: Provider, key: Uuid) -> bool {
         let path = self.path(provider, key);
         crate::secure_file::reject_symlink_components(&path).is_ok()
             && crate::secure_file::validate_owned_directory(&path).is_ok()

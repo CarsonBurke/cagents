@@ -1,0 +1,2206 @@
+use super::*;
+use crate::settings_widgets::{Group, Setting, field as setting_field, group as settings_group};
+
+fn monospace_font_setting<'a>(family: &str, field: SettingsField) -> Setting<'a, Message> {
+    static FAMILIES: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
+        let fonts = cosmic::iced::advanced::graphics::text::font_system()
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut names: Vec<_> = fonts
+            .db()
+            .faces()
+            .filter(|face| face.monospaced)
+            .flat_map(|face| face.families.iter().map(|(name, _)| name.clone()))
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    });
+    let mut values = vec![String::new()];
+    values.extend(FAMILIES.iter().cloned());
+    if !values.iter().any(|value| value == family) {
+        values.push(family.to_owned());
+    }
+    let selected = values.iter().position(|value| value == family);
+    let labels: Vec<_> = values
+        .iter()
+        .map(|value| {
+            if value.is_empty() {
+                "System monospace".to_owned()
+            } else {
+                value.clone()
+            }
+        })
+        .collect();
+    setting_field(
+        "Installed monospace fonts",
+        "Choose a fixed-pitch font installed on this computer.",
+        crate::ui_controls::field::select(labels, selected, move |index| {
+            Message::SettingsChanged {
+                field,
+                value: values[index].clone(),
+            }
+        })
+        .into(),
+    )
+}
+
+fn setting_input<'a>(
+    detail: impl Into<Cow<'a, str>> + 'a,
+    value: &'a str,
+    field: SettingsField,
+    invalid: &'a HashMap<SettingsField, String>,
+) -> Setting<'a, Message> {
+    let label = field.label();
+    let error = invalid.get(&field).map(String::as_str);
+    let mut input = crate::ui_controls::field::text(label, value)
+        .on_input(move |value| Message::SettingsDraftChanged { field, value })
+        .width(Length::Fill);
+    if let Some(error) = error {
+        input = input.error(error);
+    }
+    setting_field(label, detail, input.into()).error(error)
+}
+
+fn setting_stepper<'a>(
+    label: &'static str,
+    detail: impl Into<Cow<'a, str>> + 'a,
+    value: &'a str,
+    field: SettingsField,
+    min: f32,
+    max: f32,
+    step: f32,
+    default: f32,
+    unit: &'static str,
+) -> Setting<'a, Message> {
+    let current = value.parse::<f32>().unwrap_or(default).clamp(min, max);
+    let change = |next: f32| Message::SettingsChanged {
+        field,
+        value: format!("{:.3}", next.clamp(min, max)),
+    };
+    let control = widget::row::with_children(vec![
+        crate::ui_controls::icon_button(Icon::Minus, format!("Decrease {label}"))
+            .on_press_maybe((current > min).then(|| change(current - step)))
+            .into(),
+        widget::container(design::body(format!("{}{}", current, unit)))
+            .center_x(72)
+            .center_y(design::PRIMARY_CONTROL_SIZE)
+            .into(),
+        crate::ui_controls::icon_button(Icon::Plus, format!("Increase {label}"))
+            .on_press_maybe((current < max).then(|| change(current + step)))
+            .into(),
+        crate::ui_controls::icon_button(Icon::Undo, format!("Reset {label}"))
+            .on_press_maybe((current != default).then(|| change(default)))
+            .into(),
+    ])
+    .spacing(space::XS)
+    .align_y(Alignment::Center)
+    .width(Length::Shrink)
+    .into();
+    setting_field(label, detail, control)
+}
+
+/// The switch that turns a routine question on again after "Don't ask
+/// again", or off without waiting for it to be asked.
+fn confirmation_setting<'a>(kind: settings::Confirmation, asks: bool) -> Setting<'a, Message> {
+    let (label, detail, keywords) = match kind {
+        settings::Confirmation::StopWorkingChat => (
+            "Confirm closing a working chat",
+            "Ask before closing a chat that is still working. Closing stops it; the conversation stays in history.",
+            "working_chats stop",
+        ),
+        settings::Confirmation::CloseActiveTerminal => (
+            "Confirm closing active processes",
+            "Ask before closing a terminal with a foreground program or background jobs. Idle shells close immediately.",
+            "active_processes terminal",
+        ),
+    };
+    crate::settings_widgets::toggle(label, detail, asks, move |ask| Message::SettingsChanged {
+        field: SettingsField::Confirm(kind),
+        value: ask.to_string(),
+    })
+    .keywords(keywords)
+}
+
+fn settings_choice<'a>(
+    label: &'static str,
+    detail: &'static str,
+    field: SettingsField,
+    choices: impl IntoIterator<Item = (&'static str, &'static str, bool)>,
+) -> Setting<'a, Message> {
+    let buttons: Vec<Element<'a, Message>> = choices
+        .into_iter()
+        .map(|(choice, value, selected)| {
+            let marker: Element<'a, Message> = if selected {
+                settings_icon(Icon::Select).into()
+            } else {
+                iced::widget::Space::new().width(16).height(16).into()
+            };
+            crate::interaction::hover(
+                widget::button::custom(
+                    widget::row::with_children(vec![marker, design::body(choice).into()])
+                        .spacing(space::S)
+                        .align_y(Alignment::Center),
+                )
+                .name(choice)
+                .class(crate::sidebar::sidebar_button_style(selected))
+                .selected(selected)
+                .padding([space::XS, space::S])
+                .height(design::ROW_HEIGHT)
+                .width(Length::Fill)
+                .on_press(Message::SettingsChanged {
+                    field,
+                    value: value.to_owned(),
+                }),
+            )
+        })
+        .collect();
+    setting_field(
+        label,
+        detail,
+        widget::column::with_children(buttons)
+            .spacing(space::XS)
+            .width(Length::Fill)
+            .into(),
+    )
+}
+
+/// One provider's default-account choice: the accounts it has, each marked
+/// when it is the one new conversations start on.
+fn default_account_choice<'a>(
+    provider: crate::agent::Provider,
+    choices: &[account_ui::DefaultChoice],
+) -> Setting<'a, Message> {
+    let (label, detail) = match provider {
+        crate::agent::Provider::Claude => (
+            "Claude",
+            "Automatic uses a signed-in plan and switches when its allowance runs out. Choosing an account pins new conversations and terminals; project choices take precedence.",
+        ),
+        _ => (
+            "ChatGPT (Codex)",
+            "Automatic uses a signed-in plan and switches when its allowance runs out. Choosing an account pins new conversations and terminals; project choices take precedence.",
+        ),
+    };
+    let selected = Some(
+        choices
+            .iter()
+            .position(|choice| choice.selected)
+            .map_or(0, |index| index + 1),
+    );
+    let labels =
+        std::iter::once("Automatic — use another signed-in plan when exhausted".to_owned())
+            .chain(choices.iter().map(|choice| choice.label.clone()))
+            .collect::<Vec<_>>();
+    let ids = std::iter::once(None)
+        .chain(choices.iter().map(|choice| Some(choice.id.clone())))
+        .collect::<Vec<_>>();
+    setting_field(
+        label,
+        detail,
+        crate::ui_controls::field::select(labels, selected, move |index| {
+            Message::AccountUi(match &ids[index] {
+                Some(id) => account_ui::Action::SetDefault(id.clone()),
+                None => account_ui::Action::SetAutomatic(provider),
+            })
+        })
+        .into(),
+    )
+}
+
+/// What the settings pane shows besides the draft being edited, gathered
+/// from the rest of the application once per frame.
+pub(super) struct SettingsContext<'a> {
+    pub feedback: Option<&'a SettingsFeedback>,
+    /// Refused values, by the field that refused them.
+    pub invalid: &'a HashMap<SettingsField, String>,
+    pub pressed_key: Option<&'a keyboard::Event>,
+    pub accounts: Vec<(crate::agent::Provider, Vec<account_ui::DefaultChoice>)>,
+    pub updates: update_ui::UpdateSummary,
+    pub testing_notification: bool,
+}
+
+fn settings_category_controls<'a>(
+    category: SettingsCategory,
+    draft: &'a SettingsDraft,
+    context: &SettingsContext<'a>,
+) -> Vec<Group<'a, Message>> {
+    let invalid = context.invalid;
+    let testing_notification = context.testing_notification;
+    match category {
+        SettingsCategory::Notifications => {
+            use crate::notifications::Field;
+            let fields = [
+                (
+                    Field::Enabled,
+                    "System notifications",
+                    "Show desktop alerts for agent lifecycle events, including while all windows are closed.",
+                ),
+                (
+                    Field::Success,
+                    "Successful completion",
+                    "Notify when a provider confirms that a turn finished.",
+                ),
+                (
+                    Field::Failure,
+                    "Failure or cancellation",
+                    "Notify when a turn fails or is cancelled.",
+                ),
+                (
+                    Field::Waiting,
+                    "Waiting for you",
+                    "Notify when an agent needs input or approval, or its outcome could not be confirmed.",
+                ),
+                (
+                    Field::ReviewRequests,
+                    "Review requests",
+                    "Notify when GitHub requests your review, including requests discovered beyond the first page.",
+                ),
+                (
+                    Field::WhileFocused,
+                    "Notify while focused",
+                    "Also notify while you are watching that agent. Off by default.",
+                ),
+                (
+                    Field::MessagePreviews,
+                    "Show message previews",
+                    "Include conversation names and response or request excerpts on the desktop. These may be visible on a shared or locked screen. Off by default.",
+                ),
+            ];
+            let mut controls: Vec<_> = fields
+                .into_iter()
+                .map(|(field, label, detail)| {
+                    crate::settings_widgets::toggle_enabled(
+                        label,
+                        detail,
+                        draft.notifications.get(field),
+                        matches!(field, Field::Enabled | Field::MessagePreviews)
+                            || draft.notifications.get(Field::Enabled),
+                        move |enabled| Message::SettingsChanged {
+                            field: SettingsField::Notifications(field),
+                            value: enabled.to_string(),
+                        },
+                    )
+                })
+                .collect();
+            controls.push(setting_field(
+                "Test notification",
+                "Your desktop controls presentation and sound. Unavailable delivery keeps attention inside cagents; the result appears in notices.",
+                crate::ui_controls::button::secondary(if testing_notification {
+                    "Sending test notification…"
+                } else {
+                    "Send test notification"
+                })
+                .id(widget::Id::new("settings.notifications.test"))
+                .on_press_maybe(
+                    (!testing_notification)
+                        .then_some(Message::NotificationUi(notification_ui::Action::Test)),
+                )
+                .into(),
+            )
+            .label_in_control());
+            vec![settings_group(
+                "Agent notifications",
+                "Private alerts show the provider and folder. Message previews are available when you choose to enable them.",
+                controls,
+            )]
+        }
+        SettingsCategory::About => {
+            let updates = &context.updates;
+            let version = if crate::instance::NAME == "development" {
+                format!("{} (development build)", crate::version())
+            } else {
+                crate::version().to_owned()
+            };
+            let status = design::body(updates.status.clone())
+                .wrapping(iced::widget::text::Wrapping::Word)
+                .width(Length::Fill);
+            let mut update_row: Vec<Element<'a, Message>> = vec![if updates.failed {
+                status
+                    .class(cosmic::theme::Text::Custom(design::destructive_text))
+                    .into()
+            } else {
+                status.into()
+            }];
+            if let Some((_, url)) = &updates.available {
+                update_row.push(update_ui::release_notes_button(url));
+                update_row.push(
+                    // `Apply` is refused while this window is blocked, so the
+                    // button is disabled and the reason shown below it.
+                    crate::ui_controls::button::primary("Review update")
+                        .on_press_maybe(
+                            updates
+                                .apply_blocker
+                                .is_none()
+                                .then_some(Message::UpdateUi(update_ui::Action::Apply)),
+                        )
+                        .into(),
+                );
+            } else {
+                update_row.push(
+                    crate::ui_controls::button::secondary("Check for updates")
+                        .id(widget::Id::new("settings.updates.check"))
+                        .on_press_maybe(
+                            updates
+                                .can_check
+                                .then_some(Message::UpdateUi(update_ui::Action::CheckNow)),
+                        )
+                        .into(),
+                );
+            }
+            vec![settings_group(
+                "cagents",
+                "The build you are running and how it stays current.",
+                vec![
+                    setting_field(
+                        "Window version",
+                        "The application build running in this window.",
+                        design::body(version).into(),
+                    ),
+                    setting_field(
+                        "Updates",
+                        match updates.apply_blocker {
+                            Some(reason) => format!("{} {reason}", updates.detail),
+                            None => updates.detail.clone(),
+                        },
+                        widget::row::with_children(update_row)
+                            .align_y(Alignment::Center)
+                            .spacing(space::S)
+                            .width(Length::Fill)
+                            .into(),
+                    ),
+                    crate::settings_widgets::toggle(
+                        "Check for updates automatically",
+                        "Look for a new release at startup and every six hours. A check that cannot reach the server is retried quietly; only one you ask for reports a failure.",
+                        draft.check_for_updates,
+                        |enabled| Message::SettingsChanged {
+                            field: SettingsField::CheckForUpdates,
+                            value: enabled.to_string(),
+                        },
+                    )
+                    .keywords("check_for_updates"),
+                ],
+            )]
+        }
+        SettingsCategory::Accounts => {
+            let mut settings: Vec<Setting<'a, Message>> = context
+                .accounts
+                .iter()
+                .filter(|(_, choices)| !choices.is_empty())
+                .map(|(provider, choices)| default_account_choice(*provider, choices))
+                .collect();
+            settings.push(setting_field(
+                "Manage accounts",
+                "Add, rename, sign in to or remove accounts, and compare their usage limits.",
+                crate::ui_controls::button::secondary("Open Accounts")
+                    .on_press(Message::AccountUi(account_ui::Action::OpenPane))
+                    .into(),
+            )
+            .label_in_control());
+            vec![
+                settings_group(
+                    "Default accounts",
+                    "Choose defaults for new conversations, or use Automatic to choose an account with available usage.",
+                    settings,
+                ),
+                settings_group(
+                    "Usage",
+                    "How account allowances appear throughout the app.",
+                    vec![settings_choice(
+                        "Account usage",
+                        "Left shows remaining allowance in text and gauges. Used shows consumed allowance. Warning colours still indicate when an account is running low.",
+                        SettingsField::AccountUsageDisplay,
+                        settings::AccountUsageDisplay::ALL.map(|display| {
+                            (
+                                display.label(),
+                                display.key(),
+                                draft.account_usage_display == display,
+                            )
+                        }),
+                    )
+                    .keywords("account_usage_display remaining consumed")],
+                ),
+            ]
+        }
+        SettingsCategory::General => {
+            let reset = setting_field(
+                "Reset all settings",
+                "Restore default preferences; saved conversations and tabs are preserved.",
+                crate::ui_controls::button::destructive("Reset all settings")
+                    .id(widget::Id::new("settings.reset"))
+                    .on_press(Message::ResetSettings)
+                    .into(),
+            )
+            .label_in_control();
+            let directory = setting_input(
+                "Absolute path, or relative to the repository root. Defaults to .worktrees/. Each new worktree gets its own subdirectory.",
+                &draft.managed_worktree_directory,
+                SettingsField::ManagedWorktreeDirectory,
+                invalid,
+            );
+            let worktree_pane = settings_choice(
+                "Default worktree pane",
+                "Open this pane in an empty worktree. An unused native chat is removed when you switch worktrees.",
+                SettingsField::DefaultWorktreePane,
+                settings::DefaultPane::ALL.map(|pane| {
+                    (
+                        pane.label(),
+                        pane.key(),
+                        draft.default_worktree_pane == pane,
+                    )
+                }),
+            );
+            let cleanup = crate::settings_widgets::toggle(
+                "Notify about merged worktrees",
+                "Show a notice when a GitHub worktree's pull request is merged, naming uncommitted changes and ignored files such as .env that deleting it would discard. Worktrees are never deleted automatically.",
+                draft.auto_delete_merged_worktrees,
+                |enabled| Message::SettingsChanged {
+                    field: SettingsField::AutoDeleteMergedWorktrees,
+                    value: enabled.to_string(),
+                },
+            )
+            .keywords("merged_worktrees");
+            let channel_pane = settings_choice(
+                "Default channel pane",
+                "Open this pane in an empty channel. An unused native chat is removed when you switch channels.",
+                SettingsField::DefaultChannelPane,
+                settings::DefaultPane::ALL
+                    .map(|pane| (pane.label(), pane.key(), draft.default_channel_pane == pane)),
+            );
+            let sidebar_worktrees = settings_choice(
+                "Checkouts in sidebar",
+                "Show each project's checkouts after its channels, grouped or listed directly. Hidden hides every checkout, the repository's root checkout too, and lists each open pane under its project instead. Projects can override this default, except while it is Hidden.",
+                SettingsField::SidebarWorktrees,
+                settings::SidebarWorktrees::ALL
+                    .map(|mode| (mode.label(), mode.key(), draft.sidebar_worktrees == mode)),
+            );
+            let order = settings_choice(
+                "Worktree order",
+                "Main stays first. Imported worktrees with unknown creation dates follow dated worktrees, ordered by path.",
+                SettingsField::WorktreeSort,
+                [
+                    ("Newest", "newest", draft.worktree_sort == "newest"),
+                    ("Oldest", "oldest", draft.worktree_sort == "oldest"),
+                    (
+                        "Alphabetical",
+                        "alphabetical",
+                        draft.worktree_sort == "alphabetical",
+                    ),
+                ],
+            );
+            let activation = crate::settings_widgets::toggle(
+                "Focus follows mouse",
+                "When on, resting the pointer on a pane focuses it and puts the keyboard in its message input, terminal or editor, without scrolling. Typing, clicking or dragging before then keeps focus where it is. When off, click a pane or use pane navigation to focus it.",
+                draft.focus_follows_mouse,
+                |enabled| Message::SettingsChanged {
+                    field: SettingsField::FocusFollowsMouse,
+                    value: enabled.to_string(),
+                },
+            )
+            .keywords("Pane focus pane_focus");
+            let hot_panes = setting_input(
+                "At least 1 pane. Extra background panes may hibernate.",
+                &draft.max_hot_cards,
+                SettingsField::MaxHotCards,
+                invalid,
+            );
+            let hibernation = setting_input(
+                "Milliseconds before an inactive pane hibernates; 0 suspends immediately.",
+                &draft.hibernation_delay_ms,
+                SettingsField::HibernationDelayMs,
+                invalid,
+            );
+            let stale = setting_input(
+                "A card with no commits, file changes or agent work for this many days moves to Stale.",
+                &draft.work_stale_after_days,
+                SettingsField::WorkStaleAfterDays,
+                invalid,
+            );
+            vec![
+                settings_group(
+                    "Worktrees",
+                    "Locations, ordering and the first pane in a worktree.",
+                    vec![sidebar_worktrees, directory, worktree_pane, cleanup, order],
+                ),
+                settings_group(
+                    "Work board",
+                    "How the board sorts work that has gone quiet.",
+                    vec![stale],
+                ),
+                settings_group(
+                    "Workspace",
+                    "Channels and pane focus.",
+                    vec![channel_pane, activation],
+                ),
+                settings_group(
+                    "Performance",
+                    "Balance active panes and background resource use.",
+                    vec![hot_panes, hibernation],
+                ),
+                settings_group(
+                    "Confirmations",
+                    "Questions asked before routine closes. Turn one back on here after choosing Don't ask again.",
+                    settings::Confirmation::ALL
+                        .into_iter()
+                        .map(|kind| {
+                            confirmation_setting(
+                                kind,
+                                draft.confirmations.get(&kind).copied().unwrap_or(true),
+                            )
+                        })
+                        .collect(),
+                ),
+                settings_group(
+                    "Reset",
+                    "Restore preferences without removing conversations or panes.",
+                    vec![reset],
+                ),
+            ]
+        }
+        SettingsCategory::NativeChat => vec![settings_group(
+            "Native chat",
+            "Message composition and conversation presentation.",
+            vec![
+                crate::settings_widgets::toggle(
+                    "Enter sends a chat message",
+                    "Enter sends the message and Shift+Enter breaks the line. Turn this off to compose with Enter and send with Ctrl+Enter.",
+                    draft.chat_enter_sends,
+                    |enabled| Message::SettingsChanged {
+                        field: SettingsField::ChatEnterSends,
+                        value: enabled.to_string(),
+                    },
+                )
+                .keywords("Chat send key chat_send_key"),
+                crate::settings_widgets::toggle(
+                    "Expand tool groups by default",
+                    "Choose whether new tool-call groups start expanded. Individual disclosure choices are remembered while paging.",
+                    draft.chat_expand_tool_groups,
+                    |enabled| Message::SettingsChanged {
+                        field: SettingsField::ChatExpandToolGroups,
+                        value: enabled.to_string(),
+                    },
+                )
+                .keywords("tool_groups"),
+            ],
+        )],
+        SettingsCategory::Editor => vec![
+            settings_group(
+                "Font",
+                "Leave a field blank to follow the terminal font. Ctrl+=, Ctrl+− and Ctrl+0 zoom the focused editor or terminal.",
+                vec![
+                    setting_input(
+                        "Monospace font family, or blank to follow the terminal.",
+                        &draft.editor_font_family,
+                        SettingsField::EditorFontFamily,
+                        invalid,
+                    ),
+                    setting_input(
+                        "8–40 logical pixels, or blank to follow the terminal.",
+                        &draft.editor_font_size,
+                        SettingsField::EditorFontSize,
+                        invalid,
+                    ),
+                ],
+            ),
+            settings_group("Editor", "Shared native editor and diff preferences.", {
+                let mut options = crate::settings_widgets::editor_options(
+                    draft.editor_auto_save,
+                    draft.editor_wrap_lines,
+                    draft.editor_syntax_theme,
+                    |enabled| Message::SettingsChanged {
+                        field: SettingsField::EditorAutoSave,
+                        value: enabled.to_string(),
+                    },
+                    |enabled| Message::SettingsChanged {
+                        field: SettingsField::EditorWrapLines,
+                        value: enabled.to_string(),
+                    },
+                    |theme| Message::SettingsChanged {
+                        field: SettingsField::EditorSyntaxTheme,
+                        value: theme.key().into(),
+                    },
+                );
+                options.push(crate::settings_widgets::toggle(
+                    "Hide unchanged diff lines",
+                    "Fold unchanged context between hunks. Turn off to show the complete file.",
+                    draft.diff_hide_unchanged,
+                    |enabled| Message::SettingsChanged {
+                        field: SettingsField::DiffHideUnchanged,
+                        value: enabled.to_string(),
+                    },
+                ));
+                options
+            }),
+        ],
+        SettingsCategory::Appearance => vec![
+            settings_group(
+                "Interface",
+                "Make the workbench comfortable on your display. Changes apply immediately and are saved automatically.",
+                vec![
+                    setting_field(
+                        "App theme",
+                        "Colors for the entire application. Terminal and syntax palettes are independent.",
+                        crate::ui_controls::field::select(
+                            AppTheme::ALL
+                                .iter()
+                                .map(|theme| theme.label().to_owned())
+                                .collect::<Vec<_>>(),
+                            AppTheme::ALL
+                                .iter()
+                                .position(|theme| theme.key() == draft.app_theme),
+                            |index| Message::SettingsChanged {
+                                field: SettingsField::AppTheme,
+                                value: AppTheme::ALL[index].key().into(),
+                            },
+                        )
+                        .into(),
+                    ),
+                    setting_stepper(
+                        "Interface scale",
+                        "Scales the entire interface independently of display scaling.",
+                        &draft.ui_scale,
+                        SettingsField::UiScale,
+                        0.8,
+                        1.5,
+                        0.05,
+                        1.0,
+                        "×",
+                    ),
+                    crate::settings_widgets::toggle(
+                        "Show the status bar",
+                        "See each signed-in account's usage limits at the bottom of the window.",
+                        draft.show_status_bar,
+                        |enabled| Message::SettingsChanged {
+                            field: SettingsField::ShowStatusBar,
+                            value: enabled.to_string(),
+                        },
+                    )
+                    .keywords("status_bar"),
+                    crate::settings_widgets::toggle(
+                        "Show worktree change badges",
+                        "Show a changes badge beside worktrees with uncommitted changes in Projects.",
+                        draft.show_worktree_changes_icons,
+                        |enabled| Message::SettingsChanged {
+                            field: SettingsField::ShowWorktreeChangesIcons,
+                            value: enabled.to_string(),
+                        },
+                    )
+                    .keywords("Show worktree changes icons worktree_changes_icons show_worktree_changes_icons"),
+                    crate::settings_widgets::toggle(
+                        "Show mentioned pull requests",
+                        "In a channel's Pull requests section, also list pull requests it only mentioned, below the ones it worked on.",
+                        draft.show_mentioned_pull_requests,
+                        |enabled| Message::SettingsChanged {
+                            field: SettingsField::ShowMentionedPullRequests,
+                            value: enabled.to_string(),
+                        },
+                    )
+                    .keywords("Mentioned pull requests show_mentioned_pull_requests"),
+                ],
+            ),
+            settings_group(
+                "Workspace layout",
+                "Keep navigation and context readable without giving up working space.",
+                vec![
+                    setting_stepper(
+                        "New terminal/browser width",
+                        "Fraction of the workspace. Existing pane widths are preserved.",
+                        &draft.default_column_fraction,
+                        SettingsField::DefaultColumnFraction,
+                        0.25,
+                        1.0,
+                        0.05,
+                        0.5,
+                        "×",
+                    ),
+                    setting_stepper(
+                        "Native pane minimum width",
+                        "Fraction of the workspace used by new native panes when sharing space. A lone pane fills the workspace; resize or cycle its width to override.",
+                        &draft.default_native_pane_fraction,
+                        SettingsField::DefaultNativePaneFraction,
+                        0.25,
+                        1.0,
+                        0.05,
+                        0.5,
+                        "",
+                    ),
+                ],
+            ),
+        ],
+        SettingsCategory::Terminal => vec![
+            settings_group(
+                "Text & cursor",
+                "Tune every open terminal live. Application colors are controlled by the shell or terminal program.",
+                vec![
+                    setting_stepper(
+                        "Font size",
+                        "Logical pixels before interface and display scaling.",
+                        &draft.terminal_font_size,
+                        SettingsField::TerminalFontSize,
+                        8.0,
+                        40.0,
+                        1.0,
+                        14.0,
+                        " px",
+                    ),
+                    setting_input(
+                        "Leave empty for system monospace. Use an installed fixed-pitch family, including a Nerd Font for Powerline glyphs. Saves after you pause typing.",
+                        &draft.terminal_font_family,
+                        SettingsField::TerminalFontFamily,
+                        invalid,
+                    ),
+                    monospace_font_setting(
+                        &draft.terminal_font_family,
+                        SettingsField::TerminalFontFamily,
+                    ),
+                    setting_stepper(
+                        "Line height",
+                        "Space between text baselines, relative to font size.",
+                        &draft.terminal_line_height,
+                        SettingsField::TerminalLineHeight,
+                        1.0,
+                        2.0,
+                        0.05,
+                        1.286,
+                        "×",
+                    ),
+                    setting_stepper(
+                        "Inner padding",
+                        "Breathing room between terminal text and the pane edge.",
+                        &draft.terminal_padding,
+                        SettingsField::TerminalPadding,
+                        0.0,
+                        24.0,
+                        2.0,
+                        8.0,
+                        " px",
+                    ),
+                    setting_input(
+                        "1–10 lines per mouse-wheel notch. Use scroll speed for high-resolution wheel or trackpad input.",
+                        &draft.terminal_scroll_size,
+                        SettingsField::TerminalScrollSize,
+                        invalid,
+                    ),
+                    setting_stepper(
+                        "Scroll speed",
+                        "Multiplier for wheel scrolling. One keeps the configured scroll size unchanged.",
+                        &draft.terminal_scroll_speed,
+                        SettingsField::TerminalScrollSpeed,
+                        0.25,
+                        4.0,
+                        0.25,
+                        1.0,
+                        "×",
+                    ),
+                    terminal_theme_choice(&draft.terminal_theme, draft.has_custom_terminal_theme),
+                    crate::settings_widgets::toggle(
+                        "Confirm multiline paste",
+                        "Warn before pasting multiple lines when the program does not support bracketed paste.",
+                        draft.confirm_multiline_paste,
+                        |enabled| Message::SettingsChanged {
+                            field: SettingsField::ConfirmMultilinePaste,
+                            value: enabled.to_string(),
+                        },
+                    )
+                    .keywords("multiline_paste"),
+                    settings_choice(
+                        "Cursor shape",
+                        "Bar is the default. Application follows program cursor requests; explicit shapes override requests without forcing a hidden cursor visible.",
+                        SettingsField::TerminalCursorStyle,
+                        [
+                            (
+                                "Application",
+                                "application",
+                                draft.terminal_cursor_style == "application",
+                            ),
+                            ("Block", "block", draft.terminal_cursor_style == "block"),
+                            ("Bar", "beam", draft.terminal_cursor_style == "beam"),
+                            (
+                                "Underline",
+                                "underline",
+                                draft.terminal_cursor_style == "underline",
+                            ),
+                        ],
+                    ),
+                ],
+            ),
+            settings_group(
+                "History",
+                "Keep enough output to investigate a task without retaining unlimited terminal history.",
+                vec![setting_input(
+                    "0–1,024 MiB per newly started terminal, allocated as needed. Existing history is preserved.",
+                    &draft.terminal_scrollback_mib,
+                    SettingsField::TerminalScrollbackMib,
+                    invalid,
+                )],
+            ),
+            settings_group(
+                "Upgrades",
+                "Replacing the daemon checkpoints terminals and conversations, then resumes them.",
+                vec![crate::settings_widgets::toggle(
+                    "Relaunch unresumable agents on upgrade",
+                    "Reopen an agent whose conversation cannot be resumed exactly in its resume picker, instead of refusing the upgrade. Other running jobs still block it.",
+                    draft.relaunch_agents_on_upgrade,
+                    |enabled| Message::SettingsChanged {
+                        field: SettingsField::RelaunchAgentsOnUpgrade,
+                        value: enabled.to_string(),
+                    },
+                )
+                .keywords("unresumable_agents")],
+            ),
+        ],
+        SettingsCategory::Links => vec![settings_group(
+            "Link handling",
+            "Choose the default browser for links. Modified clicks explicitly choose either browser.",
+            vec![
+                setting_input(
+                    "Use {query} where the search terms belong, for example https://duckduckgo.com/?q={query}.",
+                    &draft.browser_search_url,
+                    SettingsField::BrowserSearchUrl,
+                    invalid,
+                ),
+                #[cfg(feature = "integrated-browser")]
+                setting_field(
+                    "Browser logins",
+                    "Choose sites from local browser profiles to import into this app session.",
+                    crate::ui_controls::button::secondary("Import browser logins")
+                        .on_press(Message::BrowserImport(browser_import_ui::Action::Open))
+                        .into(),
+                )
+                .label_in_control(),
+                settings_choice(
+                    "Open links in",
+                    "Regular clicks use this destination. Ctrl+click and Ctrl+Shift+click override it.",
+                    SettingsField::LinkOpenDestination,
+                    [
+                        (
+                            "In-app browser",
+                            LinkOpenDestination::IntegratedBrowser.as_str(),
+                            draft.link_open_destination == LinkOpenDestination::IntegratedBrowser,
+                        ),
+                        (
+                            "System default",
+                            LinkOpenDestination::SystemDefault.as_str(),
+                            draft.link_open_destination == LinkOpenDestination::SystemDefault,
+                        ),
+                    ],
+                ),
+                settings_choice(
+                    "System browser gesture",
+                    "The other gesture opens the in-app browser. Both work regardless of the default above.",
+                    SettingsField::LinkOpenGesture,
+                    [
+                        (
+                            "Ctrl+Click",
+                            LinkOpenGesture::ControlClick.as_str(),
+                            draft.link_open_gesture == LinkOpenGesture::ControlClick,
+                        ),
+                        (
+                            "Ctrl+Shift+Click",
+                            LinkOpenGesture::ControlShiftClick.as_str(),
+                            draft.link_open_gesture == LinkOpenGesture::ControlShiftClick,
+                        ),
+                    ],
+                ),
+                settings_choice(
+                    "Open pull requests in",
+                    "Where a pull request row in Projects opens. The review pane fetches the changes and tracks which files you have viewed.",
+                    SettingsField::PullRequestOpenTarget,
+                    [
+                        (
+                            "Review pane",
+                            PullRequestOpenTarget::Review.as_str(),
+                            draft.pull_request_open_target == PullRequestOpenTarget::Review,
+                        ),
+                        (
+                            "Browser link",
+                            PullRequestOpenTarget::Link.as_str(),
+                            draft.pull_request_open_target == PullRequestOpenTarget::Link,
+                        ),
+                    ],
+                ),
+            ],
+        )],
+        SettingsCategory::Keyboard => keyboard_groups(draft, invalid, context.pressed_key),
+    }
+}
+
+fn category_icon(category: SettingsCategory) -> Icon {
+    match category {
+        SettingsCategory::Notifications => Icon::NotificationSettings,
+        SettingsCategory::General => Icon::Settings,
+        SettingsCategory::Appearance => Icon::Display,
+        SettingsCategory::Terminal => Icon::Terminal,
+        SettingsCategory::Links => Icon::WebBrowser,
+        SettingsCategory::Keyboard => Icon::Keyboard,
+        SettingsCategory::NativeChat => Icon::Chat,
+        SettingsCategory::Editor => Icon::TextEditor,
+        SettingsCategory::Accounts => Icon::Users,
+        SettingsCategory::About => Icon::Info,
+    }
+}
+
+fn settings_icon(name: Icon) -> widget::icon::Icon {
+    name.handle().icon().size(16)
+}
+
+fn category_button<'a>(
+    item: SettingsCategory,
+    selected: SettingsCategory,
+    refused: bool,
+) -> Element<'a, Message> {
+    let mut row = crate::ui_controls::list_row(Some(category_icon(item)), item.label())
+        .selected(item == selected)
+        .on_press(Message::SelectSettingsCategory(item));
+    if refused {
+        // Points back to a refused value from wherever the user went next.
+        row = row.trailing(refused_marker()).name(format!(
+            "{}, has a setting that was not saved",
+            item.label()
+        ));
+    }
+    row.into()
+}
+
+/// A small dot in the error tone, beside a category holding a refused value.
+fn refused_marker<'a>() -> Element<'a, Message> {
+    widget::container(iced::widget::Space::new().width(6).height(6))
+        .class(cosmic::theme::Container::custom(|theme| {
+            cosmic::widget::container::Style {
+                background: Some(design::destructive_color(theme).into()),
+                border: cosmic::iced::Border {
+                    radius: 3.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        }))
+        .into()
+}
+
+/// Whether the last edits reached the settings file, beside the page title.
+fn save_status<'a>(
+    feedback: Option<&'a SettingsFeedback>,
+    refused: usize,
+) -> Option<Element<'a, Message>> {
+    let refused_text = |text: String| {
+        design::caption(text)
+            .class(cosmic::theme::Text::Custom(design::destructive_text))
+            .into()
+    };
+    Some(match feedback? {
+        SettingsFeedback::Saved => design::caption("Saved").into(),
+        SettingsFeedback::Pending => design::caption("Saving…").into(),
+        SettingsFeedback::Invalid => refused_text(match refused {
+            1 => "1 setting not saved".to_owned(),
+            count => format!("{count} settings not saved"),
+        }),
+        SettingsFeedback::Error(_) => refused_text("Not saved".to_owned()),
+    })
+}
+
+/// Card width below which the category rail folds above the settings. The
+/// rail needs its own width plus a readable column beside it.
+const RAIL_BREAKPOINT: f32 = 560.0;
+/// The width of the category rail beside the settings.
+const RAIL_WIDTH: f32 = 42.0 * design::GRID_UNIT;
+/// How narrow a shortcut's action name may become beside its keys before the
+/// keys move beneath it: room for a short name, such as "Close pane", or about
+/// half of a long one on each of two lines.
+const SHORTCUT_LABEL_MIN_WIDTH: f32 = 120.0;
+
+/// The settings pane's body. Its layout follows the card's width, which the
+/// user sets per card, not the window's.
+pub(super) fn settings_pane<'a>(
+    category: SettingsCategory,
+    draft: &'a SettingsDraft,
+    query: &'a str,
+    context: SettingsContext<'a>,
+) -> Element<'a, Message> {
+    crate::ui_controls::responsive(move |size| {
+        settings_layout(category, draft, query, &context, size.width)
+    })
+    .into()
+}
+
+fn settings_layout<'a>(
+    category: SettingsCategory,
+    draft: &'a SettingsDraft,
+    query: &'a str,
+    context: &SettingsContext<'a>,
+    width: f32,
+) -> Element<'a, Message> {
+    let (feedback, invalid) = (context.feedback, context.invalid);
+    let content_max_width = if category == SettingsCategory::Keyboard {
+        960.0
+    } else {
+        CONTENT_MAX_WIDTH
+    };
+    let narrow = width < RAIL_BREAKPOINT;
+    let refused = |item: SettingsCategory| invalid.keys().any(|field| field.category() == item);
+    let searching = !query.trim().is_empty();
+    let gutter = if narrow {
+        space::M
+    } else {
+        5.0 * design::GRID_UNIT
+    };
+
+    let mut search = crate::ui_controls::field::search("Search settings", query)
+        .id(crate::settings_widgets::search_id())
+        .on_input(Message::SettingsSearchChanged)
+        .width(Length::Fill);
+    if !query.is_empty() {
+        search = search.trailing_icon(crate::ui_controls::field::clear(
+            Message::SettingsSearchChanged(String::new()),
+        ));
+    }
+    // Whether the page was saved is reported beside whatever names the page:
+    // its title, or in a narrow pane the category picker, so the report never
+    // adds a row that pushes the settings down under the pointer.
+    let mut status = save_status(feedback, invalid.len());
+    let navigation: Element<'a, Message> = if narrow {
+        let mut rows: Vec<Element<'a, Message>> = vec![search.into()];
+        // Search results span every category, so the picker gives its room
+        // to them while a query is active.
+        if !searching {
+            let labels = SettingsCategory::ALL.map(SettingsCategory::label).to_vec();
+            let selected = SettingsCategory::ALL
+                .iter()
+                .position(|item| *item == category);
+            let picker = crate::ui_controls::field::select(labels, selected, |index| {
+                Message::SelectSettingsCategory(SettingsCategory::ALL[index])
+            })
+            .width(Length::Fill)
+            .into();
+            rows.push(
+                widget::row::with_children(std::iter::once(picker).chain(status.take()))
+                    .spacing(space::S)
+                    .align_y(Alignment::Center)
+                    .width(Length::Fill)
+                    .into(),
+            );
+        }
+        widget::container(
+            widget::column::with_children(rows)
+                .spacing(space::XS)
+                .width(Length::Fill),
+        )
+        .padding([space::S, gutter])
+        .width(Length::Fill)
+        .into()
+    } else {
+        // The search field and the rows share one gutter, so the field and
+        // a selected row's highlight span the same width; the scrollbar rail
+        // lives inside the rows' trailing gutter. See `design::list`.
+        let categories = widget::scrollable(
+            widget::container(
+                widget::column::with_children(
+                    SettingsCategory::ALL
+                        .into_iter()
+                        .map(|item| category_button(item, category, refused(item))),
+                )
+                .spacing(space::XXS)
+                .width(Length::Fill),
+            )
+            // The gap below the search field is the list's own leading
+            // padding, so the rows scroll right up to the field.
+            .padding(design::list::scroll_padding(space::XS * 2.0).bottom(space::XS))
+            .width(Length::Fill),
+        )
+        .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
+            crate::design::scrollbar(),
+        ))
+        .class(cosmic::style::iced::Scrollable::Minimal)
+        .width(Length::Fill)
+        .height(Length::Fill);
+        let categories = crate::interaction::overflow_fade_y(categories, design::base);
+        widget::column::with_children(vec![
+            widget::container(search)
+                .padding(design::list::edge_padding(space::M, 0.0))
+                .width(Length::Fill)
+                .into(),
+            categories.into(),
+        ])
+        .width(Length::Fixed(RAIL_WIDTH))
+        .height(Length::Fill)
+        .into()
+    };
+
+    let categories: Vec<_> = if context.pressed_key.is_some() {
+        vec![SettingsCategory::Keyboard]
+    } else if searching {
+        SettingsCategory::ALL.to_vec()
+    } else {
+        vec![category]
+    };
+    let mut results = Vec::new();
+    let mut page_description = None;
+    for category in categories {
+        let filter = if context.pressed_key.is_some()
+            || crate::settings_widgets::matches(category.label(), query)
+        {
+            ""
+        } else {
+            query
+        };
+        let mut groups = settings_category_controls(category, draft, context);
+        // A page with one group of its own name would say it twice, once as
+        // the page title and again, larger, as the section title. Its
+        // description then introduces the page, under the page title.
+        if !searching
+            && let [group] = groups.as_mut_slice()
+            && group.title() == category.label()
+        {
+            page_description = Some(group.untitled()).filter(|detail| !detail.is_empty());
+        }
+        results.extend(
+            groups
+                .into_iter()
+                .filter_map(|group| group.view(category.label(), filter)),
+        );
+    }
+    if context.pressed_key.is_some() && results.len() == 1 {
+        // The filter controls remain available even when no binding matches.
+        results.push(design::body("No matching shortcuts").into());
+    } else if results.is_empty() {
+        results.push(design::body("No matching settings").into());
+    }
+    if let Some(SettingsFeedback::Error(message)) = feedback {
+        // Not any one field's fault, so it leads the page rather than
+        // sitting under a control.
+        results.insert(
+            0,
+            design::body(format!("Settings could not be saved: {message}"))
+                .class(cosmic::theme::Text::Custom(design::destructive_text))
+                .wrapping(iced::widget::text::Wrapping::Word)
+                .width(Length::Fill)
+                .into(),
+        );
+    }
+    // The page title outranks the section titles under it. A narrow page
+    // leaves the category's name, and its save state, to the picker above it.
+    let titled = searching || !narrow;
+    let mut header: Vec<Element<'a, Message>> = Vec::new();
+    if titled || status.is_some() {
+        let title: Element<'a, Message> = if titled {
+            design::display(if searching {
+                "Search results"
+            } else {
+                category.label()
+            })
+            .width(Length::Fill)
+            .into()
+        } else {
+            iced::widget::Space::new().width(Length::Fill).into()
+        };
+        header.push(
+            widget::row::with_children(std::iter::once(title).chain(status))
+                .align_y(Alignment::Center)
+                .spacing(space::S)
+                .width(Length::Fill)
+                // The height of the search field beside it, so the page
+                // title and the field share one centre line.
+                .height(design::DENSE_ROW_HEIGHT)
+                .into(),
+        );
+    }
+    if let Some(description) = page_description {
+        if !header.is_empty() {
+            header.push(
+                iced::widget::Space::new()
+                    .height(design::rhythm::TITLE_TO_DESCRIPTION)
+                    .into(),
+            );
+        }
+        header.push(design::description(description).into());
+    }
+    let header = (!header.is_empty()).then(|| {
+        widget::container(
+            widget::container(widget::column::with_children(header).width(Length::Fill))
+                .max_width(content_max_width),
+        )
+        .padding(iced::Padding {
+            top: space::M,
+            right: gutter,
+            bottom: 0.0,
+            left: gutter,
+        })
+        .width(Length::Fill)
+    });
+    let scroll = widget::scrollable(
+        widget::container(
+            widget::column::with_children(results)
+                .spacing(design::rhythm::SECTION_TO_SECTION)
+                .width(Length::Fill)
+                .max_width(content_max_width),
+        )
+        .padding(iced::Padding {
+            top: design::rhythm::PAGE_TO_SECTION,
+            right: gutter,
+            bottom: space::XL,
+            left: gutter,
+        })
+        .width(Length::Fill),
+    )
+    .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
+        crate::design::scrollbar(),
+    ))
+    .id(crate::settings_widgets::content_id())
+    .class(cosmic::style::iced::Scrollable::Minimal)
+    .width(Length::Fill)
+    .height(Length::Fill);
+    // The title and save state stay put while the page scrolls under them,
+    // fading out beneath the title rather than being cut at its foot.
+    let scroll = crate::interaction::overflow_fade_y(scroll, design::base);
+    let content: Element<'a, Message> =
+        widget::column::with_children(header.map(Element::from).into_iter().chain([scroll]))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
+    if narrow {
+        widget::column::with_children(vec![
+            navigation,
+            crate::design::horizontal_rule().into(),
+            content,
+        ])
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+    } else {
+        widget::row::with_children(vec![
+            navigation,
+            crate::design::vertical_rule().into(),
+            content,
+        ])
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+    }
+}
+
+fn terminal_theme_choice<'a>(selected: &str, has_custom: bool) -> Setting<'a, Message> {
+    let mut choices: Vec<(&str, &str)> = crate::terminal::TerminalTheme::PRESETS
+        .iter()
+        .map(|(_, label, id)| (*label, *id))
+        .collect();
+    if has_custom || selected == "custom" {
+        choices.push(("Custom", "custom"));
+    }
+    let index = choices.iter().position(|(_, id)| *id == selected);
+    let labels: Vec<String> = choices
+        .iter()
+        .map(|(label, _)| (*label).to_owned())
+        .collect();
+    setting_field(
+        "Color theme",
+        "Live terminal colors. Add a custom_terminal_theme table to settings.toml to create your own; application color overrides remain intact.",
+        crate::ui_controls::field::select(labels, index, move |index| Message::SettingsChanged {
+            field: SettingsField::TerminalTheme,
+            value: choices[index].1.to_owned(),
+        })
+        .into(),
+    )
+}
+
+fn shortcut_group(field: SettingsField) -> &'static str {
+    use workspace_widget::GlobalShortcut as Action;
+    match field.shortcut_action().expect("shortcut field") {
+        Action::ChatPermissions | Action::ChatModel | Action::ChatAccount | Action::NewThread => {
+            "Chat"
+        }
+        Action::ReviewToggleViewed
+        | Action::ReviewNextFile
+        | Action::ReviewPreviousFile
+        | Action::ReviewNextUnviewed
+        | Action::ReviewNextChange
+        | Action::ReviewPreviousChange => "Review",
+        Action::CycleWorkspace(_)
+        | Action::CommandPalette
+        | Action::FocusProjectSearch
+        | Action::ToggleProjects
+        | Action::OpenSettings => "Navigation",
+        _ => "Panes",
+    }
+}
+
+fn shortcut_matches_pressed_key(chords: &str, event: Option<&keyboard::Event>) -> bool {
+    event.is_none_or(|event| {
+        settings::parse_chords(chords).iter().any(|chord| {
+            settings::parse_shortcut(chord)
+                .is_ok_and(|binding| workspace_widget::shortcut_event_matches(binding, event))
+        })
+    })
+}
+
+fn fixed_shortcut_matches_pressed_key(
+    fixed: &settings::FixedShortcut,
+    event: Option<&keyboard::Event>,
+) -> bool {
+    let Some(event) = event else {
+        return true;
+    };
+    if let Some(expected) = fixed.font_zoom_delta {
+        let keyboard::Event::KeyPressed {
+            key,
+            physical_key,
+            modifiers,
+            ..
+        } = event
+        else {
+            return false;
+        };
+        return crate::interaction::font_zoom_chord(key, *physical_key, *modifiers)
+            == Some(expected);
+    }
+    fixed
+        .chords
+        .iter()
+        .any(|chord| shortcut_matches_pressed_key(chord, Some(event)))
+}
+
+fn keyboard_groups<'a>(
+    draft: &'a SettingsDraft,
+    invalid: &'a HashMap<SettingsField, String>,
+    pressed_key: Option<&keyboard::Event>,
+) -> Vec<Group<'a, Message>> {
+    let mut groups = vec![settings_group("Keyboard shortcuts", "Leave blank to unbind optional actions. Required actions need at least one chord. Fixed chords belong to native surfaces.", vec![setting_field("Filter shortcuts", "", widget::row::with_children(vec![
+        widget::button::text("Filter by pressed key").on_press(Message::Palette(palette_ui::Action::FilterKey)).into(),
+        widget::button::text("Conflicts").on_press(Message::SettingsSearchChanged("conflicts".into())).into(),
+    ]).spacing(space::S).into()).label_in_control()]).compact()];
+    for group in ["Panes", "Navigation", "Chat", "Review", "Editor"] {
+        let mut rows: Vec<_> = SettingsField::SHORTCUTS
+            .into_iter()
+            .filter(|field| shortcut_group(*field) == group)
+            .filter_map(|field| {
+                let action = field.shortcut_action().expect("shortcut field");
+                let value = draft
+                    .keyboard_shortcuts
+                    .shortcut_values()
+                    .into_iter()
+                    .find(|(candidate, _)| *candidate == action)
+                    .expect("registered draft")
+                    .1;
+                shortcut_matches_pressed_key(value, pressed_key).then(|| {
+                    shortcut_input(
+                        field.label(),
+                        value,
+                        field,
+                        &draft.keyboard_shortcuts,
+                        invalid,
+                    )
+                })
+            })
+            .collect();
+        for fixed in settings::FIXED_SHORTCUTS
+            .iter()
+            .filter(|fixed| fixed.scope == group)
+        {
+            let keys = fixed.chords.join(", ");
+            if !fixed_shortcut_matches_pressed_key(fixed, pressed_key) {
+                continue;
+            }
+            let row = widget::row::with_children(vec![
+                design::body(fixed.label)
+                    .width(Length::FillPortion(3))
+                    .into(),
+                design::caption(keys.clone())
+                    .width(Length::FillPortion(4))
+                    .into(),
+                design::caption("Fixed").width(64).into(),
+            ])
+            .spacing(space::S)
+            .align_y(Alignment::Center);
+            rows.push(
+                setting_field(fixed.label, "", row.into())
+                    .label_in_control()
+                    .keywords(&keys)
+                    .keywords("fixed"),
+            );
+        }
+        if !rows.is_empty() {
+            groups.push(settings_group(group, "Action · Keys · Source", rows).compact());
+        }
+    }
+    groups
+}
+
+/// The Record button of a shortcut row.
+pub(super) fn record_shortcut_button(field: SettingsField) -> widget::Id {
+    widget::Id::new(format!("settings.shortcut.record.{field:?}"))
+}
+
+fn shortcut_input<'a>(
+    label: &'static str,
+    value: &'a str,
+    field: SettingsField,
+    draft: &ShortcutDraft,
+    invalid: &'a HashMap<SettingsField, String>,
+) -> Setting<'a, Message> {
+    let action = field
+        .shortcut_action()
+        .expect("shortcut setting has command");
+    let index = SettingsField::SHORTCUTS
+        .iter()
+        .position(|candidate| *candidate == field)
+        .expect("shortcut index");
+    let chords = settings::parse_chords(value);
+    let default = workspace_widget::shortcut_chords(action, &KeyboardShortcuts::default());
+    let source = if value == default { "Default" } else { "User" };
+    let mut controls: Vec<Element<'a, Message>> = chords
+        .iter()
+        .enumerate()
+        .map(|(index, chord)| {
+            let mut remaining = chords.clone();
+            remaining.remove(index);
+            crate::ui_controls::button::quiet(format!("{chord} ×"))
+                .name(format!("Remove {chord} shortcut for {label}"))
+                .on_press(Message::SettingsDraftChanged {
+                    field,
+                    value: settings::format_chords(&remaining),
+                })
+                .into()
+        })
+        .collect();
+    // Record, Reset and Source end the row as one unit: they never part
+    // across lines, Source keeps its column in every row, and it stays on
+    // the keys' line when they move beneath the action's name.
+    controls.push(
+        widget::row::with_children(vec![
+            widget::row::with_children(vec![
+                crate::ui_controls::icon_button(
+                    Icon::Keyboard,
+                    format!("Record shortcut for {label}"),
+                )
+                .id(record_shortcut_button(field))
+                .compact()
+                .on_press(Message::Palette(palette_ui::Action::Record(field)))
+                .into(),
+                crate::ui_controls::icon_button(Icon::Undo, format!("Reset {label} shortcut"))
+                    .compact()
+                    .on_press_maybe((value != default).then(|| Message::SettingsDraftChanged {
+                        field,
+                        value: default,
+                    }))
+                    .into(),
+            ])
+            .spacing(2)
+            .into(),
+            design::caption(source).width(64).into(),
+        ])
+        .spacing(space::S)
+        .align_y(Alignment::Center)
+        .into(),
+    );
+    let required = if settings::shortcut_required(index) {
+        " · required"
+    } else {
+        ""
+    };
+    let mut error = invalid.get(&field).cloned();
+    if error.is_none() {
+        for chord in &chords {
+            match settings::parse_shortcut(chord) {
+                Err(reason) => {
+                    error = Some(sentence(reason));
+                    break;
+                }
+                Ok(binding) => {
+                    if let Some(reason) = settings::shortcut_chord_refusal(binding) {
+                        error = Some(sentence(reason));
+                        break;
+                    }
+                    if let Some((other, _)) =
+                        draft.shortcut_values().into_iter().find(|(other, value)| {
+                            *other != action
+                                && settings::parse_chords(value).iter().any(|chord| {
+                                    settings::parse_shortcut(chord)
+                                        .is_ok_and(|candidate| candidate == binding)
+                                })
+                        })
+                    {
+                        error = Some(format!(
+                            "Conflicts with {}",
+                            workspace_widget::shortcut_descriptor(other).label
+                        ));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    // The keys and their buttons end the action's line while its name keeps
+    // readable room, and otherwise move beneath the name and wrap there, in
+    // order.
+    let row =
+        crate::ui_controls::labeled_controls(design::body(format!("{label}{required}")), controls)
+            .min_label(SHORTCUT_LABEL_MIN_WIDTH)
+            .spacing(2.0)
+            .label_gap(space::S);
+    let mut children = vec![row.into()];
+    if let Some(reason) = &error {
+        children.push(
+            design::caption(reason.clone())
+                .class(cosmic::theme::Text::Custom(design::destructive_text))
+                .into(),
+        );
+    }
+    let conflict = if error.is_some() {
+        "conflicts unsaved"
+    } else {
+        ""
+    };
+    setting_field(
+        label,
+        "",
+        widget::column::with_children(children).spacing(2).into(),
+    )
+    .label_in_control()
+    .keywords(value)
+    .keywords(settings::shortcut_search_keywords(value))
+    .keywords(format!("keyboard_shortcuts {source} {conflict}"))
+}
+
+#[cfg(test)]
+mod keyboard_table_tests {
+    use super::*;
+
+    #[test]
+    fn default_shortcut_rows_keep_every_control_visible_and_in_order() {
+        use iced::{
+            Rectangle, Size,
+            advanced::{
+                Layout, layout,
+                widget::{Operation, Tree, operation::Focusable},
+            },
+        };
+        #[derive(Default)]
+        struct Controls {
+            label: &'static str,
+            buttons: Vec<Rectangle>,
+            source: Option<Rectangle>,
+            label_bounds: Option<Rectangle>,
+        }
+        impl Operation for Controls {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                _: Option<&widget::Id>,
+                bounds: Rectangle,
+                _: &mut dyn Focusable,
+            ) {
+                self.buttons.push(bounds);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, bounds: Rectangle, text: &str) {
+                if matches!(text, "Default" | "User") {
+                    self.source = Some(bounds);
+                } else if text.starts_with(self.label) {
+                    self.label_bounds = Some(bounds);
+                }
+            }
+        }
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let draft = SettingsDraft::from_settings(&AppSettings::default());
+        let invalid = HashMap::new();
+        for width in [360.0, 560.0] {
+            for field in SettingsField::SHORTCUTS {
+                let action = field.shortcut_action().unwrap();
+                let value = draft
+                    .keyboard_shortcuts
+                    .shortcut_values()
+                    .into_iter()
+                    .find(|(candidate, _)| *candidate == action)
+                    .unwrap()
+                    .1;
+                let row = shortcut_input(
+                    field.label(),
+                    value,
+                    field,
+                    &draft.keyboard_shortcuts,
+                    &invalid,
+                );
+                let mut element = settings_group("Keyboard", "", vec![row])
+                    .compact()
+                    .view("Keyboard", "")
+                    .unwrap();
+                let mut tree = Tree::new(element.as_widget());
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::new(width, 0.0), Size::new(width, 1000.0)),
+                );
+                let mut controls = Controls {
+                    label: field.label(),
+                    ..Controls::default()
+                };
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut controls,
+                );
+                assert_eq!(
+                    controls.buttons.len(),
+                    settings::parse_chords(value).len() + 2
+                );
+                for bounds in &controls.buttons {
+                    assert!(
+                        bounds.width > 0.0 && bounds.height > 0.0,
+                        "{field:?} at{width}: empty native control {bounds:?}"
+                    );
+                    assert!(
+                        bounds.x >= 0.0 && bounds.x + bounds.width <= width + 0.1,
+                        "{field:?} at{width}: clipped native control {bounds:?}"
+                    );
+                }
+                // Chips may wrap in a narrow pane, but in reading order: each
+                // follows the previous one on its line or starts a lower line.
+                for pair in controls.buttons.windows(2) {
+                    let same_line = (pair[0].center_y() - pair[1].center_y()).abs() < 4.1;
+                    assert!(
+                        if same_line {
+                            pair[0].x + pair[0].width <= pair[1].x + 0.1
+                        } else {
+                            pair[1].y >= pair[0].y + pair[0].height - 0.1
+                        },
+                        "{field:?} at{width}: controls out of order {:?}",
+                        controls.buttons
+                    );
+                }
+                // Record and Reset stay together after the last chip.
+                let [.., record, reset] = controls.buttons[..] else {
+                    unreachable!("every row has Record and Reset");
+                };
+                assert!(
+                    (record.center_y() - reset.center_y()).abs() < 0.1,
+                    "{field:?} at{width}: Record and Reset separated {:?}",
+                    controls.buttons
+                );
+                let label = controls
+                    .label_bounds
+                    .expect("the action label remains visible");
+                // The name sits before the controls on their line, or above
+                // them once they move beneath it; it never overlaps one.
+                assert!(
+                    label.width > 0.0
+                        && controls.buttons.iter().all(|bounds| {
+                            label.x + label.width <= bounds.x + 0.1
+                                || label.y + label.height <= bounds.y + 0.1
+                        }),
+                    "{field:?} at{width}: label {label:?} meets {:?}",
+                    controls.buttons
+                );
+                if width == 560.0 {
+                    let center = controls.buttons[0].center_y();
+                    assert!(
+                        label.x + label.width <= controls.buttons[0].x + 0.1,
+                        "{field:?} at{width}: keys left the name's line {label:?} {:?}",
+                        controls.buttons
+                    );
+                    assert!(
+                        controls
+                            .buttons
+                            .iter()
+                            .all(|bounds| (bounds.center_y() - center).abs() < 4.1),
+                        "{field:?} at{width}: controls wrapped {:?}",
+                        controls.buttons
+                    );
+                }
+                let source = controls.source.expect("Source remains visible");
+                assert!(source.width > 0.0 && source.height > 0.0);
+                assert!(source.x >= 0.0 && source.x + source.width <= width + 0.1);
+                assert!(
+                    reset.x + reset.width <= source.x + 0.1
+                        && (source.center_y() - reset.center_y()).abs() < 4.1,
+                    "{field:?} at{width}: Source {source:?} left Reset {reset:?}"
+                );
+                if width == 560.0 {
+                    assert!(
+                        node.size().height <= 64.0,
+                        "{field:?} atwide table must stay compact: {:?}",
+                        node.size()
+                    );
+                }
+            }
+        }
+    }
+
+    /// Focusable controls and their bounds, in traversal order. A text field
+    /// reports itself as focusable too.
+    #[derive(Default)]
+    struct Focusables(Vec<iced::Rectangle>, Vec<(String, iced::Rectangle)>);
+
+    impl iced::advanced::widget::Operation for Focusables {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation)) {
+            visit(self);
+        }
+        fn focusable(
+            &mut self,
+            _: Option<&widget::Id>,
+            bounds: iced::Rectangle,
+            _: &mut dyn iced::advanced::widget::operation::Focusable,
+        ) {
+            self.0.push(bounds);
+        }
+        fn text(&mut self, _: Option<&widget::Id>, bounds: iced::Rectangle, text: &str) {
+            self.1.push((text.to_owned(), bounds));
+        }
+    }
+
+    fn laid_out_settings(category: SettingsCategory, width: f32) -> Vec<iced::Rectangle> {
+        laid_out(category, width).0
+    }
+
+    /// The focusable controls and the text runs of a settings page laid out
+    /// at `width`.
+    fn laid_out(category: SettingsCategory, width: f32) -> Focusables {
+        laid_out_with(category, width, None)
+    }
+
+    fn laid_out_with(
+        category: SettingsCategory,
+        width: f32,
+        feedback: Option<&SettingsFeedback>,
+    ) -> Focusables {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let draft = SettingsDraft::from_settings(&AppSettings::default());
+        let invalid = HashMap::new();
+        let context = SettingsContext {
+            feedback,
+            invalid: &invalid,
+            pressed_key: None,
+            accounts: Vec::new(),
+            updates: update_ui::UpdateSummary {
+                status: String::new(),
+                failed: false,
+                checking: false,
+                can_check: false,
+                available: None,
+                apply_blocker: None,
+                detail: String::new(),
+            },
+            testing_notification: false,
+        };
+        let mut element = settings_layout(category, &draft, "", &context, width);
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 2000.0)),
+        );
+        let mut found = Focusables::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut found);
+        found
+    }
+
+    /// Reporting that a change was saved adds no row: the controls stay where
+    /// they were, so a second click on a stepper lands on the same control.
+    #[test]
+    fn saving_does_not_move_the_settings_under_the_pointer() {
+        for width in [400.0, 900.0] {
+            let category = SettingsCategory::Appearance;
+            let unsaved = laid_out_with(category, width, None);
+            let saved = laid_out_with(category, width, Some(&SettingsFeedback::Saved));
+            assert_eq!(unsaved.0, saved.0, "controls moved at {width}");
+            assert!(
+                saved.1.iter().any(|(text, _)| text == "Saved"),
+                "no save report at {width}"
+            );
+        }
+    }
+
+    /// A wide page is titled with its category; a narrow one leaves that to
+    /// the category picker above it rather than naming the page twice. A
+    /// page whose only group shares its name keeps that group's description,
+    /// set once, above its settings.
+    #[test]
+    fn a_page_names_its_category_once_at_every_width() {
+        let category = SettingsCategory::NativeChat;
+        for (width, titles) in [(900.0, 1), (400.0, 0)] {
+            let texts = laid_out(category, width).1;
+            let display = texts
+                .iter()
+                .filter(|(text, bounds)| {
+                    text == category.label() && bounds.height == design::LINE_DISPLAY
+                })
+                .count();
+            assert_eq!(display, titles, "page titles at {width}");
+            let sections = texts
+                .iter()
+                .filter(|(text, bounds)| {
+                    text == category.label() && bounds.height == design::LINE_TITLE
+                })
+                .count();
+            assert_eq!(sections, 0, "section titled like its page at {width}");
+            let description = texts
+                .iter()
+                .filter(|(text, _)| text.starts_with("Message composition"))
+                .count();
+            assert_eq!(description, 1, "page description at {width}");
+        }
+    }
+
+    #[test]
+    fn category_rows_span_the_search_field_and_share_its_text_column() {
+        let found = laid_out_settings(SettingsCategory::Appearance, 900.0);
+        let search = found[0];
+        assert_eq!(search.x, design::list::GUTTER);
+        let rows: Vec<_> = found
+            .iter()
+            .skip(1)
+            .take(SettingsCategory::ALL.len())
+            .collect();
+        assert_eq!(rows.len(), SettingsCategory::ALL.len());
+        for row in rows {
+            assert_eq!(row.x, search.x, "{row:?} against {search:?}");
+            assert_eq!(row.width, search.width, "{row:?} against {search:?}");
+            assert_eq!(row.height, design::ROW_HEIGHT);
+        }
+        assert_eq!(
+            search.x + search.width,
+            RAIL_WIDTH - design::list::GUTTER,
+            "the field and the rows end one gutter before the rail's edge"
+        );
+    }
+
+    #[test]
+    fn every_control_stays_inside_the_pane_at_every_width() {
+        for category in SettingsCategory::ALL {
+            for width in [320.0, 480.0, 560.0, 720.0, 1200.0] {
+                for bounds in laid_out_settings(category, width) {
+                    assert!(
+                        bounds.x >= 0.0 && bounds.x + bounds.width <= width + 0.5,
+                        "{category:?} at {width}: control {bounds:?} leaves the pane",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn key_filter_includes_fixed_rows_and_all_matching_registered_actions() {
+        let mut draft = SettingsDraft::from_settings(&AppSettings::default());
+        draft.keyboard_shortcuts.rename_pane = "Ctrl+Tab".into();
+        draft.keyboard_shortcuts.chat_model = "Ctrl+Tab".into();
+        let invalid = HashMap::new();
+        let groups = keyboard_groups(&draft, &invalid, None);
+        let matches = groups
+            .into_iter()
+            .filter_map(|group| group.view("Keyboard", "Ctrl+Tab"))
+            .count();
+        assert_eq!(
+            matches, 3,
+            "the pane action, chat action and fixed navigation row all match"
+        );
+        assert_eq!(
+            keyboard_groups(&draft, &invalid, None)
+                .into_iter()
+                .filter_map(|group| group.view("Keyboard", "Ctrl+="))
+                .count(),
+            1
+        );
+        draft.keyboard_shortcuts.rename_pane = "Control + F8".into();
+        draft.keyboard_shortcuts.chat_model = "F8 + Control".into();
+        assert_eq!(
+            keyboard_groups(&draft, &invalid, None)
+                .into_iter()
+                .filter_map(|group| group.view("Keyboard", "Ctrl+F8"))
+                .count(),
+            2,
+            "pressed keys find accepted aliases and modifier order"
+        );
+
+        // A real pressed-key filter must retain the event: the same shifted
+        // number key can match both numeric and symbol bindings.
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.settings_draft.keyboard_shortcuts.rename_pane = "Ctrl+Shift+1".into();
+        app.settings_draft.keyboard_shortcuts.chat_model = "Ctrl+Shift+!".into();
+        let press = |value: &str, modified: &str, code, modifiers| keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character(value.into()),
+            modified_key: keyboard::Key::Character(modified.into()),
+            physical_key: keyboard::key::Physical::Code(code),
+            location: keyboard::Location::Standard,
+            modifiers,
+            text: None,
+            repeat: false,
+        };
+        // Native iced-winit events carry key_without_modifiers separately
+        // from the logical key after Shift.
+        let shifted = press(
+            "1",
+            "!",
+            keyboard::key::Code::Digit1,
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+        );
+        drop(app.update_palette(palette_ui::Action::FilterKey));
+        drop(app.palette_key_event(&shifted));
+        assert_eq!(app.settings_search, "Ctrl+Shift+1");
+        assert_eq!(
+            keyboard_groups(
+                &app.settings_draft,
+                &app.settings_invalid,
+                app.palette.pressed_key_filter()
+            )
+            .into_iter()
+            .filter_map(|group| group.view("Keyboard", ""))
+            .count(),
+            3,
+            "filter controls and both numeric/symbol action groups are visible"
+        );
+        for chord in ["Ctrl+Shift+1", "Ctrl+Shift+!"] {
+            assert!(shortcut_matches_pressed_key(
+                chord,
+                app.palette.pressed_key_filter()
+            ));
+        }
+        drop(app.update_palette(palette_ui::Action::FilterKey));
+        drop(app.palette_key_event(&keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        }));
+        assert!(!app.palette.is_open());
+        assert_eq!(app.settings_search, "Ctrl+Shift+1");
+        assert_eq!(
+            keyboard_groups(
+                &app.settings_draft,
+                &app.settings_invalid,
+                app.palette.pressed_key_filter()
+            )
+            .len(),
+            3,
+            "cancelling replacement capture preserves both previous match groups"
+        );
+        for chord in ["Ctrl+Shift+1", "Ctrl+Shift+!"] {
+            assert!(shortcut_matches_pressed_key(
+                chord,
+                app.palette.pressed_key_filter()
+            ));
+        }
+        drop(app.update_palette(palette_ui::Action::FilterKey));
+        drop(app.palette_key_event(&press(
+            "1",
+            "1",
+            keyboard::key::Code::Numpad1,
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+        )));
+        assert_eq!(
+            keyboard_groups(
+                &app.settings_draft,
+                &app.settings_invalid,
+                app.palette.pressed_key_filter()
+            )
+            .len(),
+            1,
+            "a numpad digit matches neither the number-row nor symbol binding"
+        );
+        // This covers a source-admitted logical-zero event, not a claim about
+        // the default native keypad layout. XKB may instead emit unmodified
+        // Insert with modified_key 0, which the actual zoom handler rejects.
+        let keypad_reset = press(
+            "0",
+            "0",
+            keyboard::key::Code::Numpad0,
+            keyboard::Modifiers::CTRL,
+        );
+        assert_eq!(
+            crate::interaction::font_zoom_chord(
+                &keyboard::Key::Character("0".into()),
+                keyboard::key::Physical::Code(keyboard::key::Code::Numpad0),
+                keyboard::Modifiers::CTRL,
+            ),
+            Some(0),
+            "the actual native handler accepts this logical keypad zero"
+        );
+        drop(app.update_palette(palette_ui::Action::FilterKey));
+        drop(app.palette_key_event(&keypad_reset));
+        assert_eq!(app.settings_search, "Ctrl+0");
+        assert!(
+            !shortcut_matches_pressed_key("Ctrl+0", app.palette.pressed_key_filter()),
+            "configurable digit bindings still require the number row"
+        );
+        let fixed_matches: Vec<_> = settings::FIXED_SHORTCUTS
+            .iter()
+            .filter(|fixed| {
+                fixed_shortcut_matches_pressed_key(fixed, app.palette.pressed_key_filter())
+            })
+            .map(|fixed| fixed.label)
+            .collect();
+        assert_eq!(fixed_matches, ["Reset font size"]);
+        assert_eq!(
+            keyboard_groups(
+                &app.settings_draft,
+                &app.settings_invalid,
+                app.palette.pressed_key_filter()
+            )
+            .len(),
+            2,
+            "the pressed keypad filter renders its controls and the actual fixed reset row"
+        );
+
+        drop(app.update_palette(palette_ui::Action::FilterKey));
+        drop(app.palette_key_event(&press(
+            "à",
+            "à",
+            keyboard::key::Code::Digit0,
+            keyboard::Modifiers::CTRL,
+        )));
+        assert_eq!(app.settings_search, "Ctrl+0");
+        assert!(shortcut_matches_pressed_key(
+            "Ctrl+0",
+            app.palette.pressed_key_filter()
+        ));
+        assert_eq!(
+            keyboard_groups(
+                &app.settings_draft,
+                &app.settings_invalid,
+                app.palette.pressed_key_filter()
+            )
+            .len(),
+            2,
+            "filter controls and fixed Reset font size remain visible"
+        );
+        drop(app.update(Message::SettingsSearchChanged("typed query".into())));
+        assert!(app.palette.pressed_key_filter().is_none());
+        drop(app.update_palette(palette_ui::Action::FilterKey));
+        drop(app.palette_key_event(&shifted));
+        drop(app.update(Message::SelectSettingsCategory(SettingsCategory::Keyboard)));
+        assert!(app.palette.pressed_key_filter().is_none());
+    }
+}
+
+/// Observe preferences another window may change while this one is open - the
+/// sidebar's worktree display, the account usage display and which routine
+/// questions are asked - off the UI thread. The subscription restarts after a
+/// local save, so a skipped observation during that save is read again.
+pub(super) fn shared_preferences_stream(
+    path: Option<PathBuf>,
+) -> impl cosmic::iced::futures::Stream<Item = AppSettings> {
+    use cosmic::iced::futures::SinkExt;
+    cosmic::iced::stream::channel(1, async move |mut output| {
+        let Some(path) = path else {
+            return;
+        };
+        let mut previous = None;
+        let mut stamp = None;
+        loop {
+            let path = path.clone();
+            let old_stamp = stamp;
+            let loaded = tokio::task::spawn_blocking(move || {
+                use std::os::unix::fs::MetadataExt;
+                let metadata = std::fs::metadata(&path).ok()?;
+                let next_stamp = (
+                    metadata.ino(),
+                    metadata.mtime(),
+                    metadata.mtime_nsec(),
+                    metadata.len(),
+                );
+                if old_stamp == Some(next_stamp) {
+                    return None;
+                }
+                settings::load(path)
+                    .ok()
+                    .map(|settings| (next_stamp, settings))
+            })
+            .await;
+            if let Ok(Some((next_stamp, settings))) = loaded {
+                stamp = Some(next_stamp);
+                let current = (
+                    settings.sidebar_worktrees,
+                    settings.sidebar_worktree_overrides.clone(),
+                    settings.account_usage_display,
+                    settings::Confirmation::ALL.map(|kind| settings.asks(kind)),
+                    settings.sidebar_worktrees_when_shown,
+                );
+                if previous.as_ref() != Some(&current) {
+                    previous = Some(current);
+                    if output.send(settings).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn shared_preferences_observes_account_usage_display_changes_without_sidebar_changes() {
+        use cosmic::iced::futures::{StreamExt, pin_mut};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut settings = AppSettings::default();
+        settings::save(&path, &settings).unwrap();
+        let stream = shared_preferences_stream(Some(path.clone()));
+        pin_mut!(stream);
+        let initial = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            initial.account_usage_display,
+            settings::AccountUsageDisplay::Left
+        );
+        settings.account_usage_display = settings::AccountUsageDisplay::Used;
+        settings::save(&path, &settings).unwrap();
+        let observed = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            observed.account_usage_display,
+            settings::AccountUsageDisplay::Used
+        );
+        assert_eq!(observed.sidebar_worktrees, initial.sidebar_worktrees);
+        assert_eq!(
+            observed.sidebar_worktree_overrides,
+            initial.sidebar_worktree_overrides
+        );
+    }
+
+    #[tokio::test]
+    async fn sidebar_preferences_observes_global_and_project_changes() {
+        use cosmic::iced::futures::{StreamExt, pin_mut};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let initial = AppSettings::default();
+        settings::save(&path, &initial).unwrap();
+        let stream = shared_preferences_stream(Some(path.clone()));
+        pin_mut!(stream);
+        let first = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.sidebar_worktrees, settings::SidebarWorktrees::Grouped);
+        let mut changed = initial;
+        let project = ProjectId::new();
+        changed.sidebar_worktrees = settings::SidebarWorktrees::Hidden;
+        changed
+            .sidebar_worktree_overrides
+            .insert(project, settings::SidebarWorktrees::Expanded);
+        settings::save(&path, &changed).unwrap();
+        let observed = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            observed.sidebar_worktrees,
+            settings::SidebarWorktrees::Hidden
+        );
+        assert_eq!(
+            observed.sidebar_worktree_overrides.get(&project),
+            Some(&settings::SidebarWorktrees::Expanded)
+        );
+    }
+}

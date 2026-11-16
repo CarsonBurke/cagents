@@ -448,7 +448,7 @@ class Profiles(unittest.TestCase):
 
 
 STUB = """\
-#!/usr/bin/env python3
+#!/usr/bin/python3
 import json, os, sys
 log = os.environ["STUB_LOG"]
 runtime = os.environ.get("XDG_RUNTIME_DIR")

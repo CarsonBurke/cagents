@@ -1,8 +1,10 @@
 #[cfg(feature = "host")]
 pub(crate) mod adopted_orphans;
+#[cfg(feature = "host")]
+pub(crate) mod child_events;
 #[cfg(all(feature = "host", target_os = "linux"))]
 pub(crate) mod child_reaper;
-pub(crate) mod holder_registry;
+pub mod holder_registry;
 pub(crate) mod hosting;
 pub(crate) mod lease_handoff;
 #[cfg(feature = "host")]
@@ -204,7 +206,7 @@ fn wait_for_activity_until_with(
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum PlatformError {
+pub enum PlatformError {
     #[error("XDG_RUNTIME_DIR is not set to an absolute path")]
     MissingRuntimeDirectory,
     #[error("runtime path {path:?} is not owned by the current user")]
@@ -251,16 +253,13 @@ impl RuntimePaths {
 /// Serializes recovery discovery through confirmed attachment across all UIs.
 /// The file is never unlinked; only its owning guard releases the flock.
 #[cfg(feature = "ui")]
-pub(crate) struct RecoveryLease {
+pub struct RecoveryLease {
     lock: File,
 }
 
 #[cfg(feature = "ui")]
 impl RecoveryLease {
-    pub(crate) fn acquire(
-        socket: &Path,
-        timeout: std::time::Duration,
-    ) -> Result<Self, PlatformError> {
+    pub fn acquire(socket: &Path, timeout: std::time::Duration) -> Result<Self, PlatformError> {
         let directory_path = socket.parent().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -340,7 +339,9 @@ impl Drop for RecoveryLease {
     }
 }
 
-pub(crate) struct HostLease {
+/// The daemon's exclusive lease on its instance, released when dropped.
+#[doc(hidden)]
+pub struct HostLease {
     socket_path: PathBuf,
     lock: File,
     shared_handoff: bool,
@@ -452,7 +453,22 @@ impl HostLease {
     /// A window seeding the instance holds it too, so no daemon starts while
     /// the window writes.
     #[cfg(any(debug_assertions, feature = "development"))]
-    pub(crate) fn acquire_for_seeding(paths: &RuntimePaths) -> Result<Self, PlatformError> {
+    #[doc(hidden)]
+    pub fn acquire_for_seeding() -> Result<Self, String> {
+        let paths = RuntimePaths::discover().map_err(|error| error.to_string())?;
+        Self::acquire_for_seeding_at(&paths).map_err(|error| match error {
+            PlatformError::AlreadyRunning { path } => format!(
+                "A cagents daemon is running for this instance ({}). Stop it before seeding: \
+                 `scripts/run-development --stop-instance NAME` for an instance, or stop the \
+                 native-evidence session.",
+                path.display()
+            ),
+            error => error.to_string(),
+        })
+    }
+
+    #[cfg(any(debug_assertions, feature = "development"))]
+    fn acquire_for_seeding_at(paths: &RuntimePaths) -> Result<Self, PlatformError> {
         #[cfg(feature = "host")]
         prepare_runtime_directory(&paths.directory)?;
         #[cfg(not(feature = "host"))]
@@ -764,10 +780,7 @@ pub(crate) fn running_executable_at(
 /// Authenticate the current socket against the daemon's exclusive lease before
 /// using a new incarnation as evidence that an old owner has been replaced.
 /// Merely reaching a socket (or receiving a proof mismatch) is not authority.
-pub(crate) fn replacement_owner(
-    socket: &Path,
-    proof: &HostSessionProof,
-) -> Result<u32, PlatformError> {
+pub fn replacement_owner(socket: &Path, proof: &HostSessionProof) -> Result<u32, PlatformError> {
     let pid = lease_owner(&socket.with_file_name("cagentsd.lock"), proof)?;
     let stream = UnixStream::connect(socket)?;
     let mut credential: libc::ucred = unsafe { std::mem::zeroed() };
@@ -797,6 +810,30 @@ pub(crate) fn lease_owner(
     lock_path: &Path,
     proof: &HostSessionProof,
 ) -> Result<u32, PlatformError> {
+    lease_owner_process(lock_path, proof).map(|(pid, _)| pid)
+}
+
+/// Pin the authenticated serving owner before requesting shutdown. The pidfd
+/// survives lease release and cannot follow a replacement or a reused PID.
+pub(crate) struct ShutdownTarget {
+    process: File,
+}
+
+impl ShutdownTarget {
+    pub(crate) fn pin(socket: &Path, proof: &HostSessionProof) -> Result<Self, PlatformError> {
+        let (_, process) = lease_owner_process(&socket.with_file_name("cagentsd.lock"), proof)?;
+        Ok(Self { process })
+    }
+
+    pub(crate) fn wait(&self, timeout: std::time::Duration) -> io::Result<bool> {
+        wait_process(&self.process, timeout)
+    }
+}
+
+fn lease_owner_process(
+    lock_path: &Path,
+    proof: &HostSessionProof,
+) -> Result<(u32, File), PlatformError> {
     #[derive(Deserialize)]
     struct RecoveryMetadata {
         pid: u32,
@@ -822,8 +859,8 @@ pub(crate) fn lease_owner(
     if !proof.is_complete() || metadata.proof != *proof || read_boot_id()? != proof.boot_id {
         return Err(io::Error::other("daemon lease does not match its discovery proof").into());
     }
-    let _pidfd = open_validated_pidfd(&lock, metadata.pid, Path::new("/proc"))?;
-    Ok(metadata.pid)
+    let process = open_validated_pidfd(&lock, metadata.pid, Path::new("/proc"))?;
+    Ok((metadata.pid, process))
 }
 
 /// Sends SIGTERM to the daemon identified by the current instance's lock.
@@ -871,13 +908,13 @@ pub(crate) fn terminate_daemon_from_lock() -> Result<bool, PlatformError> {
 /// inherit the person's approval merely by acquiring the same lock pathname.
 #[cfg(feature = "ui")]
 #[derive(Debug)]
-pub(crate) struct RestartTarget {
+pub struct RestartTarget {
     process: File,
     proof: HostSessionProof,
 }
 
 #[cfg(feature = "ui")]
-pub(crate) fn restart_target() -> Result<RestartTarget, PlatformError> {
+pub fn restart_target() -> Result<RestartTarget, PlatformError> {
     restart_target_at(&RuntimePaths::discover()?)
 }
 
@@ -910,8 +947,9 @@ fn restart_target_at(paths: &RuntimePaths) -> Result<RestartTarget, PlatformErro
 impl RestartTarget {
     /// An inert UI state-machine fixture. The regular file cannot name or
     /// signal a process; tests must drop restart tasks without polling them.
-    #[cfg(test)]
-    pub(crate) fn inert_for_ui_test() -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn inert_for_ui_test() -> Self {
         Self {
             process: tempfile::tempfile().expect("inert restart fixture"),
             proof: HostSessionProof {
@@ -924,7 +962,7 @@ impl RestartTarget {
 
     /// Try graceful termination, then finish the same confirmed process if it
     /// cannot respond. The kernel descriptor fences PID reuse throughout.
-    pub(crate) fn terminate(&self) -> Result<(), PlatformError> {
+    pub fn terminate(&self) -> Result<(), PlatformError> {
         self.terminate_at(
             &RuntimePaths::discover()?,
             std::time::Duration::from_secs(5),
@@ -976,7 +1014,6 @@ fn signal_process(process: &File, signal: c_int) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "ui")]
 fn wait_process(process: &File, duration: std::time::Duration) -> io::Result<bool> {
     let deadline = std::time::Instant::now() + duration;
     loop {
@@ -992,7 +1029,10 @@ fn wait_process(process: &File, duration: std::time::Duration) -> io::Result<boo
             libc::poll(
                 &mut poll,
                 1,
-                remaining.as_millis().min(i32::MAX as u128) as i32,
+                remaining
+                    .as_nanos()
+                    .div_ceil(1_000_000)
+                    .min(i32::MAX as u128) as i32,
             )
         };
         if result > 0 {
@@ -1182,7 +1222,7 @@ pub(crate) fn current_uid() -> u32 {
 
 /// Called only in a child's pre-exec hook. Long-lived sibling processes must
 /// not retain installer assets, update leases, or other inherited descriptors.
-pub(crate) fn seal_inherited_descriptors() -> io::Result<()> {
+pub fn seal_inherited_descriptors() -> io::Result<()> {
     // SAFETY: close_range takes scalar bounds and only changes descriptor flags.
     if unsafe { libc::close_range(3, u32::MAX, libc::CLOSE_RANGE_CLOEXEC as libc::c_int) } != 0 {
         return Err(io::Error::last_os_error());
@@ -1219,7 +1259,7 @@ pub(crate) fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
     Ok(credentials.uid)
 }
 
-pub(crate) fn read_boot_id() -> io::Result<BootId> {
+pub fn read_boot_id() -> io::Result<BootId> {
     let value = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
     let value = value.trim();
     if value.is_empty() || value.len() > 128 {
@@ -1274,8 +1314,9 @@ pub(crate) fn termination_requested() -> bool {
     TERMINATION_REQUESTED.load(Ordering::Acquire)
 }
 
-#[cfg(test)]
-pub(crate) fn shut_down_test_listener(listener: std::os::unix::net::UnixListener) {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn shut_down_test_listener(listener: std::os::unix::net::UnixListener) {
     // Concurrent tests may fork before CLOEXEC closes an inherited copy.
     // Shut down the shared socket so every retained descriptor refuses connections.
     // SAFETY: the listener owns this live socket descriptor.

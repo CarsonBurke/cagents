@@ -159,6 +159,15 @@ impl RawClient {
                 .unwrap()
                 .expect("the daemon closed the connection before replying");
             assert_eq!(envelope.version, self.protocol, "{envelope:?}");
+            if self.protocol == CANDIDATE_LINE_PROTOCOL {
+                assert!(
+                    !matches!(
+                        &envelope.message,
+                        ServerMessage::WorkspaceModelEdited { .. }
+                    ),
+                    "an older watch must be refused before subscribing: {envelope:?}"
+                );
+            }
             if envelope.request_id == Some(request_id) {
                 return envelope.message;
             }
@@ -226,6 +235,58 @@ fn older_cli_session() {
             response: ServerResponse::Agent(Reply::Listed(agents)),
         } => assert!(agents.is_empty()),
         other => panic!("unexpected agent list reply: {other:?}"),
+    }
+
+    // A model watch now delivers a snapshot with closed identities and edges
+    // with scope revisions. Refuse that watch before it subscribes, while
+    // keeping the old explicit read/write requests and full replies intact.
+    let refused = older.request(ClientRequest::WatchWorkspaceModel);
+    assert!(
+        unsupported_version(&refused).contains("Start a new session"),
+        "{refused:?}"
+    );
+    let repository = socket.parent().unwrap().to_owned();
+    let edited = match older.request(ClientRequest::EditWorkspaceModel {
+        edit: cagents::workspace_model::ModelEdit::OpenProject {
+            repository: repository.clone(),
+            name: "Legacy client workspace".into(),
+            kind: cagents::model::ProjectKind::Folder,
+        },
+    }) {
+        ServerMessage::Response {
+            response: ServerResponse::WorkspaceModel { model },
+        } => model,
+        other => panic!("the older edit must retain its full-model reply: {other:?}"),
+    };
+    assert_eq!(edited.projects.len(), 1);
+    assert_eq!(edited.projects[0].repository, repository);
+    match older.request(ClientRequest::ReadWorkspaceModel) {
+        ServerMessage::Response {
+            response: ServerResponse::WorkspaceModel { model },
+        } => assert_eq!(model, edited),
+        other => panic!("the older read must retain its full-model reply: {other:?}"),
+    }
+    // A different client commits through the new delta API. The refused old
+    // watch must leave no changed notification ahead of its next legacy reply.
+    let mut current = RawClient::connect(&socket, PROTOCOL_VERSION);
+    current.handshake();
+    assert!(matches!(
+        current.request(ClientRequest::ApplyWorkspaceEdit {
+            edit: cagents::workspace_model::ModelEdit::OpenProject {
+                repository,
+                name: "Updated by the current client".into(),
+                kind: cagents::model::ProjectKind::Folder,
+            },
+        }),
+        ServerMessage::Response {
+            response: ServerResponse::WorkspaceEdit(_)
+        }
+    ));
+    match older.request(ClientRequest::ReadWorkspaceModel) {
+        ServerMessage::Response {
+            response: ServerResponse::WorkspaceModel { model },
+        } => assert_eq!(model.projects[0].name, "Updated by the current client"),
+        other => panic!("the older read must survive a concurrent current write: {other:?}"),
     }
 
     // It may not stop or update a daemon it was not built for; the refusal

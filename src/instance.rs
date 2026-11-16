@@ -1,6 +1,6 @@
 #[cfg(test)]
 use crate::flock::fdinfo_owns_lock as fdinfo_owns_slot;
-use crate::flock::{flock_owner, process_owns_lock as process_owns_slot};
+use crate::flock::process_owns_lock as process_owns_slot;
 use std::{
     env,
     fs::{self, File, OpenOptions},
@@ -29,10 +29,13 @@ use std::{
 mod daemon_admission;
 #[doc(hidden)]
 pub mod ui_options;
+#[cfg(any(feature = "host", test))]
+pub(crate) use daemon_admission::AdmissionFence;
+#[cfg(feature = "host")]
+pub(crate) use daemon_admission::DaemonAdmissionGuard;
 pub use daemon_admission::DaemonStillStarting;
 pub(crate) use daemon_admission::{
-    AdmissionFence, DAEMON_FENCE_ENV, DaemonAdmissionGuard, LaunchFence, daemon_launch_is_updating,
-    inherit_daemon_fence,
+    DAEMON_FENCE_ENV, LaunchFence, daemon_launch_is_updating, inherit_daemon_fence,
 };
 
 use directories::ProjectDirs;
@@ -139,7 +142,7 @@ pub fn window_restore_policy() -> WindowRestorePolicy {
         })
 }
 
-pub(crate) fn window_launch_restore_policy() -> WindowRestorePolicy {
+pub fn window_launch_restore_policy() -> WindowRestorePolicy {
     WINDOW_RESTORE_POLICY
         .get()
         .map_or(WindowRestorePolicy::Ordinary, |restore| restore.launch)
@@ -148,7 +151,7 @@ pub(crate) fn window_launch_restore_policy() -> WindowRestorePolicy {
 /// The startup gate reached its saved-pane verdict, including an incomplete
 /// recovery. Later work uses ordinary admission; already-issued pane tasks
 /// retain their explicitly captured attachment-only intent.
-pub(crate) fn finish_window_restore() {
+pub fn finish_window_restore() {
     if let Some(restore) = WINDOW_RESTORE_POLICY.get() {
         restore.finished.store(true, Ordering::Release);
     }
@@ -177,7 +180,7 @@ pub fn validate_window_slot(slot: &str) -> io::Result<()> {
     Ok(())
 }
 
-pub(crate) fn runtime_directory() -> io::Result<PathBuf> {
+pub fn runtime_directory() -> io::Result<PathBuf> {
     let path = env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
@@ -221,7 +224,7 @@ fn destination_socket_name(destination: &crate::notifications::Destination) -> S
 /// file description and has not reached exec yet. Closing a File alone does
 /// not release flock until every inherited descriptor has also closed.
 #[derive(Debug)]
-pub(crate) struct OwnedLock(Option<File>);
+pub struct OwnedLock(Option<File>);
 
 impl std::ops::Deref for OwnedLock {
     type Target = File;
@@ -593,7 +596,7 @@ pub fn install_panic_hook_with_version(product: &'static str, version: &'static 
         let Some(recovered) = crate::runtime_state::begin_panic_report() else {
             return;
         };
-        crate::diagnostics::record_panic(recovered);
+        crate::diagnostics::record_panic(recovered, panic);
         // Payloads/backtraces can contain secrets. Only a user-requested local
         // debug capture invokes the raw default hook.
         if crate::diagnostics::local_debug() {
@@ -972,6 +975,7 @@ pub(crate) fn window_protection_ready() -> io::Result<OwnedLock> {
 
 /// Blocks new windows while automatic cleanup authenticates existing owners.
 /// Windows launched meanwhile wait for it rather than report an update.
+#[cfg(feature = "host")]
 pub(crate) fn worktree_mutation_launch_fence() -> io::Result<AdmissionFence> {
     AdmissionFence::acquire()
 }
@@ -1150,7 +1154,6 @@ fn verified_window_lease_owners_in(
     use std::os::fd::FromRawFd;
     let slots = running_window_slots(runtime)?;
     let mut owners = Vec::new();
-    let kernel_locks = fs::read_to_string(proc_root.join("locks"))?;
     for slot in slots {
         let lease_path = runtime.join(slot_lock_name(&slot));
         let lock = OpenOptions::new()
@@ -1166,17 +1169,19 @@ fn verified_window_lease_owners_in(
         // Btrfs subvolume st_dev can differ from the superblock device printed
         // in /proc/locks. Index by inode, then disambiguate using the actual
         // locked descriptor's stat device and inode, not a mere open descriptor.
-        let pids: std::collections::BTreeSet<_> = kernel_locks
-            .lines()
-            .filter_map(|line| flock_owner(line, &expected))
+        // The index can miss a held lock under churn, so the owner the window
+        // recorded in its lease is a candidate too.
+        let recorded: Vec<u32> = daemon_admission::recorded_owner(&lock)
+            .into_iter()
             .collect();
-        let mut matches = Vec::new();
-        for pid in pids {
+        let mut matches = crate::flock::proven_owners(proc_root, &expected, &recorded, |pid| {
             let process = proc_root.join(pid.to_string());
+            // A candidate that exits or hides its descriptors mid-proof, as a
+            // stale recorded pid may, is simply not the owner.
             if !fs::metadata(&process).is_ok_and(|metadata| metadata.uid() == current_uid())
-                || !process_owns_slot(&process, pid, &expected)?
+                || !process_owns_slot(&process, pid, &expected).unwrap_or(false)
             {
-                continue;
+                return Ok(None);
             }
             // SAFETY: pidfd_open returns a fresh owned descriptor or -1.
             let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
@@ -1198,16 +1203,41 @@ fn verified_window_lease_owners_in(
                     "window ownership changed during verification",
                 ));
             }
-            matches.push(verified);
+            Ok(Some(verified))
+        })?;
+        // A window that closed after the slots were listed is not live.
+        if matches.is_empty() && lease_released(&lock, &expected)? {
+            continue;
         }
         if matches.len() != 1 {
             return Err(io::Error::other(format!(
-                "cannot authenticate live window {slot}"
+                "cannot authenticate live window {slot}: {} verified lease owners",
+                matches.len()
             )));
         }
         owners.push(matches.pop().unwrap());
     }
     Ok(owners)
+}
+
+/// Whether nobody holds the lease `lock` opened, probed through a separate
+/// open of that same inode: a duplicate would share the open file description
+/// and could take a lock already held through it, and the path may since
+/// name another file.
+fn lease_released(lock: &File, expected: &fs::Metadata) -> io::Result<bool> {
+    let probe = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(format!("/proc/self/fd/{}", lock.as_raw_fd()))?;
+    let probed = probe.metadata()?;
+    if probed.dev() != expected.dev() || probed.ino() != expected.ino() {
+        return Err(io::Error::other("window lease changed during verification"));
+    }
+    match owned_file_lock(probe, libc::LOCK_EX | libc::LOCK_NB) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 pub fn update_in_progress() -> bool {
@@ -1248,13 +1278,47 @@ pub struct UiUpdateGuard {
     restore_policy: WindowRestorePolicy,
 }
 
-/// A committed window is already closing. After this long its update gives
-/// up waiting: Drop reopens without it, and recovery restarts the daemon.
+/// A committed window is already closing. After this long its update stops
+/// waiting politely: Drop reopens without it, and recovery ends or signals it.
 const COMMITTED_WINDOW_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a saved window that ignored its close deadline has after SIGTERM.
 const SAVED_WINDOW_TERMINATE_GRACE: Duration = Duration::from_secs(5);
 /// SIGKILL cannot be refused; this only bounds the kernel's teardown.
 const SAVED_WINDOW_KILL_REAP: Duration = Duration::from_secs(5);
+/// How often recovery reports a window it is still waiting for.
+const UNPROVEN_WINDOW_PROGRESS: Duration = Duration::from_secs(15);
+
+/// A lingering window that cannot be proven to have saved since closing.
+struct Unproven<'a> {
+    reason: String,
+    /// The pinned process of a window that acknowledged closing and has not
+    /// been seen to give up its slot: a daemon cannot start beside it.
+    /// None for a window that may be healthy, such as one that never
+    /// acknowledged or whose slot another process now holds.
+    closing: Option<Closing<'a>>,
+}
+
+struct Closing<'a> {
+    window: &'a VerifiedWindow,
+    /// Verified as the slot's current owner, so it may be signalled.
+    owns_slot: bool,
+}
+
+impl<'a> Unproven<'a> {
+    fn unknown(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            closing: None,
+        }
+    }
+
+    fn closing(reason: String, window: &'a VerifiedWindow, owns_slot: bool) -> Self {
+        Self {
+            reason,
+            closing: Some(Closing { window, owns_slot }),
+        }
+    }
+}
 
 /// What the update can prove about each window it is closing.
 #[derive(Default)]
@@ -1559,7 +1623,7 @@ impl UiUpdateGuard {
             match self.saved_window(slot, flushed) {
                 Ok(Some(window)) => saved.push((slot.as_str(), window)),
                 Ok(None) => eprintln!("Window {slot} exited at the close deadline."),
-                Err(reason) => {
+                Err(Unproven { reason, .. }) => {
                     eprintln!(
                         "Window {slot} is still open after {}s and {reason}; it keeps running.",
                         waited.as_secs()
@@ -1587,9 +1651,11 @@ impl UiUpdateGuard {
         &self,
         slot: &str,
         flushed: &impl Fn(u32, u64) -> io::Result<bool>,
-    ) -> Result<Option<&VerifiedWindow>, String> {
+    ) -> Result<Option<&VerifiedWindow>, Unproven<'_>> {
         let Some((_, window)) = self.close.pinned.iter().find(|(s, _)| s == slot) else {
-            return Err("its process was not identified when the update prepared it".into());
+            return Err(Unproven::unknown(
+                "its process was not identified when the update prepared it",
+            ));
         };
         // An exit between listing slots and verifying the process is success,
         // not an unverifiable window: its procfs entries are already gone.
@@ -1598,18 +1664,36 @@ impl UiUpdateGuard {
             return Ok(None);
         }
         let Some((_, requested)) = self.close.committed.iter().find(|(s, _)| s == slot) else {
-            return Err("did not acknowledge closing".into());
+            return Err(Unproven::unknown("did not acknowledge closing"));
         };
         match window.still_owns_lease() {
             Ok(true) => {}
             _ if exited(window) => return Ok(None),
-            Ok(false) => return Err("its slot now belongs to a different process".into()),
-            Err(error) => return Err(format!("its process could not be verified: {error}")),
+            Ok(false) => {
+                return Err(Unproven::unknown(
+                    "its slot now belongs to a different process",
+                ));
+            }
+            Err(error) => {
+                return Err(Unproven::closing(
+                    format!("its process could not be verified: {error}"),
+                    window,
+                    false,
+                ));
+            }
         }
         match flushed(window.pid, *requested) {
             Ok(true) => Ok(Some(window)),
-            Ok(false) => Err("has not reported that its workspace was saved".into()),
-            Err(error) => Err(format!("its save report could not be read: {error}")),
+            Ok(false) => Err(Unproven::closing(
+                "has not reported that its workspace was saved".into(),
+                window,
+                true,
+            )),
+            Err(error) => Err(Unproven::closing(
+                format!("its save report could not be read: {error}"),
+                window,
+                true,
+            )),
         }
     }
 
@@ -1617,13 +1701,22 @@ impl UiUpdateGuard {
     /// still holds its slot. A daemon admits only authenticated live windows,
     /// and a half-exited one fails that check: a daemon restarted beside it
     /// exits instead of serving. Wait for committed windows, then end those
-    /// that already saved. Windows that never committed are healthy live
-    /// windows of the source and are left alone.
+    /// that already saved. Any other window that acknowledged closing and
+    /// still holds its slot gets one SIGTERM and is waited for without a cap,
+    /// since starting beside it cannot succeed; only interrupting this worker
+    /// ends that wait, with Interrupted. Windows that never acknowledged, or
+    /// whose slot another process now holds, may be healthy live windows the
+    /// daemon admits: they are left alone and the restart proceeds.
     pub(crate) fn settle_committed_windows(&self) -> io::Result<()> {
+        // Only a signal to this worker ends the wait: a daemon started beside
+        // a window that holds its slot can only be refused.
+        let _interrupt = crate::update::WorkerInterrupt::install()?;
         self.settle_committed_windows_with(
             COMMITTED_WINDOW_EXIT_TIMEOUT,
             crate::diagnostics::ui_final_flush_complete,
             SAVED_WINDOW_TERMINATE_GRACE,
+            crate::update::WorkerInterrupt::requested,
+            UNPROVEN_WINDOW_PROGRESS,
         )
     }
 
@@ -1632,6 +1725,8 @@ impl UiUpdateGuard {
         timeout: Duration,
         flushed: impl Fn(u32, u64) -> io::Result<bool>,
         grace: Duration,
+        interrupted: impl Fn() -> bool,
+        progress: Duration,
     ) -> io::Result<()> {
         match self.wait_for_committed_windows_within(timeout) {
             Err(error) if error.kind() == io::ErrorKind::TimedOut => {}
@@ -1644,27 +1739,87 @@ impl UiUpdateGuard {
             match self.saved_window(slot, &flushed) {
                 Ok(Some(window)) => saved.push((slot.as_str(), window)),
                 Ok(None) => {}
-                Err(reason) => {
+                Err(Unproven {
+                    reason,
+                    closing: Some(closing),
+                }) => {
                     eprintln!(
-                        "Window {slot} is still closing after {}s and {reason}; it keeps running.",
+                        "Window {slot} is still closing after {}s and {reason}.",
                         timeout.as_secs()
                     );
-                    unsaved.push(slot.as_str());
+                    unsaved.push((slot.as_str(), closing));
                 }
+                Err(Unproven {
+                    reason,
+                    closing: None,
+                }) => eprintln!(
+                    "Window {slot} is still open after {}s and {reason}; it keeps running beside the restarted terminal service.",
+                    timeout.as_secs()
+                ),
             }
         }
         end_saved_windows(&saved, timeout, grace)?;
-        if unsaved.is_empty() {
-            Ok(())
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!(
-                    "window {} is still closing after {}s",
-                    unsaved.join(", "),
-                    timeout.as_secs()
+        // It saved when it acknowledged closing; SIGTERM lets it exit cleanly.
+        // Without a later save report it is never killed.
+        for (slot, Closing { window, owns_slot }) in &unsaved {
+            if !owns_slot {
+                continue;
+            }
+            match window.signal(libc::SIGTERM) {
+                Ok(true) => eprintln!("Window {slot} (pid {}): sent SIGTERM.", window.pid),
+                Ok(false) => {}
+                Err(error) => eprintln!(
+                    "Could not send SIGTERM to window {slot} (pid {}): {error}",
+                    window.pid
                 ),
-            ))
+            }
+        }
+        let mut next_progress = std::time::Instant::now();
+        loop {
+            let live = running_window_slots(&self.runtime)?;
+            // Once its pinned process is gone, whatever holds the slot is a
+            // different window that the restarted daemon can admit.
+            let waiting: Vec<_> = unsaved
+                .iter()
+                .filter(|(slot, closing)| {
+                    closing.window.is_alive() && live.iter().any(|live| live == slot)
+                })
+                .map(|(slot, closing)| (*slot, closing.owns_slot.then_some(closing.window.pid)))
+                .collect();
+            if waiting.is_empty() {
+                return Ok(());
+            }
+            if interrupted() {
+                let reports: Vec<_> = waiting
+                    .iter()
+                    .map(|(slot, pid)| match pid {
+                        Some(pid) => format!(
+                            "Window {slot} (pid {pid}) is still closing, so the terminal service was not restarted. To continue now, end it: kill {pid}, then run: cagents daemon start"
+                        ),
+                        None => format!(
+                            "Window {slot} is still closing, so the terminal service was not restarted. Once it exits, run: cagents daemon start"
+                        ),
+                    })
+                    .collect();
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    reports.join(" "),
+                ));
+            }
+            if std::time::Instant::now() >= next_progress {
+                for (slot, pid) in &waiting {
+                    match pid {
+                        Some(pid) => eprintln!(
+                            "Window {slot} (pid {pid}) is still closing; the terminal service restarts as soon as it exits. To continue now, end it: kill {pid}"
+                        ),
+                        None => eprintln!(
+                            "Window {slot} is still closing; the terminal service restarts as soon as it exits."
+                        ),
+                    }
+                }
+                next_progress = std::time::Instant::now() + progress;
+            }
+            std::thread::sleep(Duration::from_millis(25));
         }
     }
 
@@ -1741,7 +1896,7 @@ impl UiUpdateGuard {
 /// What the update reports when windows did not reopen cleanly. Someone reads
 /// this: the launcher's handshake prefix goes, and windows stopped by the same
 /// thing share one sentence instead of repeating it per window.
-pub(crate) fn relaunch_failure(windows: usize, errors: &[(&str, String)]) -> String {
+pub fn relaunch_failure(windows: usize, errors: &[(&str, String)]) -> String {
     let mut groups: Vec<(Vec<&str>, String)> = Vec::new();
     for (slot, error) in errors {
         let text = error
@@ -1886,7 +2041,7 @@ pub fn launch_window(new_window: bool, slot: Option<&str>, source: Option<&str>)
 
 /// Session ids belong to a daemon/device namespace. Never resolve a local
 /// coordination link against a different device's saved window.
-pub(crate) fn window_matches_selected_device(slot: &str) -> io::Result<bool> {
+pub fn window_matches_selected_device(slot: &str) -> io::Result<bool> {
     match (crate::device::selected(), slot.starts_with("device-")) {
         (None, device_slot) => Ok(!device_slot),
         (Some(_), false) => Ok(false),
@@ -3024,6 +3179,51 @@ mod tests {
     }
 
     #[test]
+    fn a_live_window_missing_from_the_kernel_lock_index_is_found_by_its_recorded_owner() {
+        let runtime = tempfile::tempdir().unwrap();
+        let mut held = owned_lock(
+            &runtime.path().join(slot_lock_name("second")),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+        .unwrap();
+        daemon_admission::publish_capability(held.file_mut()).unwrap();
+        // /proc/locks can skip a held lock when other locks change while it is
+        // read; this index never lists it.
+        let proc_root = tempfile::tempdir().unwrap();
+        fs::write(proc_root.path().join("locks"), "").unwrap();
+        let pid = std::process::id();
+        symlink(
+            Path::new("/proc").join(pid.to_string()),
+            proc_root.path().join(pid.to_string()),
+        )
+        .unwrap();
+        let owners = verified_window_lease_owners_in(runtime.path(), proc_root.path()).unwrap();
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0].pid(), pid);
+        // A held lease that no candidate proves is still refused, not taken
+        // for a window that closed.
+        let unrecorded = owned_lock(
+            &runtime.path().join(slot_lock_name("third")),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+        .unwrap();
+        let Err(refused) = verified_window_lease_owners_in(runtime.path(), proc_root.path()) else {
+            panic!("a held lease no candidate proves was accepted");
+        };
+        assert_eq!(
+            refused.to_string(),
+            "cannot authenticate live window third: 0 verified lease owners"
+        );
+        drop(unrecorded);
+        drop(held);
+        assert!(
+            verified_window_lease_owners_in(runtime.path(), proc_root.path())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn window_ownership_cannot_combine_different_descriptors() {
         let root = tempfile::tempdir().unwrap();
         let held = owned_lock(&root.path().join("lease"), libc::LOCK_EX | libc::LOCK_NB).unwrap();
@@ -3407,6 +3607,8 @@ mod tests {
                 Duration::from_millis(100),
                 |_, _| Ok(true),
                 Duration::from_millis(200),
+                || false,
+                UNPROVEN_WINDOW_PROGRESS,
             )
             .unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -3418,40 +3620,119 @@ mod tests {
     }
 
     #[test]
-    fn rollback_leaves_unsaved_and_uncommitted_windows_running() {
+    fn rollback_waits_for_an_unsaved_window_and_never_kills_it() {
         let runtime = tempdir().unwrap();
         let mut guard = guard_in(runtime.path());
-        let mut window = LingeringWindow::spawn(runtime.path(), "second", false);
+        // It ignores SIGTERM, like a window wedged after acknowledging.
+        let mut window = LingeringWindow::spawn(runtime.path(), "second", true);
         pin_committed(&mut guard, "second");
+        let polls = std::cell::Cell::new(0);
         let error = guard
             .settle_committed_windows_with(
                 Duration::from_millis(100),
                 |_, _| Ok(false),
                 Duration::ZERO,
+                || {
+                    polls.set(polls.get() + 1);
+                    polls.get() > 20
+                },
+                Duration::from_millis(100),
             )
             .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-        assert!(error.to_string().contains("second"), "{error}");
-        assert_eq!(window.exit_signal(), None);
-        // A commit the window never acknowledged leaves a healthy source
-        // window, even when an older save report exists.
-        guard.close.committed.clear();
-        assert!(
-            guard
-                .settle_committed_windows_with(
-                    Duration::from_millis(100),
-                    |_, _| Ok(true),
-                    Duration::ZERO,
-                )
-                .is_err()
+        // Only an interrupt ends the wait; no daemon may start beside it.
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        let pid = window.0.id();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Window second (pid {pid}) is still closing, so the terminal service was not restarted. To continue now, end it: kill {pid}, then run: cagents daemon start"
+            )
         );
+        assert_eq!(
+            window.exit_signal(),
+            None,
+            "an unsaved window is never killed"
+        );
+        assert_eq!(running_window_slots(runtime.path()).unwrap(), ["second"]);
+    }
+
+    #[test]
+    fn rollback_sends_an_unsaved_window_one_sigterm_and_waits_for_it() {
+        let runtime = tempdir().unwrap();
+        let mut guard = guard_in(runtime.path());
+        let mut window = LingeringWindow::spawn(runtime.path(), "second", false);
+        pin_committed(&mut guard, "second");
+        guard
+            .settle_committed_windows_with(
+                Duration::from_millis(100),
+                |_, _| Ok(false),
+                Duration::ZERO,
+                || false,
+                UNPROVEN_WINDOW_PROGRESS,
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while window.exit_signal().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(window.exit_signal(), Some(libc::SIGTERM));
+    }
+
+    #[test]
+    fn rollback_restarts_beside_a_window_that_never_acknowledged_closing() {
+        let runtime = tempdir().unwrap();
+        let mut guard = guard_in(runtime.path());
+        let mut window = LingeringWindow::spawn(runtime.path(), "second", false);
+        pin_committed(&mut guard, "second");
+        // Its slot was marked closed before update-commit, but the window
+        // never acknowledged it: it may be healthy and never exit. Even a
+        // save report must not get it signalled or awaited.
+        guard.close.committed.clear();
+        guard
+            .settle_committed_windows_with(
+                Duration::from_millis(100),
+                |_, _| Ok(true),
+                Duration::ZERO,
+                || panic!("a healthy window must not be waited for"),
+                UNPROVEN_WINDOW_PROGRESS,
+            )
+            .unwrap();
         assert_eq!(window.exit_signal(), None);
+        assert_eq!(running_window_slots(runtime.path()).unwrap(), ["second"]);
         // A window that never received a commit is not awaited at all.
         guard.closed.clear();
         guard
-            .settle_committed_windows_with(Duration::from_secs(30), |_, _| Ok(true), Duration::ZERO)
+            .settle_committed_windows_with(
+                Duration::from_secs(30),
+                |_, _| Ok(true),
+                Duration::ZERO,
+                || panic!("nothing is closing"),
+                UNPROVEN_WINDOW_PROGRESS,
+            )
             .unwrap();
         assert_eq!(window.exit_signal(), None);
+    }
+
+    #[test]
+    fn rollback_restarts_beside_a_slot_another_process_now_holds() {
+        let runtime = tempdir().unwrap();
+        let mut guard = guard_in(runtime.path());
+        let mut first = LingeringWindow::spawn(runtime.path(), "second", false);
+        pin_committed(&mut guard, "second");
+        // The committed window exits and the user reopens that slot.
+        first.0.kill().unwrap();
+        first.0.wait().unwrap();
+        let mut reopened = LingeringWindow::spawn(runtime.path(), "second", false);
+        guard
+            .settle_committed_windows_with(
+                Duration::from_millis(100),
+                |_, _| Ok(false),
+                Duration::ZERO,
+                || panic!("a reopened window must not be waited for"),
+                UNPROVEN_WINDOW_PROGRESS,
+            )
+            .unwrap();
+        assert_eq!(reopened.exit_signal(), None);
     }
 
     #[test]

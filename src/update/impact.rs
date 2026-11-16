@@ -233,12 +233,96 @@ impl DaemonImpact {
     }
 }
 
+/// Why a reviewed update was not installed: what its preview said had to be
+/// resolved by hand when the review was closed. The job keeps it, so whoever
+/// reads the outcome later sees those reasons rather than a cancellation.
+///
+/// Titles and reasons are the review's own safe presentation, never a
+/// source's free-form diagnostics.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Refusal {
+    pub sessions: Vec<RefusedSession>,
+    /// Reasons that belong to no one session, such as agent launches that
+    /// must settle first.
+    pub blockers: Vec<String>,
+    /// Nobody closed the review; it expired while these still held it back.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub expired: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefusedSession {
+    pub title: String,
+    pub reason: String,
+}
+
+/// Separates an update outcome's summary from its details, as every reader
+/// of the job's message expects.
+const DETAILS_LABEL: &str = " Details: ";
+
+impl Refusal {
+    /// "1 session needs attention", or "2 sessions need attention and other
+    /// work must finish first".
+    pub fn summary(&self) -> String {
+        let sessions = match self.sessions.len() {
+            0 => None,
+            1 => Some("1 session needs attention".to_owned()),
+            count => Some(format!("{count} sessions need attention")),
+        };
+        let work = (!self.blockers.is_empty()).then_some("other work must finish first");
+        let held = match (sessions, work) {
+            (Some(sessions), Some(work)) => format!("{sessions} and {work}"),
+            (Some(sessions), None) => sessions,
+            (None, work) => work.unwrap_or_default().to_owned(),
+        };
+        if self.expired {
+            format!("the review expired while {held}")
+        } else {
+            held
+        }
+    }
+
+    /// Each reason on its own line of a notice's details.
+    pub fn details(&self) -> Vec<String> {
+        self.sessions
+            .iter()
+            .map(|session| format!("{}: {}", session.title, session.reason))
+            .chain(self.blockers.iter().cloned())
+            .collect()
+    }
+
+    /// What the CLI prints: the summary, then each reason on its own line.
+    pub fn report(&self) -> String {
+        let mut report = format!("Update not installed: {}.", self.summary());
+        for detail in self.details() {
+            report.push_str("\n  ");
+            report.push_str(&detail);
+        }
+        report
+    }
+
+    /// The job's message: the summary, then every reason after the details
+    /// label, so a reader that predates `refusal` still shows them.
+    pub fn message(&self) -> String {
+        let details = self
+            .details()
+            .iter()
+            .map(|detail| detail.trim_end_matches('.').to_owned())
+            .collect::<Vec<_>>()
+            .join("; ");
+        format!(
+            "Update not installed: {}.{DETAILS_LABEL}{details}.",
+            self.summary()
+        )
+    }
+}
+
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::model::{BootId, HostIncarnation, HostSessionId, HostSessionProof};
 
-    fn waiting() -> DaemonImpact {
+    pub(in crate::update) fn waiting() -> DaemonImpact {
         DaemonImpact {
             capability: ShutdownCapability {
                 proof: HostSessionProof {
@@ -533,6 +617,115 @@ mod tests {
         assert!(!preview.preserves_consent(&changed));
     }
 
+    /// A waiting conversation, one that needs attention, one the update
+    /// carries, and agent launches still settling.
+    pub(in crate::update) fn blocked() -> DaemonImpact {
+        let mut daemon = waiting();
+        daemon.sessions[0].disposition = Disposition::Blocked;
+        daemon.sessions[0].reason = STOPPED_WITH_UNSETTLED_WORK.into();
+        let mut carried = daemon.sessions[0].clone();
+        carried.id = TerminalId::new();
+        carried.title = "Shell".into();
+        carried.disposition = Disposition::Continues;
+        carried.reason = "Keeps running".into();
+        daemon.sessions.push(carried);
+        daemon
+            .blockers
+            .push("Additional agent launches must settle before updating".into());
+        daemon
+    }
+
+    pub(in crate::update) fn blocked_preview() -> Preview {
+        Preview {
+            editors: Vec::new(),
+            candidate: Candidate {
+                version: "9.8.7".into(),
+                protocol: 32,
+                digest: "original".into(),
+            },
+            replaces_daemon: true,
+            daemon: Some(blocked()),
+            from_version: String::new(),
+            windows: 0,
+            stopped: Vec::new(),
+            stopped_windows: Vec::new(),
+            labels: Default::default(),
+        }
+    }
+
+    #[test]
+    fn a_refusal_names_only_what_holds_the_update_back_in_review_wording() {
+        let mut preview = Preview {
+            daemon: Some(waiting()),
+            ..blocked_preview()
+        };
+        assert_eq!(preview.refusal(), None, "waiting for idle is not refused");
+        preview = blocked_preview();
+        let refusal = preview.refusal().unwrap();
+        assert_eq!(
+            refusal.sessions,
+            vec![RefusedSession {
+                title: "Claude".into(),
+                reason: "Its provider stopped with unfinished work. Close this conversation before updating.".into(),
+            }]
+        );
+        assert_eq!(
+            refusal.blockers,
+            ["Agents are still starting. Wait for them to finish opening before updating."]
+        );
+        assert_eq!(
+            refusal.summary(),
+            "1 session needs attention and other work must finish first"
+        );
+        assert_eq!(
+            refusal.message(),
+            "Update not installed: 1 session needs attention and other work must finish first. \
+             Details: Claude: Its provider stopped with unfinished work. \
+             Close this conversation before updating; \
+             Agents are still starting. Wait for them to finish opening before updating."
+        );
+
+        // The sidebar's name tells untitled conversations apart, as the
+        // terminal review does.
+        let id = preview.daemon.as_ref().unwrap().sessions[0].id;
+        preview.labels.names.insert(id, "Release review".into());
+        assert_eq!(
+            preview.refusal().unwrap().sessions[0].title,
+            "Release review"
+        );
+
+        // Free-form source diagnostics never reach the record.
+        let daemon = preview.daemon.as_mut().unwrap();
+        daemon.sessions[0].reason = "socket /run/private/token refused".into();
+        daemon.blockers = vec!["internal: lease 42 busy".into()];
+        let refusal = preview.refusal().unwrap();
+        assert!(!refusal.message().contains("socket"));
+        assert!(!refusal.message().contains("lease 42"));
+
+        let mut service = blocked_preview();
+        service.daemon.as_mut().unwrap().sessions.clear();
+        assert_eq!(
+            service.refusal().unwrap().summary(),
+            "other work must finish first"
+        );
+        let mut sessions = blocked_preview();
+        let daemon = sessions.daemon.as_mut().unwrap();
+        daemon.blockers.clear();
+        daemon.sessions[1].disposition = Disposition::Blocked;
+        assert_eq!(
+            sessions.refusal().unwrap().summary(),
+            "2 sessions need attention"
+        );
+        let expired = Refusal {
+            expired: true,
+            ..sessions.refusal().unwrap()
+        };
+        assert_eq!(
+            expired.summary(),
+            "the review expired while 2 sessions need attention"
+        );
+    }
+
     #[test]
     fn older_preview_json_defaults_the_outcomes_and_context() {
         let preview: Preview = serde_json::from_value(serde_json::json!({
@@ -577,6 +770,33 @@ pub struct Preview {
 }
 
 impl Preview {
+    /// What holds this preview back, if anything has to be resolved by hand
+    /// before it can install. Each session is named as the review names it.
+    pub fn refusal(&self) -> Option<Refusal> {
+        let daemon = self.daemon.as_ref().filter(|daemon| daemon.blocked())?;
+        Some(Refusal {
+            sessions: daemon
+                .sessions
+                .iter()
+                .filter(|session| session.disposition == Disposition::Blocked)
+                .map(|session| {
+                    let review = session.review();
+                    RefusedSession {
+                        title: self
+                            .labels
+                            .names
+                            .get(&session.id)
+                            .cloned()
+                            .unwrap_or(review.title),
+                        reason: review.reason,
+                    }
+                })
+                .collect(),
+            blockers: daemon.review_notices(),
+            expired: false,
+        })
+    }
+
     pub(super) fn inspection(&self) -> super::source_inspection::SourceInspection {
         super::source_inspection::SourceInspection {
             details: self.labels.details.clone(),

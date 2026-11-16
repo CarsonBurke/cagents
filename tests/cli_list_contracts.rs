@@ -55,7 +55,11 @@ impl Listing {
             (
                 Self::Sessions,
                 ClientRequest::Agent {
-                    operation: Operation::Sessions(scope),
+                    operation:
+                        Operation::Context {
+                            scope,
+                            standing: true,
+                        },
                     ..
                 },
             ) => {
@@ -73,6 +77,7 @@ impl Listing {
                             channel: None,
                             view_scope: None,
                             channel_repository: None,
+                            lineage_channel: None,
                             state: cagents::agent::ActivityState::Working,
                             directory: Some("/fixture".into()),
                             worktree: Some("/fixture".into()),
@@ -91,11 +96,14 @@ impl Listing {
                 } else {
                     vec![]
                 };
-                ServerResponse::Agent(agent_execution::Reply::Sessions(
-                    agent_execution::directory::Sessions {
-                        caller: None,
-                        scope: agent_execution::directory::Scope::All,
-                        sessions,
+                ServerResponse::Agent(agent_execution::Reply::Context(
+                    agent_execution::directory::Context {
+                        sessions: agent_execution::directory::Sessions {
+                            caller: None,
+                            scope: agent_execution::directory::Scope::All,
+                            sessions,
+                        },
+                        lineage_channel: None,
                     },
                 ))
             }
@@ -512,19 +520,43 @@ fn accepted_wait_output(
             );
             while let Some(request) = read_frame::<ClientEnvelope>(&mut stream).unwrap() {
                 assert_eq!(request.proof.as_ref(), Some(&proof));
+                if matches!(&request.request, ClientRequest::ReadWorkspaceModel) {
+                    respond(
+                        &mut stream,
+                        request.request_id,
+                        ServerMessage::Response {
+                            response: ServerResponse::WorkspaceModel {
+                                model: WorkspaceModel {
+                                    channels: vec![ModelChannel {
+                                        id: accepted.agent.channel().unwrap(),
+                                        repository: accepted.agent.spec.target.repository.clone(),
+                                        title: "Fixture accepted agents".into(),
+                                        title_source: Default::default(),
+                                        ordinal: 0,
+                                    }],
+                                    ..Default::default()
+                                },
+                            },
+                        },
+                    );
+                    continue;
+                }
                 let ClientRequest::Agent { operation, .. } = request.request else {
                     panic!("request outside private agent contract");
                 };
                 let reply = match operation {
-                    Operation::Directory(_) => {
-                        Reply::Directory(agent_execution::directory::Directory {
+                    Operation::Context {
+                        standing: false, ..
+                    } => Reply::Context(agent_execution::directory::Context {
+                        sessions: agent_execution::directory::Sessions {
                             caller: None,
                             scope: agent_execution::directory::Scope::Project(
                                 accepted.agent.spec.target.repository.clone(),
                             ),
                             sessions: vec![],
-                        })
-                    }
+                        },
+                        lineage_channel: None,
+                    }),
                     // The agent's usage limit and account, read beside its run.
                     Operation::Sessions(scope) => {
                         Reply::Sessions(agent_execution::directory::Sessions {
@@ -535,16 +567,25 @@ fn accepted_wait_output(
                     }
                     Operation::List => Reply::Listed(vec![]),
                     Operation::Inbox(_) | Operation::PeekInbox(_) => Reply::Inbox(vec![]),
-                    Operation::Submit(submit) => {
+                    // A spawn submits; a follow-up asks for a prompt, which
+                    // this agent takes now.
+                    Operation::Submit(submit)
+                    | Operation::Prompt {
+                        request: submit, ..
+                    } => {
                         submits += 1;
                         assert_eq!(submits, 1, "no duplicate submission after Accepted");
-                        match submit.destination {
-                            agent_execution::Destination::New(_) => assert!(spawn),
+                        let prompted = match submit.destination {
+                            agent_execution::Destination::New(_) => {
+                                assert!(spawn);
+                                false
+                            }
                             agent_execution::Destination::Existing(id) => {
                                 assert!(!spawn);
                                 assert_eq!(id, accepted.agent.id);
+                                true
                             }
-                        }
+                        };
                         receipt = Some(serde_json::json!({
                             "agent": accepted.agent,
                             "run": accepted.run,
@@ -552,7 +593,14 @@ fn accepted_wait_output(
                             "idempotency_key": submit.idempotency_key,
                             "device": "local",
                         }));
-                        Reply::Accepted(accepted.clone())
+                        if prompted {
+                            Reply::Prompted {
+                                accepted: accepted.clone(),
+                                start: agent_execution::Start::Sent { resumed: false },
+                            }
+                        } else {
+                            Reply::Accepted(accepted.clone())
+                        }
                     }
                     Operation::Run(id) => {
                         assert_eq!(id, accepted.run.id);
@@ -706,6 +754,17 @@ fn accepted_wait_recovery_is_readable_and_normal_timeout_stays_distinct() {
             receipt["idempotency_key"]
         );
         assert_eq!(response["data"]["run"]["state"], "Running");
+        if spawn {
+            let agent: Agent = serde_json::from_value(receipt["agent"].clone()).unwrap();
+            assert_eq!(
+                response["data"]["placed_in"]["channel"],
+                serde_json::json!(agent.channel().unwrap())
+            );
+            assert_eq!(
+                response["data"]["placed_in"]["title"],
+                "Fixture accepted agents"
+            );
+        }
     }
 }
 
