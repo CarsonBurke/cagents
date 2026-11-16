@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "ui")]
 pub mod coordination;
 pub mod failure;
+mod fresh;
 pub mod notification;
 pub mod presentation;
 pub mod pricing;
@@ -351,6 +352,14 @@ pub enum Recovery {
     /// it - a stopped daemon, a busy writer, a provider that failed to launch -
     /// can succeed on the next attempt.
     Retry,
+    /// The daemon refused this start and reported that repeating it cannot help.
+    /// Keep the saved conversation and diagnostic without offering a retry.
+    Blocked,
+    /// A [`Self::Blocked`] refusal that a restart of this computer lifts: the
+    /// daemon cannot prove that an earlier process of this boot no longer
+    /// holds the conversation, and a new boot proves every such process gone.
+    /// Nothing reopens it before then, so it is offered no retry either.
+    AfterRestart,
     /// The daemon has no free resident chat slots. Retrying preserves this
     /// conversation; capacity must become available before it can start.
     Capacity,
@@ -365,11 +374,25 @@ pub enum Recovery {
     /// already shares. What the reader gives up is this card's pointer to the
     /// old conversation, because no surface re-opens a conversation by
     /// identifier afterwards except the Codex binding panel. So a card
-    /// offering this says the old conversation stays on disk and that it will
+    /// offering this says the old conversation isn't deleted and that it will
     /// stop being the way back to it, rather than implying either a deletion
     /// or a round trip that is not there.
     Fresh,
 }
+
+impl Recovery {
+    /// Whether repeating the same start cannot help until something outside
+    /// this card changes.
+    pub fn is_blocked(self) -> bool {
+        matches!(self, Self::Blocked | Self::AfterRestart)
+    }
+}
+
+/// The daemon's refusal of a retained Claude conversation whose earlier
+/// process ended without recording its close. Only a later boot proves that
+/// process gone, so a client reads this exact sentence as
+/// [`Recovery::AfterRestart`]. The protocol has no code of its own for it.
+pub const UNPROVEN_OWNER_REFUSAL: &str = "This conversation's earlier Claude process ended without recording its close, and cagents cannot prove that nothing else still holds the conversation, so nothing was started in its place. It can be reopened after you restart this computer.";
 
 impl StartFailure {
     pub fn retry(message: impl Into<String>) -> Self {
@@ -1000,7 +1023,7 @@ impl Session {
 
     /// A saved transcript is eligible for the forced, read-only history API.
     /// This shape is never authority to launch, close or resume a provider.
-    pub(crate) fn is_saved_claude_history(&self) -> bool {
+    pub fn is_saved_claude_history(&self) -> bool {
         (self.launch.provider == Provider::Claude
             || crate::upgrade::floor::load().is_ok_and(|ledger| ledger.source(self.id).is_some()))
             && matches!(self.native_continuity, NativeContinuity::ReconnectOnly)

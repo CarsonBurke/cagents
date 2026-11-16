@@ -41,6 +41,7 @@ fn view(runtime: &Runtime) -> Element<'_, Message> {
         true,
         None,
         vec![],
+        true,
     )
 }
 

@@ -18,6 +18,8 @@ pub(super) struct ChatCloseConfirm {
     session: TerminalId,
     /// False when this window cannot tell, as while it is still attaching.
     certain: bool,
+    /// A refused first message is still an unsent draft, not a running chat.
+    discard_draft: bool,
     restore_card: Option<CardId>,
     restore_keyboard_nav: bool,
 }
@@ -50,7 +52,9 @@ impl Cagents {
         // A question asked beside a close under way could end up under that
         // close's own dialog. A chat with nothing to ask doesn't have to wait.
         if self.chat_close_dialog_visible()
-            || (self.chat_close_would_ask(card).is_some() && self.another_close_under_way(card))
+            || ((self.chat_close_would_ask(card).is_some()
+                || self.blocked_draft_discard(card).is_some())
+                && self.another_close_under_way(card))
         {
             self.queue_card_close(card, false);
             return Some(Task::none());
@@ -67,7 +71,12 @@ impl Cagents {
     }
 
     pub(super) fn ask_before_chat_close(&mut self, card: CardId) -> Option<Task<Message>> {
-        let (session, certain) = self.chat_close_would_ask(card)?;
+        // An unsent first message is asked about whatever the stop-question
+        // setting says: that setting governs stopping work, not losing text.
+        let draft = self.blocked_draft_discard(card);
+        let (session, certain) = draft
+            .map(|session| (session, true))
+            .or_else(|| self.chat_close_would_ask(card))?;
         if !self.prepare_shared_removal(card) {
             return Some(Task::none());
         }
@@ -76,6 +85,7 @@ impl Cagents {
             card,
             session,
             certain,
+            discard_draft: draft.is_some(),
             restore_card: self.workspace.focused(),
             restore_keyboard_nav,
         });
@@ -88,6 +98,8 @@ impl Cagents {
     fn chat_close_target_current(&self, intent: &ChatCloseConfirm) -> bool {
         self.card_state(intent.card).is_some_and(|state| {
             state.existence.is_open()
+                && (!intent.discard_draft
+                    || self.blocked_draft_discard(intent.card) == Some(intent.session))
                 && matches!(&state.kind, CardKind::Chat(session) if session.id == intent.session)
         })
     }
@@ -155,7 +167,13 @@ impl Cagents {
         if current {
             // Only a close that goes ahead keeps a tick in "Don't ask again";
             // one whose conversation changed meanwhile answered nothing.
-            let remember = self.commit_confirmation(QUESTION);
+            // The discard question has no "Don't ask again" of its own.
+            let remember = if intent.discard_draft {
+                self.dismiss_confirmation(QUESTION);
+                Task::none()
+            } else {
+                self.commit_confirmation(QUESTION)
+            };
             Task::batch([remember, self.begin_chat_close(intent.card)])
         } else {
             self.dismiss_confirmation(QUESTION);
@@ -184,11 +202,18 @@ impl Cagents {
                     .and_then(|intent| self.card_chrome.get(&intent.card))
                     .map(|chrome| chrome.title.to_string())
             });
-        let title = name.map_or_else(
-            || "Stop this conversation?".to_owned(),
-            |name| format!("Stop \u{201c}{name}\u{201d}?"),
-        );
-        let body = if first_message.is_some() {
+        let discard_draft = intent.is_some_and(|intent| intent.discard_draft);
+        let title = if discard_draft {
+            "Discard this message?".to_owned()
+        } else {
+            name.map_or_else(
+                || "Stop this conversation?".to_owned(),
+                |name| format!("Stop \u{201c}{name}\u{201d}?"),
+            )
+        };
+        let body = if discard_draft {
+            "Closing this tab discards your unsent message."
+        } else if first_message.is_some() {
             "Its first message is still on its way. Closing it stops the conversation, discards that message and closes it in every window."
         } else if intent.is_some_and(|intent| intent.certain) {
             "It is still working. Closing it stops it and closes it in every window."
@@ -200,16 +225,28 @@ impl Cagents {
                 widget::column::with_children(vec![
                     crate::design::title(title).into(),
                     crate::design::body(body).into(),
-                    self.dont_ask_again_control(QUESTION, true),
+                    if discard_draft {
+                        iced::widget::Space::new().into()
+                    } else {
+                        self.dont_ask_again_control(QUESTION, true)
+                    },
                 ])
                 .spacing(space::M),
                 dialog_ui::confirmation_actions(
-                    crate::ui_controls::button::secondary("Keep working")
-                        .id(widget::Id::new(CANCEL))
-                        .on_press(Message::CancelChatClose),
-                    crate::ui_controls::button::destructive("Stop and close")
-                        .id(widget::Id::new(CONFIRM))
-                        .on_press(Message::ConfirmChatClose),
+                    crate::ui_controls::button::secondary(if discard_draft {
+                        "Cancel"
+                    } else {
+                        "Keep working"
+                    })
+                    .id(widget::Id::new(CANCEL))
+                    .on_press(Message::CancelChatClose),
+                    crate::ui_controls::button::destructive(if discard_draft {
+                        "Discard"
+                    } else {
+                        "Stop and close"
+                    })
+                    .id(widget::Id::new(CONFIRM))
+                    .on_press(Message::ConfirmChatClose),
                 ),
                 560.0,
             ),

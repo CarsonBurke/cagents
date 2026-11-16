@@ -426,6 +426,7 @@ impl Pane {
                 true,
                 None,
                 Vec::new(),
+                true,
             );
             let mut ui = UserInterface::build(
                 element,
@@ -595,6 +596,7 @@ impl Pane {
             true,
             None,
             Vec::new(),
+            true,
         );
         let viewed = clock.elapsed();
         let clock = Instant::now();

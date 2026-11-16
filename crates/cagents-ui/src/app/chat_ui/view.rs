@@ -1267,6 +1267,7 @@ impl Cagents {
                         runtime.session.launch.provider,
                         &runtime.session.launch.recipe,
                     ),
+                    self.chat_offers_fresh_conversation(card),
                 );
                 if !runtime.closed_elsewhere
                     && let Some(recovery) = self.account_recovery_controls(card)
@@ -2369,6 +2370,7 @@ impl Runtime {
         accepting_drops: bool,
         accounts: Option<ChatAccounts>,
         offers: Vec<Offer<'a>>,
+        fresh_available: bool,
     ) -> Element<'a, Message> {
         self.view_with_resets(
             recovery,
@@ -2382,6 +2384,7 @@ impl Runtime {
             accounts,
             offers,
             None,
+            fresh_available,
         )
     }
 
@@ -2398,6 +2401,7 @@ impl Runtime {
         accounts: Option<ChatAccounts>,
         offers: Vec<Offer<'a>>,
         reset_controls: Option<crate::app::account_ui::resets::Controls>,
+        fresh_available: bool,
     ) -> Element<'a, Message> {
         let transition = transition.into();
         let transitioning = !matches!(transition, ViewTransition::Idle);
@@ -2627,7 +2631,22 @@ impl Runtime {
                     self.disconnected || self.paging().is_some(),
                 ));
             }
-            if self.turns.is_empty() && self.queued.is_none() && !self.closed_elsewhere {
+            let unanchored = |incident: &&failure::Incident| {
+                !incident.active_recovery
+                    && incident.child_scope.is_none()
+                    && incident.anchor.is_none()
+            };
+            // A pane that shows why its conversation couldn't open is not
+            // waiting for a first message; inviting one would contradict it.
+            if self.turns.is_empty()
+                && self.queued.is_none()
+                && !self.closed_elsewhere
+                && !self
+                    .failure_ui
+                    .incidents
+                    .iter()
+                    .any(|incident| unanchored(&incident))
+            {
                 // The empty state says what to do. It used to show whatever the
                 // adapter's last status detail was, which meant an empty
                 // conversation greeted the reader with a connection state instead
@@ -2648,11 +2667,7 @@ impl Runtime {
                     .into(),
                 );
             }
-            for incident in self.failure_ui.incidents.iter().filter(|incident| {
-                !incident.active_recovery
-                    && incident.child_scope.is_none()
-                    && incident.anchor.is_none()
-            }) {
+            for incident in self.failure_ui.incidents.iter().filter(unanchored) {
                 transcript.push(
                     widget::container(
                         self.failure_view_with_reset(incident, reset_controls.as_ref()),
@@ -3026,10 +3041,13 @@ impl Runtime {
                 .spacing(space::S)
                 .into(),
             );
-        } else if (self.disconnected || snapshot.exited) && self.auth_error().is_none() {
+        } else if self.start_blocked.is_some()
+            || ((self.disconnected || snapshot.exited) && self.auth_error().is_none())
+        {
             content.push(self.stopped_controls(
                 transitioning,
                 matches!(transition, ViewTransition::Resuming),
+                fresh_available,
             ));
         }
         if let Some((url, instructions)) = &snapshot.open_url {
@@ -3317,7 +3335,7 @@ impl Runtime {
         // contents. The action handler checks the current draft before sending;
         // tying the binding to a view-time draft snapshot can leave Enter
         // inserting a newline until another pointer event redraws the pane.
-        let key_submit = if available {
+        let key_submit = if available && !self.start_blocked.is_some() {
             (modes.first().copied(), modes.get(1).copied())
         } else {
             (None, None)
@@ -3497,8 +3515,10 @@ impl Runtime {
                                 design::muted_icon_color
                             }))
                             .on_press_maybe(
-                                (available && !self.provider_coming_up())
-                                    .then(|| action(Action::SubmitControl(target, mode))),
+                                (available
+                                    && !self.start_blocked.is_some()
+                                    && !self.provider_coming_up())
+                                .then(|| action(Action::SubmitControl(target, mode))),
                             )
                             .into()
                     }
@@ -6938,6 +6958,7 @@ mod tests {
                 true,
                 None,
                 vec![],
+                true,
             );
             let mut tree = Tree::new(element.as_widget());
             let viewport = iced::Rectangle::with_size(iced::Size::new(600.0, 800.0));
@@ -7882,6 +7903,7 @@ mod tests {
                 true,
                 None,
                 Vec::new(),
+                true,
             );
             let mut tree = Tree::new(&element);
             let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 1000.0));
@@ -8813,6 +8835,7 @@ mod tests {
                 true,
                 None,
                 vec![],
+                true,
             );
             tree.diff(&mut element);
             element.as_widget_mut().layout(
@@ -9030,6 +9053,7 @@ mod tests {
                 true,
                 None,
                 vec![],
+                true,
             );
             let mut tree = Tree::new(element.as_widget());
             let node = element.as_widget_mut().layout(
@@ -9245,6 +9269,7 @@ mod tests {
                 true,
                 None,
                 vec![],
+                true,
             )
         }
         fn push(streams: &mut Vec<BoxStream<'static, Effect>>, task: Task<Message>) {
@@ -9918,6 +9943,7 @@ mod tests {
             true,
             None,
             vec![],
+            true,
         );
         let renderer = crate::app::tests::headless_renderer();
         let mut tree = Tree::new(element.as_widget());
@@ -10010,6 +10036,7 @@ mod tests {
                 true,
                 None,
                 vec![],
+                true,
             )
         }
         let source = (0..80)
@@ -10207,6 +10234,7 @@ mod tests {
                     true,
                     None,
                     vec![],
+                    true,
                 )
             }
             let source = (0..80)
@@ -10646,6 +10674,7 @@ mod tests {
                 true,
                 None,
                 vec![],
+                true,
             )
         }
         for case in [
@@ -11150,6 +11179,7 @@ mod tests {
                     true,
                     None,
                     vec![],
+                    true,
                 )
             }
             fn dispatch(app: &mut Cagents, target: Target, command: &str) -> Task<Message> {
@@ -11454,6 +11484,7 @@ mod tests {
                 true,
                 None,
                 Vec::new(),
+                true,
             )
         }
         let thought = chat::Item {
@@ -12379,6 +12410,7 @@ mod tests {
                 true,
                 None,
                 vec![],
+                true,
             );
             let mut tree = Tree::new(element.as_widget());
             let node = element.as_widget_mut().layout(
@@ -12625,6 +12657,7 @@ mod tests {
                 true,
                 None,
                 Vec::new(),
+                true,
             );
             let mut ui = UserInterface::build(view, iced::Size::new(450.0, 700.0), cache, renderer);
             struct Bounds {
@@ -12874,6 +12907,7 @@ mod tests {
             true,
             accounts,
             vec![],
+            true,
         );
         let mut tree = Tree::new(element.as_widget());
         let node = element.as_widget_mut().layout(
@@ -13167,6 +13201,7 @@ mod tests {
                     true,
                     None,
                     vec![],
+                    true,
                 );
                 let mut tree = Tree::new(element.as_widget());
                 let node = element.as_widget_mut().layout(
@@ -13718,6 +13753,7 @@ mod tests {
                     true,
                     None,
                     vec![],
+                    true,
                 );
                 let mut tree = Tree::new(&element);
                 let node = element.as_widget_mut().layout(
@@ -15338,6 +15374,7 @@ mod tests {
                 true,
                 None,
                 vec![],
+                true,
             );
             tree.diff(&mut element);
             let node = element.as_widget_mut().layout(
@@ -17573,6 +17610,7 @@ mod tests {
                 true,
                 None,
                 Vec::new(),
+                true,
             );
             let mut full_tree = Tree::new(full.as_widget());
             let full_node = full.as_widget_mut().layout(
@@ -17805,6 +17843,7 @@ mod tests {
                 true,
                 None,
                 Vec::new(),
+                true,
             );
             let mut tree = Tree::new(&element);
             let node = element.as_widget_mut().layout(
@@ -17903,6 +17942,7 @@ mod tests {
                     true,
                     None,
                     Vec::new(),
+                    true,
                 );
                 let mut tree = Tree::new(element.as_widget());
                 let node = element.as_widget_mut().layout(
@@ -17958,6 +17998,7 @@ mod tests {
                         true,
                         None,
                         vec![],
+                        true,
                     );
                     let mut tree = Tree::new(element.as_widget());
                     let node = element.as_widget_mut().layout(

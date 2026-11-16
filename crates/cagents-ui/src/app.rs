@@ -9518,6 +9518,7 @@ impl Cagents {
             .is_none_or(|state| !state.existence.is_open())
             || self.pane_close_owned(card)
             || self.chat_start_pending(card)
+            || self.chat_retry_blocked(card)
             // One relaunch at a time: a second would replace the identity the
             // first is starting and tear down whatever it launched.
             || self.terminal_start_in_flight(card)
@@ -11502,11 +11503,15 @@ impl Cagents {
                             } else {
                                 std::borrow::Cow::Borrowed("This build does not include the integrated browser. Open the saved page in your system browser.")
                             }
+                        } else if let Some(blocked) = self.blocked_failure(id) {
+                            std::borrow::Cow::Borrowed(blocked.reopen.headline())
                         } else { std::borrow::Cow::Borrowed(message.message()) })
                             .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                             .width(Length::Fill)
                             .into(),
-                        if matches!(message, terminal_failure::Failure::Terminal(_)) {
+                        if self.blocked_failure_source(id).is_some() {
+                            self.blocked_failure_diagnostics(id)
+                        } else if matches!(message, terminal_failure::Failure::Terminal(_)) {
                             widget::column::with_children(vec![
                                 self.terminal_diagnostic_summary(id),
                                 self.terminal_diagnostic_controls(id),
@@ -11518,11 +11523,16 @@ impl Cagents {
                         },
                         self.account_recovery_controls(id)
                             .unwrap_or_else(|| iced::widget::Space::new().into()),
-                        self.chat_capacity_guidance(id)
+                        self.blocked_failure_guidance(id)
+                            .or_else(|| self.chat_capacity_guidance(id).map(str::to_owned))
                             .map(|guidance| design::caption(guidance).into())
                             .unwrap_or_else(|| iced::widget::Space::new().into()),
                         widget::row::with_children({
-                            let mut controls = if let Some(reason) = browser_session
+                            let mut controls = if self.chat_retry_blocked(id) {
+                                // A permanent refusal keeps no Retry; the
+                                // recovery guidance above names the next step.
+                                Vec::new()
+                            } else if let Some(reason) = browser_session
                                 .and(self.browser_unavailable_reason())
                             {
                                 // The page can still be read: the system
@@ -11573,21 +11583,36 @@ impl Cagents {
                             // A conversation no retry can reach still has one
                             // thing left to do with it, and the reader has to
                             // be the one who asks for it.
+                            // Without Retry, the first remaining action is
+                            // the card's primary one, as on a stopped pane.
+                            let closing = self.terminal_close_in_progress(id);
+                            // While a restart is the way back, no button is
+                            // the next step: each one gives that way up.
+                            let waits = self
+                                .blocked_failure(id)
+                                .is_some_and(|blocked| blocked.reopen.waits());
+                            let button = |controls: &Vec<Element<'_, Message>>, label| {
+                                if controls.is_empty() && !waits {
+                                    crate::ui_controls::button::primary(label)
+                                } else {
+                                    crate::ui_controls::button::secondary(label)
+                                }
+                            };
                             if self.chat_offers_fresh_conversation(id) {
                                 controls.push(
-                                    crate::ui_controls::button::secondary(
-                                        "Start a new conversation here",
-                                    )
-                                    .id(card_control_id(id, "chat.fresh"))
-                                    .name("Start a new conversation in the same directory")
-                                    .on_press(Message::ChatUi(chat_ui::Action::StartFresh(id)))
-                                    .into(),
+                                    button(&controls, "Start a new conversation")
+                                        .id(card_control_id(id, "chat.fresh"))
+                                        .name("Start a new conversation")
+                                        // Close owns the card until it settles.
+                                        .on_press_maybe((!closing).then_some(Message::ChatUi(
+                                            chat_ui::Action::StartFresh(id),
+                                        )))
+                                        .into(),
                                 );
                             }
                             controls.push(
                                 {
-                                    let closing = self.terminal_close_in_progress(id);
-                                    crate::ui_controls::button::secondary("Close")
+                                    button(&controls, "Close")
                                         .instead("Checking…", closing)
                                         .id(card_control_id(id, "failed.close"))
                                         .name(format!("Close {}", labels.type_label))
