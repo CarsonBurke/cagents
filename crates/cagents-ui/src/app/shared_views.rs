@@ -1,6 +1,9 @@
 //! A client projection of daemon-owned scope views. Pending local intentions
 //! are layered over snapshots until acknowledged; snapshots never erase them.
+mod discovery;
 pub(super) mod seed_refusal;
+mod settlement;
+pub(super) use settlement::next_generation;
 
 use super::*;
 use crate::workspace_model::{
@@ -99,6 +102,11 @@ enum ViewScopeAuthorities<'a> {
         repositories: HashMap<PathBuf, PathBuf>,
         projects: HashSet<PathBuf>,
     },
+    /// Owned by [`discovery::ViewDiscovery`] between saves.
+    Indexed {
+        repositories: &'a HashMap<PathBuf, PathBuf>,
+        projects: &'a HashSet<PathBuf>,
+    },
 }
 
 impl ViewScopeAuthorities<'_> {
@@ -106,6 +114,7 @@ impl ViewScopeAuthorities<'_> {
         match self {
             Self::Borrowed { repositories, .. } => repositories.get(path).copied(),
             Self::Owned { repositories, .. } => repositories.get(path).map(PathBuf::as_path),
+            Self::Indexed { repositories, .. } => repositories.get(path).map(PathBuf::as_path),
         }
     }
 
@@ -113,6 +122,7 @@ impl ViewScopeAuthorities<'_> {
         match self {
             Self::Borrowed { projects, .. } => projects.contains(repository),
             Self::Owned { projects, .. } => projects.contains(repository),
+            Self::Indexed { projects, .. } => projects.contains(repository),
         }
     }
 }
@@ -254,8 +264,8 @@ pub(super) struct State {
     held_descriptor_clones: std::cell::Cell<usize>,
     /// The daemon answered this window without a shared model to give.
     pub(super) registry_unavailable: bool,
-    baseline: HashMap<Scope, Vec<Pane>>,
-    initialized: HashSet<Scope>,
+    baseline: settlement::ScopeMap<Vec<Pane>>,
+    initialized: settlement::ScopeSet,
     seeding: HashSet<Scope>,
     pub(super) seed_attempts: HashMap<Scope, uuid::Uuid>,
     /// Definitive failures stay held until an explicit retry or a new registry.
@@ -296,6 +306,8 @@ pub(super) struct State {
     pub chat_adoptions: HashMap<CardId, crate::session::ChatIdentityAdoption>,
     pub restorations: Vec<crate::persistence::TerminalPaneRestoration>,
     restoration_requests: HashMap<CardId, TerminalId>,
+    /// What complete saves keep of scope discovery between passes.
+    discovery: discovery::ViewDiscovery,
 }
 
 impl State {
@@ -307,6 +319,13 @@ impl State {
             || (self.initialized.contains(scope)
                 && !self.seeding.contains(scope)
                 && !self.blocked.contains(scope))
+    }
+
+    /// Stops comparing each complete pass with a rediscovery, for timing
+    /// workloads that measure what a pass costs.
+    #[cfg(test)]
+    pub(super) fn skip_rediscovery_check(&mut self) {
+        self.discovery.unchecked = true;
     }
 
     /// Treats `scope` as already seeded with `panes`, as an acknowledged seed
@@ -1062,6 +1081,27 @@ impl Cagents {
                     .map(|path| (card, path))
             })
             .collect::<Vec<_>>();
+        let scopes = self.discovered_scopes(
+            &topology.authorities,
+            self.active_workspace.as_deref(),
+            worktree_cards.iter().map(|(_, path)| *path),
+        );
+        ScopeDiscovery {
+            scopes,
+            worktree_cards,
+        }
+    }
+
+    /// The scopes `discover_view_scopes_with` finds, given the active
+    /// workspace and the worktree of each card outside a channel, in the
+    /// order it finds them: channels, then listed worktree views, known
+    /// roots, the active workspace and the cards' worktrees.
+    fn discovered_scopes<'a: 'p, 'p>(
+        &'a self,
+        authorities: &ViewScopeAuthorities<'_>,
+        active: Option<&'p Path>,
+        card_paths: impl Iterator<Item = &'p Path>,
+    ) -> Vec<Cow<'a, Scope>> {
         let mut channels = HashSet::new();
         let mut scopes = self
             .durable
@@ -1075,7 +1115,7 @@ impl Cagents {
         let mut worktrees = HashSet::<(&Path, &Path)>::new();
         for view in &self.workspace_model.views {
             if let Scope::Worktree { repository, path } = &view.scope
-                && topology.authorities.contains_repository(repository)
+                && authorities.contains_repository(repository)
                 && worktrees.insert((repository.as_path(), path.as_path()))
             {
                 scopes.push(Cow::Borrowed(&view.scope));
@@ -1084,11 +1124,11 @@ impl Cagents {
         for path in self
             .known_worktree_roots
             .iter()
-            .map(PathBuf::as_path)
-            .chain(self.active_workspace.as_deref())
-            .chain(worktree_cards.iter().map(|(_, path)| *path))
+            .map(|root| -> &'p Path { root })
+            .chain(active)
+            .chain(card_paths)
         {
-            if let Some(repository) = topology.authorities.repository_for(path)
+            if let Some(repository) = authorities.repository_for(path)
                 && worktrees.insert((repository, path))
             {
                 scopes.push(Cow::Owned(Scope::Worktree {
@@ -1097,10 +1137,7 @@ impl Cagents {
                 }));
             }
         }
-        ScopeDiscovery {
-            scopes,
-            worktree_cards,
-        }
+        scopes
     }
 
     #[cfg(test)]
@@ -1297,22 +1334,33 @@ impl Cagents {
         selected: Option<&HashSet<Scope>>,
         topology: &ViewScopeTopology<'a>,
     ) -> LocalViews {
+        let mut phase = WorkspaceProjectionTiming::new(selected.is_none());
+        let discovery = self.discover_view_scopes_with(topology);
+        phase.mark("local_discover");
+        self.project_local_views(selected, discovery, phase)
+    }
+
+    /// The local side of the `publishable` scopes among those discovered.
+    fn project_local_views<'a>(
+        &'a self,
+        selected: Option<&HashSet<Scope>>,
+        discovery: ScopeDiscovery<'a>,
+        mut phase: WorkspaceProjectionTiming,
+    ) -> LocalViews {
         #[cfg(test)]
         self.shared_views
             .local_projection_count
             .set(self.shared_views.local_projection_count.get() + 1);
-        let mut phase = WorkspaceProjectionTiming::new(selected.is_none());
+        let ScopeDiscovery {
+            scopes,
+            worktree_cards,
+        } = discovery;
         let cards = self
             .durable
             .cards
             .iter()
             .map(|card| (card.id, card))
             .collect::<HashMap<_, _>>();
-        let ScopeDiscovery {
-            scopes,
-            worktree_cards,
-        } = self.discover_view_scopes_with(topology);
-        phase.mark("local_discover");
         let mut by_path = HashMap::<&Path, Vec<CardId>>::new();
         for (card, path) in worktree_cards {
             if card.existence.is_open() && !card.kind.is_utility() {
@@ -1876,7 +1924,7 @@ impl Cagents {
         else {
             return;
         };
-        let baseline = self.shared_views.baseline.entry(scope.clone()).or_default();
+        let baseline = self.shared_views.baseline.entry_or_default(scope.clone());
         if baseline.iter().any(|existing| existing.id == card) {
             return;
         }
@@ -1984,7 +2032,10 @@ impl Cagents {
         {
             return;
         }
-        self.publish_projected_view_changes(self.local_views(), ViewProjection::All);
+        let mut discovery = std::mem::take(&mut self.shared_views.discovery);
+        let projected = self.discovered_local_views(&mut discovery);
+        self.shared_views.discovery = discovery;
+        self.publish_projected_view_changes(projected, ViewProjection::All);
     }
 
     fn publish_projected_view_changes(
@@ -2104,8 +2155,7 @@ impl Cagents {
                     let baseline = self
                         .shared_views
                         .baseline
-                        .entry(destination.clone())
-                        .or_default();
+                        .entry_or_default(destination.clone());
                     baseline.insert(index.min(baseline.len()), pane.clone());
                 }
             }

@@ -99,7 +99,7 @@ fn chat(directory: &Path, index: usize) -> CardKind {
     })
 }
 
-fn terminal(directory: &Path) -> CardKind {
+pub(super) fn terminal(directory: &Path) -> CardKind {
     CardKind::Terminal(fresh_terminal_session(LaunchRecipe {
         program: "bash".into(),
         arguments: Vec::new(),
@@ -107,7 +107,7 @@ fn terminal(directory: &Path) -> CardKind {
     }))
 }
 
-fn card(title: String, kind: CardKind, existence: Existence) -> CardState {
+pub(super) fn card(title: String, kind: CardKind, existence: Existence) -> CardState {
     CardState {
         id: CardId::new(),
         generation: 0,
@@ -518,6 +518,7 @@ fn worktree_open_timing() {
 #[ignore = "timing workload; run optimized with --ignored --nocapture"]
 fn navigation_save_timing() {
     let (mut app, channels, directory) = large_workspace(&Scale::LARGE);
+    app.shared_views.skip_rediscovery_check();
     let targets = &channels[..Scale::LARGE.chats];
     let click = |app: &mut Cagents, round: usize, index: usize| {
         let channel_id = targets[(index * 7 + round) % targets.len()];
