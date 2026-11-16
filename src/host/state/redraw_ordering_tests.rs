@@ -1,12 +1,12 @@
 //! Orderings a redraw broadcast must keep now that its frames are encoded
 //! outside the host lock. Each test plans a broadcast, lets something else
-//! take the lock, then commits, and replays the subscriber's queue the way a
-//! hosted client applies it.
+//! take the lock, then commits, and replays the subscriber's queue the way
+//! `HostedTerminal` applies it.
 use super::*;
 use crate::{
     model::{BootId, HostIncarnation, HostSessionId},
     terminal::{CellSnapshot, CellText, RenderStreamFixture, RowSnapshot, ScrollSnapshot},
-    terminal_ipc::SnapshotContent,
+    terminal_ipc::{ServerResponse, SnapshotContent},
 };
 
 const ROWS: u16 = 3;
@@ -136,92 +136,150 @@ impl Fixture {
     fn acknowledged_source(&self) -> u64 {
         self.shared.lock().unwrap().subscriptions.viewports[&(1, self.id)].acknowledged_source
     }
+
+    /// Answers a `ClientRequest::Snapshot` as the daemon does: the reply is
+    /// recorded under the lock, and its connection queues it afterwards.
+    fn reply(&self, after: u64) -> Outbound {
+        let snapshot = client_snapshot(&self.shared, 1, self.id, after).unwrap();
+        let proof = self.shared.lock().unwrap().proof().clone();
+        Outbound::response(
+            &proof,
+            7,
+            crate::terminal_ipc::PreparedResponse::Decoded(ServerResponse::Snapshot {
+                terminal_id: self.id,
+                snapshot,
+            }),
+        )
+    }
+
+    /// Whether acknowledging what the subscriber shows releases the worker's
+    /// capture credit, rather than leaving capture withheld.
+    fn acknowledgement_releases_credit(&self, replay: &Replay) {
+        if replay.pending_redraw.is_some() {
+            return;
+        }
+        let shown = replay.screen.as_ref().unwrap().generation;
+        let state = self.shared.lock().unwrap();
+        let source = state.redraw_source(1, self.id, shown);
+        assert_ne!(source, 0, "acknowledging frame {shown} releases nothing");
+        assert_eq!(
+            source,
+            state.subscriptions.viewports[&(1, self.id)].acknowledged_source
+        );
+    }
 }
 
 /// What the subscriber ends up with, replayed as `HostedTerminal` applies its
-/// queue. Panics on any frame a client could not apply against exactly the
-/// frame it received before it.
+/// queue. Panics on a pushed frame that is not relative to exactly the frame
+/// queued before it.
 struct Replay {
     screen: Option<RenderSnapshot>,
     frames: Vec<u64>,
-    /// The newest `Redraw` received after the last frame, if any.
+    /// A `Redraw` newer than the screen, which makes the client fetch.
     pending_redraw: Option<u64>,
+    /// The client re-requested a full grid after a reply it could not apply.
+    refetching: bool,
 }
 
-fn replay(delivery: &DeliveryQueue, id: TerminalId) -> Replay {
+/// `snapshot_pending` is whether the client has a snapshot request in flight
+/// when the queue starts; it then ignores `Redraw` and failed pushed frames.
+fn replay(delivery: &DeliveryQueue, id: TerminalId, mut snapshot_pending: bool) -> Replay {
     delivery.close_after_drain();
     let mut replay = Replay {
         screen: None,
         frames: Vec::new(),
         pending_redraw: None,
+        refetching: false,
     };
     while let Some(message) = delivery.pop() {
-        match message.message {
+        let reply = message.wire().request_id.is_some();
+        let snapshot = match message.message {
             ServerMessage::Snapshot {
                 terminal_id,
                 snapshot,
+            } if terminal_id == id => Some(snapshot),
+            ServerMessage::Response {
+                response:
+                    ServerResponse::Snapshot {
+                        terminal_id,
+                        snapshot,
+                    },
             } if terminal_id == id => {
-                let current = replay.screen.as_ref();
-                if let SnapshotContent::Delta {
-                    base_generation, ..
-                } = &snapshot.content
-                {
-                    assert_eq!(
-                        Some(*base_generation),
-                        current.map(|screen| screen.generation),
-                        "a delta was queued against a frame other than the one queued before it"
-                    );
-                }
-                let resolved = snapshot.apply(current).expect("frame applies");
-                if let Some(current) = current {
-                    assert!(
-                        resolved.generation >= current.generation,
-                        "frame {} queued after frame {}",
-                        resolved.generation,
-                        current.generation
-                    );
-                    if resolved.generation == current.generation {
-                        // A hosted client drops a frame numbered like the one
-                        // it holds, so that frame must show the same screen.
-                        assert_eq!(text(&resolved), text(current));
-                        continue;
-                    }
-                }
-                replay.frames.push(resolved.generation);
-                replay.pending_redraw = replay
-                    .pending_redraw
-                    .filter(|redraw| *redraw > resolved.generation);
-                replay.screen = Some(resolved);
+                snapshot_pending = false;
+                snapshot
             }
             ServerMessage::Redraw {
                 terminal_id,
                 generation,
             } if terminal_id == id => {
-                replay.pending_redraw = replay.pending_redraw.max(Some(generation));
+                let cursor = replay.screen.as_ref().map_or(0, |screen| screen.generation);
+                if generation > cursor && !snapshot_pending {
+                    replay.pending_redraw = replay.pending_redraw.max(Some(generation));
+                }
+                None
             }
-            _ => {}
+            _ => None,
+        };
+        let Some(snapshot) = snapshot else { continue };
+        let current = replay.screen.as_ref();
+        if let SnapshotContent::Delta {
+            base_generation, ..
+        } = &snapshot.content
+            && !reply
+        {
+            assert_eq!(
+                Some(*base_generation),
+                current.map(|screen| screen.generation),
+                "a delta was pushed against a frame other than the one queued before it"
+            );
         }
+        let Ok(resolved) = snapshot.apply(current) else {
+            // Only a reply can get here: its base was replaced by a frame
+            // pushed before it. The client asks for a full grid.
+            assert!(reply);
+            replay.refetching = true;
+            continue;
+        };
+        if let Some(current) = current
+            && resolved.generation <= current.generation
+        {
+            // A hosted client drops a frame no newer than the one it holds.
+            if !reply {
+                assert_eq!(resolved.generation, current.generation);
+                assert_eq!(
+                    text(&resolved),
+                    text(current),
+                    "a pushed frame reused a number for a different screen"
+                );
+            }
+            continue;
+        }
+        replay.frames.push(resolved.generation);
+        replay.pending_redraw = replay
+            .pending_redraw
+            .filter(|redraw| *redraw > resolved.generation);
+        replay.screen = Some(resolved);
     }
     replay
 }
 
 impl Replay {
-    /// The subscriber either shows `expected` or holds a newer `Redraw` that
-    /// makes it fetch the current screen.
+    fn fetching(&self) -> bool {
+        self.refetching || self.pending_redraw.is_some()
+    }
+
+    /// The subscriber either shows `expected` or is fetching the current
+    /// screen.
     fn converges_to(&self, expected: &[Arc<RowSnapshot>]) {
         let screen = self
             .screen
             .as_ref()
             .expect("the subscriber received a frame");
-        let expected = text(&grid(0, expected));
-        if text(screen) == expected {
-            return;
-        }
         assert!(
-            self.pending_redraw
-                .is_some_and(|redraw| redraw > screen.generation),
-            "the subscriber shows {:?} instead of {expected:?} and was not told to fetch",
-            text(screen)
+            text(screen) == text(&grid(0, expected)) || self.fetching(),
+            "the subscriber shows {:?} instead of {:?} and is not fetching",
+            text(screen),
+            text(&grid(0, expected))
         );
     }
 }
@@ -251,13 +309,14 @@ fn concurrent_broadcasts_never_queue_a_delta_against_a_frame_the_client_lacks() 
                 planned[broadcast] = Some(fixture.plan(generation));
             }
         }
-        let replay = replay(&fixture.delivery, fixture.id);
+        let replay = replay(&fixture.delivery, fixture.id, false);
         replay.converges_to(&fixture.lines);
         let last = *replay.frames.last().unwrap();
-        let state = fixture.shared.lock().unwrap();
-        let view = &state.subscriptions.viewports[&(1, fixture.id)];
         assert_eq!(
-            state
+            fixture
+                .shared
+                .lock()
+                .unwrap()
                 .subscriptions
                 .last_sent(1, fixture.id)
                 .unwrap()
@@ -265,14 +324,49 @@ fn concurrent_broadcasts_never_queue_a_delta_against_a_frame_the_client_lacks() 
             last,
             "{order:?}: the recorded base is not the last frame queued"
         );
-        // Acknowledging the last frame releases the credit of the capture it
-        // carried, never one the subscriber did not receive.
-        assert_eq!(
-            state.redraw_source(1, fixture.id, last),
-            view.acknowledged_source
-        );
-        assert!(view.acknowledged_source <= fixture.generation);
+        fixture.acknowledgement_releases_credit(&replay);
     }
+}
+
+/// A wake can name an older generation than the capture it finds, when the
+/// worker and the event notifier broadcast at once. The newer screen must get
+/// a number of its own: under the old one the subscriber would drop it while
+/// the daemon recorded it as the next delta's base.
+#[test]
+fn a_stale_wake_with_a_newer_capture_numbers_it_afresh() {
+    let mut fixture = Fixture::new();
+    let current = fixture.change(0, "two");
+    broadcast_redraw(
+        &Arc::downgrade(&fixture.shared),
+        fixture.id,
+        current,
+        &fixture.stream.handle,
+    );
+    let newest = fixture.change(1, "tres");
+    broadcast_redraw(
+        &Arc::downgrade(&fixture.shared),
+        fixture.id,
+        current,
+        &fixture.stream.handle,
+    );
+    // Its own wake then finds nothing it has not already sent.
+    broadcast_redraw(
+        &Arc::downgrade(&fixture.shared),
+        fixture.id,
+        newest,
+        &fixture.stream.handle,
+    );
+    let last = fixture.change(2, "four");
+    broadcast_redraw(
+        &Arc::downgrade(&fixture.shared),
+        fixture.id,
+        last,
+        &fixture.stream.handle,
+    );
+    let replay = replay(&fixture.delivery, fixture.id, false);
+    assert_eq!(replay.frames.len(), 4, "{:?}", replay.frames);
+    replay.converges_to(&fixture.lines);
+    fixture.acknowledgement_releases_credit(&replay);
 }
 
 #[test]
@@ -304,7 +398,7 @@ fn a_frame_planned_before_a_resize_is_replaced_by_a_redraw() {
         before,
         "an unsent frame must not move the acknowledged capture"
     );
-    let replay = replay(&fixture.delivery, fixture.id);
+    let replay = replay(&fixture.delivery, fixture.id, false);
     assert_eq!(
         replay.frames,
         [1],
@@ -313,50 +407,45 @@ fn a_frame_planned_before_a_resize_is_replaced_by_a_redraw() {
     assert_eq!(replay.pending_redraw, Some(resized));
 }
 
+/// A `ClientRequest::Snapshot` reply is recorded under the lock but queued by
+/// its connection after the lock is released, so a broadcast can be queued
+/// first. The client still holds its old screen then. A delta against the
+/// reply would fail; with the reply pending the client would not re-request,
+/// would settle on the reply while the daemon recorded the broadcast's frame,
+/// and its acknowledgement would release no capture credit.
 #[test]
-fn a_frame_planned_before_a_snapshot_reply_is_not_sent_against_the_replaced_base() {
-    let mut fixture = Fixture::new();
-    let generation = fixture.change(0, "late");
-    let planned = fixture.plan(generation);
-    let reply = fixture.change(1, "reply");
-    {
-        // What `client_snapshot` does in its final hold, with its reply
-        // queued in that same hold.
-        let mut state = fixture.shared.lock().unwrap();
-        let revision = state.presentation_observed(1, fixture.id, reply);
-        let mut capture = (*fixture.stream.handle.snapshot()).clone();
-        capture.generation = revision;
-        let capture = Arc::new(capture);
-        state
-            .subscriptions
-            .viewports
-            .get_mut(&(1, fixture.id))
-            .unwrap()
-            .acknowledged_source = reply;
-        state
-            .subscriptions
-            .record_sent(1, fixture.id, Arc::clone(&capture));
-        let proof = state.proof_handle();
-        fixture
-            .delivery
-            .push(Outbound::broadcast(
-                &proof,
-                ServerMessage::Snapshot {
-                    terminal_id: fixture.id,
-                    snapshot: TerminalSnapshot::full(&capture),
-                },
-            ))
-            .unwrap();
+fn a_broadcast_racing_a_snapshot_reply_still_applies_and_releases_credit() {
+    for reply_queued_first in [false, true] {
+        let mut fixture = Fixture::new();
+        fixture.change(0, "reply");
+        let reply = fixture.reply(1);
+        if reply_queued_first {
+            fixture.delivery.push(reply.clone()).unwrap();
+        }
+        let generation = fixture.change(1, "push");
+        broadcast_redraw(
+            &Arc::downgrade(&fixture.shared),
+            fixture.id,
+            generation,
+            &fixture.stream.handle,
+        );
+        if !reply_queued_first {
+            fixture.delivery.push(reply).unwrap();
+        }
+        let replay = replay(&fixture.delivery, fixture.id, true);
+        // Queued after the broadcast, the reply's delta no longer applies and
+        // the client asks once for a full grid; it already shows the newest.
+        assert_eq!(replay.refetching, !reply_queued_first);
+        assert_eq!(
+            text(replay.screen.as_ref().unwrap()),
+            text(&grid(0, &fixture.lines))
+        );
+        fixture.acknowledgement_releases_credit(&replay);
+        // The broadcast's frame is a base the client now holds in order.
+        let next = fixture.change(2, "next");
+        let planned = fixture.plan(next);
+        assert!(planned[0].delta);
     }
-    fixture.commit(planned);
-    assert_eq!(fixture.acknowledged_source(), reply);
-    let replay = replay(&fixture.delivery, fixture.id);
-    assert_eq!(
-        replay.frames.len(),
-        2,
-        "only the initial frame and the reply"
-    );
-    replay.converges_to(&fixture.lines);
 }
 
 #[test]
@@ -443,10 +532,11 @@ fn a_frame_encoded_for_a_retired_worker_never_reaches_a_same_id_successor() {
 }
 
 #[test]
-fn a_hidden_subscriber_receives_nothing_planned_while_it_was_visible() {
+fn a_subscriber_hidden_after_planning_gets_nothing_and_its_reveal_returns_credit() {
     let mut fixture = Fixture::new();
     let generation = fixture.change(0, "late");
     let planned = fixture.plan(generation);
+    let before = fixture.acknowledged_source();
     fixture
         .shared
         .lock()
@@ -454,43 +544,66 @@ fn a_hidden_subscriber_receives_nothing_planned_while_it_was_visible() {
         .set_visibility(1, fixture.id, TerminalVisibility::Hidden)
         .unwrap();
     fixture.commit(planned);
-    let replay = replay(&fixture.delivery, fixture.id);
-    assert_eq!(replay.frames, [1]);
+    assert_eq!(fixture.acknowledged_source(), before);
+    // The reveal notifies; the client answers by fetching what it missed.
+    fixture
+        .shared
+        .lock()
+        .unwrap()
+        .set_visibility(1, fixture.id, TerminalVisibility::Visible)
+        .unwrap();
+    let reply = fixture.reply(1);
+    fixture.delivery.push(reply).unwrap();
+    let replay = replay(&fixture.delivery, fixture.id, false);
+    assert_eq!(replay.frames.len(), 2, "the hidden frame was pushed");
+    replay.converges_to(&fixture.lines);
+    assert_eq!(fixture.acknowledged_source(), generation);
+    assert!(!replay.fetching());
+    fixture.acknowledgement_releases_credit(&replay);
 }
 
-/// The same property with real threads: two broadcasts of each published
-/// generation race, as the terminal's worker and the shared event notifier can.
+/// The same property with real threads: two broadcasts race for every
+/// pair of generations the worker publishes, one with the newer generation
+/// and one with the older, as the worker and the shared event notifier can.
+/// The deterministic interleavings above are what cover each order; this
+/// checks nothing else is missed when the holds actually contend.
 #[test]
 fn racing_broadcast_threads_keep_every_delta_chained() {
-    const STEPS: usize = 150;
+    const STEPS: usize = 100;
     let mut fixture = Fixture::new();
     let host = Arc::downgrade(&fixture.shared);
     let id = fixture.id;
     let barrier = Arc::new(std::sync::Barrier::new(3));
+    let wakes = Arc::new(std::sync::Mutex::new([0_u64; 2]));
     let racers = (0..2)
-        .map(|_| {
+        .map(|racer| {
             let host = host.clone();
             let worker = fixture.stream.handle.clone();
             let barrier = Arc::clone(&barrier);
+            let wakes = Arc::clone(&wakes);
             thread::spawn(move || {
                 for _ in 0..STEPS {
                     barrier.wait();
-                    broadcast_redraw(&host, id, worker.generation(), &worker);
+                    let generation = wakes.lock().unwrap()[racer];
+                    broadcast_redraw(&host, id, generation, &worker);
                     barrier.wait();
                 }
             })
         })
         .collect::<Vec<_>>();
     for step in 0..STEPS {
-        fixture.change(step % usize::from(ROWS), &format!("{step:04}"));
+        let older = fixture.change(step % usize::from(ROWS), &format!("{step:03}a"));
+        let newer = fixture.change((step + 1) % usize::from(ROWS), &format!("{step:03}b"));
+        *wakes.lock().unwrap() = [older, newer];
         barrier.wait();
         barrier.wait();
     }
     for racer in racers {
         racer.join().unwrap();
     }
-    let replay = replay(&fixture.delivery, fixture.id);
+    let replay = replay(&fixture.delivery, fixture.id, false);
     replay.converges_to(&fixture.lines);
+    fixture.acknowledgement_releases_credit(&replay);
     assert!(
         replay.frames.len() > STEPS / 2,
         "the racing broadcasts delivered {} of {STEPS} frames",
