@@ -652,14 +652,20 @@ struct OfferedCards {
 /// It is deliberately not persisted: the next run offers the content once
 /// more, which is also how a build whose rules changed gets to accept it.
 struct RefusedClosure {
+    workspace: WorkspaceId,
     offered: CardState,
     generation: u64,
 }
 
 impl RefusedClosure {
-    /// Whether offering `card` over `stored` is the offer already refused,
-    /// with nothing left for it to store.
-    fn repeats(&self, card: &CardState, stored: Option<&ExistingCard>) -> bool {
+    /// Whether offering `card` over `stored` in `workspace` is the offer
+    /// already refused, with nothing left for it to store.
+    fn repeats(
+        &self,
+        workspace: WorkspaceId,
+        card: &CardState,
+        stored: Option<&ExistingCard>,
+    ) -> bool {
         // Destructured in full so that a field added to `CardState` has to be
         // classified here: what a card write stores is compared, and what
         // only describes the running window is not.
@@ -674,6 +680,7 @@ impl RefusedClosure {
         // An open row still has the tombstone to take, so only a row that is
         // absent or already closed makes the offer a pure repeat.
         stored.is_none_or(|stored| !stored.existence.is_open())
+            && self.workspace == workspace
             && self.generation == stored.map_or(0, |stored| stored.generation)
             && *title == card.title
             && *width_fraction == card.width_fraction
@@ -4436,8 +4443,20 @@ fn save_workspace_transaction(
         };
         let generation = tombstone_card(transaction, *card_id, stored, &tombstone, timestamp)?;
         card_generations.insert(*card_id, generation);
-        offered_cards.settled.remove(card_id);
     }
+    // A card this workspace no longer offers has nothing left to skip,
+    // whether its row was tombstoned above, never stored or has moved on.
+    // What this connection remembers for a workspace is bounded by the
+    // snapshot it saved last for it; other workspaces keep theirs.
+    let offered = |workspace: WorkspaceId, card: &CardId| {
+        workspace != state.id || incoming_ids.contains(card)
+    };
+    offered_cards
+        .settled
+        .retain(|card, settled| offered(settled.workspace, card));
+    offered_cards
+        .refused
+        .retain(|card, refused| offered(refused.workspace, card));
 
     Ok(WorkspaceCommit {
         generation: next,
@@ -4711,7 +4730,7 @@ fn save_closed_card(
         return tombstone_card(transaction, card.id, stored, &card.existence, timestamp);
     }
     if let Some(refused) = offered_cards.refused.get(&card.id)
-        && refused.repeats(card, stored)
+        && refused.repeats(workspace, card, stored)
     {
         return Ok(refused.generation);
     }
@@ -4747,6 +4766,7 @@ fn save_closed_card(
             offered_cards.refused.insert(
                 card.id,
                 RefusedClosure {
+                    workspace,
                     offered: card.clone(),
                     generation,
                 },
@@ -12944,6 +12964,95 @@ mod tests {
         let restored = store.load_card(card, None).unwrap().unwrap();
         assert_eq!(restored.title, "latest", "the latest content wins");
         assert_eq!(restored.generation, settled.0.cast_unsigned() + 5);
+    }
+
+    /// #2872: a card the window stops offering leaves what the connection
+    /// remembers, even when no tombstone is written for it because storage no
+    /// longer lists it under this workspace.
+    #[test]
+    fn a_card_the_window_stops_offering_is_forgotten() {
+        let directory = tempdir().unwrap();
+        let boot_id = boot("boot-a");
+        let store =
+            StateStore::open(directory.path().join("state.sqlite3"), boot_id.clone()).unwrap();
+        let (mut workspace, mut lane) = settled_closed_history(&store, &boot_id);
+        let remembered = |store: &StateStore| {
+            store
+                .lock_inner()
+                .unwrap()
+                .offered_cards
+                .settled
+                .keys()
+                .copied()
+                .collect::<BTreeSet<_>>()
+        };
+        assert_eq!(
+            remembered(&store),
+            workspace.cards.iter().map(|card| card.id).collect(),
+        );
+        // Tombstoned by the snapshot that drops it.
+        let dropped = workspace.cards.remove(workspace.cards.len() - 1).id;
+        lane.save(&store, &workspace).unwrap();
+        assert!(!remembered(&store).contains(&dropped));
+        // Gone from this workspace's rows without a tombstone.
+        let moved = workspace.cards.remove(workspace.cards.len() - 1).id;
+        store
+            .lock_inner()
+            .unwrap()
+            .connection
+            .execute_batch(&format!(
+                "DELETE FROM browser_restore WHERE card_id = '{moved}';
+                 DELETE FROM cards WHERE card_id = '{moved}';"
+            ))
+            .unwrap();
+        lane.save(&store, &workspace).unwrap();
+        assert_eq!(
+            remembered(&store),
+            workspace.cards.iter().map(|card| card.id).collect(),
+        );
+        store.shutdown().unwrap();
+    }
+
+    /// #2872: a refused closure the window stops offering is forgotten as
+    /// well, while what the connection remembers for another workspace
+    /// survives this one's saves.
+    #[test]
+    fn a_refused_closure_the_window_stops_offering_is_forgotten() {
+        let directory = tempdir().unwrap();
+        let (mut workspace, mut session) = agent_workspace(crate::agent::Provider::Claude);
+        let card = workspace.cards[0].id;
+        // Refused whatever storage holds, so never stored and never tombstoned.
+        session.id = TerminalId::new();
+        workspace.cards[0].kind = CardKind::Chat(session);
+        workspace.cards[0].existence = closed_by_user();
+        workspace.focused = None;
+        let store = StateStore::open(directory.path().join("state.sqlite3"), boot("boot")).unwrap();
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        let other = workspace_with_terminal(&boot("boot"));
+        let other_card = other.cards[0].id;
+        SaveLane::default().save(&store, &other).unwrap();
+        let remembered = |store: &StateStore| {
+            let inner = store.lock_inner().unwrap();
+            (
+                inner.offered_cards.refused.contains_key(&card),
+                inner.offered_cards.settled.contains_key(&other_card),
+            )
+        };
+        assert_eq!(
+            remembered(&store),
+            (true, true),
+            "each workspace keeps its own"
+        );
+
+        workspace.cards.clear();
+        lane.save(&store, &workspace).unwrap();
+        assert_eq!(
+            remembered(&store),
+            (false, true),
+            "only the saved workspace forgets what it no longer offers"
+        );
+        store.shutdown().unwrap();
     }
 
     /// A settled open card whose row another path changed is written again:
