@@ -384,9 +384,11 @@ impl Builder {
         }
         if let Some(cursor) = &self.before {
             if names(cursor, &item.id) {
-                // Until an older item joins the page, the cursor itself
-                // still marks where the next page begins.
-                self.oldest = self.before.take();
+                // Until an older item joins the page, the cursor's entry
+                // still marks where the next page begins: by its ID, as
+                // `earlier` always is, whichever name the caller gave.
+                self.oldest = Some(item.id.clone());
+                self.before = None;
             }
             return true;
         }
