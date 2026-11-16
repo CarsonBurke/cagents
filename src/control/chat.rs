@@ -6,7 +6,8 @@ pub use image_assets::ImageAssetCommand;
 
 #[derive(Debug, clap::Subcommand)]
 pub enum ChatCommand {
-    /// Inspect or explicitly remove images stored on this physical device, without a daemon.
+    /// Inspect or explicitly remove images stored on this physical device.
+    #[command(after_help = "Needs no daemon.")]
     ImageAssets {
         #[command(subcommand)]
         command: ImageAssetCommand,
@@ -16,7 +17,8 @@ pub enum ChatCommand {
         #[command(subcommand)]
         command: Option<CapacityCommand>,
     },
-    /// Inspect or release one eligible resident; idle or finished alone is insufficient.
+    /// Inspect or release one eligible resident.
+    #[command(after_help = "Being idle or finished alone does not make a resident eligible.")]
     Release {
         /// Full resident native chat ID, as shown by chat capacity.
         id: TerminalId,

@@ -223,25 +223,33 @@ pub enum TopCommand {
         #[command(subcommand)]
         command: GhCommand,
     },
-    /// Show this session, its parent and agents, and peers in its channel or checkout.
+    /// Show this session and the sessions related to it.
+    #[command(after_help = "Lists its parent and agents, and peers in its channel or checkout.")]
     Whoami,
     /// Inspect account plan allowances and the calling session’s context.
     Account {
         #[command(subcommand)]
         command: AccountCommand,
     },
-    /// List live agent sessions in this project, whoever started them, or everyone in your channel with --channel.
-    #[command(visible_alias = "ls")]
+    /// List live agent sessions in this project.
+    #[command(
+        visible_alias = "ls",
+        after_help = "Includes every session in scope, whoever started it."
+    )]
     Sessions(SessionsArgs),
-    /// Read a session's conversation, newest last: messages, tool calls and compactions.
-    #[command(visible_alias = "history")]
+    /// Read a session's conversation, newest last.
+    #[command(
+        visible_alias = "history",
+        after_help = "Shows its messages, tool calls and compactions."
+    )]
     Transcript(TranscriptArgs),
     /// Inspect native resident capacity and explicitly release completed handles.
     Chat {
         #[command(subcommand)]
         command: ChatCommand,
     },
-    /// Message another session; a live conversation receives it once idle.
+    /// Message another session.
+    #[command(after_help = "A live conversation receives the message once it is idle.")]
     Send(SendArgs),
     /// Message another session and wait for its reply.
     Ask(AskArgs),
@@ -249,7 +257,10 @@ pub enum TopCommand {
     Reply(ReplyArgs),
     /// Read the messages left for this session.
     Inbox(InboxArgs),
-    /// List this project's worktrees and branches in progress, newest activity first; or pin or remove one.
+    /// List, pin or remove this project's worktrees and branches in progress.
+    #[command(
+        after_help = "Alone, `cagents work` lists them, newest activity first, and takes the list options above."
+    )]
     Work {
         #[command(subcommand)]
         command: Option<WorkCommand>,
@@ -437,7 +448,8 @@ pub enum DaemonCommand {
         #[arg(long)]
         census: Option<PathBuf>,
     },
-    /// Update to a release or finish a staged installation through the app's reviewed flow.
+    /// Update to a release, or finish a staged installation.
+    #[command(after_help = "Goes through the app's reviewed update flow.")]
     Upgrade {
         /// Download and update to this release instead of a staged installation.
         #[arg(long, value_name = "VERSION")]
@@ -449,18 +461,22 @@ pub enum DaemonCommand {
         #[arg(long)]
         interrupt: bool,
     },
-    /// Stop the daemon and wait up to 30 seconds for exit (use --confirm for counted confirmation).
+    /// Stop the daemon.
+    #[command(
+        after_help = "Waits up to 30 seconds for the daemon to exit. Without a value, --confirm prompts on the terminal. \
+            A service unit or script has no terminal, so it may pass a capability from \
+            `daemon preflight` instead, the same counted authority \
+            `cagents-ui --confirm-daemon-stop` uses."
+    )]
     Stop {
         #[arg(long, conflicts_with = "confirm")]
         #[arg(help = "Refuse shutdown while hosted sessions remain.")]
         require_empty: bool,
-        #[arg(long, conflicts_with = "confirm")]
+        #[arg(long, conflicts_with = "confirm", value_name = "N")]
         #[arg(help = "Refuse shutdown if the observed session inventory generation changed.")]
         expected_generation: Option<u64>,
-        /// Confirm termination of the counted hosted sessions. Bare, this
-        /// prompts on the terminal. A service unit or script has no terminal,
-        /// so it may pass a capability from `daemon preflight` instead — the
-        /// same counted authority `cagents-ui --confirm-daemon-stop` uses.
+        /// Confirm termination of the counted hosted sessions, as described
+        /// below.
         #[arg(long, value_name = "CAPABILITY_JSON", num_args = 0..=1)]
         confirm: Option<Option<String>>,
         /// Return when shutdown is accepted, before the daemon has exited.
@@ -488,13 +504,14 @@ pub enum DaemonCommand {
         #[arg(long)]
         yes: bool,
     },
-    /// Print this executable's wire protocol version without contacting a daemon.
+    /// Print this executable's wire protocol version.
+    #[command(after_help = "Contacts no daemon.")]
     ProtocolVersion,
-    /// Print the schema of the shared-model store on disk, or nothing if there
-    /// is none. Refuses while a daemon runs.
+    /// Print the schema of the shared-model store on disk.
+    #[command(after_help = "Prints nothing if there is no store. Refuses while a daemon runs.")]
     StoreSchema,
-    /// Convert the shared-model store back to an older schema, so that an
-    /// older release's daemon can open it. Refuses while a daemon runs.
+    /// Convert the shared-model store back to an older schema.
+    #[command(after_help = "Lets an older release's daemon open it. Refuses while a daemon runs.")]
     DowngradeStore {
         /// The schema to convert to, such as one `daemon store-schema` printed
         /// before an update.

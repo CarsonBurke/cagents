@@ -10,8 +10,8 @@ use crate::chat::{DeliveryKind, ToolStatus};
 
 #[derive(Debug, clap::Args)]
 pub struct TranscriptArgs {
-    /// The session: its ID, lineage or agent ID, or at least four characters
-    /// of one; or `parent`, the session that started this one.
+    /// A session, lineage or agent ID, or at least four characters of one; or
+    /// `parent`, the session that started this one.
     #[arg(value_name = "SESSION")]
     session: String,
     /// How many messages to show, newest last; tool calls and notices

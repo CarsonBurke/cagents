@@ -16,59 +16,59 @@ pub enum AgentCommand {
     /// The terminal presentation of an already hosted execution agent.
     #[command(hide = true)]
     Console {
-        #[arg(help = "The hosted agent ID.")]
+        #[arg(help = "The hosted agent ID")]
         agent_id: AgentId,
     },
     /// Start a provider session on one prompt, accepted durably.
-    ///
-    /// The provider defaults to the calling session's, the directory to the
-    /// current one, and the project to the open one containing it.
+    #[command(
+        after_help = "Without --channel or --worktree, the agent joins the calling session's \
+        view, or the channel its lineage last belonged to when that view is missing or \
+        ambiguous. An agent for another project, or for a caller that never belonged to a \
+        channel, gets a new channel."
+    )]
     Spawn {
         #[command(flatten)]
         prompt: PromptArgs,
         /// Unique lowercase handle among your open agents, such as reviewer.
         #[arg(long)]
         name: Option<String>,
-        /// claude, codex, or omp. Defaults to the calling session's provider.
+        /// claude, codex or omp; defaults to the calling session's.
         #[arg(long, value_parser = parse_provider)]
         provider: Option<Provider>,
-        /// The open project to work in, by any directory inside it.
-        /// Defaults to the one containing the agent's directory.
+        /// The open project to work in, by any directory inside it; defaults
+        /// to the one containing the agent's directory.
         #[arg(long, visible_alias = "project")]
         repository: Option<PathBuf>,
-        /// The agent's working directory. Defaults to the --project path when
-        /// given, and otherwise the current directory.
+        /// The agent's working directory; defaults to the --project path, or
+        /// else the current directory.
         #[arg(long)]
         directory: Option<PathBuf>,
-        /// Place the agent in this channel. By default it joins the calling
-        /// session's view, or the channel its lineage last belonged to when
-        /// that view is missing or ambiguous; an agent for another project, or
-        /// for a caller that never belonged to a channel, gets a new channel.
+        /// Place the agent in this channel; the default is below.
         #[arg(long)]
         channel: Option<ChannelId>,
-        /// Place the agent among the panes of this open checkout, the
-        /// project's own folder or one of its linked worktrees, instead of
-        /// in a channel. It is also the working directory unless --directory
-        /// names another.
+        /// Place the agent among this open checkout's panes, the project
+        /// folder or a linked worktree, instead of a channel; also the working
+        /// directory unless --directory names another.
         #[arg(long, conflicts_with = "channel")]
         worktree: Option<PathBuf>,
         #[arg(long)]
-        #[arg(help = "Stable account ID (provider/system or provider/UUID).")]
+        #[arg(help = "Stable account ID: provider/system or provider/UUID")]
         account: Option<AccountId>,
         #[arg(long, default_value = "chat", value_parser = ["chat", "terminal"])]
-        #[arg(help = "Presentation surface for the provider session.")]
+        #[arg(help = "How the session is presented")]
         surface: String,
         #[arg(long)]
         #[arg(
-            help = "Provider model ID (Claude: an alias such as fable, opus, sonnet or haiku, which the installed Claude Code resolves, or a full ID such as claude-fable-5-2; Codex: exact provider catalog ID; OMP: provider/model). Omit to use the provider default; the native chat model picker lists available IDs."
+            help = "Provider model ID; omit for the provider default. Claude: an alias the installed Claude Code resolves, such as fable, opus, sonnet or haiku, or a full ID such as claude-fable-5-2. Codex: an exact provider catalog ID. OMP: provider/model. The native chat model picker lists available IDs"
         )]
         model: Option<String>,
-        #[arg(long)]
-        #[arg(help = "Permission policy (Claude: default/manual/auto/acceptEdits/plan/dontAsk/bypassPermissions; Codex: untrusted/on-failure/on-request/never; OMP: always-ask/write/yolo).",
+        #[arg(long, value_name = "MODE")]
+        #[arg(help = "Permission policy. Claude: default, manual, auto, acceptEdits, plan, dontAsk or bypassPermissions. Codex: untrusted, on-failure, on-request or never. OMP: always-ask, write or yolo",
+            hide_possible_values = true,
             value_parser = ["default", "manual", "auto", "acceptEdits", "plan", "dontAsk", "bypassPermissions", "untrusted", "on-failure", "on-request", "never", "always-ask", "write", "yolo"])]
         permission_mode: Option<String>,
         /// The provider's effort name, such as low or high; omit for its default.
-        #[arg(long)]
+        #[arg(long, value_name = "EFFORT")]
         reasoning_effort: Option<String>,
         #[command(flatten)]
         retry: RetryArgs,
@@ -78,17 +78,18 @@ pub enum AgentCommand {
         show: ShowArgs,
     },
     /// Send a follow-up prompt to an owned agent.
-    ///
-    /// An idle agent starts a run with it now, reopening its conversation if
-    /// its process stopped. A busy one holds it, unsent, and runs it as soon
-    /// as its current work ends.
+    #[command(
+        after_help = "An idle agent starts a run with it now, reopening its conversation \
+        if its process stopped. A busy one holds it, unsent, and runs it as soon as its \
+        current work ends."
+    )]
     Send {
-        /// The agent, by ID or a unique prefix of it.
+        /// Agent handle, ID, or unique ID prefix.
         agent: String,
         #[command(flatten)]
         prompt: PromptArgs,
-        /// Interrupt the agent's current turn, so this prompt runs as soon as
-        /// that turn stops. Prompts already waiting still run first.
+        /// Interrupt the current turn so this prompt runs when it stops;
+        /// prompts already waiting still run first.
         #[arg(long)]
         interrupt: bool,
         #[command(flatten)]
@@ -100,7 +101,7 @@ pub enum AgentCommand {
     },
     /// Read an owned agent and its latest run.
     Status {
-        #[arg(help = "Agent handle, ID, or unique ID prefix.")]
+        #[arg(help = "Agent handle, ID, or unique ID prefix")]
         agent: String,
         #[command(flatten)]
         show: ShowArgs,
@@ -108,34 +109,34 @@ pub enum AgentCommand {
     /// List this caller's open agents without their results.
     List,
     /// Wait for runs to settle or ask for input.
-    ///
-    /// Each handle is an agent, standing for its latest run, or a run, by ID
-    /// or a unique prefix of it.
-    ///
-    /// Exit codes: 0 succeeded; 3 timed out; 4 failed, cancelled or interrupted;
-    /// 5 waiting for input, approval or an arrived message. With --any, use
-    /// the first ready run; otherwise failure outranks input, then timeout.
+    #[command(
+        after_help = "Exit codes: 0 succeeded; 3 timed out; 4 failed, cancelled or \
+        interrupted; 5 waiting for input, approval or an arrived message. With --any, the \
+        first ready run decides; otherwise failure outranks input, then timeout."
+    )]
     Wait {
         #[arg(required = true, value_name = "AGENT_OR_RUN")]
-        #[arg(help = "Agent or run handles to wait for.")]
+        #[arg(
+            help = "Agent handles or IDs, each standing for its latest run, or run IDs; unique ID prefixes work too"
+        )]
         handles: Vec<String>,
         /// Return as soon as any of them is ready, rather than all.
         #[arg(long)]
         any: bool,
         #[arg(long, default_value = "60", value_parser = parse_positive_seconds)]
-        #[arg(help = "Maximum time to wait, in seconds.")]
+        #[arg(help = "Maximum time to wait, in seconds")]
         timeout: f64,
         #[command(flatten)]
         show: ShowArgs,
     },
     /// List the questions and approvals an owned agent is waiting on.
     Requests {
-        #[arg(help = "Agent handle, ID, or unique ID prefix.")]
+        #[arg(help = "Agent handle, ID, or unique ID prefix")]
         agent: String,
     },
     /// Answer one of an owned agent's requests with one of its actions.
     Answer {
-        #[arg(help = "Agent handle, ID, or unique ID prefix.")]
+        #[arg(help = "Agent handle, ID, or unique ID prefix")]
         agent: String,
         /// The request ID `requests` lists.
         request: String,
@@ -147,7 +148,7 @@ pub enum AgentCommand {
     },
     /// Interrupt an owned agent's active run.
     Interrupt {
-        #[arg(help = "Agent handle, ID, or unique ID prefix.")]
+        #[arg(help = "Agent handle, ID, or unique ID prefix")]
         agent: String,
         /// Permit the interrupt to stop the provider's background subagents,
         /// including any waiting on their own background work.
@@ -156,7 +157,7 @@ pub enum AgentCommand {
     },
     /// Stop and close an agent, including its background subagents.
     Close {
-        #[arg(help = "Agent handle, ID, or unique ID prefix.")]
+        #[arg(help = "Agent handle, ID, or unique ID prefix")]
         agent: String,
     },
 }
@@ -164,8 +165,7 @@ pub enum AgentCommand {
 /// A prompt given as an argument, in a file, or on standard input.
 #[derive(Debug, clap::Args)]
 pub struct PromptArgs {
-    /// The prompt, which may begin with `-`; a lone `-` reads it from
-    /// standard input.
+    /// The prompt, which may begin with `-`; a lone `-` reads standard input.
     #[arg(value_name = "PROMPT", allow_hyphen_values = true)]
     pub(super) text: Option<String>,
     /// Read the prompt from this file.
@@ -178,9 +178,9 @@ pub struct PromptArgs {
 
 #[derive(Debug, clap::Args)]
 pub struct RetryArgs {
-    /// Retrying with the same key and request returns the original
-    /// acceptance instead of starting the work again. Generated when omitted.
-    #[arg(long)]
+    /// Retrying with this key and the same request returns the original
+    /// acceptance instead of starting again; generated when omitted.
+    #[arg(long, value_name = "KEY")]
     idempotency_key: Option<String>,
 }
 
@@ -190,7 +190,7 @@ pub struct WaitArgs {
     /// 5 input or approval needed.
     #[arg(long)]
     pub(super) wait: bool,
-    /// How long `--wait` waits.
+    /// How long `--wait` waits, in seconds.
     #[arg(long, default_value = "60", value_parser = parse_positive_seconds, requires = "wait")]
     timeout: f64,
 }
