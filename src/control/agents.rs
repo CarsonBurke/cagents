@@ -451,6 +451,9 @@ fn list_human(summaries: &[Summary], projects: &[ModelProject], program: &str) -
     out
 }
 
+/// How long naming an accepted run may wait on the agent list.
+const HANDLES_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// How output names agents and runs: by the shortest prefix, eight
 /// characters or more, that tells apart every agent and run it knows of, as
 /// `agent list` shows them. Each is accepted back as a handle.
@@ -984,9 +987,24 @@ impl Session {
     }
 
     /// How to name agents and runs, among the caller's open ones and `also`.
-    /// Without the list, as when the daemon refuses it, the shortest prefix.
+    /// The list is read only for human text, and only briefly: without it,
+    /// as when the daemon is slow or refuses it, `also` alone decides.
     fn handles(&mut self, also: &[String]) -> Handles {
-        Handles::among(self.summaries().unwrap_or_default(), also)
+        if self.summaries.is_none() && super::human_output() {
+            let authority = self.context.authority.clone();
+            let deadline = Instant::now() + HANDLES_TIMEOUT;
+            let listed = self
+                .client()
+                .ok()
+                .map(|client| client.agent_before(authority, Operation::List, Some(deadline)));
+            match listed {
+                Some(Ok(Reply::Listed(summaries))) => self.summaries = Some(summaries),
+                // A late reply must not answer this session's next request.
+                Some(Err(_)) => self.connection = None,
+                _ => {}
+            }
+        }
+        Handles::among(self.summaries.as_deref().unwrap_or_default(), also)
     }
 
     /// An agent handle, or the agent of a run handle. A whole ID outside the
@@ -1358,7 +1376,7 @@ pub(super) fn execute_with_context(
             let summaries = session.summaries()?.to_vec();
             // Names make the listing readable; without them it names each
             // project by its folder.
-            let projects = if summaries.is_empty() {
+            let projects = if summaries.is_empty() || !super::human_output() {
                 Vec::new()
             } else {
                 session
@@ -1437,6 +1455,11 @@ pub(super) fn execute_with_context(
             } else {
                 runs_steps(&program, &statuses, names)
             };
+            if !messages.is_empty() {
+                // Waiting again on them all covers waiting on any one.
+                let wait = format!("{program} agent wait ");
+                steps.retain(|(command, _)| !command.starts_with(&wait));
+            }
             steps.extend(arrived_steps(
                 &program,
                 &messages,

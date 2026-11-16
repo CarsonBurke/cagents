@@ -45,7 +45,6 @@ pub enum AutomationCommand {
         definition: PathBuf,
     },
     /// List definitions, ordered by ID.
-    #[command(after_help = "A page holds up to 100; use --after for the next page.")]
     List {
         #[arg(long)]
         #[arg(help = "Continue after the last automation UUID in the previous page.")]

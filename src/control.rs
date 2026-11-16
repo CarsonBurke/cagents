@@ -149,7 +149,7 @@ pub struct GlobalOptions {
 
 /// What a subcommand's help says in place of listing the global options.
 const GLOBAL_OPTIONS_NOTE: &str =
-    "Global options --device, --json and --no-start are accepted here too; see `cagents --help`.";
+    "Also takes --device, --json and --no-start; see `cagents --help`.";
 
 /// Lists the global options in `cagents --help` alone. Each top-level
 /// subcommand gets a hidden copy of them, which clap propagates in place of
@@ -231,7 +231,7 @@ pub enum TopCommand {
         #[command(subcommand)]
         command: AccountCommand,
     },
-    /// List live agent sessions in this project.
+    /// List live agent sessions in this project, or your channel's with --channel.
     #[command(
         visible_alias = "ls",
         after_help = "Includes every session in scope, whoever started it."
@@ -2966,6 +2966,22 @@ impl Drop for StartPolicy {
     }
 }
 
+/// Whether this invocation prints JSON, which human text is not part of.
+static JSON_OUTPUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the human text a command builds is printed, so a daemon read
+/// that only improves that text is worth making.
+fn human_output() -> bool {
+    !JSON_OUTPUT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+struct OutputPolicy(bool);
+impl Drop for OutputPolicy {
+    fn drop(&mut self) {
+        JSON_OUTPUT.store(self.0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 fn control_daemon_socket() -> Result<PathBuf, AppError> {
     if !daemon_autostart_disabled() {
         return terminal::ensure_daemon_ready().map_err(|e| AppError::new("daemon_start", e));
@@ -3216,6 +3232,8 @@ where
         || std::env::var("CAGENTS_NO_START")
             .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
     let _start_policy = StartPolicy(NO_START.swap(no_start, std::sync::atomic::Ordering::Relaxed));
+    let _output_policy =
+        OutputPolicy(JSON_OUTPUT.swap(cli.global.json, std::sync::atomic::Ordering::Relaxed));
 
     // Local evidence must remain readable when a staged owner, backend, or
     // daemon cannot start. Do not select/prepare a device or follow a route.
