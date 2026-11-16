@@ -466,6 +466,71 @@ fn channel_open_timing() {
     }
 }
 
+/// What the save a channel click defers costs the UI thread when it comes
+/// due, as `channel_open_timing` clicks: the whole save untraced, then each
+/// phase of a second pass from the workspace pipeline's own timing.
+#[test]
+#[ignore = "timing workload; run optimized with --ignored --nocapture"]
+fn navigation_save_timing() {
+    let (mut app, channels, directory) = large_workspace(&Scale::LARGE);
+    let targets = &channels[..Scale::LARGE.chats];
+    let save = |app: &mut Cagents, round: usize, index: usize| {
+        let channel_id = targets[(index * 7 + round) % targets.len()];
+        drop(app.update(Message::Sidebar(SidebarAction::OpenChannel { channel_id })));
+        assert!(app.navigation_save.is_some(), "the click defers its save");
+        let started = Instant::now();
+        drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
+        assert!(app.navigation_save.is_none(), "the save ran");
+        started.elapsed()
+    };
+    for index in 0..5 {
+        save(&mut app, 0, index);
+    }
+    let mut saves = Vec::new();
+    for round in 0..2 {
+        for index in 0..targets.len() {
+            saves.push(save(&mut app, round, index));
+        }
+    }
+    summary("navigation save", &mut saves);
+
+    let log_path = directory.path().join("save-phases.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "cagents::workspace_pipeline=debug",
+        ))
+        .with_writer(move || log.try_clone().unwrap())
+        .finish();
+    crate::test_tracing::with_thread_subscriber(subscriber, || {
+        for index in 0..targets.len() {
+            save(&mut app, 2, index);
+        }
+    });
+    let logged = std::fs::read_to_string(log_path).unwrap();
+    let field = |line: &str, name: &str| {
+        line.split_whitespace()
+            .find_map(|token| token.strip_prefix(&format!("{name}=")))
+            .map(|value| value.trim_matches('"').to_owned())
+    };
+    let mut phases = BTreeMap::<String, Vec<Duration>>::new();
+    for line in logged.lines() {
+        if let (Some(stage), Some(micros)) = (field(line, "stage"), field(line, "phase_us"))
+            && let Ok(micros) = micros.parse()
+        {
+            phases
+                .entry(stage)
+                .or_default()
+                .push(Duration::from_micros(micros));
+        }
+    }
+    for (stage, durations) in &mut phases {
+        summary(&format!("  {stage}"), durations);
+    }
+}
+
 /// Where a steady frame's build time goes, phase by phase, as
 /// `UserInterface::build` runs them: the named-state extraction, the
 /// reconciliation, the restoration of states that cached subtrees kept, and
