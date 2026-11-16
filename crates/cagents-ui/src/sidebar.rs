@@ -44,8 +44,8 @@ use row_interaction::RowInteraction;
 mod attention;
 pub use attention::{State as AttentionState, Summary as AttentionSummary};
 
-mod cluster;
-pub use cluster::{MemberState as ChannelMemberState, Members as ChannelMembers};
+mod members;
+pub use members::{MemberState as ChannelMemberState, Members as ChannelMembers};
 
 mod rail;
 
@@ -545,7 +545,7 @@ pub struct SidebarChannel {
     /// Bounded derived context from the shared notification journal.
     pub notification_preview: Option<String>,
     /// The live agents and plain terminals in the channel, which its glyph
-    /// column draws as a cluster. A fixed-size tally, so comparing rows stays
+    /// column draws as the lead's mark and a count. A fixed-size tally, so comparing rows stays
     /// as cheap as comparing their other fields.
     pub members: ChannelMembers,
     pub chats: usize,
@@ -586,7 +586,7 @@ impl SidebarChannel {
         self
     }
 
-    /// The live agents and plain terminals the row's cluster shows.
+    /// The live agents and plain terminals the row's glyph column shows.
     pub fn with_members(mut self, members: ChannelMembers) -> Self {
         self.members = members;
         self.describe();
@@ -8364,25 +8364,21 @@ fn channel_view(
     let ink = channel_ink(channel, listing);
     // Who is at work stands in for the glyph. A channel on its way out shows
     // only the muted glyph its label recedes with.
-    let cluster = (!deleting)
+    let mark = (!deleting)
         .then(|| {
-            cluster::view(
+            members::view(
                 &channel.members,
                 if compact {
-                    cluster::Ground::Rail {
-                        selected: channel.selected,
-                    }
+                    members::Ground::Rail
                 } else {
-                    cluster::Ground::Row {
-                        selected: channel.selected,
-                    }
+                    members::Ground::Row
                 },
-                ink == RowInk::Muted,
+                ink,
             )
         })
         .flatten();
-    let has_cluster = cluster.is_some();
-    let glyph: Element<'static, SidebarAction> = cluster.unwrap_or_else(|| {
+    let has_members = mark.is_some();
+    let glyph: Element<'static, SidebarAction> = mark.unwrap_or_else(|| {
         row_glyph(
             WorkspaceGlyph::Channel,
             ink,
@@ -8406,8 +8402,8 @@ fn channel_view(
         );
         let indicator = match deletion {
             Some(RowDeletion::Deleting) => Some(deleting_indicator()),
-            // The cluster already counts who is there.
-            _ if has_cluster => attention_indicator(attention),
+            // The mark's badge already counts who is there.
+            _ if has_members => attention_indicator(attention),
             _ => channel_indicator(attention, channel.chats),
         };
         grid.content(glyph, Some(label), indicator)

@@ -3259,8 +3259,8 @@ mod tests {
         assert!(!app.sidebar_model.projects[0].channels[0].has_panes);
     }
 
-    /// The row's cluster shows who is at work in the channel: each live
-    /// agent as its provider, working first, then each open shell. A chat
+    /// The row counts who is at work in the channel: each live
+    /// agent by its provider, working first, then each open shell. A chat
     /// whose provider has not started shows nothing, and an ended shell drops
     /// out, as does an agent whose activity ends.
     #[test]
