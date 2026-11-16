@@ -2768,6 +2768,52 @@ mod tests {
     }
 
     #[test]
+    fn a_handover_the_chat_declines_parses_again_through_its_subscription() {
+        let executor = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = executor.enter();
+        let target = target();
+        let source = item("A chat that stops presenting declines this parse.");
+        let mut state = configured(target, &source);
+        state.stage(
+            &source,
+            true,
+            crate::settings::EditorSyntaxTheme::Auto,
+            |_, _| false,
+        );
+        state.rank("message", TAIL);
+        let Settled::Ready(id, run, ready) = state.settle_tail(target, Duration::from_secs(10))
+        else {
+            panic!("a free parser prepares the tail within the budget");
+        };
+        assert!(state.subscriptions(target).is_empty());
+        // Only the handed-over run is released: a stale run or another
+        // entry leaves it handed over.
+        state.unclaim(&id, run + 1);
+        state.unclaim("another", run);
+        assert!(state.subscriptions(target).is_empty());
+        drop(ready);
+        state.unclaim(&id, run);
+        assert_eq!(
+            state.subscriptions(target).len(),
+            1,
+            "the declined run is parsed again rather than left unprepared"
+        );
+        assert!(
+            matches!(
+                state.settle_tail(target, Duration::from_secs(10)),
+                Settled::Idle
+            ),
+            "a run its subscription has seen is not handed over again"
+        );
+        drop(state);
+        retirement_barrier();
+    }
+
+    #[test]
     fn pending_handoffs_reject_replaced_sources_and_contexts() {
         use iced::futures::StreamExt;
         let executor = tokio::runtime::Builder::new_multi_thread()
