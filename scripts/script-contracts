@@ -90,10 +90,12 @@ JOBS = (
         Suite("focused lib tests", "tests/test_lib.py", sources=("scripts/test-lib",)),
         Suite("HOST test helper", "tests/cargo_host_test_helper.py",
               sources=("scripts/cargo-host-test-helper.py", "scripts/cargo_artifacts.py")),
-        Suite("main build sentinel", "tests/main_build_sentinel.py", sources=("scripts/main-build-sentinel",)),
+        Suite("main build sentinel", "tests/main_build_sentinel.py",
+              sources=("scripts/main-build-sentinel", "scripts/cargo_warnings.py")),
     )),
     Job("tooling", suites=(
         Suite("Cargo artifacts", "tests/cargo_artifacts.py", sources=("scripts/cargo_artifacts.py",)),
+        Suite("lane warnings", "tests/cargo_lane.py", sources=("scripts/cargo-lane", "scripts/cargo_warnings.py")),
         Suite("script contracts", "tests/script_contracts.py", sources=("scripts/script-contracts",)),
         Suite("mise tasks", "tests/mise_tasks.py", sources=("mise.toml",)),
         Suite("doctor", "tests/doctor.py", sources=("scripts/doctor",)),

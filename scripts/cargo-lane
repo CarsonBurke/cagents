@@ -1,0 +1,120 @@
+#!/usr/bin/python3
+"""Run a lane's Cargo command through scripts/cargo-gate, holding the
+workspace's crates to the rule main's build check applies: no warnings.
+
+Usage: scripts/cargo-lane SUBCOMMAND [CARGO ARGS...] [-- HARNESS ARGS...]
+
+Cargo's messages are read as JSON, which the gate relays from the build host
+unchanged, so nothing about what compiles where, or what is fresh, differs
+from running the gate directly. Diagnostics print as Cargo renders them,
+except that a warning from a vendored crate, outside the `[workspace]`
+members, is counted and not shown, and a workspace crate's warning shows once
+however many targets report it. Errors show from every crate. Cargo replays
+a fresh unit's warnings, so a check that compiles nothing still reports them.
+
+The command exits with Cargo's status; when Cargo succeeded but a workspace
+crate warned, it ends with one line naming where, and exits 1. An explicit
+JSON --message-format is passed through untouched, with nothing filtered.
+
+Environment:
+  CAGENTS_VENDORED_WARNINGS=1  Show the vendored crates' warnings too
+"""
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import cargo_warnings
+
+PROGRAM = "cargo-lane"
+# How many warnings the closing line locates; each was shown in full above.
+LOCATIONS_SHOWN = 10
+
+
+def split_format(arguments):
+    """The --message-format the caller asked for, if any, and the arguments
+    without it. Only Cargo's options count: those before a `--` that starts
+    the harness's or program's arguments."""
+    formats, rest = [], []
+    words = iter(arguments)
+    for word in words:
+        if word == "--":
+            rest += [word, *words]
+            break
+        if word == "--message-format":
+            formats.append(next(words, ""))
+        elif word.startswith("--message-format="):
+            formats.append(word.partition("=")[2])
+        else:
+            rest.append(word)
+    return ",".join(formats) or None, rest
+
+
+def plural(count, noun):
+    return f"{count} {noun}{'s' * (count != 1)}"
+
+
+def main(arguments):
+    if arguments[:1] in (["-h"], ["--help"]):
+        print(__doc__, end="")
+        return 0
+    if not arguments or arguments[0].startswith("-"):
+        print(__doc__, end="", file=sys.stderr)
+        return 2
+    gate = [str(HERE / "cargo-gate"), arguments[0]]
+    requested, rest = split_format(arguments[1:])
+    if requested and any(part.strip().startswith("json") for part in requested.split(",")):
+        os.execv(gate[0], [*gate, *arguments[1:]])
+    formats = ["json"]
+    if requested and "short" in requested:
+        formats.append("json-diagnostic-short")
+    elif sys.stderr.isatty():
+        formats.append("json-diagnostic-rendered-ansi")
+    # Cargo's own options follow the subcommand, ahead of any `--`.
+    command = [*gate, "--message-format=" + ",".join(formats), *rest]
+
+    try:
+        packages = cargo_warnings.workspace_packages(HERE.parent)
+    except cargo_warnings.WorkspaceUnreadable as error:
+        print(f"{PROGRAM}: the workspace's members are unreadable, so every warning shows "
+              f"and none fails the command: {error}", file=sys.stderr)
+        packages = None
+    warnings = cargo_warnings.Warnings(packages)
+    show_vendored = os.environ.get("CAGENTS_VENDORED_WARNINGS") == "1"
+    # Cargo's standard error, with its progress and its own errors, passes
+    # straight through; its standard output carries the messages.
+    with subprocess.Popen(command, stdout=subprocess.PIPE, text=True, errors="replace") as process:
+        try:
+            for line in process.stdout:
+                kind, text = warnings.read(line)
+                if kind == cargo_warnings.OUTPUT:
+                    sys.stdout.write(text)
+                    sys.stdout.flush()
+                elif kind in (cargo_warnings.DIAGNOSTIC, cargo_warnings.OWN) or (
+                        kind == cargo_warnings.VENDORED and show_vendored):
+                    sys.stderr.write(text)
+                    sys.stderr.flush()
+            status = process.wait()
+        except KeyboardInterrupt:
+            # The gate got the same interrupt and cancels its build.
+            status = process.wait()
+    if status < 0:
+        status = 128 - status
+    if warnings.vendored and not show_vendored:
+        print(f"{PROGRAM}: {plural(len(warnings.vendored), 'warning')} from vendored crates not shown "
+              "(CAGENTS_VENDORED_WARNINGS=1 shows them)", file=sys.stderr)
+    if warnings.own:
+        places = warnings.locations()
+        where = ", ".join(places[:LOCATIONS_SHOWN]) + (
+            f", and {len(places) - LOCATIONS_SHOWN} more" if len(places) > LOCATIONS_SHOWN else "")
+        print(f"{PROGRAM}: {plural(len(warnings.own), 'warning')} from the workspace's crates"
+              f"{f' ({where})' if where else ''}; main's build check fails on them", file=sys.stderr)
+        if status == 0:
+            status = 1
+    return status
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
