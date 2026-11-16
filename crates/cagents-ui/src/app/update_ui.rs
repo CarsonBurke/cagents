@@ -368,21 +368,10 @@ impl Cagents {
             rows.extend(daemon.review_notices().into_iter().map(notice_body));
         }
         if !rows.is_empty() {
-            body.push(
-                widget::container(crate::interaction::overflow_fade_y(
-                    widget::scrollable(
-                        widget::column::with_children(rows)
-                            .spacing(space::M)
-                            .padding(design::with_vertical_rail(iced::Padding::ZERO)),
-                    )
-                    .direction(iced::widget::scrollable::Direction::Vertical(
-                        design::scrollbar(),
-                    )),
-                    design::dialog_base,
-                ))
-                .max_height(320)
-                .into(),
-            );
+            body.push(dialog_ui::scrolled_region(
+                widget::column::with_children(rows).spacing(space::M),
+                320.0,
+            ));
         }
         if !terminal_confirmation
             && let Some(daemon) = &preview.daemon
@@ -394,41 +383,45 @@ impl Cagents {
                     .into(),
             );
         }
-        body.push(
-            widget::row::with_children(vec![
-                crate::ui_controls::button::quiet("Copy details")
-                    .id(widget::Id::new("update.copy"))
-                    .on_press(Message::UpdateUi(Action::CopyDetails))
-                    .into(),
-                iced::widget::Space::new().width(Length::Fill).into(),
-                crate::ui_controls::button::secondary("Cancel")
-                    .id(widget::Id::new("update.cancel"))
-                    .on_press(Message::UpdateUi(Action::CancelApply))
-                    .into(),
-                crate::ui_controls::button::primary(if terminal_confirmation {
-                    "Continue in terminal"
-                } else if preview.daemon.as_ref().is_some_and(|daemon| {
-                    daemon
-                        .sessions
-                        .iter()
-                        .any(|session| session.disposition == Disposition::WaitsForIdle)
-                }) {
-                    "Update when idle"
-                } else {
-                    "Update and reopen"
-                })
-                .id(widget::Id::new("update.confirm"))
-                .on_press_maybe((!terminal_confirmation).then_some(Message::UpdateUi(
-                    Action::ConfirmApply(confirmation.nonce.clone()),
-                )))
+        let actions = widget::row::with_children(vec![
+            crate::ui_controls::button::quiet("Copy details")
+                .id(widget::Id::new("update.copy"))
+                .on_press(Message::UpdateUi(Action::CopyDetails))
                 .into(),
-            ])
-            .align_y(Alignment::Center)
-            .spacing(space::S)
+            iced::widget::Space::new().width(Length::Fill).into(),
+            crate::ui_controls::button::secondary("Cancel")
+                .id(widget::Id::new("update.cancel"))
+                .on_press(Message::UpdateUi(Action::CancelApply))
+                .into(),
+            crate::ui_controls::button::primary(if terminal_confirmation {
+                "Continue in terminal"
+            } else if preview.daemon.as_ref().is_some_and(|daemon| {
+                daemon
+                    .sessions
+                    .iter()
+                    .any(|session| session.disposition == Disposition::WaitsForIdle)
+            }) {
+                "Update when idle"
+            } else {
+                "Update and reopen"
+            })
+            .id(widget::Id::new("update.confirm"))
+            .on_press_maybe((!terminal_confirmation).then_some(Message::UpdateUi(
+                Action::ConfirmApply(confirmation.nonce.clone()),
+            )))
             .into(),
-        );
+        ])
+        .align_y(Alignment::Center)
+        .spacing(space::S);
+        // A short window scrolls what the update affects; Cancel and the
+        // update stay in reach.
         Some(dialog_ui::overlay(
-            dialog_ui::surface(widget::column::with_children(body).spacing(space::L), 600.0),
+            dialog_ui::scrolling_surface_with_actions(
+                widget::column::with_children(body).spacing(space::L),
+                actions,
+                600.0,
+                720.0,
+            ),
             Some(Message::UpdateUi(Action::CancelApply)),
             1.0,
         ))
@@ -1634,6 +1627,39 @@ mod tests {
         drop(app.update_update_ui(Action::Polled(Some(job.id.clone()), Ok(Some(resolved)))));
         assert!(app.modal_is_open());
         assert!(app.update_ui.set_aside.is_none());
+    }
+
+    /// At the minimum 900x600 window with 150% interface scale, a long
+    /// review scrolls, and Cancel and the update stay whole and inside the
+    /// window.
+    #[test]
+    fn update_actions_stay_in_reach_at_the_scaled_minimum_window() {
+        use crate::update::impact::Disposition;
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        let review = daemon_preview(
+            (0..12)
+                .map(|index| session(&format!("Codex · project {index}"), Disposition::Resumes))
+                .collect(),
+        );
+        app.update_ui.job = Some(awaiting(&review));
+        app.update_ui.confirmation = Some(review);
+        for id in ["update.cancel", "update.confirm"] {
+            let geometry = |window| {
+                super::super::dialog_ui::tests::action_geometry(
+                    app.update_dialog().unwrap(),
+                    window,
+                    &widget::Id::new(id),
+                )
+            };
+            let (_, _, _, natural) = geometry(iced::Size::new(1200.0, 900.0));
+            let (window, _, _, control) = geometry(iced::Size::new(600.0, 400.0));
+            assert!(
+                control.height == natural.height
+                    && control.y >= 0.0
+                    && control.y + control.height <= window.height,
+                "{id} must stay whole and inside the window: {control:?}, not {natural:?}"
+            );
+        }
     }
 
     #[test]
