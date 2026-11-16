@@ -21,7 +21,7 @@ pub(super) struct Reservation {
 }
 
 fn resident_owner(state: &HostState, id: TerminalId) -> bool {
-    state.holds_chat_work(&id)
+    state.is_live(&id)
 }
 
 fn binding_owns_work(

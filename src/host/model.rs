@@ -1586,7 +1586,9 @@ mod tests {
         let legacy = Connection::open(&path).unwrap();
         legacy
             .execute_batch(
-                "DROP TABLE terminal_pane_bindings;
+                "DROP TABLE pane_chat_allocations;
+                 DROP TABLE pane_chat_starts;
+                 DROP TABLE terminal_pane_bindings;
                  DROP TRIGGER session_channel_insert;
                  DROP TRIGGER session_channel_move;
                  DROP TABLE session_channels;

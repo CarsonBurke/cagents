@@ -1456,19 +1456,7 @@ impl HostState {
             || self
                 .chats
                 .get(id)
-                .is_some_and(|record| !record.handle.is_completed())
-            || self.chat_spawning.contains_key(id)
-            || self.chat_handoffs.contains_key(id)
-    }
-
-    /// Whether anything in this daemon still holds conversation `id`'s
-    /// provider: a record owning work or returning to its terminal, a start,
-    /// handoff or native startup in flight, or a close or retirement under
-    /// way. A pane's first-send owner is kept while any of these does.
-    pub(super) fn holds_chat_work(&self, id: &TerminalId) -> bool {
-        self.chats
-            .get(id)
-            .is_some_and(|record| record.handle.owns_work() || record.returning_terminal)
+                .is_some_and(|record| record.handle.owns_work() || record.returning_terminal)
             || self.chat_spawning.contains_key(id)
             || self.chat_handoffs.contains_key(id)
             || self.native_actor_startups.contains_key(id)
