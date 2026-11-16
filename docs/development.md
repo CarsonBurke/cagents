@@ -1857,6 +1857,10 @@ shared cache can refresh, about every two minutes, or later when `retry_at`
 says so. Unknown or missing checks count as not passed. A read from before the
 head was known, or one that has not yet caught up with the script's own push,
 cannot report that the head moved.
+When GitHub refuses the merge because `main` moved while it was merging
+(`Base branch was modified`, HTTP 405), it reads the PR again after a short
+pause: a conflict now takes the conflict path above, and otherwise it merges
+once more at the same head. A second such refusal stops the landing.
 
 Per the merge policy, it does not bring the branch up to date with `main`
 merely because `main` moved, and it compiles nothing. When the branch

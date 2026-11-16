@@ -34,6 +34,15 @@ branch = pr["head"]["ref"]
 head = origin("rev-parse", "refs/heads/" + branch).strip()
 if args[:3] == ["api", "-X", "PUT"]:
     fields = dict(value.split("=", 1) for value in args[5::2])
+    queued = root / "merge-errors.json"  # One refusal per merge attempt, then success.
+    errors = json.loads(queued.read_text()) if queued.exists() else []
+    if errors:
+        error = errors.pop(0)
+        queued.write_text(json.dumps(errors))
+        if error.get("dirty"):  # GitHub sees the moved main conflict from now on.
+            (root / "pr.json").write_text(json.dumps({**pr, "mergeable_state": "dirty"}))
+        print(error["error"], file=sys.stderr)
+        sys.exit(1)
     if (root / "merge-error").exists():
         print((root / "merge-error").read_text(), file=sys.stderr)
         sys.exit(1)
@@ -453,6 +462,39 @@ class LandTests(unittest.TestCase):
         self.assertEqual(self.run_land(), 0, self.output)
         self.assertEqual(len(self.sleeps), 1)
         self.assertIn("landed #7", self.output)
+
+    BASE_MOVED = "gh: Base branch was modified. Review and try the merge again. (HTTP 405)"
+
+    def merge_attempts(self):
+        calls = [json.loads(line) for line in (self.root / "gh-calls").read_text().splitlines()]
+        return [dict(value.split("=", 1) for value in call[5::2])["sha"]
+                for call in calls if call[:3] == ["api", "-X", "PUT"]]
+
+    def test_main_moving_during_the_merge_retries_it_once_at_the_same_head(self):
+        head = self.remote_head()
+        (self.root / "merge-errors.json").write_text(json.dumps([{"error": self.BASE_MOVED}]))
+        self.assertEqual(self.run_land(), 0, self.output)
+        self.assertEqual(self.merge_attempts(), [head, head])
+        self.assertEqual(self.merged()["sha"], head)
+        self.assertEqual(self.sleeps, [land.MINIMUM_WAIT])
+
+    def test_main_moving_into_a_conflict_during_the_merge_takes_the_conflict_path(self):
+        old = self.remote_head()
+        self.advance_main("unrelated.txt", "x\n")
+        (self.root / "merge-errors.json").write_text(json.dumps([{"error": self.BASE_MOVED, "dirty": True}]))
+        self.assertEqual(self.run_land(), 0, self.output)
+        new = self.remote_head()
+        self.assertEqual(self.git(self.origin, "rev-parse", f"{new}^1"), old)
+        self.assertEqual(self.merge_attempts(), [old, new])
+        self.assertIn("now conflicts with main", self.output)
+
+    def test_main_moving_during_both_merges_is_refused_without_looping(self):
+        head = self.remote_head()
+        (self.root / "merge-errors.json").write_text(json.dumps([{"error": self.BASE_MOVED}] * 3))
+        self.assertEqual(self.run_land(), land.REFUSED, self.output)
+        self.assertEqual(self.merge_attempts(), [head, head])
+        self.assertIsNone(self.merged())
+        self.assertIn("keeps moving", self.output)
 
     def test_an_empty_squash_message_is_refused(self):
         with self.assertRaises(land.Stop) as refused:

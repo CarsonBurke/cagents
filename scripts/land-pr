@@ -375,6 +375,10 @@ def wait_for_ci(root, repository, number, head, since, deadline, superseded):
 
 # ---- Landing ----------------------------------------------------------------
 
+class BaseMoved(Exception):
+    """GitHub refused a merge because main moved while it was merging."""
+
+
 def merge(repository, number, head, title, body):
     result = gh("api", "-X", "PUT", f"repos/{repository}/pulls/{number}/merge", "-f", f"sha={head}",
                 "-f", "merge_method=squash", "-f", f"commit_title={title}", "-f", f"commit_message={body}")
@@ -382,8 +386,30 @@ def merge(repository, number, head, title, body):
         error = result.stderr.strip()
         if "HTTP 409" in error:
             raise Stop(HEAD_MOVED, f"GitHub refused the merge, the head moved: {error}")
+        if "HTTP 405" in error and "Base branch was modified" in error:
+            raise BaseMoved(error)
         raise Stop(REFUSED if re.search(r"HTTP 4\d\d", error) else 1, f"GitHub refused the merge: {error}")
     return json.loads(result.stdout).get("sha", "")
+
+
+def merge_after_base_moved(repository, number, head, title, body, error):
+    """Merge once more after main moved during the merge, still pinned to HEAD.
+
+    None when the PR now conflicts with main, for the conflict path to handle.
+    A second refusal is final: landings racing for main do not loop.
+    """
+    say(f"{BASE} moved while merging #{number}; checking it again")
+    sleep(MINIMUM_WAIT)  # GitHub recomputes mergeability once main has moved.
+    pr = read_pr(repository, number)
+    if pr["head"]["sha"] != head:
+        raise Stop(HEAD_MOVED, f"#{number} moved to {pr['head']['sha'][:12]}; review it and run again")
+    if pr.get("mergeable_state") == "dirty":
+        say(f"#{number} now conflicts with {BASE}")
+        return None
+    try:
+        return merge(repository, number, head, title, body)
+    except BaseMoved as again:
+        raise Stop(REFUSED, f"GitHub refused the merge again, {BASE} keeps moving: {again}") from None
 
 
 DRY_RUN_STATUS = {"failed": CI_FAILED, "moved": HEAD_MOVED, "closed": REFUSED, "conflict": CONFLICT}
@@ -415,7 +441,12 @@ def land(root, repository, number, update=False, dry_run=False, timeout=60):
                 return DRY_RUN_STATUS.get(verdict, 0)
             verdict, detail = wait_for_ci(root, repository, number, target, since, deadline, superseded)
             if verdict == "green":
-                merged = merge(repository, number, target, title, body)
+                try:
+                    merged = merge(repository, number, target, title, body)
+                except BaseMoved as error:
+                    merged = merge_after_base_moved(repository, number, target, title, body, error)
+                if merged is None:
+                    continue  # Conflicts with the new main: bring it in next round.
                 git(root, "fetch", "--quiet", "--no-tags", "origin",
                     f"+refs/heads/{BASE}:refs/remotes/origin/{BASE}", check=False)
                 say(f"landed #{number} at {target[:12]} as {merged[:12]} on {BASE}")
