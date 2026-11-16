@@ -9,6 +9,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -19,6 +20,10 @@ use crate::{
 };
 
 const MAX_DIRECTORIES: usize = 8192;
+/// How long metadata that evicting every content watch could not admit waits
+/// before evicting for it again. Capacity can return in another process
+/// meanwhile, but every eviction rewatches and rescans all content.
+const EVICTION_RETRY: Duration = Duration::from_secs(10 * 60);
 
 /// Paths relative to a worktree root, sorted and kept in one allocation. A
 /// large checkout tracks tens of thousands of paths, and each watcher owner
@@ -795,7 +800,7 @@ impl Monitor {
                 };
                 let mut watcher = create_watcher();
                 let mut registered: BTreeMap<PathBuf, (RecursiveMode, u64, u64)> = BTreeMap::new();
-                let mut unadmitted = BTreeSet::new();
+                let mut unadmitted = BTreeMap::new();
                 while requests.recv().is_ok() {
                     let projects = {
                         let configuration = desired_configuration
@@ -941,14 +946,15 @@ impl Monitor {
     }
 }
 
-/// `unadmitted` holds the metadata paths that did not fit even after every
-/// content watch was evicted for them, across registrations. Evicting again
-/// for one would only churn every content watch and rescan its projects, so
-/// later passes just retry the watch until a full rearm.
+/// `unadmitted` holds, across registrations, the metadata paths that did not
+/// fit even with every content watch evicted, and when that was found.
+/// Evicting again at once would only churn every content watch and rescan
+/// its projects, so later passes retry the watch alone until
+/// [`EVICTION_RETRY`] has passed, a full rearm, or success.
 fn reconcile(
     watcher: &mut impl Watcher,
     registered: &mut BTreeMap<PathBuf, (RecursiveMode, u64, u64)>,
-    unadmitted: &mut BTreeSet<PathBuf>,
+    unadmitted: &mut BTreeMap<PathBuf, Instant>,
     desired: &BTreeMap<PathBuf, RecursiveMode>,
     metadata: &BTreeSet<PathBuf>,
     owners: &BTreeMap<PathBuf, BTreeSet<ProjectId>>,
@@ -959,7 +965,7 @@ fn reconcile(
     if rearm.all {
         unadmitted.clear();
     } else {
-        unadmitted.retain(|path| metadata.contains(path));
+        unadmitted.retain(|path, at| metadata.contains(path) && at.elapsed() < EVICTION_RETRY);
     }
     registered.retain(|path, (mode, device, inode)| {
         if !rearm.all
@@ -974,6 +980,9 @@ fn reconcile(
             false
         }
     });
+    // Once this pass has evicted all content, metadata that still meets the
+    // quota cannot be helped by evicting what the content pass re-adds.
+    let mut evicted = false;
     // Planning priority must survive the path-sorted map: content from an
     // earlier project must not consume native capacity before later metadata.
     for (path, &mode) in desired
@@ -990,7 +999,7 @@ fn reconcile(
                 .is_err_and(|error| matches!(error.kind, notify::ErrorKind::MaxFilesWatch))
         };
         let mut result = watcher.watch(path, mode);
-        if metadata.contains(path) && !unadmitted.contains(path) && quota(&result) {
+        if metadata.contains(path) && !unadmitted.contains_key(path) && quota(&result) {
             // Existing content may occupy all native capacity when a new
             // project's metadata arrives. Only quota refusal can preempt it;
             // every evicted path is admitted again in the content pass below.
@@ -1004,10 +1013,11 @@ fn reconcile(
                     let _ = watcher.unwatch(&path);
                     registered.remove(&path);
                 }
+                evicted = true;
                 result = watcher.watch(path, mode);
-                if quota(&result) {
-                    unadmitted.insert(path.clone());
-                }
+            }
+            if evicted && quota(&result) {
+                unadmitted.insert(path.clone(), Instant::now());
             }
         }
         let result = result.and_then(|()| {
@@ -1707,7 +1717,7 @@ mod tests {
         fail: BTreeSet<PathBuf>,
         remove_after_watch: Option<PathBuf>,
         /// The coordinator's memory of metadata eviction could not admit.
-        unadmitted: BTreeSet<PathBuf>,
+        unadmitted: BTreeMap<PathBuf, Instant>,
     }
 
     impl Watcher for LimitedWatcher {
@@ -1837,7 +1847,7 @@ mod tests {
         reconcile(
             &mut watcher,
             &mut registered,
-            &mut BTreeSet::new(),
+            &mut BTreeMap::new(),
             &plan.desired,
             &plan.metadata,
             &plan.owners,
@@ -1950,92 +1960,84 @@ mod tests {
     fn metadata_that_eviction_cannot_admit_stops_evicting_content() {
         let directory = tempfile::tempdir().unwrap();
         let content = directory.path().join("a-content");
-        let metadata_path = directory.path().join("z-metadata");
-        for p in [&content, &metadata_path] {
+        let first_metadata = directory.path().join("y-metadata");
+        let second_metadata = directory.path().join("z-metadata");
+        for p in [&content, &first_metadata, &second_metadata] {
             std::fs::create_dir(p).unwrap();
         }
         let id = ProjectId::new();
         let desired = BTreeMap::from([
             (content.clone(), RecursiveMode::NonRecursive),
-            (metadata_path.clone(), RecursiveMode::Recursive),
+            (first_metadata.clone(), RecursiveMode::Recursive),
+            (second_metadata.clone(), RecursiveMode::Recursive),
         ]);
-        let metadata = BTreeSet::from([metadata_path.clone()]);
+        let metadata = BTreeSet::from([first_metadata.clone(), second_metadata.clone()]);
         let owners = desired
             .keys()
             .map(|p| (p.clone(), BTreeSet::from([id])))
             .collect::<BTreeMap<_, _>>();
-        // The metadata root's subtree exceeds the quota however much content
+        // Each metadata root's subtree exceeds the quota however much content
         // yields, as when other processes hold most of the inotify limit.
         let mut watcher = LimitedWatcher {
             capacity: 2,
-            fail: BTreeSet::from([metadata_path.clone()]),
+            fail: metadata.clone(),
             ..Default::default()
         };
         let mut registered = BTreeMap::new();
         let mut pending = Pending::default();
-        // Nothing is registered to evict yet; content then fills capacity.
-        let first = registered_transition(
-            &mut pending,
-            &mut watcher,
-            &mut registered,
-            &desired,
-            &metadata,
-            &owners,
-        );
-        assert!(first.contains_key(&id));
-        assert!(registered.contains_key(&content));
-        assert!(watcher.unadmitted.is_empty());
-        // The retry evicts content once; the metadata still does not fit.
-        watcher.removals.clear();
-        let second = registered_transition(
-            &mut pending,
-            &mut watcher,
-            &mut registered,
-            &desired,
-            &metadata,
-            &owners,
-        );
-        assert!(second.contains_key(&id));
-        assert!(watcher.removals.contains(&content));
-        assert!(
-            registered.contains_key(&content),
-            "content is admitted again"
-        );
-        assert_eq!(watcher.unadmitted, BTreeSet::from([metadata_path.clone()]));
-        for _ in 0..3 {
+        let mut transition = |watcher: &mut LimitedWatcher, registered: &mut BTreeMap<_, _>| {
             watcher.removals.clear();
             watcher.attempts.clear();
-            let failures = registered_transition(
+            registered_transition(
                 &mut pending,
-                &mut watcher,
-                &mut registered,
+                watcher,
+                registered,
                 &desired,
                 &metadata,
                 &owners,
+            )
+        };
+        // Nothing is registered to evict yet; content then fills capacity.
+        assert!(transition(&mut watcher, &mut registered).contains_key(&id));
+        assert!(registered.contains_key(&content));
+        assert!(watcher.unadmitted.is_empty());
+        // The retry evicts content once, for the first metadata path; neither
+        // fits, and content is admitted again.
+        assert!(transition(&mut watcher, &mut registered).contains_key(&id));
+        assert_eq!(
+            watcher.removals.iter().filter(|p| **p == content).count(),
+            1
+        );
+        assert!(registered.contains_key(&content));
+        assert_eq!(
+            watcher.unadmitted.keys().cloned().collect::<BTreeSet<_>>(),
+            metadata,
+            "the second path is not left to evict everything next time"
+        );
+        for _ in 0..3 {
+            assert!(
+                transition(&mut watcher, &mut registered).contains_key(&id),
+                "the metadata stays uncovered"
             );
-            assert!(failures.contains_key(&id), "the metadata stays uncovered");
             assert_eq!(
                 watcher.attempts,
-                vec![metadata_path.clone()],
-                "a retry tries the metadata once and leaves content registered"
+                vec![first_metadata.clone(), second_metadata.clone()],
+                "a retry tries each metadata path once and leaves content registered"
             );
             assert!(!watcher.removals.contains(&content));
             assert!(registered.contains_key(&content));
         }
-        // Once the watch fits, the memory is settled.
+        // Capacity can return elsewhere, so eviction is tried again later.
+        for at in watcher.unadmitted.values_mut() {
+            *at = Instant::now() - EVICTION_RETRY;
+        }
+        assert!(transition(&mut watcher, &mut registered).contains_key(&id));
+        assert!(watcher.removals.contains(&content));
+        assert_eq!(watcher.unadmitted.len(), 2);
+        // Once the watches fit, the memory is settled.
         watcher.fail.clear();
         watcher.capacity = 3;
-        assert!(
-            registered_transition(
-                &mut pending,
-                &mut watcher,
-                &mut registered,
-                &desired,
-                &metadata,
-                &owners
-            )
-            .is_empty()
-        );
+        assert!(transition(&mut watcher, &mut registered).is_empty());
         assert!(watcher.unadmitted.is_empty());
     }
 
@@ -2119,7 +2121,7 @@ mod tests {
         reconcile(
             &mut watcher,
             &mut registered,
-            &mut BTreeSet::new(),
+            &mut BTreeMap::new(),
             &desired,
             &metadata,
             &owners,
@@ -2304,7 +2306,7 @@ mod tests {
             reconcile(
                 &mut watcher,
                 &mut registered,
-                &mut BTreeSet::new(),
+                &mut BTreeMap::new(),
                 &desired,
                 &metadata,
                 &owners,
@@ -2443,7 +2445,7 @@ mod tests {
     }
 
     #[test]
-    fn only_native_registration_failures_are_reported_recoverable() {
+    fn planned_refusals_are_unrecoverable_and_backend_faults_recoverable() {
         let directory = tempfile::tempdir().unwrap();
         let mut project = project(directory.path());
         project.worktrees.truncate(1);
