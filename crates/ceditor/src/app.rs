@@ -5061,7 +5061,7 @@ impl Application for Editor {
                     widget::button::standard("Cancel")
                         .on_press_maybe((!dialog.busy).then_some(Message::CancelFileOperation))
                         .into(),
-                    widget::button::standard(if dialog.busy { "Working…" } else { title })
+                    cagents_ui::ui_controls::button::stock_instead(title, "Working…", dialog.busy)
                         .on_press_maybe((!dialog.busy).then_some(Message::SubmitFileOperation))
                         .into(),
                 ])
@@ -5227,11 +5227,11 @@ impl Editor {
                         settings_field(
                             "Reset all settings",
                             "Restore default editor preferences and keyboard shortcuts. Open files and saved tabs are preserved.",
-                            widget::button::standard(if self.settings_reset_confirm {
-                                "Confirm reset all settings"
-                            } else {
-                                "Reset all settings"
-                            })
+                            cagents_ui::ui_controls::button::stock_instead(
+                                "Reset all settings",
+                                "Confirm reset all settings",
+                                self.settings_reset_confirm,
+                            )
                             .on_press(Message::ResetSettings)
                             .into(),
                         ),

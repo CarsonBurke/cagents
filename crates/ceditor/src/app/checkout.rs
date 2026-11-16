@@ -731,9 +731,7 @@ impl Editor {
                 body.push(design::caption("Inspect this outcome, then close and prepare checkout again before retrying.").into());
             }
             body.push(
-                widget::button::suggested(if dialog.busy() {
-                    "Reconciling checkout…"
-                } else {
+                cagents_ui::ui_controls::button::stock_instead(
                     match plan.disposition() {
                         PrCheckoutDisposition::OpenPreservingLocal => "Keep existing local work",
                         PrCheckoutDisposition::RepairTrackingPreservingLocal => {
@@ -745,8 +743,11 @@ impl Editor {
                         PrCheckoutDisposition::FastForwardAndRepair => {
                             "Update worktree and set PR upstream"
                         }
-                    }
-                })
+                    },
+                    "Reconciling checkout…",
+                    dialog.busy(),
+                )
+                .class(cosmic::theme::Button::Suggested)
                 .on_press_maybe(
                     (!dialog.busy() && !dialog.accepted).then(|| action(Action::ReconcileExisting)),
                 )
@@ -762,11 +763,12 @@ impl Editor {
                 .into(),
             );
             body.push(
-                widget::button::suggested(if dialog.busy() {
-                    "Creating…"
-                } else {
-                    "Create worktree"
-                })
+                cagents_ui::ui_controls::button::stock_instead(
+                    "Create worktree",
+                    "Creating…",
+                    dialog.busy(),
+                )
+                .class(cosmic::theme::Button::Suggested)
                 .on_press_maybe((!dialog.busy()).then(|| action(Action::Create)))
                 .into(),
             );
@@ -790,11 +792,12 @@ impl Editor {
             body.push(branch.into());
             body.push(destination.into());
             body.push(
-                widget::button::suggested(if dialog.busy() {
-                    "Resolving…"
-                } else {
-                    "Review checkout"
-                })
+                cagents_ui::ui_controls::button::stock_instead(
+                    "Review checkout",
+                    "Resolving…",
+                    dialog.busy(),
+                )
+                .class(cosmic::theme::Button::Suggested)
                 .on_press_maybe(
                     (!dialog.busy() && self.checkout_journal.is_some())
                         .then(|| action(Action::Resolve)),
@@ -811,11 +814,11 @@ impl Editor {
             body.push(widget::text::body(error).into());
         }
         body.push(
-            widget::button::standard(if dialog.busy() {
-                "Cancel operation"
-            } else {
-                "Close"
-            })
+            cagents_ui::ui_controls::button::stock_instead(
+                "Close",
+                "Cancel operation",
+                dialog.busy(),
+            )
             .on_press(action(Action::Cancel))
             .into(),
         );

@@ -897,37 +897,12 @@ fn notice_surface_busy_action<'a>(
     id: widget::Id,
     message: Message,
 ) -> Element<'a, Message> {
-    // The look of COSMIC's text button, which takes only one label.
-    let theme = cosmic::theme::active();
-    let spacing = theme.cosmic();
-    let text = |label: &'a str| -> Element<'a, Message> {
-        widget::text(label)
-            .size(14)
-            .line_height(iced::widget::text::LineHeight::Absolute(20.0.into()))
-            .wrapping(iced::widget::text::Wrapping::None)
-            .into()
-    };
-    let (shown, kept) = if busy {
-        (busy_label, label)
-    } else {
-        (label, busy_label)
-    };
-    widget::button::custom(
-        widget::container(crate::ui_controls::reserved(
-            text(shown),
-            [text(kept)],
-            iced::alignment::Horizontal::Center,
-        ))
-        .padding([0, spacing.space_s()])
-        .height(Length::Fixed(spacing.space_l().into()))
-        .center_y(Length::Fixed(spacing.space_l().into())),
-    )
-    .padding(0)
-    .id(id)
-    .name(if busy { busy_label } else { accessible_name })
-    .class(notice_surface_button(severity))
-    .on_press_maybe((!busy).then_some(message))
-    .into()
+    crate::ui_controls::button::stock_instead(label, busy_label, busy)
+        .id(id)
+        .name(if busy { busy_label } else { accessible_name })
+        .class(notice_surface_button(severity))
+        .on_press_maybe((!busy).then_some(message))
+        .into()
 }
 
 /// The save-health notices: the writer lane's state, and the writes storage
