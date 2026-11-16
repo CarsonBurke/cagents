@@ -36,7 +36,9 @@ pub(crate) use gauge::activity_animates;
 pub use gauge::{
     activity_spinner, animate_activity, budget_bar, budget_radial, budget_radial_toned,
 };
-pub use icon::{Icon, ceditor_icon, ceditor_window_icon, passive_icon, provider_icon};
+pub use icon::{
+    Icon, ceditor_icon, ceditor_window_icon, passive_icon, provider_artwork, provider_icon,
+};
 pub use icon_button::{
     IconButton, control_style, icon_button, outlined_control_style, segmented_controls,
     toolbar_actions,
