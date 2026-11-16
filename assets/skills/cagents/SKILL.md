@@ -6,6 +6,8 @@ description: Use when working through the cagents CLI, for separate agent sessio
 - `cagents <command> --help` is the reference. Use `--json` when you will parse the output.
 - Your own subagents are usually the better choice for work that belongs to this conversation. A cagents session is for another provider, another project, or work the user should be able to watch, take over, or have outlive you.
 - `cagents whoami` and `cagents ls` show who else is working in the checkout. Message them rather than editing around them or guessing what they are doing.
+- Listings show session and agent IDs by their shortest unique prefix, which `send`, `transcript` and `agent` accept. Their last line, `hint: …`, names the commands that usually come next.
+- `cagents work` lists this project's worktrees and branches in progress, with their pull requests and sessions.
 - `cagents ls --channel` lists the sessions in your channel, including those whose provider has exited, such as from a usage limit. `cagents transcript SESSION` reads one's conversation, newest last; follow its `--before` hint for earlier messages. When a session has exited, or you need what it already did, read its transcript.
 - A spawned agent knows only its prompt.
 - A timeout does not mean a submission failed, and submitting again runs the work twice. If you must retry, reuse the reported `--idempotency-key`.

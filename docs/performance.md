@@ -216,7 +216,7 @@ paths, entity IDs or event payloads:
 | Index | Stage | Measured caller |
 | --- | --- | --- |
 | 0 | Refresh | `Runtime::refresh`, including its early returns |
-| 1 | Parent preparation | Parent `prepare_items` in refresh |
+| 1 | Parent preparation | Parent `prepare_transcript_cache` in refresh |
 | 2 | Child preparation | `prepare_child_cache`, including empty selection |
 | 3 | Parse | Markdown source advance and content append/restart |
 | 4 | Highlight | Fence scan and syntax-block update |

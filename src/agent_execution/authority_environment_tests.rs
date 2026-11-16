@@ -189,6 +189,29 @@ fn present_authority_never_downgrades_terminal_or_work_cli_to_user() {
                     ClientRequest::Authenticate { .. }
                 ));
             }
+            // A Work command naming no project first reads the open ones, to
+            // cover the one containing the current directory; this fixture
+            // has none. Removal reuses the scope its plan read.
+            if matches!(operation, "pin" | "unpin" | "plan") {
+                assert!(matches!(
+                    request.request,
+                    ClientRequest::ReadWorkspaceMetadata {
+                        query: crate::workspace_model::metadata::Query::Projects
+                    }
+                ));
+                respond(
+                    &mut stream,
+                    &proof,
+                    request.request_id,
+                    ServerResponse::WorkspaceMetadata(
+                        crate::workspace_model::metadata::Reply::Projects {
+                            identity: uuid::Uuid::nil(),
+                            projects: Vec::new(),
+                        },
+                    ),
+                );
+                request = receive(&mut stream, &proof, &mut next);
+            }
             let attached = if matches!(operation, "write" | "close") {
                 let ClientRequest::Attach {
                     terminal_id,

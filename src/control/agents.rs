@@ -356,7 +356,7 @@ fn list_human(summaries: &[Summary]) -> String {
 /// The part of an ID people type and read: unique among one caller's agents
 /// in practice, and accepted back as a handle.
 fn short(id: impl std::fmt::Display) -> String {
-    id.to_string().chars().take(8).collect()
+    super::format::prefix(&id.to_string(), super::format::MIN_ABBREVIATION).to_owned()
 }
 
 impl ControlClient {

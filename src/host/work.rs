@@ -1128,7 +1128,8 @@ impl Handle {
     }
 
     /// The one card on `board` named by `name`: its branch, its storage key or
-    /// its worktree's path.
+    /// its worktree's path, absolute or, as a listing of one project shows
+    /// it, relative to the project's primary checkout.
     fn card(board: &Board, name: &str) -> Result<Item, String> {
         // A path names a worktree however it is spelled: through a symlink,
         // or as Git recorded it.
@@ -1136,6 +1137,17 @@ impl Handle {
             .is_absolute()
             .then(|| std::fs::canonicalize(name).ok())
             .flatten();
+        let rooted = |item: &Item| {
+            if Path::new(name).is_absolute() {
+                return None;
+            }
+            board
+                .projects
+                .iter()
+                .find(|project| project.repository == item.project)
+                .and_then(|project| project.root.as_ref())
+                .map(|root| root.join(name))
+        };
         let mut matches = board
             .items
             .iter()
@@ -1144,6 +1156,9 @@ impl Handle {
                     || item.key.storage_key() == name
                     || item.worktree.as_ref().is_some_and(|worktree| {
                         worktree.path == Path::new(name)
+                            || rooted(item).is_some_and(|rooted| {
+                                rooted.components().eq(worktree.path.components())
+                            })
                             || path.as_ref().is_some_and(|path| {
                                 std::fs::canonicalize(&worktree.path)
                                     .is_ok_and(|card| card == *path)
@@ -1792,6 +1807,78 @@ mod watch_recovery_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A listing of one project shows a worktree relative to its primary
+    /// checkout, so that path names the card from any directory; a branch
+    /// shared across projects still needs one.
+    #[test]
+    fn a_card_is_named_by_its_worktree_relative_to_the_primary_checkout() {
+        let card = |project: &str, branch: &str, path: &str| {
+            serde_json::from_value::<crate::work::Item>(serde_json::json!({
+                "project": format!("/{project}/.git"),
+                "project_name": project,
+                "key": {"branch": branch},
+                "branch": branch,
+                "worktree": {
+                    "path": path,
+                    "primary": false,
+                    "locked": false,
+                    "created_at_unix_ms": null
+                },
+                "head": null,
+                "comparison": null,
+                "dirty": null,
+                "pull_request": null,
+                "linear": null,
+                "sessions": [],
+                "last_activity": null,
+                "error": null,
+                "column": "landed",
+                "derived": "landed",
+                "pinned": false
+            }))
+            .unwrap()
+        };
+        let project = |name: &str| crate::work::Project {
+            repository: format!("/{name}/.git").into(),
+            name: name.into(),
+            root: Some(format!("/{name}").into()),
+            base: None,
+            scanned_at_unix_ms: None,
+            scan_error: None,
+            forge: Forge::NotGitHub,
+        };
+        let board = Board {
+            generated_at_unix_ms: 0,
+            stale_after_days: 7,
+            projects: vec![project("app"), project("docs")],
+            items: vec![
+                card("app", "fix", "/app/.worktrees/fix"),
+                card("docs", "fix", "/docs/.worktrees/fix"),
+                card("docs", "other", "/elsewhere/other"),
+            ],
+            linear_unavailable: None,
+        };
+        let named = |name: &str| Handle::card(&board, name).map(|item| item.worktree.unwrap().path);
+        assert_eq!(
+            named(".worktrees/fix").unwrap_err(),
+            "2 cards are named .worktrees/fix, in app, docs; choose one with --project"
+        );
+        let app = Board {
+            projects: vec![project("app")],
+            items: board.items[..1].to_vec(),
+            ..board.clone()
+        };
+        assert_eq!(
+            Handle::card(&app, "./.worktrees/fix")
+                .unwrap()
+                .branch
+                .as_deref(),
+            Some("fix")
+        );
+        assert_eq!(named("other").unwrap(), Path::new("/elsewhere/other"));
+        assert!(named("worktrees/fix").is_err());
+    }
 
     fn polling_handle() -> Handle {
         Handle(Arc::new(Inner {
