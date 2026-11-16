@@ -82,6 +82,8 @@ mod close_refusal;
 mod closed_draft;
 mod completion;
 mod coordination;
+#[cfg(test)]
+mod diagnostic_chronology_tests;
 mod disclosure;
 mod failure;
 mod find;
@@ -1839,6 +1841,26 @@ impl<'c> turn::Presented<'c> for Presentations<'c> {
     }
     fn titled(&self, item: &chat::Item) -> Option<&'c tool_title::Title> {
         self.0.get(&item.id)?.title_of(item)
+    }
+}
+
+/// What a live transcript's grouping reads: its presentations, and the
+/// failure notices it retains outside its items.
+struct Grouping<'c> {
+    presentations: Presentations<'c>,
+    provider: Provider,
+    failures: &'c [failure::Note],
+}
+
+impl<'c> turn::Presented<'c> for Grouping<'c> {
+    fn coordinated(&self, item: &chat::Item) -> Option<&'c coordination::Coordinated> {
+        self.presentations.coordinated(item)
+    }
+    fn titled(&self, item: &chat::Item) -> Option<&'c tool_title::Title> {
+        self.presentations.titled(item)
+    }
+    fn separates(&self, typed: &chat::Item, incoming: &chat::Item) -> bool {
+        failure::separates_prompt(self.provider, self.failures, &typed.id, &incoming.id)
     }
 }
 
@@ -4212,6 +4234,18 @@ impl Runtime {
         failure::prompt_anchor(self.session.launch.provider, &snapshot.items)
             .or_else(|| turns.last().map(|turn| turn.key.as_str()))
     }
+    /// Groups `snapshot`'s items as this transcript draws them.
+    fn transcript_turns(&self, snapshot: &Snapshot) -> Vec<turn::Turn> {
+        turn::group(
+            &snapshot.items,
+            &self.asked_after,
+            Grouping {
+                presentations: Presentations(&self.cache),
+                provider: self.session.launch.provider,
+                failures: &self.failures,
+            },
+        )
+    }
     /// Records a notice in the transcript, after the message it concerns.
     fn note(&mut self, notice: String) {
         if self.snapshot.has_later {
@@ -5255,8 +5289,31 @@ impl Runtime {
         )
     }
 
+    /// Install the answer being written in the update that staged it, so
+    /// each streamed chunk costs one frame rather than two. Waiting for the
+    /// parse, rather than drawing the old text meanwhile, costs the UI
+    /// thread less than that frame would.
+    fn settle_streaming_answer(&mut self) -> Task<Message> {
+        /// Streamed publications parse in under a millisecond at the 95th
+        /// percentile, and a frame of the transcript costs about 3 ms.
+        const BUDGET: Duration = Duration::from_millis(2);
+        // Only a chat on screen parses, as only it has subscriptions.
+        if !self.presents() || !self.visible.load(Ordering::Relaxed) {
+            return Task::none();
+        }
+        match self.preparation.settle_tail(self.target, BUDGET) {
+            preparation::Settled::Idle => Task::none(),
+            preparation::Settled::Ready(id, run, ready) => {
+                self.markdown_prepared(self.target, &id, run, ready);
+                Task::none()
+            }
+            preparation::Settled::Pending(task) => task,
+        }
+    }
+
     fn markdown_prepared(&mut self, target: Target, id: &str, run: u64, ready: preparation::Ready) {
         if !self.presents() {
+            self.preparation.unclaim(id, run);
             return;
         }
         // Observe any replacement already published by the client before
@@ -5310,11 +5367,7 @@ impl Runtime {
         }
         self.resume_preparation();
         if regroup && self.selected_subagent.is_none() {
-            let turns = turn::group(
-                &self.snapshot.items,
-                &self.asked_after,
-                Presentations(&self.cache),
-            );
+            let turns = self.transcript_turns(&self.snapshot);
             carry_step_disclosures(
                 &mut self.opened,
                 &mut self.find_disclosure,
@@ -5753,10 +5806,9 @@ impl Runtime {
             }
         }
         self.source_clock = source_clock;
-        let cache = &self.cache;
         let turns = (grouping_dirty
             || !turn::same_structure(&self.snapshot.items, &snapshot.items))
-        .then(|| turn::group(&snapshot.items, &self.asked_after, Presentations(cache)));
+        .then(|| self.transcript_turns(&snapshot));
         if let Some(turns) = &turns {
             carry_step_disclosures(
                 &mut self.opened,
@@ -12263,6 +12315,7 @@ impl Cagents {
                         let previous_limit = runtime.failure_ui.limit_occurrence;
                         let rehydrating = runtime.presentation_evicted;
                         runtime.refresh();
+                        let settled = runtime.settle_streaming_answer();
                         // First hydration can load historical provider errors
                         // never classified in this window. Current Snapshot/
                         // Local rejection handoff is recorded by refresh itself.
@@ -12324,6 +12377,7 @@ impl Cagents {
                         }
                         let refresh_limits = self.refresh_chat_limit_accounts();
                         return Task::batch([
+                            settled,
                             refresh_limits,
                             self.list_chat_models(target.card),
                             self.resume_current_find(target, true),
@@ -20652,6 +20706,7 @@ mod tests {
                 }
             }
             let window = cosmic::iced::window::Id::unique();
+            app.core.set_main_window_id(Some(window));
             drop(app.update(Message::WindowCloseRequested(window)));
             assert!(app.exit.is_none());
             assert_eq!(app.transient_work_close, Some(window));
@@ -27919,7 +27974,7 @@ mod tests {
             };
             // A confirmed canonical Home, rather than an unregistered local
             // channel: only its authoritative disappearance permits retirement.
-            let home = crate::channel_work::Home {
+            let home = crate::workspace_model::ChannelIncarnation {
                 registry: uuid::Uuid::new_v4(),
                 channel,
                 creation_ordinal: 4,

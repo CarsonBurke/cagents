@@ -256,8 +256,14 @@ use crate::{
 /// tiers to account readings, which older CLIs are sent without, and appends
 /// the account-reset and after-sign-in probe device operations, with a
 /// JSON-framed reset reply that older CLIs cannot request.
+/// Version 185 retires channel work. Its request, response and workspace
+/// edit keep their positions as payload-free variants; the daemon refuses the
+/// request a carried older CLI can still send and never sends the others.
 /// Replace the matched daemon/window set.
-pub const PROTOCOL_VERSION: u16 = 184;
+pub const PROTOCOL_VERSION: u16 = 185;
+/// The refusal of a retired channel-work request or workspace edit.
+pub const RETIRED_CHANNEL_WORK: &str =
+    "Channel work was removed; the Work board (`cagents work`) tracks pull requests";
 /// A correlated refusal issued before source-checked cleanup has any effect.
 pub const TERMINAL_CLOSE_SOURCE_CONFLICT: &str =
     "The terminal changed or still owns work; nothing was closed";
@@ -629,10 +635,13 @@ pub enum ClientRequest {
     /// the same response, as [`crate::work::Response::Watching`]. Each later
     /// change arrives as [`ServerMessage::WorkBoard`].
     WatchWork,
-    ChannelWork {
-        authority: crate::agent_execution::Authority,
-        request: crate::channel_work_api::Request,
-    },
+    /// Retired channel work, which protocol 185 removed. It holds the request
+    /// position so later requests keep their tags. A carried older CLI's
+    /// request decodes as this variant, since postcard reads only the tag of
+    /// the envelope's last field and ignores the payload after it, and is
+    /// refused.
+    #[serde(rename = "ChannelWork")]
+    RetiredChannelWork,
     /// Whether startup recovery finished, is still awaiting original owners,
     /// or kept them after a failure. Answered during recovery, unlike every
     /// request that recovery refuses with the same `TerminalUnavailable`.
@@ -1114,7 +1123,10 @@ pub enum ServerResponse {
         page: crate::chat::TextCopyPage,
     },
     Work(crate::work::Response),
-    ChannelWork(crate::channel_work_api::Response),
+    /// Retired with [`ClientRequest::RetiredChannelWork`]; never sent. It holds
+    /// the response position so later responses keep their tags.
+    #[serde(rename = "channel_work")]
+    RetiredChannelWork,
     StartupState(StartupState),
     /// What [`ClientRequest::ChatLostProcesses`] found still running, after
     /// ending what it ended.

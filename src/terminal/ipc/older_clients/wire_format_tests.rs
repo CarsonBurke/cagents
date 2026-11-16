@@ -25,6 +25,19 @@ const DEVICE_REPLY: &str = "cagents::device_service::Reply";
 const AUTOMATION_RESPONSE: &str = "cagents::automations::Response";
 const SERVER_MESSAGE: &str = "cagents::terminal::ipc::ServerMessage";
 
+/// Channel work, which protocol 185 retired. Its variants keep their
+/// positions without their payloads: the daemon refuses the request, refuses
+/// the edit, and never sends the response, so no older client relies on what
+/// they carried.
+const RETIRED_CHANNEL_WORK: [(&str, &[&str]); 3] = [
+    ("cagents::terminal::ipc::ClientRequest", &["ChannelWork"]),
+    ("cagents::terminal::ipc::ServerResponse", &["channel_work"]),
+    (
+        "cagents::workspace_model::ModelEdit",
+        &["ChannelWorkChanged"],
+    ),
+];
+
 #[test]
 fn workspace_delta_requests_and_receipts_round_trip_as_framed_messages() {
     use crate::{
@@ -515,19 +528,21 @@ fn every_older_client_is_proven_against_its_recorded_format() {
                 (AGENT_REPLY, client.agent_replies as usize),
                 (DEVICE_REPLY, client.device_replies as usize),
             ],
-            [
-                (client.protocol < FIRING_WITH_SKIPPED_OCCURRENCES)
-                    .then_some((AUTOMATION_RESPONSE, FIRING_REPLIES)),
-                (client.protocol < MODEL_EDGES_WITH_EFFECTS)
-                    .then_some((SERVER_MESSAGE, MODEL_EDGES)),
-                (client.protocol < WORK_CHECK_COUNTS)
-                    .then_some((WORK_RESPONSE, WORK_CHECK_REPLIES)),
-                (client.protocol < WORK_CHECK_COUNTS)
-                    .then_some((SERVER_MESSAGE, WORK_BOARD_MESSAGES)),
-            ]
-            .into_iter()
-            .flatten()
-            .collect(),
+            RETIRED_CHANNEL_WORK
+                .into_iter()
+                .map(Some)
+                .chain([
+                    (client.protocol < FIRING_WITH_SKIPPED_OCCURRENCES)
+                        .then_some((AUTOMATION_RESPONSE, FIRING_REPLIES)),
+                    (client.protocol < MODEL_EDGES_WITH_EFFECTS)
+                        .then_some((SERVER_MESSAGE, MODEL_EDGES)),
+                    (client.protocol < WORK_CHECK_COUNTS)
+                        .then_some((WORK_RESPONSE, WORK_CHECK_REPLIES)),
+                    (client.protocol < WORK_CHECK_COUNTS)
+                        .then_some((SERVER_MESSAGE, WORK_BOARD_MESSAGES)),
+                ])
+                .flatten()
+                .collect(),
             restated_for(client.protocol),
         );
         assert!(

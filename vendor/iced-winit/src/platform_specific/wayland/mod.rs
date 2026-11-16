@@ -2,6 +2,7 @@ pub mod commands;
 pub mod conversion;
 pub(crate) mod event_loop;
 pub(crate) mod handlers;
+mod keyboard_grab;
 pub mod keymap;
 pub mod sctk_event;
 pub mod subsurface_widget;
@@ -97,6 +98,7 @@ pub(crate) struct WaylandSpecific {
     surface_ids: HashMap<ObjectId, SurfaceIdWrapper>,
     subsurface_state: Option<SubsurfaceState>,
     surface_subsurfaces: HashMap<window::Id, Vec<SubsurfaceInstance>>,
+    pub(crate) keyboard_grabs: keyboard_grab::KeyboardGrabs,
 }
 
 impl PlatformSpecific {
@@ -195,6 +197,7 @@ impl WaylandSpecific {
             modifiers,
             subsurface_state,
             surface_subsurfaces,
+            keyboard_grabs,
         } = self;
 
         match e {
@@ -226,6 +229,7 @@ impl WaylandSpecific {
                         events,
                         clipboard,
                         subsurface_state,
+                        keyboard_grabs,
                         create_compositor,
                     )
                     .await;
