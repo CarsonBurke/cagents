@@ -1080,7 +1080,13 @@ mod tests {
                 };
                 let child = late_original.child.take().unwrap();
                 match reservation.retain(child, pidfd) {
-                    Ok(()) => Ok(()),
+                    Ok(()) => {
+                        // The reaper now owns the child; disarm the fixture's
+                        // failure-only cleanup so its drop leaves it running.
+                        late_original.armed = false;
+                        drop(late_original);
+                        Ok(())
+                    }
                     Err((error, child, _, reservation)) => {
                         late_original.child = Some(child);
                         // Reap via the original cleanup owner before returning
