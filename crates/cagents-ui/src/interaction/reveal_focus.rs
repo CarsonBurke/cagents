@@ -3,12 +3,17 @@ use cosmic::iced::advanced::{
     Clipboard, Layout, Shell, Widget, layout, overlay, renderer,
     widget::{Id, Operation, Tree, operation, tree},
 };
-use cosmic::iced::{Event, Length, Rectangle, Size, Vector, keyboard, mouse, window};
+use cosmic::iced::time::{Duration, Instant};
+use cosmic::iced::{Event, Length, Rectangle, Size, Vector, keyboard, mouse, touch, window};
 use cosmic::{Element, Renderer, Theme};
 
 /// How many frames after a key the reveal waits for focus to move: the app
 /// may answer the key by focusing a control a frame or two later.
 const SETTLE_FRAMES: u8 = 3;
+
+/// How long after a key the reveal waits for focus to move at most, since
+/// an idle window draws no frames to count.
+const SETTLE_TIME: Duration = Duration::from_millis(250);
 
 /// `content`, a scrollable, scrolled just far enough to show a control that
 /// the keyboard moves focus to inside it, by Tab, an arrow key or a shortcut
@@ -22,8 +27,7 @@ const SETTLE_FRAMES: u8 = 3;
 /// scrollables in between, as for [`super::overflow_fade_y`]. Focus inside a
 /// scrollable nested in it, such as a list in a dialog, brings that list
 /// into view; a `reveal_focus` around the list as well then shows the
-/// control within it. A control that takes focus without an id, as an iced text editor
-/// made without one does, can't be followed and is left where it is.
+/// control within it.
 pub fn reveal_focus<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
 ) -> Element<'a, Message> {
@@ -63,10 +67,27 @@ enum Role {
 /// Where focus stood when the last key arrived.
 #[derive(Default)]
 struct State {
-    /// The control focused before the last key was handled.
-    before: Option<Id>,
+    /// The control focused before the last key was handled, by its place
+    /// among the controls that can take focus. Most controls are given a
+    /// new id each time the view is built, and a key rebuilds it, so the
+    /// place is what stays the same while focus does.
+    before: Option<usize>,
     /// Frames left to wait for the last key to move focus.
     settling: u8,
+    /// When the wait for the last key ends regardless.
+    until: Option<Instant>,
+}
+
+impl State {
+    /// Whether a key's move is still awaited at `now`.
+    fn settling(&self, now: Instant) -> bool {
+        self.settling > 0 && self.until.is_some_and(|until| now < until)
+    }
+
+    fn settle(&mut self) {
+        self.settling = 0;
+        self.until = None;
+    }
 }
 
 /// A region the walk is inside.
@@ -83,9 +104,12 @@ enum Frame {
 struct FindFocus {
     /// The scrollable's viewport, its content height and its offset.
     scrollable: Option<(Rectangle, f32, f32)>,
-    /// The focused control, and the region of the outer scrollable's content
+    /// How many controls that can take focus the walk has passed.
+    passed: usize,
+    /// The focused control's place among those, and the region of the outer
+    /// scrollable's content
     /// to show for it, if any.
-    focused: Option<(Id, Option<Rectangle>)>,
+    focused: Option<(usize, Option<Rectangle>)>,
     /// The regions enclosing the widgets being visited, outermost first.
     frames: Vec<Frame>,
     /// A region was just visited; the next traversal enters it.
@@ -178,13 +202,17 @@ impl Operation for FindFocus {
 
     fn focusable(
         &mut self,
-        id: Option<&Id>,
+        _id: Option<&Id>,
         bounds: Rectangle,
         state: &mut dyn operation::Focusable,
     ) {
-        if let Some(id) = id.filter(|_| state.is_focused() && self.scrollable.is_some()) {
-            self.focused = Some((id.clone(), self.target(bounds)));
+        if self.scrollable.is_none() {
+            return;
         }
+        if state.is_focused() {
+            self.focused = Some((self.passed, self.target(bounds)));
+        }
+        self.passed += 1;
     }
 }
 
@@ -236,7 +264,7 @@ impl<Message> Marked<'_, Message> {
     ) -> bool {
         let find = self.find(tree, layout, renderer);
         let state = tree.state.downcast_mut::<State>();
-        let focused = find.focused.as_ref().map(|(id, _)| id.clone());
+        let focused = find.focused.as_ref().map(|(place, _)| *place);
         if state.before == focused {
             return false;
         }
@@ -349,10 +377,22 @@ impl<Message> Widget<Message, Theme, Renderer> for Marked<'_, Message> {
         // Only the keyboard's moves count: what has focus before a key is
         // the baseline, however it got there, and the first change in the
         // frames that follow, moved by the key itself or by the app's answer
-        // to it, is the move. Those frames' layout is the one measured.
+        // to it, is the move. Those frames' layout is the one measured. The
+        // pointer ends the wait: what it focuses is the person's own choice.
+        let now = Instant::now();
         let key = matches!(event, Event::Keyboard(keyboard::Event::KeyPressed { .. }));
-        if key && tree.state.downcast_ref::<State>().settling == 0 {
-            let before = self.find(tree, layout, renderer).focused.map(|(id, _)| id);
+        if matches!(
+            event,
+            Event::Mouse(mouse::Event::ButtonPressed(_))
+                | Event::Touch(touch::Event::FingerPressed { .. })
+        ) {
+            tree.state.downcast_mut::<State>().settle();
+        }
+        if key && !tree.state.downcast_ref::<State>().settling(now) {
+            let before = self
+                .find(tree, layout, renderer)
+                .focused
+                .map(|(place, _)| place);
             tree.state.downcast_mut::<State>().before = before;
         }
         self.content.as_widget_mut().update(
@@ -366,13 +406,19 @@ impl<Message> Widget<Message, Theme, Renderer> for Marked<'_, Message> {
             viewport,
         );
         if key {
-            tree.state.downcast_mut::<State>().settling = SETTLE_FRAMES;
-        } else if matches!(event, Event::Window(window::Event::RedrawRequested(_)))
-            && tree.state.downcast_ref::<State>().settling > 0
+            let state = tree.state.downcast_mut::<State>();
+            state.settling = SETTLE_FRAMES;
+            state.until = Some(now + SETTLE_TIME);
+        } else if let Event::Window(window::Event::RedrawRequested(at)) = event
+            && tree.state.downcast_ref::<State>().settling(*at)
         {
             let moved = self.reveal(tree, layout, renderer, shell);
             let state = tree.state.downcast_mut::<State>();
-            state.settling = if moved { 0 } else { state.settling - 1 };
+            if moved {
+                state.settle();
+            } else {
+                state.settling -= 1;
+            }
         }
     }
     fn mouse_interaction(
@@ -478,6 +524,10 @@ mod tests {
     /// Twenty rows in a [`VIEW`] tall scrollable, button rows unless `rows`
     /// says otherwise.
     struct Harness {
+        rows: Vec<(usize, Row)>,
+        /// Whether buttons get a new id each build, as cosmic's do unless
+        /// given one.
+        unique: bool,
         element: Element<'static, ()>,
         tree: Tree,
         node: layout::Node,
@@ -488,16 +538,56 @@ mod tests {
         Id::new(format!("row-{row}"))
     }
 
-    fn button(row: usize) -> Element<'static, ()> {
-        widget::button::text(format!("Row {row}"))
-            .id(id(row))
-            .height(30)
-            .on_press(())
-            .into()
+    fn limits() -> layout::Limits {
+        layout::Limits::new(Size::ZERO, Size::new(300.0, VIEW))
     }
 
     impl Harness {
         fn new(rows: &[(usize, Row)]) -> Self {
+            Self::build(rows, false)
+        }
+
+        /// Buttons without ids of their own, so each build gives them new
+        /// ones.
+        fn unnamed() -> Self {
+            Self::build(&[], true)
+        }
+
+        fn build(rows: &[(usize, Row)], unique: bool) -> Self {
+            let mut element = Self::view(rows, unique);
+            let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+            let mut tree = Tree::new(&element);
+            let node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits());
+            Self {
+                rows: rows.to_vec(),
+                unique,
+                element,
+                tree,
+                node,
+                renderer,
+            }
+        }
+
+        /// The view built afresh, as the app does after each message.
+        fn rebuild(&mut self) {
+            self.element = Self::view(&self.rows, self.unique);
+            self.tree.diff(self.element.as_widget_mut());
+            self.node =
+                self.element
+                    .as_widget_mut()
+                    .layout(&mut self.tree, &self.renderer, &limits());
+        }
+
+        fn view(rows: &[(usize, Row)], unique: bool) -> Element<'static, ()> {
+            let button = |row: usize| -> Element<'static, ()> {
+                let button = widget::button::text(format!("Row {row}"));
+                if unique { button } else { button.id(id(row)) }
+                    .height(30)
+                    .on_press(())
+                    .into()
+            };
             let rows = (0..20)
                 .map(|index| {
                     match rows
@@ -519,21 +609,7 @@ mod tests {
                     }
                 })
                 .collect::<Vec<_>>();
-            let mut element =
-                reveal_focus(widget::scrollable(widget::column::with_children(rows)).height(VIEW));
-            let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
-            let mut tree = Tree::new(&element);
-            let node = element.as_widget_mut().layout(
-                &mut tree,
-                &renderer,
-                &layout::Limits::new(Size::ZERO, Size::new(300.0, VIEW)),
-            );
-            Self {
-                element,
-                tree,
-                node,
-                renderer,
-            }
+            reveal_focus(widget::scrollable(widget::column::with_children(rows)).height(VIEW))
         }
 
         fn operate(&mut self, operation: &mut dyn Operation) {
@@ -563,6 +639,31 @@ mod tests {
             self.operate(&mut focusable::focus::<()>(id(row)));
         }
 
+        /// Focuses the `place`th control that can take focus, whatever its
+        /// id.
+        fn focus_place(&mut self, place: usize) {
+            struct Place(usize);
+            impl Operation for Place {
+                fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                    operate(self);
+                }
+                fn focusable(
+                    &mut self,
+                    _id: Option<&Id>,
+                    _bounds: Rectangle,
+                    state: &mut dyn operation::Focusable,
+                ) {
+                    if self.0 == 0 {
+                        state.focus();
+                    } else {
+                        state.unfocus();
+                    }
+                    self.0 = self.0.wrapping_sub(1);
+                }
+            }
+            self.operate(&mut Place(place));
+        }
+
         fn key(&mut self) {
             self.event(Event::Keyboard(keyboard::Event::KeyPressed {
                 key: keyboard::Key::Named(keyboard::key::Named::Tab),
@@ -578,9 +679,11 @@ mod tests {
         }
 
         fn frame(&mut self) {
-            self.event(Event::Window(
-                window::Event::RedrawRequested(Instant::now()),
-            ));
+            self.frame_at(Instant::now());
+        }
+
+        fn frame_at(&mut self, at: Instant) {
+            self.event(Event::Window(window::Event::RedrawRequested(at)));
         }
 
         /// A key that focuses `row`, answered in the next frame.
@@ -670,6 +773,58 @@ mod tests {
         }
         harness.focus(10);
         harness.frame();
+        assert_eq!(harness.scrolled(), 0.0);
+    }
+
+    #[test]
+    fn a_rebuilt_view_s_new_ids_are_not_a_focus_move() {
+        let mut harness = Harness::unnamed();
+        // A click focuses row 4, under the bottom fade; then a key the
+        // control keeps, as typing does, rebuilds the view with new ids.
+        harness.focus_place(4);
+        harness.frame();
+        harness.key();
+        harness.rebuild();
+        harness.frame();
+        let mut find = FindFocus::default();
+        harness.operate(&mut find);
+        assert_eq!(
+            find.focused.map(|(place, _)| place),
+            Some(4),
+            "the rebuilt row keeps focus"
+        );
+        assert_eq!(harness.scrolled(), 0.0);
+    }
+
+    #[test]
+    fn tab_through_a_rebuilt_view_still_reveals() {
+        let mut harness = Harness::unnamed();
+        harness.key();
+        harness.rebuild();
+        harness.focus_place(10);
+        harness.frame();
+        assert_eq!(harness.scrolled(), 330.0 + 24.0 - VIEW);
+    }
+
+    #[test]
+    fn a_click_after_a_key_that_moved_nothing_doesnt_scroll() {
+        let mut harness = Harness::new(&[]);
+        harness.key();
+        harness.frame();
+        harness.event(Event::Mouse(mouse::Event::ButtonPressed(
+            mouse::Button::Left,
+        )));
+        harness.focus(4);
+        harness.frame();
+        assert_eq!(harness.scrolled(), 0.0);
+    }
+
+    #[test]
+    fn focus_moved_once_the_wait_has_timed_out_is_not_the_keys() {
+        let mut harness = Harness::new(&[]);
+        harness.key();
+        harness.focus(10);
+        harness.frame_at(Instant::now() + SETTLE_TIME);
         assert_eq!(harness.scrolled(), 0.0);
     }
 }
