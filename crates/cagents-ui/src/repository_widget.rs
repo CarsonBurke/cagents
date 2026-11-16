@@ -5244,8 +5244,28 @@ impl RepositoryRuntime {
         Some((
             self.generation,
             document.revision,
-            Arc::clone(&self.diff_model()?.before),
+            Arc::clone(self.working_baseline()?),
         ))
+    }
+
+    /// The index text a live comparison is built against: the current
+    /// comparison's, or one retained only for a restyle. One retained across
+    /// a Git refresh may name an index that has since moved, and a rebuild
+    /// against it would replace the comparison Git is reading.
+    fn working_baseline(&self) -> Option<&Arc<str>> {
+        let state = match self.diff_state(&self.diff_basis) {
+            Some(state @ DiffState::Ready(..)) => state,
+            _ => {
+                &self
+                    .retained_diff()
+                    .filter(|retained| retained.restyle)?
+                    .state
+            }
+        };
+        match state {
+            DiffState::Ready(RenderedDiff::Text { model, .. }, _) => Some(&model.before),
+            _ => None,
+        }
     }
 
     /// Whether the live-buffer comparison wanted is the one applied, styled
@@ -18196,6 +18216,16 @@ mod tests {
             // The status listing that follows the mutation has arrived.
             runtime.mutation_refresh_pending = false;
             drop(runtime.ensure_current_diff(card));
+            // Nor may the buffer race Git with a rebuild against the old index.
+            drop(runtime.working_diff_task(card));
+            if let Some(ticket) = runtime.working_diff.timer {
+                runtime.working_diff.deadline = Some(Instant::now());
+                drop(runtime.start_working_diff(card, ticket));
+            }
+            assert!(
+                runtime.working_diff.active.is_none(),
+                "restyled: {restyled}"
+            );
             assert!(
                 matches!(
                     runtime.diff_state(&DiffBasis::IndexToWorktree),
