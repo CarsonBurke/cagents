@@ -1855,7 +1855,7 @@ fn resume_reaches<'a>(scope: &Scope, counts: &[usize; 3]) -> Element<'a, Message
                 contents.push(crate::ui_controls::reserved(
                     design::body(label),
                     [design::body(room).into()],
-                    iced::alignment::Horizontal::Center,
+                    iced::alignment::Horizontal::Left,
                 ));
                 widget::button::custom(
                     widget::row::with_children(contents)
