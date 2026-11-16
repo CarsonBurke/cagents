@@ -1322,7 +1322,7 @@ mod tests {
     }
 
     /// At the minimum 900x600 window with 150% interface scale, a long
-    /// request scrolls and every decision stays inside the window.
+    /// request scrolls and every decision stays whole and inside the window.
     #[test]
     fn approval_decisions_stay_in_reach_at_the_scaled_minimum_window() {
         let (mut app, _) = reviewing();
@@ -1334,17 +1334,21 @@ mod tests {
             .prompt = "Read all of the saved request before deciding.\n".repeat(80);
         let generation = app.automation_approval.generation;
         for role in ["dismiss", "decline", "approve"] {
-            let (window, viewport, content, control) =
+            let geometry = |window| {
                 super::super::dialog_ui::tests::action_geometry(
                     app.automation_approval_dialog().unwrap(),
-                    cosmic::iced::Size::new(600.0, 400.0),
+                    window,
                     &approval_control_id(generation, role),
-                );
+                )
+            };
+            let (_, _, _, natural) = geometry(cosmic::iced::Size::new(1200.0, 900.0));
+            let (window, viewport, content, control) =
+                geometry(cosmic::iced::Size::new(600.0, 400.0));
             assert!(
-                control.height > 0.0
+                control.height == natural.height
                     && control.y >= 0.0
                     && control.y + control.height <= window.height,
-                "{role} must stay inside the window: {control:?}"
+                "{role} must stay whole and inside the window: {control:?}, not {natural:?}"
             );
             assert!(viewport.y + viewport.height <= control.y);
             assert!(content > viewport.height, "the request scrolls instead");
