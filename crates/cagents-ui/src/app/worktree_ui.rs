@@ -62,7 +62,7 @@ impl<'a> ResolveRoot<'a> for WorktreeRoots<'a> {
 /// worktree switch cost a `realpath` apiece on the UI thread. So a root is
 /// resolved once, when it becomes known. One that could not be resolved, such
 /// as a checkout that does not exist yet, keeps its own path. It is tried again
-/// once the sidebar lists a row at that path, which is how a checkout created
+/// while the sidebar lists a row at that path, which is how a checkout created
 /// later shows up. A deleted checkout gets no row and is not tried again. A
 /// symbolic link retargeted under a root that already resolved goes unseen.
 ///
@@ -82,8 +82,10 @@ struct CanonicalRoots {
     pending: Vec<PathBuf>,
     /// Roots that could not be resolved.
     unresolved: HashSet<PathBuf>,
-    /// The [`WorktreePathIndex::generation`] that `unresolved` was last
-    /// checked against.
+    /// The unresolved roots that a row lists, tried again on each pass until
+    /// their checkout exists.
+    listed: Vec<PathBuf>,
+    /// The [`WorktreePathIndex::generation`] that `listed` was taken from.
     checked_rows: Option<u64>,
     /// Whether the forms were taken for a remote device, where paths are
     /// never resolved here.
@@ -130,9 +132,9 @@ impl KnownWorktreeRoots {
         *self = Self::default();
     }
 
-    /// The known roots by canonical form, resolving those known since the
-    /// last call and those still unresolved that `rows` now lists.
-    fn canonical(&mut self, rows: &WorktreePathIndex) -> &HashMap<PathBuf, Vec<PathBuf>> {
+    /// Resolves the roots known since the last pass, and those still
+    /// unresolved that `rows` lists.
+    fn resolve_new(&mut self, rows: &WorktreePathIndex) {
         let remote = crate::device::is_remote();
         let canonical = &mut self.canonical;
         if canonical.remote != remote {
@@ -162,31 +164,63 @@ impl KnownWorktreeRoots {
         }
         if canonical.checked_rows != Some(rows.generation()) {
             canonical.checked_rows = Some(rows.generation());
-            let listed = canonical
+            canonical.listed = canonical
                 .unresolved
                 .iter()
                 .filter(|root| rows.lists(root))
                 .cloned()
-                .collect::<Vec<_>>();
-            for root in listed {
-                #[cfg(test)]
-                {
-                    canonical.resolutions += 1;
-                }
-                let Some(form) = resolve(&root) else {
-                    continue;
-                };
-                canonical.unresolved.remove(&root);
-                if let Some(aliases) = canonical.roots.get_mut(&root) {
-                    aliases.retain(|alias| *alias != root);
-                    if aliases.is_empty() {
-                        canonical.roots.remove(&root);
-                    }
-                }
-                canonical.roots.entry(form).or_default().push(root);
-            }
+                .collect();
         }
-        &self.canonical.roots
+        let mut listed = std::mem::take(&mut canonical.listed);
+        listed.retain(|root| {
+            #[cfg(test)]
+            {
+                canonical.resolutions += 1;
+            }
+            let Some(form) = resolve(root) else {
+                return true;
+            };
+            canonical.unresolved.remove(root);
+            if let Some(aliases) = canonical.roots.get_mut(root) {
+                aliases.retain(|alias| alias != root);
+                if aliases.is_empty() {
+                    canonical.roots.remove(root);
+                }
+            }
+            canonical.roots.entry(form).or_default().push(root.clone());
+            false
+        });
+        canonical.listed = listed;
+    }
+
+    /// The known root nearest above `directory`, whose canonical form is
+    /// `resolved` when it could be resolved. Of two aliases of that root, the
+    /// one `listed` is preferred.
+    ///
+    /// A directory that no longer exists keeps its own path, as a root deleted
+    /// before it became known does. A root resolved while it existed is
+    /// filed under its canonical form, which such a path need not start with,
+    /// so the roots are also looked up by the paths they became known by.
+    fn owner(
+        &self,
+        directory: &Path,
+        resolved: Option<&Path>,
+        listed: impl Fn(&Path) -> bool,
+    ) -> Option<&Path> {
+        let by_form = |ancestor: &Path| {
+            self.canonical
+                .roots
+                .get(ancestor)?
+                .iter()
+                .max_by_key(|root| listed(root))
+                .map(PathBuf::as_path)
+        };
+        match resolved {
+            Some(canonical) => nearest_root(canonical, by_form),
+            None => nearest_root(directory, |ancestor| {
+                by_form(ancestor).or_else(|| self.roots.get(ancestor).map(PathBuf::as_path))
+            }),
+        }
     }
 }
 
@@ -794,27 +828,21 @@ impl Cagents {
             );
         self.worktree_paths
             .refresh(&self.known_worktree_roots, &self.sidebar_model.projects);
+        self.known_worktree_roots.resolve_new(&self.worktree_paths);
         let index = &self.worktree_paths;
-        let roots = self.known_worktree_roots.canonical(index);
+        let known = &self.known_worktree_roots;
         let remote = crate::device::is_remote();
-        // The nearest root among the canonical directory's ancestors; of two
-        // aliases of that root, the one Projects lists.
         let resolve = |directory: &Path| {
-            let canonical = if remote {
-                directory.to_path_buf()
+            let resolved = if remote {
+                Some(directory.to_path_buf())
             } else {
-                directory
-                    .canonicalize()
-                    .unwrap_or_else(|_| directory.into())
+                directory.canonicalize().ok()
             };
-            nearest_root(&canonical, |ancestor| {
-                roots
-                    .get(ancestor)?
-                    .iter()
-                    .max_by_key(|root| index.lists(root))
-                    .map(PathBuf::as_path)
-            })
-            .map_or_else(|| canonical.clone(), Path::to_path_buf)
+            known
+                .owner(directory, resolved.as_deref(), |root| index.lists(root))
+                .map(Path::to_path_buf)
+                .or(resolved)
+                .unwrap_or_else(|| directory.into())
         };
         let mut directories = HashMap::<&Path, PathBuf>::new();
         self.worktree_owners = self
@@ -2407,7 +2435,8 @@ mod tests {
         let mut index = WorktreePathIndex::default();
         let mut projects = Vec::new();
         index.refresh(&known, &projects);
-        let roots = known.canonical(&index).clone();
+        known.resolve_new(&index);
+        let roots = known.canonical.roots.clone();
         assert_eq!(roots[&real.join("existing")], [alias.join("existing")]);
         assert_eq!(roots[&alias.join("later")], [alias.join("later")]);
         assert_eq!(roots[&alias.join("deleted")], [alias.join("deleted")]);
@@ -2416,7 +2445,7 @@ mod tests {
         // Nothing new: every form is reused, even once the directory exists.
         std::fs::create_dir_all(real.join("later")).unwrap();
         index.refresh(&known, &projects);
-        known.canonical(&index);
+        known.resolve_new(&index);
         assert_eq!(known.canonical.resolutions, 3);
 
         // The checkout gains its row, so it is resolved; the deleted root,
@@ -2439,7 +2468,8 @@ mod tests {
             Vec::new(),
         ));
         index.refresh(&known, &projects);
-        let roots = known.canonical(&index).clone();
+        known.resolve_new(&index);
+        let roots = known.canonical.roots.clone();
         assert_eq!(known.canonical.resolutions, 4);
         assert_eq!(roots[&real.join("later")], [alias.join("later")]);
         assert!(!roots.contains_key(&alias.join("later")));
@@ -2450,9 +2480,67 @@ mod tests {
         assert!(known.insert(alias.join("new")));
         assert!(!known.insert(alias.join("new")));
         index.refresh(&known, &projects);
-        let roots = known.canonical(&index).clone();
+        known.resolve_new(&index);
+        let roots = known.canonical.roots.clone();
         assert_eq!(known.canonical.resolutions, 5);
         assert_eq!(roots[&real.join("new")], [alias.join("new")]);
+
+        // A row can list a checkout still being created. It is tried on each
+        // pass until it exists.
+        known.insert(alias.join("creating"));
+        projects[0].worktrees.push(SidebarWorktree::new(
+            crate::model::WorktreeId::new(),
+            alias.join("creating"),
+            None,
+            false,
+            false,
+            None,
+            None,
+            None,
+        ));
+        index.refresh(&known, &projects);
+        known.resolve_new(&index);
+        assert_eq!(known.canonical.resolutions, 7, "known, then listed");
+        known.resolve_new(&index);
+        assert_eq!(known.canonical.resolutions, 8);
+        std::fs::create_dir_all(real.join("creating")).unwrap();
+        known.resolve_new(&index);
+        assert_eq!(known.canonical.resolutions, 9);
+        assert_eq!(
+            known.canonical.roots[&real.join("creating")],
+            [alias.join("creating")]
+        );
+        known.resolve_new(&index);
+        assert_eq!(known.canonical.resolutions, 9);
+    }
+
+    /// A checkout deleted after it was resolved still owns the panes filed
+    /// under the path it became known by, as it did while it existed.
+    #[cfg(unix)]
+    #[test]
+    fn a_deleted_checkout_known_through_an_alias_keeps_its_panes() {
+        let directory = tempfile::tempdir().unwrap();
+        let real = directory.path().join("real");
+        let alias = directory.path().join("alias");
+        let root = alias.join("repo");
+        let nested = root.join("worktrees/feature");
+        std::fs::create_dir_all(real.join("repo/worktrees/feature/src")).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let shell = terminal(nested.join("src").to_str().unwrap());
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        register_worktrees(
+            &mut app,
+            &[root.to_str().unwrap(), nested.to_str().unwrap()],
+        );
+        app.durable = Arc::new(WorkspaceState {
+            cards: vec![shell.clone()].into(),
+            ..WorkspaceState::default()
+        });
+        let _ = app.select_worktree(nested.clone(), false);
+        assert_eq!(app.worktree_owners[&shell.id], nested);
+        std::fs::remove_dir_all(real.join("repo/worktrees")).unwrap();
+        app.refresh_worktree_owners(None);
+        assert_eq!(app.worktree_owners[&shell.id], nested);
     }
 
     /// Switching worktrees resolves only the panes' directories and the
