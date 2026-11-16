@@ -45,8 +45,10 @@ pub(super) use execution::{EARLIER_MESSAGES, UNVERIFIED_BEHIND, UNVERIFIED_REFUS
 pub(super) use mailbox::{MESSAGE_RUN_KEY, MessageHandoff};
 mod native_actor;
 mod native_actor_retirement;
+mod pane_chat_starts;
 pub(super) use native_actor::NativeActorEvent;
 pub(super) use native_actor_retirement::{NativeActorOwnership, NativeActorRetirement};
+pub(super) use pane_chat_starts::Binding as PaneChatBinding;
 mod navigation;
 #[cfg(test)]
 mod public_delta_tests;
@@ -61,7 +63,7 @@ mod views;
 #[cfg(test)]
 mod workspace_snapshot_tests;
 
-const SCHEMA_VERSION: u32 = 27;
+const SCHEMA_VERSION: u32 = 28;
 
 /// Wait for another connection's writer rather than failing at admission.
 /// Read-then-write transactions must start immediate so SQLite can use this
@@ -1039,6 +1041,10 @@ fn migrate_through(
         retired_channel_work::remove(tx)?;
         schema::migration_checkpoint(27)?;
     }
+    if version < 28 && target >= 28 {
+        pane_chat_starts::migrate(tx)?;
+        schema::migration_checkpoint(28)?;
+    }
     Ok(())
 }
 
@@ -1580,7 +1586,9 @@ mod tests {
         let legacy = Connection::open(&path).unwrap();
         legacy
             .execute_batch(
-                "DROP TABLE terminal_pane_bindings;
+                "DROP TABLE pane_chat_allocations;
+                 DROP TABLE pane_chat_starts;
+                 DROP TABLE terminal_pane_bindings;
                  DROP TRIGGER session_channel_insert;
                  DROP TRIGGER session_channel_move;
                  DROP TABLE session_channels;

@@ -1771,6 +1771,7 @@ fn process_admitted_request(
             ))
         }
         request @ (ClientRequest::ChatStart { .. }
+        | ClientRequest::ChatStartInPane { .. }
         | ClientRequest::ChatPrepareResume { .. }
         | ClientRequest::ChatRecoverAccount { .. }
         | ClientRequest::ChatPreview { .. }

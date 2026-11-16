@@ -260,7 +260,10 @@ use crate::{
 /// edit keep their positions as payload-free variants; the daemon refuses the
 /// request a carried older CLI can still send and never sends the others.
 /// Replace the matched daemon/window set.
-pub const PROTOCOL_VERSION: u16 = 185;
+/// Version 186 appends `ChatStartInPane`, which admits a pane's first send by
+/// its stable pane identity before the provider starts, so a second window's
+/// fresh conversation cannot take a pane another window already started.
+pub const PROTOCOL_VERSION: u16 = 186;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";
@@ -703,6 +706,23 @@ pub enum ClientRequest {
     ReadCapturedTerminalRemovalBasis {
         capture: crate::workspace_model::views::CapturedTerminalSource,
     },
+    /// First-send admission is serialized by stable pane identity, before
+    /// provider initialization. Later attachments retain the ordinary path.
+    ChatStartInPane {
+        pane: PaneChatStart,
+        session: crate::chat::Session,
+        execution_environment: ChatExecutionEnvironment,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneChatStart {
+    pub registry: uuid::Uuid,
+    pub card: crate::model::CardId,
+    pub source: crate::chat::Session,
+    /// A deliberately local pane need not wait for a shared descriptor. An
+    /// existing canonical pane still takes precedence over this client hint.
+    pub allow_local: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
