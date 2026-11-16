@@ -339,18 +339,32 @@ impl Installation {
     }
 
     fn state_dir(&self) -> Result<PathBuf, UpdateError> {
-        let path = self.prefix.join(".update");
-        match fs::DirBuilder::new().mode(0o700).create(&path) {
-            Ok(()) => (),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (),
-            Err(error) => return Err(error.into()),
-        }
-        let meta = fs::symlink_metadata(&path)?;
-        if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
-            return Err(invalid("unsafe updater state directory"));
-        }
-        Ok(path)
+        state_dir(&self.prefix)
     }
+}
+
+fn state_dir(prefix: &Path) -> Result<PathBuf, UpdateError> {
+    let path = prefix.join(".update");
+    match fs::DirBuilder::new().mode(0o700).create(&path) {
+        Ok(()) => (),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (),
+        Err(error) => return Err(error.into()),
+    }
+    let meta = fs::symlink_metadata(&path)?;
+    if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
+        return Err(invalid("unsafe updater state directory"));
+    }
+    Ok(path)
+}
+
+/// Holds the update job lease of the installation at `prefix`, so no job can
+/// run or start while the caller changes what that installation serves.
+/// [`UpdateError::Busy`] means a job is active: its worker keeps the lease for
+/// its whole lifetime, including review and confirmation.
+pub(crate) fn exclude_update_jobs(
+    prefix: &Path,
+) -> Result<crate::instance::OwnedLock, UpdateError> {
+    acquire_lock(&state_dir(prefix)?)
 }
 
 fn invalid(message: impl Into<String>) -> UpdateError {

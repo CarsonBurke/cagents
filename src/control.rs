@@ -271,6 +271,19 @@ pub enum TopCommand {
         #[arg(help = "Directory containing the staged executable version.")]
         version_root: Option<PathBuf>,
     },
+    /// Serve an installed version while preserving running windows and daemon.
+    #[command(hide = true)]
+    SelectInstall {
+        #[arg(long)]
+        #[arg(help = "Installation destination prefix.")]
+        prefix: PathBuf,
+        #[arg(long)]
+        #[arg(help = "Installed version directory to serve.")]
+        version_root: PathBuf,
+        #[arg(long)]
+        #[arg(help = "Link target current must still hold.")]
+        expect_current: PathBuf,
+    },
     /// Save, close and reopen every window with this installation's executables.
     #[command(hide = true)]
     RestartWindows {
@@ -3021,7 +3034,9 @@ where
                 | DaemonCommand::StopForRebuild { .. }
                 | DaemonCommand::DowngradeStore { .. },
         } => Some(crate::daemon::hosting::LIFECYCLE_REFUSAL.into()),
-        TopCommand::CoordinateInstall { .. } | TopCommand::RestartWindows { .. } => {
+        TopCommand::CoordinateInstall { .. }
+        | TopCommand::SelectInstall { .. }
+        | TopCommand::RestartWindows { .. } => {
             Some("Installation and window restart commands require your own terminal".into())
         }
         TopCommand::Account {
@@ -3065,6 +3080,7 @@ where
                     | DaemonCommand::StoreSchema
                     | DaemonCommand::DowngradeStore { .. },
             } | TopCommand::CoordinateInstall { .. }
+                | TopCommand::SelectInstall { .. }
                 | TopCommand::RestartWindows { .. }
         )
     {
@@ -3335,6 +3351,7 @@ fn routes_to_staged_owner(command: &TopCommand) -> bool {
             | TopCommand::CoordinateInstall { .. }
             | TopCommand::VerifyInstallGuard { .. }
             | TopCommand::RecordDeferredInstall { .. }
+            | TopCommand::SelectInstall { .. }
             | TopCommand::UpdateWorker { .. }
             | TopCommand::RestartWindows { .. }
             | TopCommand::Daemon {
@@ -3421,10 +3438,13 @@ fn execute_with_model_context(
         } => {
             crate::install_guard::run(&prefix, &installer, &arguments, stage_only)
                 .map_err(|error| AppError::new("install", error))?;
+            let selected = stage_only && arguments.iter().any(|argument| argument == "--select");
             Ok(CommandOutput {
                 command: "update.coordinate_install",
-                data: json!({"reopened": !stage_only, "staged": stage_only}),
-                human: if stage_only {
+                data: json!({"reopened": !stage_only, "staged": stage_only, "selected": selected}),
+                human: if selected {
+                    "Installed version selected; running windows and daemon preserved"
+                } else if stage_only {
                     "Update staged; running windows and daemon preserved"
                 } else {
                     "Installer finished; saved windows reopened"
@@ -3461,6 +3481,19 @@ fn execute_with_model_context(
                 command: "update.record_deferred_install",
                 data: json!({"deferred":true}),
                 human: "Daemon replacement deferred".into(),
+            })
+        }
+        TopCommand::SelectInstall {
+            prefix,
+            version_root,
+            expect_current,
+        } => {
+            crate::install_guard::select_staged(&prefix, &version_root, &expect_current)
+                .map_err(|error| AppError::new("install", error))?;
+            Ok(CommandOutput {
+                command: "update.select_install",
+                data: json!({"selected": true}),
+                human: "Installed version selected".into(),
             })
         }
         TopCommand::Ui {
