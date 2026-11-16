@@ -467,63 +467,79 @@ fn channel_open_timing() {
 }
 
 /// What the save a channel click defers costs the UI thread when it comes
-/// due, as `channel_open_timing` clicks: the whole save untraced, then each
-/// phase of a second pass from the workspace pipeline's own timing.
+/// due, clicking channels in `channel_open_timing`'s order. The whole
+/// `NavigationSaveDue` update is timed untraced: the save, then the full
+/// projection that follows it. A second pass traces only those updates and
+/// reports the workspace pipeline's own timing of each phase of the save.
 #[test]
 #[ignore = "timing workload; run optimized with --ignored --nocapture"]
 fn navigation_save_timing() {
     let (mut app, channels, directory) = large_workspace(&Scale::LARGE);
     let targets = &channels[..Scale::LARGE.chats];
-    let save = |app: &mut Cagents, round: usize, index: usize| {
+    let click = |app: &mut Cagents, round: usize, index: usize| {
         let channel_id = targets[(index * 7 + round) % targets.len()];
         drop(app.update(Message::Sidebar(SidebarAction::OpenChannel { channel_id })));
         assert!(app.navigation_save.is_some(), "the click defers its save");
+    };
+    let save_due = |app: &mut Cagents| {
         let started = Instant::now();
         drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
+        let elapsed = started.elapsed();
         assert!(app.navigation_save.is_none(), "the save ran");
-        started.elapsed()
+        elapsed
     };
     for index in 0..5 {
-        save(&mut app, 0, index);
+        click(&mut app, 0, index);
+        save_due(&mut app);
     }
-    let mut saves = Vec::new();
+    let mut updates = Vec::new();
     for round in 0..2 {
         for index in 0..targets.len() {
-            saves.push(save(&mut app, round, index));
+            click(&mut app, round, index);
+            updates.push(save_due(&mut app));
         }
     }
-    summary("navigation save", &mut saves);
+    summary("update(NavigationSaveDue)", &mut updates);
 
     let log_path = directory.path().join("save-phases.log");
     let log = std::fs::File::create(&log_path).unwrap();
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .without_time()
-        .with_env_filter(tracing_subscriber::EnvFilter::new(
-            "cagents::workspace_pipeline=debug",
-        ))
-        .with_writer(move || log.try_clone().unwrap())
-        .finish();
-    crate::test_tracing::with_thread_subscriber(subscriber, || {
-        for index in 0..targets.len() {
-            save(&mut app, 2, index);
-        }
-    });
+    let traced = || {
+        let log = log.try_clone().unwrap();
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(
+                "cagents::workspace_pipeline=debug",
+            ))
+            .with_writer(move || log.try_clone().unwrap())
+            .finish()
+    };
+    for index in 0..targets.len() {
+        click(&mut app, 2, index);
+        crate::test_tracing::with_thread_subscriber(traced(), || save_due(&mut app));
+    }
     let logged = std::fs::read_to_string(log_path).unwrap();
-    let field = |line: &str, name: &str| {
+    let field = |line: &str, prefix: &str| {
         line.split_whitespace()
-            .find_map(|token| token.strip_prefix(&format!("{name}=")))
+            .find_map(|token| token.strip_prefix(prefix))
             .map(|value| value.trim_matches('"').to_owned())
     };
+    // Phases report microseconds since the previous mark; the snapshot
+    // capture after them reports its own nanoseconds.
     let mut phases = BTreeMap::<String, Vec<Duration>>::new();
     for line in logged.lines() {
-        if let (Some(stage), Some(micros)) = (field(line, "stage"), field(line, "phase_us"))
-            && let Ok(micros) = micros.parse()
-        {
-            phases
-                .entry(stage)
-                .or_default()
-                .push(Duration::from_micros(micros));
+        let Some(stage) = field(line, "stage=") else {
+            continue;
+        };
+        let duration = if let Some(micros) = field(line, "phase_us=") {
+            micros.parse().ok().map(Duration::from_micros)
+        } else {
+            field(line, "elapsed_ns=")
+                .and_then(|nanos| nanos.parse().ok())
+                .map(Duration::from_nanos)
+        };
+        if let Some(duration) = duration {
+            phases.entry(stage).or_default().push(duration);
         }
     }
     for (stage, durations) in &mut phases {
