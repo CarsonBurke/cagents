@@ -2361,6 +2361,7 @@ impl Cagents {
                 let mut conversations = BTreeMap::<_, sidebar::AttentionSummary>::new();
                 let mut chats = 0;
                 let mut has_panes = false;
+                let mut members = sidebar::ChannelMembers::default();
                 let mut notification_preview: Option<&super::notification_ui::Preview> = None;
                 for id in &channel.cards {
                     // A visiting utility pane is not what the channel holds.
@@ -2388,6 +2389,25 @@ impl Cagents {
                         chats += 1;
                     }
                     let attention = state.card_attention(*id);
+                    // A live agent shows as its provider; an open shell with no
+                    // agent as a terminal. A chat whose provider has not
+                    // started, or has ended, has no one to show.
+                    match (state.card_activity(*id), &card.kind) {
+                        (Some(activity), _) => members.add_agent(
+                            activity.provider,
+                            sidebar::ChannelMemberState::of(activity.state, attention.limited != 0),
+                        ),
+                        (None, CardKind::Terminal(session)) if !super::terminal_ended(session) => {
+                            match crate::agent::Provider::recognize_launch(&session.launch) {
+                                // An agent launched in the terminal that has
+                                // yet to report what it is doing.
+                                Some(provider) => members
+                                    .add_agent(provider, sidebar::ChannelMemberState::Running),
+                                None => members.add_terminal(),
+                            }
+                        }
+                        (None, _) => {}
+                    }
                     if attention != sidebar::AttentionSummary::default() {
                         let resource = match &card.kind {
                             CardKind::Chat(session) => (0, session.id.as_uuid()),
@@ -2415,6 +2435,7 @@ impl Cagents {
                         && row.attention == attention
                         && row.chats == chats
                         && row.has_panes == has_panes
+                        && row.members == members
                         && row.ordinal == channel.ordinal
                         && row.deletion == deletion
                         && row.notification_preview.as_ref() == notification_preview
@@ -2430,6 +2451,7 @@ impl Cagents {
                         has_panes,
                         channel.ordinal,
                     )
+                    .with_members(members)
                     .with_attention(attention);
                     row.deletion = deletion;
                     row = row.with_notification_preview(notification_preview.cloned());
@@ -3231,6 +3253,90 @@ mod tests {
             super::super::project_ui::removed_existence("closed");
         app.refresh_sidebar_channels();
         assert!(!app.sidebar_model.projects[0].channels[0].has_panes);
+    }
+
+    /// The row's cluster shows who is at work in the channel: each live
+    /// agent as its provider, working first, then each open shell. A chat
+    /// whose provider has not started shows nothing, and an ended shell drops
+    /// out, as does an agent whose activity ends.
+    #[test]
+    fn a_channel_row_shows_its_live_agents_then_its_shells() {
+        use crate::agent::{Activity, ActivityState, Provider};
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let project = ProjectId::new();
+        let durable = Arc::make_mut(&mut app.durable);
+        let shell = durable.cards[0].id;
+        let [idle, working, unstarted] = [CardId::new(), CardId::new(), CardId::new()];
+        for id in [idle, working, unstarted] {
+            let mut chat = durable.cards[0].clone();
+            chat.kind = crate::model::CardKind::Chat(chat_session());
+            chat.id = id;
+            durable.cards.push(chat);
+        }
+        durable.channels.push(ProjectChannel {
+            title_source: Default::default(),
+            id: ChannelId::new(),
+            project_id: project,
+            title: "Investigation".into(),
+            ordinal: 0,
+            shared: false,
+            cards: vec![shell, idle, working, unstarted],
+            focused: Some(idle),
+        });
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "project".into(),
+            "/repo".into(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        app.sidebar_state.set_card_activity(
+            idle,
+            Activity {
+                provider: Provider::Codex,
+                state: ActivityState::Idle,
+            },
+        );
+        app.sidebar_state.set_card_activity(
+            working,
+            Activity {
+                provider: Provider::Claude,
+                state: ActivityState::Working,
+            },
+        );
+
+        app.refresh_sidebar_channels();
+        let row = &app.sidebar_model.projects[0].channels[0];
+        assert_eq!(
+            row.members.description(),
+            "Claude Code, working; Codex, idle; Terminal"
+        );
+        assert!(
+            row.tooltip_for_test()
+                .contains("Claude Code, working; Codex, idle; Terminal")
+        );
+        assert!(
+            row.accessible_name_for_test()
+                .contains("Claude Code, working; Codex, idle; Terminal")
+        );
+
+        let durable = Arc::make_mut(&mut app.durable);
+        let crate::model::CardKind::Terminal(session) = &mut durable.cards[0].kind else {
+            panic!("the fixture's first card is a shell");
+        };
+        session.continuity = crate::model::TerminalContinuity::Exited {
+            last_exit: super::super::terminal_exit(0, None),
+        };
+        app.sidebar_state.clear_agent_activity(working);
+        app.refresh_sidebar_channels();
+        let row = &app.sidebar_model.projects[0].channels[0];
+        assert_eq!(row.members.description(), "Codex, idle");
+
+        app.sidebar_state.clear_agent_activity(idle);
+        app.refresh_sidebar_channels();
+        let row = &app.sidebar_model.projects[0].channels[0];
+        assert!(row.members.is_empty(), "the channel keeps its glyph");
     }
 
     #[test]

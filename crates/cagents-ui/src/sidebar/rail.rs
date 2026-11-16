@@ -45,8 +45,10 @@ const RING: f32 = 2.0;
 const DOT: f32 = 10.0;
 /// A status glyph's backing disc, ring included: the warning triangle, the
 /// error mark and the spinner.
-const DISC: f32 = 14.0;
+pub(super) const DISC: f32 = 14.0;
 const STATUS_GLYPH: u16 = 12;
+/// How strongly a selected cell's tile leans toward the ink.
+pub(super) const SELECTED_ALPHA: f32 = 0.12;
 const SPINNER: f32 = 10.0;
 
 const _: () = assert!(PILL_HEIGHT <= DISC && DOT <= DISC);
@@ -395,7 +397,7 @@ fn tile_style<const SELECTED: bool>() -> theme::Button {
         disabled: bool,
     ) -> button::Style {
         let ink: Color = theme.current_container().on.into();
-        let wash = if selected { 0.12 } else { 0.0 } + lift;
+        let wash = if selected { SELECTED_ALPHA } else { 0.0 } + lift;
         button::Style {
             background: (wash > 0.0).then(|| Background::Color(ink.scale_alpha(wash))),
             border_radius: theme.cosmic().corner_radii.radius_s.into(),
