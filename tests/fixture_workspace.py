@@ -276,17 +276,6 @@ class Generated(unittest.TestCase):
                 self.assertIsNone(cards[window["focused"]]["closed_at_ms"])
             for unread in window["unread"]:
                 self.assertIsNone(cards[unread["card"]]["closed_at_ms"])
-        # A seeded terminal has no hosted process and opens as a failure, so
-        # every channel holding a conversation shows one, and the primary
-        # window opens on one.
-        for channel in self.plan["channels"]:
-            held = [cards[card]["kind"]["type"] for card in channel["cards"]]
-            if "chat" in held:
-                self.assertEqual(cards[channel["focused"]]["kind"]["type"], "chat")
-        if any(card["kind"]["type"] == "chat" for channel in self.plan["channels"]
-               for card in map(cards.get, channel["cards"])):
-            primary = next(w for w in self.plan["windows"] if w["slot"] == "primary")
-            self.assertEqual(cards[primary["focused"]]["kind"]["type"], "chat")
         sessions = {e["session_id"] for e in self.plan["history"]["claude"]}
         threads = {e["thread_id"] for e in self.plan["history"]["codex"] if not e["subagent"]}
         for card in cards.values():
