@@ -20,6 +20,73 @@ pub struct Found {
 mod tests {
     use super::*;
 
+    /// At the minimum 900x600 window with 150% interface scale, a long site
+    /// list or error report scrolls, and the actions that finish, retry or
+    /// cancel the import stay whole and inside the window.
+    #[test]
+    fn import_actions_stay_in_reach_at_the_scaled_minimum_window() {
+        fn reachable(app: &Cagents, ids: &[&'static str]) {
+            for id in ids {
+                let geometry = |window| {
+                    super::super::dialog_ui::tests::action_geometry(
+                        app.browser_import_dialog().unwrap(),
+                        window,
+                        &widget::Id::new(*id),
+                    )
+                };
+                let (_, _, _, natural) = geometry(cosmic::iced::Size::new(1200.0, 900.0));
+                let (window, viewport, content, control) =
+                    geometry(cosmic::iced::Size::new(600.0, 400.0));
+                assert!(
+                    control.height == natural.height
+                        && control.y >= 0.0
+                        && control.y + control.height <= window.height,
+                    "{id} must stay whole and inside the window: {control:?}, not {natural:?}"
+                );
+                assert!(viewport.y + viewport.height <= control.y);
+                assert!(content > viewport.height, "the body scrolls instead");
+            }
+        }
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        drop(app.update_browser_import(Action::Open));
+        drop(app.update_browser_import(Action::Consent));
+        let generation = app.browser_import.generation;
+        let sites: Vec<_> = (0..85)
+            .map(|index| Site {
+                host: format!("site-{index:03}.example.invalid"),
+                cookies: index + 1,
+            })
+            .collect();
+        let found = vec![Found {
+            profile: Profile {
+                browser: cagents_browser_import::Browser::Firefox,
+                name: "Fixture profile".into(),
+                database: PathBuf::from("/fixture/cookies.sqlite"),
+            },
+            selected: sites.iter().map(|site| site.host.clone()).collect(),
+            sites,
+            error: None,
+        }];
+        drop(app.update_browser_import(Action::Scanned(generation, Ok(found))));
+        assert!(matches!(app.browser_import.phase, Phase::Selection));
+        reachable(
+            &app,
+            &[
+                "dialog.browser-import.cancel",
+                "dialog.browser-import.scan",
+                "dialog.browser-import.import",
+            ],
+        );
+        app.browser_import.errors = (0..30)
+            .map(|index| format!("Profile {index} could not be read: the database is locked."))
+            .collect();
+        app.browser_import.phase = Phase::Finished("Imported 12 cookies for 3 sites.".into());
+        reachable(
+            &app,
+            &["dialog.browser-import.cancel", "dialog.browser-import.scan"],
+        );
+    }
+
     #[test]
     fn escape_cancels_the_import_surface_or_its_stop_confirmation() {
         let mut app = super::super::tests::context_inspector_test_app(false);
@@ -568,40 +635,40 @@ impl Cagents {
         let mut content: Vec<Element<'_, Message>> =
             vec![crate::design::title("Import browser logins").into()];
         let button = |label: &'static str, action| {
-            let cancel = matches!(action, Action::Cancel | Action::KeepWorking);
+            let id = match action {
+                Action::Cancel | Action::KeepWorking => Some("dialog.browser-import.cancel"),
+                Action::Consent => Some("dialog.browser-import.scan"),
+                Action::Import => Some("dialog.browser-import.import"),
+                _ => None,
+            };
             let button = if matches!(action, Action::ConfirmCancel) {
                 crate::ui_controls::button::destructive(label)
             } else {
                 crate::ui_controls::button::secondary(label)
             };
             let button = button.on_press(message(action));
-            if cancel {
-                button
-                    .id(widget::Id::new("dialog.browser-import.cancel"))
-                    .into()
-            } else {
-                button.into()
+            match id {
+                Some(id) => button.id(widget::Id::new(id)).into(),
+                None => button.into(),
             }
         };
-        if state.confirm_cancel {
+        let actions: Element<'_, Message> = if state.confirm_cancel {
             content.push(notice_body("Stop this import? A scan may be waiting for the desktop keyring. Cookies already written into the in-app browser remain there."));
-            content.push(super::dialog_ui::confirmation_actions(
+            super::dialog_ui::confirmation_actions(
                 button("Keep going", Action::KeepWorking),
                 button("Stop import", Action::ConfirmCancel),
-            ));
+            )
         } else {
             match &state.phase {
                 Phase::Intro => {
                     content.push(notice_body("Read cookie databases from Chrome, Chromium, Brave, Firefox, and Zen profiles on this machine? You choose the sites before importing. Encrypted Chrome-family cookies may ask to unlock your desktop keyring."));
                     content.push(notice_body("Cookie values stay in this app's browser and are never sent to its terminal service. Source profiles are read-only. Imported logins apply to all in-app tabs for this app session; some sites may still require signing in."));
-                    content.push(
-                        widget::row::with_children(vec![
-                            button("Skip", Action::Cancel),
-                            button("Scan local profiles", Action::Consent),
-                        ])
-                        .spacing(space::S)
-                        .into(),
-                    );
+                    widget::row::with_children(vec![
+                        button("Skip", Action::Cancel),
+                        button("Scan local profiles", Action::Consent),
+                    ])
+                    .spacing(space::S)
+                    .into()
                 }
                 Phase::Scanning | Phase::Extracting | Phase::Importing => {
                     content.push(notice_body(if state.cancel.load(Ordering::Relaxed) {
@@ -615,7 +682,7 @@ impl Cagents {
                             _ => "Importing selected sites into the in-app browser…",
                         }
                     }));
-                    content.push(button("Cancel", Action::Cancel));
+                    button("Cancel", Action::Cancel)
                 }
                 Phase::Selection => {
                     if state.found.is_empty() {
@@ -704,49 +771,38 @@ impl Cagents {
                         .spacing(space::S)
                         .into(),
                     );
-                    content.push(crate::interaction::overflow_fade_y(
-                        widget::scrollable(
-                            widget::column::with_children(rows)
-                                .spacing(space::S)
-                                .padding(design::with_vertical_rail(iced::Padding::ZERO)),
-                        )
-                        .direction(iced::widget::scrollable::Direction::Vertical(
-                            design::scrollbar(),
-                        ))
-                        .height(Length::Fixed(360.0)),
-                        design::dialog_base,
-                    ));
-                    content.push(
-                        widget::row::with_children(vec![
-                            button("Cancel", Action::Cancel),
-                            button("Scan again", Action::Consent),
-                            button("Import selected", Action::Import),
-                        ])
-                        .spacing(space::S)
-                        .into(),
-                    );
+                    content.push(widget::column::with_children(rows).spacing(space::S).into());
+                    widget::row::with_children(vec![
+                        button("Cancel", Action::Cancel),
+                        button("Scan again", Action::Consent),
+                        button("Import selected", Action::Import),
+                    ])
+                    .spacing(space::S)
+                    .into()
                 }
                 Phase::Finished(detail) => {
                     content.push(notice_body(detail.clone()));
                     for error in &state.errors {
                         content.push(crate::design::body(error.clone()).into());
                     }
-                    content.push(
-                        widget::row::with_children(vec![
-                            button("Done", Action::Cancel),
-                            button("Retry", Action::Consent),
-                        ])
-                        .spacing(space::S)
-                        .into(),
-                    );
+                    widget::row::with_children(vec![
+                        button("Done", Action::Cancel),
+                        button("Retry", Action::Consent),
+                    ])
+                    .spacing(space::S)
+                    .into()
                 }
-                Phase::Closed => {}
+                Phase::Closed => return None,
             }
-        }
+        };
+        // Long site lists and error reports scroll; the actions that finish,
+        // retry or cancel the import stay in reach at any size and scale.
         Some(dialog_ui::overlay(
-            dialog_ui::surface(
+            dialog_ui::scrolling_surface_with_actions(
                 widget::column::with_children(content).spacing(space::L),
+                actions,
                 620.0,
+                760.0,
             ),
             Some(message(Action::Cancel)),
             1.0,
