@@ -814,8 +814,13 @@ impl Cagents {
                                     (state.page > 0).then(|| message(Action::Page(state.page - 1))),
                                 )
                                 .into(),
-                            crate::design::body(format!("Page {} of {}", state.page + 1, pages))
-                                .into(),
+                            // Next keeps its place as the page number
+                            // gains a digit.
+                            crate::ui_controls::reserved(
+                                crate::design::body(format!("Page {} of {pages}", state.page + 1)),
+                                [crate::design::body(format!("Page {pages} of {pages}")).into()],
+                                iced::alignment::Horizontal::Center,
+                            ),
                             crate::ui_controls::button::secondary("Next")
                                 .on_press_maybe(
                                     (state.page + 1 < pages)
