@@ -509,11 +509,9 @@ mod tests {
     /// The view's height; its fades take 24 px at each edge.
     const VIEW: f32 = 150.0;
 
-    /// What stands in a row of the page.
+    /// What stands in a row of the page other than a 30 px button.
     #[derive(Clone, Copy)]
     enum Row {
-        /// A 30 px button.
-        Button,
         /// A 30 px scrollable around buttons 100 to 109.
         Nested,
         /// A button under a 20 px caption and over a 20 px note, in a
@@ -595,7 +593,7 @@ mod tests {
                         .find(|(at, _)| *at == index)
                         .map(|(_, row)| *row)
                     {
-                        None | Some(Row::Button) => button(index),
+                        None => button(index),
                         Some(Row::Nested) => widget::scrollable(widget::column::with_children(
                             (100..110).map(button).collect::<Vec<_>>(),
                         ))

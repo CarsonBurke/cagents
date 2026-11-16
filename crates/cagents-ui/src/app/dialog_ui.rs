@@ -464,7 +464,7 @@ pub(super) mod tests {
             &renderer,
             &mut operation::focusable::focus::<()>(ids[0].clone()),
         );
-        let mut press = |element: &mut Element<'_, Message>, tree: &mut Tree, event| {
+        let press = |element: &mut Element<'_, Message>, tree: &mut Tree, event| {
             let mut messages = Vec::new();
             element.as_widget_mut().update(
                 tree,
@@ -514,7 +514,7 @@ pub(super) mod tests {
                 }
             }
         }
-        let mut seen = |element: &mut Element<'_, Message>, tree: &mut Tree| {
+        let seen = |element: &mut Element<'_, Message>, tree: &mut Tree| {
             let mut seen = Seen::default();
             element
                 .as_widget_mut()
