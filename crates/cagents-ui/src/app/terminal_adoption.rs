@@ -474,7 +474,7 @@ mod tests {
     }
 
     fn register_worktrees(app: &mut Cagents, paths: &[&str]) {
-        app.sidebar_model.projects = vec![SidebarProject::new(
+        *app.sidebar_model.projects = vec![SidebarProject::new(
             ProjectId::new(),
             RepositoryId::new(),
             "repo".into(),

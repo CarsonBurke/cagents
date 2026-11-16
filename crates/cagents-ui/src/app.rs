@@ -20881,7 +20881,7 @@ mod tests {
             },
         );
         let selected = PathBuf::from("/repo/selected");
-        app.sidebar_model.projects = vec![SidebarProject::new(
+        *app.sidebar_model.projects = vec![SidebarProject::new(
             project_id,
             crate::repository::RepositoryId::new(),
             "repo".into(),
@@ -27199,7 +27199,7 @@ mod tests {
 
     fn workspace_switcher_test_app(count: usize) -> Cagents {
         let mut app = context_inspector_test_app(false);
-        app.sidebar_model.projects = (0..count)
+        *app.sidebar_model.projects = (0..count)
             .map(|index| {
                 SidebarProject::new(
                     ProjectId::new(),
@@ -27685,7 +27685,7 @@ mod tests {
         let broken = ProjectId::new();
         let healthy = ProjectId::new();
         let healthy_path = PathBuf::from("/repositories/healthy");
-        app.sidebar_model.projects = vec![
+        *app.sidebar_model.projects = vec![
             restored_sidebar_project(broken, "broken", Path::new("/repositories/broken")),
             restored_sidebar_project(healthy, "healthy", &healthy_path),
         ];
@@ -32775,7 +32775,7 @@ mod tests {
         let git = ProjectId::new();
         let worktree = crate::model::WorktreeId::new();
         let channel = crate::model::ChannelId::new();
-        app.sidebar_model.projects = vec![
+        *app.sidebar_model.projects = vec![
             SidebarProject::new(
                 folder,
                 RepositoryId::new(),
@@ -32994,7 +32994,7 @@ mod tests {
         let expected_project = app.sidebar_model.projects[0].clone();
         for loaded in [aliased, linked_load] {
             drop(app.update(complete(loaded, 1)));
-            assert_eq!(app.sidebar_model.projects, vec![expected_project.clone()]);
+            assert_eq!(*app.sidebar_model.projects, vec![expected_project.clone()]);
             assert_eq!(
                 app.durable
                     .cards
@@ -33013,7 +33013,7 @@ mod tests {
         drop(app.update(Message::RepositorySelected(Ok(root))));
         assert_eq!(app.repository_generations[&first_id], 2);
         drop(app.update(complete(first, 1)));
-        assert_eq!(app.sidebar_model.projects, vec![expected_project]);
+        assert_eq!(*app.sidebar_model.projects, vec![expected_project]);
         assert_eq!(app.active_workspace.as_ref(), Some(&canonical_linked));
     }
 
