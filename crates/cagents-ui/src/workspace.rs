@@ -1457,11 +1457,19 @@ impl Workspace {
                 .selection
                 .filter(|point| Some(point.card.id) == self.focused)
                 .and_then(|point| {
-                    // The selection stays wholly in view if it grew past the
-                    // viewport's edge.
                     let offset = point.resolve(&self.geometry)?;
-                    self.geometry
-                        .focus_offset(point.card.id, self.viewport_width, offset)
+                    let resized = self
+                        .geometry
+                        .card(point.card.id)
+                        .is_some_and(|card| card.width() != point.card.width());
+                    // A selection that grew past the viewport's edge is
+                    // revealed whole; an unrelated edit moves nothing.
+                    if resized {
+                        self.geometry
+                            .focus_offset(point.card.id, self.viewport_width, offset)
+                    } else {
+                        Some(offset)
+                    }
                 });
             let position = selection.or_else(|| {
                 anchor
@@ -2239,6 +2247,7 @@ mod tests {
         while workspace.camera().is_animating() {
             workspace.tick(Duration::from_millis(16));
         }
+        workspace.take_widget_focus_request();
         let before = workspace.geometry().card(selected).unwrap();
         let on_screen = before.start - workspace.camera().offset();
         let anchor = workspace.capture_viewport_anchor();
@@ -2248,6 +2257,32 @@ mod tests {
         workspace.restore_viewport_anchor(anchor);
         let after = workspace.geometry().card(selected).unwrap();
         assert_eq!(after.start - workspace.camera().offset(), on_screen);
+        assert_eq!(workspace.pending_widget_focus, None);
+    }
+
+    #[test]
+    fn an_unrelated_insertion_leaves_a_partly_visible_selection_where_it_is() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fixed(500.0); 3], 1100.0);
+        let selected = workspace.order().nth(2).unwrap();
+        workspace.focus(selected).unwrap();
+        while workspace.camera().is_animating() {
+            workspace.tick(Duration::from_millis(16));
+        }
+        workspace.native_scroll(0.0, 1100.0);
+        workspace.take_widget_focus_request();
+        let pane = workspace.geometry().card(selected).unwrap();
+        assert!(pane.start < 1100.0 && pane.end > 1100.0);
+        let anchor = workspace.capture_viewport_anchor();
+        // A peer appends a pane past the selection. Nothing near the reader
+        // changed, so the camera does not reveal the rest of the selection.
+        workspace
+            .add_card(card(CardWidth::Fixed(500.0)), 3, false)
+            .unwrap();
+
+        workspace.restore_viewport_anchor(anchor);
+        assert_eq!(workspace.camera().offset(), 0.0);
+        assert_eq!(workspace.focused(), Some(selected));
+        assert_eq!(workspace.pending_widget_focus, None);
     }
 
     #[test]
