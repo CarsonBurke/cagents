@@ -397,6 +397,22 @@ print(json.dumps(dict(reason='compiler-artifact',target=dict(name='cagents',kind
             {"__typename": "StatusContext", "context": "deploy", "state": "SUCCESS"}])
         self.assertEqual(report["limitations"], [])
         self.assertIn("startedAt", saved["snapshot"]["checks"][0], "the cache itself is left as it was")
+        self.assertEqual(report["data"]["limitations"], [])
+
+    def test_a_cached_cli_rest_read_reports_ci_but_not_the_review_decision(self):
+        key = status.target("o/r", "github.com", 7)
+        checks = [{"__typename": "CheckRun", "name": "test", "status": "COMPLETED", "conclusion": "SUCCESS"}]
+        saved = {"fetched_at": int(time.time()), "error": None, "next_attempt": 0,
+                 "snapshot": {"pull_request": {"headRefOid": "a" * 40, "reviewDecision": None},
+                              "checks_state": "SUCCESS", "checks": checks, "checks_complete": True,
+                              "primary_cost": None, "transport": "rest"}}
+        with patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.assertEqual(status.output(saved, key, True), 0)
+        report = json.loads(out.getvalue())
+        # Top-level limitations tell land-pr CI is unknown; this CI is known.
+        self.assertEqual(report["limitations"], [])
+        self.assertEqual(report["data"]["source"], "cache")
+        self.assertIn("review decision is unknown", report["data"]["limitations"][0])
 
     def test_the_fallback_and_land_pr_agree_on_which_checks_passed(self):
         land_loader = importlib.machinery.SourceFileLoader("land_pr", str(ROOT / "scripts/land-pr"))

@@ -105,13 +105,18 @@ fn human(report: &pr_status::Report) -> String {
         } else {
             format!(", {} passed", passed.len())
         },
-        if snapshot.checks_complete || snapshot.is_rest_bootstrap() {
-            ""
-        } else {
-            " (first 100 contexts; aggregate includes all)"
+        match (snapshot.checks_complete, snapshot.transport) {
+            _ if snapshot.is_rest_bootstrap() => "",
+            (true, _) => "",
+            (false, pr_status::Transport::Graphql) => {
+                " (first 100 contexts; aggregate includes all)"
+            }
+            (false, pr_status::Transport::Rest) => " (first 100 contexts; the rest unread)",
         },
         if snapshot.is_rest_bootstrap() {
             "unknown"
+        } else if snapshot.transport == pr_status::Transport::Rest {
+            "unknown (REST read while GraphQL is rate limited)"
         } else {
             pr.review_decision.as_deref().unwrap_or("none reported")
         },
@@ -216,10 +221,12 @@ mod tests {
                 checks,
                 checks_complete: true,
                 primary_cost: Some(1),
+                transport: pr_status::Transport::Graphql,
             }),
             error: None,
             retry_at: None,
             outcome: "succeeded",
+            limitations: Vec::new(),
         };
         assert_eq!(
             human(&report),

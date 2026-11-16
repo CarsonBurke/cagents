@@ -80,9 +80,10 @@ checks = answer.get("checks", [{"__typename": "CheckRun", "name": "contracts",
                                 "status": "COMPLETED", "conclusion": "SUCCESS"}])
 print(json.dumps({"ok": True, "data": {
     "snapshot": {"pull_request": pr, "checks_state": answer.get("ci", "SUCCESS"), "checks": checks,
-                 "checks_complete": answer.get("complete", True)},
+                 "checks_complete": answer.get("complete", True),
+                 "transport": answer.get("transport", "graphql")},
     "fetched_at": int(time.time()) + answer.get("age", 0), "retry_at": answer.get("retry_at"),
-    "error": None},
+    "error": None, "limitations": answer.get("data_limitations", [])},
     "limitations": answer.get("limitations", [])}))
 '''
 
@@ -442,6 +443,16 @@ class LandTests(unittest.TestCase):
     def test_aggregate_success_lands_past_the_hundred_listed_checks(self):
         self.status({"complete": False})
         self.assertEqual(self.run_land(), 0, self.output)
+
+    def test_ci_read_through_rest_while_graphql_is_limited_lands_on_green(self):
+        # The CLI's REST read knows CI but not the review decision, which
+        # land-pr does not use; only its aggregate decides.
+        rest = {"transport": "rest", "data_limitations": [
+            "Read through REST while GitHub GraphQL is rate limited; the review decision is unknown."]}
+        self.status({**rest, "ci": "PENDING", "complete": False}, {**rest, "ci": "SUCCESS"})
+        self.assertEqual(self.run_land(), 0, self.output)
+        self.assertEqual(len(self.sleeps), 1)
+        self.assertIn("landed #7", self.output)
 
     def test_an_empty_squash_message_is_refused(self):
         with self.assertRaises(land.Stop) as refused:
