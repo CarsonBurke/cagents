@@ -57,6 +57,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
             | crate::work::Request::Snapshots { .. },
         )
         | R::WatchWork
+        // Admitted only so its handler can explain that it was removed.
         | R::RetiredChannelWork => Access::Open,
         R::Input { terminal_id, .. }
         | R::Paste { terminal_id, .. }

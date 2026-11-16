@@ -31,6 +31,8 @@ mod device_request_tests;
 #[cfg(all(test, target_os = "linux"))]
 mod explicit_authority_server_tests;
 #[cfg(test)]
+mod retired_channel_work_tests;
+#[cfg(test)]
 mod workspace_progress_tests;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);

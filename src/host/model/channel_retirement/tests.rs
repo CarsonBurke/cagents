@@ -1,4 +1,6 @@
-//! Exercise retirement through the registry's canonical edit path.
+//! Exercise retirement through the registry's canonical edit path. The view
+//! revision and refusal messages are covered beside the view tests in
+//! `views.rs`; these cover a reused identity and the agents a channel holds.
 use super::super::*;
 use crate::workspace_model::ChannelIncarnation;
 
@@ -31,27 +33,6 @@ fn fixture() -> (Registry, tempfile::TempDir, ChannelIncarnation, PathBuf) {
         creation_ordinal: model.channel(id).unwrap().ordinal,
     };
     (registry, directory, home, repository)
-}
-
-#[test]
-fn retirement_accepts_only_the_captured_empty_view() {
-    let (mut registry, _directory, home, _repository) = fixture();
-    let stale = registry
-        .apply(&ModelEdit::RetireEmptyChannel {
-            home,
-            expected_view_revision: 5,
-        })
-        .unwrap();
-    assert!(!stale.changed);
-    assert!(stale.model.channel(home.channel).is_some());
-    let applied = registry
-        .apply(&ModelEdit::RetireEmptyChannel {
-            home,
-            expected_view_revision: 0,
-        })
-        .unwrap();
-    assert!(applied.changed);
-    assert!(applied.model.channel(home.channel).is_none());
 }
 
 #[test]

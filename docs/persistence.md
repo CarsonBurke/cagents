@@ -377,7 +377,7 @@ complete affected ownership closure, including aliases and managed panes
 outside that repository, and keep structural preparation, ownership evidence,
 admission, notification attribution and immediate snapshots. Inconsistent
 local placement and uncertain derived worktree membership keep full
-reconciliation. Channel-work invalidations project nothing.
+reconciliation.
 
 After a settled presentation change, the window delays capturing its saved
 snapshot until the autosave debounce expires: 250 ms after the latest change,
@@ -523,7 +523,10 @@ stores, so an old copy can never feed a later upgrade or seed.
   there are no panes). The older daemon repairs channel homes on open. A
   further conversion to 23 or 22 keeps these placement rows, so the older view writer
   can edit existing panes. Retired declarations are not recovered by rollback;
-  other workspace and execution state survives both conversions.
+  other workspace and execution state survives both conversions. Like the
+  schema 18 migration, the converter validates every pane first and refuses
+  the whole rollback if one is invalid or both open and closed in its view,
+  where the schema 26 daemon would refuse only edits to that view.
 - The wire changes (scope revisions on edits, `ReadWorkspaceView`, draft
   edits) bump `PROTOCOL_VERSION`. Window and daemon versions are a matched set,
   so the in-app update performs a full daemon upgrade, with its existing

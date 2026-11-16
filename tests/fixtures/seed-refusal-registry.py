@@ -63,8 +63,17 @@ def main():
                 raise ValueError("the fixture channel must already contain a saved chat pane")
             db.execute(f"DROP TRIGGER IF EXISTS {TRIGGER}")
             # Deleting the selected view cascades to its panes and their
-            # projections, preserving the revision clock and all actor,
-            # history and window-retention records.
+            # projections, preserving the clocks and all actor, history and
+            # window-retention records. A schema 26 or older registry also
+            # keeps channel-work placement epochs without a foreign key; reset
+            # the selected panes' rows so they can register again.
+            if db.execute("SELECT 1 FROM sqlite_schema WHERE name='channel_work_placement_epochs'").fetchone():
+                db.execute(
+                    "DELETE FROM channel_work_placement_epochs WHERE pane IN ("
+                    "SELECT p.id FROM panes p JOIN view_scopes s ON p.scope=s.id "
+                    "WHERE s.channel=?)",
+                    (channel,),
+                )
             db.execute("DELETE FROM view_scopes WHERE channel=?", (channel,))
             # The UUID is parsed above; the reason is a fixed fixture sentence.
             db.execute(f"CREATE TRIGGER {TRIGGER} BEFORE INSERT ON view_scopes WHEN NEW.channel='{channel}' BEGIN SELECT RAISE(ABORT, '{SQLITE_TRIGGER_REASON}'); END")

@@ -1127,9 +1127,6 @@ pub(super) fn record_project_removal(
     repository: &Path,
     recorder: &mut Recorder,
 ) -> Result<(), String> {
-    if db.is_autocommit() {
-        return Err("Scope removal requires the canonical view transaction".into());
-    }
     for scope in store::project_scopes(db, repository_key(repository)?)? {
         record_scope_removal(db, &scope, recorder)?;
     }
@@ -1141,6 +1138,9 @@ fn record_scope_removal(
     scope: &Scope,
     recorder: &mut Recorder,
 ) -> Result<(), String> {
+    if db.is_autocommit() {
+        return Err("Scope removal requires the canonical view transaction".into());
+    }
     let Some(before) = store::read_stored(db, scope)? else {
         return Ok(());
     };

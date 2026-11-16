@@ -781,9 +781,9 @@ the fixture's paused terminal does not appear in that dialog.
 offline Claude conversation with an unsent launch-note draft. Its `refuse`
 step closes only the UI, keeps the daemon and provider alive, then uses
 [`seed-refusal-registry.py`](../tests/fixtures/seed-refusal-registry.py) to
-remove that channel's shared view and the projections of its panes. It keeps
-the revision clock, actor/history records, window retention pins and other
-scopes. The helper then adds a trigger that published-schema admission does
+remove that channel's shared view and, on a registry from before schema 27,
+its active channel-work placement mappings. It keeps the monotonic clocks,
+actor/history records, window retention pins and other scopes. The helper then adds a trigger that published-schema admission does
 not recognize. While armed, the real registry can refuse all writes, before
 the trigger's channel-conditional body runs. The native notice reports the
 registry's schema-mismatch reason, not the trigger body's SQLite sentence.
@@ -831,8 +831,8 @@ viewport and the inspector state, so observe it instead of reusing a guessed
 point. Stop immediately after capturing the states.
 
 The helper refuses a HOME or data directory outside the private evidence
-fixture. Its offline contracts cover selected-view cleanup, foreign-key
-cascades, unchanged unrelated rows and the revision clock, and refusal to modify
+fixture. Its offline contracts cover selected-view/placement cleanup, foreign-key
+cascades, unchanged unrelated rows and monotonic clocks, and refusal to modify
 an unrelated home or missing channel. A separate direct-SQL check exercises the
 conditional trigger body only; it does not test daemon schema admission. Real
 registry refusal and successful recovery must be checked in the native app:
