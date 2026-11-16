@@ -237,6 +237,35 @@ mod tests {
         );
         assert!(initial_terminal_attachment(&source, &[current.clone(), current], &proof).is_err());
     }
+
+    #[test]
+    fn an_initial_pane_its_daemon_no_longer_lists_says_what_retry_will_find() {
+        let card = crate::app::tests::terminal_card_state();
+        let CardKind::Terminal(mut source) = card.kind else {
+            unreachable!()
+        };
+        let proof = HostSessionProof {
+            host_session_id: "host".into(),
+            boot_id: "boot".into(),
+            host_incarnation: "replacement".into(),
+        };
+        let code = |source: &TerminalSession| {
+            let message = initial_terminal_or_missing(source, &[], &proof).unwrap_err();
+            terminal_failure::runtime_error_code(&message, "runtime_failed")
+        };
+        source.continuity = TerminalContinuity::Live {
+            host_session_id: "earlier".into(),
+            boot_id: "earlier-boot".into(),
+            host_incarnation: "earlier".into(),
+        };
+        assert_eq!(code(&source), "terminal_not_hosted");
+        source.continuity = TerminalContinuity::Live {
+            host_session_id: "earlier".into(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: "earlier".into(),
+        };
+        assert_eq!(code(&source), "terminal_daemon_restarted");
+    }
 }
 
 impl InitialPanes {

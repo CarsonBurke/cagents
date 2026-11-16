@@ -20244,10 +20244,7 @@ fn attach_initial_terminal(
         crate::control::ControlClient::connect(&socket).map_err(|error| error.to_string())?;
     let proof = client.proof().clone();
     let terminals = client.list().map_err(|error| error.to_string())?;
-    // The pane is kept either way; its message says what Retry will find.
-    let session = initial_terminal_attachment(&source, &terminals, &proof)?.ok_or_else(|| {
-        terminal_failure::missing_terminal_message(&source, &proof, &terminals).to_owned()
-    })?;
+    let session = initial_terminal_or_missing(&source, &terminals, &proof)?;
     saved_terminal::attach_existing(
         card,
         daemon_recovery::RecoveredTerminal {
@@ -20260,6 +20257,18 @@ fn attach_initial_terminal(
         proof,
         sender,
     )
+}
+
+/// The terminal an initial pane attaches to. When its daemon no longer lists
+/// it, the pane is kept and the error says what Retry will find.
+fn initial_terminal_or_missing(
+    source: &TerminalSession,
+    terminals: &[crate::terminal::ipc::TerminalDescriptor],
+    proof: &HostSessionProof,
+) -> Result<TerminalSession, String> {
+    initial_terminal_attachment(source, terminals, proof)?.ok_or_else(|| {
+        terminal_failure::missing_terminal_message(source, proof, terminals).to_owned()
+    })
 }
 
 fn initial_terminal_attachment(
