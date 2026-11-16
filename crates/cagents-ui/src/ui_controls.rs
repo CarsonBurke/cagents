@@ -30,7 +30,7 @@ mod tabs;
 mod trailing;
 pub use trailing::trailing;
 
-pub use display::{badge, change_counts, comment_card};
+pub use display::{badge, bounded_badge, change_counts, comment_card};
 #[cfg(test)]
 pub(crate) use gauge::activity_animates;
 pub use gauge::{

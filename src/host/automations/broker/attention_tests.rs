@@ -437,6 +437,7 @@ fn withheld_journal_receipt_never_holds_control_host_or_registry_scope() {
         root: directory.path().into(),
         wake: Wake::default(),
         workers: Mutex::default(),
+        launching: Mutex::default(),
         cleanup: Mutex::new(None),
         attention: Mutex::default(),
         notifications: Mutex::default(),

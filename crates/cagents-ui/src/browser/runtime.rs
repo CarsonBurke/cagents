@@ -1096,16 +1096,20 @@ impl CardSession {
             return;
         }
         self.webview.paint();
-        // The viewport source rectangle may only grow together with the buffer
-        // it crops, and the rendering context's present attaches that buffer
-        // and commits the child in one step, so latch clip state right here.
-        let buffer = self.rendering.context.size();
-        if let Err(error) = self
-            .rendering
-            .lease
-            .before_present(PhysicalViewport::new(buffer.width, buffer.height))
-        {
+        // EGL may retain the pre-resize backbuffer for this swap. The
+        // requested context size cannot authorize a larger viewport source.
+        let buffer = match self.rendering.draw_buffer_size() {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                tracing::warn!(%error, "cannot query the browser draw buffer");
+                events.semantic(BrowserEvent::Error(error));
+                return;
+            }
+        };
+        tracing::trace!(requested = ?self.rendering.context.size(), draw = ?buffer, "browser presentation buffer");
+        if let Err(error) = self.rendering.lease.before_present(buffer) {
             events.semantic(BrowserEvent::Error(error));
+            return;
         }
         self.rendering.context.present();
         if let Err(error) = self.rendering.lease.flush() {

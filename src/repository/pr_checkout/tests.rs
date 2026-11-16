@@ -117,7 +117,7 @@ struct Fixture {
 
 impl Fixture {
     fn new(tracked: bool) -> Self {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_fixture::tempdir().unwrap();
         let root = temporary.path().join("checkout");
         let bare = temporary.path().join("remote.git");
         fs::create_dir(&root).unwrap();
@@ -319,7 +319,7 @@ fn native_transaction_phases_preserve_current_and_fast_forward_checkouts() {
 
 #[test]
 fn preparing_notifications_preserve_policy_refusal_without_prepared_proof() {
-    let temporary = tempfile::tempdir().unwrap();
+    let temporary = crate::test_fixture::tempdir().unwrap();
     let hook = temporary.path().join("transaction");
     fs::write(&hook, include_bytes!("transaction.sh")).unwrap();
     let policy = temporary.path().join("policy");

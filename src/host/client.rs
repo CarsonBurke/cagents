@@ -1326,6 +1326,26 @@ fn process_admitted_request(
     let notification_watch = matches!(&request, ClientRequest::WatchNotifications { .. });
     match request {
         ClientRequest::DeviceOperation { operation } => {
+            if let crate::device_service::Operation::AccountReset { request } = operation {
+                let outcome = super::agent_execution::account_info::consume(host, request)
+                    .map_err(|message| {
+                        ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
+                    })?;
+                let value = serde_json::to_value(outcome).map_err(|_| {
+                    ProtocolError::new(
+                        ProtocolErrorCode::Internal,
+                        "The reset result could not be encoded; refresh usage before retrying",
+                        false,
+                    )
+                })?;
+                return Ok((
+                    ServerResponse::DeviceOperation {
+                        reply: crate::device_service::Reply::AccountReset(value),
+                    },
+                    Vec::new(),
+                    false,
+                ));
+            }
             match &operation {
                 crate::device_service::Operation::AccountLifecycle { .. } => {
                     return Err(ProtocolError::new(
@@ -1361,7 +1381,8 @@ fn process_admitted_request(
                     super::account_lifecycle::ensure_update(host, &proposed)?;
                 }
                 crate::device_service::Operation::AccountLogin { account }
-                | crate::device_service::Operation::AccountProbe { account, .. } => {
+                | crate::device_service::Operation::AccountProbe { account, .. }
+                | crate::device_service::Operation::AccountProbeAfterLogin { account } => {
                     super::account_lifecycle::ensure_paths(host, account.resolved_home())?;
                 }
                 _ => {}

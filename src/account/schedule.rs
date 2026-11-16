@@ -8,6 +8,8 @@
 //! - never while the window is unfocused, since nobody is reading it;
 //! - on regaining focus, once the figures are more than [`STALE_AFTER`] old;
 //! - on the periodic tick, once they are more than [`REFRESH_INTERVAL`] old;
+//! - once after a new classified usage rejection, coalescing bursts with
+//!   [`LIMIT_DEBOUNCE`] while retaining automatic focus and backoff policy;
 //! - on a manual refresh at most once per [`MANUAL_DEBOUNCE`], whatever the
 //!   figures' age, because the reader asked;
 //! - after a failure, not before an exponential backoff from
@@ -17,7 +19,8 @@
 //! Figures that arrive another way - another window's probe read back from
 //! the cache, or a running conversation's live events - count exactly as a
 //! probe would, which is what keeps several windows, and a busy conversation,
-//! from probing at all.
+//! from probing routinely. A new rejection still needs a fresh inventory
+//! reading because partial live usage events do not report reset credits.
 //!
 //! Every method takes the current time rather than reading a clock, so the
 //! policy is tested by stating times instead of waiting for them.
@@ -28,6 +31,8 @@ pub type Millis = u64;
 pub const STALE_AFTER: Millis = 5 * 60_000;
 pub const REFRESH_INTERVAL: Millis = 10 * 60_000;
 pub const MANUAL_DEBOUNCE: Millis = 60_000;
+/// Coalesce bursts of fresh limit incidents without polling the provider.
+pub const LIMIT_DEBOUNCE: Millis = 10_000;
 pub const BACKOFF_BASE: Millis = 30_000;
 pub const BACKOFF_MAX: Millis = 15 * 60_000;
 /// Older than this, figures are shown as of when they were observed rather
@@ -55,6 +60,8 @@ pub enum Trigger {
     Focus,
     /// The reader asked.
     Manual,
+    /// A new provider rejection contradicts the cached quota/reset inventory.
+    Limit,
 }
 
 /// One account's probe state.
@@ -67,19 +74,41 @@ pub struct Schedule {
     failures: u32,
     retry_at: Option<Millis>,
     last_manual: Option<Millis>,
+    last_limit: Option<Millis>,
     awaiting_login_until: Option<Millis>,
 }
 
 impl Schedule {
     /// Whether `trigger` at `now` should start a probe.
     pub fn should_probe(&self, trigger: Trigger, now: Millis, focused: bool) -> bool {
+        self.should_probe_observed(trigger, now, focused, self.observed_at)
+    }
+
+    /// Combined providers have full inventory readings distinct from partial
+    /// live window events. Their existing periodic admission uses that age.
+    pub fn should_probe_full(
+        &self,
+        trigger: Trigger,
+        now: Millis,
+        focused: bool,
+        observed_at: Millis,
+    ) -> bool {
+        self.should_probe_observed(trigger, now, focused, Some(observed_at))
+    }
+
+    fn should_probe_observed(
+        &self,
+        trigger: Trigger,
+        now: Millis,
+        focused: bool,
+        observed_at: Option<Millis>,
+    ) -> bool {
         if self.in_flight(now) {
             return false;
         }
         // A stamp beyond the slack is from before the clock was set back,
         // and says nothing about how old the figures are.
-        let age = self
-            .observed_at
+        let age = observed_at
             .filter(|observed| *observed <= now.saturating_add(CLOCK_SLACK))
             .map_or(Millis::MAX, |observed| now.saturating_sub(observed));
         match trigger {
@@ -89,6 +118,13 @@ impl Schedule {
             Trigger::Manual => self
                 .last_manual
                 .is_none_or(|last| now.saturating_sub(last) >= MANUAL_DEBOUNCE),
+            Trigger::Limit => {
+                focused
+                    && self.retry_at.is_none_or(|retry| now >= retry)
+                    && self
+                        .last_limit
+                        .is_none_or(|last| now.saturating_sub(last) >= LIMIT_DEBOUNCE)
+            }
             Trigger::Tick | Trigger::Focus => {
                 let awaiting = self.awaiting_login(now);
                 let threshold = match (trigger, awaiting) {
@@ -100,6 +136,22 @@ impl Schedule {
                 focused && self.retry_at.is_none_or(|retry| now >= retry) && age >= threshold
             }
         }
+    }
+
+    /// Earliest automatic limit-event read after its burst throttle/backoff.
+    /// Completion drains in-flight reads promptly; the deadline also recovers
+    /// a lost completion without adding a periodic reader.
+    pub fn limit_ready_at(&self, now: Millis) -> Option<Millis> {
+        self.in_flight
+            .map(|started| started.saturating_add(IN_FLIGHT_LIMIT))
+            .filter(|deadline| *deadline > now)
+            .into_iter()
+            .chain(
+                self.last_limit
+                    .map(|last| last.saturating_add(LIMIT_DEBOUNCE)),
+            )
+            .chain(self.retry_at)
+            .max()
     }
 
     /// Whether a manual refresh at `now` would be accepted, for a control
@@ -132,6 +184,9 @@ impl Schedule {
         self.in_flight = Some(now);
         if trigger == Trigger::Manual {
             self.last_manual = Some(now);
+        }
+        if trigger == Trigger::Limit {
+            self.last_limit = Some(now);
         }
     }
 
@@ -397,5 +452,31 @@ mod tests {
         assert!(schedule.should_probe(Trigger::Tick, T0 + backoff(1), true));
         assert!(schedule.awaiting_login(T0 + LOGIN_WATCH));
         assert!(!schedule.awaiting_login(T0 + LOGIN_WATCH + 10_000));
+    }
+    #[test]
+    fn limit_events_bypass_recent_usage_but_keep_focus_backoff_and_a_separate_burst_throttle() {
+        let mut schedule = Schedule::default();
+        schedule.observe(T0);
+        assert!(!schedule.should_probe(Trigger::Limit, T0, false));
+        assert!(schedule.should_probe(Trigger::Limit, T0, true));
+        schedule.start(Trigger::Limit, T0);
+        assert_eq!(
+            schedule.limit_ready_at(T0),
+            Some(T0 + IN_FLIGHT_LIMIT),
+            "one owned wake also recovers a lost older read"
+        );
+        assert!(schedule.should_probe(Trigger::Limit, T0 + IN_FLIGHT_LIMIT, true));
+        assert!(!schedule.should_probe(Trigger::Limit, T0 + 1, true));
+        schedule.succeed(T0);
+        assert!(!schedule.should_probe(Trigger::Limit, T0 + LIMIT_DEBOUNCE - 1, true));
+        assert!(schedule.should_probe(Trigger::Limit, T0 + LIMIT_DEBOUNCE, true));
+        assert!(
+            schedule.manual_ready(T0 + 1),
+            "automatic checking does not consume manual intent"
+        );
+        schedule.start(Trigger::Limit, T0 + LIMIT_DEBOUNCE);
+        schedule.fail(T0 + LIMIT_DEBOUNCE);
+        assert!(!schedule.should_probe(Trigger::Limit, T0 + 2 * LIMIT_DEBOUNCE, true));
+        assert!(schedule.should_probe(Trigger::Limit, T0 + LIMIT_DEBOUNCE + BACKOFF_BASE, true));
     }
 }

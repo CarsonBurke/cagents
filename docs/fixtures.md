@@ -16,6 +16,7 @@ person.
 | A chat that answers offline, with tools, subagents, errors or crashes | The synthetic Claude provider, [`tests/fixtures/chat-composer-claude.sh`](chat-composer-fixture.md) |
 | GitHub availability, project avatars or a worktree's pull request in the sidebar, offline | The fixture's forge, [`tests/fixtures/fixture-gh.sh`](#an-offline-github), switched on by `home/.config/fixture-forge` |
 | A saved Claude conversation damaged by a crash and a huge tool output, to resume | [`tests/fixtures/claude-damaged-history.py`](../tests/fixtures/claude-damaged-history.py)` PROJECT`, run in a session's fixture with `scripts/native-evidence env python3 ...`; it writes the transcript under the fixture HOME's `.claude` |
+| A long saved chat for paging backward and forward | [`tests/fixtures/claude-long-history.py`](../tests/fixtures/claude-long-history.py)` PROJECT`, run through `scripts/native-evidence env python3 ...`; 260 numbered exchanges exceed the retained history window |
 | A Codex chat that answers offline, with tool rows, subagent errors or terminal escapes | A [Codex peer](#an-offline-codex), installed by `native-evidence start SIDE --codex PEER` |
 | Real Codex app-server ownership, saved-history loading or socket behaviour | [An isolated real executable](#a-real-codex-in-the-fixture), selected by `native-evidence start SIDE --codex-executable /absolute/path/to/codex` |
 | Test a script's contract without a compositor or Cargo | The stubbed Python suites in `tests/*.py`, such as `tests/native_evidence.py` |
@@ -58,6 +59,31 @@ directories, so nothing reaches the real desktop, daemon or provider config:
 `stop` ends all of it: the daemon first, then every process whose environment
 names the task's runtime directory or fixture HOME, which is the proof that it
 belongs to the task.
+
+## A long paged chat
+
+On the build host, run this in a native-evidence session before opening the
+saved conversation:
+
+```sh
+scripts/native-evidence env python3 "$PWD/tests/fixtures/claude-long-history.py" \
+    "$CAGENTS_EVIDENCE_TASK/fixture/project" --tool-bytes 4194304
+scripts/native-evidence cli project open "$CAGENTS_EVIDENCE_TASK/fixture/project"
+```
+
+Choose **Resume conversation** from the new-tab menu and open **History paging
+checkpoints**. Its 260 numbered exchanges include a 4 MiB Bash result every 32
+turns. These results consume the transcript's byte budget while their collapsed
+command groups can fit inside the viewport. Page backward into one of these
+short rendered windows, then wheel downward to check that newer history loads
+without clicking its fallback button. Check that the visible checkpoint stays
+anchored when the next page arrives. No provider command is executed.
+
+Omit `--tool-bytes` for ordinary completed prose. `--scale 64` increases the
+paragraph count enough to exercise provider history paging with prose alone.
+The generator writes under `HOME/.claude`; always run it through
+`native-evidence env`, which supplies the private fixture HOME. Stop and
+`save-seed` after setup to reuse exactly the same conversation on both sides.
 
 ## A scoped UI caller
 
@@ -242,9 +268,10 @@ the separate option below.
 | `tool-rows` | `codex-tool-rows.py` | plays one turn of MCP, dynamic and function tools, collaboration calls, a hook prompt, image generation, a compaction and a diff, started then completed |
 | `child-errors` | `codex-child-errors.py` | reports subagent diagnostics before a failed turn; the prompts `failed-turn`, `retry`, `disconnect`, `closed-after-finish` and `auth-required` pick the neighbouring cases |
 | `terminal-escape` | `terminal-escape-codex.py` | streams terminal escapes; see the script for the file that completes the stream |
+| `usage-resets` | `codex-usage-resets.py` | reports invented usage and reset credits; consumes update only its private fixture state |
 
-`start` copies the three scripts into `TASK/fixture/libexec/codex`, since the
-peers load their transport from beside them, creates `home/.codex`, and
+`start` copies the peers and their shared helpers into
+`TASK/fixture/libexec/codex`, since the peers load their transport from beside them, creates `home/.codex`, and
 installs [`tests/fixtures/fixture-codex.sh`](../tests/fixtures/fixture-codex.sh)
 as `bin/codex`. That passes the fixture as the peer's private root and
 `$HOME/.codex` as `CODEX_HOME` unless the app names another, and every peer
@@ -262,8 +289,9 @@ check, `codex app-server` over stdio: with an `account/rateLimits/read`
 result in `home/.codex/fixture-rate-limits.json`, such as
 [`fixtures/accounts/codex-rate-limits-read.json`](../fixtures/accounts/codex-rate-limits-read.json)'s
 `result`, the account shows those figures; without one, it reports no usage.
-The other peers leave the app's account and usage-limit handling unexercised,
-and no peer verifies live account credentials.
+The `usage-resets` peer also exercises account usage and explicit reset
+consumption with invented credits. The other peers leave the app's account and
+usage-limit handling unexercised, and no peer verifies live account credentials.
 
 The `tool-rows` peer also reads an optional `model/list` result from
 `home/.codex/fixture-models.json`. Its nonempty `data` array needs a `model`
@@ -309,6 +337,99 @@ terminal open while **Signing in…** is visible; `login status` stays immediate
 This exercises the app's recovery controls and login-terminal lifecycle without
 authenticating an account or contacting a provider. It does not verify provider
 credentials or account changes.
+
+## Usage reset evidence
+
+`tests/fixtures/usage-reset-scene.sh` prepares invented Claude and Codex
+allowances in a running native-evidence task. Start with `--codex usage-resets`
+on both sides. Run these commands on the build host, with
+`CAGENTS_EVIDENCE_TASK` naming that task; hosted agents use plain SSH:
+
+```sh
+tests/fixtures/usage-reset-scene.sh seed   # once, before save-seed
+tests/fixtures/usage-reset-scene.sh serve  # after each start restores the seed
+scripts/native-evidence cli account info --account claude/system --refresh
+scripts/native-evidence cli account info --account codex/system --refresh
+```
+
+`seed` refuses an existing reset state, creates `.cagents-reset-fixture` under
+the private fixture root, and populates each private provider home. Claude has
+a Fable grant with two resets, an account grant with one, and an available
+recurring session reset; the Fable grant is the next usable grant. Session
+usage is 82%, weekly usage 96% and Fable
+usage 100%. Codex has two reset credits, a session at 90% and a week at 100%.
+Counts, timestamps, identities and messages are invented.
+
+`serve` binds a loopback HTTP listener and writes the Claude home's
+`fixture-reset-api.json` with its address. The debug-only Claude reset
+transport recognizes that marker under the marked fixture root and sends
+only the literal fake bearer `cagents-fixture-only`; it does not read real
+credentials. The listener accepts only that bearer and the invented
+organization. Its private HOME/runtime lets native-evidence stop identify and
+end it with the rest of the task. Start the listener again after restoring a
+seed, since an old port does not identify the new session.
+
+Open Accounts and capture the usage view. Spawn a synthetic Claude chat with
+`--model fable`: its initial turn reports the Fable limit and stops, providing
+the limit-card comparison. Capture the reset confirmation and cancel it first.
+On the after side, a confirmed reset updates `fixture-usage.json`, the count,
+and the next fake turn's live usage. A Fable reset preserves account windows;
+an account reset preserves Fable. No real reset is consumed. The recurring session route deliberately has no
+server idempotency: `session_post_count` records every submitted POST so a
+client contract can verify that an uncertain request is never sent again.
+
+For recovery evidence, `usage-reset-scene.sh mode claude disconnect` makes a
+claim persist before closing its connection; the refresh sees the true state,
+and replaying the original idempotency key spends nothing further. Use
+`mode claude error` for a refusal before spending. Codex accepts those same
+modes. `mode claude unconfirmed` spends once but answers HTTP 200 with
+`result: unavailable` and `reason: reset_unconfirmed`; the same key then
+answers `already_used` without another spend. Restore the seed before each independent comparison so both sides
+start with the same counts. For a limited account without a reset action, use
+`mode claude depleted` or `mode codex depleted`: these set the relevant window
+to 100% and all reset counts to zero, without submitting a consume. Claude
+turn frames are refreshed too, so the Fable card stays limited without an
+available reset. To hit the limit again while retaining the remaining resets,
+use `mode claude limited` or `mode codex limited`. This updates the relevant
+usage windows without changing reset counts, prior claims or consume counts.
+Codex then fails a turn only while ordinary usage is blocked; after a fake
+reset it emits an ordinary completed assistant reply, so the native flow can
+verify that work continues. Mode changes share the service's state lock.
+
+For Claude scope confirmations, `usage-reset-scene.sh next-grant fable|account`
+selects one of the two existing grants as the next eligible grant. The account
+grant clears both Session and Weekly; the Fable grant clears only its model
+window. The selector preserves usage, counts, claims and identity, and rejects
+missing, exhausted, paused or unusable grants. It does not submit a consume;
+the service continues to reject a consume for any grant that is not next.
+
+For Claude plan-label evidence, `usage-reset-scene.sh plan NAME` accepts
+`pro`, `max5x`, `max20x`, `ultra` or `unknown`. It changes the fake profile's
+`organization.plan_display_name`, its tier/type metadata, the debug marker's
+optional `subscription_type` and `rate_limit_tier`, and the usage report's
+legacy subscription type. Email, organization UUID, usage windows, reset
+counts and prior claims stay unchanged; the switch never submits a consume.
+Refresh account usage after switching plans. The fake auth status and
+`get_usage` responses continue to omit display labels and tier metadata,
+matching the installed client; the extra information comes from the fake
+profile and cached-metadata marker.
+
+Pro reports `Pro`. Max cases report the label `Max` with the known cached tier
+IDs `default_claude_max_5x` and `default_claude_max_20x`. Ultra reports `Ultra`
+while its legacy subscription remains `max`; its profile uses the confirmed
+`default_claude_max_20x` tier, `claude_max` organization type and null
+`seat_tier`. The unknown case reports `Fixture Horizon`
+with the invented `fixture_horizon_unknown_tier`, also retaining legacy
+`max`, so a reader can verify that unfamiliar labels are not collapsed into
+an older plan. The unchanged default scene reports `Max` without a tier.
+Plan switches work before or after starting the fake service and retain its
+current loopback address.
+
+The service and Codex peer share `fixture-reset-state.json` files guarded by
+file locks. Their offline contracts run with
+`/usr/bin/python3 -I -B tests/usage_reset_fixture.py -v`. These verify fake
+read/consume behavior and transport ambiguity; they do not qualify the live
+Claude endpoint, real Codex credits or the native UI.
 
 ## A real Codex in the fixture
 

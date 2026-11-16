@@ -356,6 +356,50 @@ mod tests {
         );
     }
 
+    /// A group confirmation holds each channel to the panes it counted. One
+    /// that gains a pane meanwhile is shown again rather than deleted.
+    #[test]
+    fn a_channel_that_gains_a_pane_holds_the_group_until_confirmed_again() {
+        let (mut app, _, ids) = fixture();
+        select(&mut app, &ids[..2]);
+        drop(app.begin_sidebar_group_delete());
+        let counted = |app: &Cagents| {
+            app.sidebar_selection_ui
+                .dialog
+                .as_ref()
+                .unwrap()
+                .targets
+                .iter()
+                .find(|target| target.row == SelectionRow::Channel(ids[0]))
+                .and_then(|target| target.consent.as_ref())
+                .map(channel_ui::Consent::conversations)
+        };
+        assert_eq!(counted(&app), Some(0));
+
+        let durable = Arc::make_mut(&mut app.durable);
+        let arrival = durable.cards[0].id;
+        durable.channels[0].cards.push(arrival);
+        drop(app.update_sidebar_selection(Action::Confirm));
+        let dialog = app
+            .sidebar_selection_ui
+            .dialog
+            .as_ref()
+            .expect("the group is shown again");
+        assert!(dialog.error.is_some());
+        assert_eq!(counted(&app), Some(1));
+        assert!(ids[..2].iter().all(|id| !app.channel_ui.is_deleting(*id)));
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .any(|channel| channel.id == ids[1])
+        );
+
+        drop(app.update_sidebar_selection(Action::Confirm));
+        assert!(app.sidebar_selection_ui.dialog.is_none());
+        assert!(app.channel_ui.is_deleting(ids[0]));
+    }
+
     #[test]
     fn model_refresh_prunes_removed_rows_without_another_sidebar_click() {
         let (mut app, _, ids) = fixture();
@@ -388,6 +432,9 @@ struct Target {
     /// Why this member cannot go yet. Any blocker holds the whole group, so
     /// the confirmation never deletes a subset the user did not choose.
     blocker: Option<String>,
+    /// For a channel, what deleting it closes, as the dialog reports it.
+    /// Confirm deletes it only while this still covers the channel.
+    consent: Option<channel_ui::Consent>,
 }
 
 #[derive(Debug)]
@@ -511,6 +558,7 @@ impl Cagents {
                     label: project.name.clone(),
                     detail: project.repository.display().to_string(),
                     blocker: self.selected_project_removal_blocker(id),
+                    consent: None,
                 })
             }
             SelectionRow::Worktree(project, id) => {
@@ -525,6 +573,7 @@ impl Cagents {
                     label: worktree.label().to_owned(),
                     detail: worktree.path.display().to_string(),
                     blocker: self.selected_worktree_deletion_blocker(project, id),
+                    consent: None,
                 })
             }
             SelectionRow::Channel(id) => {
@@ -540,8 +589,11 @@ impl Cagents {
                     .ok_or("The selected channel's project is no longer open.")?;
                 let blocker = if self.channel_ui.is_deleting(id) {
                     Some("Channel deletion is already in progress.".into())
-                } else if channel.cards.iter().any(|card| matches!(self.cards.get(card), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation())) {
-                    Some("Save or close this channel's unsaved editor buffers first.".into())
+                } else if let Some(editor) = self.unsaved_channel_editors(&channel.cards).first() {
+                    Some(format!(
+                        "Save or discard the unsaved changes in \"{}\" first.",
+                        self.unsaved_editor_name(*editor)
+                    ))
                 } else {
                     None
                 };
@@ -555,6 +607,7 @@ impl Cagents {
                     .into_owned(),
                     detail: project.name.clone(),
                     blocker,
+                    consent: Some(self.channel_deletion_consent(channel)),
                 })
             }
             SelectionRow::Card(_) => Err("Panes cannot be closed from the sidebar.".into()),
@@ -625,6 +678,16 @@ impl Cagents {
             match self.selected_row_target(target.row) {
                 Ok(current) if current.directory == target.directory => {
                     target.blocker = current.blocker;
+                    if let (Some(shown), Some(now)) = (&target.consent, &current.consent)
+                        && !shown.covers(now)
+                    {
+                        // Shown afresh: the next Confirm consents to it.
+                        target.consent = current.consent;
+                        dialog.error = Some(
+                            "A selected channel changed while this was open. Review it and confirm again."
+                                .to_owned(),
+                        );
+                    }
                 }
                 Ok(_) => {
                     dialog.error = Some(
@@ -710,15 +773,8 @@ impl Cagents {
                 let conversations = dialog
                     .targets
                     .iter()
-                    .filter_map(|target| match target.row {
-                        SelectionRow::Channel(id) => self
-                            .durable
-                            .channels
-                            .iter()
-                            .find(|channel| channel.id == id),
-                        _ => None,
-                    })
-                    .map(|channel| self.channel_conversation_count(channel))
+                    .filter_map(|target| target.consent.as_ref())
+                    .map(channel_ui::Consent::conversations)
                     .sum::<usize>();
                 (
                     (conversations > 0).then(|| {

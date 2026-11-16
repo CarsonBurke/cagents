@@ -239,7 +239,10 @@ initialize response and each turn's `init` omit the active model while keeping
 the catalog and normal turn activity. Remove it to report the resolved model
 on the next turn. To give the account check figures, write a
 `get_usage` control response's inner `response` to `fixture-usage.json`; the
-account check and each conversation read it whenever they ask. A live usage change is a
+account check and each conversation read it whenever they ask. For reset
+consumption evidence, use the [usage reset scene](fixtures.md#usage-reset-evidence),
+which keeps these reports and subsequent turn frames in step with its fake
+reset state. A live usage change is a
 `rate_limit_event` frame in `fixture-frames.jsonl`, such as
 `fixtures/accounts/claude-rate-limit-event-fable.json`, which a Fable turn
 reported. The login the account check reads is `fixture@example.test` on a

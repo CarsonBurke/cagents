@@ -306,6 +306,9 @@ pub(super) enum Retirement {
 #[derive(Debug, Default)]
 pub struct State {
     dialog: Option<Deletion>,
+    /// A confirmed deletion waiting while the user saves or discards the
+    /// unsaved editors it named, with the consent they gave.
+    resolving: Option<(ChannelId, Consent)>,
     /// Deletions under way. Each runs behind its channel's row rather than a
     /// dialog, so the rest of the window stays usable meanwhile.
     deleting: HashSet<ChannelId>,
@@ -459,12 +462,69 @@ fn closed_channel_source_matches(before: &CardKind, current: &CardKind) -> bool 
     &ended == before
 }
 
+/// What a pane is a view of, as far as deleting it is concerned: a pane that
+/// starts showing another session is not the pane the user agreed to close.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PaneSource {
+    Terminal(crate::model::TerminalId),
+    Chat(crate::model::TerminalId),
+    Other(std::mem::Discriminant<CardKind>),
+}
+
+impl PaneSource {
+    fn of(kind: &CardKind) -> Self {
+        match kind {
+            // Recovery can give a terminal a new identity while it stays the
+            // same shell; its origin is what stays fixed.
+            CardKind::Terminal(session) => {
+                Self::Terminal(session.recovery_origin.unwrap_or(session.id))
+            }
+            CardKind::Chat(session) => Self::Chat(session.id),
+            other => Self::Other(std::mem::discriminant(other)),
+        }
+    }
+}
+
+/// Everything deleting a channel would close or lose, as the user was shown
+/// it. A deletion only goes ahead while this still covers the channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Consent {
+    /// The channel's open panes, by identity, with what each shows. Their
+    /// order is presentation, not part of what is deleted.
+    panes: Vec<(CardId, PaneSource)>,
+    /// Open chats and terminals among them.
+    conversations: usize,
+    /// Editors whose work exists nowhere else yet, by the name shown for them.
+    unsaved: Vec<(CardId, String)>,
+}
+
+impl Consent {
+    pub(super) fn conversations(&self) -> usize {
+        self.conversations
+    }
+
+    /// Whether deleting the channel as it is now loses nothing beyond what
+    /// this consent named: the same panes showing the same sources, and no
+    /// unsaved editor it did not list.
+    pub(super) fn covers(&self, current: &Self) -> bool {
+        self.panes == current.panes
+            && current
+                .unsaved
+                .iter()
+                .all(|(card, _)| self.unsaved.iter().any(|(named, _)| named == card))
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Deletion {
     channel: ChannelId,
     title: String,
-    /// Open conversations the deletion closes, reported before it happens.
-    chats: usize,
+    /// What the dialog names, fixed when it opened. Confirming deletes no
+    /// more than this.
+    consent: Consent,
+    /// The channel changed after the dialog was first shown; this is the
+    /// fresh account of it.
+    changed: bool,
     /// Why the last deletion of this channel failed, when the dialog is
     /// opened again after it. Confirming retries it.
     failure: Option<String>,
@@ -585,6 +645,20 @@ impl Cagents {
                 return Task::none();
             }
             self.channel_ui.deleting.remove(&id);
+            // Already under way, so a refusal here is a failed deletion the
+            // channel's row offers to retry, not a deletion never started.
+            if let Some(blocker) = self
+                .durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == id)
+                .and_then(|channel| self.channel_deletion_blocker(&channel.cards))
+            {
+                self.status = Some(TransientNotice::warning(blocker));
+                self.channel_ui.failed.insert(id, blocker.into());
+                self.refresh_sidebar_channels();
+                return Task::none();
+            }
             return self.delete_channel(id);
         }
         if let Action::SessionsClosed(id, operation, result) = action {
@@ -598,11 +672,20 @@ impl Cagents {
             }
             let attempt = self.channel_ui.closing.remove(&id).unwrap();
             self.channel_ui.deleting.remove(&id);
-            let result = result.and_then(|()| {
-                self.channel_close_targets_current(id, &attempt).then_some(()).ok_or_else(|| {
-                    "The channel's panes changed while sessions were closing; review them before deleting again".into()
+            let result = result
+                .and_then(|()| {
+                    self.channel_close_targets_current(id, &attempt).then_some(()).ok_or_else(|| {
+                        "The channel's panes changed while sessions were closing; review them before deleting again".into()
+                    })
                 })
-            });
+                .and_then(|()| {
+                    self.unsaved_channel_editors(&attempt.members)
+                        .is_empty()
+                        .then_some(())
+                        .ok_or_else(|| {
+                            "An editor in the channel has unsaved changes; save or discard them before deleting again".into()
+                        })
+                });
             return match result {
                 Ok(()) => {
                     // Managed teardown can remove these captured-open panes
@@ -684,7 +767,7 @@ impl Cagents {
                 let Some(deletion) = self.channel_ui.dialog.take() else {
                     return Task::none();
                 };
-                self.delete_channel(deletion.channel)
+                self.delete_consented_channel(deletion.channel, &deletion.consent)
             }
             Action::Dismiss => {
                 // Declining to delete a channel whose deletion failed is the
@@ -1507,19 +1590,150 @@ impl Cagents {
         else {
             return Task::none();
         };
-        let title = channel_display_title(channel, self.sidebar_model.project(channel.project_id))
-            .into_owned();
-        let chats = self.channel_conversation_count(channel);
-        if chats == 0 && !always_confirm {
+        let consent = self.channel_deletion_consent(channel);
+        if consent.conversations == 0 && consent.unsaved.is_empty() && !always_confirm {
             return self.delete_channel(id);
         }
+        self.open_channel_deletion_dialog(id, consent, false)
+    }
+
+    /// Shows the delete confirmation for `consent`, opening on Cancel.
+    fn open_channel_deletion_dialog(
+        &mut self,
+        id: ChannelId,
+        consent: Consent,
+        changed: bool,
+    ) -> Task<Message> {
+        let Some(channel) = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)
+        else {
+            return Task::none();
+        };
+        let title = channel_display_title(channel, self.sidebar_model.project(channel.project_id))
+            .into_owned();
         self.channel_ui.dialog = Some(Deletion {
             channel: id,
             title,
-            chats,
+            consent,
+            changed,
             failure: self.channel_ui.failed.get(&id).cloned(),
         });
         iced::widget::operation::focus(State::focus_target()).map(cosmic::Action::App)
+    }
+
+    /// Whether this editor holds work that closing it would lose: unsaved
+    /// changes, a save still in flight, or a save whose outcome is unresolved.
+    pub(super) fn editor_holds_unsaved_work(&self, card: CardId) -> bool {
+        matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation())
+    }
+
+    /// The editors among `cards` that deleting them would lose work in. Every
+    /// way of deleting a channel asks this before it closes anything.
+    pub(super) fn unsaved_channel_editors(&self, cards: &[CardId]) -> Vec<CardId> {
+        cards
+            .iter()
+            .copied()
+            .filter(|card| self.editor_holds_unsaved_work(*card))
+            .collect()
+    }
+
+    /// What deleting `channel` now would close and lose, for a confirmation
+    /// to show and later hold the deletion to.
+    pub(super) fn channel_deletion_consent(&self, channel: &ProjectChannel) -> Consent {
+        let mut panes: Vec<_> = channel
+            .cards
+            .iter()
+            .filter_map(|card| self.card_state(*card))
+            .filter(|state| state.existence.is_open() && !state.kind.is_utility())
+            .map(|state| (state.id, PaneSource::of(&state.kind)))
+            .collect();
+        panes.sort_by_key(|(card, _)| *card);
+        let unsaved = self
+            .unsaved_channel_editors(&channel.cards)
+            .into_iter()
+            .map(|card| (card, self.unsaved_editor_name(card)))
+            .collect();
+        Consent {
+            panes,
+            conversations: self.channel_conversation_count(channel),
+            unsaved,
+        }
+    }
+
+    /// The file an unsaved editor has open, as its pane would name it.
+    pub(super) fn unsaved_editor_name(&self, card: CardId) -> String {
+        match self.cards.get(&card) {
+            Some(CardRuntime::Repository(runtime)) => runtime
+                .selected_path()
+                .map(|path| path.display().to_string()),
+            _ => None,
+        }
+        .or_else(|| self.card_state(card).map(|state| state.title.clone()))
+        .unwrap_or_else(|| "An editor".into())
+    }
+
+    /// Goes ahead with a deletion the user confirmed, provided the channel
+    /// still holds only what they were shown. Otherwise the confirmation
+    /// comes back with what it holds now, and nothing is closed.
+    fn delete_consented_channel(&mut self, id: ChannelId, consent: &Consent) -> Task<Message> {
+        let Some(current) = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)
+            .map(|channel| self.channel_deletion_consent(channel))
+        else {
+            return Task::none();
+        };
+        if !consent.covers(&current) {
+            return self.open_channel_deletion_dialog(id, current, true);
+        }
+        if current.unsaved.is_empty() {
+            return self.delete_channel(id);
+        }
+        // Each unsaved editor is offered Save first, as closing it alone
+        // would; the deletion continues once every one is resolved.
+        let editors = current.unsaved.iter().map(|(card, _)| *card).collect();
+        self.channel_ui.resolving = Some((id, consent.clone()));
+        self.begin_dirty_close(DirtyCloseIntent::Channel(id), editors)
+    }
+
+    /// The unsaved editors of a confirmed deletion are saved or discarded.
+    pub(super) fn resume_channel_deletion(&mut self, id: ChannelId) -> Task<Message> {
+        match self.channel_ui.resolving.take() {
+            Some((resolving, consent)) if resolving == id => {
+                self.delete_consented_channel(id, &consent)
+            }
+            other => {
+                self.channel_ui.resolving = other;
+                Task::none()
+            }
+        }
+    }
+
+    pub(super) fn cancel_channel_deletion(&mut self, id: ChannelId) {
+        if self
+            .channel_ui
+            .resolving
+            .as_ref()
+            .is_some_and(|(resolving, _)| *resolving == id)
+        {
+            self.channel_ui.resolving = None;
+        }
+    }
+
+    /// Why `cards` cannot be deleted with their channel yet, if anything.
+    fn channel_deletion_blocker(&self, cards: &[CardId]) -> Option<&'static str> {
+        if cards.iter().any(|card| self.pane_transfer_pending(*card)) {
+            Some("Wait for the pane move to finish before deleting this channel.")
+        } else if !self.unsaved_channel_editors(cards).is_empty() {
+            Some("Save or discard the unsaved editor changes in this channel before deleting it.")
+        } else {
+            None
+        }
     }
 
     /// The open conversations - chats and terminals - that deleting
@@ -1536,6 +1750,22 @@ impl Cagents {
                 })
             })
             .count()
+    }
+
+    /// The saved sessions deleting a channel of `cards` asks the daemon to
+    /// close. A fenced pane's saved session is unconfirmed, so nothing is
+    /// asked of its agent: deleting the channel retires only the pane.
+    pub(super) fn channel_sessions_to_close(&self, cards: &[CardId]) -> Vec<CardKind> {
+        self.durable
+            .cards
+            .iter()
+            .filter(|card| {
+                cards.contains(&card.id)
+                    && card.existence.is_open()
+                    && !self.shared_views.quarantined.contains(&card.id)
+            })
+            .map(|card| card.kind.clone())
+            .collect()
     }
 
     pub(super) fn delete_channels(&mut self, ids: Vec<ChannelId>) -> Task<Message> {
@@ -1558,10 +1788,8 @@ impl Cagents {
         else {
             return Task::none();
         };
-        if cards.iter().any(|card| self.pane_transfer_pending(*card)) {
-            self.status = Some(TransientNotice::warning(
-                "Wait for the pane move to finish before deleting this channel.",
-            ));
+        if let Some(blocker) = self.channel_deletion_blocker(&cards) {
+            self.status = Some(TransientNotice::warning(blocker));
             return Task::none();
         }
         if !self.channel_ui.deleting.insert(id) {
@@ -1602,13 +1830,7 @@ impl Cagents {
             });
             return Task::batch([leave, retry]);
         }
-        let sessions: Vec<_> = self
-            .durable
-            .cards
-            .iter()
-            .filter(|card| cards.contains(&card.id) && card.existence.is_open())
-            .map(|card| card.kind.clone())
-            .collect();
+        let sessions = self.channel_sessions_to_close(&cards);
         if !sessions
             .iter()
             .any(|kind| matches!(kind, CardKind::Terminal(_) | CardKind::Chat(_)))
@@ -1621,7 +1843,11 @@ impl Cagents {
             .durable
             .cards
             .iter()
-            .filter(|card| cards.contains(&card.id) && card.existence.is_open())
+            .filter(|card| {
+                cards.contains(&card.id)
+                    && card.existence.is_open()
+                    && !self.shared_views.quarantined.contains(&card.id)
+            })
             .map(|card| {
                 (
                     card.id,
@@ -1805,7 +2031,7 @@ impl Cagents {
             if passive
                 && (self.shared_chat_has_local_work(card)
                     || self.chat_runs_unobserved_by_peers(card)
-                    || matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.is_dirty() || runtime.is_saving()))
+                    || self.editor_holds_unsaved_work(card))
             {
                 self.retain_local_pane(card);
                 let scope = self
@@ -1960,7 +2186,7 @@ impl Cagents {
         let dialog = self.channel_ui.dialog.as_ref()?;
         let mut rows: Vec<Element<'_, Message>> = vec![
             design::title("Delete channel?").into(),
-            super::notice_body(match dialog.chats {
+            super::notice_body(match dialog.consent.conversations {
                 0 => format!("Delete \"{}\" from this workspace?", dialog.title),
                 1 => format!("Delete \"{}\" and close its conversation?", dialog.title),
                 chats => format!(
@@ -1969,6 +2195,26 @@ impl Cagents {
                 ),
             }),
         ];
+        if let Some(unsaved) = unsaved_editors_notice(&dialog.consent.unsaved) {
+            rows.push(
+                widget::text::body(unsaved)
+                    .class(cosmic::theme::Text::Custom(design::warning_text))
+                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                    .width(Length::Fill)
+                    .into(),
+            );
+        }
+        if dialog.changed {
+            rows.push(
+                widget::text::body(
+                    "The channel changed while this was open. Review what it holds now.",
+                )
+                .class(cosmic::theme::Text::Custom(design::warning_text))
+                .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                .width(Length::Fill)
+                .into(),
+            );
+        }
         if let Some(failure) = &dialog.failure {
             rows.push(super::notice_body(format!(
                 "The last attempt failed: {failure}"
@@ -2233,6 +2479,27 @@ impl Cagents {
 
 fn channel_title_from_prompt(prompt: &str) -> Option<String> {
     crate::workspace_model::channel_title_from_prompt(prompt)
+}
+
+/// What the delete confirmation says about unsaved editors, naming each.
+fn unsaved_editors_notice(unsaved: &[(CardId, String)]) -> Option<String> {
+    let names = unsaved
+        .iter()
+        .map(|(_, name)| format!("\"{name}\""))
+        .collect::<Vec<_>>();
+    let list = match names.as_slice() {
+        [] => return None,
+        [one] => {
+            return Some(format!(
+                "{one} has unsaved changes. You can save or discard them before the channel is deleted."
+            ));
+        }
+        [first, second] => format!("{first} and {second}"),
+        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
+    };
+    Some(format!(
+        "{list} have unsaved changes. You can save or discard each before the channel is deleted."
+    ))
 }
 
 /// A channel still waiting for its first accepted prompt has to be nameable
@@ -3048,8 +3315,272 @@ mod tests {
                 focused: Some(card),
             });
         let _ = app.handle_channel_ui(Action::Delete(id));
-        assert_eq!(app.channel_ui.dialog.as_ref().unwrap().chats, 1);
+        assert_eq!(
+            app.channel_ui
+                .dialog
+                .as_ref()
+                .unwrap()
+                .consent
+                .conversations,
+            1
+        );
         assert!(app.durable.channels.iter().any(|channel| channel.id == id));
+    }
+
+    /// `channel_with_a_conversation`, plus an editor pane in the doomed
+    /// channel holding `runtime`'s work.
+    fn channel_with_an_editor(
+        runtime: impl FnOnce(CardId) -> crate::repository_widget::RepositoryRuntime,
+    ) -> (Cagents, ChannelId, CardId, CardId) {
+        let (mut app, doomed, _survivor, conversation) = channel_with_a_conversation();
+        let editor = CardId::new();
+        let durable = Arc::make_mut(&mut app.durable);
+        let mut state = durable.cards[0].clone();
+        state.id = editor;
+        state.title = "project".into();
+        state.kind = CardKind::Repository(crate::model::RepositoryView {
+            project: durable.channels[0].project_id,
+            repository: "/repo/.git".into(),
+            worktree: "/repo".into(),
+            selected_file: None,
+        });
+        durable.cards.push(state);
+        durable
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == doomed)
+            .unwrap()
+            .cards
+            .push(editor);
+        app.cards
+            .insert(editor, CardRuntime::Repository(Box::new(runtime(editor))));
+        (app, doomed, conversation, editor)
+    }
+
+    fn channel_exists(app: &Cagents, id: ChannelId) -> bool {
+        app.durable.channels.iter().any(|channel| channel.id == id)
+    }
+
+    /// Deleting a channel never silently takes an editor's unsaved or
+    /// in-flight work with it: every route asks first or refuses, and the
+    /// confirmation names the file and offers Save before anything closes.
+    #[test]
+    fn unsaved_or_saving_editors_block_silent_channel_deletion() {
+        use crate::repository_widget::RepositoryRuntime;
+        for runtime in [
+            RepositoryRuntime::dirty_fixture as fn(CardId) -> RepositoryRuntime,
+            |card| RepositoryRuntime::post_persist_failure_fixture(card).0,
+        ] {
+            // With no conversation left in it, the pointer Delete used to
+            // delete the channel at once.
+            let (mut app, doomed, conversation, editor) = channel_with_an_editor(runtime);
+            Arc::make_mut(&mut app.durable)
+                .channels
+                .iter_mut()
+                .find(|channel| channel.id == doomed)
+                .unwrap()
+                .cards
+                .retain(|card| *card != conversation);
+            drop(app.handle_channel_ui(Action::Delete(doomed)));
+            let dialog = app.channel_ui.dialog.as_ref().expect("deletion asks first");
+            assert_eq!(dialog.consent.conversations, 0);
+            assert_eq!(dialog.consent.unsaved, vec![(editor, "notes.txt".into())]);
+            assert_eq!(
+                unsaved_editors_notice(&dialog.consent.unsaved).as_deref(),
+                Some(
+                    "\"notes.txt\" has unsaved changes. You can save or discard them before the channel is deleted."
+                )
+            );
+
+            // Confirming hands the editor to its own Save / Discard / Cancel
+            // question; the channel and the editor are both still there.
+            drop(app.handle_channel_ui(Action::ConfirmDelete));
+            assert!(channel_exists(&app, doomed));
+            assert!(app.dirty_repository_close.as_ref().is_some_and(|close| {
+                close.card == editor && close.intent == DirtyCloseIntent::Channel(doomed)
+            }));
+            assert!(app.editor_holds_unsaved_work(editor));
+
+            // Routes with no dialog of their own, such as a group deletion or
+            // a retry, refuse rather than discard the editor.
+            drop(app.delete_channel(doomed));
+            assert!(channel_exists(&app, doomed) && !app.channel_ui.is_deleting(doomed));
+            assert!(app.editor_holds_unsaved_work(editor));
+            drop(app.handle_channel_ui(Action::RetryDelete(doomed)));
+            assert!(channel_exists(&app, doomed) && app.editor_holds_unsaved_work(editor));
+            assert!(
+                app.channel_ui.failed.contains_key(&doomed),
+                "a deletion already under way reports the refusal on its row"
+            );
+        }
+    }
+
+    /// An editor that picks up unsaved work while the channel's sessions
+    /// close stops the deletion at its completion.
+    #[test]
+    fn unsaved_work_arriving_while_sessions_close_fails_the_deletion() {
+        use crate::repository_widget::RepositoryRuntime;
+        let (mut app, doomed, _conversation, editor) = channel_with_an_editor(|card| {
+            RepositoryRuntime::open_fixture(card, "notes.txt", "saved\n").0
+        });
+        assert!(!app.editor_holds_unsaved_work(editor));
+        drop(app.handle_channel_ui(Action::Delete(doomed)));
+        drop(app.handle_channel_ui(Action::ConfirmDelete));
+        assert!(app.channel_ui.is_deleting(doomed));
+
+        app.cards.insert(
+            editor,
+            CardRuntime::Repository(Box::new(RepositoryRuntime::dirty_fixture(editor))),
+        );
+        drop(app.handle_channel_ui(Action::SessionsClosed(
+            doomed,
+            app.channel_ui.close_operation(doomed),
+            Ok(()),
+        )));
+        assert!(channel_exists(&app, doomed));
+        assert!(app.channel_ui.failed.contains_key(&doomed));
+        assert!(app.editor_holds_unsaved_work(editor));
+    }
+
+    /// Each named editor is asked in turn; cancelling any of them keeps the
+    /// channel, even after another was discarded.
+    #[test]
+    fn every_unsaved_editor_is_resolved_before_the_channel_goes() {
+        use crate::repository_widget::RepositoryRuntime;
+        let (mut app, doomed, _conversation, first) =
+            channel_with_an_editor(RepositoryRuntime::dirty_fixture);
+        let second = CardId::new();
+        let durable = Arc::make_mut(&mut app.durable);
+        let mut state = durable
+            .cards
+            .iter()
+            .find(|card| card.id == first)
+            .unwrap()
+            .clone();
+        state.id = second;
+        durable.cards.push(state);
+        durable
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == doomed)
+            .unwrap()
+            .cards
+            .push(second);
+        app.cards.insert(
+            second,
+            CardRuntime::Repository(Box::new(RepositoryRuntime::dirty_fixture(second))),
+        );
+
+        drop(app.handle_channel_ui(Action::Delete(doomed)));
+        assert_eq!(
+            app.channel_ui
+                .dialog
+                .as_ref()
+                .unwrap()
+                .consent
+                .unsaved
+                .len(),
+            2
+        );
+        drop(app.handle_channel_ui(Action::ConfirmDelete));
+        assert!(
+            app.dirty_repository_close
+                .as_ref()
+                .is_some_and(|close| close.card == first)
+        );
+        drop(app.update(Message::DiscardAndCloseRepository(first)));
+        assert!(
+            app.dirty_repository_close
+                .as_ref()
+                .is_some_and(|close| close.card == second)
+        );
+        assert!(!app.channel_ui.is_deleting(doomed));
+        drop(app.update(Message::CancelRepositoryClose));
+        assert!(app.channel_ui.resolving.is_none());
+        assert!(channel_exists(&app, doomed) && !app.channel_ui.is_deleting(doomed));
+        assert!(app.editor_holds_unsaved_work(second));
+    }
+
+    #[test]
+    fn discarding_the_named_editor_completes_the_confirmed_deletion_and_cancel_keeps_it() {
+        use crate::repository_widget::RepositoryRuntime;
+        for discard in [true, false] {
+            let (mut app, doomed, _conversation, editor) =
+                channel_with_an_editor(RepositoryRuntime::dirty_fixture);
+            drop(app.handle_channel_ui(Action::Delete(doomed)));
+            drop(app.handle_channel_ui(Action::ConfirmDelete));
+            if discard {
+                drop(app.update(Message::DiscardAndCloseRepository(editor)));
+                assert!(app.dirty_repository_close.is_none());
+                assert!(
+                    app.channel_ui.is_deleting(doomed),
+                    "the deletion the user confirmed goes ahead"
+                );
+            } else {
+                drop(app.update(Message::CancelRepositoryClose));
+                assert!(app.channel_ui.resolving.is_none());
+                assert!(!app.channel_ui.is_deleting(doomed));
+                assert!(channel_exists(&app, doomed) && app.editor_holds_unsaved_work(editor));
+            }
+        }
+    }
+
+    /// The confirmation's account of the channel is fixed when it opens. A
+    /// pane that arrives or changes source meanwhile is not deleted on the
+    /// strength of a dialog that never showed it.
+    #[test]
+    fn deletion_consent_is_fixed_when_the_confirmation_opens() {
+        let (mut app, doomed, _survivor, conversation) = channel_with_a_conversation();
+        drop(app.handle_channel_ui(Action::Delete(doomed)));
+        let shown = app.channel_ui.dialog.as_ref().unwrap().consent.clone();
+        assert_eq!(shown.conversations, 1);
+
+        // Another window adds a second conversation while the dialog is open.
+        let arrival = CardId::new();
+        let durable = Arc::make_mut(&mut app.durable);
+        let mut chat = durable.cards[0].clone();
+        chat.id = arrival;
+        chat.kind = CardKind::Chat(chat_session());
+        durable.cards.push(chat);
+        durable
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == doomed)
+            .unwrap()
+            .cards
+            .push(arrival);
+        // The open dialog still reports what it was opened with.
+        assert_eq!(app.channel_ui.dialog.as_ref().unwrap().consent, shown);
+
+        drop(app.handle_channel_ui(Action::ConfirmDelete));
+        assert!(!app.channel_ui.is_deleting(doomed), "nothing is closed");
+        let refreshed = app.channel_ui.dialog.as_ref().expect("asked again");
+        assert!(refreshed.changed);
+        assert_eq!(refreshed.consent.conversations, 2);
+        assert!(
+            refreshed
+                .consent
+                .panes
+                .iter()
+                .any(|(card, _)| *card == arrival)
+        );
+
+        // A pane whose session is replaced is a change too.
+        let refreshed = refreshed.consent.clone();
+        let durable = Arc::make_mut(&mut app.durable);
+        let state = durable
+            .cards
+            .iter_mut()
+            .find(|card| card.id == conversation)
+            .unwrap();
+        state.kind = CardKind::Chat(chat_session());
+        drop(app.handle_channel_ui(Action::ConfirmDelete));
+        assert!(!app.channel_ui.is_deleting(doomed));
+        assert_ne!(app.channel_ui.dialog.as_ref().unwrap().consent, refreshed);
+
+        // Confirming what is now shown deletes it.
+        drop(app.handle_channel_ui(Action::ConfirmDelete));
+        assert!(app.channel_ui.is_deleting(doomed));
     }
 
     /// A window whose active channel, "Investigation", holds a live
@@ -3137,7 +3668,7 @@ mod tests {
             assert_eq!(app.durable.active_channel, Some(channel));
             assert_eq!(app.workspace.order().collect::<Vec<_>>().len(), 1);
             assert_eq!(persists(), saved, "a click alone waits for the burst");
-            assert!(app.navigation_save_pending);
+            assert!(app.navigation_save.is_some());
             // The burst's first click arms the one timer; later clicks don't
             // push it back, so a long burst is still saved within the delay.
             let generation = *armed.get_or_insert(app.navigation_save_generation);
@@ -3146,7 +3677,7 @@ mod tests {
         let burst = app.navigation_save_generation;
         drop(app.update(Message::NavigationSaveDue(burst)));
         assert_eq!(persists(), saved + 1, "the burst is saved once");
-        assert!(!app.navigation_save_pending);
+        assert!(app.navigation_save.is_none());
 
         // A timer armed for a burst some other save already wrote does not
         // cut the next burst short.
@@ -3161,7 +3692,7 @@ mod tests {
         let stale = app.navigation_save_generation - 1;
         drop(app.update(Message::NavigationSaveDue(stale)));
         assert_eq!(persists(), saved + 2, "the earlier burst's timer is spent");
-        assert!(app.navigation_save_pending);
+        assert!(app.navigation_save.is_some());
         drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
         assert_eq!(persists(), saved + 3);
         assert_eq!(app.durable.active_channel, Some(first));

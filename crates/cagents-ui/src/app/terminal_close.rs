@@ -344,6 +344,20 @@ impl Cagents {
             || self.completed_release == Some(card)
     }
 
+    /// Closes a fenced pane, whatever its kind, like any other pane - it
+    /// leaves the shared view and can be reopened from recently closed - but
+    /// asks nothing of its agent. Its saved session is unconfirmed, so no
+    /// session may be stopped on its behalf.
+    pub(super) fn close_fenced_card(&mut self, card: CardId) -> Option<Task<Message>> {
+        if !self.shared_views.quarantined.contains(&card) {
+            return None;
+        }
+        Arc::make_mut(&mut self.durable)
+            .pending_chat_admissions
+            .remove(&card);
+        Some(self.request_card_removal(card))
+    }
+
     pub(super) fn begin_card_close(&mut self, card: CardId) -> Task<Message> {
         self.reset_shared_removal_for_new_close(card);
         self.close_card_as(card, !self.asks(QUESTION), false)
@@ -412,6 +426,9 @@ impl Cagents {
         if self.chat_close_dialog_visible() {
             self.queue_card_close(card, unasked);
             return Task::none();
+        }
+        if let Some(closed) = self.close_fenced_card(card) {
+            return closed;
         }
         if self.pane_transfer_pending(card) {
             self.status = Some(TransientNotice::warning(

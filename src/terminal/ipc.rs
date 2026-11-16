@@ -252,8 +252,12 @@ use crate::{
 /// chat snapshots, whose inspector encoding stays frozen for update sources.
 /// Version 183 fences shared Close on its original pane and terminal worker,
 /// with attachment metadata, captured-source reads and source-checked cleanup.
+/// Version 184 adds reset inventories and reported plan display names and
+/// tiers to account readings, which older CLIs are sent without, and appends
+/// the account-reset and after-sign-in probe device operations, with a
+/// JSON-framed reset reply that older CLIs cannot request.
 /// Replace the matched daemon/window set.
-pub const PROTOCOL_VERSION: u16 = 183;
+pub const PROTOCOL_VERSION: u16 = 184;
 /// A correlated refusal issued before source-checked cleanup has any effect.
 pub const TERMINAL_CLOSE_SOURCE_CONFLICT: &str =
     "The terminal changed or still owns work; nothing was closed";
@@ -271,7 +275,9 @@ pub const TERMINAL_CLOSE_SOURCE_ABSENT: &str =
 pub const CANDIDATE_LINE_PROTOCOL: u16 = 128;
 
 mod older_clients;
-pub(crate) use older_clients::{ENDED_TOOL_STATUS, WAITING_TOOL_STATUS, encoding_before};
+pub(crate) use older_clients::{
+    ENDED_TOOL_STATUS, PLAN_AND_RESET_READINGS, WAITING_TOOL_STATUS, encoding_before,
+};
 pub use older_clients::{OlderClient, is_cli_peer, older_client};
 
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row

@@ -820,6 +820,7 @@ mod tests {
     ) -> SessionAccount {
         use crate::account::{UsageSnapshot, UsageSource, UsageWindow, info::RemainingWindow};
         let usage = UsageSnapshot {
+            resets: Vec::new(),
             windows: windows
                 .iter()
                 .map(|(label, kind, used, resets_at)| UsageWindow {
@@ -841,6 +842,8 @@ mod tests {
             observed_at,
             source: UsageSource::Live,
             plan: None,
+            plan_display_name: None,
+            rate_limit_tier: None,
             detail: None,
         };
         let remaining = RemainingWindow::of(&usage, now);

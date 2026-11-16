@@ -294,6 +294,11 @@ impl Cagents {
     }
 
     pub(in crate::app) fn prepare_shared_removal(&mut self, card: CardId) -> bool {
+        // A fenced pane's saved source is unconfirmed, so its close captures
+        // none: publication removes the closed pane from its view by identity.
+        if self.shared_views.quarantined.contains(&card) {
+            return true;
+        }
         if !self.shared_views.removals.contains_key(&card) && !self.capture_shared_removal(card) {
             return false;
         }
