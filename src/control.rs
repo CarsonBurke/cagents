@@ -51,7 +51,7 @@ pub use messages::{Arrival, AskArgs, InboxArgs, ReplyArgs, SendArgs};
 mod linear;
 pub use linear::LinearCommand;
 mod work;
-pub use work::WorkCommand;
+pub use work::{WorkCommand, WorkListArgs};
 #[cfg(feature = "ui")]
 pub(crate) mod invocation;
 
@@ -138,6 +138,29 @@ pub struct Cli {
     pub command: TopCommand,
 }
 
+impl Cli {
+    /// What the grammar alone cannot refuse. `work`'s list options sit beside
+    /// its subcommands so `cagents work` lists, but mean nothing to one.
+    /// Clap's own conflict would also refuse the global options there.
+    fn validated(self) -> Result<Self, clap::Error> {
+        if let TopCommand::Work {
+            command: Some(_),
+            list,
+        } = &self.command
+            && *list != WorkListArgs::default()
+        {
+            use clap::CommandFactory;
+            return Err(Self::command().error(
+                ClapErrorKind::ArgumentConflict,
+                "the list options of `cagents work` cannot be used with a subcommand; \
+                 give a subcommand its own options after it, as in \
+                 `cagents work rm CARD --project PROJECT`",
+            ));
+        }
+        Ok(self)
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub enum TopCommand {
     /// Generate a shell completion script without contacting services.
@@ -181,10 +204,12 @@ pub enum TopCommand {
     Reply(ReplyArgs),
     /// Read the messages left for this session.
     Inbox(InboxArgs),
-    /// Show every worktree and branch in progress, newest activity first.
+    /// List this project's worktrees and branches in progress, newest activity first; or pin or remove one.
     Work {
         #[command(subcommand)]
-        command: WorkCommand,
+        command: Option<WorkCommand>,
+        #[command(flatten)]
+        list: WorkListArgs,
     },
     /// Manage recurring daemon-owned work and its durable run history.
     #[command(alias = "automations")]
@@ -270,6 +295,19 @@ pub enum TopCommand {
         #[arg(long, requires = "stage_only")]
         #[arg(help = "Directory containing the staged executable version.")]
         version_root: Option<PathBuf>,
+    },
+    /// Serve an installed version while preserving running windows and daemon.
+    #[command(hide = true)]
+    SelectInstall {
+        #[arg(long)]
+        #[arg(help = "Installation destination prefix.")]
+        prefix: PathBuf,
+        #[arg(long)]
+        #[arg(help = "Installed version directory to serve.")]
+        version_root: PathBuf,
+        #[arg(long)]
+        #[arg(help = "Link target current must still hold.")]
+        expect_current: PathBuf,
     },
     /// Save, close and reopen every window with this installation's executables.
     #[command(hide = true)]
@@ -430,7 +468,8 @@ pub enum DaemonCommand {
         /// before an update.
         schema: u32,
     },
-    /// Stop any development daemon without relying on its wire protocol.
+    /// Stop any development daemon without relying on its wire protocol, waiting
+    /// up to 30 seconds for it to exit.
     #[command(hide = true)]
     StopForRebuild {
         /// Confirm that every development job, including background subagents, stops.
@@ -2947,7 +2986,7 @@ where
         emit_error(wants_json, &AppError::new("daemon_startup", error));
         return ExitCode::FAILURE;
     }
-    let cli = match Cli::try_parse_from(arguments.clone()) {
+    let cli = match Cli::try_parse_from(arguments.clone()).and_then(Cli::validated) {
         Ok(cli) => cli,
         Err(error)
             if matches!(
@@ -3021,7 +3060,9 @@ where
                 | DaemonCommand::StopForRebuild { .. }
                 | DaemonCommand::DowngradeStore { .. },
         } => Some(crate::daemon::hosting::LIFECYCLE_REFUSAL.into()),
-        TopCommand::CoordinateInstall { .. } | TopCommand::RestartWindows { .. } => {
+        TopCommand::CoordinateInstall { .. }
+        | TopCommand::SelectInstall { .. }
+        | TopCommand::RestartWindows { .. } => {
             Some("Installation and window restart commands require your own terminal".into())
         }
         TopCommand::Account {
@@ -3065,6 +3106,7 @@ where
                     | DaemonCommand::StoreSchema
                     | DaemonCommand::DowngradeStore { .. },
             } | TopCommand::CoordinateInstall { .. }
+                | TopCommand::SelectInstall { .. }
                 | TopCommand::RestartWindows { .. }
         )
     {
@@ -3335,6 +3377,7 @@ fn routes_to_staged_owner(command: &TopCommand) -> bool {
             | TopCommand::CoordinateInstall { .. }
             | TopCommand::VerifyInstallGuard { .. }
             | TopCommand::RecordDeferredInstall { .. }
+            | TopCommand::SelectInstall { .. }
             | TopCommand::UpdateWorker { .. }
             | TopCommand::RestartWindows { .. }
             | TopCommand::Daemon {
@@ -3396,10 +3439,13 @@ fn execute_with_model_context(
             Some(context) => automations::execute_with_context(command, &context),
             None => automations::execute(command),
         },
-        TopCommand::Work { command } => match service_context {
-            Some(context) => work::execute_with_context(command, &context),
-            None => work::execute(command),
-        },
+        TopCommand::Work { command, list } => {
+            let command = command.unwrap_or(WorkCommand::List(list));
+            match service_context {
+                Some(context) => work::execute_with_context(command, &context),
+                None => work::execute(command),
+            }
+        }
         TopCommand::Agent { command } => match service_context {
             Some(context) => agents::execute_with_context(command, &context),
             None => agents::execute(command),
@@ -3421,10 +3467,13 @@ fn execute_with_model_context(
         } => {
             crate::install_guard::run(&prefix, &installer, &arguments, stage_only)
                 .map_err(|error| AppError::new("install", error))?;
+            let selected = stage_only && arguments.iter().any(|argument| argument == "--select");
             Ok(CommandOutput {
                 command: "update.coordinate_install",
-                data: json!({"reopened": !stage_only, "staged": stage_only}),
-                human: if stage_only {
+                data: json!({"reopened": !stage_only, "staged": stage_only, "selected": selected}),
+                human: if selected {
+                    "Installed version selected; running windows and daemon preserved"
+                } else if stage_only {
                     "Update staged; running windows and daemon preserved"
                 } else {
                     "Installer finished; saved windows reopened"
@@ -3461,6 +3510,19 @@ fn execute_with_model_context(
                 command: "update.record_deferred_install",
                 data: json!({"deferred":true}),
                 human: "Daemon replacement deferred".into(),
+            })
+        }
+        TopCommand::SelectInstall {
+            prefix,
+            version_root,
+            expect_current,
+        } => {
+            crate::install_guard::select_staged(&prefix, &version_root, &expect_current)
+                .map_err(|error| AppError::new("install", error))?;
+            Ok(CommandOutput {
+                command: "update.select_install",
+                data: json!({"selected": true}),
+                human: "Installed version selected".into(),
             })
         }
         TopCommand::Ui {
@@ -4234,18 +4296,38 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                     "Rebuilding stops all development terminal/chat jobs and their background subagents; pass --including-subagents to permit this.",
                 ));
             }
-            let stopped = crate::daemon::terminate_daemon_from_lock()
-                .map_err(|error| AppError::new("daemon_process", error))?;
+            // Returns only once the original process has exited, so a caller
+            // can start its replacement at once without polling the socket.
+            let stopped = crate::daemon::terminate_daemon_from_lock(DAEMON_STOP_TIMEOUT)
+                .map_err(rebuild_stop_error)?;
             Ok(CommandOutput {
                 command: "daemon.stop_for_rebuild",
                 data: json!({ "instance": instance::NAME, "stopped": stopped }),
                 human: if stopped {
-                    format!("{} daemon stopping", instance::NAME)
-                } else {
                     format!("{} daemon stopped", instance::NAME)
+                } else {
+                    format!("{} daemon was not running", instance::NAME)
                 },
             })
         }
+    }
+}
+
+/// A stop that times out is the same condition as an accepted `daemon stop`
+/// that does not finish, so it reports the same kind. Stopping prepares no
+/// runtime, so an I/O failure is reported without that platform prefix.
+fn rebuild_stop_error(error: crate::daemon::PlatformError) -> AppError {
+    match error {
+        crate::daemon::PlatformError::Io(io) => AppError {
+            kind: if io.kind() == std::io::ErrorKind::TimedOut {
+                "shutdown_timeout"
+            } else {
+                "daemon_process"
+            },
+            message: io.to_string(),
+            details: Some(json!({ "instance": instance::NAME, "stopped": false })),
+        },
+        error => AppError::new("daemon_process", error),
     }
 }
 
@@ -6423,6 +6505,18 @@ mod tests {
         assert!(human.contains(&channel.id.to_string()));
         // Channel repository identity is retained; it is not asserted to be a checkout path.
         assert!(human.contains("/repo/.git"));
+    }
+
+    #[test]
+    fn a_rebuild_stop_timeout_reports_an_unfinished_stop() {
+        let message = "the daemon (process 7) did not exit within 30 seconds of SIGTERM";
+        let timeout = rebuild_stop_error(io::Error::new(io::ErrorKind::TimedOut, message).into());
+        assert_eq!(timeout.kind, "shutdown_timeout");
+        assert_eq!(timeout.message, message, "no runtime-preparation prefix");
+        assert_eq!(timeout.details.unwrap()["stopped"], json!(false));
+        let other = rebuild_stop_error(io::Error::other("refused").into());
+        assert_eq!(other.kind, "daemon_process");
+        assert_eq!(other.message, "refused");
     }
 
     #[test]

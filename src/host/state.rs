@@ -3464,8 +3464,8 @@ impl ChatRestore {
 ///
 /// The accept loop is the only other place that observes
 /// `daemon::termination_requested`, and it is not reached until this returns, so
-/// without these checks `cagents daemon stop-for-rebuild` reported "daemon
-/// stopping" while the daemon kept launching checkpointed processes, and a
+/// without these checks the daemon kept launching checkpointed processes after
+/// `cagents daemon stop-for-rebuild` had asked it to stop, and a
 /// logout `SIGKILL` mid-restore left the checkpoint in `Phase::Restoring`, which
 /// is never automatically replayed for native sessions. Aborting through
 /// `close_failed_restore` positively closes whatever was already started and

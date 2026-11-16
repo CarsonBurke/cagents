@@ -91,6 +91,8 @@ Options:
   --version VERSION  Install a release version (default: latest v* release)
   --prefix PATH      Installation root (default: $XDG_DATA_HOME/cagents-install)
   --stage-only       Publish a verified update without changing running windows or daemon
+  --select VERSION   With --stage-only, serve an installed version instead of this release;
+                     selecting the running version withdraws a staged update
   --restart-daemon   Checkpoint supported sessions and replace the running daemon
   --require-empty-daemon  With --restart-daemon, refuse to interrupt live sessions
   --relaunch-agents  With --restart-daemon, relaunch non-resumable agents into their resume picker
@@ -118,6 +120,7 @@ UNINSTALL=0
 PURGE=0
 RESTART_DAEMON=0
 STAGE_ONLY=0
+SELECT_VERSION=
 REQUIRE_EMPTY_DAEMON=0
 RELAUNCH_AGENTS=
 PREPARE_CANDIDATE=
@@ -148,6 +151,11 @@ while [ "$#" -gt 0 ]; do
         --supports-prepared-candidate)
             [ "$#" -eq 1 ] || fail '--supports-prepared-candidate takes no arguments'
             exit 0
+            ;;
+        --select)
+            [ "$#" -ge 2 ] && [ -n "$2" ] || fail '--select requires a version'
+            SELECT_VERSION=$2
+            shift 2
             ;;
         --restart-daemon)
             RESTART_DAEMON=1
@@ -214,6 +222,17 @@ fi
 
 [ -z "$RELAUNCH_AGENTS" ] || [ "$RESTART_DAEMON" -eq 1 ] \
     || fail '--relaunch-agents and --no-relaunch-agents require --restart-daemon'
+if [ -n "$SELECT_VERSION" ]; then
+    # Selection never closes windows or touches the daemon. Requiring the
+    # option that promises this keeps the effect explicit at the call site.
+    [ "$STAGE_ONLY" -eq 1 ] || fail '--select requires --stage-only'
+    case $SELECT_VERSION in
+        v*) SELECT_VERSION=${SELECT_VERSION#v} ;;
+    esac
+    case $SELECT_VERSION in
+        ''|[!0-9]*|*..*|*[!0-9A-Za-z.+~-]*) fail "unsafe selected version: $SELECT_VERSION" ;;
+    esac
+fi
 [ "$REQUIRE_EMPTY_DAEMON" -eq 0 ] || [ "$RESTART_DAEMON" -eq 1 ] \
     || fail '--require-empty-daemon requires --restart-daemon'
 
@@ -1064,6 +1083,13 @@ if [ -n "$PREPARE_CANDIDATE$PREPARED_CANDIDATE" ]; then
     fi \
         || fail 'the candidate cannot validate the worker application update fence'
     COORDINATOR=$CANDIDATE_COORDINATOR
+elif [ -n "$SELECT_VERSION" ]; then
+    # The installed builds may predate selection, and the served one may be
+    # the build being withdrawn. Only this verified release coordinates it.
+    supports_stage_guard "$CANDIDATE_COORDINATOR" \
+        && installer_tool "$CANDIDATE_COORDINATOR" select-install --help >/dev/null 2>&1 \
+        || fail 'this release cannot select an installed version; run --select with the installer of a release that supports it; installation was not changed'
+    COORDINATOR=$CANDIDATE_COORDINATOR
 elif [ "$STAGE_ONLY" -eq 1 ]; then
     # Staged launch routing is interpreted by this exact candidate set. An old
     # candidate cannot borrow a newer installed coordinator's staging support.
@@ -1111,6 +1137,7 @@ else
     fi
     set -- --version "$VERSION" --prefix "$PREFIX"
     [ "$STAGE_ONLY" -eq 0 ] || set -- "$@" --stage-only
+    [ -z "$SELECT_VERSION" ] || set -- "$@" --select "$SELECT_VERSION"
     [ "$RESTART_DAEMON" -eq 0 ] || set -- "$@" --restart-daemon
     [ "$REQUIRE_EMPTY_DAEMON" -eq 0 ] || set -- "$@" --require-empty-daemon
     case $RELAUNCH_AGENTS in
@@ -1149,6 +1176,35 @@ else
     COORDINATOR_PID=
     trap 'exit 1' HUP INT TERM
     exit "$COORDINATOR_STATUS"
+fi
+
+refresh_launcher_caches() {
+    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+        gtk-update-icon-cache --force --ignore-theme-index "$DATA_HOME/icons/hicolor" >/dev/null 2>&1 || :
+    fi
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database "$DATA_HOME/applications" >/dev/null 2>&1 || :
+    fi
+}
+
+if [ -n "$SELECT_VERSION" ]; then
+    # Nothing from this release is installed: its coordinator only switches
+    # current, under the held launch fence and staging ownership checks, to a
+    # complete version that is already installed in this prefix.
+    [ ! -L "$PREFIX" ] || fail "refusing to install through symlink $PREFIX"
+    [ -L "$PREFIX/current" ] || fail "no installed version to select from at $PREFIX"
+    SELECTED_FROM=$(readlink "$PREFIX/current") || fail "cannot inspect $PREFIX/current"
+    "$COORDINATOR" select-install --prefix "$PREFIX" \
+        --version-root "$PREFIX/versions/$SELECT_VERSION" \
+        --expect-current "$SELECTED_FROM" >/dev/null \
+        || fail "version $SELECT_VERSION was not selected"
+    if [ -L "$DESKTOP_LINK" ] && [ "$(readlink "$DESKTOP_LINK" 2>/dev/null || :)" = "$DESKTOP_TARGET" ]; then
+        # Refresh directory watchers after switching the version target.
+        ln -snf "$DESKTOP_TARGET" "$DESKTOP_LINK" || :
+    fi
+    refresh_launcher_caches
+    printf 'Serving installed cagents %s; running windows and daemon were preserved. Windows offer an update only while it differs from the version they run.\n' "$SELECT_VERSION"
+    exit 0
 fi
 
 if [ -L "$PREFIX" ]; then
@@ -1695,12 +1751,12 @@ TRANSACTION_COMMITTED=1
 if [ "$NEW_VERSION_RETAINED" -eq 1 ]; then
     rm -f "$NEW_VERSION_DIR/$RETAINED_MARKER"
 fi
-if command -v gtk-update-icon-cache >/dev/null 2>&1; then
-    gtk-update-icon-cache --force --ignore-theme-index "$DATA_HOME/icons/hicolor" >/dev/null 2>&1 || :
+# A published candidate is an ordinary installed tree. Markers left on a tree
+# that failed or rolled back keep it from being selected without revalidation.
+if [ "$NEW_VERSION_PREPARED" -eq 1 ]; then
+    rm -f "$NEW_VERSION_DIR/$PREPARED_MARKER"
 fi
-if command -v update-desktop-database >/dev/null 2>&1; then
-    update-desktop-database "$DATA_HOME/applications" >/dev/null 2>&1 || :
-fi
+refresh_launcher_caches
 
 
 if [ "$STAGE_ONLY" -eq 1 ]; then

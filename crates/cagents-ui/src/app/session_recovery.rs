@@ -503,6 +503,46 @@ mod tests {
     }
 
     #[test]
+    fn recovery_review_debug_redacts_launch_environment_values() {
+        let (_directory, mut app, card) = fixture();
+        let mut state = (*app.durable).clone();
+        for pane in &mut state.cards {
+            let CardKind::Terminal(terminal) = &mut pane.kind else {
+                continue;
+            };
+            terminal.launch.environment.insert(
+                "PRIVATE_RECOVERY_ENVIRONMENT".into(),
+                "PRIVATE_RECOVERY_VALUE".into(),
+            );
+        }
+        let source = state.cards[0].id;
+        let terminal = match &state
+            .cards
+            .iter()
+            .find(|pane| pane.id == card)
+            .unwrap()
+            .kind
+        {
+            CardKind::Terminal(terminal) => terminal.id,
+            _ => unreachable!(),
+        };
+        let review = Review::from_snapshot(
+            &state,
+            TerminalPaneAdoption {
+                alias: source,
+                canonical: card,
+                terminal,
+            },
+        )
+        .unwrap();
+
+        let diagnostic = format!("{review:?}");
+        assert!(diagnostic.contains("PRIVATE_RECOVERY_ENVIRONMENT"));
+        assert!(!diagnostic.contains("PRIVATE_RECOVERY_VALUE"));
+        app.session.as_mut().unwrap().shutdown();
+    }
+
+    #[test]
     fn retained_recovery_control_keeps_press_and_focus_with_its_original_terminal() {
         use iced::advanced::{Layout, Shell, clipboard, layout, mouse, widget::Tree};
         use iced::{Event, Rectangle, Size};

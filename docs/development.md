@@ -132,7 +132,7 @@ enabled. See [Daemon and upgrades](daemon.md#development-instance).
 
 The CLI, UI client, and terminal host have separate Cargo feature boundaries.
 The root `cagents` package is the shared library with the `cagents` and
-`cagentsd` binaries. The application (`src/app` and the other UI-only modules)
+`cagentsd` binaries. The application (`crates/cagents-ui/src/app` and the other UI-only modules)
 and the `cagents-ui` binary are the `cagents-ui` package in `crates/cagents-ui`,
 which depends on the shared library's `ui` feature. Editing the application
 recompiles only that package; editing the shared library recompiles both.
@@ -265,8 +265,10 @@ mise run dev -- --debug --log-file /tmp/cagents-ui.log
 Use `--fresh-daemon` after changing daemon, terminal-host, IPC/protocol, or
 process-lifecycle code, so the UI cannot reconnect to an older development
 daemon. It compiles a feature-matched control CLI, pins and validates the
-isolated daemon through a Linux pidfd, and signals it without depending on the
-old wire protocol. Selecting `--fresh-daemon` explicitly permits stopping every hosted development
+isolated daemon through a Linux pidfd, signals it without depending on the
+old wire protocol, and waits up to 30 seconds for that process to exit before
+the replacement starts; if it is still stopping then, the launch fails rather
+than start beside it. Selecting `--fresh-daemon` explicitly permits stopping every hosted development
 terminal/chat job and its background subagents. Background work will not resume
 automatically. The runner prints this impact before signaling the daemon.
 
@@ -560,8 +562,8 @@ changes). A watched source change is not proof that it was safely patched.
 has successfully linked and launched the actual replacement executable, after
 shared argument parsing and before ordinary UI startup.
 It verifies the matched sibling CLI version, stops the development jobs and
-waits for the private socket to close. Any replacement build failure leaves the
-existing daemon running. Help/invalid arguments/internal helper launches cannot
+waits up to 30 seconds for the daemon process to exit. Any replacement build
+failure leaves the existing daemon running. Help/invalid arguments/internal helper launches cannot
 consume restart intent. Valid named/device/new-window arguments remain supported.
 
 Qualification for this lane includes an actual view-only edit, unchanged UI PID
@@ -1407,34 +1409,14 @@ mise run test:host -- --test terminal_load_contract
 mise run test:ui -- --test session_restore_contract
 ```
 
-For focused library tests, compile one isolated test harness and run the
-Cargo-reported executable directly, after its build admission has ended.
-
-`--no-run` only compiles tests. A later direct harness launch, including
-`scripts/test-lib host`, must receive its own matched helper, because it runs
-outside the gate. Prepare it immediately before that launch, without changing
-sources, Cargo environment, target or profile:
-
-```sh
-(
-    CAGENTS_TEST_RETAINED_ACTOR_HELPER=$(
-        scripts/cargo-gate exec /usr/bin/python3 scripts/build-ceditor-product cagentsd --locked \
-            --no-default-features --features host --profile test --bin cagentsd
-    ) || exit
-    export CAGENTS_TEST_RETAINED_ACTOR_HELPER
-    scripts/test-lib host --prefix terminal:: --test-threads 1
-)
-```
-
-Use the same profile option in both commands when overriding it. The gate
-translates a supplied helper path inside the checkout or target to its build-host
-copy; a path outside both is refused. A matching version alone does not prove
-that binaries from two dirty source trees match. CLI and UI focused runs need no
-helper. The `ui` lane runs the application's tests (`-p cagents-ui`);
+For focused library tests, `scripts/test-lib` builds one lane's library test
+harness and runs exactly the tests you name, through one `scripts/cargo-gate test`
+command. The `ui` lane runs the application's tests (`-p cagents-ui`);
 `shared-ui` runs the shared library's tests under `--features ui`:
 
 ```sh
 scripts/test-lib cli search_match::tests::overlapping_occurrences_keep_the_best_boundary_rank
+scripts/test-lib host --prefix terminal:: --test-threads 1
 scripts/test-lib ui --profile dev-runtime --prefix app::chat_ui::
 scripts/test-lib shared-ui --prefix settings::
 ```
@@ -1442,24 +1424,47 @@ scripts/test-lib shared-ui --prefix settings::
 Use actual full test names, or repeat `--prefix MODULE::` for literal module
 groups. Prefixes expand to ordinary full names and overlapping selections run
 once. The command rejects missing names, duplicate exact names, empty groups,
-ambiguous artifacts and ignored-only selections. An explicitly named ignored
-test is refused; ignored tests within a prefix are visibly skipped. Use the
-existing explicit opt-in workflow for ignored cases, after satisfying their
-fixture and authority requirements.
+a harness from another package and ignored-only selections, before any test
+runs. An explicitly named ignored test is refused; ignored tests within a
+prefix are visibly skipped. Use the existing explicit opt-in workflow for
+ignored cases, after satisfying their fixture and authority requirements.
 
-The helper fixes `--locked --no-default-features --package cagents --lib` and
-selects only the requested CLI, HOST or UI boundary. It preserves the caller's
-Cargo environment, stdin, test exit status and cancellation. It submits one
-test-compilation command through `scripts/cargo-gate`, then performs discovery
-and exact execution without Cargo. Set the usual `CARGO_BUILD_JOBS`,
-`CARGO_TARGET_DIR` and `CAGENTS_BUILD_LOCK` as needed. The gate's existing build
-directory seeding policy also applies; `CAGENTS_BUILD_SEED=0` disables it. Keep
-source and target unchanged until the command finishes; a detected executable
-replacement is refused.
+The tests run where the gate runs any other test: on the build host, from the
+copy of the checkout that built them, or here after a local build. Tests that
+reach repository files through `env!("CARGO_MANIFEST_DIR")`, such as the
+`fixture_workspace::` tests that run `scripts/fixture-workspace`, therefore find
+them, and each test starts in its package's root, as under `cargo test`. To do
+this, `test-lib` makes itself Cargo's runner for the harness
+(`target.'cfg(all())'.runner`, which keeps the gate from adding its own). Cargo
+starts it with the harness's path; it lists the harness, resolves the selection
+to exact names and replaces itself with the harness. Cargo prefers a runner
+configured for the exact target, as in `~/.cargo/config.toml`; the first
+argument `test-lib` passes after `--` is one only its runner accepts, so with
+such a runner the harness fails rather than run the names as loose filters.
+Because the gate prepares the HOST helper for any HOST test command,
+`scripts/test-lib host` needs no helper of its own; an explicitly supplied
+`CAGENTS_TEST_RETAINED_ACTOR_HELPER` is kept, as above.
+
+The helper fixes `--locked --no-default-features --lib` and the lane's package
+and features. Everything else is the gate's: its admission, build host, memory
+limit for the tests, stdin (none on the build host), cancellation and exit
+status, which is the harness's or that of a refusal (2), as Cargo passes it on.
+Cargo's `error: test failed` that follows a refusal belongs to the line
+`test-lib:` printed before it. The command runs in a process group of its own,
+and a signal sent to `test-lib` goes to that whole group, as a terminal's Ctrl-C
+would: built locally, the gate becomes Cargo, which ignores an interrupt while
+its tests run and passes no signal on. After a signal, `test-lib` ends only once
+the group has, killing what is left after 5 seconds. In a terminal's foreground
+job the group gets the terminal, as a shell's job would, so Ctrl-C reaches each
+process once, the tests can read the terminal, and Ctrl-Z stops the job and
+`test-lib` with it. Set the usual `CARGO_BUILD_JOBS`,
+`CARGO_TARGET_DIR` and `CAGENTS_BUILD_LOCK` as needed. Keep sources unchanged
+until the command finishes; a harness replaced while it is being listed is
+refused.
 
 Run the helper outside `cargo-gate exec`, a parent `flock`, or a coordinator's
-held build lease. It refuses inherited admission because a child cannot release
-its parent's lock. The ordinary `cargo-gate test` commands above remain useful
+held build lease: it refuses inherited admission. The ordinary `cargo-gate test`
+commands above remain useful
 for integration targets, broader suites and explicit ignored-test workflows.
 
 GitHub's script contracts run the Python suites listed in
@@ -2292,7 +2297,8 @@ elsewhere before cleanup. Run the pure checks with
 | `Config files in .../mise.toml are not trusted` | Run `mise trust` in that worktree, or trust the whole checkout with `mise settings add trusted_config_paths PATH`. |
 | Something else is missing | `mise run doctor` names each missing prerequisite and its fix. |
 | The UI talks to an old daemon after you changed daemon, host, or IPC code | Relaunch with `--fresh-daemon`. |
-| `development daemon did not stop within 5 seconds` | Look for a lingering development daemon with `pgrep -a cagentsd`, let it exit (or stop that process), then retry `--fresh-daemon`. The socket is `$XDG_RUNTIME_DIR/cagents-development/cagentsd.sock`. |
+| `the daemon (process PID) did not exit within 30 seconds of SIGTERM` | `--fresh-daemon` stopped the instance's daemon and waited for that process to exit; it is still stopping its sessions. Let it exit (`ps -p PID`), then retry `--fresh-daemon`. |
+| `instance NAME daemon did not stop within 5 seconds` | `--stop-instance` stopped the daemon with a CLI that may predate waiting for exit, and its socket remained. Look for the lingering daemon with `pgrep -a cagentsd`, let it exit (or stop that process), then retry. |
 | Compilation exhausts RAM or swap | Lower `CARGO_BUILD_JOBS`, use `--browserless`, and build through `scripts/cargo-gate` rather than starting builds side by side; see [resource usage](#build-and-test-resource-usage). |
 | A UI problem needs logs | Add `--debug --log-file /tmp/cagents-ui.log` and read the file after reproducing. |
 | New links do not open in browserless mode | Install `xdg-utils`, or use a desktop with a working portal. |

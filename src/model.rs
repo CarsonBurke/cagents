@@ -234,7 +234,7 @@ impl CardKind {
 
 /// An argv-based launch recipe. `program` is never interpreted by a shell and
 /// every argument and environment entry remains a separate value.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaunchRecipe {
     pub program: String,
     pub arguments: Vec<String>,
@@ -244,6 +244,30 @@ pub struct LaunchRecipe {
     /// selected accounts must survive daemon restarts without saving credentials.
     #[serde(default)]
     pub unset_environment: BTreeSet<String>,
+}
+
+/// Environment values can carry credentials, so diagnostics name each variable
+/// without printing its value.
+impl std::fmt::Debug for LaunchRecipe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LaunchRecipe")
+            .field("program", &self.program)
+            .field("arguments", &self.arguments)
+            .field("working_directory", &self.working_directory)
+            .field("environment", &RedactedEnvironment(&self.environment))
+            .field("unset_environment", &self.unset_environment)
+            .finish()
+    }
+}
+
+struct RedactedEnvironment<'a>(&'a BTreeMap<String, String>);
+
+impl std::fmt::Debug for RedactedEnvironment<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map()
+            .entries(self.0.keys().map(|name| (name, format_args!("<redacted>"))))
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -1641,6 +1665,26 @@ mod durable_save_workload;
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn launch_recipe_debug_names_environment_without_values() {
+        let mut recipe = LaunchRecipe {
+            program: "/bin/sh".into(),
+            arguments: vec!["-l".into()],
+            working_directory: "/work".into(),
+            environment: BTreeMap::new(),
+            unset_environment: BTreeSet::from(["OLD_TOKEN".into()]),
+        };
+        recipe
+            .environment
+            .insert("API_TOKEN".into(), "secret-value".into());
+
+        let diagnostic = format!("{recipe:?}");
+        assert!(diagnostic.contains("API_TOKEN"), "{diagnostic}");
+        assert!(diagnostic.contains("OLD_TOKEN"), "{diagnostic}");
+        assert!(diagnostic.contains("/bin/sh"), "{diagnostic}");
+        assert!(!diagnostic.contains("secret-value"), "{diagnostic}");
+    }
 
     fn titled(title: &str) -> CardState {
         CardState {

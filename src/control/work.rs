@@ -2,7 +2,7 @@
 //! progress, newest activity first.
 use super::*;
 use crate::work::{
-    ActivitySource, Board, CheckOutcome, Column, ConversationPullRequests, Forge, Item, Keep,
+    Board, CheckOutcome, Column, ConversationPullRequests, Forge, Item, ItemKey, Keep,
     PullRequestState, Removal, RemovalPlan, Removed, Request, Response, Review, SavedSnapshot,
     Scope,
 };
@@ -21,16 +21,18 @@ const REMOVE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug, Subcommand)]
 pub enum WorkCommand {
-    /// List every worktree and branch in progress, newest activity first.
+    /// List this project's worktrees and branches in progress, newest
+    /// activity first. `cagents work` alone does this.
     #[command(visible_alias = "ls")]
-    List(ListArgs),
+    List(WorkListArgs),
     /// Pin a card to a column, overriding the column its state implies.
     Pin {
         /// The card's branch, or its worktree's path.
         item: String,
         /// active, in-progress, in-review, landed or stale.
         column: Column,
-        /// The open project the card belongs to, by name or path.
+        /// The open project the card belongs to, by name or path. The
+        /// default is the project containing the current directory.
         #[arg(long)]
         project: Option<PathBuf>,
     },
@@ -38,19 +40,26 @@ pub enum WorkCommand {
     Unpin {
         /// The card's branch, or its worktree's path.
         item: String,
-        /// The open project the card belongs to, by name or path.
+        /// The open project the card belongs to, by name or path. The
+        /// default is the project containing the current directory.
         #[arg(long)]
         project: Option<PathBuf>,
     },
-    /// Remove a card's worktree, keeping its branch. Removal is refused while
-    /// a session or process uses the worktree, and unless nothing unsaved
-    /// would be lost or --snapshot or --discard says what happens to it.
+    /// Remove a card's worktree, keeping its branch.
+    ///
+    /// Removal is refused while a session or process uses the worktree, and
+    /// unless nothing unsaved would be lost or --snapshot or --discard says
+    /// what happens to it. --dry-run shows the plan.
     #[command(visible_alias = "remove")]
     Rm(RemoveArgs),
-    /// List the snapshots worktree removals kept, newest first. Restore one
-    /// with `git stash apply --index REF` in any worktree of its project.
+    /// List the snapshots worktree removals kept, newest first.
+    ///
+    /// Restore one with `git stash apply --index REF` in any worktree of its
+    /// project.
     Snapshots {
         /// Only the open project with this name, or containing this path.
+        /// The default is the project containing the current directory, or
+        /// every project outside one.
         #[arg(long)]
         project: Option<PathBuf>,
     },
@@ -60,7 +69,8 @@ pub enum WorkCommand {
 pub struct RemoveArgs {
     /// The card's branch, or its worktree's path.
     item: String,
-    /// The open project the card belongs to, by name or path.
+    /// The open project the card belongs to, by name or path. The default
+    /// is the project containing the current directory.
     #[arg(long)]
     project: Option<PathBuf>,
     /// Keep unsaved changes as a snapshot before removing the worktree.
@@ -88,11 +98,16 @@ pub struct RemoveArgs {
     yes: bool,
 }
 
-#[derive(Debug, clap::Args)]
-pub struct ListArgs {
-    /// Only the open project with this name, or containing this path.
+#[derive(Debug, Default, PartialEq, clap::Args)]
+pub struct WorkListArgs {
+    /// Only the open project with this name, or containing this path. The
+    /// default is the project containing the current directory, or every
+    /// project outside one.
     #[arg(long)]
     project: Option<PathBuf>,
+    /// Every open project's cards.
+    #[arg(long, conflicts_with = "project")]
+    all: bool,
     /// Only cards in this column: active, in-progress, in-review, landed or
     /// stale.
     #[arg(long)]
@@ -101,7 +116,15 @@ pub struct ListArgs {
     /// daemon's latest facts.
     #[arg(long)]
     fresh: bool,
+    /// The newest cards of each column to list, or 0 for all of them.
+    /// [default: 10; every card with --json]
+    #[arg(long, value_name = "N")]
+    limit: Option<usize>,
 }
+
+/// How many cards of each column a listing shows when no `--limit` says.
+/// The rest are counted, and `--json` reports them all.
+const DEFAULT_LIMIT: usize = 10;
 
 impl ControlClient {
     fn work(&mut self, request: Request, timeout: Duration) -> Result<Response, ControlError> {
@@ -254,48 +277,101 @@ impl ControlClient {
     }
 }
 
-fn scope(project: Option<PathBuf>) -> Result<Scope, AppError> {
-    Ok(match project {
-        Some(project) => Scope::Project(super::project_argument(project)?),
-        None => Scope::All,
-    })
+/// One connection to the daemon for a work command, which reads what the
+/// command covers and then asks for it. Inside a hosted session the daemon
+/// lets a connection read the board but change it only once it names its
+/// authority, which a changing command's connection does first.
+struct Daemon<'a> {
+    context: &'a ServiceRequestContext,
+    client: ControlClient,
+}
+
+impl<'a> Daemon<'a> {
+    fn connect(context: &'a ServiceRequestContext, changes: bool) -> Result<Self, AppError> {
+        let mut client = context.connect()?;
+        if changes && context.scoped() {
+            client
+                .authenticate(context.authority.clone())
+                .map_err(protocol_error)?;
+        }
+        Ok(Self { context, client })
+    }
+
+    /// The projects a command covers: the open project `project` names, or
+    /// else the one [`Self::here`] finds, or else every project.
+    fn scope(&mut self, project: Option<PathBuf>) -> Result<Scope, AppError> {
+        Ok(match project {
+            Some(project) => Scope::Project(super::project_argument(project)?),
+            None => self.here()?.map_or(Scope::All, Scope::Project),
+        })
+    }
+
+    /// The open Git project containing the current directory, placed among
+    /// the daemon's open projects as the daemon places a session's
+    /// directory; none outside every one. A remote device's projects are not
+    /// where this shell runs, so there it finds none.
+    fn here(&mut self) -> Result<Option<PathBuf>, AppError> {
+        if self.context.remote {
+            return Ok(None);
+        }
+        let Ok(directory) = std::env::current_dir() else {
+            return Ok(None);
+        };
+        let (_, projects) = self
+            .client
+            .read_workspace_projects()
+            .map_err(protocol_error)?;
+        Ok(containing(&directory, &projects))
+    }
+
+    fn send(&mut self, request: Request, timeout: Duration) -> Result<Response, AppError> {
+        self.send_with(request, timeout, protocol_error)
+    }
+
+    fn send_with(
+        &mut self,
+        request: Request,
+        timeout: Duration,
+        failed: impl FnOnce(ControlError) -> AppError,
+    ) -> Result<Response, AppError> {
+        self.client.work(request, timeout).map_err(failed)
+    }
+}
+
+/// The repository key of the open Git project `directory` is in. An open
+/// folder has no worktrees, so it widens the listing like no project.
+fn containing(
+    directory: &Path,
+    projects: &[crate::workspace_model::ModelProject],
+) -> Option<PathBuf> {
+    let repository = crate::project_location::place_among(directory, projects).project?;
+    projects
+        .iter()
+        .any(|project| {
+            project.repository == repository && project.kind == crate::model::ProjectKind::Git
+        })
+        .then_some(repository)
 }
 
 /// A card named by its worktree's path is sent as that path made canonical,
-/// as the daemon knows it; anything else is a branch name.
+/// as the daemon knows it; anything else is a branch name, or a path the
+/// daemon reads relative to the project's primary checkout. A leading `~`
+/// is the home directory, as a listing shows it, even when quoted.
 fn item_argument(item: String) -> String {
-    let path = Path::new(&item);
-    if path.join(".git").exists()
-        && let Ok(canonical) = std::fs::canonicalize(path)
+    item_in(item, std::env::var_os("HOME").as_deref().map(Path::new))
+}
+
+fn item_in(item: String, home: Option<&Path>) -> String {
+    let expanded = match (item.strip_prefix("~/"), home) {
+        (Some(rest), Some(home)) => home.join(rest),
+        _ => PathBuf::from(&item),
+    };
+    if expanded.join(".git").exists()
+        && let Ok(canonical) = std::fs::canonicalize(&expanded)
     {
         return canonical.to_string_lossy().into_owned();
     }
     item
-}
-
-fn send(
-    context: &ServiceRequestContext,
-    request: Request,
-    timeout: Duration,
-) -> Result<Response, AppError> {
-    send_with(context, request, timeout, protocol_error)
-}
-
-fn send_with(
-    context: &ServiceRequestContext,
-    request: Request,
-    timeout: Duration,
-    failed: impl FnOnce(ControlError) -> AppError,
-) -> Result<Response, AppError> {
-    let mut client = context.connect()?;
-    // Inside a hosted session the daemon lets this read the board but never
-    // change it, as it can tell once the connection names its authority.
-    if context.scoped() && matches!(request, Request::Pin { .. } | Request::Remove(_)) {
-        client
-            .authenticate(context.authority.clone())
-            .map_err(protocol_error)?;
-    }
-    client.work(request, timeout).map_err(failed)
 }
 
 pub(super) fn execute(command: WorkCommand) -> Result<CommandOutput, AppError> {
@@ -324,7 +400,8 @@ fn remove(
     arguments: RemoveArgs,
     context: &ServiceRequestContext,
 ) -> Result<CommandOutput, AppError> {
-    let scope = scope(arguments.project)?;
+    let mut daemon = Daemon::connect(context, false)?;
+    let scope = daemon.scope(arguments.project)?;
     let item = item_argument(arguments.item);
     let request = Request::RemovalPlan {
         scope: scope.clone(),
@@ -336,9 +413,11 @@ fn remove(
     } else {
         PLAN_TIMEOUT
     };
-    let Response::RemovalPlan(plan) = send(context, request, timeout)? else {
+    let Response::RemovalPlan(plan) = daemon.send(request, timeout)? else {
         return Err(AppError::new("work", "Unexpected Work board response"));
     };
+    // The removal, which may take minutes, asks on a connection of its own.
+    drop(daemon);
     let described = plan_human(&plan);
     if arguments.dry_run {
         return Ok(CommandOutput {
@@ -402,7 +481,8 @@ fn remove(
         ),
         error => protocol_error(error),
     };
-    let Response::Removed(removed) = send_with(context, request, REMOVE_TIMEOUT, unanswered)?
+    let Response::Removed(removed) =
+        Daemon::connect(context, true)?.send_with(request, REMOVE_TIMEOUT, unanswered)?
     else {
         return Err(AppError::new("work", "Unexpected Work board response"));
     };
@@ -417,10 +497,11 @@ fn snapshots(
     project: Option<PathBuf>,
     context: &ServiceRequestContext,
 ) -> Result<CommandOutput, AppError> {
+    let mut daemon = Daemon::connect(context, false)?;
     let request = Request::Snapshots {
-        scope: scope(project)?,
+        scope: daemon.scope(project)?,
     };
-    let Response::Snapshots(snapshots) = send(context, request, BOARD_TIMEOUT)? else {
+    let Response::Snapshots(snapshots) = daemon.send(request, BOARD_TIMEOUT)? else {
         return Err(AppError::new("work", "Unexpected Work board response"));
     };
     let human = snapshots_human(&snapshots, crate::chat::now_ms().unwrap_or_default());
@@ -550,9 +631,27 @@ fn snapshots_human(snapshots: &[SavedSnapshot], now_ms: u64) -> String {
     )
 }
 
-fn list(arguments: ListArgs, context: &ServiceRequestContext) -> Result<CommandOutput, AppError> {
+fn list(
+    arguments: WorkListArgs,
+    context: &ServiceRequestContext,
+) -> Result<CommandOutput, AppError> {
+    let mut daemon = Daemon::connect(context, false)?;
+    let placed = match (&arguments.project, arguments.all) {
+        (None, false) => daemon.here()?,
+        _ => None,
+    };
+    let program = super::format::program();
+    let named = arguments
+        .project
+        .as_ref()
+        .map(|project| super::format::shell_word(&project.display().to_string()));
+    let scope = match (arguments.project, placed.clone()) {
+        (Some(project), _) => Scope::Project(super::project_argument(project)?),
+        (None, Some(repository)) => Scope::Project(repository),
+        (None, None) => Scope::All,
+    };
     let request = Request::Board {
-        scope: scope(arguments.project)?,
+        scope: scope.clone(),
         fresh: arguments.fresh,
     };
     let timeout = if arguments.fresh {
@@ -560,20 +659,37 @@ fn list(arguments: ListArgs, context: &ServiceRequestContext) -> Result<CommandO
     } else {
         BOARD_TIMEOUT
     };
-    let Response::Board(mut board) = send(context, request, timeout)? else {
+    let Response::Board(mut board) = daemon.send(request, timeout)? else {
         return Err(AppError::new("work", "Unexpected Work board response"));
     };
     if let Some(column) = arguments.column {
         board.items.retain(|item| item.column == column);
     }
-    let human = board_human(
-        &board,
-        arguments.column,
-        crate::chat::now_ms().unwrap_or_default(),
-    );
+    // The card of the worktree this shell is in is always listed.
+    let current = (!context.remote)
+        .then(|| std::env::current_dir().and_then(std::fs::canonicalize).ok())
+        .flatten()
+        .and_then(|directory| current_worktree(&board.items, &directory));
+    let listing = Listing {
+        column: arguments.column,
+        limit: arguments.limit.unwrap_or(DEFAULT_LIMIT),
+        program: &program,
+        project: named.as_deref(),
+        all: arguments.all,
+        placed: placed.is_some(),
+        current: current.as_deref(),
+    };
+    let human = board_human(&board, &listing, crate::chat::now_ms().unwrap_or_default());
+    let omitted = arguments
+        .limit
+        .map(|limit| listing.omit(&mut board.items, limit));
+    let mut data = json!({ "board": board, "scope": scope });
+    if let Some(omitted) = omitted {
+        data["omitted"] = json!(omitted);
+    }
     Ok(CommandOutput {
         command: "work.list",
-        data: json!({ "board": board }),
+        data,
         human,
     })
 }
@@ -584,12 +700,13 @@ fn pin(
     project: Option<PathBuf>,
     context: &ServiceRequestContext,
 ) -> Result<CommandOutput, AppError> {
+    let mut daemon = Daemon::connect(context, true)?;
     let request = Request::Pin {
-        scope: scope(project)?,
+        scope: daemon.scope(project)?,
         item: item_argument(item),
         column,
     };
-    let Response::Pinned(item) = send(context, request, BOARD_TIMEOUT)? else {
+    let Response::Pinned(item) = daemon.send(request, BOARD_TIMEOUT)? else {
         return Err(AppError::new("work", "Unexpected Work board response"));
     };
     let human = match column {
@@ -611,50 +728,160 @@ fn pin(
     })
 }
 
-/// One table per column, in board order, then what kept any project from
-/// being read in full. `filtered_to` names the column the cards were
-/// filtered to.
-fn board_human(board: &Board, filtered_to: Option<Column>, now_ms: u64) -> String {
-    let mut sections = Vec::new();
-    for column in Column::ALL {
-        let items = board
+/// How a board is listed: the column it was filtered to, how many cards
+/// of each column to show, how the command that listed it named this
+/// program and its projects, so a hint can extend it, whether its project
+/// was the current directory's, and that directory.
+struct Listing<'a> {
+    column: Option<Column>,
+    limit: usize,
+    program: &'a str,
+    /// `--project`'s value, quoted for the shell.
+    project: Option<&'a str>,
+    all: bool,
+    placed: bool,
+    /// The worktree this shell is in, if the board has its card.
+    current: Option<&'a Path>,
+}
+
+impl Listing<'_> {
+    /// Whether `item` is listed when it is the `index`th card of its column:
+    /// one of the newest `limit`, or the card of the worktree this shell is in.
+    fn shows(&self, item: &Item, index: usize, limit: usize) -> bool {
+        limit == 0
+            || index < limit
+            || self.current.is_some_and(|current| {
+                item.worktree
+                    .as_ref()
+                    .is_some_and(|worktree| worktree.path == current)
+            })
+    }
+
+    /// Keeps the cards of each column [`Self::shows`] lists, in board order,
+    /// and counts the rest by column.
+    fn omit(
+        &self,
+        items: &mut Vec<Item>,
+        limit: usize,
+    ) -> std::collections::BTreeMap<Column, usize> {
+        let mut seen = std::collections::HashMap::<Column, usize>::new();
+        let mut omitted = std::collections::BTreeMap::new();
+        items.retain(|item| {
+            let index = seen.entry(item.column).or_default();
+            let shown = self.shows(item, *index, limit);
+            *index += 1;
+            if !shown {
+                *omitted.entry(item.column).or_default() += 1;
+            }
+            shown
+        });
+        omitted
+    }
+}
+
+/// The worktree of `items` that holds `directory`: the innermost, since a
+/// project's linked worktrees usually sit inside its primary checkout.
+fn current_worktree(items: &[Item], directory: &Path) -> Option<PathBuf> {
+    items
+        .iter()
+        .filter_map(|item| item.worktree.as_ref())
+        .map(|worktree| &worktree.path)
+        .filter(|path| directory.starts_with(path))
+        .max_by_key(|path| path.components().count())
+        .cloned()
+}
+
+const HEADERS: [&str; 9] = [
+    "CARD",
+    "PROJECT",
+    "ACTIVITY",
+    "BASE",
+    "CHANGES",
+    "PULL REQUEST",
+    "TICKET",
+    "SESSIONS",
+    "WORKTREE",
+];
+
+/// One table per column, in board order, the newest `limit` cards of each,
+/// then what kept any project from being read in full and what to run next.
+/// A project every card shares is named once, with where it is, rather than
+/// on every row, and its worktrees are shown relative to it; across projects
+/// each row names its own and shows its worktree in full.
+fn board_human(board: &Board, listing: &Listing<'_>, now_ms: u64) -> String {
+    let single = match board.projects.as_slice() {
+        [project] => Some(project),
+        _ => board
             .items
-            .iter()
-            .filter(|item| item.column == column)
-            .collect::<Vec<_>>();
-        if items.is_empty() {
-            continue;
-        }
-        let rows = items
-            .iter()
-            .map(|item| row(item, now_ms))
-            .collect::<Vec<_>>();
-        sections.push(format!(
-            "{} ({})\n{}",
-            column.label().to_uppercase(),
-            items.len(),
-            super::format::table(
-                [
-                    "CARD",
-                    "PROJECT",
-                    "ACTIVITY",
-                    "BASE",
-                    "CHANGES",
-                    "PULL REQUEST",
-                    "TICKET",
-                    "SESSIONS",
-                    "WORKTREE"
-                ],
-                rows,
-                "",
+            .first()
+            .filter(|first| board.items.iter().all(|item| item.project == first.project))
+            .and_then(|first| {
+                board
+                    .projects
+                    .iter()
+                    .find(|project| project.repository == first.project)
+            }),
+    };
+    let root = single.and_then(|project| project.root.as_deref());
+    let columns: Vec<(Column, Vec<&Item>)> = Column::ALL
+        .into_iter()
+        .map(|column| {
+            (
+                column,
+                board
+                    .items
+                    .iter()
+                    .filter(|item| item.column == column)
+                    .collect::<Vec<_>>(),
             )
+        })
+        .filter(|(_, items)| !items.is_empty())
+        .collect();
+    let rows: Vec<Vec<[String; 9]>> = columns
+        .iter()
+        .map(|(_, items)| {
+            items
+                .iter()
+                .enumerate()
+                .filter(|(index, item)| listing.shows(item, *index, listing.limit))
+                .map(|(_, item)| {
+                    let mut row = row(item, root, now_ms);
+                    if single.is_some() {
+                        row[1].clear();
+                    }
+                    row
+                })
+                .collect()
+        })
+        .collect();
+    let kept = super::format::columns_in_use(&rows.concat());
+    let mut sections = Vec::new();
+    let mut truncated = Vec::new();
+    for ((column, items), rows) in columns.iter().zip(rows) {
+        let count = if rows.len() < items.len() {
+            truncated.push(*column);
+            format!("{} of {}", rows.len(), items.len())
+        } else {
+            items.len().to_string()
+        };
+        sections.push(format!(
+            "{} ({count})\n{}",
+            column.label().to_uppercase(),
+            super::format::table_of(HEADERS, rows, kept, ""),
         ));
     }
     if sections.is_empty() {
-        sections.push(match filtered_to {
+        let mut empty = match listing.column {
             Some(column) => format!("No cards in {}", column.label()),
             None => "No cards".into(),
-        });
+        };
+        if let Some(project) = single {
+            empty.push_str(&format!(
+                " in project {}",
+                super::format::plain(&project.name)
+            ));
+        }
+        sections.push(empty);
     }
     let notes = board
         .projects
@@ -664,7 +891,7 @@ fn board_human(board: &Board, filtered_to: Option<Column>, now_ms: u64) -> Strin
             let scan = project.scan_error.as_deref().map(|error| {
                 format!(
                     "{name}: Git could not be read: {}",
-                    super::format::plain(error)
+                    super::format::plain(&super::format::home_shortened(error))
                 )
             });
             let forge = match &project.forge {
@@ -686,10 +913,14 @@ fn board_human(board: &Board, filtered_to: Option<Column>, now_ms: u64) -> Strin
         })
         .chain(board.items.iter().filter_map(|item| {
             let error = item.error.as_deref()?;
+            let name = match &item.key {
+                ItemKey::Worktree(path) => super::format::location(path, root),
+                ItemKey::Branch(_) => item.label(),
+            };
             Some(format!(
                 "{}: its changes could not be read: {}",
-                super::format::plain(&item.label()),
-                super::format::plain(error)
+                super::format::plain(&name),
+                super::format::plain(&super::format::home_shortened(error))
             ))
         }))
         .chain(board.linear_unavailable.as_deref().map(|reason| {
@@ -699,32 +930,93 @@ fn board_human(board: &Board, filtered_to: Option<Column>, now_ms: u64) -> Strin
             )
         }))
         .collect::<Vec<_>>();
+    let mut footer = Vec::new();
+    if let Some(project) = single.filter(|_| !board.items.is_empty()) {
+        let name = super::format::plain(&project.name);
+        footer.push(match root {
+            Some(root) => format!(
+                "(project {name} at {})",
+                super::format::location(root, None)
+            ),
+            None => format!("(project {name})"),
+        });
+    }
+    let program = listing.program;
+    let projects = match (listing.project, listing.all) {
+        (Some(project), _) => format!(" --project {project}"),
+        (None, true) => " --all".into(),
+        (None, false) => String::new(),
+    };
+    let command = format!("{program} work{projects}");
+    let mut steps: Vec<(String, &str)> = Vec::new();
+    // One column to finish: the one listed, or the only one cut short.
+    let rest = listing.column.or(match truncated.as_slice() {
+        [only] => Some(*only),
+        _ => None,
+    });
+    match rest {
+        _ if truncated.is_empty() => {}
+        Some(column) => steps.push((
+            format!(
+                "{command} --column {} --limit 0",
+                column.as_str().replace('_', "-")
+            ),
+            "lists the rest",
+        )),
+        None => steps.push((
+            format!("{command} --column COLUMN --limit 0"),
+            "lists a whole column",
+        )),
+    }
+    if listing.placed {
+        steps.push((format!("{program} work --all"), "lists every project"));
+    }
+    if columns.iter().any(|(column, _)| *column == Column::Landed) {
+        // Removal looks in this directory's project unless told otherwise.
+        let project = match (single, listing.project) {
+            (_, Some(project)) => format!(" --project {project}"),
+            (Some(project), None) if listing.all => {
+                format!(" --project {}", super::format::shell_word(&project.name))
+            }
+            (Some(_), None) => String::new(),
+            (None, None) => " --project PROJECT".into(),
+        };
+        steps.push((
+            format!("{program} work rm CARD{project} --dry-run"),
+            "shows what removing a landed worktree loses",
+        ));
+    }
     if !notes.is_empty() {
         sections.push(notes.join("\n"));
     }
-    sections.join("\n\n")
+    let mut human = sections.join("\n\n");
+    for line in footer {
+        human.push('\n');
+        human.push_str(&line);
+    }
+    if !steps.is_empty() {
+        human.push('\n');
+        human.push_str(&super::format::hint(&steps));
+    }
+    human
 }
 
-fn row(item: &Item, now_ms: u64) -> [String; 9] {
-    let mut card = item.label();
+/// A card's cells. `root` is the primary checkout of the one project a
+/// listing shows, which its worktree is shown relative to; across projects
+/// the worktree is shown in full.
+fn row(item: &Item, root: Option<&Path>, now_ms: u64) -> [String; 9] {
+    // A detached worktree's card is named by its path, which its WORKTREE
+    // cell already shows.
+    let mut card = match &item.key {
+        ItemKey::Worktree(_) => "(detached)".to_owned(),
+        ItemKey::Branch(_) => item.label(),
+    };
     if item.pinned {
         card.push_str(" (pinned)");
     }
     let activity = item.last_activity.map_or_else(
         || "-".to_owned(),
-        |activity| {
-            format!(
-                "{} ({})",
-                super::format::relative_time(activity.at_unix_ms, now_ms),
-                match activity.source {
-                    ActivitySource::Commit => "commit",
-                    ActivitySource::Files => "files",
-                    ActivitySource::Session => "agent",
-                    ActivitySource::Created => "created",
-                    ActivitySource::PullRequest => "pull request",
-                }
-            )
-        },
+        |activity| super::format::relative_time(activity.at_unix_ms, now_ms),
     );
     let base = item.comparison.as_ref().map_or_else(
         || "-".to_owned(),
@@ -782,28 +1074,6 @@ fn row(item: &Item, now_ms: u64) -> [String; 9] {
         .as_ref()
         .and_then(|ticket| ticket.identifier.clone())
         .unwrap_or_else(|| "-".into());
-    let sessions = if item.sessions.is_empty() {
-        "-".to_owned()
-    } else {
-        item.sessions
-            .iter()
-            .map(|session| {
-                format!(
-                    "{} {}",
-                    session
-                        .provider
-                        .map_or("shell", |provider| provider.executable()),
-                    match session.state {
-                        crate::agent::ActivityState::Working => "working",
-                        crate::agent::ActivityState::Waiting => "waiting",
-                        crate::agent::ActivityState::Idle => "idle",
-                        crate::agent::ActivityState::Unknown => "running",
-                    }
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
     [
         card,
         item.project_name.clone(),
@@ -812,19 +1082,45 @@ fn row(item: &Item, now_ms: u64) -> [String; 9] {
         changes,
         pull_request,
         ticket,
-        sessions,
+        sessions(&item.sessions),
         item.worktree.as_ref().map_or_else(
             || "-".to_owned(),
-            |worktree| worktree.path.display().to_string(),
+            |worktree| super::format::location(&worktree.path, root),
         ),
     ]
+}
+
+/// A card's sessions counted by what they are doing, busiest first:
+/// "2 working, 3 idle". `cagents ls` lists them.
+fn sessions(sessions: &[crate::work::Session]) -> String {
+    use crate::agent::ActivityState;
+    let counts = [
+        (ActivityState::Working, "working"),
+        (ActivityState::Waiting, "waiting"),
+        (ActivityState::Idle, "idle"),
+        (ActivityState::Unknown, "running"),
+    ]
+    .into_iter()
+    .filter_map(|(state, label)| {
+        let count = sessions
+            .iter()
+            .filter(|session| session.state == state)
+            .count();
+        (count > 0).then(|| format!("{count} {label}"))
+    })
+    .collect::<Vec<_>>();
+    if counts.is_empty() {
+        "-".into()
+    } else {
+        counts.join(", ")
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::work::{
-        Activity, Checks, Comparison, Dirty, ItemKey, LinearTicket, PullRequest, Session,
+        Activity, ActivitySource, Checks, Comparison, Dirty, LinearTicket, PullRequest, Session,
         TicketSource, Worktree,
     };
 
@@ -893,21 +1189,97 @@ mod tests {
         }
     }
 
+    fn project(name: &str) -> crate::work::Project {
+        crate::work::Project {
+            repository: format!("/{name}/.git").into(),
+            name: name.into(),
+            root: Some(format!("/{name}").into()),
+            base: Some("origin/main".into()),
+            scanned_at_unix_ms: Some(NOW),
+            scan_error: None,
+            forge: Forge::NotGitHub,
+        }
+    }
+
+    fn board(projects: Vec<crate::work::Project>, items: Vec<Item>) -> Board {
+        Board {
+            generated_at_unix_ms: NOW,
+            stale_after_days: 7,
+            projects,
+            items,
+            linear_unavailable: None,
+        }
+    }
+
+    fn card(branch: &str, column: Column) -> Item {
+        let mut item = item();
+        item.key = ItemKey::Branch(branch.into());
+        item.branch = Some(branch.into());
+        item.column = column;
+        item.pinned = false;
+        item.linear = None;
+        item.worktree = None;
+        item
+    }
+
+    fn listing(limit: usize, placed: bool) -> Listing<'static> {
+        Listing {
+            column: None,
+            limit,
+            program: "cagents",
+            project: None,
+            all: false,
+            placed,
+            current: None,
+        }
+    }
+
     #[test]
     fn rows_name_every_fact_a_card_carries() {
         assert_eq!(
-            row(&item(), NOW),
+            row(&item(), Some(Path::new("/repo")), NOW),
             [
                 "fix/main-12-login (pinned)".to_owned(),
                 "repo".into(),
-                "1 min ago (files)".into(),
+                "1 min ago".into(),
                 "+3 -1".into(),
                 "4 (1 conflicted)".into(),
                 "#42 open, checks fail, approved".into(),
                 "MAIN-12".into(),
-                "claude working".into(),
-                "/repo/.worktrees/login".into(),
+                "1 working".into(),
+                ".worktrees/login".into(),
             ]
+        );
+        // Across projects, a worktree keeps its whole path.
+        assert_eq!(row(&item(), None, NOW)[8], "/repo/.worktrees/login");
+        // A detached worktree is named by that path, in its own cell.
+        let mut detached = item();
+        detached.key = ItemKey::Worktree("/repo/.worktrees/login".into());
+        detached.pinned = false;
+        let cells = row(&detached, Some(Path::new("/repo")), NOW);
+        assert_eq!([&cells[0], &cells[8]], ["(detached)", ".worktrees/login"]);
+    }
+
+    #[test]
+    fn a_cards_sessions_are_counted_busiest_first() {
+        use crate::agent::ActivityState::{Idle, Unknown, Waiting, Working};
+        let session = |state| Session {
+            id: crate::model::TerminalId::new(),
+            provider: Some(crate::agent::Provider::Claude),
+            title: None,
+            state,
+        };
+        assert_eq!(sessions(&[]), "-");
+        assert_eq!(
+            sessions(&[
+                session(Idle),
+                session(Working),
+                session(Idle),
+                session(Unknown),
+                session(Waiting),
+                session(Working),
+            ]),
+            "2 working, 1 waiting, 2 idle, 1 running"
         );
     }
 
@@ -917,41 +1289,328 @@ mod tests {
         stale.column = Column::Stale;
         stale.key = ItemKey::Branch("old".into());
         stale.branch = Some("old".into());
-        let board = Board {
-            generated_at_unix_ms: NOW,
-            stale_after_days: 7,
-            projects: vec![crate::work::Project {
-                repository: "/repo/.git".into(),
-                name: "repo".into(),
-                root: Some("/repo".into()),
-                base: Some("origin/main".into()),
-                scanned_at_unix_ms: Some(NOW),
-                scan_error: None,
-                forge: Forge::Unavailable {
-                    reason: "gh is not\ninstalled".into(),
-                },
-            }],
-            items: vec![item(), stale],
-            linear_unavailable: Some("Add a Linear key".into()),
+        let mut repo = project("repo");
+        repo.forge = Forge::Unavailable {
+            reason: "gh is not\ninstalled".into(),
         };
-        let human = board_human(&board, None, NOW);
+        let mut board = board(vec![repo], vec![item(), stale]);
+        board.linear_unavailable = Some("Add a Linear key".into());
+        let human = board_human(&board, &listing(DEFAULT_LIMIT, false), NOW);
         let active = human.find("ACTIVE (1)").unwrap();
         let stale = human.find("STALE (1)").unwrap();
         assert!(active < stale);
-        assert!(human.ends_with(
-            "repo: GitHub is unavailable: gh is not installed\n\
-             Linear tickets could not be looked up: Add a Linear key"
-        ));
+        assert!(
+            human.ends_with(
+                "repo: GitHub is unavailable: gh is not installed\n\
+                 Linear tickets could not be looked up: Add a Linear key\n\
+                 (project repo at /repo)"
+            ),
+            "{human}"
+        );
         let empty = Board {
             items: Vec::new(),
             projects: Vec::new(),
             linear_unavailable: None,
             ..board
         };
-        assert_eq!(board_human(&empty, None, NOW), "No cards");
         assert_eq!(
-            board_human(&empty, Some(Column::Landed), NOW),
-            "No cards in Landed"
+            board_human(&empty, &listing(DEFAULT_LIMIT, false), NOW),
+            "No cards"
+        );
+        let landed = Listing {
+            column: Some(Column::Landed),
+            ..listing(DEFAULT_LIMIT, false)
+        };
+        assert_eq!(board_human(&empty, &landed, NOW), "No cards in Landed");
+        // An empty board of one project says which.
+        let scoped = Board {
+            projects: vec![project("repo")],
+            ..empty
+        };
+        assert_eq!(
+            board_human(&scoped, &listing(DEFAULT_LIMIT, true), NOW),
+            "No cards in project repo\nhint: `cagents work --all` lists every project"
+        );
+    }
+
+    #[test]
+    fn one_projects_board_names_it_once_and_drops_columns_no_card_has() {
+        let single = board(vec![project("repo")], vec![card("a", Column::Active)]);
+        let human = board_human(&single, &listing(DEFAULT_LIMIT, true), NOW);
+        let header = human.lines().nth(1).unwrap();
+        assert_eq!(
+            header.split_whitespace().collect::<Vec<_>>(),
+            [
+                "CARD", "ACTIVITY", "BASE", "CHANGES", "PULL", "REQUEST", "SESSIONS"
+            ],
+            "{human}"
+        );
+        assert!(
+            human.ends_with(
+                "\n(project repo at /repo)\nhint: `cagents work --all` lists every project"
+            ),
+            "{human}"
+        );
+
+        let mut other = card("b", Column::Stale);
+        other.project = "/other/.git".into();
+        other.project_name = "other".into();
+        let both = board(
+            vec![project("repo"), project("other")],
+            vec![card("a", Column::Active), other],
+        );
+        let mut both = both;
+        both.items[0].worktree = item().worktree;
+        let human = board_human(&both, &listing(DEFAULT_LIMIT, false), NOW);
+        // Every section keeps the same columns, so they read as one table.
+        let headers: Vec<&str> = human
+            .lines()
+            .filter(|line| line.starts_with("CARD"))
+            .collect();
+        assert_eq!(headers.len(), 2);
+        assert_eq!(headers[0], headers[1]);
+        assert!(headers[0].contains("PROJECT"), "{human}");
+        // With no one root to be relative to, a worktree is shown in full.
+        assert!(human.contains(" /repo/.worktrees/login\n"), "{human}");
+        assert!(!human.contains("(project"), "{human}");
+        assert!(!human.contains("hint:"), "{human}");
+
+        // A listing of every project names the card's project to remove it.
+        both.items[1].column = Column::Landed;
+        let all = Listing {
+            all: true,
+            ..listing(DEFAULT_LIMIT, false)
+        };
+        assert!(
+            board_human(&both, &all, NOW).ends_with(
+                "hint: `cagents work rm CARD --project PROJECT --dry-run` \
+                 shows what removing a landed worktree loses"
+            ),
+            "{human}"
+        );
+    }
+
+    #[test]
+    fn a_listing_shows_the_newest_cards_of_each_column_and_how_to_see_the_rest() {
+        let items = (0..12)
+            .map(|index| card(&format!("work-{index}"), Column::InProgress))
+            .chain([card("done", Column::Landed)])
+            .collect();
+        let board = board(vec![project("repo")], items);
+        let human = board_human(&board, &listing(DEFAULT_LIMIT, true), NOW);
+        assert!(human.contains("IN PROGRESS (10 of 12)\n"), "{human}");
+        assert!(human.contains("\nwork-9 "), "{human}");
+        assert!(!human.contains("work-10"), "{human}");
+        assert!(human.contains("LANDED (1)\n"), "{human}");
+        assert!(
+            human.ends_with(
+                "hint: `cagents work --column in-progress --limit 0` lists the rest; \
+                 `cagents work --all` lists every project; \
+                 `cagents work rm CARD --dry-run` shows what removing a landed worktree loses"
+            ),
+            "{human}"
+        );
+
+        let all = board_human(&board, &listing(0, false), NOW);
+        assert!(all.contains("IN PROGRESS (12)\n"), "{all}");
+        assert!(all.contains("work-11"), "{all}");
+
+        let listed = |items: &mut Vec<Item>, listing: &Listing<'_>, limit| {
+            let omitted = listing.omit(items, limit);
+            (items.iter().map(Item::label).collect::<Vec<_>>(), omitted)
+        };
+        let mut items = board.items.clone();
+        let (labels, omitted) = listed(&mut items, &listing(2, false), 2);
+        assert_eq!(labels, ["work-0", "work-1", "done"]);
+        assert_eq!(omitted, [(Column::InProgress, 10)].into());
+        let (labels, omitted) = listed(&mut items, &listing(0, false), 0);
+        assert_eq!(labels.len(), 3);
+        assert!(omitted.is_empty());
+    }
+
+    /// The card of the worktree this shell is in is listed however old, so
+    /// an agent always finds its own branch.
+    #[test]
+    fn a_listing_keeps_the_card_of_the_current_worktree() {
+        let mut items: Vec<Item> = (0..12)
+            .map(|index| {
+                let mut card = card(&format!("work-{index}"), Column::InProgress);
+                card.worktree = Some(Worktree {
+                    path: format!("/repo/.worktrees/{index}").into(),
+                    primary: false,
+                    locked: false,
+                    created_at_unix_ms: None,
+                });
+                card
+            })
+            .collect();
+        let mut primary = card("main", Column::InProgress);
+        primary.worktree = Some(Worktree {
+            path: "/repo".into(),
+            primary: true,
+            locked: false,
+            created_at_unix_ms: None,
+        });
+        items.insert(3, primary);
+        let board = board(vec![project("repo")], items);
+        // The innermost worktree holding the directory is the current one,
+        // not the primary checkout the linked worktrees sit inside.
+        let current = current_worktree(&board.items, Path::new("/repo/.worktrees/11/src"));
+        assert_eq!(current.as_deref(), Some(Path::new("/repo/.worktrees/11")));
+        let inside = Listing {
+            current: current.as_deref(),
+            ..listing(DEFAULT_LIMIT, true)
+        };
+        let human = board_human(&board, &inside, NOW);
+        assert!(human.contains("IN PROGRESS (11 of 13)\n"), "{human}");
+        assert!(human.contains("\nwork-11 "), "{human}");
+        assert!(!human.contains("work-10 "), "{human}");
+        let mut items = board.items.clone();
+        inside.omit(&mut items, 3);
+        assert_eq!(
+            items.iter().map(Item::label).collect::<Vec<_>>(),
+            ["work-0", "work-1", "work-2", "work-11"]
+        );
+    }
+
+    /// The listing's own options carry into its hints: the device, the
+    /// project and the column.
+    #[test]
+    fn hints_extend_the_command_that_listed_the_board() {
+        let items = (0..12)
+            .map(|index| card(&format!("work-{index}"), Column::InProgress))
+            .chain([card("done", Column::Landed)])
+            .collect();
+        let board = board(vec![project("repo")], items);
+        let named = Listing {
+            program: "cagents --device fw16",
+            project: Some("'my repo'"),
+            column: Some(Column::InProgress),
+            ..listing(DEFAULT_LIMIT, false)
+        };
+        let mut filtered = board.clone();
+        filtered
+            .items
+            .retain(|item| item.column == Column::InProgress);
+        assert!(board_human(&filtered, &named, NOW).ends_with(
+            "hint: `cagents --device fw16 work --project 'my repo' --column in-progress --limit 0` \
+                 lists the rest"
+        ));
+        let named = Listing {
+            column: None,
+            ..named
+        };
+        assert!(board_human(&board, &named, NOW).ends_with(
+            "`cagents --device fw16 work rm CARD --project 'my repo' --dry-run` \
+                 shows what removing a landed worktree loses"
+        ));
+    }
+
+    /// The current directory is placed as the daemon places a session's: a
+    /// checkout or linked worktree belongs to its open repository; an open
+    /// folder, or no open project, widens to every project.
+    #[test]
+    fn the_current_directory_selects_the_open_git_project_containing_it() {
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let repository = root.join("app/.git");
+        std::fs::create_dir_all(repository.join("worktrees/linked")).unwrap();
+        std::fs::create_dir_all(root.join("app/src")).unwrap();
+        let linked = root.join("linked");
+        std::fs::create_dir_all(linked.join("src")).unwrap();
+        std::fs::write(
+            linked.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                repository.join("worktrees/linked").display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(repository.join("worktrees/linked/commondir"), "../..\n").unwrap();
+        let folder = root.join("notes");
+        std::fs::create_dir_all(&folder).unwrap();
+        let open = |repository: &Path, kind| crate::workspace_model::ModelProject {
+            repository: repository.to_owned(),
+            name: "fixture".into(),
+            kind,
+            ordinal: 0,
+        };
+        let projects = [
+            open(&repository, crate::model::ProjectKind::Git),
+            open(&folder, crate::model::ProjectKind::Folder),
+        ];
+        assert_eq!(
+            containing(&root.join("app/src"), &projects),
+            Some(repository.clone())
+        );
+        assert_eq!(containing(&linked.join("src"), &projects), Some(repository));
+        assert_eq!(containing(&folder, &projects), None);
+        assert_eq!(containing(&root, &projects), None);
+    }
+
+    #[test]
+    fn work_alone_lists_and_takes_the_list_options() {
+        let parse = |arguments: &[&str]| {
+            Cli::try_parse_from(std::iter::once("cagents").chain(arguments.iter().copied()))
+                .and_then(Cli::validated)
+        };
+        let Ok(Cli {
+            command:
+                TopCommand::Work {
+                    command: None,
+                    list,
+                },
+            ..
+        }) = parse(&["work", "--column", "in-review", "--limit", "3"])
+        else {
+            panic!("`cagents work` alone should list");
+        };
+        assert_eq!(list.column, Some(Column::InReview));
+        assert_eq!(list.limit, Some(3));
+        assert!(matches!(
+            parse(&["work", "ls", "--all"]),
+            Ok(Cli {
+                command: TopCommand::Work {
+                    command: Some(WorkCommand::List(WorkListArgs { all: true, .. })),
+                    ..
+                },
+                ..
+            })
+        ));
+        assert!(parse(&["work", "--all", "rm", "x"]).is_err());
+        // Global options still combine with a subcommand.
+        assert!(matches!(
+            parse(&["work", "--json", "rm", "x", "--dry-run"]),
+            Ok(Cli {
+                json: true,
+                command: TopCommand::Work {
+                    command: Some(WorkCommand::Rm(_)),
+                    ..
+                },
+                ..
+            })
+        ));
+        assert!(parse(&["work", "--all", "--project", "x"]).is_err());
+    }
+
+    /// A detached card is named by the path a listing shows, which a
+    /// quoted `~` must not break.
+    #[test]
+    fn a_card_named_by_a_home_relative_path_is_sent_whole() {
+        let home = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(home.path()).unwrap();
+        std::fs::create_dir_all(home.join("linked")).unwrap();
+        std::fs::write(home.join("linked/.git"), "gitdir: elsewhere\n").unwrap();
+        assert_eq!(
+            item_in("~/linked".into(), Some(&home)),
+            home.join("linked").to_string_lossy()
+        );
+        // A branch, or a path only the daemon can place, is sent as given.
+        assert_eq!(item_in("fix/login".into(), Some(&home)), "fix/login");
+        assert_eq!(item_in("~/absent".into(), Some(&home)), "~/absent");
+        assert_eq!(
+            item_in(".worktrees/linked".into(), Some(&home)),
+            ".worktrees/linked"
         );
     }
 }

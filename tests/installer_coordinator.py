@@ -797,7 +797,10 @@ os.execv({real_tar!r}, [{real_tar!r}, *args])
         self.assertEqual(os.readlink(self.prefix / 'current'), f'versions/{VERSION}')
         self.assertEqual((candidate / 'bin/cagents').stat().st_ino, original_inode)
         self.assertEqual(sum(e['event'] == 'daemon-start-fixture' for e in self.events()), 1)
-        self.assertTrue((candidate / '.cagents-prepared-candidate-v1.json').exists())
+        self.assertFalse(
+            (candidate / '.cagents-prepared-candidate-v1.json').exists(),
+            'a published candidate is an ordinary installed tree',
+        )
 
     def test_prepared_candidate_rejects_wrong_job_and_tree_tampering_before_source_calls(self):
         candidate = self.prepare_candidate()
