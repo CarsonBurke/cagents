@@ -11569,8 +11569,13 @@ impl Cagents {
                             // Without Retry, the first remaining action is
                             // the card's primary one, as on a stopped pane.
                             let closing = self.terminal_close_in_progress(id);
+                            // While a restart is the way back, no button is
+                            // the next step: each one gives that way up.
+                            let waits = self
+                                .blocked_failure(id)
+                                .is_some_and(|blocked| blocked.reopen.waits());
                             let button = |controls: &Vec<Element<'_, Message>>, label| {
-                                if controls.is_empty() {
+                                if controls.is_empty() && !waits {
                                     crate::ui_controls::button::primary(label)
                                 } else {
                                     crate::ui_controls::button::secondary(label)

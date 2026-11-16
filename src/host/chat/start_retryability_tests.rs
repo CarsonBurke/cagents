@@ -512,6 +512,60 @@ fn an_unmatched_ended_actor_waits_for_a_restart_rather_than_a_retry() {
     assert!(host.lock().unwrap().chats.is_empty());
     assert!(host.lock().unwrap().chat_spawning.is_empty());
     assert!(host.lock().unwrap().native_actor_startups.is_empty());
+
+    // The caption's promise: after a restart, the card's own restore asks
+    // for the same source, and a daemon of the new boot prepares it.
+    drop(_wire);
+    drop(_lease);
+    drop(host);
+    let daemon = |proof: &HostSessionProof| -> SharedHost {
+        let mut state = HostState::new(proof.clone());
+        state.enable_holder_recovery();
+        state.install_model(
+            super::super::model::Registry::at(&root.join("registry.sqlite3")).unwrap(),
+        );
+        Arc::new(HostLock::new(state))
+    };
+    // Another daemon of the same boot still cannot prove the old owner gone.
+    let same_boot = HostSessionProof {
+        host_session_id: "unmatched-same-boot".into(),
+        boot_id: proof.boot_id.clone(),
+        host_incarnation: "same-boot-restart".into(),
+    };
+    let host = daemon(&same_boot);
+    let lease = crate::daemon::HostLease::acquire(&paths, &same_boot).unwrap();
+    let refusal = process_inner(
+        &host,
+        0,
+        ClientRequest::ChatPrepareResume {
+            source: source.clone(),
+        },
+    )
+    .err()
+    .expect("a daemon restart within the boot proves nothing");
+    assert_eq!(refusal.message, chat::UNPROVEN_OWNER_REFUSAL);
+    drop(lease);
+    drop(host);
+    let restarted = HostSessionProof {
+        host_session_id: "unmatched-after-restart".into(),
+        boot_id: "a-later-boot".into(),
+        host_incarnation: "after-restart".into(),
+    };
+    let host = daemon(&restarted);
+    let _lease = crate::daemon::HostLease::acquire(&paths, &restarted).unwrap();
+    let ServerResponse::ChatResumePrepared { session } = process_inner(
+        &host,
+        0,
+        ClientRequest::ChatPrepareResume {
+            source: source.clone(),
+        },
+    )
+    .unwrap_or_else(|error| panic!("the restarted daemon refused: {}", error.message)) else {
+        panic!("the restarted daemon did not prepare the saved conversation")
+    };
+    assert_ne!(session.id, source.id);
+    assert_eq!(session.launch, source.launch);
+    assert!(host.lock().unwrap().chats.is_empty());
 }
 
 #[test]

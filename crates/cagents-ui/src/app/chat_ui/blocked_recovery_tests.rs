@@ -840,9 +840,11 @@ fn blocked_saved_source_cannot_retry_through_auth_text_or_stale_account_recovery
 #[test]
 fn each_blocked_refusal_kind_renders_its_own_headline_and_caption() {
     use blocked_recovery::{
-        CLOSE_GUIDANCE, FRESH_EXPLANATION, HEADLINE, RESTART_GUIDANCE, RESTART_HEADLINE, Reopen,
+        CLOSE_GUIDANCE, FRESH_EXPLANATION, HEADLINE, RESTART_CLOSE_TRADEOFF,
+        RESTART_FRESH_TRADEOFF, RESTART_GUIDANCE, RESTART_HEADLINE, Reopen,
     };
-    let fresh_restart = format!("{RESTART_GUIDANCE} {FRESH_EXPLANATION}");
+    let fresh_restart = format!("{RESTART_GUIDANCE} {RESTART_FRESH_TRADEOFF}");
+    let close_restart = format!("{RESTART_GUIDANCE} {RESTART_CLOSE_TRADEOFF}");
     for (recovery, reopen, headline, fresh, close_only) in [
         (
             chat::Recovery::Blocked,
@@ -856,11 +858,14 @@ fn each_blocked_refusal_kind_renders_its_own_headline_and_caption() {
             Reopen::AfterRestart,
             RESTART_HEADLINE,
             fresh_restart.as_str(),
-            RESTART_GUIDANCE,
+            close_restart.as_str(),
         ),
     ] {
         assert_eq!(Reopen::of(recovery), Some(reopen));
         assert_eq!(reopen.headline(), headline);
+        // Waiting is the way back only after a restart; no button then
+        // stands out as the next step.
+        assert_eq!(reopen.waits(), reopen == Reopen::AfterRestart);
         for (valid_recipe, caption) in [(true, fresh), (false, close_only)] {
             for runtime in [false, true] {
                 for (width, inspector) in [(900.0, false), (1280.0, false), (1280.0, true)] {
@@ -875,6 +880,12 @@ fn each_blocked_refusal_kind_renders_its_own_headline_and_caption() {
                     } else {
                         frame(app.card_view(card, true, false), width, None)
                     };
+                    if runtime {
+                        assert_eq!(
+                            chat_runtime(&app, card).emphasizes_recovery(),
+                            !reopen.waits()
+                        );
+                    }
                     let mut labels = labels(&tree);
                     // A runtime puts the headline on its failure incident.
                     let incident_tree;

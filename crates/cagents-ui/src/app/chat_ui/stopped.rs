@@ -161,6 +161,14 @@ impl Runtime {
         }
     }
 
+    /// Whether the first recovery button is styled as the next step. Not
+    /// while a restart is the way back: every button gives that up.
+    pub(super) fn emphasizes_recovery(&self) -> bool {
+        !self
+            .start_blocked
+            .is_some_and(blocked_recovery::Reopen::waits)
+    }
+
     pub(super) fn stopped_controls(
         &self,
         transitioning: bool,
@@ -173,11 +181,16 @@ impl Runtime {
             secondary,
         } = self.stopped_with_offer(transitioning, resuming, fresh_available);
         let mut controls = Vec::new();
+        let emphasize = self.emphasizes_recovery();
         if let Some((label, pressed, enabled)) = primary {
             controls.push(
-                crate::ui_controls::button::primary(label)
-                    .on_press_maybe(enabled.then(|| pressed.message(self.target)))
-                    .into(),
+                if emphasize {
+                    crate::ui_controls::button::primary(label)
+                } else {
+                    crate::ui_controls::button::secondary(label)
+                }
+                .on_press_maybe(enabled.then(|| pressed.message(self.target)))
+                .into(),
             );
         }
         if let Some((label, pressed, enabled)) = secondary {

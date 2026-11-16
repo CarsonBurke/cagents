@@ -5652,6 +5652,105 @@ mod tests {
         }
     }
 
+    /// A recovery pane only attaches, so a refused attachment it could act
+    /// on becomes Retry. A permanent refusal, including one a restart lifts,
+    /// keeps its kind and the daemon's exact words.
+    #[test]
+    fn recovery_restore_keeps_permanent_attach_refusals_as_they_are() {
+        use super::super::{Recovery, UNPROVEN_OWNER_REFUSAL};
+        for (code, message, retryable, recovery) in [
+            (
+                ipc::ProtocolErrorCode::TerminalUnavailable,
+                "Exact attachment refusal",
+                false,
+                Recovery::Blocked,
+            ),
+            (
+                ipc::ProtocolErrorCode::InvalidRequest,
+                UNPROVEN_OWNER_REFUSAL,
+                false,
+                Recovery::AfterRestart,
+            ),
+            (
+                ipc::ProtocolErrorCode::AccountRemoved,
+                "Exact attachment refusal",
+                false,
+                Recovery::Retry,
+            ),
+        ] {
+            let live = host_proof("recovery");
+            let saved = stranded_claude(Some(CONVERSATION));
+            let mut current = saved.clone();
+            current.proof = Some(live.clone());
+            let expected = saved.clone();
+            let (stream, mut server) = UnixStream::pair().unwrap();
+            let worker = thread::spawn(move || {
+                server
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                for step in 0..3 {
+                    let envelope: ClientEnvelope = ipc::read_frame(&mut server).unwrap().unwrap();
+                    let reply = match (step, envelope.request) {
+                        (0, ClientRequest::Connect { .. }) => ServerMessage::Response {
+                            response: ServerResponse::Connected {
+                                proof: live.clone(),
+                                resumed: vec![],
+                            },
+                        },
+                        (1, ClientRequest::ResolveUpgradeChat { source }) if source == expected => {
+                            ServerMessage::Response {
+                                response: ServerResponse::UpgradeChatResolved {
+                                    session: current.clone(),
+                                },
+                            }
+                        }
+                        (2, ClientRequest::ChatAttach { session }) if session == current => {
+                            ServerMessage::Error(ipc::ProtocolError::new(code, message, retryable))
+                        }
+                        other => panic!("read-only restore must only attach: {other:?}"),
+                    };
+                    ipc::write_frame(
+                        &mut server,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: Some(envelope.request_id),
+                            proof: live.clone(),
+                            message: reply,
+                        },
+                    )
+                    .unwrap();
+                }
+                let extra: Option<ClientEnvelope> = ipc::read_frame(&mut server).unwrap();
+                assert!(extra.is_none(), "a refused attachment starts nothing");
+            });
+            let failure = ClientHandle::connect_on(
+                stream,
+                saved,
+                Intent::RestoreExisting,
+                None,
+                false,
+                None,
+                None,
+                None,
+                |_| {},
+            )
+            .err()
+            .expect("daemon refused attachment");
+            worker.join().unwrap();
+            assert_eq!(failure.recovery, recovery, "{code:?}");
+            if recovery == Recovery::Retry {
+                assert!(failure.message.starts_with(message), "{}", failure.message);
+                assert!(
+                    failure.message.contains("only attaches"),
+                    "{}",
+                    failure.message
+                );
+            } else {
+                assert_eq!(failure.message, message, "{code:?}");
+            }
+        }
+    }
+
     #[test]
     fn recovery_restore_keeps_exact_live_and_issued_history_attachments() {
         let live = host_proof("recovery");

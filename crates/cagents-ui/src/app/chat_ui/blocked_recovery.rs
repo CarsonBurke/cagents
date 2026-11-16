@@ -9,6 +9,9 @@ pub(super) const DRAFT_GUIDANCE: &str = "Your message is kept. Copy it into a ne
 pub(super) const FRESH_EXPLANATION: &str = "Starts a new conversation in this card. The old one stays on disk, but this card stops pointing at it. Your draft is kept.";
 pub(super) const RESTART_GUIDANCE: &str =
     "Keep this card, and it reopens the conversation after the restart.";
+pub(super) const RESTART_FRESH_TRADEOFF: &str = "Starting a new conversation here or closing the card gives that up, though the old conversation stays on disk. A new conversation keeps your draft.";
+pub(super) const RESTART_CLOSE_TRADEOFF: &str =
+    "Closing the card gives that up, though the conversation stays on disk.";
 pub(super) const CLOSE_GUIDANCE: &str =
     "Details say why. Closing this card keeps the conversation on disk.";
 
@@ -52,9 +55,15 @@ impl Reopen {
         match (self, fresh) {
             (Self::Unproven, true) => FRESH_EXPLANATION.to_owned(),
             (Self::Unproven, false) => CLOSE_GUIDANCE.to_owned(),
-            (Self::AfterRestart, true) => [RESTART_GUIDANCE, FRESH_EXPLANATION].join(" "),
-            (Self::AfterRestart, false) => RESTART_GUIDANCE.to_owned(),
+            (Self::AfterRestart, true) => [RESTART_GUIDANCE, RESTART_FRESH_TRADEOFF].join(" "),
+            (Self::AfterRestart, false) => [RESTART_GUIDANCE, RESTART_CLOSE_TRADEOFF].join(" "),
         }
+    }
+
+    /// Whether doing nothing is the way back. No button is then emphasized
+    /// as the next step, since each of them gives that way up.
+    pub(in crate::app) fn waits(self) -> bool {
+        self == Self::AfterRestart
     }
 }
 
