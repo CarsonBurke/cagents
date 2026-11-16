@@ -5843,6 +5843,21 @@ mod tests {
             "{edits:?}"
         );
 
+        // Once its last card leaves, it still holds a published pane whose
+        // removal is this scope's to diff, so it stays projected.
+        let published = Arc::clone(&app.durable);
+        let mut without = (*published).clone();
+        without.cards.retain(|kept| kept.id != card.id);
+        without.card_scopes.remove(&card.id);
+        app.durable = Arc::new(without);
+        assert!(
+            app.shared_views.baseline[&historical]
+                .iter()
+                .any(|pane| pane.id == card.id)
+        );
+        assert!(app.local_views().scopes.contains(&historical));
+        app.durable = published;
+
         // A discovered scope that was never seeded is seeded.
         let unseeded = model.views[41].scope.clone();
         app.shared_views.initialized.remove(&unseeded);
