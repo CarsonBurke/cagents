@@ -33,18 +33,40 @@ fn nearest_root<'a>(
 /// Resolve a directory by its ancestors rather than comparing it with every
 /// historical checkout. Built for one immutable workspace projection.
 pub(super) struct WorktreeRoots<'a> {
-    roots: HashSet<&'a Path>,
+    roots: RootSet<'a>,
+}
+
+enum RootSet<'a> {
+    Borrowed(HashSet<&'a Path>),
+    /// A set kept between projections, which is not hashed again.
+    Indexed(&'a HashSet<PathBuf>),
 }
 
 impl<'a> WorktreeRoots<'a> {
     pub(super) fn new(roots: impl Iterator<Item = &'a Path>) -> Self {
         Self {
-            roots: roots.collect(),
+            roots: RootSet::Borrowed(roots.collect()),
+        }
+    }
+
+    pub(super) fn indexed(roots: &'a HashSet<PathBuf>) -> Self {
+        Self {
+            roots: RootSet::Indexed(roots),
         }
     }
 
     fn resolve(&self, directory: &Path) -> Option<&'a Path> {
-        nearest_root(directory, |ancestor| self.roots.get(ancestor).copied())
+        match &self.roots {
+            RootSet::Borrowed(roots) => {
+                nearest_root(directory, |ancestor| roots.get(ancestor).copied())
+            }
+            RootSet::Indexed(roots) => {
+                let roots = *roots;
+                nearest_root(directory, |ancestor| {
+                    roots.get(ancestor).map(PathBuf::as_path)
+                })
+            }
+        }
     }
 }
 
@@ -67,10 +89,23 @@ impl<'a> ResolveRoot<'a> for WorktreeRoots<'a> {
 /// symbolic link retargeted under a root that already resolved goes unseen.
 ///
 /// Roots are only added; [`Self::clear`] is for tests.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(super) struct KnownWorktreeRoots {
     roots: HashSet<PathBuf>,
     canonical: CanonicalRoots,
+    /// Drawn afresh for each new set and each added root, so equal
+    /// generations mean the same roots. A copy keeps it with the roots.
+    generation: u64,
+}
+
+impl Default for KnownWorktreeRoots {
+    fn default() -> Self {
+        Self {
+            roots: HashSet::new(),
+            canonical: CanonicalRoots::default(),
+            generation: crate::revision::next_revision(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -102,7 +137,12 @@ impl KnownWorktreeRoots {
             return false;
         }
         self.canonical.pending.push(root.clone());
+        self.generation = crate::revision::next_revision();
         self.roots.insert(root)
+    }
+
+    pub(super) fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Adds every path in `roots`, copying only those not yet known.

@@ -16,13 +16,8 @@
 //! revision says "may have changed", and the caller compares contents to tell.
 
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicU64, Ordering};
 
-static NEXT_REVISION: AtomicU64 = AtomicU64::new(1);
-
-fn next_revision() -> u64 {
-    NEXT_REVISION.fetch_add(1, Ordering::Relaxed)
-}
+use crate::revision::next_revision;
 
 /// Clones keep the revision, since they hold the same contents; equality
 /// compares the contents alone.

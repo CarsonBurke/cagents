@@ -1,6 +1,8 @@
 //! A client projection of daemon-owned scope views. Pending local intentions
 //! are layered over snapshots until acknowledged; snapshots never erase them.
+mod discovery;
 pub(super) mod seed_refusal;
+mod settlement;
 
 use super::*;
 use crate::workspace_model::{
@@ -99,6 +101,12 @@ enum ViewScopeAuthorities<'a> {
         repositories: HashMap<PathBuf, PathBuf>,
         projects: HashSet<PathBuf>,
     },
+}
+
+/// Whether `card` is a pane of the worktree view it resolves to: an open
+/// card that is not a utility page.
+fn shows_in_worktree(card: &CardState) -> bool {
+    card.existence.is_open() && !card.kind.is_utility()
 }
 
 impl ViewScopeAuthorities<'_> {
@@ -254,8 +262,8 @@ pub(super) struct State {
     held_descriptor_clones: std::cell::Cell<usize>,
     /// The daemon answered this window without a shared model to give.
     pub(super) registry_unavailable: bool,
-    baseline: HashMap<Scope, Vec<Pane>>,
-    initialized: HashSet<Scope>,
+    baseline: settlement::ScopeMap<Vec<Pane>>,
+    initialized: settlement::ScopeSet,
     seeding: HashSet<Scope>,
     pub(super) seed_attempts: HashMap<Scope, uuid::Uuid>,
     /// Definitive failures stay held until an explicit retry or a new registry.
@@ -296,6 +304,8 @@ pub(super) struct State {
     pub chat_adoptions: HashMap<CardId, crate::session::ChatIdentityAdoption>,
     pub restorations: Vec<crate::persistence::TerminalPaneRestoration>,
     restoration_requests: HashMap<CardId, TerminalId>,
+    /// What complete saves keep of scope discovery between passes.
+    discovery: discovery::ViewDiscovery,
 }
 
 impl State {
@@ -307,6 +317,18 @@ impl State {
             || (self.initialized.contains(scope)
                 && !self.seeding.contains(scope)
                 && !self.blocked.contains(scope))
+    }
+
+    #[cfg(test)]
+    pub(super) fn seeding_scopes(&self) -> Vec<Scope> {
+        self.seeding.iter().cloned().collect()
+    }
+
+    /// Stops comparing each complete pass with a rediscovery, for timing
+    /// workloads that measure what a pass costs.
+    #[cfg(test)]
+    pub(super) fn skip_rediscovery_check(&mut self) {
+        self.discovery.unchecked = true;
     }
 
     /// Treats `scope` as already seeded with `panes`, as an acknowledged seed
@@ -967,6 +989,17 @@ impl Cagents {
         })
     }
 
+    /// `view_repository_paths`, owned, keeping each path's first authority.
+    fn owned_view_repositories(&self) -> HashMap<PathBuf, PathBuf> {
+        let mut repositories = HashMap::new();
+        for (path, repository) in self.view_repository_paths() {
+            repositories
+                .entry(path.to_owned())
+                .or_insert_with(|| repository.to_owned());
+        }
+        repositories
+    }
+
     #[cfg(test)]
     fn record_topology_build(&self) {
         self.shared_views
@@ -1006,16 +1039,10 @@ impl Cagents {
     ) -> ViewScopeTopology<'a> {
         #[cfg(test)]
         self.record_topology_build();
-        let mut repositories = HashMap::new();
-        for (path, repository) in self.view_repository_paths() {
-            repositories
-                .entry(path.to_owned())
-                .or_insert_with(|| repository.to_owned());
-        }
         ViewScopeTopology {
             roots,
             authorities: ViewScopeAuthorities::Owned {
-                repositories,
+                repositories: self.owned_view_repositories(),
                 projects: self
                     .sidebar_model
                     .projects
@@ -1135,7 +1162,7 @@ impl Cagents {
         let worktree = worktree_cards
             .iter()
             .find(|(state, _)| state.id == card)
-            .filter(|(state, _)| state.existence.is_open() && !state.kind.is_utility())
+            .filter(|(state, _)| shows_in_worktree(state))
             .map(|(_, path)| *path);
         scopes
             .into_iter()
@@ -1190,8 +1217,7 @@ impl Cagents {
                     .cards
                     .iter()
                     .filter(|card| {
-                        card.existence.is_open()
-                            && !card.kind.is_utility()
+                        shows_in_worktree(card)
                             && !channel_cards.contains(&card.id)
                             && self.unchanneled_card_worktree_indexed(card, &roots)
                                 == Some(path.as_path())
@@ -1297,25 +1323,36 @@ impl Cagents {
         selected: Option<&HashSet<Scope>>,
         topology: &ViewScopeTopology<'a>,
     ) -> LocalViews {
+        let mut phase = WorkspaceProjectionTiming::new(selected.is_none());
+        let discovery = self.discover_view_scopes_with(topology);
+        phase.mark("local_discover");
+        self.project_local_views(selected, discovery, phase)
+    }
+
+    /// The local side of the `publishable` scopes among those discovered.
+    fn project_local_views<'a>(
+        &'a self,
+        selected: Option<&HashSet<Scope>>,
+        discovery: ScopeDiscovery<'a>,
+        mut phase: WorkspaceProjectionTiming,
+    ) -> LocalViews {
         #[cfg(test)]
         self.shared_views
             .local_projection_count
             .set(self.shared_views.local_projection_count.get() + 1);
-        let mut phase = WorkspaceProjectionTiming::new(selected.is_none());
+        let ScopeDiscovery {
+            scopes,
+            worktree_cards,
+        } = discovery;
         let cards = self
             .durable
             .cards
             .iter()
             .map(|card| (card.id, card))
             .collect::<HashMap<_, _>>();
-        let ScopeDiscovery {
-            scopes,
-            worktree_cards,
-        } = self.discover_view_scopes_with(topology);
-        phase.mark("local_discover");
         let mut by_path = HashMap::<&Path, Vec<CardId>>::new();
         for (card, path) in worktree_cards {
-            if card.existence.is_open() && !card.kind.is_utility() {
+            if shows_in_worktree(card) {
                 by_path.entry(path).or_default().push(card.id);
             }
         }
@@ -1555,10 +1592,7 @@ impl Cagents {
             .cards
             .iter()
             .copied()
-            .filter(|id| {
-                self.card_state(*id)
-                    .is_some_and(|card| card.existence.is_open() && !card.kind.is_utility())
-            })
+            .filter(|id| self.card_state(*id).is_some_and(shows_in_worktree))
             .collect();
         if current != before.panes.iter().map(|pane| pane.id).collect::<Vec<_>>() {
             return Err("local membership is unsettled");
@@ -1661,9 +1695,7 @@ impl Cagents {
         {
             return None;
         }
-        if !self
-            .card_state(card)
-            .is_some_and(|state| state.existence.is_open() && !state.kind.is_utility())
+        if !self.card_state(card).is_some_and(shows_in_worktree)
             || self
                 .shared_views
                 .requested_transfers
@@ -1876,7 +1908,7 @@ impl Cagents {
         else {
             return;
         };
-        let baseline = self.shared_views.baseline.entry(scope.clone()).or_default();
+        let baseline = self.shared_views.baseline.entry_or_default(scope.clone());
         if baseline.iter().any(|existing| existing.id == card) {
             return;
         }
@@ -1984,7 +2016,14 @@ impl Cagents {
         {
             return;
         }
-        self.publish_projected_view_changes(self.local_views(), ViewProjection::All);
+        let mut discovery = std::mem::take(&mut self.shared_views.discovery);
+        let settlement = discovery::Settlement {
+            initialized: self.shared_views.initialized.take_changes(),
+            baseline: self.shared_views.baseline.take_changes(),
+        };
+        let projected = self.discovered_local_views(&mut discovery, settlement);
+        self.shared_views.discovery = discovery;
+        self.publish_projected_view_changes(projected, ViewProjection::All);
     }
 
     fn publish_projected_view_changes(
@@ -2104,8 +2143,7 @@ impl Cagents {
                     let baseline = self
                         .shared_views
                         .baseline
-                        .entry(destination.clone())
-                        .or_default();
+                        .entry_or_default(destination.clone());
                     baseline.insert(index.min(baseline.len()), pane.clone());
                 }
             }
@@ -2744,8 +2782,7 @@ impl Cagents {
             }
         }
         for (card, path) in discovery.worktree_cards {
-            if card.existence.is_open()
-                && !card.kind.is_utility()
+            if shows_in_worktree(card)
                 && let Some(scopes) = scopes_by_path.get(path)
             {
                 owners
@@ -3095,8 +3132,7 @@ impl Cagents {
                         .cards
                         .iter()
                         .filter(|card| {
-                            card.existence.is_open()
-                                && !card.kind.is_utility()
+                            shows_in_worktree(card)
                                 && !channel_cards.contains(&card.id)
                                 && local_worktrees.get(card.id) == Some(path)
                         })
