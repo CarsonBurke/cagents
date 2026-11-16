@@ -41,6 +41,8 @@ impl Browser {
         matches!(self, Self::Chrome | Self::Chromium | Self::Brave)
     }
 
+    /// The `application` attribute a Chromium browser stores its key under.
+    #[cfg(feature = "desktop-keyring")]
     fn application(self) -> &'static str {
         match self {
             Self::Chrome => "chrome",
