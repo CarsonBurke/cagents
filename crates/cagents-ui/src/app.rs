@@ -1009,13 +1009,14 @@ fn save_quarantine_view<'a>(
     // An exhausted lane offers the one retry on its own notice; a retry
     // re-offers these writes too, so a second button would only repeat it.
     let lane_offers_retry = matches!(health.health, SessionSaveHealth::RetryExhausted { .. });
-    let guidance = if health.retry_requested {
+    // A requested retry keeps its button, busy, so the recovery action
+    // beside it stays put and the button itself says the retry is under
+    // way; with the retry on the lane's notice, this one says so.
+    let guidance = if health.retry_requested && lane_offers_retry {
         "Retry requested; waiting for the session writer."
     } else {
         QUARANTINE_GUIDANCE
     };
-    // A requested retry keeps its button, busy, so the recovery action
-    // beside it stays put.
     let action =
         ((health.offers_retry() || health.retry_requested) && !lane_offers_retry).then(|| {
             notice_surface_busy_action(
@@ -1085,13 +1086,10 @@ fn save_lane_view(health: &SaveHealthState, path: String) -> Option<Element<'_, 
             first_failed_at_unix_ms,
             attempts,
         } => {
-            let guidance = if health.retry_requested {
-                "Retry requested; waiting for the session writer."
-            } else {
-                category.guidance()
-            };
             // A requested retry keeps its button, busy, so the notice
-            // doesn't jump while the writer works.
+            // doesn't jump while the writer works, and the button says
+            // the retry is under way.
+            let guidance = category.guidance();
             let action = Some(notice_surface_busy_action(
                 NoticeSeverity::Error,
                 "Retry save",
