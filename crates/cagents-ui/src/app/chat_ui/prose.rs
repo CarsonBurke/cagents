@@ -20,6 +20,7 @@ use super::*;
 use iced::widget::text::Span;
 
 /// How a link in an answer reaches the surface.
+#[cfg(test)]
 fn link(target: Target, uri: markdown::Uri) -> Message {
     action(Action::OpenSharedDocument(target, uri))
 }
@@ -1288,6 +1289,7 @@ fn code_line(
 
 /// A bounded visual chunk. Copy and selection keep the original logical
 /// paragraph, so splitting here introduces no whitespace into clipboard text.
+#[cfg(test)]
 pub(super) fn chunk_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
     const BYTES: usize = 2048;
     const LINES: usize = 40;
@@ -2608,7 +2610,6 @@ mod tests {
             language: None,
             code: raw.clone(),
             source: display.clone(),
-            lines: vec![],
             reader_source: Box::new(reader_source::Source::new(&display)),
         };
         let mut element = items_for_test(&cached, &[item], target);

@@ -97,6 +97,7 @@ pub(crate) fn authorize(proof: &HostSessionProof) -> Result<(), String> {
 
 /// Absence is not a receipt. A new daemon must present an exact authenticated
 /// source alias and own this installation's current exclusive lease.
+#[cfg(test)]
 pub(crate) fn confirmed(
     source: &TerminalSession,
     expected: &Record,
@@ -124,6 +125,7 @@ pub(crate) fn confirmed_with_role(
 
 /// Used only when another authenticated owner (the native holder) retained this
 /// exact private Record. Public terminal IDs or launch recipes are insufficient.
+#[cfg(test)]
 pub(crate) fn confirmed_owner(expected: &Record, proof: &HostSessionProof) -> Result<bool, String> {
     confirmed_receipt(expected, proof, None, None)
 }

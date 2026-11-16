@@ -234,7 +234,7 @@ pub(super) fn mapped(cursor: Cursor, change: &TextChange) -> Option<Cursor> {
 /// A permit covers clipboard/chooser callbacks AND queued worker ownership.
 /// Resetting a draft cancels its lease, but does not release the worker's slot.
 #[derive(Clone, Debug)]
-pub(super) struct Ticket {
+pub struct Ticket {
     pub id: uuid::Uuid,
     state: std::sync::Arc<Job>,
 }

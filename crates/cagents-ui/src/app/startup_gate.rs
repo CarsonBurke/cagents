@@ -108,7 +108,7 @@ struct Observed {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct Inspection {
+pub struct Inspection {
     context: InspectionContext,
     outcome: Result<Observation, String>,
 }
@@ -1379,6 +1379,7 @@ pub(super) struct UpdateFailure {
     pub(super) summary: String,
     pub(super) notice: TransientNotice,
     /// Says what this window's own retained report already says.
+    #[cfg(test)]
     pub(super) retained: bool,
 }
 
@@ -1388,6 +1389,7 @@ pub(super) fn update_failure(message: &str) -> UpdateFailure {
         return UpdateFailure {
             summary: "saved sessions could not be fully restored".to_owned(),
             notice: TransientNotice::error(RETAINED_NOTICE).with_details(grouped),
+            #[cfg(test)]
             retained: true,
         };
     }
@@ -1403,6 +1405,7 @@ pub(super) fn update_failure(message: &str) -> UpdateFailure {
     UpdateFailure {
         summary: text.trim_end_matches('.').to_owned(),
         notice,
+        #[cfg(test)]
         retained: false,
     }
 }

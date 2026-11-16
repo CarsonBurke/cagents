@@ -61,7 +61,10 @@ impl Drop for ContextInner {
 /// an effectful bootstrap reserves a documented upper bound before creating
 /// handles and keeps that capacity charged through all pending cleanup.
 #[derive(Clone)]
-pub(crate) struct RecoveryContext(Arc<ContextInner>);
+pub(crate) struct RecoveryContext {
+    // Held only so the last clone's drop releases the lease and its budget.
+    _lease: Arc<ContextInner>,
+}
 impl RecoveryContext {
     pub(crate) fn with_guard(
         guard: impl Send + Sync + 'static,
@@ -87,11 +90,13 @@ impl RecoveryContext {
         used.contexts += 1;
         used.descriptors = total;
         drop(used);
-        Ok(Self(Arc::new(ContextInner {
-            guard: Some(Box::new(guard)),
-            descriptors,
-            budget,
-        })))
+        Ok(Self {
+            _lease: Arc::new(ContextInner {
+                guard: Some(Box::new(guard)),
+                descriptors,
+                budget,
+            }),
+        })
     }
     /// Reserve before producer effects. The resulting unresolved leaf owns
     /// this exact pre-acquired context until success or its final owner drop.
@@ -132,6 +137,7 @@ impl RecoverySlot {
             creation_guard: None,
         })
     }
+    #[cfg(test)]
     pub(crate) fn with_creation_guard(mut self, guard: Arc<dyn Send + Sync>) -> Self {
         // Only fresh pre-effect slots enter this constructor. The same guard
         // then travels through the factory, producer and recovery authority.

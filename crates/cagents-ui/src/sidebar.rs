@@ -11860,7 +11860,9 @@ fn changes_footer<'a>(
         commit_label
     };
     let commit = crate::interaction::tooltip(
-        crate::ui_controls::button::primary(commit_label)
+        // Ticking Amend relabels Commit; Push beside it stays put.
+        crate::ui_controls::button::primary("Commit")
+            .instead("Amend commit", state.commit_draft.amend)
             .icon(Icon::Commit)
             .name(format!("{commit_label} (Ctrl+Enter)"))
             .id(chrome.commit_id.clone())
@@ -12351,16 +12353,16 @@ pub fn discard_confirmation_dialog(pending: &DiscardConfirmation) -> Element<'_,
                 .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                 .into(),
             design::caption("Discarded work is not recoverable from Git.").into(),
-            crate::app::dialog_ui::confirmation_actions(
-                crate::ui_controls::button::secondary("Cancel")
-                    .id(discard_cancel_id())
-                    .on_press(SidebarAction::CancelDiscard),
-                crate::ui_controls::button::destructive("Discard")
-                    .id(discard_confirm_id())
-                    .on_press(pending.confirm_action()),
-            ),
         ])
         .spacing(space::M),
+        crate::app::dialog_ui::confirmation_actions(
+            crate::ui_controls::button::secondary("Cancel")
+                .id(discard_cancel_id())
+                .on_press(SidebarAction::CancelDiscard),
+            crate::ui_controls::button::destructive("Discard")
+                .id(discard_confirm_id())
+                .on_press(pending.confirm_action()),
+        ),
         520.0,
     )
 }

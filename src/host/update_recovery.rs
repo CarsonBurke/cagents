@@ -1062,11 +1062,27 @@ mod tests {
         let server_host = host.clone();
         let server =
             std::thread::spawn(move || super::super::client::serve(server, 2, server_host));
+        let expected = if provider_kind == crate::agent::Provider::Codex {
+            assert!(matches!(
+                wrong_thread.native_continuity,
+                chat::NativeContinuity::Durable { .. }
+            ));
+            // This conflicting thread cannot borrow the paused page or clear
+            // the old allocation's update fence by retrying the same source.
+            chat::Recovery::Blocked
+        } else {
+            chat::Recovery::Retry
+        };
         let failure = match chat::client::ClientHandle::fixture_restore(client, wrong_thread) {
             Err(failure) => failure,
             Ok(_) => panic!("a different thread must not display the captured page"),
         };
-        assert_eq!(failure.recovery, chat::Recovery::Retry);
+        assert_eq!(failure.recovery, expected);
+        if provider_kind == crate::agent::Provider::Codex {
+            assert!(failure.message.ends_with(
+                "This conversation was stopped for the update; its earlier provider is not attached"
+            ));
+        }
         server.join().unwrap();
         assert!(host.lock().unwrap().chats.is_empty());
         assert!(!sentinel.exists());

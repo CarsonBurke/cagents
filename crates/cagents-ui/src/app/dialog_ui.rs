@@ -114,24 +114,15 @@ pub(crate) fn scrolling_surface_with_actions<'a, M: 'a>(
     max_height: f32,
 ) -> Element<'a, M> {
     crate::interaction::opaque(
-        widget::container(crate::interaction::footed(
-            crate::interaction::overflow_fade_y(
-                widget::scrollable(scrolled_body(
-                    content,
-                    Padding {
-                        top: space::L - design::BORDER_WIDTH,
-                        bottom: space::M,
-                        ..Padding::ZERO
-                    },
-                ))
-                .direction(iced::widget::scrollable::Direction::Vertical(
-                    design::scrollbar(),
-                ))
-                .width(Length::Fill)
-                .height(Length::Shrink),
-                design::dialog_base,
-            ),
+        widget::container(scrolling_with_actions(
+            content,
             actions,
+            Padding {
+                top: space::L - design::BORDER_WIDTH,
+                bottom: space::M,
+                ..Padding::ZERO
+            },
+            design::dialog_base,
         ))
         .class(cosmic::theme::Container::Dialog(false))
         .padding(Padding {
@@ -145,6 +136,32 @@ pub(crate) fn scrolling_surface_with_actions<'a, M: 'a>(
         .max_height(max_height),
     )
     .into()
+}
+
+/// `content` above the `actions` that close it, which stay whole and in
+/// reach: when the space is too short for both, only the content gives up
+/// height and scrolls, fading at its edges into `fill`, the surface behind
+/// it. `padding` holds the content off the scrollbar's rail and scrolls with
+/// it. The pair is as tall as its parts, so short content leaves no gap
+/// above the actions.
+pub(crate) fn scrolling_with_actions<'a, M: 'a>(
+    content: impl Into<Element<'a, M>>,
+    actions: impl Into<Element<'a, M>>,
+    padding: Padding,
+    fill: fn(&cosmic::Theme) -> iced::Color,
+) -> Element<'a, M> {
+    crate::interaction::footed(
+        crate::interaction::overflow_fade_y(
+            widget::scrollable(scrolled_body(content, padding))
+                .direction(iced::widget::scrollable::Direction::Vertical(
+                    design::scrollbar(),
+                ))
+                .width(Length::Fill)
+                .height(Length::Shrink),
+            fill,
+        ),
+        actions,
+    )
 }
 
 /// What a confirmation's committing action costs, which decides where the
@@ -176,14 +193,23 @@ impl Consequence {
     }
 }
 
-/// A dialog that asks a question: [`surface`] whose controls Tab, Shift+Tab
-/// and the arrows cycle through without leaving it. Escape and the backdrop
+/// How tall a dialog with closing actions grows before its body scrolls,
+/// in a window with room for it.
+pub(crate) const MAX_HEIGHT: f32 = 640.0;
+
+/// A dialog that asks a question: its `content` above the `actions` that
+/// answer it, which stay whole and in reach however long the content is
+/// (see [`scrolling_surface_with_actions`]). Tab, Shift+Tab and the arrows
+/// cycle through its controls without leaving it. Escape and the backdrop
 /// dismiss it as every dialog does.
 pub(crate) fn confirmation_surface<'a, M: 'a>(
     content: impl Into<Element<'a, M>>,
+    actions: impl Into<Element<'a, M>>,
     max_width: f32,
 ) -> Element<'a, M> {
-    surface(crate::interaction::focus_scope(content), max_width)
+    crate::interaction::focus_scope(scrolling_surface_with_actions(
+        content, actions, max_width, MAX_HEIGHT,
+    ))
 }
 
 pub(crate) fn dont_ask_again_id(confirmation: settings::Confirmation) -> widget::Id {
@@ -350,6 +376,7 @@ pub(super) mod tests {
         let ids = ["first", "disabled", "last"].map(widget::Id::new);
         let dialog = || {
             confirmation_surface(
+                widget::text("Choose one"),
                 widget::row::with_children(
                     ids.iter()
                         .enumerate()
@@ -610,8 +637,78 @@ pub(super) mod tests {
         assert_eq!(viewport.y + viewport.height, button.y);
     }
 
+    /// The minimum 900x600 window at the supported 150% interface scale, in
+    /// logical pixels.
+    pub(in crate::app) const SCALED_MINIMUM_WINDOW: iced::Size = iced::Size::new(600.0, 400.0);
+
+    /// A message long enough to fill any dialog at the scaled minimum window.
+    pub(in crate::app) fn long_message() -> String {
+        "fatal: the operation could not finish because something went wrong. ".repeat(40)
+    }
+
+    /// Each control `ids` names stays whole and inside the scaled minimum
+    /// window, as tall as in a roomy one, below the dialog's body, which
+    /// scrolls instead.
+    pub(in crate::app) fn assert_actions_stay_in_reach<'a>(
+        dialog: impl Fn() -> Element<'a, Message>,
+        ids: &[widget::Id],
+    ) {
+        for id in ids {
+            let (_, _, _, natural) = action_geometry(dialog(), iced::Size::new(1200.0, 900.0), id);
+            let (window, viewport, content, control) =
+                action_geometry(dialog(), SCALED_MINIMUM_WINDOW, id);
+            assert!(
+                natural.height > 0.0,
+                "{id:?} is a control in the dialog: {natural:?}"
+            );
+            assert!(
+                control.height == natural.height
+                    && control.y >= 0.0
+                    && control.y + control.height <= window.height,
+                "{id:?} must stay whole and inside the window: {control:?}, not {natural:?}"
+            );
+            assert!(
+                viewport.y + viewport.height <= control.y,
+                "{id:?} sits below the body: {viewport:?}, {control:?}"
+            );
+            assert!(content > viewport.height, "the body scrolls instead");
+        }
+    }
+
+    /// Every confirmation keeps its answers in reach, however long what it
+    /// asks about is.
+    #[test]
+    fn a_confirmation_keeps_its_answers_in_reach_whatever_it_says() {
+        let [dismiss, confirm] = ["dismiss", "confirm"].map(|role| widget::Id::new(role));
+        assert_actions_stay_in_reach(
+            || {
+                overlay(
+                    confirmation_surface(
+                        widget::column::with_children(vec![
+                            design::title("Delete it?").into(),
+                            design::body(long_message()).into(),
+                        ])
+                        .spacing(space::M),
+                        confirmation_actions(
+                            crate::ui_controls::button::secondary("Cancel")
+                                .id(dismiss.clone())
+                                .on_press(Message::CancelDialog),
+                            crate::ui_controls::button::destructive("Delete")
+                                .id(confirm.clone())
+                                .on_press(Message::CancelDialog),
+                        ),
+                        480.0,
+                    ),
+                    None,
+                    1.0,
+                )
+            },
+            &[dismiss.clone(), confirm.clone()],
+        );
+    }
+
     /// The window, the dialog body's scroll viewport, its content height and
-    /// the bounds of the control `id`, in a laid-out dialog.
+    /// the bounds of the control or container `id`, in a laid-out dialog.
     pub(in crate::app) fn action_geometry(
         mut element: Element<'_, Message>,
         window: iced::Size,
@@ -647,6 +744,11 @@ pub(super) mod tests {
                 bounds: iced::Rectangle,
                 _: &mut dyn operation::Focusable,
             ) {
+                if id == Some(self.0) {
+                    self.3 = bounds;
+                }
+            }
+            fn container(&mut self, id: Option<&widget::Id>, bounds: iced::Rectangle) {
                 if id == Some(self.0) {
                     self.3 = bounds;
                 }

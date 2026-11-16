@@ -438,11 +438,25 @@ def rest(key):
                         "next_attempt": max(rest_due, at + REFRESH)})
 
 
+def check_passed(check):
+    if check.get("__typename") == "StatusContext":
+        return check.get("state") == "SUCCESS"
+    return check.get("status") == "COMPLETED" and check.get("conclusion") in ("SUCCESS", "NEUTRAL", "SKIPPED")
+
+
+def reported_check(check):
+    """A check as the Rust CLI reports it: no timestamps, and links only where it has not passed."""
+    dropped = {"startedAt", "completedAt"} | ({"detailsUrl", "targetUrl", "description"} if check_passed(check) else set())
+    return {field: value for field, value in check.items() if field not in dropped}
+
+
 def output(saved, key, as_json):
     at = int(time.time())
     fetched = saved.get("fetched_at")
     failed = bool(saved.get("error")) or not saved.get("snapshot")
     snapshot = saved.get("snapshot")
+    if snapshot:
+        snapshot = {**snapshot, "checks": [reported_check(check) for check in snapshot.get("checks", [])]}
     partial = not snapshot or (not snapshot["checks_complete"] and not snapshot["checks"])
     report = {"target": key, "source": "rest-bootstrap" if partial else "cache", "snapshot": snapshot,
               "fetched_at": fetched, "age_seconds": at - fetched if fetched else None,

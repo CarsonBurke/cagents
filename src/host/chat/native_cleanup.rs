@@ -57,14 +57,6 @@ pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Re
     close_retained_inner(host, source, None, None)
 }
 
-pub(super) fn close_retained_with_reservation(
-    host: &SharedHost,
-    source: &Session,
-    closing: &capacity::Reservation,
-) -> Result<(), String> {
-    close_retained_inner(host, source, Some(closing), None)
-}
-
 pub(super) fn close_captured(
     host: &SharedHost,
     source: &Session,

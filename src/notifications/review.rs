@@ -1,6 +1,5 @@
 //! Exact GitHub review-request authority, independent of a provider session.
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ReviewRequest {
@@ -67,7 +66,9 @@ impl ReviewRequest {
 
     /// Request IDs are immutable GitHub nodes. Route text may change (repository
     /// rename), but the same viewer/request must never be charged a second alert.
+    #[cfg(any(feature = "host", test))]
     pub(crate) fn storage_key(&self) -> String {
+        use sha2::{Digest, Sha256};
         let mut digest = Sha256::new();
         for part in [
             self.host.as_bytes(),

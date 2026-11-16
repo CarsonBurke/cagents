@@ -3170,6 +3170,7 @@ pub(crate) fn read_labeled_migration_sessions_with_budget(
 /// Terminal ownership lives in normalized tables, not cards.content_json.
 /// The caller must read and validate this card's kind/existence in that same
 /// transaction; this helper never opens a store or changes its schema/state.
+#[cfg(any(feature = "host", test))]
 pub(crate) fn read_migration_session_at(
     connection: &Connection,
     card: CardId,

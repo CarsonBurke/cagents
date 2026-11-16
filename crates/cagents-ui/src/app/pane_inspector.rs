@@ -21,7 +21,7 @@ use super::*;
 pub(super) const PANE_CONTENT_MIN_WIDTH: f32 = 360.0;
 
 /// The gap between the floating toggle and the corner of the pane's content.
-const TOGGLE_INSET: f32 = space::XS;
+pub(super) const TOGGLE_INSET: f32 = space::XS;
 
 /// Content stops a standard gap before the floating toggle's leading edge.
 pub(super) const TOGGLE_CLEARANCE: f32 = TOGGLE_INSET + design::PRIMARY_CONTROL_SIZE + space::S;

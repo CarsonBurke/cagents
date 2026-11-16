@@ -6807,6 +6807,7 @@ pub(crate) struct GitFileLock {
 
 impl GitFileLock {
     /// Git removed the containing administrative directory itself.
+    #[cfg(feature = "host")]
     pub(crate) fn retired_with_directory(&mut self) {
         self.active = false;
     }
@@ -12162,6 +12163,7 @@ struct WorktreeJournal {
     detail: String,
 }
 
+#[cfg(feature = "ui")]
 fn operation_timestamp() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -12277,6 +12279,7 @@ fn canonical_future_path(path: &Path) -> io::Result<PathBuf> {
     }
 }
 
+#[cfg(feature = "ui")]
 fn worktree_lease(path: &Path, create: bool) -> io::Result<crate::instance::OwnedLock> {
     worktree_lease_with_grace(path, create, Duration::ZERO)
 }
@@ -12325,6 +12328,7 @@ fn worktree_lease_with_grace(
 /// Settlement always requests EX, so SH still fences it. The process opens its
 /// independent SH description only after fork: unrelated parent forks can copy
 /// this guard, but cannot inherit an intended child's independent lock.
+#[cfg(feature = "ui")]
 fn inherited_worktree_lease(lease: &fs::File) -> Result<i32, RepositoryError> {
     // flock conversion is not atomic. On contention the caller must abort the
     // operation before executing another command, even if EX was lost.
@@ -13051,6 +13055,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         self.guard_created_pr_checkout_report(&journal, report)
     }
 
+    #[cfg(feature = "ui")]
     fn prepare_worktree_journal(
         &self,
         request: &CreateWorktreeRequest,
@@ -13317,6 +13322,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
 
     /// Only the original live request may clean up its own Git lock. Startup
     /// reconciliation deliberately never calls this mutating helper.
+    #[cfg(feature = "ui")]
     fn unlock_created_worktree(&self, journal: &mut WorktreeJournal) {
         let cleanup = (|| -> Result<(), RepositoryError> {
             let lease = worktree_lease_with_grace(&journal.lease_path, false, CLEANUP_GRACE)

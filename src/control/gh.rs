@@ -85,8 +85,12 @@ fn human(report: &pr_status::Report) -> String {
         return format!("{target}: status unavailable");
     };
     let pr = &snapshot.pull_request;
+    let (passed, attention): (Vec<_>, Vec<_>) = snapshot
+        .checks
+        .iter()
+        .partition(|check| pr_status::check_passed(check));
     let mut result = format!(
-        "{target}: {}{}\n{}\nHead: {}\nChecks: {}{}\nReview: {} · Merge: {}\n{} ({}, {age})",
+        "{target}: {}{}\n{}\nHead: {}\nChecks: {}{}{}\nReview: {} · Merge: {}\n{} ({}, {age})",
         pr.state,
         if pr.is_draft { " (draft)" } else { "" },
         pr.title,
@@ -95,6 +99,11 @@ fn human(report: &pr_status::Report) -> String {
             "unknown (REST bootstrap read)"
         } else {
             snapshot.checks_state.as_deref().unwrap_or("none reported")
+        },
+        if passed.is_empty() {
+            String::new()
+        } else {
+            format!(", {} passed", passed.len())
         },
         if snapshot.checks_complete || snapshot.is_rest_bootstrap() {
             ""
@@ -110,7 +119,9 @@ fn human(report: &pr_status::Report) -> String {
         pr.url,
         report.source
     );
-    for check in &snapshot.checks {
+    // Passing checks are counted above; only the rest need a line, and a
+    // finished one its link, where its log is.
+    for check in attention {
         let name = check["name"]
             .as_str()
             .or_else(|| check["context"].as_str())
@@ -122,6 +133,24 @@ fn human(report: &pr_status::Report) -> String {
             .or_else(|| check["state"].as_str())
             .unwrap_or("unknown");
         result.push_str(&format!("\n  {state}: {name}"));
+        let finished = if check["__typename"] == "StatusContext" {
+            !matches!(check["state"].as_str(), Some("PENDING" | "EXPECTED"))
+        } else {
+            check["status"] == "COMPLETED"
+        };
+        if let Some(link) = check["detailsUrl"]
+            .as_str()
+            .or_else(|| check["targetUrl"].as_str())
+            .filter(|_| finished)
+        {
+            result.push_str(&format!(" {link}"));
+        }
+        if let Some(description) = check["description"]
+            .as_str()
+            .filter(|description| finished && !description.is_empty())
+        {
+            result.push_str(&format!(" ({description})"));
+        }
     }
     result
 }
@@ -155,5 +184,52 @@ mod tests {
             .command;
         assert!(!staged_command_requires_daemon(&command));
         assert!(!routes_to_staged_owner(&command));
+    }
+
+    #[test]
+    fn human_status_counts_passing_checks_and_links_finished_failures() {
+        let key = target("Owner/Repo", "github.com", 7).unwrap();
+        let link = "https://github.com/Owner/Repo/actions/runs/1/job/2";
+        let pull_request = serde_json::from_value(serde_json::json!({
+            "number":7,"title":"Fix it","url":"https://github.com/Owner/Repo/pull/7","state":"OPEN",
+            "isDraft":false,"headRefName":"fix","headRefOid":"a".repeat(40),"baseRefName":"main",
+            "mergeable":"MERGEABLE","mergeStateStatus":"BLOCKED","reviewDecision":null,
+            "updatedAt":"2026-11-09T00:00:00Z"}))
+        .unwrap();
+        let checks = vec![
+            serde_json::json!({"__typename":"CheckRun","name":"Contract structure","status":"COMPLETED","conclusion":"SUCCESS"}),
+            serde_json::json!({"__typename":"CheckRun","name":"Formatting","status":"COMPLETED","conclusion":"SUCCESS"}),
+            serde_json::json!({"__typename":"CheckRun","name":"Suites (tooling)","status":"COMPLETED","conclusion":"FAILURE","detailsUrl":link}),
+            serde_json::json!({"__typename":"CheckRun","name":"Script contracts","status":"IN_PROGRESS","conclusion":null,"detailsUrl":link}),
+            serde_json::json!({"__typename":"StatusContext","context":"lint","state":"ERROR","targetUrl":link,"description":"Lint crashed"}),
+            serde_json::json!({"__typename":"StatusContext","context":"deploy","state":"PENDING","targetUrl":link,"description":"Waiting"}),
+        ];
+        let report = pr_status::Report {
+            target: key,
+            fetched_at: Some(100),
+            age_seconds: Some(5),
+            stale: false,
+            source: "cache",
+            snapshot: Some(pr_status::Snapshot {
+                pull_request,
+                checks_state: Some("FAILURE".into()),
+                checks,
+                checks_complete: true,
+                primary_cost: Some(1),
+            }),
+            error: None,
+            retry_at: None,
+            outcome: "succeeded",
+        };
+        assert_eq!(
+            human(&report),
+            format!(
+                "github.com/Owner/Repo #7: OPEN\nFix it\nHead: {}\nChecks: FAILURE, 2 passed\n\
+                 Review: none reported · Merge: BLOCKED\nhttps://github.com/Owner/Repo/pull/7 (cache, snapshot 5s old)\n  \
+                 FAILURE: Suites (tooling) {link}\n  IN_PROGRESS: Script contracts\n  \
+                 ERROR: lint {link} (Lint crashed)\n  PENDING: deploy",
+                "a".repeat(40)
+            )
+        );
     }
 }

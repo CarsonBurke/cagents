@@ -72,7 +72,7 @@ pub(crate) enum SystemUrlOpener {
     #[default]
     Desktop,
     /// Records each URL it is given and reports it opened.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "integrated-browser"))]
     Recording(std::sync::Arc<std::sync::Mutex<Vec<Url>>>),
 }
 
@@ -85,7 +85,7 @@ impl SystemUrlOpener {
         async move {
             match opener {
                 Self::Desktop => open_system_url(url).await,
-                #[cfg(test)]
+                #[cfg(all(test, feature = "integrated-browser"))]
                 Self::Recording(opened) => {
                     opened.lock().unwrap().push(url);
                     Ok(())

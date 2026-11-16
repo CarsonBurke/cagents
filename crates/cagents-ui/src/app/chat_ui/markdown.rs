@@ -97,6 +97,7 @@ impl Content {
     }
 
     /// Creates some new [`Content`] by parsing the given Markdown.
+    #[cfg(test)]
     pub fn parse(markdown: &str) -> Self {
         Self::parse_labelled(markdown, Arc::default())
     }
@@ -541,8 +542,6 @@ pub enum Item {
         code: Arc<str>,
         /// Immutable display input prepared once with this parser revision.
         source: Arc<str>,
-        /// The styled lines of text in the code block.
-        lines: Vec<Text>,
         /// Stable source digest and bounded append proof for nested reader geometry.
         reader_source: Box<super::reader_source::Source>,
     },
@@ -588,13 +587,11 @@ impl Clone for Item {
                 language,
                 code,
                 source,
-                lines,
                 reader_source,
             } => Self::CodeBlock {
                 language: language.clone(),
                 code: code.clone(),
                 source: source.clone(),
-                lines: lines.clone(),
                 reader_source: reader_source.clone(),
             },
             Self::List { start, bullets } => Self::List {
@@ -1047,6 +1044,7 @@ impl Text {
     /// This never scans text or materializes plain/styled spans. Reparsing
     /// records exact conservative proofs before publication; rewrites and
     /// Markdown reinterpretation establish a new lineage instead.
+    #[cfg(test)]
     pub fn append_proven(&self, previous: &Text) -> bool {
         append_proven(
             &self.spans,
@@ -1120,6 +1118,7 @@ impl Text {
 
     /// Style just a bounded rendered byte range; hidden chunks never populate
     /// the AST's whole-paragraph styled-spans cache.
+    #[cfg(test)]
     pub fn spans_range(
         &self,
         style: Style,
@@ -1602,7 +1601,6 @@ fn parse_with<'a>(
     };
     let mut code = String::new();
     let mut code_language = None;
-    let mut code_lines = Vec::new();
     let mut strong = false;
     let mut emphasis = false;
     let mut strikethrough = false;
@@ -1978,7 +1976,6 @@ fn parse_with<'a>(
                         source: display.clone(),
                         reader_source: Box::new(super::reader_source::Source::new(&display)),
                         code: display,
-                        lines: code_lines.drain(..).collect(),
                     },
                     source,
                 )
@@ -2826,7 +2823,7 @@ mod tests {
     ];
 
     #[test]
-    fn native_model_matches_pinned_markdown_semantics_without_discarded_highlight_lines() {
+    fn native_model_matches_pinned_markdown_semantics() {
         for source in CASES {
             let native = Content::parse(source);
             let original = original::Content::parse(source);
@@ -2835,11 +2832,6 @@ mod tests {
                 original_outline(original.items()),
                 "{source:?}"
             );
-            for item in native.items() {
-                if let Item::CodeBlock { lines, .. } = item {
-                    assert!(lines.is_empty());
-                }
-            }
         }
     }
 

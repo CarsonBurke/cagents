@@ -671,6 +671,7 @@ impl Bound {
 
 /// Retain only the immutable allocation/lineage and serving ownership fields
 /// used by the proof reader. Output and attachment metadata can keep changing.
+#[cfg(feature = "host")]
 pub(crate) fn proof_terminal_descriptor(
     mut descriptor: crate::terminal_ipc::TerminalDescriptor,
 ) -> crate::terminal_ipc::TerminalDescriptor {
@@ -2524,8 +2525,8 @@ pub(crate) struct AlreadyRecovered {
     pub paused_chats: Vec<TerminalId>,
     pub witness: SettledWitness,
     pub adopted_chat_descriptors: Vec<Session>,
+    #[cfg(test)]
     pub adopted_terminals: Vec<TerminalId>,
-    pub adopted_chats: Vec<TerminalId>,
     checkpoint_path: PathBuf,
     daemon_binary: PathBuf,
     checkpoint_hash: String,
@@ -2942,6 +2943,7 @@ fn archived_discovery_strict(
 /// Optional proof metadata, consulted only after ordinary holder adoption.
 /// This never directs restoration, adoption, paused panes or provider starts.
 /// Broken, unsupported or unrelated history must never prevent normal startup.
+#[cfg(any(feature = "host", test))]
 pub(crate) fn archived_discovery(
     checkpoint: &Path,
     daemon: &Path,
@@ -3042,8 +3044,8 @@ fn recovered_data(
         paused_terminals: record.paused_terminals,
         paused_chats: record.paused_chats,
         adopted_chat_descriptors: descriptors,
+        #[cfg(test)]
         adopted_terminals: record.adopted_terminals,
-        adopted_chats: record.adopted_chats,
         checkpoint_path: checkpoint.to_owned(),
         daemon_binary: target,
         checkpoint_hash: record.checkpoint_hash,

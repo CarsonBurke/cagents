@@ -22,6 +22,88 @@ pub(super) fn close_sessions_retiring_agents(sessions: Vec<CardKind>) -> Result<
     close_sessions_with(sessions, OpenAgents::Retire)
 }
 
+/// Fresh replaces this exact conversation, rather than whichever conversation
+/// currently occupies its native ID. A changed owner must be reconciled before
+/// Fresh can be attempted again; inventory alone cannot authorize that change.
+pub(super) fn close_captured_chat(source: crate::chat::Session) -> Result<(), String> {
+    let socket = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
+    let Some(mut client) = connect(&socket)? else {
+        return no_daemon_captured_close_result(&source);
+    };
+    close_captured_chat_with(&mut client, &source)
+}
+
+fn no_daemon_captured_close_result(source: &crate::chat::Session) -> Result<(), String> {
+    if source.terminal.is_some() {
+        return Err(
+            "Reconnect the daemon to confirm the retained native provider has stopped".into(),
+        );
+    }
+    no_daemon_close_result(&[CardKind::Chat(source.clone())])
+}
+
+fn close_captured_chat_with(
+    client: &mut crate::control::ControlClient,
+    source: &crate::chat::Session,
+) -> Result<(), String> {
+    let chats = client.list_chats().map_err(|error| error.to_string())?;
+    let live = chats.iter().find(|live| live.id == source.id);
+    if live.is_some_and(|live| live != source) {
+        return Err(captured_chat_changed());
+    }
+    let mut agents = None;
+    // Closing an open agent's conversation retires the agent and its pane,
+    // which leaves Fresh no card to start in. Refuse before closing anything.
+    if captured_open_agent(source, read_open_agents(&mut agents, client)?)? {
+        return Err(agent_owned_conversation());
+    }
+    if live.is_some() {
+        // The attachment must still be the captured descriptor after inventory
+        // was read. In particular, never close an ID-only handle or derive a
+        // paired terminal from a replacement occupying the same native ID.
+        client
+            .close_chat_with_snapshot(source.clone())
+            .map_err(|error| error.reason())?;
+        agents = None;
+        if captured_open_agent(source, read_open_agents(&mut agents, client)?)? {
+            return Err(agent_owned_conversation());
+        }
+    } else if may_have_retained_owner(source) || source.terminal.is_some() {
+        // Actor absence is not a retained-owner or paired-terminal receipt.
+        client
+            .close_retained_chat(source.clone())
+            .map_err(|error| error.reason())?;
+    }
+    Ok(())
+}
+
+fn captured_open_agent(
+    source: &crate::chat::Session,
+    agents: &[crate::agent_execution::Agent],
+) -> Result<bool, String> {
+    let mut bound = false;
+    for agent in agents.iter().filter(|agent| !agent.closed) {
+        if let Some(crate::agent_execution::HostedSession::Chat(session)) = &agent.session
+            && session.id == source.id
+        {
+            if session != source {
+                return Err(captured_chat_changed());
+            }
+            bound = true;
+        }
+    }
+    Ok(bound)
+}
+
+fn agent_owned_conversation() -> String {
+    "An agent runs this conversation, so it can't start a new one in its place. Close it instead."
+        .into()
+}
+
+fn captured_chat_changed() -> String {
+    "The hosted chat does not match the exact saved conversation".into()
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OpenAgents {
     Keep,
@@ -1207,7 +1289,7 @@ impl Cagents {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(feature = "integrated-browser")))]
     pub(super) fn remember_channel_name_for_test(&mut self, id: ChannelId, title: String) {
         self.remember_channel_name(id, title, crate::model::ChannelTitleSource::Provider);
     }
@@ -2224,20 +2306,20 @@ impl Cagents {
                 "The last attempt failed: {failure}"
             )));
         }
-        rows.push(super::dialog_ui::confirmation_actions(
+        let actions = super::dialog_ui::confirmation_actions(
             crate::ui_controls::button::secondary("Cancel")
                 .id(widget::Id::new("dialog.channel.close"))
                 .on_press(Message::ChannelUi(Action::Dismiss)),
-            crate::ui_controls::button::destructive(if dialog.failure.is_some() {
-                "Retry delete"
-            } else {
-                "Delete channel"
-            })
-            .id(widget::Id::new("dialog.channel.confirm"))
-            .on_press(Message::ChannelUi(Action::ConfirmDelete)),
-        ));
+            crate::ui_controls::button::destructive("Delete channel")
+                .instead("Retry delete", dialog.failure.is_some())
+                .id(widget::Id::new("dialog.channel.confirm"))
+                .on_press(Message::ChannelUi(Action::ConfirmDelete)),
+        );
+        // A long failure or list of unsaved editors scrolls; the answers stay
+        // in reach.
         Some(super::dialog_ui::confirmation_surface(
             widget::column::with_children(rows).spacing(space::M),
+            actions,
             480.0,
         ))
     }
@@ -2678,6 +2760,20 @@ mod tests {
                 ordinal != crate::workspace_model::PENDING_ORDINAL
             );
         }
+    }
+
+    /// Why the last deletion failed can run long; it scrolls, and Cancel and
+    /// Retry stay in reach at the scaled minimum window.
+    #[test]
+    fn deletion_answers_stay_in_reach_beside_a_long_failure() {
+        use super::super::dialog_ui::tests::{assert_actions_stay_in_reach, long_message};
+        let (mut app, channel, _survivor, _card) = channel_with_a_conversation();
+        drop(app.handle_channel_ui(Action::Delete(channel)));
+        app.channel_ui.dialog.as_mut().unwrap().failure = Some(long_message());
+        assert_actions_stay_in_reach(
+            || super::super::dialog_ui::overlay(app.channel_dialog_view().unwrap(), None, 1.0),
+            &["dialog.channel.close", "dialog.channel.confirm"].map(widget::Id::new),
+        );
     }
 
     #[test]
@@ -4010,7 +4106,7 @@ mod tests {
 mod revival_tests;
 
 #[cfg(test)]
-mod close_tests {
+pub(in crate::app) mod close_tests {
     use super::*;
     use crate::agent_execution::{
         Agent, HostedSession, Origin, Placement, Spec, Surface, Target as AgentTarget,
@@ -4028,7 +4124,7 @@ mod close_tests {
         session
     }
 
-    fn agent(session: &crate::chat::Session) -> Agent {
+    pub(in crate::app) fn agent(session: &crate::chat::Session) -> Agent {
         let placement = Placement::Channel(ChannelId::new());
         Agent {
             id: crate::model::AgentId::new(),
@@ -4055,6 +4151,397 @@ mod close_tests {
             created_ms: 0,
             closed: false,
         }
+    }
+
+    fn proof() -> crate::model::HostSessionProof {
+        crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("session"),
+            boot_id: crate::model::BootId::new("boot"),
+            host_incarnation: crate::model::HostIncarnation::new("incarnation"),
+        }
+    }
+
+    fn captured_source() -> crate::chat::Session {
+        let mut source = conversation(crate::chat::NativeContinuity::ReconnectOnly);
+        source.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        source.proof = Some(proof());
+        source
+    }
+
+    fn listed(sessions: Vec<crate::chat::Session>) -> crate::terminal::ipc::ServerResponse {
+        crate::terminal::ipc::ServerResponse::ChatListed { sessions }
+    }
+
+    /// Close reads only the agent rows, not the whole workspace model.
+    fn read_agents() -> crate::terminal::ipc::ClientRequest {
+        crate::terminal::ipc::ClientRequest::ReadWorkspaceMetadata {
+            query: crate::workspace_model::metadata::Query::Agents,
+        }
+    }
+
+    fn model(agents: Vec<Agent>) -> crate::terminal::ipc::ServerResponse {
+        crate::terminal::ipc::ServerResponse::WorkspaceMetadata(
+            crate::workspace_model::metadata::Reply::Agents {
+                identity: uuid::Uuid::nil(),
+                agents,
+            },
+        )
+    }
+
+    /// Actual control framing checks the entire request sequence, including
+    /// absence of replacement attach/close or ID-derived terminal cleanup.
+    fn captured_close(
+        source: &crate::chat::Session,
+        steps: Vec<(
+            crate::terminal::ipc::ClientRequest,
+            crate::terminal::ipc::ServerResponse,
+        )>,
+    ) -> Result<(), String> {
+        use crate::terminal::ipc::{
+            ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage,
+            ServerResponse, read_frame, write_frame,
+        };
+        use std::os::unix::net::UnixStream;
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        peer.set_write_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let captured = source.clone();
+        let server = std::thread::spawn(move || {
+            let connect: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+            assert!(matches!(connect.request, ClientRequest::Connect { .. }));
+            let mut respond = |request_id, response| {
+                write_frame(
+                    &mut peer,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(request_id),
+                        proof: proof(),
+                        message: ServerMessage::Response { response },
+                    },
+                )
+                .unwrap();
+            };
+            respond(
+                connect.request_id,
+                ServerResponse::Connected {
+                    proof: proof(),
+                    resumed: Vec::new(),
+                },
+            );
+            let mut terminal_inventory_read = false;
+            for (expected, response) in steps {
+                let request = loop {
+                    let request: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                    assert_eq!(request.proof, Some(proof()));
+                    // Ordinary Close asks for terminal inventory too. Permit
+                    // that ordering so the old ID-substitution policy reaches
+                    // the ownership assertion, not a fixture protocol mismatch.
+                    if request.request == ClientRequest::List {
+                        assert_eq!(expected, ClientRequest::ChatList);
+                        assert!(
+                            !terminal_inventory_read,
+                            "terminal inventory may be read only once"
+                        );
+                        terminal_inventory_read = true;
+                        write_frame(
+                            &mut peer,
+                            &ServerEnvelope {
+                                version: PROTOCOL_VERSION,
+                                request_id: Some(request.request_id),
+                                proof: proof(),
+                                message: ServerMessage::Response {
+                                    response: ServerResponse::Listed {
+                                        terminals: Vec::new(),
+                                    },
+                                },
+                            },
+                        )
+                        .unwrap();
+                        continue;
+                    }
+                    break request;
+                };
+                assert_eq!(request.request, expected);
+                write_frame(
+                    &mut peer,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(request.request_id),
+                        proof: proof(),
+                        message: ServerMessage::Response { response },
+                    },
+                )
+                .unwrap();
+            }
+            if let Some(request) = read_frame::<ClientEnvelope>(&mut peer).unwrap() {
+                if let ClientRequest::ChatAttach { session } = &request.request {
+                    assert_eq!(
+                        session, &captured,
+                        "Fresh must never attach the replacement occupying the captured native ID"
+                    );
+                }
+                panic!(
+                    "unexpected cleanup after the captured source: {:?}",
+                    request.request
+                );
+            }
+        });
+        let mut client = crate::control::ControlClient::from_stream(stream).unwrap();
+        let result = close_captured_chat_with(&mut client, source);
+        drop(client);
+        server.join().unwrap();
+        result
+    }
+
+    fn paired_source() -> crate::chat::Session {
+        let mut source = captured_source();
+        let host = proof();
+        source.terminal = Some(crate::model::TerminalSession {
+            id: source.id,
+            launch: source.launch.recipe.clone(),
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+            transcript_path: None,
+            resume_hint: None,
+            continuity: crate::model::TerminalContinuity::Live {
+                host_session_id: host.host_session_id,
+                boot_id: host.boot_id,
+                host_incarnation: host.host_incarnation,
+            },
+        });
+        source
+    }
+
+    #[test]
+    fn fresh_close_requires_receipt_for_absent_retained_owner_or_pair() {
+        use crate::terminal::ipc::{ClientRequest, ServerResponse};
+        let mut retained = captured_source();
+        retained.native_continuity = crate::chat::NativeContinuity::Durable {
+            provider_version: "fixture".into(),
+        };
+        for source in [retained, paired_source()] {
+            assert!(no_daemon_captured_close_result(&source).is_err());
+            assert!(
+                captured_close(
+                    &source,
+                    vec![
+                        (ClientRequest::ChatList, listed(vec![])),
+                        (read_agents(), model(vec![])),
+                        (
+                            ClientRequest::ChatCloseRetained {
+                                session: source.clone()
+                            },
+                            ServerResponse::Accepted
+                        ),
+                    ]
+                )
+                .is_ok()
+            );
+            assert!(
+                captured_close(
+                    &source,
+                    vec![
+                        (ClientRequest::ChatList, listed(vec![])),
+                        (read_agents(), model(vec![])),
+                        (
+                            ClientRequest::ChatCloseRetained {
+                                session: source.clone()
+                            },
+                            ServerResponse::Detached
+                        ),
+                    ]
+                )
+                .is_err()
+            );
+        }
+        assert!(no_daemon_captured_close_result(&captured_source()).is_ok());
+    }
+
+    #[test]
+    fn fresh_close_refuses_same_id_replacement_before_attachment() {
+        use crate::terminal::ipc::ClientRequest;
+        let source = captured_source();
+        for change in 0..5 {
+            let mut replacement = source.clone();
+            match change {
+                0 => replacement.launch.session_id = Some(uuid::Uuid::new_v4().to_string()),
+                1 => replacement.launch.recipe.arguments.push("--changed".into()),
+                2 => {
+                    replacement
+                        .launch
+                        .recipe
+                        .environment
+                        .insert("ACCOUNT".into(), "other".into());
+                }
+                3 => {
+                    replacement.proof.as_mut().unwrap().host_incarnation =
+                        crate::model::HostIncarnation::new("new-owner")
+                }
+                _ => {
+                    replacement.native_continuity =
+                        crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 }
+                }
+            }
+            assert!(
+                captured_close(
+                    &source,
+                    vec![(ClientRequest::ChatList, listed(vec![replacement]))]
+                )
+                .is_err(),
+                "replacement variant {change}"
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_close_checks_attached_descriptor_before_close() {
+        use crate::terminal::ipc::{ClientRequest, ServerResponse};
+        let source = captured_source();
+        let mut replacement = source.clone();
+        replacement.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        assert!(
+            captured_close(
+                &source,
+                vec![
+                    (ClientRequest::ChatList, listed(vec![source.clone()])),
+                    (read_agents(), model(vec![])),
+                    (
+                        ClientRequest::ChatAttach {
+                            session: source.clone()
+                        },
+                        ServerResponse::ChatAttached {
+                            session: replacement,
+                            snapshot: Default::default()
+                        }
+                    ),
+                    (
+                        ClientRequest::ChatDetach { chat_id: source.id },
+                        ServerResponse::Detached
+                    ),
+                ]
+            )
+            .is_err()
+        );
+    }
+
+    /// Closing an open agent's conversation retires the agent and removes its
+    /// pane, so Fresh would start in a card that no longer exists. It refuses
+    /// before closing anything, and again if an agent claims it mid-close.
+    #[test]
+    fn fresh_close_refuses_a_conversation_an_open_agent_runs_as() {
+        use crate::terminal::ipc::{ClientRequest, ServerResponse};
+        let source = captured_source();
+        for live in [false, true] {
+            assert_eq!(
+                captured_close(
+                    &source,
+                    vec![
+                        (
+                            ClientRequest::ChatList,
+                            listed(if live { vec![source.clone()] } else { vec![] })
+                        ),
+                        (read_agents(), model(vec![agent(&source)])),
+                    ]
+                ),
+                Err(agent_owned_conversation())
+            );
+        }
+        assert_eq!(
+            captured_close(
+                &source,
+                vec![
+                    (ClientRequest::ChatList, listed(vec![source.clone()])),
+                    (read_agents(), model(vec![])),
+                    (
+                        ClientRequest::ChatAttach {
+                            session: source.clone()
+                        },
+                        ServerResponse::ChatAttached {
+                            session: source.clone(),
+                            snapshot: Default::default()
+                        }
+                    ),
+                    (
+                        ClientRequest::ChatClose { chat_id: source.id },
+                        ServerResponse::ChatClosed {
+                            chat_id: source.id,
+                            snapshot: Default::default()
+                        }
+                    ),
+                    (read_agents(), model(vec![agent(&source)])),
+                ]
+            ),
+            Err(agent_owned_conversation())
+        );
+    }
+
+    #[test]
+    fn fresh_close_never_follows_agent_replacement_before_or_after_close() {
+        use crate::terminal::ipc::{ClientRequest, ServerResponse};
+        let source = captured_source();
+        let mut replacement = source.clone();
+        replacement.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        for live in [false, true] {
+            assert!(
+                captured_close(
+                    &source,
+                    vec![
+                        (
+                            ClientRequest::ChatList,
+                            listed(if live { vec![source.clone()] } else { vec![] })
+                        ),
+                        (read_agents(), model(vec![agent(&replacement)])),
+                    ]
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            captured_close(
+                &source,
+                vec![
+                    (ClientRequest::ChatList, listed(vec![source.clone()])),
+                    (read_agents(), model(vec![])),
+                    (
+                        ClientRequest::ChatAttach {
+                            session: source.clone()
+                        },
+                        ServerResponse::ChatAttached {
+                            session: source.clone(),
+                            snapshot: Default::default()
+                        }
+                    ),
+                    (
+                        ClientRequest::ChatClose { chat_id: source.id },
+                        ServerResponse::ChatClosed {
+                            chat_id: source.id,
+                            snapshot: Default::default()
+                        }
+                    ),
+                    (read_agents(), model(vec![agent(&replacement)])),
+                ]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn fresh_close_of_an_absent_unretained_conversation_asks_nothing_more() {
+        use crate::terminal::ipc::ClientRequest;
+        let source = captured_source();
+        assert!(
+            captured_close(
+                &source,
+                vec![
+                    (ClientRequest::ChatList, listed(vec![])),
+                    (read_agents(), model(vec![])),
+                ]
+            )
+            .is_ok()
+        );
     }
 
     /// A conversation a stopped daemon left without a live actor still runs

@@ -9,6 +9,11 @@ pub(super) struct Recovery {
 }
 impl Runtime {
     pub(super) fn auth_error(&self) -> Option<&str> {
+        // A permanent start refusal has no typed sign-in remedy. Raw local
+        // or older snapshot text is diagnostic, not authority to retry it.
+        if self.start_blocked.is_some() {
+            return None;
+        }
         self.snapshot
             .error
             .as_deref()
@@ -97,7 +102,7 @@ impl Cagents {
                 if self.auth_account(runtime).is_some_and(|account| self.account_login_change(&account).is_none()))
     }
     pub(super) fn resume_after_sign_in(&mut self, target: Target) -> Task<Message> {
-        if !self.chat_auth_resume_enabled(target) {
+        if self.chat_retry_blocked(target.card) || !self.chat_auth_resume_enabled(target) {
             return Task::none();
         }
         let Some(CardRuntime::Chat(runtime)) = self.cards.get(&target.card) else {
@@ -148,14 +153,10 @@ pub(super) fn view<'a>(
         let resume_enabled = enabled && recovery.login_change.is_none();
         login_change = recovery.login_change;
         controls.push(
-            crate::ui_controls::button::primary(if recovery.signing_in {
-                "Signing in…"
-            } else {
-                "Sign in"
-            })
-            .reserve_labels(["Sign in", "Signing in…"])
-            .on_press_maybe(enabled.then_some(action(Action::SignIn(target, recovery.account))))
-            .into(),
+            crate::ui_controls::button::primary("Sign in")
+                .instead("Signing in…", recovery.signing_in)
+                .on_press_maybe(enabled.then_some(action(Action::SignIn(target, recovery.account))))
+                .into(),
         );
         controls.push(
             crate::ui_controls::button::secondary("Resume chat")
@@ -183,9 +184,8 @@ pub(super) fn view<'a>(
     let mut rows = vec![
         design::body(label).into(),
         design::caption(if known { "Sign in, then resume this conversation. Your draft is retained." } else { "Open accounts to add or link this session’s account, then return here to sign in and resume. Your draft is retained." }).into(),
-        widget::row::with_children(controls)
-            .spacing(step::GAP_S)
-            .wrap()
+        widget::flex_row(controls)
+            .spacing(step::GAP_S as u16)
             .into(),
     ];
     for incident in runtime

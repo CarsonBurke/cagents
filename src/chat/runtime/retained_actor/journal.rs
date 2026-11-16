@@ -215,6 +215,7 @@ impl Journal {
         self.last_loss = Some(loss);
         Ok(())
     }
+    #[cfg(test)]
     pub fn clear_acknowledged_loss_for_restart(&mut self) -> Result<(), String> {
         self.ensure_writable()?;
         let Some(loss) = self.continuity_loss()? else {
@@ -454,6 +455,7 @@ impl Journal {
         self.finished_runs.remove(&run);
         Ok(())
     }
+    #[cfg(test)]
     pub fn admit(&mut self, identity: &InputIdentity) -> Result<InputReceipt, String> {
         self.admit_with_run(identity, None)
     }

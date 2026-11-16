@@ -95,7 +95,6 @@ pub(super) struct UpdateSummary {
     pub status: String,
     /// Whether `status` reports a failed check.
     pub failed: bool,
-    pub checking: bool,
     /// Whether "Check for updates" can run now.
     pub can_check: bool,
     /// A newer release: its version and release notes.
@@ -450,23 +449,24 @@ impl Cagents {
                 .id(widget::Id::new("update.cancel"))
                 .on_press(Message::UpdateUi(Action::CancelApply))
                 .into(),
-            crate::ui_controls::button::primary(if terminal_confirmation {
-                "Continue in terminal"
-            } else if preview.daemon.as_ref().is_some_and(|daemon| {
-                daemon
-                    .sessions
-                    .iter()
-                    .any(|session| session.disposition == Disposition::WaitsForIdle)
-            }) {
-                "Update when idle"
-            } else {
-                "Update and reopen"
-            })
-            .id(widget::Id::new("update.confirm"))
-            .on_press_maybe((!terminal_confirmation).then_some(Message::UpdateUi(
-                Action::ConfirmApply(confirmation.nonce.clone()),
-            )))
-            .into(),
+            // Choosing to wait for idle sessions renames the update, and
+            // Cancel beside it stays put.
+            crate::ui_controls::button::primary("Update and reopen")
+                .instead("Continue in terminal", terminal_confirmation)
+                .instead(
+                    "Update when idle",
+                    preview.daemon.as_ref().is_some_and(|daemon| {
+                        daemon
+                            .sessions
+                            .iter()
+                            .any(|session| session.disposition == Disposition::WaitsForIdle)
+                    }),
+                )
+                .id(widget::Id::new("update.confirm"))
+                .on_press_maybe((!terminal_confirmation).then_some(Message::UpdateUi(
+                    Action::ConfirmApply(confirmation.nonce.clone()),
+                )))
+                .into(),
         ])
         .align_y(Alignment::Center)
         .spacing(space::S);
@@ -812,7 +812,6 @@ impl Cagents {
         UpdateSummary {
             status,
             failed,
-            checking: state.checking,
             can_check: !development && !state.checking && !state.updating(),
             apply_blocker: available
                 .as_ref()

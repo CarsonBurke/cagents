@@ -8,7 +8,7 @@ pub(super) fn queue_preview(text: &str) -> String {
     let text = text.trim();
     text[..text.floor_char_boundary(QUEUE_PREVIEW_BYTES)].to_owned()
 }
-pub(super) struct QueuePreview {
+pub struct QueuePreview {
     pub(super) source: Arc<LocalSource>,
     pub(super) preview: Arc<str>,
 }
@@ -77,21 +77,10 @@ impl ProviderQueue {
         self.sources.clear();
         self.snapshot = Default::default();
     }
-    pub(super) fn retained_bytes(&self) -> usize {
-        self.sources
-            .values()
-            .map(|source| {
-                source
-                    .source
-                    .allocation()
-                    .saturating_add(source.preview.len())
-            })
-            .sum()
-    }
 }
 
 /// Canonical local input, created once at submission and never provider history.
-pub(super) struct LocalSource {
+pub struct LocalSource {
     pub(super) id: u64,
     text: String,
     pub(super) lease: Mutex<Option<Arc<preparation::Lease>>>,

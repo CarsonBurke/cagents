@@ -28,6 +28,7 @@ impl VerifiedRetirement {
     pub(crate) fn receipt(&self) -> &RetirementReceipt {
         &self.0
     }
+    #[cfg(test)]
     pub(crate) fn into_receipt(self) -> RetirementReceipt {
         self.0
     }
@@ -238,6 +239,7 @@ pub(super) fn retirement_proved(
     retirement_proved_inner(&identity.record, proof, Some(identity))
 }
 
+#[cfg(test)]
 pub(super) fn retirement_proved_for_record(
     record: &Record,
     proof: &HostSessionProof,
@@ -423,6 +425,7 @@ fn validate_retired_publication(
     }
     Ok(())
 }
+#[cfg(test)]
 pub(super) fn retired_actor_receipt(
     record: &Record,
     current: &HostSessionProof,
@@ -496,20 +499,6 @@ pub(super) fn compact_retired(record: &Record, current: &HostSessionProof) -> Re
     let bytes = serde_json::to_vec(&receipt).map_err(|error| error.to_string())?;
     save_at(&path, &bytes)?;
     Ok(before.saturating_sub(bytes.len() as u64))
-}
-
-pub(crate) fn remove(record: &Record) -> Result<(), String> {
-    let path = path(record)?;
-    match std::fs::remove_file(retirement_path(record)?) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.to_string()),
-    }
-    match std::fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.to_string()),
-    }
 }
 
 /// Runtime receipts of actors that no helper or provider backs, for the

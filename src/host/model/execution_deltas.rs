@@ -91,6 +91,7 @@ pub(crate) fn discard_execution_delta_in(db: &rusqlite::Connection) -> Result<()
 impl Registry {
     /// Public model edits publish their own precise effects. Their temporary
     /// inventory must not be repeated by a later execution announcement.
+    #[cfg(test)]
     pub(crate) fn discard_execution_delta(&self) -> Result<(), String> {
         discard_execution_delta_in(&self.db)
     }

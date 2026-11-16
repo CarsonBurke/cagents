@@ -922,10 +922,6 @@ fn continuity_matches(
 pub(crate) fn validate_file(path: &Path) -> Result<(), UpdateError> {
     Census::load(path).map(|_| ())
 }
-pub(crate) fn capture_file(output: &Path) -> Result<(), UpdateError> {
-    capture_file_with_candidate(output, None)
-}
-
 pub(crate) fn capture_file_with_candidate(
     output: &Path,
     candidate_cli: Option<&Path>,

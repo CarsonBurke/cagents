@@ -526,14 +526,14 @@ pub(super) struct State {
     outstanding: HashMap<uuid::Uuid, CardId>,
 }
 #[derive(Clone)]
-pub(super) struct Permit(Arc<Mutex<Option<transcript_location::ValidatedTranscript>>>);
+pub struct Permit(Arc<Mutex<Option<transcript_location::ValidatedTranscript>>>);
 impl std::fmt::Debug for Permit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("ValidatedTranscriptPermit")
     }
 }
 #[derive(Debug, Clone)]
-pub(super) enum Action {
+pub enum Action {
     Copy(CardId),
     Reveal(CardId),
     Probed {
@@ -860,16 +860,13 @@ impl Cagents {
         let probe = self.terminal_failure.probes.get(&card);
         let remote = crate::device::is_remote();
         let available = !remote && probe.is_some_and(|probe| probe.available && !probe.pending);
-        let folder = crate::ui_controls::button::secondary(
-            if !remote && probe.is_some_and(|probe| probe.pending) {
-                "Checking transcript…"
-            } else if available {
-                "Open transcript folder"
-            } else {
-                "Transcript unavailable"
-            },
-        )
-        .id(card_control_id(card, "failure.folder"));
+        let folder = crate::ui_controls::button::secondary("Open transcript folder")
+            .instead(
+                "Checking transcript…",
+                !remote && probe.is_some_and(|probe| probe.pending),
+            )
+            .instead("Transcript unavailable", !available)
+            .id(card_control_id(card, "failure.folder"));
         let folder = if let Some(action) = action.filter(|_| available) {
             folder.on_press(action)
         } else {

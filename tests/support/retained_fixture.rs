@@ -12,7 +12,8 @@ use std::{
 };
 
 /// Same-test reexecs that clear their environment must preserve this, so they
-/// run the body instead of nesting another supervisor.
+/// run the body instead of nesting another supervisor. The library's test
+/// wrapper offers it as `retained_fixture::owner_env()`.
 pub const OWNER_ENV: &str = "CAGENTS_TEST_RETAINED_FIXTURE_OWNER";
 const PARENT_ENV: &str = "CAGENTS_TEST_RETAINED_FIXTURE_PARENT";
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -32,11 +33,6 @@ pub(crate) fn shutdown_on_signal() -> io::Result<()> {
         }
     }
     Ok(())
-}
-
-/// `OWNER_ENV` and its value, for `Command::envs` after `env_clear()`.
-pub fn owner_env() -> Option<(&'static str, std::ffi::OsString)> {
-    std::env::var_os(OWNER_ENV).map(|value| (OWNER_ENV, value))
 }
 
 /// Call first in the test. Returns true in the harness and the supervisor;

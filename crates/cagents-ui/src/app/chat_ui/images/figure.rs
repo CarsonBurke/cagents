@@ -37,14 +37,14 @@ struct Key {
 
 /// What identifies the contents of the file a preview was decoded from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::app) struct Stamp {
+pub struct Stamp {
     modified: Option<SystemTime>,
     len: u64,
 }
 
 /// Why a local image shows as a link rather than a preview.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::app) enum Reason {
+pub enum Reason {
     Missing,
     Unreadable,
     NotImage,
@@ -64,7 +64,7 @@ impl Reason {
 
 /// What a worker found for one request.
 #[derive(Clone)]
-pub(in crate::app) enum Outcome {
+pub enum Outcome {
     /// The file still has the stamp of the preview already shown.
     Unchanged,
     Ready {
@@ -686,7 +686,7 @@ pub(super) fn sync(runtime: &Runtime) {
 
 /// What a reader can do with an image from its context menu or by clicking.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(in crate::app) enum Command {
+pub enum Command {
     /// Opens the preview in the image viewer, or the source without one.
     Open,
     CopyPath,

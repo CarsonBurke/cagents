@@ -2172,64 +2172,6 @@ fn record_primary_failure(
     }
 }
 
-/// Socket evidence is separate from the lease metadata left by an old source.
-enum CleanupDaemon {
-    Ready,
-    Absent,
-    Unknown(String),
-}
-
-fn cleanup_daemon(paths: &crate::daemon::RuntimePaths, owns_handoff: bool) -> CleanupDaemon {
-    let source = match source::Client::connect(&paths.socket) {
-        Ok(source) => source,
-        Err(crate::control::ControlError::Connect(error))
-            if matches!(
-                error.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-            ) =>
-        {
-            // A handoff owns the old daemon's lease while its metadata can
-            // still name an unreaped, exited source. That is a reservation,
-            // not proof of a serving daemon. Other holders remain uncertain.
-            return if owns_handoff {
-                CleanupDaemon::Absent
-            } else {
-                match crate::daemon::HostLease::is_held(paths) {
-                    Ok(false) => CleanupDaemon::Absent,
-                    Ok(true) => CleanupDaemon::Unknown(
-                        "the daemon lease is held without an answering service".into(),
-                    ),
-                    Err(error) => CleanupDaemon::Unknown(error.to_string()),
-                }
-            };
-        }
-        Err(error) => return CleanupDaemon::Unknown(error.to_string()),
-    };
-    let source::Client::Current { mut client, peer } = source else {
-        return CleanupDaemon::Unknown("the answering service uses an older protocol".into());
-    };
-    if client.protocol() != crate::terminal_ipc::PROTOCOL_VERSION {
-        return CleanupDaemon::Unknown("the answering service uses a different protocol".into());
-    }
-    let verified = (|| {
-        peer.verify(client.proof())?;
-        let state = client
-            .startup_state()
-            .map_err(|error| invalid(error.to_string()))?;
-        peer.verify(client.proof())?;
-        if state != crate::terminal_ipc::StartupState::Ready {
-            return Err(invalid(
-                "the answering service has not finished restoring its panes",
-            ));
-        }
-        Ok(())
-    })();
-    match verified {
-        Ok(()) => CleanupDaemon::Ready,
-        Err(error) => CleanupDaemon::Unknown(error.to_string()),
-    }
-}
-
 /// Settle the reservation before reopening clients. The worker, including a
 /// headless update with no windows, owns restarting the selected installation.
 fn finish_handoff(

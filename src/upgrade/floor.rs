@@ -24,13 +24,13 @@ pub struct Record {
     #[serde(default)]
     pub service_stopped: bool,
     #[serde(default)]
-    pub snapshots: Vec<StoppedSnapshot>,
+    pub(crate) snapshots: Vec<StoppedSnapshot>,
     #[serde(default)]
     pub aliases: Vec<Session>,
     pub chats: Vec<Session>,
     pub terminals: Vec<TerminalId>,
     #[serde(default)]
-    pub presentations: Vec<Presentation>,
+    pub(crate) presentations: Vec<Presentation>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

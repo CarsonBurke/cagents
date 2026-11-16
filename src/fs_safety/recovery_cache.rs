@@ -156,14 +156,17 @@ impl<T> std::fmt::Debug for RecoveryDirectory<T> {
     }
 }
 impl<T> RecoveryDirectory<T> {
+    #[cfg(test)]
     pub(crate) fn directory(&self) -> &Root {
         self.publication.directory()
     }
+    #[cfg(test)]
     pub(crate) fn context(&self) -> &FilesystemRecoveryContext {
         &self.context
     }
     /// Actual held-FD observation after private setup, not mkdir's umask-applied
     /// initial mode. Consumers must revalidate before later permission effects.
+    #[cfg(test)]
     pub(crate) fn private_metadata(&self) -> &std::fs::Metadata {
         &self.private_metadata
     }
@@ -202,14 +205,6 @@ pub enum RecoveryDirectoryError {
         cause: io::Error,
         recovery: RecoveryAuthority,
     },
-}
-impl RecoveryDirectoryError {
-    pub(crate) fn recovery(&self) -> Option<&RecoveryAuthority> {
-        match self {
-            Self::Retained { recovery, .. } => Some(recovery),
-            Self::Rejected(_) => None,
-        }
-    }
 }
 
 // Keep incoming native owners charged across ordinary rejection AND callback
@@ -315,14 +310,7 @@ impl<T> PendingDirectory<T> {
 /// and transfers that exact non-cloneable admission here. No H0, derived
 /// placement, extra ledger, source-file acquisition or path-based authority.
 /// Existing/Unverified directories never confer owned cleanup or file rights.
-pub(crate) fn prepare_recovery_directory(
-    admission: FilesystemRecoveryReservation,
-    leaf: &OsStr,
-    cancelled: impl Fn() -> bool,
-) -> Result<RecoveryDirectory, RecoveryDirectoryError> {
-    prepare_recovery_directory_with_owner(admission, leaf, cancelled, ())
-}
-
+///
 /// Preserve the lower producer's already-pinned source/file/parent fields in
 /// this SAME reservation on every post-effect failure. No second slot, owner
 /// registry or loss of original descriptors while returning a recovery error.

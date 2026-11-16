@@ -6,9 +6,11 @@ use std::path::{Path, PathBuf};
 
 mod claude;
 #[cfg(feature = "host")]
-pub(crate) use claude::transcript as claude_transcript;
-#[cfg(feature = "host")]
-pub(crate) use claude::transcript_exists as claude_transcript_exists;
+pub(crate) use claude::{
+    TranscriptError as ClaudeTranscriptError, transcript as claude_transcript,
+    transcript_exists as claude_transcript_exists,
+    transcript_for_start as claude_transcript_for_start,
+};
 mod codex;
 #[cfg(feature = "host")]
 pub(crate) use codex::{archived_rollout as codex_archived_rollout, rollout as codex_rollout};

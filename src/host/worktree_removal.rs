@@ -363,7 +363,11 @@ pub(super) fn ensure_outside(host: &SharedHost, cwd: &Path) -> Result<(), Protoc
     }
     let ancestors = existing_ancestors(cwd).map_err(refusal)?;
     if scopes.iter().any(|scope| scope.contains(cwd, &ancestors)) {
-        return Err(refusal(STARTING_INSIDE));
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::InvalidRequest,
+            STARTING_INSIDE,
+            true,
+        ));
     }
     Ok(())
 }
@@ -384,7 +388,11 @@ pub(super) fn ensure_outside_directory(
         .iter()
         .any(|scope| ancestors.contains(&scope.identity))
     {
-        return Err(refusal(STARTING_INSIDE));
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::InvalidRequest,
+            STARTING_INSIDE,
+            true,
+        ));
     }
     Ok(())
 }

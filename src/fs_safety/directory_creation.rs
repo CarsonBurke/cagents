@@ -313,6 +313,7 @@ impl OwnedPrivateSibling {
         self.stamp = Some(stamp);
         Ok(())
     }
+    #[cfg(test)]
     pub(crate) fn directory(&self) -> io::Result<&Root> {
         self.validate()?;
         Ok(self.directory.as_ref().unwrap())
@@ -342,18 +343,22 @@ impl OwnedPrivateSibling {
     /// Actual native handles, including the pinned original sticky parent.
     /// Arc aliases of the parent/child must be deduplicated by the owner.
     /// Quarantine is a name under that same parent and owns no extra FD.
+    #[cfg(test)]
     pub(crate) fn retained_descriptor_count(&self) -> usize {
         1 + usize::from(self.directory.is_some())
     }
+    #[cfg(test)]
     pub(crate) fn is_resolved(&self) -> bool {
         self.removed && self.synced
     }
+    #[cfg(test)]
     pub(crate) fn diagnostic_path(&self) -> PathBuf {
         self.parent
             .directory
             .path
             .join(self.quarantined.as_ref().unwrap_or(&self.name))
     }
+    #[cfg(test)]
     pub(crate) fn is_removed(&self) -> bool {
         self.removed
     }

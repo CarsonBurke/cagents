@@ -16,6 +16,9 @@ pub(super) struct Stopped {
     pub(super) primary: Option<(&'static str, Press, bool)>,
     /// A second, lesser choice beside it.
     pub(super) secondary: Option<(&'static str, Press, bool)>,
+    /// Every label the primary action can take while this card stays in its
+    /// state, so pressing it does not resize it under the pointer.
+    pub(super) primary_labels: &'static [&'static str],
 }
 
 /// What pressing one of a stopped card's buttons does.
@@ -25,31 +28,59 @@ pub(super) enum Press {
     Reconnect,
     /// Start a provider on a saved conversation the card is reading.
     ResumeSaved,
-    /// Leave the conversation that did not load and start one beside it.
+    /// Start a new conversation in this card after checked retirement.
     StartFresh,
+    Close,
 }
 
 impl Press {
-    pub(super) fn action(self, target: Target) -> Action {
+    pub(super) fn message(self, target: Target) -> Message {
         match self {
-            Self::Reconnect => Action::Reconnect(target),
-            Self::ResumeSaved => Action::ResumeSaved(target),
-            Self::StartFresh => Action::StartFresh(target.card),
+            Self::Reconnect => action(Action::Reconnect(target)),
+            Self::ResumeSaved => action(Action::ResumeSaved(target)),
+            Self::StartFresh => action(Action::StartFresh(target.card)),
+            Self::Close => Message::CloseCard(target.card),
         }
     }
 }
 
 impl Runtime {
+    #[cfg(test)]
     pub(super) fn stopped(&self, transitioning: bool, resuming: bool) -> Stopped {
+        self.stopped_with_offer(transitioning, resuming, self.offers_fresh_conversation())
+    }
+
+    fn stopped_with_offer(
+        &self,
+        transitioning: bool,
+        resuming: bool,
+        fresh_available: bool,
+    ) -> Stopped {
         let snapshot = &self.snapshot;
         let provider = self.session.launch.provider.label();
-        let unresumable = self.offers_fresh_conversation();
+        let unresumable = fresh_available;
         let saved_history = self.has_connected_saved_history(snapshot);
         let enabled = !transitioning
             && self.pending.is_none()
             && self.attachment_chooser_pending.is_none()
             && self.pastes_pending == 0
             && (!saved_history || !snapshot.history_loading);
+        if let Some(reopen) = self.start_blocked {
+            return Stopped {
+                guidance: if self.is_draft() {
+                    blocked_recovery::DRAFT_GUIDANCE.to_owned()
+                } else {
+                    reopen.guidance(unresumable)
+                },
+                primary: Some(if unresumable {
+                    ("Start a new conversation", Press::StartFresh, enabled)
+                } else {
+                    ("Close", Press::Close, !transitioning)
+                }),
+                secondary: unresumable.then_some(("Close", Press::Close, !transitioning)),
+                primary_labels: &[],
+            };
+        }
         if saved_history {
             return Stopped {
                 guidance: snapshot
@@ -58,6 +89,7 @@ impl Runtime {
                     .unwrap_or_else(|| "Saved conversation history is read-only.".into()),
                 primary: Some(("Resume conversation", Press::ResumeSaved, enabled)),
                 secondary: None,
+                primary_labels: &[],
             };
         }
         if self.resumes_in_place() {
@@ -72,7 +104,8 @@ impl Runtime {
                     )
                 } else if unresumable {
                     format!(
-                        "{provider} stopped before the saved conversation loaded. Try again, or start a new conversation beside it: the old one stays on disk, but this card stops pointing at it."
+                        "{provider} stopped before the saved conversation loaded. {}",
+                        blocked_recovery::FRESH_EXPLANATION
                     )
                 } else {
                     format!("{provider} stopped. The conversation and your draft are kept.")
@@ -93,17 +126,18 @@ impl Runtime {
                     Press::StartFresh,
                     enabled,
                 )),
+                primary_labels: &["Resume conversation", "Resuming…", "Try again"],
             };
         }
         if unresumable {
             return Stopped {
-                guidance: "The saved conversation did not load. Try again, or start a new conversation beside it: the old one stays on disk, but this card stops pointing at it.".into(),
+                guidance: format!(
+                    "The saved conversation did not load. {}",
+                    blocked_recovery::FRESH_EXPLANATION
+                ),
                 primary: Some(("Try again", Press::Reconnect, enabled)),
-                secondary: Some((
-                    "Start a new conversation",
-                    Press::StartFresh,
-                    enabled,
-                )),
+                secondary: Some(("Start a new conversation", Press::StartFresh, enabled)),
+                primary_labels: &[],
             };
         }
         if self.disconnected || !self.connected() {
@@ -113,6 +147,7 @@ impl Runtime {
                 ),
                 primary: Some(("Reconnect", Press::Reconnect, enabled)),
                 secondary: None,
+                primary_labels: &[],
             };
         }
         if self.session.owns_codex_listener() {
@@ -122,50 +157,70 @@ impl Runtime {
                 ),
                 primary: Some(("Reconnect", Press::Reconnect, enabled)),
                 secondary: None,
+                primary_labels: &[],
             };
         }
         // Attaching again would only bring back this same stopped actor, and
         // nothing here can start its provider on the conversation yet.
         Stopped {
             guidance: format!(
-                "{provider} stopped, and this card can't start it again. To continue, copy your draft, close this card, then reopen the conversation with Resume conversation in the new tab (+) menu."
+                "{provider} stopped, and this tab can't start it again. To continue, copy your unsent message, close this tab, then reopen the conversation with Resume conversation in the new tab (+) menu."
             ),
             primary: None,
             secondary: None,
+            primary_labels: &[],
         }
+    }
+
+    /// Whether the first recovery button is styled as the next step. Not
+    /// while a restart is the way back: every button gives that up.
+    pub(super) fn emphasizes_recovery(&self) -> bool {
+        !self
+            .start_blocked
+            .is_some_and(blocked_recovery::Reopen::waits)
     }
 
     pub(super) fn stopped_controls(
         &self,
         transitioning: bool,
         resuming: bool,
+        fresh_available: bool,
     ) -> Element<'_, Message> {
         let Stopped {
             guidance,
             primary,
             secondary,
-        } = self.stopped(transitioning, resuming);
+            primary_labels,
+        } = self.stopped_with_offer(transitioning, resuming, fresh_available);
         let mut controls = Vec::new();
+        let emphasize = self.emphasizes_recovery();
         if let Some((label, pressed, enabled)) = primary {
             controls.push(
-                crate::ui_controls::button::primary(label)
-                    .on_press_maybe(enabled.then(|| action(pressed.action(self.target))))
-                    .into(),
+                if emphasize {
+                    crate::ui_controls::button::primary(label)
+                } else {
+                    crate::ui_controls::button::secondary(label)
+                }
+                .keep_room_for(primary_labels.iter().copied())
+                .on_press_maybe(enabled.then(|| pressed.message(self.target)))
+                .into(),
             );
         }
         if let Some((label, pressed, enabled)) = secondary {
             controls.push(
                 crate::ui_controls::button::secondary(label)
-                    .on_press_maybe(enabled.then(|| action(pressed.action(self.target))))
+                    .on_press_maybe(enabled.then(|| pressed.message(self.target)))
                     .into(),
             );
         }
-        let mut rows = vec![design::caption(guidance).width(Length::Fill).into()];
+        let mut rows = Vec::new();
+        if !guidance.is_empty() {
+            rows.push(design::caption(guidance).width(Length::Fill).into());
+        }
         if !controls.is_empty() {
             rows.push(
-                widget::row::with_children(controls)
-                    .spacing(step::GAP_S)
-                    .wrap()
+                widget::flex_row(controls)
+                    .spacing(step::GAP_S as u16)
                     .into(),
             );
         }

@@ -21,7 +21,7 @@ use url::Url;
 /// two minutes. An explicit server cooldown can extend that interval.
 pub const MAX_AGE: u64 = 120;
 const MAX_CACHE_BYTES: u64 = 4 * 1024 * 1024;
-const QUERY: &str = "query CagentsPrStatus($owner:String!,$name:String!,$number:Int!){rateLimit{cost} repository(owner:$owner,name:$name){pullRequest(number:$number){number title url state isDraft headRefName headRefOid baseRefName mergeable mergeStateStatus reviewDecision updatedAt commits(last:1){nodes{commit{oid statusCheckRollup{state contexts(first:100){nodes{__typename ... on CheckRun{name status conclusion detailsUrl startedAt completedAt} ... on StatusContext{context state targetUrl description}} pageInfo{hasNextPage endCursor}}}}}}}}}";
+const QUERY: &str = "query CagentsPrStatus($owner:String!,$name:String!,$number:Int!){rateLimit{cost} repository(owner:$owner,name:$name){pullRequest(number:$number){number title url state isDraft headRefName headRefOid baseRefName mergeable mergeStateStatus reviewDecision updatedAt commits(last:1){nodes{commit{oid statusCheckRollup{state contexts(first:100){nodes{__typename ... on CheckRun{name status conclusion detailsUrl} ... on StatusContext{context state targetUrl description}} pageInfo{hasNextPage endCursor}}}}}}}}}";
 
 struct StatusService<E = SystemProcessExecutor> {
     gh: PathBuf,
@@ -215,6 +215,36 @@ pub struct Snapshot {
     pub primary_cost: Option<u64>,
 }
 
+/// Whether a check context has passed, by the rule `scripts/land-pr` applies.
+pub fn check_passed(check: &serde_json::Value) -> bool {
+    if check["__typename"] == "StatusContext" {
+        return check["state"] == "SUCCESS";
+    }
+    check["status"] == "COMPLETED"
+        && matches!(
+            check["conclusion"].as_str(),
+            Some("SUCCESS" | "NEUTRAL" | "SKIPPED")
+        )
+}
+
+/// A check context as a report shows it. Callers decide on its name and state;
+/// they follow a link only to a check that has not passed, so a passing
+/// check's link and description are left out, as are the timestamps that
+/// snapshots saved before the query stopped asking for them still carry.
+fn reported_check(mut check: serde_json::Value) -> serde_json::Value {
+    let passed = check_passed(&check);
+    if let Some(fields) = check.as_object_mut() {
+        fields.remove("startedAt");
+        fields.remove("completedAt");
+        if passed {
+            for field in ["detailsUrl", "targetUrl", "description"] {
+                fields.remove(field);
+            }
+        }
+    }
+    check
+}
+
 impl Snapshot {
     /// Whether the bootstrap script's single REST read wrote this snapshot
     /// to the shared cache. REST carries no check rollup or review decision,
@@ -267,7 +297,10 @@ impl Cached {
                     .fetched_at
                     .is_none_or(|at| now.saturating_sub(at) >= MAX_AGE),
             source,
-            snapshot: self.snapshot,
+            snapshot: self.snapshot.map(|mut snapshot| {
+                snapshot.checks = snapshot.checks.into_iter().map(reported_check).collect();
+                snapshot
+            }),
             error: self.error,
             retry_at: (self.next_attempt > now).then_some(self.next_attempt),
             outcome: if failed { "failed" } else { "succeeded" },
@@ -1124,6 +1157,47 @@ mod tests {
         assert!(report.snapshot.unwrap().checks_state.is_none());
         // It still counts as this interval's shared read.
         assert_eq!(fixture.calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn reports_keep_links_only_for_checks_that_have_not_passed() {
+        let mut snapshot = parse(&data(), &key()).unwrap();
+        let link = "https://status-test.invalid/Owner/Repo/actions/runs/1/job/2";
+        let run = |name: &str, status: &str, conclusion: Option<&str>| {
+            serde_json::json!({"__typename":"CheckRun","name":name,"status":status,"conclusion":conclusion,
+                "detailsUrl":link,"startedAt":"2026-11-09T00:00:00Z","completedAt":"2026-11-09T00:01:00Z"})
+        };
+        snapshot.checks = vec![
+            run("passed", "COMPLETED", Some("SUCCESS")),
+            run("skipped", "COMPLETED", Some("SKIPPED")),
+            run("failed", "COMPLETED", Some("FAILURE")),
+            run("running", "IN_PROGRESS", None),
+            serde_json::json!({"__typename":"StatusContext","context":"deploy","state":"SUCCESS",
+                "targetUrl":link,"description":"Deployed"}),
+            serde_json::json!({"__typename":"StatusContext","context":"lint","state":"ERROR",
+                "targetUrl":link,"description":"Lint crashed"}),
+        ];
+        let report = Cached {
+            fetched_at: Some(now()),
+            snapshot: Some(snapshot),
+            error: None,
+            next_attempt: 0,
+        }
+        .report(&key(), "cache", now());
+        let checks = report.snapshot.unwrap().checks;
+        let passed = |name: &str| serde_json::json!({"__typename":"CheckRun","name":name,"status":"COMPLETED","conclusion":if name == "passed" {"SUCCESS"} else {"SKIPPED"}});
+        assert_eq!(
+            checks,
+            vec![
+                passed("passed"),
+                passed("skipped"),
+                serde_json::json!({"__typename":"CheckRun","name":"failed","status":"COMPLETED","conclusion":"FAILURE","detailsUrl":link}),
+                serde_json::json!({"__typename":"CheckRun","name":"running","status":"IN_PROGRESS","conclusion":null,"detailsUrl":link}),
+                serde_json::json!({"__typename":"StatusContext","context":"deploy","state":"SUCCESS"}),
+                serde_json::json!({"__typename":"StatusContext","context":"lint","state":"ERROR","targetUrl":link,"description":"Lint crashed"}),
+            ]
+        );
+        assert!(!QUERY.contains("startedAt") && !QUERY.contains("completedAt"));
     }
 
     #[test]

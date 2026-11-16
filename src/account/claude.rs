@@ -128,6 +128,7 @@ impl PlanMetadata {
         )
     }
 
+    #[cfg(any(feature = "ui", feature = "host"))]
     pub(super) fn or(self, fallback: Self) -> Self {
         Self {
             subscription_type: self.subscription_type.or(fallback.subscription_type),
@@ -870,14 +871,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn login(email: &str, disputed_by: Option<&str>) -> Identity {
-        Identity {
-            email: Some(email.into()),
-            disputed_by: disputed_by.map(str::to_owned),
-            ..Identity::default()
-        }
-    }
-
     #[test]
     fn a_record_names_the_login_its_status_reports() {
         assert_eq!(
@@ -902,6 +895,13 @@ mod tests {
     #[cfg(any(feature = "ui", feature = "host"))]
     fn a_disagreement_is_reported_until_a_sign_in_is_known_to_have_settled_it() {
         use super::super::cache::Settled;
+        fn login(email: &str, disputed_by: Option<&str>) -> Identity {
+            Identity {
+                email: Some(email.into()),
+                disputed_by: disputed_by.map(str::to_owned),
+                ..Identity::default()
+            }
+        }
         const NOW: u64 = 1_000_000_000;
         let decide = |reported: &Identity,
                       other: RecordedLogin,

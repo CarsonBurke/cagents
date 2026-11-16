@@ -17,6 +17,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(test)]
+use crate::workspace_model::WorkspaceModel;
 use crate::{
     model::{
         CardId, HostSessionProof, TerminalContinuity, TerminalExit, TerminalId, TerminalSession,
@@ -29,7 +31,7 @@ use crate::{
         TerminalDescriptor, TerminalSnapshot, TerminalSpawnOptions, TerminalVisibility,
         WireTerminalEvent,
     },
-    workspace_model::{ModelEdit, WorkspaceModel},
+    workspace_model::ModelEdit,
 };
 
 use super::delivery::{DEFAULT_CLIENT_QUEUE_CAPACITY, DeliveryQueue, Outbound};
@@ -820,6 +822,7 @@ impl HostState {
     }
 
     /// Applies one edit and tells every other watcher about it.
+    #[cfg(test)]
     pub(crate) fn edit_model(
         &mut self,
         origin: ClientId,
@@ -1366,6 +1369,7 @@ impl HostState {
         }
     }
 
+    #[cfg(test)]
     fn reserve_spawn_for_view(
         &mut self,
         terminal_id: TerminalId,
@@ -1650,6 +1654,7 @@ impl HostState {
             .ok_or_else(|| not_found(terminal_id))
     }
 
+    #[cfg(test)]
     pub(crate) fn handle(
         &self,
         client_id: ClientId,
@@ -1697,6 +1702,7 @@ impl HostState {
             .clone())
     }
 
+    #[cfg(test)]
     pub(crate) fn focus_handle(
         &self,
         client_id: ClientId,
@@ -1731,46 +1737,6 @@ impl HostState {
             ));
         }
         Ok(record.handle.clone())
-    }
-
-    /// Produces the repaint a client needs to reach the terminal's current
-    /// generation, or `None` when it already holds it.
-    ///
-    /// A delta is only offered when the recorded base for this subscription is
-    /// exactly the generation the client says it holds; any disagreement, a
-    /// resize, a detached capture, or a first request falls back to a full
-    /// repaint. The base is recorded before returning, so the diff for the next
-    /// repaint is a pointer scan over the row list.
-    pub(crate) fn snapshot(
-        &mut self,
-        client_id: ClientId,
-        terminal_id: TerminalId,
-        after_generation: u64,
-    ) -> Result<Option<TerminalSnapshot>, ProtocolError> {
-        if !self.subscriptions.attached(client_id, terminal_id) {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::PermissionDenied,
-                format!("client is not attached to terminal {terminal_id}"),
-                false,
-            ));
-        }
-        let record = self
-            .terminals
-            .get(&terminal_id)
-            .ok_or_else(|| not_found(terminal_id))?;
-        let snapshot = record.handle.snapshot();
-        if snapshot.generation <= after_generation {
-            return Ok(None);
-        }
-        let wire = match self.subscriptions.last_sent(client_id, terminal_id) {
-            Some(base) if base.generation == after_generation => {
-                TerminalSnapshot::diff(&snapshot, base)
-            }
-            _ => TerminalSnapshot::full(&snapshot),
-        };
-        self.subscriptions
-            .record_sent(client_id, terminal_id, Arc::clone(&snapshot));
-        Ok(Some(wire))
     }
 
     pub(crate) fn replay_events(
@@ -3150,8 +3116,8 @@ pub(super) fn restore_upgrade(host: &SharedHost) -> Result<Vec<TerminalId>, Stri
     )
 }
 
-/// Lifecycle fixtures that prove their owned providers stopped can supply a
-/// controlled census without depending on unrelated protected host processes.
+/// Lifecycle fixtures inspect real kernel data for their owned process roster
+/// and prove provider retirement without unrelated protected host processes.
 #[cfg(test)]
 pub(in crate::host) fn restore_upgrade_with_process_fixture(
     host: &SharedHost,

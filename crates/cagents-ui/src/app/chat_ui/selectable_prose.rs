@@ -394,7 +394,7 @@ pub(super) fn flow_source_optional(
         inlines: None,
         logical,
         flow: Some(flow),
-        flow_ready: ready,
+        _flow_ready: ready,
         matches: highlights,
         spans,
         plain,
@@ -705,7 +705,7 @@ fn build_text(
     let flow_ready = flow.as_ref().and_then(|flow| flow.borrow().prepared());
     let body = Element::new(Selectable {
         find_enabled: find.is_some(),
-        flow_ready,
+        _flow_ready: flow_ready,
         inlines,
         spans,
         plain,
@@ -750,7 +750,9 @@ struct Selectable {
     /// own with the spans it shaped.
     inlines: Option<Arc<markdown::Inlines>>,
     flow: Option<flow_layout::Handle>,
-    flow_ready: Option<Arc<flow_layout::Prepared>>,
+    /// Never read: it keeps the geometry the widget was built from, and that
+    /// geometry's admission, alive for as long as the widget is.
+    _flow_ready: Option<Arc<flow_layout::Prepared>>,
     logical: Option<Logical>,
     matches: super::find_navigation::Marks,
     spans: Arc<[Span<'static, markdown::Uri>]>,
@@ -1541,7 +1543,7 @@ mod tests {
                     },
                     logical: None,
                     flow: None,
-                    flow_ready: None,
+                    _flow_ready: None,
                 };
                 let mut tree =
                     Tree::new(&selectable as &dyn Widget<Message, cosmic::Theme, cosmic::Renderer>);
@@ -1622,7 +1624,7 @@ mod tests {
                     },
                     logical: None,
                     flow: None,
-                    flow_ready: None,
+                    _flow_ready: None,
                 };
                 let mut tree =
                     Tree::new(&selectable as &dyn Widget<Message, cosmic::Theme, cosmic::Renderer>);
@@ -1715,7 +1717,7 @@ mod tests {
             },
             logical: None,
             flow: None,
-            flow_ready: None,
+            _flow_ready: None,
         };
         let mut tree =
             Tree::new(&selectable as &dyn Widget<Message, cosmic::Theme, cosmic::Renderer>);
@@ -1834,7 +1836,7 @@ mod tests {
             find_enabled: true,
             logical: None,
             flow: None,
-            flow_ready: None,
+            _flow_ready: None,
             plain: "α first\nβ second".into(),
             spans: spans.clone(),
             matches: vec![].into(),
@@ -2120,7 +2122,7 @@ mod tests {
             },
             logical: None,
             flow: None,
-            flow_ready: None,
+            _flow_ready: None,
         };
         let mut tree =
             Tree::new(&selectable as &dyn Widget<Message, cosmic::Theme, cosmic::Renderer>);
@@ -2232,7 +2234,7 @@ mod tests {
             find_enabled: true,
             logical: None,
             flow: None,
-            flow_ready: None,
+            _flow_ready: None,
             plain: "before αβ linked".into(),
             spans,
             matches: vec![].into(),
@@ -2279,7 +2281,7 @@ mod tests {
             find_enabled: true,
             logical: None,
             flow: None,
-            flow_ready: None,
+            _flow_ready: None,
             plain: "Straße CAFÉ".into(),
             spans: vec![Span::new("Stra"), Span::new("ße"), Span::new(" CAFÉ")].into(),
             matches: super::super::find::ranges("Straße CAFÉ", "STRASSE").into(),
@@ -2308,7 +2310,7 @@ mod tests {
             find_enabled: true,
             logical: None,
             flow: None,
-            flow_ready: None,
+            _flow_ready: None,
             plain: "one needle two".into(),
             spans: vec![Span::new("one needle two")].into(),
             matches: vec![4..10].into(),

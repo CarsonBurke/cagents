@@ -373,7 +373,7 @@ impl ProcessOutput {
 }
 
 /// Test resource gates can observe cancellation without a descriptor.
-#[cfg(test)]
+#[cfg(all(test, feature = "ui"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WaitEvent {
     Cancelled,
@@ -404,6 +404,7 @@ struct CancellationState {
 enum CancellationNotifier {
     #[cfg(all(test, feature = "ui"))]
     Process(mpsc::Sender<WaitEvent>),
+    #[cfg(any(feature = "host", feature = "ui", test))]
     Signal(mpsc::SyncSender<()>),
     Descriptor(Arc<OwnedFd>),
 }
@@ -415,6 +416,7 @@ impl CancellationNotifier {
             Self::Process(sender) => {
                 let _ = sender.send(WaitEvent::Cancelled);
             }
+            #[cfg(any(feature = "host", feature = "ui", test))]
             Self::Signal(sender) => {
                 let _ = sender.try_send(());
             }
@@ -471,6 +473,7 @@ impl CancellationToken {
     /// Registers a bounded wake signal for a blocking resource gate. Register
     /// before checking cancellation, then recheck the flag after every wake.
     /// A full channel already contains a wake, so cancelling never blocks.
+    #[cfg(any(feature = "host", feature = "ui", test))]
     pub(crate) fn register_signal(&self, waker: mpsc::SyncSender<()>) -> CancellationWaker<'_> {
         self.register_notifier(CancellationNotifier::Signal(waker))
     }

@@ -210,7 +210,7 @@ pub fn application_window_icon() -> window::Icon {
     .expect("embedded application icon dimensions must match its RGBA pixels")
 }
 
-#[cfg(any(feature = "integrated-browser", test))]
+#[cfg(feature = "integrated-browser")]
 const INITIAL_HYDRATION_EPOCH: u64 = 1;
 
 #[cfg(feature = "integrated-browser")]
@@ -331,6 +331,7 @@ enum NoticeKey {
     /// Closing this chat, which the daemon refused.
     ChatClose(CardId),
     /// Finding the integrated browser, which the last check could not.
+    #[cfg(feature = "integrated-browser")]
     BrowserUnavailable,
     /// Saving the reservation for this already running terminal.
     TerminalSave(CardId, TerminalId),
@@ -1879,19 +1880,16 @@ pub(crate) fn display_path(path: &Path) -> Cow<'_, str> {
     }
 }
 
-/// The process's starting directory, already formatted for display.
+/// The process's starting directory, resolved once.
 ///
 /// Nothing in this application calls `set_current_dir`, so this value cannot
-/// change while the process runs. The empty-workspace surface is the default
-/// first-run view and `view` re-runs on every redraw, so resolving this there
-/// cost a blocking `getcwd` plus three allocations per frame.
+/// change while the process runs. Views that re-run on every redraw read it,
+/// so resolving it there would cost a blocking `getcwd` per frame.
 static STARTING_DIRECTORY: LazyLock<PathBuf> = LazyLock::new(|| {
     crate::device::home()
         .cloned()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")))
 });
-static STARTING_DIRECTORY_CAPTION: LazyLock<String> =
-    LazyLock::new(|| format!("Starting directory: {}", display_path(&STARTING_DIRECTORY)));
 
 /// A terminal that has never run, under a new identity, waiting to launch `launch`.
 pub(super) fn fresh_terminal_session(launch: LaunchRecipe) -> TerminalSession {
@@ -2640,21 +2638,6 @@ struct InspectorTransition {
     started_at: Instant,
     from: f32,
     to: f32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ContextOverlayChange {
-    Entered,
-    Exited,
-    Unchanged,
-}
-
-const fn context_overlay_change(was_overlay: bool, is_overlay: bool) -> ContextOverlayChange {
-    match (was_overlay, is_overlay) {
-        (false, true) => ContextOverlayChange::Entered,
-        (true, false) => ContextOverlayChange::Exited,
-        _ => ContextOverlayChange::Unchanged,
-    }
 }
 
 impl InspectorTransition {
@@ -5087,6 +5070,7 @@ impl BrowserAddress {
     /// redacted presentation. A restored or reported location therefore keeps
     /// its complete URL when the user submits the unchanged address, while a
     /// submitted draft is immediately replaced by its safe presentation.
+    #[cfg(test)]
     fn submit(&mut self) -> Result<Url, ()> {
         self.submit_with_search("https://duckduckgo.com/?q={query}")
     }
@@ -9518,6 +9502,7 @@ impl Cagents {
             .is_none_or(|state| !state.existence.is_open())
             || self.pane_close_owned(card)
             || self.chat_start_pending(card)
+            || self.chat_retry_blocked(card)
             // One relaunch at a time: a second would replace the identity the
             // first is starting and tear down whatever it launched.
             || self.terminal_start_in_flight(card)
@@ -11422,6 +11407,11 @@ impl Cagents {
                     accounts: self.default_account_choices(),
                     updates: self.update_summary(),
                     testing_notification: self.notification_ui.testing,
+                    trailing_clearance: if self.pane_inspector_layout(id).is_none() {
+                        pane_inspector::TOGGLE_CLEARANCE
+                    } else {
+                        0.0
+                    },
                 },
             ),
             Some(CardRuntime::Accounts) => self.accounts_pane(),
@@ -11497,11 +11487,15 @@ impl Cagents {
                             } else {
                                 std::borrow::Cow::Borrowed("This build does not include the integrated browser. Open the saved page in your system browser.")
                             }
+                        } else if let Some(blocked) = self.blocked_failure(id) {
+                            std::borrow::Cow::Borrowed(blocked.reopen.headline())
                         } else { std::borrow::Cow::Borrowed(message.message()) })
                             .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                             .width(Length::Fill)
                             .into(),
-                        if matches!(message, terminal_failure::Failure::Terminal(_)) {
+                        if self.blocked_failure_source(id).is_some() {
+                            self.blocked_failure_diagnostics(id)
+                        } else if matches!(message, terminal_failure::Failure::Terminal(_)) {
                             widget::column::with_children(vec![
                                 self.terminal_diagnostic_summary(id),
                                 self.terminal_diagnostic_controls(id),
@@ -11513,11 +11507,16 @@ impl Cagents {
                         },
                         self.account_recovery_controls(id)
                             .unwrap_or_else(|| iced::widget::Space::new().into()),
-                        self.chat_capacity_guidance(id)
+                        self.blocked_failure_guidance(id)
+                            .or_else(|| self.chat_capacity_guidance(id).map(str::to_owned))
                             .map(|guidance| design::caption(guidance).into())
                             .unwrap_or_else(|| iced::widget::Space::new().into()),
                         widget::row::with_children({
-                            let mut controls = if let Some(reason) = browser_session
+                            let mut controls = if self.chat_retry_blocked(id) {
+                                // A permanent refusal keeps no Retry; the
+                                // recovery guidance above names the next step.
+                                Vec::new()
+                            } else if let Some(reason) = browser_session
                                 .and(self.browser_unavailable_reason())
                             {
                                 // The page can still be read: the system
@@ -11568,29 +11567,41 @@ impl Cagents {
                             // A conversation no retry can reach still has one
                             // thing left to do with it, and the reader has to
                             // be the one who asks for it.
+                            // Without Retry, the first remaining action is
+                            // the card's primary one, as on a stopped pane.
+                            let closing = self.terminal_close_in_progress(id);
+                            // While a restart is the way back, no button is
+                            // the next step: each one gives that way up.
+                            let waits = self
+                                .blocked_failure(id)
+                                .is_some_and(|blocked| blocked.reopen.waits());
+                            let button = |controls: &Vec<Element<'_, Message>>, label| {
+                                if controls.is_empty() && !waits {
+                                    crate::ui_controls::button::primary(label)
+                                } else {
+                                    crate::ui_controls::button::secondary(label)
+                                }
+                            };
                             if self.chat_offers_fresh_conversation(id) {
                                 controls.push(
-                                    crate::ui_controls::button::secondary(
-                                        "Start a new conversation here",
-                                    )
-                                    .id(card_control_id(id, "chat.fresh"))
-                                    .name("Start a new conversation in the same directory")
-                                    .on_press(Message::ChatUi(chat_ui::Action::StartFresh(id)))
-                                    .into(),
+                                    button(&controls, "Start a new conversation")
+                                        .id(card_control_id(id, "chat.fresh"))
+                                        .name("Start a new conversation")
+                                        // Close owns the card until it settles.
+                                        .on_press_maybe((!closing).then_some(Message::ChatUi(
+                                            chat_ui::Action::StartFresh(id),
+                                        )))
+                                        .into(),
                                 );
                             }
                             controls.push(
                                 {
-                                    let closing = self.terminal_close_in_progress(id);
-                                    crate::ui_controls::button::secondary(if closing {
-                                        "Checking…"
-                                    } else {
-                                        "Close"
-                                    })
-                                    .id(card_control_id(id, "failed.close"))
-                                    .name(format!("Close {}", labels.type_label))
-                                    .on_press_maybe((!closing).then_some(Message::CloseCard(id)))
-                                    .into()
+                                    button(&controls, "Close")
+                                        .instead("Checking…", closing)
+                                        .id(card_control_id(id, "failed.close"))
+                                        .name(format!("Close {}", labels.type_label))
+                                        .on_press_maybe((!closing).then_some(Message::CloseCard(id)))
+                                        .into()
                                 },
                             );
                             controls
@@ -19361,12 +19372,11 @@ impl Application for Cagents {
                         notice_detail(self.window_close_transient_blocker().unwrap_or(
                             "The pending work is complete. Cancel this dialog and close again.",
                         )),
-                        widget::row::with_children(controls)
-                            .spacing(space::S)
-                            .wrap()
-                            .into(),
                     ])
                     .spacing(space::M),
+                    widget::row::with_children(controls)
+                        .spacing(space::S)
+                        .wrap(),
                     480.0,
                 ),
                 Some(Message::CancelTransientWorkClose),
@@ -19438,16 +19448,16 @@ impl Application for Cagents {
                              pane widths, and the configured language servers.",
                         ),
                         notice_detail("This cannot be undone."),
-                        dialog_ui::confirmation_actions(
-                            crate::ui_controls::button::secondary("Cancel")
-                                .id(widget::Id::new("dialog.reset-settings.cancel"))
-                                .on_press(Message::CancelResetSettings),
-                            crate::ui_controls::button::destructive("Reset settings")
-                                .id(widget::Id::new("dialog.reset-settings.confirm"))
-                                .on_press(Message::ConfirmResetSettings),
-                        ),
                     ])
                     .spacing(space::M),
+                    dialog_ui::confirmation_actions(
+                        crate::ui_controls::button::secondary("Cancel")
+                            .id(widget::Id::new("dialog.reset-settings.cancel"))
+                            .on_press(Message::CancelResetSettings),
+                        crate::ui_controls::button::destructive("Reset settings")
+                            .id(widget::Id::new("dialog.reset-settings.confirm"))
+                            .on_press(Message::ConfirmResetSettings),
+                    ),
                     480.0,
                 ),
                 Some(Message::CancelResetSettings),
@@ -19523,28 +19533,26 @@ impl Application for Cagents {
                 );
             }
             controls.push(
-                crate::ui_controls::button::primary(if runtime.has_save_conflict() {
-                    "Overwrite and close"
-                } else if runtime.has_durability_warning() {
-                    "Retry save and close"
-                } else {
-                    "Save and close"
-                })
-                .id(dirty_close_control_id(card, DirtyCloseControl::Save))
-                .on_press_maybe(save_message)
-                .into(),
+                crate::ui_controls::button::primary("Save and close")
+                    .instead("Overwrite and close", runtime.has_save_conflict())
+                    .instead("Retry save and close", runtime.has_durability_warning())
+                    .id(dirty_close_control_id(card, DirtyCloseControl::Save))
+                    .on_press_maybe(save_message)
+                    .into(),
             );
             let dismiss = controls.remove(0);
-            rows.push(dialog_ui::confirmation_actions(
+            let actions = dialog_ui::confirmation_actions(
                 dismiss,
                 widget::row::with_children(controls).spacing(space::S),
-            ));
-
+            );
+            // A long path or save error scrolls; the answers stay in reach.
             return Some(dialog_ui::overlay(
-                dialog_ui::surface(
+                dialog_ui::scrolling_surface_with_actions(
                     widget::container(widget::column::with_children(rows).spacing(space::M))
                         .id(widget::Id::new(format!("dialog.dirty-close.{card}"))),
+                    actions,
                     560.0,
+                    dialog_ui::MAX_HEIGHT,
                 ),
                 (!runtime.is_saving()).then_some(Message::CancelRepositoryClose),
                 1.0,
@@ -20574,13 +20582,6 @@ mod tests {
             panic!("New terminal must create a terminal without a project");
         };
         assert_eq!(terminal.launch.working_directory, *STARTING_DIRECTORY);
-        assert_eq!(
-            *STARTING_DIRECTORY_CAPTION,
-            format!(
-                "Starting directory: {}",
-                display_path(&terminal.launch.working_directory)
-            ),
-        );
         assert!(app.sidebar_model.projects.is_empty());
     }
 

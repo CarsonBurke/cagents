@@ -1105,6 +1105,7 @@ impl HostedTerminalHandle {
         self.inner.terminal_id
     }
 
+    #[cfg(feature = "ui")]
     pub(crate) fn execution_instance(&self) -> Option<uuid::Uuid> {
         *self
             .inner
@@ -1347,7 +1348,7 @@ impl HostedTerminalHandle {
 
     /// A stopped surface with an authenticated receipt for reducer fixtures.
     /// Framed-socket tests exercise transport authentication separately.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(all(feature = "ui", any(test, feature = "test-support")))]
     pub(crate) fn set_worker_receipt_for_test(&self, owner: &HostSessionProof, worker: uuid::Uuid) {
         self.inner.stop.request();
         assert!(self.inner.published.pin_proof(owner));

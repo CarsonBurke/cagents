@@ -294,7 +294,7 @@ impl ColdView {
 /// Only called after the host committed authenticated orphan adoption. Missing
 /// historical work is an honest negative observation, not a new paused owner
 /// and not a reason to prevent the remaining real service from becoming Ready.
-#[cfg(any(feature = "host", test))]
+#[cfg(feature = "host")]
 pub(crate) fn publish(
     checkpoint: &Path,
     target: &Path,

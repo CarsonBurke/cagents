@@ -1,7 +1,7 @@
 //! Workspace SQL owns its own serialized connection. HostState is borrowed only
 //! for resident admission, subscription and publication, never for layout SQL.
 use super::{
-    model::{Applied, DeltaApplied, Registry},
+    model::{DeltaApplied, Registry},
     state::{ClientId, SharedHost},
 };
 use crate::{
@@ -218,17 +218,6 @@ pub(super) fn edit(
         registry.model().map_err(unavailable)
     })
     .map(|(_, model)| model)
-}
-
-/// Shared public-edit validation also serves the guarded title path.
-pub(super) fn apply(registry: &mut Registry, edit: &ModelEdit) -> Result<Applied, ProtocolError> {
-    let applied = apply_delta(registry, edit)?;
-    Ok(Applied {
-        model: registry.model().map_err(unavailable)?,
-        sequence: applied.receipt.sequence,
-        changed: applied.changed,
-        effects: applied.receipt.effects,
-    })
 }
 
 pub(super) fn apply_delta(

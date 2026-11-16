@@ -2097,7 +2097,7 @@ pub(crate) mod handoff {
             Ok(None)
         }
 
-        #[cfg(any(feature = "host", test))]
+        #[cfg(feature = "host")]
         pub(crate) fn retire_recovered(&self, id: crate::model::TerminalId) -> Result<(), String> {
             let _update = self.unattached.lock().unwrap_or_else(|p| p.into_inner());
             let mut entries = self.read_recovered()?;

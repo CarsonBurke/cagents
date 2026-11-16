@@ -665,6 +665,7 @@ impl RemoteActor {
         validate_evidence_record(record, proof)?;
         final_snapshot::compact_retired(record, proof)
     }
+    #[cfg(test)]
     pub fn retired_actor_receipt(
         record: &Record,
         proof: &HostSessionProof,
@@ -696,6 +697,7 @@ impl RemoteActor {
             (self.0.notify)(Update::RetainedOutcomes);
         }
     }
+    #[cfg(test)]
     pub fn native_holder_record(&self) -> &Record {
         &self.0.identity.record
     }
@@ -848,6 +850,7 @@ impl RemoteActor {
         self.0.wake.notify();
         self.state().generation
     }
+    #[cfg(test)]
     pub fn attachment_snapshot(&self) -> Snapshot {
         let state = self.state();
         Snapshot {
@@ -867,6 +870,7 @@ impl RemoteActor {
         }
     }
     /// Bounded resident projection; never performs socket I/O or reads transcript pages.
+    #[cfg(test)]
     pub fn notification_content(
         &self,
         kind: crate::notifications::Kind,
@@ -896,9 +900,6 @@ impl RemoteActor {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
-    }
-    pub fn restart_environment(&self) -> BTreeMap<String, String> {
-        self.0.recovery_environment.clone()
     }
     pub fn recovery_environment_matches(&self, value: &BTreeMap<String, String>) -> bool {
         &self.0.recovery_environment == value
@@ -1462,6 +1463,7 @@ impl RemoteActor {
         }
         true
     }
+    #[cfg(test)]
     fn publish_closed(&self, snapshot: Snapshot) {
         self.publish_closed_inner(snapshot, None);
     }
@@ -1548,6 +1550,7 @@ impl RemoteActor {
         self.0.stop.store(true, Ordering::Release);
         self.0.wake.notify();
     }
+    #[cfg(test)]
     pub(in crate::chat::runtime) fn pinned_launch_directory(
         &self,
     ) -> Result<(crate::agent_execution::DirectoryIdentity, Arc<File>), String> {
@@ -1682,6 +1685,7 @@ impl RemoteActor {
             Duration::ZERO,
         )
     }
+    #[cfg(test)]
     pub fn pending_inputs(&self) -> Vec<InputIdentity> {
         self.0
             .pending
@@ -2046,17 +2050,6 @@ impl RemoteActor {
             .map(|pending| pending.payload.clone())
             .ok_or("The original input envelope is unavailable; never reconstruct it")?;
         self.answer("input", json!([identity, payload]))
-    }
-    /// Explicit retransmission of the exact protocol envelope. Existing helper
-    /// receipts return the original outcome without invoking the adapter again.
-    /// This never replays stdin or generates a replacement prompt UUID.
-    pub fn retry_input(&self, identity: &InputIdentity) -> Result<InputReceipt, String> {
-        if self.0.stop.load(Ordering::Acquire) {
-            return Err(UNAVAILABLE_INPUT.into());
-        }
-        let receipt = self.answer_input(identity)??;
-        self.apply_receipts(std::slice::from_ref(&receipt));
-        Ok(receipt)
     }
     fn apply_receipts(&self, receipts: &[InputReceipt]) {
         let mut pending = self.0.pending.lock().unwrap_or_else(|p| p.into_inner());
@@ -2698,6 +2691,7 @@ impl Server {
         }
         Ok(response)
     }
+    #[cfg(test)]
     fn notifier(&self) -> impl Fn(Update) + Send + Sync + 'static {
         let outcomes = self.journal.clone();
         let changed = self.changed.clone();

@@ -10,7 +10,7 @@ pub(in crate::app) struct RemovalSource {
 
 /// A basis read for this immutable gesture, never an unscoped inventory reply.
 #[derive(Clone, Debug)]
-pub(in crate::app) struct TerminalRemovalReceipt {
+pub struct TerminalRemovalReceipt {
     pub basis: TerminalRemovalBasis,
     pub capture: Option<CapturedTerminalSource>,
 }
@@ -66,6 +66,7 @@ impl TerminalCleanupAuthority {
             _ => None,
         }
     }
+    #[cfg(test)]
     pub(in crate::app) fn requires_absence(&self) -> bool {
         matches!(
             self,
@@ -359,6 +360,7 @@ impl Cagents {
 
     /// Positive absence may fill missing authority. A current inventory read
     /// never grants an unknown worker to the original Close.
+    #[cfg(test)]
     pub(in crate::app) fn shared_removal_terminal_basis(
         &mut self,
         card: CardId,

@@ -522,7 +522,8 @@ fn link_form<'a>(state: &'a State, provider: Provider, path: &'a str) -> Element
                 crate::ui_controls::button::secondary("Cancel")
                     .on_press_maybe((!state.table.linking).then_some(Message::AccountUi(Action::LinkCancel)))
                     .into(),
-                crate::ui_controls::button::primary(if state.table.linking { "Adding…" } else { "Use home" })
+                crate::ui_controls::button::primary("Use home")
+                    .instead("Adding…", state.table.linking)
                     .on_press_maybe((!state.table.linking && !path.trim().is_empty()).then_some(Message::AccountUi(Action::LinkCommit)))
                     .into(),
             ])

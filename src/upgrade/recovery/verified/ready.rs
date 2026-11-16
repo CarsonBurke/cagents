@@ -102,15 +102,6 @@ fn captured_terminals(census: &Census) -> impl Iterator<Item = &TerminalSession>
 }
 
 impl ReadyView {
-    pub(crate) fn load(
-        serving: &HostSessionProof,
-        target: &Path,
-        terminals: &[TerminalDescriptor],
-        chats: &[Session],
-    ) -> Result<Option<Self>, String> {
-        Self::load_discovered(None, serving, target, terminals, chats)
-    }
-
     pub(crate) fn load_for_source(
         expected_source: &HostSessionProof,
         serving: &HostSessionProof,

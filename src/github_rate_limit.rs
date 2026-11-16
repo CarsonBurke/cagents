@@ -39,6 +39,7 @@ impl RateLimit {
         }
     }
 
+    #[cfg(any(feature = "host", feature = "ui", test))]
     pub fn primary(resource: impl Into<String>, retry_at: u64) -> Self {
         Self {
             retry_at,
@@ -54,10 +55,7 @@ impl RateLimit {
         self
     }
 
-    pub fn for_resource(&self, resource: &str) -> Option<Self> {
-        self.for_resource_at(resource, now())
-    }
-
+    #[cfg(test)]
     pub fn for_resource_at(&self, resource: &str, at: u64) -> Option<Self> {
         if self.retry_at > at
             && (self.resource.is_none() || self.resource.as_deref() == Some(resource))
