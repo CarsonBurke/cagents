@@ -167,6 +167,21 @@ features, `--no-default-features --features host` for the daemon for example;
 `--package cagents --package cagents-ui --features cagents/ui`, and `browser`
 selects `--package cagents-ui --features integrated-browser`.
 
+Every lane compiles the workspace's crates without warnings, tests included,
+and a new warning is a regression to fix in the change that adds it. An item
+that only some lanes use carries the `cfg` of exactly those lanes, such as
+`#[cfg(feature = "host")]` or `#[cfg(any(feature = "host", feature = "ui"))]`,
+on the module or impl block where a cluster of such items lives; a helper only
+tests use is `#[cfg(test)]`, and code no lane or test uses is removed. Do not
+silence a warning with `#[allow(dead_code)]` or `#[allow(unused)]`: that hides
+it in the lanes where it is real. A field kept only so its `Drop` runs, such as
+a lease or guard, takes a leading underscore rather than being deleted. The
+[main build sentinel](#watching-main-after-merges) reports any warning these
+crates print in its lanes. The UI lanes also print warnings from the vendored
+dependencies under `vendor/`: Cargo shows warnings for every path dependency,
+and stable Cargo has no per-dependency switch to hide them, so they are expected
+and do not count.
+
 Each of these commands waits in the build host's queue on its own, and on a
 busy host the wait is most of its time: on fw16 under a full queue, the CLI
 check above took 26 s to compile and 19 minutes in all. The CLI, host and
@@ -702,9 +717,16 @@ CLI, `--features host`, `--features ui`, `-p cagents-ui`, and
 graph with its Wayland registry test server. These use the ordinary shared queue
 and the persistent sentinel worktree cache, without a held slot between lanes.
 The sentinel neither merges nor modifies another checkout or native session.
+A lane fails when it does not compile or when a workspace crate prints a
+warning; it reads Cargo's JSON messages to tell the workspace's crates, the
+checked commit's `[workspace] members`, from vendored path dependencies, whose
+warnings do not count. Its logs hold Cargo's rendered diagnostics, and
+`logs/SHA-LANE-warnings.log` the counted warnings, each once; for a lane that
+compiled, the issue shows those rather than the log's tail.
 
-Once the newest commit it checked passes, the sentinel also builds the three
-executables [native evidence](#native-evidence) runs for that commit and keeps
+Once the newest commit it checked compiles, warnings or not, the sentinel also
+builds the three executables [native evidence](#native-evidence) runs for that
+commit and keeps
 them under `builds/` in its state directory, for the six newest such commits,
 about 0.6 GiB each. Evidence of main then copies them instead of compiling. A
 build that fails is logged to `logs/SHA-evidence.log` and not retried; evidence
@@ -758,7 +780,7 @@ State and full per-commit lane logs live in
 `~/.local/state/cagents-main-sentinel` (`--state` overrides it). On failure it
 creates or updates one issue titled **Main Rust build sentinel: compilation
 failure**, reopens it if closed, and includes the SHA, parents, last passing SHA,
-lane statuses and diagnostic tails. A later passing commit adds a recovery
+lane statuses with their warning counts, and diagnostic tails. A later passing commit adds a recovery
 comment; a person closes the issue. Successful commits need no GitHub API call.
 Notification failures retain the completed result for retry without rebuilding;
 rate limits defer attempts until the reset from `gh api rate_limit`. Other

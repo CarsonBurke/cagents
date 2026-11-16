@@ -39,17 +39,33 @@ class SentinelTests(unittest.TestCase):
         gate.write_text('''#!/usr/bin/python3
 import json, os, subprocess, sys
 from pathlib import Path
-selection = sys.argv[sys.argv.index('--all-targets') + 1:]
+assert sys.argv[-1] == '--message-format=json', sys.argv
+selection = sys.argv[sys.argv.index('--all-targets') + 1:-1]
 lane = next(name for name, value in json.loads(os.environ['SENTINEL_LANES']).items()
             if value == selection)
 sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
 with open(os.environ['SENTINEL_CALLS'], 'a') as out:
     out.write(json.dumps([sha, lane, sys.argv[1:], os.environ.get('CAGENTS_BUILD_REMOTE')]) + '\\n')
+def diagnostic(package_id, level, text):
+    print(json.dumps({'reason': 'compiler-message', 'package_id': package_id,
+                      'message': {'level': level, 'message': text,
+                                  'rendered': f'{level}: {text}\\n'}}))
+print('Checking cagents', file=sys.stderr)
+# Vendored path dependencies print warnings in every lane; they never count.
+diagnostic('path+file:///src/vendor/libcosmic#1.0.0', 'warning', 'vendored unused import')
+diagnostic('path+file:///src/vendor/iced-core#iced_core@0.14.0', 'warning', 'vendored dead code')
+if Path('warning-' + lane).exists():
+    diagnostic('path+file:///src/crates/cagents-ui#0.1.3', 'warning', 'function `lane_only` is never used')
+    # Once for the library and once for its tests, as Cargo reports it.
+    diagnostic('path+file:///src#cagents@0.1.3', 'warning', 'unused import: `Lane`')
+    diagnostic('path+file:///src#cagents@0.1.3', 'warning', 'unused import: `Lane`')
 if Path('broken-' + lane).exists():
-    print('error: deliberately incompatible merge')
+    diagnostic('path+file:///src#cagents@0.1.3', 'error', 'deliberately incompatible merge')
     sys.exit(101)
 ''')
         gate.chmod(0o755)
+        (self.origin / "Cargo.toml").write_text(
+            '[workspace]\nmembers = [".", "crates/*"]\n\n[package]\nname = "cagents"\n')
         application = self.origin / "crates/cagents-ui/Cargo.toml"
         application.parent.mkdir(parents=True)
         application.write_text('[package]\nname = "cagents-ui"\n')
@@ -82,9 +98,11 @@ if sys.argv[1:3] == ['issue', 'create']:
     def command(self, *args):
         return subprocess.check_output(args, text=True, stderr=subprocess.PIPE).strip()
 
-    def commit(self, message, broken=None):
+    def commit(self, message, broken=None, warning=None):
         if broken:
             (self.origin / f"broken-{broken}").touch()
+        if warning:
+            (self.origin / f"warning-{warning}").touch()
         self.command("git", "-C", str(self.origin), "add", ".")
         self.command("git", "-C", str(self.origin), "commit", "-q", "--allow-empty", "-m", message)
         return self.command("git", "-C", str(self.origin), "rev-parse", "HEAD")
@@ -109,6 +127,7 @@ if sys.argv[1:3] == ['issue', 'create']:
                          [(sha, lane) for sha in (self.first, second, third) for lane in sentinel.LANES])
         for entry in records:
             self.assertEqual(entry[2][:4], ['check', '--locked', '--no-default-features', '--all-targets'])
+            self.assertEqual(entry[2][-1], '--message-format=json')
             self.assertEqual(entry[3], 'fw16')
 
     def test_commit_before_the_application_package_skips_only_its_lanes(self):
@@ -145,6 +164,49 @@ if sys.argv[1:3] == ['issue', 'create']:
         self.tick()
         self.assertTrue(any(entry[:3] == ["issue", "comment", "42"] and fixed in str(entry)
                             for entry in self.recorded()))
+
+    def test_workspace_warnings_fail_the_check_but_vendored_ones_do_not(self):
+        self.tick()
+        state = json.loads((self.state / "state.json").read_text())
+        self.assertEqual(state["last_good"], self.first)
+        self.assertFalse(any(entry[:2] == ["issue", "create"] for entry in self.recorded()))
+        log = (self.state / "logs" / f"{self.first}-ui.log").read_text()
+        self.assertIn("warning: vendored unused import", log)
+        self.assertIn("Checking cagents", log)
+        warned = self.commit("lane-only helper", warning="app")
+        self.now += 120
+        self.tick()
+        state = json.loads((self.state / "state.json").read_text())
+        self.assertEqual(state["checked"], warned)
+        self.assertEqual(state["last_good"], self.first)
+        self.assertEqual(state["compiled"], warned)
+        self.assertEqual(state["issue"], 42)
+        body = (self.state / "issue.md").read_text()
+        self.assertIn("- app: exit 0, 2 warnings\n", body)
+        self.assertIn("- cli: exit 0\n", body)
+        self.assertIn("function `lane_only` is never used", body)
+        self.assertNotIn("vendored", body)
+        self.assertNotIn("cli diagnostics", body)
+        (self.origin / "warning-app").unlink()
+        fixed = self.commit("gate the helper")
+        self.now += 120
+        self.tick()
+        self.assertTrue(any(entry[:3] == ["issue", "comment", "42"] and fixed in str(entry)
+                            for entry in self.recorded()))
+        self.assertEqual(json.loads((self.state / "state.json").read_text())["last_good"], fixed)
+
+    def test_an_unreadable_manifest_leaves_the_lanes_to_cargo(self):
+        self.tick()
+        (self.origin / "Cargo.toml").write_text("[workspace\n")
+        broken = self.commit("malformed manifest", broken="cli", warning="host")
+        self.now += 120
+        self.tick()
+        state = json.loads((self.state / "state.json").read_text())
+        self.assertEqual(state["checked"], broken)
+        body = (self.state / "issue.md").read_text()
+        self.assertIn("- cli: exit 101\n", body)
+        self.assertIn("- host: exit 0\n", body)
+        self.assertIn("deliberately incompatible merge", body)
 
     def test_rate_limit_waits_for_reset_and_retries_report_without_rebuilding(self):
         self.commit("broken", broken="ui")
@@ -253,6 +315,15 @@ for name in BINS:
         self.assertFalse(any(entry.name.startswith(".") and entry.is_dir()
                              for entry in (self.state / "builds").iterdir()))
         self.assertTrue((self.state / "builds" / good).is_dir())
+
+    def test_a_commit_that_compiles_with_warnings_is_still_built(self):
+        self.with_evidence_tool()
+        self.tick()
+        warned = self.commit("lane-only helper", warning="host")
+        self.now += 120
+        self.tick()
+        self.assertEqual(self.evidence_builds()[-1], warned)
+        self.assertTrue((self.state / "builds" / warned).is_dir())
 
     def test_only_the_newest_builds_are_kept(self):
         built = [self.with_evidence_tool()]

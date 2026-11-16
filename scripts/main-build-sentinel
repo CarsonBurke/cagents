@@ -1,8 +1,9 @@
 #!/usr/bin/python3
 """Check every new first-parent main commit, serially, through the fw16 gate,
-then build the newest one that passes for native evidence to start from."""
+then build the newest one that compiles for native evidence to start from."""
 import argparse
 import fcntl
+import glob
 import json
 import os
 from pathlib import Path
@@ -10,6 +11,7 @@ import shutil
 import socket
 import subprocess
 import time
+import tomllib
 
 TITLE = "Main Rust build sentinel: compilation failure"
 # Each lane's selection after `check --locked --no-default-features --all-targets`.
@@ -45,6 +47,69 @@ def git(repository, *args):
     return run("git", "-C", str(repository), *args, stdout=subprocess.PIPE).stdout.strip()
 
 
+def workspace_packages(checkout):
+    """Names of the checked commit's workspace members. Cargo prints warnings
+    from every path package, the vendored dependencies included; only these
+    crates must compile without them. None when the manifests cannot be read:
+    Cargo then fails the lanes itself, and that failure is what is reported."""
+    try:
+        manifest = tomllib.loads((checkout / "Cargo.toml").read_text())
+        names = set()
+        for member in manifest.get("workspace", {}).get("members", ["."]):
+            for directory in glob.glob(member, root_dir=checkout):
+                member_manifest = checkout / directory / "Cargo.toml"
+                if member_manifest.exists():
+                    names.add(tomllib.loads(member_manifest.read_text())["package"]["name"])
+        if "package" in manifest:
+            names.add(manifest["package"]["name"])
+        return names
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError, KeyError, TypeError) as error:
+        print(f"main-build-sentinel: workspace members unreadable, warnings not counted: {error}", flush=True)
+        return None
+
+
+def package_name(package_id):
+    """The name in a Cargo package ID specification, such as
+    `path+file:///src#cagents@0.1.3` or `path+file:///src/cagents-ui#0.1.3`,
+    whose name is the directory's when omitted."""
+    source, separator, fragment = package_id.rpartition("#")
+    if not separator:
+        return package_id.split(" ", 1)[0]
+    name, at, _ = fragment.partition("@")
+    return name if at else source.rstrip("/").rsplit("/", 1)[-1]
+
+
+def check_lane(command, checkout, environment, log_path, warnings_path, packages):
+    """Runs one lane's check, writing its diagnostics to the log as Cargo
+    renders them, and the workspace's own warnings, once each, to their own
+    file; returns the exit status and how many such warnings there were.
+    Cargo reports a warning once per target it compiles, such as a library
+    and its tests; its human output folds those duplicates, and so does this."""
+    log_path.write_text("")
+    counted = {}
+    with (log_path.open("a") as log,
+          subprocess.Popen([*command, "--message-format=json"], cwd=checkout, env=environment,
+                           stdout=subprocess.PIPE, stderr=log, text=True, errors="replace") as process):
+        for line in process.stdout:
+            try:
+                message = json.loads(line)
+            except ValueError:
+                message = None
+            if not isinstance(message, dict):
+                log.write(line)
+            elif message.get("reason") == "compiler-message" and isinstance(message.get("message"), dict):
+                diagnostic = message["message"]
+                rendered = diagnostic.get("rendered") or f"{diagnostic.get('message', '')}\n"
+                log.write(rendered)
+                if (packages is not None and diagnostic.get("level") == "warning"
+                        and package_name(str(message.get("package_id", ""))) in packages):
+                    counted.setdefault((message["package_id"], rendered), rendered)
+            log.flush()
+        status = process.wait()
+    warnings_path.write_text("".join(counted.values()))
+    return status, len(counted)
+
+
 def report(repository, directory, state):
     """Persist each successful report step; a failed API call never loses a result."""
     pending = state["pending"]
@@ -65,11 +130,13 @@ def report(repository, directory, state):
             raise RuntimeError(result.stderr.strip())
         return result.stdout.strip()
 
-    failed = [lane for lane, status in pending["lanes"].items() if status]
+    warnings = pending.get("warnings", {})
+    failed = [lane for lane, status in pending["lanes"].items() if status or warnings.get(lane)]
     if not failed:
         if state.get("failing"):
             gh("issue", "comment", str(state["issue"]), "--body",
-               f"Recovered at `{pending['sha']}`: all-targets checks passed on fw16 in every lane.")
+               f"Recovered at `{pending['sha']}`: all-targets checks passed on fw16 in every lane, "
+               "without warnings from the workspace's crates.")
         state["failing"] = False
         return
     if not state.get("issue"):
@@ -81,17 +148,23 @@ def report(repository, directory, state):
             save(directory / "state.json", state)
     sha = pending["sha"]
     details = git(repository, "show", "-s", "--format=%H%n%P%n%s", sha)
-    body = (f"Main fails to compile at `{sha}` on fw16.\n\n"
+    body = (f"Main fails its Rust build check at `{sha}` on fw16: a lane does not compile, "
+            "or the workspace's own crates print warnings. Vendored dependencies' warnings "
+            "do not count.\n\n"
             f"Last passing commit: `{state.get('last_good', 'none recorded')}`.\n\n"
             f"Commit, parents and subject:\n```text\n{details}\n```\n\n"
             "Checks use `scripts/cargo-gate check --locked --no-default-features --all-targets` "
             "in separate CLI, host, shared UI (`--features ui`) and application "
             "(`-p cagents-ui`) lanes.\n\n")
     for lane, status in pending["lanes"].items():
-        body += f"- {lane}: exit {status}\n"
+        count = warnings.get(lane, 0)
+        body += f"- {lane}: exit {status}" + (f", {count} warning{'s' * (count != 1)}" if count else "") + "\n"
     for lane in failed:
         log = directory / "logs" / f"{sha}-{lane}.log"
-        tail = log.read_text(errors="replace")[-5000:].replace("```", "'''")
+        # A lane that compiled failed on its warnings, which the vendored
+        # dependencies' could crowd out of the log's tail.
+        shown = log if pending["lanes"][lane] else directory / "logs" / f"{sha}-{lane}-warnings.log"
+        tail = shown.read_text(errors="replace")[-5000:].replace("```", "'''")
         body += f"\n{lane} diagnostics (tail; complete log on fw16 at `{log}`):\n```text\n{tail}\n```\n"
     body_file = directory / "issue.md"
     body_file.write_text(body)
@@ -108,10 +181,11 @@ def report(repository, directory, state):
 
 def keep_main_build(repository, directory, state):
     """Builds the executables native evidence runs for the newest checked
-    commit, if it passed, into builds/SHA, as scripts/native-evidence would
+    commit, if it compiled, into builds/SHA, as scripts/native-evidence would
     build them for its "before" side, which takes them from there."""
     sha = state.get("checked")
-    if not sha or state.get("last_good") != sha or state.get("built") == sha:
+    # Warnings fail the check, not the build evidence starts from.
+    if not sha or state.get("compiled") != sha or state.get("built") == sha:
         return
     builds = directory / "builds"
     builds.mkdir(exist_ok=True)
@@ -211,6 +285,8 @@ def tick_locked(repository, directory, github_repository):
                     git(repository, "worktree", "add", "--detach", str(checkout), sha)
                 (directory / "logs").mkdir(exist_ok=True)
                 statuses = {}
+                warnings = {}
+                packages = workspace_packages(checkout)
                 for lane, selection in LANES.items():
                     if (lane in APPLICATION_LANES
                             and not (checkout / "crates/cagents-ui/Cargo.toml").exists()):
@@ -218,12 +294,12 @@ def tick_locked(repository, directory, github_repository):
                     command = [str(checkout / "scripts/cargo-gate"), "check", "--locked",
                                "--no-default-features", "--all-targets", *selection]
                     print(f"main-build-sentinel: {sha} {lane}", flush=True)
-                    with (directory / "logs" / f"{sha}-{lane}.log").open("w") as log:
-                        # No priority bypass, held lease, or local compilation override.
-                        environment = dict(os.environ, CAGENTS_BUILD_REMOTE="fw16")
-                        statuses[lane] = subprocess.run(command, cwd=checkout, env=environment,
-                                                        stdout=log, stderr=subprocess.STDOUT).returncode
-                state["pending"] = {"sha": sha, "lanes": statuses}
+                    # No priority bypass, held lease, or local compilation override.
+                    environment = dict(os.environ, CAGENTS_BUILD_REMOTE="fw16")
+                    statuses[lane], warnings[lane] = check_lane(
+                        command, checkout, environment, directory / "logs" / f"{sha}-{lane}.log",
+                        directory / "logs" / f"{sha}-{lane}-warnings.log", packages)
+                state["pending"] = {"sha": sha, "lanes": statuses, "warnings": warnings}
                 save(path, state)
             state["retry_after"] = time.time() + 120
             save(path, state)
@@ -232,7 +308,9 @@ def tick_locked(repository, directory, github_repository):
             pending = state.pop("pending")
             state["checked"] = pending["sha"]
             if not any(pending["lanes"].values()):
-                state["last_good"] = pending["sha"]
+                state["compiled"] = pending["sha"]
+                if not any(pending.get("warnings", {}).values()):
+                    state["last_good"] = pending["sha"]
             state["queue"].pop(0)
             save(path, state)
         keep_main_build(repository, directory, state)
