@@ -298,8 +298,8 @@ The CLI's main readers are agents, which pay for its output in context. Its
 human output therefore keeps to what the next step needs: shortest unique IDs,
 one project line rather than a path per row, and one `hint:` line naming the
 likely next command. Size is measured in BPE tokens rather than bytes, because
-IDs, hashes and JSON punctuation cost about twice as many tokens per byte as
-prose. To
+IDs, hashes and JSON punctuation cost two to three times as many tokens per
+byte as prose. To
 compare a change's output before and after, run it under
 `scripts/output-tokens` (see
 [Output agents read](development.md#output-agents-read)).

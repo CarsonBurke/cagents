@@ -1609,22 +1609,25 @@ row. `scripts/output-tokens` counts them:
 
 ```sh
 scripts/output-tokens -- scripts/gh-pr-status 2900 -R CarsonBurke/cagents --json
-# 1227 tokens, 3783 bytes, exit 0
 cagents ls --json | scripts/output-tokens        # count standard input instead
 scripts/output-tokens --json --show -- mise run check:cli   # pass the output through too
 ```
 
-It runs the command, prints one line with the total and, when the command wrote
-to standard error, each stream's tokens and bytes, and exits with the
-command's status (125 when counting failed). The count uses OpenAI's
+It runs the command and prints one line, such as `412 tokens, 1650 bytes
+(stdout 398/1580, stderr 14/70), exit 0`: the total and, when the command wrote
+to standard error, each stream's tokens and bytes. It exits with the command's
+status, even when counting fails, which it reports on standard error; counting
+standard input exits 125 when counting fails. `--show` passes the output
+through as it arrives. The count uses OpenAI's
 `o200k_base` encoding through tiktoken. No public tokenizer matches every
 agent's, so compare outputs under one encoding rather than reading the numbers
 as a bill; `--encoding cl100k_base` selects another. It imports tiktoken when
 the current Python has it, and otherwise runs `uv run --offline` with the
-pinned tiktoken. The first use, with uv's cache or the vocabulary missing,
-downloads both once: the package into uv's cache and the vocabulary into
-`TIKTOKEN_CACHE_DIR` (default `~/.cache/tiktoken`), where tiktoken checks its
-hash. Later counts need no network or API key.
+pinned tiktoken, going online only when uv's cache lacks it. The first use
+downloads what is missing: the package (and a Python, if uv has none) into uv's
+cache, and the vocabulary into `TIKTOKEN_CACHE_DIR` (default
+`~/.cache/tiktoken`), where tiktoken checks its hash. Later counts need no
+network or API key.
 
 Print what the caller needs to decide its next step, and put the rest behind a
 flag:

@@ -30,11 +30,16 @@ with record.open("a") as out:
     out.write(json.dumps({{"arguments": sys.argv[1:], "cache": os.environ.get("TIKTOKEN_CACHE_DIR"),
                           "encoding": request["encoding"]}}) + "\\n")
 if "--offline" in sys.argv and os.environ.get("FAIL_OFFLINE"):
-    print("error: tiktoken==0.14.0 is not in the cache", file=sys.stderr)
+    print("mise WARN  shim noise", file=sys.stderr)
+    print("  cause: Because tiktoken was not found in the cache and you require tiktoken==0.14.0, ...", file=sys.stderr)
+    print("hint: Packages were unavailable because the network was disabled.", file=sys.stderr)
     sys.exit(2)
 if os.environ.get("FAIL_ALWAYS"):
-    print("error: no network", file=sys.stderr)
-    sys.exit(2)
+    print("Traceback (most recent call last):", file=sys.stderr)
+    print('  File "<string>", line 4, in <module>', file=sys.stderr)
+    print("    encoding = tiktoken.get_encoding(request['encoding'])", file=sys.stderr)
+    print("ValueError: Unknown encoding bogus.", file=sys.stderr)
+    sys.exit(1)
 assert sys.argv[sys.argv.index("-c") + 1].strip().startswith("import json, sys, tiktoken")
 print(json.dumps([len(text.split()) for text in request["texts"]]))
 '''
@@ -62,8 +67,9 @@ class OutputTokens(unittest.TestCase):
         os.environ.pop("FAIL_OFFLINE", None)
         os.environ.pop("FAIL_ALWAYS", None)
 
-    def run_tool(self, *arguments, stdin=b""):
-        stdout, stderr = io.TextIOWrapper(io.BytesIO()), io.TextIOWrapper(io.BytesIO())
+    def run_tool(self, *arguments, stdin=b"", merged=False):
+        stdout = io.TextIOWrapper(io.BytesIO())
+        stderr = stdout if merged else io.TextIOWrapper(io.BytesIO())
         with mock.patch.object(sys, "stdin", io.TextIOWrapper(io.BytesIO(stdin))), \
                 mock.patch.object(sys, "stdout", stdout), contextlib.redirect_stderr(stderr):
             try:
@@ -72,7 +78,7 @@ class OutputTokens(unittest.TestCase):
                 status = exit.code
         stdout.flush()
         stderr.flush()
-        return status, stdout.buffer.getvalue().decode(), stderr.buffer.getvalue().decode()
+        return status, stdout.buffer.getvalue().decode(), "" if merged else stderr.buffer.getvalue().decode()
 
     def calls(self):
         return [json.loads(line) for line in self.record.read_text().splitlines()]
@@ -106,6 +112,12 @@ class OutputTokens(unittest.TestCase):
         self.assertEqual(out, "kept\n")
         self.assertEqual(err, "noted\n2 tokens, 11 bytes (stdout 1/5, stderr 1/6), exit 0\n")
 
+    def test_show_streams_output_live_in_the_order_it_arrives(self):
+        script = "echo out1; sleep 0.2; echo err1 >&2; sleep 0.2; echo out2"
+        status, out, _ = self.run_tool("--show", "--", "sh", "-c", script, merged=True)
+        self.assertEqual(status, 0)
+        self.assertEqual(out.splitlines()[:3], ["out1", "err1", "out2"])
+
     def test_another_encoding_is_named(self):
         _, out, _ = self.run_tool("--encoding", "cl100k_base", "--", "echo", "x")
         self.assertEqual(out, "1 tokens, 2 bytes [cl100k_base], exit 0\n")
@@ -129,12 +141,25 @@ class OutputTokens(unittest.TestCase):
         self.assertEqual(["--offline" in call["arguments"] for call in calls], [True, False])
         self.assertEqual({call["cache"] for call in calls}, {str(self.root / "vocabulary")})
 
-    def test_a_failed_count_is_its_own_status_not_the_commands(self):
+    def test_a_failed_count_keeps_the_commands_status_and_is_not_retried_online(self):
         os.environ["FAIL_ALWAYS"] = "1"
-        status, out, err = self.run_tool("--", "true")
-        self.assertEqual((status, out), (tokens.FAILED, ""))
-        self.assertIn("could not run tiktoken", err)
-        self.assertIn("no network", err)
+        for command, expected in ((["true"], 0), (["sh", "-c", "exit 3"], 3)):
+            with self.subTest(command=command):
+                self.record.unlink(missing_ok=True)
+                status, out, err = self.run_tool("--show", "--", *command)
+                self.assertEqual((status, out), (expected, ""))
+                self.assertEqual(err, f"output-tokens: could not run tiktoken {tokens.TIKTOKEN_VERSION} "
+                                      "through uv: ValueError: Unknown encoding bogus.\n")
+                self.assertEqual(len(self.calls()), 1, "only a cold cache goes online")
+        status, _, _ = self.run_tool(stdin=b"x")
+        self.assertEqual(status, tokens.FAILED)
+
+    def test_a_cold_cache_failure_reports_what_uv_said_without_shim_noise(self):
+        os.environ["FAIL_OFFLINE"] = "1"
+        os.environ["FAIL_ALWAYS"] = "1"
+        _, _, err = self.run_tool(stdin=b"x")
+        self.assertEqual(len(self.calls()), 2)
+        self.assertNotIn("mise WARN", err)
 
     def test_missing_uv_and_tiktoken_is_explained(self):
         os.environ["PATH"] = str(self.root / "empty")

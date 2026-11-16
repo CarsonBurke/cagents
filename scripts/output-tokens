@@ -10,27 +10,32 @@ error, and prints one line such as
   412 tokens, 1650 bytes (stdout 398/1580, stderr 14/70), exit 0
 
 Without a command, it counts its own standard input. Bytes alone mislead: a UUID,
-a hash or JSON punctuation costs about twice as many tokens per byte as prose.
+a hash or JSON punctuation costs two to three times as many tokens per byte as prose.
 The count uses OpenAI's o200k_base encoding through tiktoken, a
 public proxy for the tokenizers agents run on; compare outputs with one encoding
 rather than reading the numbers as any provider's bill. Text is counted as
 ordinary text, so special-token spellings in it are not treated as control tokens.
 
---show passes the command's output through unchanged and prints the count on
-standard error instead. --json prints the counts as one JSON object.
+--show passes the command's output through as it arrives, each stream to its
+own, and prints the count on standard error instead. --json prints the counts as
+one JSON object.
 
 tiktoken runs from the current Python when it is importable, or else through
-`uv run` pinned to TIKTOKEN_VERSION. uv is tried offline first, so once its
-package cache and the encoding's vocabulary (kept in TIKTOKEN_CACHE_DIR, by
-default ${XDG_CACHE_HOME:-~/.cache}/tiktoken, and checked against tiktoken's
-recorded hash) are present, counting needs no network.
+`uv run` pinned to TIKTOKEN_VERSION. uv runs offline, and online only when its
+package cache lacks that tiktoken; the encoding's vocabulary is kept in
+TIKTOKEN_CACHE_DIR (by default ${XDG_CACHE_HOME:-~/.cache}/tiktoken) and checked
+against tiktoken's recorded hash. Once both are present, counting needs no
+network.
 
-Exit status: the command's own; with no command 0. 2 usage, 125 the count failed.
+Exit status: the command's own, even when counting failed, which is reported on
+standard error. Without a command: 0, or 125 when counting failed. 2 usage; 126
+or 127 the command could not be run.
 """
 import argparse
 import json
 import os
 from pathlib import Path
+import selectors
 import shutil
 import subprocess
 import sys
@@ -38,6 +43,8 @@ import sys
 TIKTOKEN_VERSION = "0.14.0"
 DEFAULT_ENCODING = "o200k_base"
 USAGE, FAILED = 2, 125
+# What uv says when the network is disabled and its cache lacks the package.
+COLD_CACHE = ("the network was disabled", "not found in the cache")
 
 # Reads {"encoding": NAME, "texts": [...]} and prints the token count of each text.
 COUNTER = r"""
@@ -80,8 +87,7 @@ def count_with_uv(encoding, texts):
     request = json.dumps({"encoding": encoding, "texts": texts})
     base = [uv, "run", "--quiet", "--no-project", "--with", f"tiktoken=={TIKTOKEN_VERSION}",
             "python3", "-I", "-c", COUNTER]
-    failure = ""
-    # Offline first, so a warm cache never touches the network; online once to fill it.
+    # Offline, so a warm cache never touches the network; online only to fill a cold one.
     for command in ([*base[:2], "--offline", *base[2:]], base):
         result = subprocess.run(command, input=request, capture_output=True, text=True,
                                 env=cache_environment(), check=False)
@@ -92,10 +98,17 @@ def count_with_uv(encoding, texts):
                 counts = None
             if isinstance(counts, list) and len(counts) == len(texts):
                 return counts
-            failure = f"unexpected tokenizer output: {result.stdout.strip()[:200]!r}"
-        else:
-            failure = result.stderr.strip()
-    raise CountFailed(f"could not run tiktoken {TIKTOKEN_VERSION} through uv: {failure}")
+            raise CountFailed(f"unexpected tokenizer output: {result.stdout.strip()[:200]!r}")
+        if "--offline" not in command or not any(sign in result.stderr for sign in COLD_CACHE):
+            break
+    raise CountFailed(f"could not run tiktoken {TIKTOKEN_VERSION} through uv: {trimmed(result.stderr)}")
+
+
+def trimmed(stderr, lines=3):
+    """The last few lines of a failure that say what went wrong, without shim or traceback noise."""
+    meaningful = [line.strip() for line in stderr.splitlines()
+                  if line.strip() and not line.startswith(("mise WARN", "  File ", "    ", "Traceback "))]
+    return " / ".join(meaningful[-lines:]) or "no error output"
 
 
 def count_tokens(encoding, texts):
@@ -134,6 +147,30 @@ def summary(result):
     return line
 
 
+def run_command(command, show):
+    """Run COMMAND, collecting each stream; with SHOW, pass each chunk on as it arrives."""
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    targets = {process.stdout: ("stdout", sys.stdout), process.stderr: ("stderr", sys.stderr)}
+    captured = {"stdout": bytearray(), "stderr": bytearray()}
+    with selectors.DefaultSelector() as selector:
+        for pipe in targets:
+            selector.register(pipe, selectors.EVENT_READ)
+        while selector.get_map():
+            for key, _ in selector.select():
+                chunk = os.read(key.fd, 65536)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    key.fileobj.close()
+                    continue
+                name, target = targets[key.fileobj]
+                captured[name] += chunk
+                if show:
+                    target.flush()
+                    target.buffer.write(chunk)
+                    target.buffer.flush()
+    return {name: bytes(data) for name, data in captured.items()}, process.wait()
+
+
 def parse(arguments):
     parser = argparse.ArgumentParser(
         prog="output-tokens", description="Count the BPE tokens of a command's output or of standard input.",
@@ -160,26 +197,21 @@ def main(arguments=None):
     status = None
     if command:
         try:
-            result = subprocess.run(command, capture_output=True, check=False)
+            streams, status = run_command(command, options.show)
         except OSError as error:
             print(f"output-tokens: cannot run {command[0]}: {error.strerror}", file=sys.stderr)
             return 127 if isinstance(error, FileNotFoundError) else 126
-        streams, status = {"stdout": result.stdout, "stderr": result.stderr}, result.returncode
-        if options.show:
-            sys.stdout.buffer.write(result.stdout)
-            sys.stdout.flush()
-            sys.stderr.buffer.write(result.stderr)
-            sys.stderr.flush()
+        # A signal-terminated command reports as the shell would, 128 + the signal.
+        status = status if status >= 0 else 128 - status
     else:
         streams = {"stdin": sys.stdin.buffer.read()}
     try:
         measured = measure(options.encoding, streams)
     except CountFailed as error:
         print(f"output-tokens: {error}", file=sys.stderr)
-        return FAILED
+        return FAILED if status is None else status
     if status is not None:
-        # A signal-terminated command reports as the shell would, 128 + the signal.
-        measured["exit"] = status if status >= 0 else 128 - status
+        measured["exit"] = status
     text = json.dumps(measured) if options.json else summary(measured)
     print(text, file=sys.stderr if options.show else sys.stdout)
     return measured.get("exit", 0)
