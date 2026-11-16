@@ -7737,6 +7737,22 @@ mod tests {
                 "{arguments:?}: {page}"
             );
         }
+
+        // A mistyped global option is still recognized wherever it goes.
+        for arguments in [
+            &["agent", "list", "--jsno"][..],
+            &["--jsno", "ls"],
+            &["agent", "--devic", "x", "list"],
+        ] {
+            let error =
+                Cli::try_parse_from(std::iter::once("cagents").chain(arguments.iter().copied()))
+                    .unwrap_err()
+                    .to_string();
+            assert!(
+                error.contains("a similar argument exists: '--"),
+                "{arguments:?}: {error}"
+            );
+        }
     }
 
     #[test]
