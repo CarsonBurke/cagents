@@ -35,7 +35,7 @@ fn fixture(root: &Path) -> Cagents {
     let path = root.join("alpha");
     std::fs::create_dir_all(&path).unwrap();
     let mut app = context_inspector_test_app(false);
-    app.sidebar_model.projects = vec![SidebarProject::new(
+    *app.sidebar_model.projects = vec![SidebarProject::new(
         ProjectId::new(),
         RepositoryId::new(),
         "alpha".into(),

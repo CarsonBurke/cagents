@@ -581,13 +581,19 @@ impl Cagents {
     }
 
     /// Opens channel `id` as navigation alone; a caller that also changed the
-    /// workspace saves it.
-    fn open_channel_with_default(&mut self, id: ChannelId) -> Task<Message> {
+    /// workspace saves it. Only a channel this window just `created` is known
+    /// to be empty before its shared view loads.
+    fn open_channel_with_default(&mut self, id: ChannelId, created: bool) -> Task<Message> {
         let scope = self.navigate_to_channel(id);
         if self.durable.active_channel != Some(id) {
             return scope;
         }
-        Task::batch([scope, self.ensure_default_pane()])
+        let default = if created {
+            self.ensure_new_channel_default_pane()
+        } else {
+            self.ensure_default_pane()
+        };
+        Task::batch([scope, default])
     }
 
     pub(super) fn new_project_channel(&mut self) -> Task<Message> {
@@ -747,7 +753,7 @@ impl Cagents {
                 else {
                     return Task::none();
                 };
-                let scope = self.open_channel_with_default(id);
+                let scope = self.open_channel_with_default(id, true);
                 self.persist();
                 Task::batch([
                     scope,
@@ -760,7 +766,7 @@ impl Cagents {
             // A channel being deleted is not somewhere to go; its row offers
             // nothing, and this refuses anything that raced it.
             Action::Open(id) if self.channel_ui.is_deleting(id) => Task::none(),
-            Action::Open(id) => self.open_channel_with_default(id),
+            Action::Open(id) => self.open_channel_with_default(id, false),
             Action::Delete(id) => self.begin_channel_deletion(id, false),
             Action::RequestDelete(id) => self.begin_channel_deletion(id, true),
             Action::ConfirmDelete => {

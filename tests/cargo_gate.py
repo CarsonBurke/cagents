@@ -157,6 +157,11 @@ class ScriptsNameTheirPython(unittest.TestCase):
         ("cargo-offload", 'return ["python3", "-c", BOOTSTRAP, encoded]'),
         ("cargo-offload", 'RUNNER = ["python3", "-c",'),
     }
+    # Text that names the language rather than running it, such as the code
+    # samples scripts/fixture-workspace writes into generated conversations.
+    language_names = {
+        ("content.py", '"python": """def {name}(rows, *, batch=500):'),
+    }
     bare = re.compile(r"(?<![\w/.-])python3?(?:\.\d+)?(?![\w.-])")
 
     def test_no_script_finds_python_on_path(self):
@@ -172,7 +177,8 @@ class ScriptsNameTheirPython(unittest.TestCase):
                 found.append(f"{script.name}:1: {lines[0]}")
             for number, line in enumerate(lines, 1):
                 text = line.strip()
-                if text.startswith("#") or (script.name, text) in self.on_the_build_host:
+                if (text.startswith("#") or (script.name, text) in self.on_the_build_host
+                        or (script.name, text) in self.language_names):
                     continue
                 if self.bare.search(line):
                     found.append(f"{script.name}:{number}: {text}")

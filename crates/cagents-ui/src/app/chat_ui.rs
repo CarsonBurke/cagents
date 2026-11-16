@@ -8220,10 +8220,12 @@ impl Cagents {
     ) -> Task<Message> {
         match pane {
             settings::DefaultPane::Terminal => {
-                if self.workspace_model.identity == crate::workspace_model::NO_REGISTRY
+                if self.shared_registry_connecting()
                     && self.worktree_view_scope(&directory).is_some()
                 {
-                    self.shared_views.deferred_default = Some(directory.clone());
+                    self.shared_views.deferred_default = self
+                        .default_pane_scope(&directory)
+                        .map(|scope| (scope, directory.clone()));
                     return Task::none();
                 }
                 self.shared_views.creating_default =
@@ -8241,6 +8243,42 @@ impl Cagents {
     }
 
     pub(super) fn ensure_default_pane(&mut self) -> Task<Message> {
+        self.ensure_default_pane_after_loading(true)
+    }
+
+    /// A channel created by this window is known to be empty. Opening an
+    /// existing channel instead waits for its shared panes before offering an
+    /// automatic composer that could receive typing intended for those panes.
+    pub(super) fn ensure_new_channel_default_pane(&mut self) -> Task<Message> {
+        self.ensure_default_pane_after_loading(false)
+    }
+
+    /// Offers the automatic pane a loading scope deferred, once that scope
+    /// is still the one shown. Its shared panes, if any, are on the strip by
+    /// now, so the pane appears only when the scope proved to be empty.
+    pub(super) fn run_deferred_default_pane(&mut self) -> Task<Message> {
+        let Some((scope, path)) = self.shared_views.deferred_default.take() else {
+            return Task::none();
+        };
+        if self.active_workspace.as_ref() != Some(&path)
+            || self.default_pane_scope(&path).as_ref() != Some(&scope)
+        {
+            return Task::none();
+        }
+        self.ensure_default_pane()
+    }
+
+    pub(super) fn default_pane_scope(
+        &self,
+        directory: &std::path::Path,
+    ) -> Option<crate::workspace_model::views::Scope> {
+        self.durable
+            .active_channel
+            .map(crate::workspace_model::views::Scope::Channel)
+            .or_else(|| self.worktree_view_scope(directory))
+    }
+
+    fn ensure_default_pane_after_loading(&mut self, wait_for_shared: bool) -> Task<Message> {
         let Some(directory) = self.active_workspace.clone() else {
             return Task::none();
         };
@@ -8250,6 +8288,17 @@ impl Cagents {
                     && matches!(state.kind, CardKind::Terminal(_) | CardKind::Chat(_))
             })
         }) {
+            return Task::none();
+        }
+        // A daemon without a shared model never admits the scope, so its
+        // windows keep offering the pane at once, as before.
+        if wait_for_shared
+            && let Some(scope) = self.default_pane_scope(&directory)
+            && (self.shared_registry_connecting()
+                || (self.workspace_model.identity != crate::workspace_model::NO_REGISTRY
+                    && !self.shared_views.scope_settled(&scope)))
+        {
+            self.shared_views.deferred_default = Some((scope, directory));
             return Task::none();
         }
         let pane = if self.durable.active_channel.is_some() {
