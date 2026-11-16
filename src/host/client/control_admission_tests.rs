@@ -223,3 +223,161 @@ fn an_exclusive_request_is_admitted_under_steady_request_traffic() {
     }
     assert!(typist.join().unwrap() > 0);
 }
+
+/// One connection's requests run in order, as the UI's hosted terminal sends
+/// them. A redraw makes it ask for a snapshot just before the next keystroke.
+mod pipelined {
+    use super::*;
+    use crate::terminal_ipc::{
+        ClientEnvelope, FrameCodec, MAX_CLIENT_FRAME_BYTES, MAX_FRAME_BYTES, PROTOCOL_VERSION,
+        ServerEnvelope, ServerMessage,
+    };
+    use std::os::unix::net::UnixStream;
+
+    const CONNECTION: u64 = 3;
+
+    struct Connection {
+        stream: UnixStream,
+        proof: HostSessionProof,
+        replies: FrameCodec,
+        serving: Option<thread::JoinHandle<()>>,
+    }
+
+    impl Connection {
+        fn open(host: &SharedHost, terminal: TerminalId) -> Self {
+            let proof = host.lock().unwrap().proof().clone();
+            let (stream, server) = UnixStream::pair().unwrap();
+            let serving_host = Arc::clone(host);
+            let serving =
+                thread::spawn(move || super::super::serve(server, CONNECTION, serving_host));
+            let mut connection = Self {
+                stream,
+                proof: proof.clone(),
+                replies: FrameCodec::new(MAX_FRAME_BYTES),
+                serving: Some(serving),
+            };
+            connection.send(
+                1,
+                ClientRequest::Connect {
+                    expected_host: Some(proof),
+                    resume: Vec::new(),
+                },
+            );
+            assert!(matches!(
+                connection.reply(1, Duration::from_secs(5)),
+                Some(ServerMessage::Response {
+                    response: ServerResponse::Connected { .. }
+                })
+            ));
+            connection.send(
+                2,
+                ClientRequest::Attach {
+                    terminal_id: terminal,
+                    after_generation: 0,
+                    after_event_sequence: 0,
+                },
+            );
+            assert!(matches!(
+                connection.reply(2, Duration::from_secs(5)),
+                Some(ServerMessage::Response { .. })
+            ));
+            connection
+        }
+
+        fn send(&mut self, request_id: u64, request: ClientRequest) {
+            FrameCodec::new(MAX_CLIENT_FRAME_BYTES)
+                .write(
+                    &mut self.stream,
+                    &ClientEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id,
+                        proof: Some(self.proof.clone()),
+                        request,
+                    },
+                )
+                .unwrap();
+        }
+
+        /// The reply to `request_id`, skipping pushed updates; None if it
+        /// does not arrive within `patience`.
+        fn reply(&mut self, request_id: u64, patience: Duration) -> Option<ServerMessage> {
+            let deadline = Instant::now() + patience;
+            loop {
+                let remaining = deadline.checked_duration_since(Instant::now())?;
+                self.stream
+                    .set_read_timeout(Some(remaining.max(Duration::from_millis(1))))
+                    .unwrap();
+                match self.replies.read::<ServerEnvelope>(&mut self.stream) {
+                    Ok(Some(envelope)) if envelope.request_id == Some(request_id) => {
+                        return Some(envelope.message);
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => return None,
+                }
+            }
+        }
+    }
+
+    impl Drop for Connection {
+        fn drop(&mut self) {
+            let _ = self.stream.shutdown(std::net::Shutdown::Both);
+            if let Some(serving) = self.serving.take() {
+                let _ = serving.join();
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_requests_queued_ahead_of_input_on_its_connection_do_not_hold_it_back() {
+        let fixture = fixture("pipelined-input");
+        let mut connection = Connection::open(&fixture.host, fixture.terminal);
+        let gate = control_gate(&fixture.host);
+        let slow_request = gate.shared();
+        let exclusive = submit(&fixture.host, OPERATOR, preflight());
+        wait_until_exclusive_waits(&fixture.host);
+
+        // What the hosted terminal sends for a redraw, a search box and the
+        // Clear action, each followed on the same connection by a keystroke.
+        let terminal_id = fixture.terminal;
+        let ahead = [
+            ClientRequest::Snapshot {
+                terminal_id,
+                after_generation: 0,
+            },
+            ClientRequest::SearchTerminal {
+                terminal_id,
+                request: 1,
+                query: "typed".into(),
+                case_sensitive: false,
+            },
+            ClientRequest::ClearTerminalScrollback { terminal_id },
+        ];
+        let mut request_id = 10;
+        let mut typed = Vec::new();
+        for request in ahead {
+            let kind = format!("{request:?}");
+            connection.send(request_id, request);
+            connection.send(request_id + 1, input(&fixture, b"x"));
+            typed.push((kind, request_id + 1));
+            request_id += 2;
+        }
+        let replies = typed
+            .into_iter()
+            .map(|(kind, id)| (kind, connection.reply(id, Duration::from_secs(2))))
+            .collect::<Vec<_>>();
+        drop(slow_request);
+        for (kind, reply) in replies {
+            assert!(
+                matches!(
+                    reply,
+                    Some(ServerMessage::Response {
+                        response: ServerResponse::Accepted
+                    })
+                ),
+                "input queued behind {kind} waited for the exclusive request: {reply:?}"
+            );
+        }
+        let admitted = exclusive.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(matches!(admitted, Ok(ServerResponse::ShutdownPreflight(_))));
+    }
+}
