@@ -75,6 +75,32 @@ class Provider(unittest.TestCase):
         self.assertEqual(status(self.root / "unconfigured-account"), default)
         self.assertEqual(status(), system)
 
+    def test_unconfirmed_model_keeps_catalog_and_turn_lifecycle_then_reports_on_next_turn(self):
+        catalog = Path(__file__).resolve().parent.parent / "fixtures/accounts/claude-initialize-models.json"
+        shutil.copyfile(catalog, self.config / "fixture-models.json")
+        (self.config / "fixture-fast-mode").touch()
+        marker = self.config / "fixture-unconfirmed-model"
+        marker.touch()
+        initialize = {"type": "control_request", "request_id": "init",
+                      "request": {"subtype": "initialize"}}
+        interrupt = {"type": "control_request", "request_id": "stop",
+                     "request": {"subtype": "interrupt"}}
+        result, output, _ = self.run_provider(frames=(initialize, prompt(1), interrupt))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        response = next(frame["response"]["response"] for frame in output
+                        if frame.get("type") == "control_response")
+        self.assertNotIn("model", response)
+        self.assertTrue(any(model["value"] == "default" for model in response["models"]))
+        init = next(frame for frame in output if frame.get("subtype") == "init")
+        self.assertNotIn("model", init)
+        self.assertTrue(any(frame.get("state") == "started" for frame in output))
+        self.assertTrue(any(frame.get("type") == "result" for frame in output))
+        marker.unlink()
+        result, output, _ = self.run_provider(frames=(prompt(2),))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        init = next(frame for frame in output if frame.get("subtype") == "init")
+        self.assertEqual(init["model"], "claude-opus-5-5")
+
     def test_resume_can_branch_from_an_earlier_record_without_removing_turns(self):
         session = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         interrupt = {"type": "control_request", "request_id": "stop",

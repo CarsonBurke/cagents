@@ -21,6 +21,7 @@ const RECORD: &str = "CAGENTS_RECORD_WIRE_FORMAT";
 /// By full name, because other enums are also called `Response`.
 const WORK_RESPONSE: &str = "cagents::work::Response";
 const AGENT_REPLY: &str = "cagents::agent_execution::Reply";
+const DEVICE_REPLY: &str = "cagents::device_service::Reply";
 const AUTOMATION_RESPONSE: &str = "cagents::automations::Response";
 const SERVER_MESSAGE: &str = "cagents::terminal::ipc::ServerMessage";
 
@@ -59,6 +60,9 @@ fn workspace_delta_requests_and_receipts_round_trip_as_framed_messages() {
         ClientRequest::ReadWorkspaceMetadata {
             query: crate::workspace_model::metadata::Query::Agents,
         },
+        ClientRequest::ReadWorkspaceMetadata {
+            query: crate::workspace_model::metadata::Query::AgentLabels,
+        },
         ClientRequest::ReadWorkspaceSnapshot,
         ClientRequest::ReadWorkspaceView {
             scope: scope.clone(),
@@ -94,6 +98,13 @@ fn workspace_delta_requests_and_receipts_round_trip_as_framed_messages() {
         Reply::Agents {
             identity,
             agents: vec![],
+        },
+        Reply::AgentLabels {
+            identity,
+            labels: vec![(
+                crate::model::AgentId::new(),
+                "reviewer · Review the one-row cards".into(),
+            )],
         },
     ] {
         let mut frame = Vec::new();
@@ -198,7 +209,7 @@ struct Comparison<'a> {
     /// contents need not match. Their positions still must.
     refused: Vec<(&'static str, &'static [&'static str])>,
     /// Appended variants of the named enum that the older client is sent as
-    /// one it knows.
+    /// one it knows, and added fields of the named struct it is sent without.
     restated: Vec<(&'static str, &'static str)>,
     /// When present, only these outer variants belong to the proven contract.
     /// Nested enums remain unrestricted and must agree in full.
@@ -238,7 +249,17 @@ impl Comparison<'_> {
                 self.shapes(direction, old, new, path);
             }
             (Container::Struct(old), Container::Struct(new)) => {
-                self.named(direction, old, new, path);
+                // A field the daemon omits for this client is one it never
+                // receives. A request still has to carry every field.
+                let new: Vec<_> = new
+                    .iter()
+                    .filter(|(name, _)| {
+                        direction == Direction::Request
+                            || !self.restated.contains(&(current, name.as_str()))
+                    })
+                    .cloned()
+                    .collect();
+                self.named(direction, old, &new, path);
             }
             (Container::Enum(old), Container::Enum(new)) => {
                 let gate = self
@@ -470,7 +491,8 @@ fn every_older_client_is_proven_against_its_recorded_format() {
                 client.server_messages,
                 client.server_responses,
                 client.work_responses,
-                client.agent_replies
+                client.agent_replies,
+                client.device_replies
             ),
             (
                 variant_count(&older, "ClientRequest"),
@@ -478,6 +500,7 @@ fn every_older_client_is_proven_against_its_recorded_format() {
                 variant_count(&older, "ServerResponse"),
                 variant_count(&older, WORK_RESPONSE),
                 variant_count(&older, AGENT_REPLY),
+                variant_count(&older, DEVICE_REPLY),
             ),
             "protocol {}'s variant counts",
             client.protocol
@@ -490,6 +513,7 @@ fn every_older_client_is_proven_against_its_recorded_format() {
                 ("ServerResponse", client.server_responses as usize),
                 (WORK_RESPONSE, client.work_responses as usize),
                 (AGENT_REPLY, client.agent_replies as usize),
+                (DEVICE_REPLY, client.device_replies as usize),
             ],
             [
                 (client.protocol < FIRING_WITH_SKIPPED_OCCURRENCES)
@@ -516,12 +540,21 @@ fn every_older_client_is_proven_against_its_recorded_format() {
     }
 }
 
-/// Appended variants a client of `protocol` is sent as ones it knows.
+/// Appended variants a client of `protocol` is sent as ones it knows, and
+/// added fields it is sent without, as (container, variant or field).
 fn restated_for(protocol: u16) -> Vec<(&'static str, &'static str)> {
     RESTATED_VARIANTS
         .iter()
         .filter(|(.., since)| protocol < *since)
         .map(|(container, variant, _)| (*container, *variant))
+        .chain(
+            OMITTED_FIELDS
+                .iter()
+                .filter(|(.., since)| protocol < *since)
+                .flat_map(|(container, fields, _)| {
+                    fields.iter().map(move |field| (*container, *field))
+                }),
+        )
         .collect()
 }
 
@@ -799,7 +832,11 @@ fn agent_addresses_are_beyond_every_older_recording() {
         AGENT_ADDRESSES_SINCE
     )));
     let index = super::variant_index(&addresses).unwrap();
-    assert_eq!(index + 1, variant_count(&traced(), "ServerMessage"));
+    // It was appended when introduced; later protocols may append more.
+    assert_eq!(
+        index + 1,
+        variant_count(&recorded(AGENT_ADDRESSES_SINCE), "ServerMessage")
+    );
     let older = OLDER_CLIENTS
         .iter()
         .map(|client| client.protocol)
@@ -811,4 +848,133 @@ fn agent_addresses_are_beyond_every_older_recording() {
             "protocol {protocol} already had a message at its position"
         );
     }
+}
+
+/// Only a window watching notifications is told a project's automation
+/// requests changed. Update sources do not watch them; recordings before
+/// protocol 178 have no message at its position.
+#[test]
+fn automation_request_changes_are_beyond_recordings_before_their_introduction() {
+    let changed = ServerMessage::AutomationProposalsChanged {
+        repository: "/fixture".into(),
+    };
+    let index = super::variant_index(&changed).unwrap();
+    const AUTOMATION_REQUEST_CHANGES_SINCE: u16 = 178;
+    assert_eq!(
+        index + 1,
+        variant_count(&recorded(AUTOMATION_REQUEST_CHANGES_SINCE), "ServerMessage")
+    );
+    let older = OLDER_CLIENTS
+        .iter()
+        .map(|client| client.protocol)
+        .chain(crate::update::source::current_client_protocols())
+        .filter(|&protocol| protocol < AUTOMATION_REQUEST_CHANGES_SINCE);
+    for protocol in older {
+        assert!(
+            variant_count(&recorded(protocol), "ServerMessage") <= index,
+            "protocol {protocol} already had a message at its position"
+        );
+    }
+}
+
+#[test]
+fn active_models_are_beyond_every_older_recording() {
+    let model = ServerMessage::ChatActiveModel {
+        chat_id: crate::model::TerminalId::new(),
+        revision: 1,
+        model: None,
+    };
+    const ACTIVE_MODELS_SINCE: u16 = 182;
+    assert!(crate::update::source::UNSOLICITED_SINCE.contains(&(
+        "ServerMessage",
+        "chat_active_model",
+        ACTIVE_MODELS_SINCE
+    )));
+    let index = super::variant_index(&model).unwrap();
+    assert_eq!(
+        index + 1,
+        variant_count(&recorded(ACTIVE_MODELS_SINCE), "ServerMessage")
+    );
+    let older = OLDER_CLIENTS
+        .iter()
+        .map(|client| client.protocol)
+        .chain(crate::update::source::current_client_protocols())
+        .filter(|&protocol| protocol < ACTIVE_MODELS_SINCE);
+    for protocol in older {
+        assert!(
+            variant_count(&recorded(protocol), "ServerMessage") <= index,
+            "protocol {protocol} already had a message at its position"
+        );
+    }
+}
+
+#[test]
+fn attachment_worker_metadata_is_beyond_older_clients_and_sources() {
+    let marker = ServerMessage::TerminalWorker {
+        terminal_id: crate::model::TerminalId::new(),
+        instance: uuid::Uuid::new_v4(),
+    };
+    let index = super::variant_index(&marker).unwrap();
+    assert_eq!(index + 1, variant_count(&recorded(183), "ServerMessage"));
+    assert!(crate::update::source::UNSOLICITED_SINCE.contains(&(
+        "ServerMessage",
+        "terminal_worker",
+        183
+    )));
+    for client in OLDER_CLIENTS {
+        assert!(!client.admits_message(&marker));
+    }
+    for protocol in
+        crate::update::source::current_client_protocols().filter(|protocol| *protocol < 183)
+    {
+        assert!(variant_count(&recorded(protocol), "ServerMessage") <= index);
+    }
+}
+
+/// Only a window watching notifications is told a project's automation
+/// requests changed. Update sources do not watch them; recordings before
+/// protocol 178 have no message at its position.
+#[test]
+fn actual_main_178_receives_the_frozen_internal_error_for_store_contention() {
+    use crate::terminal_ipc::{ProtocolError, ProtocolErrorCode, ServerEnvelopeRef, write_frame};
+    let frozen = recorded(178);
+    let Some(Container::Enum(variants)) = frozen
+        .containers
+        .get("cagents::terminal::ipc::ProtocolErrorCode")
+    else {
+        panic!("missing frozen error codes")
+    };
+    assert!(!variants.iter().any(|(name, _)| name == "store_busy"));
+    let internal = variants
+        .iter()
+        .position(|(name, _)| name == "internal")
+        .unwrap();
+    assert_eq!(
+        super::variant_index(&ProtocolErrorCode::Internal),
+        Some(internal as u32)
+    );
+    let proof = crate::model::HostSessionProof {
+        host_session_id: "fixture-host".into(),
+        boot_id: "fixture-boot".into(),
+        host_incarnation: "fixture-daemon".into(),
+    };
+    let encode = |code| {
+        let message = ServerMessage::Error(ProtocolError::new(code, "database is locked", true));
+        let mut bytes = Vec::new();
+        write_frame(
+            &mut bytes,
+            &ServerEnvelopeRef {
+                version: 178,
+                request_id: Some(17),
+                proof: &proof,
+                message: &message,
+            },
+        )
+        .unwrap();
+        bytes
+    };
+    assert_eq!(
+        encode(ProtocolErrorCode::StoreBusy),
+        encode(ProtocolErrorCode::Internal)
+    );
 }

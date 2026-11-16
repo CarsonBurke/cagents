@@ -29,10 +29,13 @@ use std::{
 mod daemon_admission;
 #[doc(hidden)]
 pub mod ui_options;
+#[cfg(any(feature = "host", test))]
+pub(crate) use daemon_admission::AdmissionFence;
+#[cfg(feature = "host")]
+pub(crate) use daemon_admission::DaemonAdmissionGuard;
 pub use daemon_admission::DaemonStillStarting;
 pub(crate) use daemon_admission::{
-    AdmissionFence, DAEMON_FENCE_ENV, DaemonAdmissionGuard, LaunchFence, daemon_launch_is_updating,
-    inherit_daemon_fence,
+    DAEMON_FENCE_ENV, LaunchFence, daemon_launch_is_updating, inherit_daemon_fence,
 };
 
 use directories::ProjectDirs;
@@ -139,7 +142,7 @@ pub fn window_restore_policy() -> WindowRestorePolicy {
         })
 }
 
-pub(crate) fn window_launch_restore_policy() -> WindowRestorePolicy {
+pub fn window_launch_restore_policy() -> WindowRestorePolicy {
     WINDOW_RESTORE_POLICY
         .get()
         .map_or(WindowRestorePolicy::Ordinary, |restore| restore.launch)
@@ -148,7 +151,7 @@ pub(crate) fn window_launch_restore_policy() -> WindowRestorePolicy {
 /// The startup gate reached its saved-pane verdict, including an incomplete
 /// recovery. Later work uses ordinary admission; already-issued pane tasks
 /// retain their explicitly captured attachment-only intent.
-pub(crate) fn finish_window_restore() {
+pub fn finish_window_restore() {
     if let Some(restore) = WINDOW_RESTORE_POLICY.get() {
         restore.finished.store(true, Ordering::Release);
     }
@@ -177,7 +180,7 @@ pub fn validate_window_slot(slot: &str) -> io::Result<()> {
     Ok(())
 }
 
-pub(crate) fn runtime_directory() -> io::Result<PathBuf> {
+pub fn runtime_directory() -> io::Result<PathBuf> {
     let path = env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
@@ -221,7 +224,7 @@ fn destination_socket_name(destination: &crate::notifications::Destination) -> S
 /// file description and has not reached exec yet. Closing a File alone does
 /// not release flock until every inherited descriptor has also closed.
 #[derive(Debug)]
-pub(crate) struct OwnedLock(Option<File>);
+pub struct OwnedLock(Option<File>);
 
 impl std::ops::Deref for OwnedLock {
     type Target = File;
@@ -972,6 +975,7 @@ pub(crate) fn window_protection_ready() -> io::Result<OwnedLock> {
 
 /// Blocks new windows while automatic cleanup authenticates existing owners.
 /// Windows launched meanwhile wait for it rather than report an update.
+#[cfg(feature = "host")]
 pub(crate) fn worktree_mutation_launch_fence() -> io::Result<AdmissionFence> {
     AdmissionFence::acquire()
 }
@@ -1892,7 +1896,7 @@ impl UiUpdateGuard {
 /// What the update reports when windows did not reopen cleanly. Someone reads
 /// this: the launcher's handshake prefix goes, and windows stopped by the same
 /// thing share one sentence instead of repeating it per window.
-pub(crate) fn relaunch_failure(windows: usize, errors: &[(&str, String)]) -> String {
+pub fn relaunch_failure(windows: usize, errors: &[(&str, String)]) -> String {
     let mut groups: Vec<(Vec<&str>, String)> = Vec::new();
     for (slot, error) in errors {
         let text = error
@@ -2037,7 +2041,7 @@ pub fn launch_window(new_window: bool, slot: Option<&str>, source: Option<&str>)
 
 /// Session ids belong to a daemon/device namespace. Never resolve a local
 /// coordination link against a different device's saved window.
-pub(crate) fn window_matches_selected_device(slot: &str) -> io::Result<bool> {
+pub fn window_matches_selected_device(slot: &str) -> io::Result<bool> {
     match (crate::device::selected(), slot.starts_with("device-")) {
         (None, device_slot) => Ok(!device_slot),
         (Some(_), false) => Ok(false),

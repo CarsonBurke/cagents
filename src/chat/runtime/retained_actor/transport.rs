@@ -186,6 +186,10 @@ pub(crate) struct Resident {
     /// that predates them reports none.
     #[serde(default)]
     pub agent_addresses: Vec<chat::AgentAddress>,
+    #[serde(default)]
+    pub active_model: Option<chat::ActiveModel>,
+    #[serde(default)]
+    pub active_model_revision: u64,
     next_input: u64,
     acknowledged_input_count: usize,
     pub continuity_loss: Option<ContinuityLoss>,
@@ -486,6 +490,8 @@ impl RemoteActor {
             work_hold: None,
             account_reports: Vec::new(),
             agent_addresses: Vec::new(),
+            active_model: None,
+            active_model_revision: 0,
             next_input: 1,
             acknowledged_input_count: 0,
             continuity_loss: None,
@@ -603,6 +609,11 @@ impl RemoteActor {
         remote.proof = self.0.proof.clone();
         remote.source = self.0.source.clone();
         other
+    }
+    #[cfg(test)]
+    pub(in crate::chat::runtime) fn confirm_session_fixture(&self, session: String) {
+        let mut state = self.0.state.lock().unwrap();
+        Arc::make_mut(&mut state).confirmed_session = Some(session);
     }
     #[cfg(test)]
     pub(in crate::chat::runtime) fn completed_failure_fixture() -> Self {
@@ -778,13 +789,17 @@ impl RemoteActor {
                 resident.idle = false;
                 resident.busy = false;
                 let (changed, generation) = (resident.changed, resident.generation);
+                let active_model_clock = (resident.close.actor_id, resident.active_model_revision);
                 if !self.publish_resident_inner(resident, true) {
                     // Another refresh, such as the outcome broker's while a
                     // close drains the outbox, can publish a newer closed
                     // reply first. This older one is then only stale.
                     let current = self.state();
                     if !(current.completed
-                        && (current.changed > changed || current.generation > generation))
+                        && (current.changed > changed
+                            || current.generation > generation
+                            || (current.close.actor_id == active_model_clock.0
+                                && current.active_model_revision > active_model_clock.1)))
                     {
                         return Err("Closed actor metadata was superseded during refresh".into());
                     }
@@ -1368,6 +1383,10 @@ impl RemoteActor {
                     && resident.close.completed))
                 || resident.changed < state.changed
                 || resident.generation < state.generation
+                // A model update can precede its change callback while both
+                // general clocks still match an older in-flight sample.
+                || (resident.close.actor_id == state.close.actor_id
+                    && resident.active_model_revision < state.active_model_revision)
                 // Installation is acknowledged independently of observer
                 // revisions. A state RPC issued before commit can arrive
                 // after its ACK with equal changed/generation values.
@@ -1406,8 +1425,11 @@ impl RemoteActor {
             {
                 updates.push(Update::PromptAvailable);
             }
-            if (resident.outbox_latest > resident.outbox_ack
-                && resident.outbox_latest != state.outbox_latest)
+            // Conversation identity is durable daemon metadata even when no
+            // window subscribes and no semantic outcome accompanies it.
+            if identity_changed
+                || (resident.outbox_latest > resident.outbox_ack
+                    && resident.outbox_latest != state.outbox_latest)
                 || (resident.continuity_loss != state.continuity_loss
                     && resident
                         .continuity_loss
@@ -1425,6 +1447,12 @@ impl RemoteActor {
             );
             if resident.agent_addresses != state.agent_addresses {
                 updates.push(Update::AgentAddresses(resident.agent_addresses.clone()));
+            }
+            if resident.active_model_revision != state.active_model_revision {
+                updates.push(Update::ActiveModel {
+                    revision: resident.active_model_revision,
+                    model: resident.active_model.clone(),
+                });
             }
             *state = Arc::new(resident);
             updates
@@ -1454,6 +1482,12 @@ impl RemoteActor {
             if state.installed {
                 resident.installed = true;
                 resident.native_continuity = state.native_continuity.clone();
+            }
+            if resident.close.actor_id == state.close.actor_id
+                && resident.active_model_revision < state.active_model_revision
+            {
+                resident.active_model = state.active_model.clone();
+                resident.active_model_revision = state.active_model_revision;
             }
             *state = Arc::new(resident);
         }
@@ -2717,6 +2751,8 @@ impl Server {
         let waiting = state.waiting;
         let usage = state.usage.clone();
         let requests = state.requests.clone();
+        let active_model = state.active_model.clone();
+        let active_model_revision = state.active_model_revision;
         let sampled_activity = state.activity();
         let work_hold = state.work_hold();
         let prompt_eligible =
@@ -2811,6 +2847,8 @@ impl Server {
             work_hold: Some(work_hold),
             account_reports,
             agent_addresses: self.actor.agent_addresses(),
+            active_model,
+            active_model_revision,
             next_input: journal.next_input()?,
             acknowledged_input_count: journal.acknowledged_input_count(),
             continuity_loss,
@@ -5890,17 +5928,22 @@ exec /bin/sleep 60
             let request: Invocation = receive(&control, TIMEOUT).unwrap();
             assert_eq!(request.method, "resolve_source");
             assert_eq!(request.epoch, Some(epoch));
-            let _ = wait.recv_timeout(Duration::from_secs(2));
+            // Stall until the client has returned: a client that ignored its
+            // deadline would never return.
+            let _ = wait.recv();
         });
         let started = Instant::now();
-        let error = actor
-            .resolve_source_until(&source, started + Duration::from_millis(40))
-            .unwrap_err();
-        let elapsed = started.elapsed();
+        let (actor, error) = crate::test_timing::returns("source resolution", move || {
+            let error = actor
+                .resolve_source_until(&source, Instant::now() + Duration::from_millis(40))
+                .unwrap_err();
+            (actor, error)
+        });
         let _ = release.send(());
         peer.join().unwrap();
         assert!(error.contains("deadline"), "{error}");
-        assert!(elapsed < Duration::from_millis(250));
+        // Sooner than the socket timeout an ignored deadline would fall back to.
+        assert!(started.elapsed() < TIMEOUT);
         assert_eq!(actor.0.epoch, epoch);
         assert!(actor.pending_inputs().is_empty());
     }
@@ -6015,25 +6058,27 @@ exec /bin/sleep 60
             assert_eq!(request.method, "inspect");
             assert!(request.epoch.is_none());
             // SO_PEERCRED has identified this exact Record.holder process, but
-            // its inspection response stalls. The client must still return.
-            let _ = wait.recv_timeout(Duration::from_secs(2));
+            // its inspection response stalls until the client has returned.
+            let _ = wait.recv();
         });
         let epoch = fixture.server.epoch;
         let source = fixture.server.source.clone();
+        let proof = fixture.server.proof.clone();
         let started = Instant::now();
-        let error = RemoteActor::inspect_at_until(
-            &record,
-            fixture.server.proof.clone(),
-            &socket,
-            started + Duration::from_millis(40),
-        )
-        .err()
-        .expect("stalled inspection must time out");
-        let elapsed = started.elapsed();
+        let error = crate::test_timing::returns("the stalled inspection", move || {
+            RemoteActor::inspect_at_until(
+                &record,
+                proof,
+                &socket,
+                Instant::now() + Duration::from_millis(40),
+            )
+            .err()
+            .expect("stalled inspection must time out")
+        });
         let _ = release.send(());
         peer.join().unwrap();
-        assert!(error.contains("deadline"));
-        assert!(elapsed < Duration::from_millis(250));
+        assert!(error.contains("deadline"), "{error}");
+        assert!(started.elapsed() < TIMEOUT);
         assert_eq!(fixture.server.epoch, epoch);
         assert_eq!(fixture.server.source, source);
         assert!(!fixture.server.actor.is_completed());
@@ -6398,6 +6443,75 @@ exec /bin/sleep 60
         assert_eq!(actor.state().native_continuity, installed.native_continuity);
         assert_eq!(actor.snapshot(None), Some(final_snapshot));
     }
+    #[test]
+    fn retained_active_model_status_rejects_equal_clock_stale_revisions() {
+        let mut actor = RemoteActor::fixture();
+        let (published, publications) = crossbeam_channel::unbounded();
+        Arc::get_mut(&mut actor.0).unwrap().notify = Arc::new(move |update| {
+            let _ = published.send(update);
+        });
+        let model = |name: &str| chat::ActiveModel {
+            id: name.into(),
+            label: name.into(),
+            reasoning: None,
+            default_reasoning: None,
+            aliases: Vec::new(),
+        };
+        let mut older = actor.state().as_ref().clone();
+        older.active_model_revision = 5;
+        older.active_model = Some(model("older"));
+        let mut newer = older.clone();
+        newer.active_model_revision = 6;
+        newer.active_model = Some(model("newer"));
+        assert_eq!(older.changed, newer.changed);
+        assert_eq!(older.generation, newer.generation);
+        assert!(actor.publish_resident(older.clone()));
+        assert!(actor.publish_resident(newer.clone()));
+        for revision in [5, 6] {
+            assert!(matches!(publications.recv_timeout(TIMEOUT).unwrap(),
+                Update::ActiveModel { revision: actual, .. } if actual == revision));
+        }
+        assert!(!actor.publish_resident(older.clone()));
+        assert!(publications.try_recv().is_err());
+        let attached = actor.state();
+        assert_eq!(attached.active_model_revision, 6);
+        assert_eq!(attached.active_model, newer.active_model);
+        actor.publish_closed_inner(
+            Snapshot {
+                exited: true,
+                ..Snapshot::default()
+            },
+            Some(older),
+        );
+        let closed = actor.state();
+        assert!(closed.completed);
+        assert_eq!(closed.active_model_revision, 6);
+        assert_eq!(closed.active_model, newer.active_model);
+    }
+
+    #[test]
+    fn confirmation_wakes_durable_broker_without_semantic_outcomes() {
+        let mut actor = RemoteActor::fixture();
+        let (sent, received) = crossbeam_channel::unbounded();
+        Arc::get_mut(&mut actor.0).unwrap().notify = Arc::new(move |update| {
+            sent.send(update).unwrap();
+        });
+        let mut confirmed = actor.state().as_ref().clone();
+        confirmed.confirmed_session = Some(uuid::Uuid::new_v4().to_string());
+        assert_eq!(confirmed.outbox_latest, confirmed.outbox_ack);
+        assert!(actor.publish_resident(confirmed.clone()));
+        assert!(
+            received
+                .try_iter()
+                .any(|update| matches!(update, Update::RetainedOutcomes))
+        );
+        assert!(actor.publish_resident(confirmed));
+        assert!(
+            received.try_iter().next().is_none(),
+            "unchanged metadata must not churn the broker"
+        );
+    }
+
     #[test]
     fn synchronous_refresh_publishes_all_transitions_and_rejects_a_delayed_observer_response() {
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
@@ -6772,14 +6886,10 @@ exec /bin/sleep 60
             retransmit(&actor).is_none(),
             "an older helper is not asked again"
         );
-        let started = Instant::now();
+        // Refused at once: waiting on the fence would end in UNSETTLED_INPUT.
         assert_eq!(
             actor.enqueue(None, Command::Refresh).unwrap_err(),
             UNSETTLEABLE_INPUT
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "refused without waiting"
         );
         // A receipt the helper reports on its own still lifts the fence.
         actor.apply_receipts(&[InputReceipt {
@@ -6939,14 +7049,10 @@ exec /bin/sleep 60
         });
         assert_eq!(state(&actor), (true, 0, true, true), "refused, still asked");
         assert!(delay(&actor) > TIMEOUT, "asked less often once overdue");
-        let started = Instant::now();
+        // Refused at once: waiting on the fence would end in UNSETTLED_INPUT.
         assert_eq!(
             actor.enqueue(None, Command::Refresh).unwrap_err(),
             UNSETTLEABLE_INPUT
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "refused at once"
         );
         // A helper that returns still settles it, which lifts the fence.
         settle_now(&actor);

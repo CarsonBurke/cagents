@@ -4,7 +4,7 @@ pub(crate) mod adopted_orphans;
 pub(crate) mod child_events;
 #[cfg(all(feature = "host", target_os = "linux"))]
 pub(crate) mod child_reaper;
-pub(crate) mod holder_registry;
+pub mod holder_registry;
 pub(crate) mod hosting;
 pub(crate) mod lease_handoff;
 #[cfg(feature = "host")]
@@ -205,7 +205,7 @@ fn wait_for_activity_until_with(
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum PlatformError {
+pub enum PlatformError {
     #[error("XDG_RUNTIME_DIR is not set to an absolute path")]
     MissingRuntimeDirectory,
     #[error("runtime path {path:?} is not owned by the current user")]
@@ -252,16 +252,13 @@ impl RuntimePaths {
 /// Serializes recovery discovery through confirmed attachment across all UIs.
 /// The file is never unlinked; only its owning guard releases the flock.
 #[cfg(feature = "ui")]
-pub(crate) struct RecoveryLease {
+pub struct RecoveryLease {
     lock: File,
 }
 
 #[cfg(feature = "ui")]
 impl RecoveryLease {
-    pub(crate) fn acquire(
-        socket: &Path,
-        timeout: std::time::Duration,
-    ) -> Result<Self, PlatformError> {
+    pub fn acquire(socket: &Path, timeout: std::time::Duration) -> Result<Self, PlatformError> {
         let directory_path = socket.parent().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -728,10 +725,7 @@ pub(crate) fn running_executable_at(
 /// Authenticate the current socket against the daemon's exclusive lease before
 /// using a new incarnation as evidence that an old owner has been replaced.
 /// Merely reaching a socket (or receiving a proof mismatch) is not authority.
-pub(crate) fn replacement_owner(
-    socket: &Path,
-    proof: &HostSessionProof,
-) -> Result<u32, PlatformError> {
+pub fn replacement_owner(socket: &Path, proof: &HostSessionProof) -> Result<u32, PlatformError> {
     let pid = lease_owner(&socket.with_file_name("cagentsd.lock"), proof)?;
     let stream = UnixStream::connect(socket)?;
     let mut credential: libc::ucred = unsafe { std::mem::zeroed() };
@@ -859,13 +853,13 @@ pub(crate) fn terminate_daemon_from_lock() -> Result<bool, PlatformError> {
 /// inherit the person's approval merely by acquiring the same lock pathname.
 #[cfg(feature = "ui")]
 #[derive(Debug)]
-pub(crate) struct RestartTarget {
+pub struct RestartTarget {
     process: File,
     proof: HostSessionProof,
 }
 
 #[cfg(feature = "ui")]
-pub(crate) fn restart_target() -> Result<RestartTarget, PlatformError> {
+pub fn restart_target() -> Result<RestartTarget, PlatformError> {
     restart_target_at(&RuntimePaths::discover()?)
 }
 
@@ -898,8 +892,9 @@ fn restart_target_at(paths: &RuntimePaths) -> Result<RestartTarget, PlatformErro
 impl RestartTarget {
     /// An inert UI state-machine fixture. The regular file cannot name or
     /// signal a process; tests must drop restart tasks without polling them.
-    #[cfg(test)]
-    pub(crate) fn inert_for_ui_test() -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn inert_for_ui_test() -> Self {
         Self {
             process: tempfile::tempfile().expect("inert restart fixture"),
             proof: HostSessionProof {
@@ -912,7 +907,7 @@ impl RestartTarget {
 
     /// Try graceful termination, then finish the same confirmed process if it
     /// cannot respond. The kernel descriptor fences PID reuse throughout.
-    pub(crate) fn terminate(&self) -> Result<(), PlatformError> {
+    pub fn terminate(&self) -> Result<(), PlatformError> {
         self.terminate_at(
             &RuntimePaths::discover()?,
             std::time::Duration::from_secs(5),
@@ -1172,7 +1167,7 @@ pub(crate) fn current_uid() -> u32 {
 
 /// Called only in a child's pre-exec hook. Long-lived sibling processes must
 /// not retain installer assets, update leases, or other inherited descriptors.
-pub(crate) fn seal_inherited_descriptors() -> io::Result<()> {
+pub fn seal_inherited_descriptors() -> io::Result<()> {
     // SAFETY: close_range takes scalar bounds and only changes descriptor flags.
     if unsafe { libc::close_range(3, u32::MAX, libc::CLOSE_RANGE_CLOEXEC as libc::c_int) } != 0 {
         return Err(io::Error::last_os_error());
@@ -1209,7 +1204,7 @@ pub(crate) fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
     Ok(credentials.uid)
 }
 
-pub(crate) fn read_boot_id() -> io::Result<BootId> {
+pub fn read_boot_id() -> io::Result<BootId> {
     let value = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
     let value = value.trim();
     if value.is_empty() || value.len() > 128 {
@@ -1264,8 +1259,9 @@ pub(crate) fn termination_requested() -> bool {
     TERMINATION_REQUESTED.load(Ordering::Acquire)
 }
 
-#[cfg(test)]
-pub(crate) fn shut_down_test_listener(listener: std::os::unix::net::UnixListener) {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn shut_down_test_listener(listener: std::os::unix::net::UnixListener) {
     // Concurrent tests may fork before CLOEXEC closes an inherited copy.
     // Shut down the shared socket so every retained descriptor refuses connections.
     // SAFETY: the listener owns this live socket descriptor.

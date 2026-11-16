@@ -582,6 +582,8 @@ pub(crate) const LIFECYCLE_VARIANTS: &[(&str, &[&str])] = &[
 pub(crate) const UNSOLICITED_SINCE: &[(&str, &str, u16)] = &[
     ("ServerMessage", "chat_limit", 160),
     ("ServerMessage", "chat_agent_addresses", 173),
+    ("ServerMessage", "chat_active_model", 182),
+    ("ServerMessage", "terminal_worker", 183),
 ];
 
 /// One source qualification for lifecycle control and migration inspection.
@@ -629,6 +631,22 @@ pub(crate) const RELEASED_SOURCES: &[ReleasedSource] = &[
         release: "0.1.3+local.c73002744",
         family: ClientFamily::Current,
     },
+    ReleasedSource {
+        protocol: 177,
+        release: "0.1.3+local.374370965",
+        family: ClientFamily::Current,
+    },
+    ReleasedSource {
+        protocol: 178,
+        // The published 3b1e81a4d and main's f016f047b share this protocol.
+        release: "0.1.3+local.3b1e81a4d",
+        family: ClientFamily::Current,
+    },
+    ReleasedSource {
+        protocol: 179,
+        release: "0.1.3+local.43f253ef8",
+        family: ClientFamily::Current,
+    },
 ];
 
 /// Protocols main served since the oldest pinned source that live updates
@@ -641,6 +659,22 @@ pub(crate) const RETIRED_SOURCES: &[(u16, &str)] = &[
     (172, "superseded before update sources were pinned"),
     (174, "main served it under a day; never installed"),
     (176, "main served it under a day; never installed"),
+    (
+        180,
+        "intermediate #2783 protocol; superseded by 181 without a qualified installed update source",
+    ),
+    (
+        181,
+        "intermediate #2815 protocol; superseded by 182 without a qualified installed update source",
+    ),
+    (
+        182,
+        "intermediate #2801 protocol; superseded by 183 without a qualified installed update source",
+    ),
+    (
+        183,
+        "intermediate #2798 protocol; superseded by 184 without a qualified installed update source",
+    ),
 ];
 
 pub(crate) fn client_family(protocol: u16) -> Option<ClientFamily> {
@@ -890,7 +924,15 @@ mod admission_message_tests {
     fn live_sources_are_the_pinned_releases_and_the_current_release() {
         assert_eq!(
             protocols().collect::<Vec<_>>(),
-            [156, 173, 175, crate::terminal_ipc::PROTOCOL_VERSION]
+            [
+                156,
+                173,
+                175,
+                177,
+                178,
+                179,
+                crate::terminal_ipc::PROTOCOL_VERSION
+            ]
         );
         for source in RELEASED_SOURCES {
             assert!(source.protocol < crate::terminal_ipc::PROTOCOL_VERSION);
@@ -899,13 +941,15 @@ mod admission_message_tests {
         for &(protocol, _) in RETIRED_SOURCES {
             assert!(!is_qualified_source(protocol), "protocol {protocol}");
         }
-        for protocol in [0, 56, 68, 77, 119, 128, 160, 165, 174, 176] {
+        for protocol in [0, 56, 68, 77, 119, 128, 160, 165, 174, 176, 180, 181, 182] {
             assert!(!is_qualified_source(protocol), "protocol {protocol}");
             let message = unsupported_source(protocol).to_string();
             assert!(message.contains(&format!("uses protocol {protocol}")));
             assert!(message.contains(&format!(
                 "live updates support only protocol 156 (desktop 0.1.3+local.991daa43e), \
-                 protocol 173 (0.1.3+local.43678f2fb), protocol 175 (0.1.3+local.c73002744) \
+                 protocol 173 (0.1.3+local.43678f2fb), protocol 175 (0.1.3+local.c73002744), \
+                 protocol 177 (0.1.3+local.374370965), protocol 178 (0.1.3+local.3b1e81a4d), \
+                 protocol 179 (0.1.3+local.43f253ef8) \
                  and protocol {}.",
                 crate::terminal_ipc::PROTOCOL_VERSION
             )));

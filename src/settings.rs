@@ -932,7 +932,9 @@ pub enum WorktreeSort {
     Alphabetical,
 }
 
-/// How additional worktrees appear beside a project's channels.
+/// How a project's checkouts appear beside its channels: the repository's
+/// root checkout and its linked worktrees. Hidden draws none of them; each
+/// pane open in one gets a row of its own instead.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SidebarWorktrees {
@@ -963,6 +965,10 @@ impl SidebarWorktrees {
 
     pub fn from_key(key: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|mode| mode.key() == key)
+    }
+
+    pub const fn shows_checkouts(self) -> bool {
+        !matches!(self, Self::Hidden)
     }
 }
 
@@ -1143,6 +1149,10 @@ pub struct AppSettings {
     pub sidebar_worktrees: SidebarWorktrees,
     #[serde(default)]
     pub sidebar_worktree_overrides: BTreeMap<crate::model::ProjectId, SidebarWorktrees>,
+    /// The visible mode [`Self::sidebar_worktrees`] last had, which showing
+    /// checkouts again from the sidebar returns to. Never Hidden.
+    #[serde(default)]
+    pub sidebar_worktrees_when_shown: SidebarWorktrees,
     #[serde(default)]
     pub default_worktree_pane: DefaultPane,
     #[serde(default)]
@@ -1302,6 +1312,7 @@ impl Default for AppSettings {
             worktree_sort: WorktreeSort::default(),
             sidebar_worktrees: SidebarWorktrees::default(),
             sidebar_worktree_overrides: BTreeMap::new(),
+            sidebar_worktrees_when_shown: SidebarWorktrees::default(),
             default_worktree_pane: DefaultPane::default(),
             default_channel_pane: DefaultPane::default(),
             editor_auto_save: default_editor_auto_save(),
@@ -1986,6 +1997,28 @@ impl AppSettings {
                 self.confirmations
                     .insert(confirmation.key().to_owned(), false);
             }
+        }
+    }
+
+    /// Sets how every project shows its checkouts. Hiding them remembers the
+    /// visible mode they had, which [`Self::toggled_sidebar_worktrees`]
+    /// returns to.
+    pub fn set_sidebar_worktrees(&mut self, mode: SidebarWorktrees) {
+        if !mode.shows_checkouts() && self.sidebar_worktrees.shows_checkouts() {
+            self.sidebar_worktrees_when_shown = self.sidebar_worktrees;
+        }
+        self.sidebar_worktrees = mode;
+    }
+
+    /// The mode the sidebar's checkouts toggle switches the default to:
+    /// Hidden while checkouts show, otherwise the visible mode they had.
+    pub fn toggled_sidebar_worktrees(&self) -> SidebarWorktrees {
+        if self.sidebar_worktrees.shows_checkouts() {
+            SidebarWorktrees::Hidden
+        } else if self.sidebar_worktrees_when_shown.shows_checkouts() {
+            self.sidebar_worktrees_when_shown
+        } else {
+            SidebarWorktrees::default()
         }
     }
 
@@ -5113,59 +5146,6 @@ new_thread = "Alt+Shift+G"
         assert_eq!(loaded.terminal_scroll_speed, 2.5);
         fs::write(&path, current.replace("terminal_scroll_size = 2\n", "")).unwrap();
         assert_eq!(load(&path).unwrap().terminal_scroll_speed, 2.5);
-    }
-
-    #[cfg(feature = "ui")]
-    #[test]
-    fn the_accepted_sidebar_width_is_exactly_the_width_the_pane_renders() {
-        use crate::sidebar::{SidebarMode, effective_width};
-
-        let with_width = |sidebar_width| AppSettings {
-            sidebar_width,
-            ..AppSettings::default()
-        };
-
-        // A width outside the pane's bounds used to validate and then render
-        // clamped, so the file said 200 while the sidebar showed 240.
-        for width in [
-            EXPANDED_WIDTH_MIN - 40.0,
-            EXPANDED_WIDTH_MIN - 0.5,
-            EXPANDED_WIDTH_MAX + 0.5,
-            f32::NAN,
-        ] {
-            assert!(
-                matches!(
-                    with_width(width).validate(),
-                    Err(SettingsError::SidebarWidth { .. })
-                ),
-                "a width of {width} cannot be persisted: the pane will not render it"
-            );
-        }
-
-        for width in [
-            EXPANDED_WIDTH_MIN,
-            AppSettings::default().sidebar_width,
-            EXPANDED_WIDTH_MAX,
-        ] {
-            let accepted = with_width(width)
-                .validate()
-                .expect("a width the pane renders must validate");
-            assert_eq!(
-                effective_width(SidebarMode::Expanded, accepted.sidebar_width),
-                width
-            );
-        }
-
-        let message = SettingsError::SidebarWidth {
-            min: EXPANDED_WIDTH_MIN,
-            max: EXPANDED_WIDTH_MAX,
-        }
-        .to_string();
-        assert!(
-            message.contains(&EXPANDED_WIDTH_MIN.to_string())
-                && message.contains(&EXPANDED_WIDTH_MAX.to_string()),
-            "the rejection must quote the bounds it enforces, not a copy of them: {message}"
-        );
     }
 
     #[test]

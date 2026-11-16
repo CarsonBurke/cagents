@@ -16,6 +16,7 @@ person.
 | A chat that answers offline, with tools, subagents, errors or crashes | The synthetic Claude provider, [`tests/fixtures/chat-composer-claude.sh`](chat-composer-fixture.md) |
 | GitHub availability, project avatars or a worktree's pull request in the sidebar, offline | The fixture's forge, [`tests/fixtures/fixture-gh.sh`](#an-offline-github), switched on by `home/.config/fixture-forge` |
 | A saved Claude conversation damaged by a crash and a huge tool output, to resume | [`tests/fixtures/claude-damaged-history.py`](../tests/fixtures/claude-damaged-history.py)` PROJECT`, run in a session's fixture with `scripts/native-evidence env python3 ...`; it writes the transcript under the fixture HOME's `.claude` |
+| A long saved chat for paging backward and forward | [`tests/fixtures/claude-long-history.py`](../tests/fixtures/claude-long-history.py)` PROJECT`, run through `scripts/native-evidence env python3 ...`; 260 numbered exchanges exceed the retained history window |
 | A Codex chat that answers offline, with tool rows, subagent errors or terminal escapes | A [Codex peer](#an-offline-codex), installed by `native-evidence start SIDE --codex PEER` |
 | Real Codex app-server ownership, saved-history loading or socket behaviour | [An isolated real executable](#a-real-codex-in-the-fixture), selected by `native-evidence start SIDE --codex-executable /absolute/path/to/codex` |
 | Test a script's contract without a compositor or Cargo | The stubbed Python suites in `tests/*.py`, such as `tests/native_evidence.py` |
@@ -45,6 +46,9 @@ directories, so nothing reaches the real desktop, daemon or provider config:
    explicitly selected
    [real executable](#a-real-codex-in-the-fixture). The fixture is mode 0700. `save-seed` keeps it as the data every later start restores,
    so both sides open the same workspace.
+   Restoring a seed keeps existing provider homes and transcript files in place,
+   including read-only files. Updated files regain the seed's saved permissions;
+   fixture symlinks are not followed when preparing files for restoration.
 3. **Compositor**: KWin's virtual backend, with its own HOME, hosting a nested
    niri session that `niri-harness` drives (`drive observe`, `drive click`,
    `shot`).
@@ -55,6 +59,48 @@ directories, so nothing reaches the real desktop, daemon or provider config:
 `stop` ends all of it: the daemon first, then every process whose environment
 names the task's runtime directory or fixture HOME, which is the proof that it
 belongs to the task.
+
+## A long paged chat
+
+On the build host, run this in a native-evidence session before opening the
+saved conversation:
+
+```sh
+scripts/native-evidence env python3 "$PWD/tests/fixtures/claude-long-history.py" \
+    "$CAGENTS_EVIDENCE_TASK/fixture/project" --tool-bytes 4194304
+scripts/native-evidence cli project open "$CAGENTS_EVIDENCE_TASK/fixture/project"
+```
+
+Choose **Resume conversation** from the new-tab menu and open **History paging
+checkpoints**. Its 260 numbered exchanges include a 4 MiB Bash result every 32
+turns. These results consume the transcript's byte budget while their collapsed
+command groups can fit inside the viewport. Page backward into one of these
+short rendered windows, then wheel downward to check that newer history loads
+without clicking its fallback button. Check that the visible checkpoint stays
+anchored when the next page arrives. No provider command is executed.
+
+Omit `--tool-bytes` for ordinary completed prose. `--scale 64` increases the
+paragraph count enough to exercise provider history paging with prose alone.
+The generator writes under `HOME/.claude`; always run it through
+`native-evidence env`, which supplies the private fixture HOME. Stop and
+`save-seed` after setup to reuse exactly the same conversation on both sides.
+
+## A scoped UI caller
+
+Add `start SIDE --ui-scoped-fixture`, or pass `--ui-scoped-fixture` to a remote
+`pair`, to exercise permission refusals in the actual UI. The option starts
+the fixture's daemon as User, then adds the hardcoded invalid synthetic
+`native-evidence-invalid-session` authority only to the UI runner's environment.
+It accepts no credential value and forwards no caller authority. `env` and
+`cli` commands retain User authority so a scene can seed its private data.
+A later `start` without the option removes that selection; `relaunch` keeps
+the current session's selection.
+
+Run it through `--remote fw16` from a hosted session. The ordinary inherited
+authority refusal still applies before fixture setup. This fixture tests a
+rejected synthetic caller, not the permissions of a valid hosted session.
+It uses the same offline providers and isolated provider homes as other
+native-evidence scenes.
 
 ## An offline GitHub
 
@@ -182,6 +228,34 @@ sleep 12
 evidence shot sidebar-avatar
 ```
 
+## A failed automatic terminal completion
+
+Development builds under `native-evidence` refuse a pending terminal's completion
+save while `home/.config/fixture-pending-terminal-save-error` exists in
+`CAGENTS_EVIDENCE_FIXTURE`. Create the file before opening a terminal. Its worker
+starts normally; the fixture refuses only the edit that clears the pane's pending
+flag. Remove the file and use the terminal's existing Retry control to exercise
+completion of that same worker.
+
+This simulates a save error in the actual daemon and native UI. It does not
+simulate SQLite contention or an execution retirement, and contacts no provider.
+The fault is absent from builds without the `development` feature.
+
+`tests/fixtures/pending-terminal-save-scene.sh` exercises this refusal in a
+native before/after pair: it types into the shell while saving fails, retries
+once while the fault remains, then removes the fault and retries saving. It
+records the pending flag and the holder-owned shell's PID/start time to
+separate worker launches from the UI's interactive PATH probes. The recovered
+shot also checks keyboard focus by typing immediately after Retry save.
+
+The scene checks the exact pane/terminal IDs and pending flag before and after
+recovery, as well as the original worker's PID/start time and fixture working
+directory. It waits for the selected workspace's empty draft and visible terminal
+output before typing. `SCENE_SHOT_PREFIX=narrow-` keeps a second layout's images
+separate; the app's responsive inspector state is preserved. Single-word OCR
+locators tolerate split text runs. The unique `Retry` locator targets the existing
+**Retry save** button even when OCR splits that label into two boxes.
+
 ## An offline Codex
 
 A session started with `--codex PEER`, or a `pair` given it, has a `codex` on
@@ -194,9 +268,10 @@ the separate option below.
 | `tool-rows` | `codex-tool-rows.py` | plays one turn of MCP, dynamic and function tools, collaboration calls, a hook prompt, image generation, a compaction and a diff, started then completed |
 | `child-errors` | `codex-child-errors.py` | reports subagent diagnostics before a failed turn; the prompts `failed-turn`, `retry`, `disconnect`, `closed-after-finish` and `auth-required` pick the neighbouring cases |
 | `terminal-escape` | `terminal-escape-codex.py` | streams terminal escapes; see the script for the file that completes the stream |
+| `usage-resets` | `codex-usage-resets.py` | reports invented usage and reset credits; consumes update only its private fixture state |
 
-`start` copies the three scripts into `TASK/fixture/libexec/codex`, since the
-peers load their transport from beside them, creates `home/.codex`, and
+`start` copies the peers and their shared helpers into
+`TASK/fixture/libexec/codex`, since the peers load their transport from beside them, creates `home/.codex`, and
 installs [`tests/fixtures/fixture-codex.sh`](../tests/fixtures/fixture-codex.sh)
 as `bin/codex`. That passes the fixture as the peer's private root and
 `$HOME/.codex` as `CODEX_HOME` unless the app names another, and every peer
@@ -214,8 +289,46 @@ check, `codex app-server` over stdio: with an `account/rateLimits/read`
 result in `home/.codex/fixture-rate-limits.json`, such as
 [`fixtures/accounts/codex-rate-limits-read.json`](../fixtures/accounts/codex-rate-limits-read.json)'s
 `result`, the account shows those figures; without one, it reports no usage.
-The other peers leave the app's account and usage-limit handling unexercised,
-and no peer verifies live account credentials.
+The `usage-resets` peer also exercises account usage and explicit reset
+consumption with invented credits. The other peers leave the app's account and
+usage-limit handling unexercised, and no peer verifies live account credentials.
+
+The `tool-rows` peer also reads an optional `model/list` result from
+`home/.codex/fixture-models.json`. Its nonempty `data` array needs a `model`
+ID on each entry; `displayName`, `supportedReasoningEfforts`,
+`defaultReasoningEffort` and `isDefault` use the app-server's field names.
+A new thread reports the requested model or the catalog's default (the first
+entry when none is marked), and reports an effort only when the launch chose
+one. Model and effort overrides sent with later turns are retained when the
+fixture thread resumes. Without the file, it keeps the usual `fixture-mini`
+catalog. This exercises catalog and selection handling, without checking
+which models or efforts a live account can use.
+With `home/.codex/fixture-unconfirmed-model` present, thread start/resume omits
+the model field while turns keep their ordinary activity and completion frames.
+Remove the marker to report the selected model on the next start/resume.
+`home/.codex/fixture-turn-pause` optionally holds a number of seconds from 0
+to 300 for the peer's busy turn, instead of its usual six-second pause.
+The footer scene uses 20 seconds so native capture can show confirmed running
+work without depending on how quickly OCR and screenshot conversion finish.
+Create `home/.codex/fixture-turn-audit.json` containing `[]` to record the last
+16 accepted turn IDs and the actual requested model/effort fields, including
+only fields present in the request. This private audit excludes prompt input and
+helps compare a native selection with the request received by the peer. Writers
+share a sibling file lock and replace the JSON atomically, so concurrent fixture
+processes using the same private home retain their records up to that limit.
+
+[`tests/fixtures/chat-footer-scene.sh`](../tests/fixtures/chat-footer-scene.sh)
+captures a draft, a started conversation, the open model picker and a selected
+high effort for Claude and Codex. Run it in a fresh `--codex tool-rows` session,
+as `wide` at 1500×900 or `narrow` at 900×900. Prepare a new task once before
+capturing: start and stop a side, run the scene as `prepare` while it is stopped,
+then `save-seed`. This removes the bootstrap's private account catalog cache,
+so both starts probe the prepared catalogs. For a remote `pair`, use a steps
+file containing `CAGENTS_EVIDENCE_TASK=$task
+"$tool/tests/fixtures/chat-footer-scene.sh" wide` (or `narrow`). The scene
+copies the recorded Claude catalog and writes an invented offline Codex
+catalog only into the fixture. It exercises the native controls and the
+provider protocol peers, without contacting either provider.
 
 For native sign-in controls, prompt the `child-errors` peer with `auth-required`.
 It refuses `turn/start` with an explicit authentication error. Put a whole number
@@ -224,6 +337,99 @@ terminal open while **Signing in…** is visible; `login status` stays immediate
 This exercises the app's recovery controls and login-terminal lifecycle without
 authenticating an account or contacting a provider. It does not verify provider
 credentials or account changes.
+
+## Usage reset evidence
+
+`tests/fixtures/usage-reset-scene.sh` prepares invented Claude and Codex
+allowances in a running native-evidence task. Start with `--codex usage-resets`
+on both sides. Run these commands on the build host, with
+`CAGENTS_EVIDENCE_TASK` naming that task; hosted agents use plain SSH:
+
+```sh
+tests/fixtures/usage-reset-scene.sh seed   # once, before save-seed
+tests/fixtures/usage-reset-scene.sh serve  # after each start restores the seed
+scripts/native-evidence cli account info --account claude/system --refresh
+scripts/native-evidence cli account info --account codex/system --refresh
+```
+
+`seed` refuses an existing reset state, creates `.cagents-reset-fixture` under
+the private fixture root, and populates each private provider home. Claude has
+a Fable grant with two resets, an account grant with one, and an available
+recurring session reset; the Fable grant is the next usable grant. Session
+usage is 82%, weekly usage 96% and Fable
+usage 100%. Codex has two reset credits, a session at 90% and a week at 100%.
+Counts, timestamps, identities and messages are invented.
+
+`serve` binds a loopback HTTP listener and writes the Claude home's
+`fixture-reset-api.json` with its address. The debug-only Claude reset
+transport recognizes that marker under the marked fixture root and sends
+only the literal fake bearer `cagents-fixture-only`; it does not read real
+credentials. The listener accepts only that bearer and the invented
+organization. Its private HOME/runtime lets native-evidence stop identify and
+end it with the rest of the task. Start the listener again after restoring a
+seed, since an old port does not identify the new session.
+
+Open Accounts and capture the usage view. Spawn a synthetic Claude chat with
+`--model fable`: its initial turn reports the Fable limit and stops, providing
+the limit-card comparison. Capture the reset confirmation and cancel it first.
+On the after side, a confirmed reset updates `fixture-usage.json`, the count,
+and the next fake turn's live usage. A Fable reset preserves account windows;
+an account reset preserves Fable. No real reset is consumed. The recurring session route deliberately has no
+server idempotency: `session_post_count` records every submitted POST so a
+client contract can verify that an uncertain request is never sent again.
+
+For recovery evidence, `usage-reset-scene.sh mode claude disconnect` makes a
+claim persist before closing its connection; the refresh sees the true state,
+and replaying the original idempotency key spends nothing further. Use
+`mode claude error` for a refusal before spending. Codex accepts those same
+modes. `mode claude unconfirmed` spends once but answers HTTP 200 with
+`result: unavailable` and `reason: reset_unconfirmed`; the same key then
+answers `already_used` without another spend. Restore the seed before each independent comparison so both sides
+start with the same counts. For a limited account without a reset action, use
+`mode claude depleted` or `mode codex depleted`: these set the relevant window
+to 100% and all reset counts to zero, without submitting a consume. Claude
+turn frames are refreshed too, so the Fable card stays limited without an
+available reset. To hit the limit again while retaining the remaining resets,
+use `mode claude limited` or `mode codex limited`. This updates the relevant
+usage windows without changing reset counts, prior claims or consume counts.
+Codex then fails a turn only while ordinary usage is blocked; after a fake
+reset it emits an ordinary completed assistant reply, so the native flow can
+verify that work continues. Mode changes share the service's state lock.
+
+For Claude scope confirmations, `usage-reset-scene.sh next-grant fable|account`
+selects one of the two existing grants as the next eligible grant. The account
+grant clears both Session and Weekly; the Fable grant clears only its model
+window. The selector preserves usage, counts, claims and identity, and rejects
+missing, exhausted, paused or unusable grants. It does not submit a consume;
+the service continues to reject a consume for any grant that is not next.
+
+For Claude plan-label evidence, `usage-reset-scene.sh plan NAME` accepts
+`pro`, `max5x`, `max20x`, `ultra` or `unknown`. It changes the fake profile's
+`organization.plan_display_name`, its tier/type metadata, the debug marker's
+optional `subscription_type` and `rate_limit_tier`, and the usage report's
+legacy subscription type. Email, organization UUID, usage windows, reset
+counts and prior claims stay unchanged; the switch never submits a consume.
+Refresh account usage after switching plans. The fake auth status and
+`get_usage` responses continue to omit display labels and tier metadata,
+matching the installed client; the extra information comes from the fake
+profile and cached-metadata marker.
+
+Pro reports `Pro`. Max cases report the label `Max` with the known cached tier
+IDs `default_claude_max_5x` and `default_claude_max_20x`. Ultra reports `Ultra`
+while its legacy subscription remains `max`; its profile uses the confirmed
+`default_claude_max_20x` tier, `claude_max` organization type and null
+`seat_tier`. The unknown case reports `Fixture Horizon`
+with the invented `fixture_horizon_unknown_tier`, also retaining legacy
+`max`, so a reader can verify that unfamiliar labels are not collapsed into
+an older plan. The unchanged default scene reports `Max` without a tier.
+Plan switches work before or after starting the fake service and retain its
+current loopback address.
+
+The service and Codex peer share `fixture-reset-state.json` files guarded by
+file locks. Their offline contracts run with
+`/usr/bin/python3 -I -B tests/usage_reset_fixture.py -v`. These verify fake
+read/consume behavior and transport ambiguity; they do not qualify the live
+Claude endpoint, real Codex credits or the native UI.
 
 ## A real Codex in the fixture
 
@@ -303,6 +509,30 @@ group, a failed command and a group with an acknowledged background command.
 It includes finished empty reasoning, active empty reasoning and a live thought
 that gains a new last line. The Edit input maps to the app's Changes item;
 its patch is synthetic. None of the described commands or tools executes.
+
+`activity` opens its own named workspace and loads
+[`activity.jsonl`](../tests/fixtures/reasoning-row-scene/activity.jsonl): an
+empty thought, a command and a background command, then a second empty thought
+that stays live for 30 seconds while that command group is still running, then
+a newer command that runs for 25 seconds in a group of its own. It captures the
+working turn at both points, waits for the answer, and captures the finished
+turn.
+
+```sh
+CAGENTS_EVIDENCE_TASK=$task "$tool/tests/fixtures/reasoning-row-scene.sh" activity
+```
+
+`agents` has the lead start a background command and three background
+subagents, one of which finishes before the lead answers, so two subagents
+and the command are still working after the lead has finished. `plan` needs a session started with
+`--codex tool-rows`: its Codex turn publishes a plan with a step in progress
+beside the running tool, collaboration and event rows, stays working for 40
+seconds through `CODEX_HOME/fixture-plan`, then finishes.
+
+```sh
+CAGENTS_EVIDENCE_TASK=$task "$tool/tests/fixtures/reasoning-row-scene.sh" agents
+CAGENTS_EVIDENCE_TASK=$task "$tool/tests/fixtures/reasoning-row-scene.sh" plan
+```
 
 For a short comparison against main after the background-notice changes, run
 `refresh-core` then `refresh-notices` in one fresh 1200x900 native session on
@@ -423,6 +653,41 @@ not establish performance for long histories or many concurrent agents.
 
 ## Adding a scene to evidence
 
+`examples/shared-removal-fixture.rs` scripts a competing window for shared
+Close races. Build it with `scripts/cargo-gate build --locked
+--no-default-features --example shared-removal-fixture`, then copy the executable
+to the evidence host. Run it through `native-evidence env`, after opening the
+fixture project, with the side's protocol number and `unconditional` for the
+old ID-only removal or `conditional` for source-checked removal. It refuses an
+environment outside native-evidence.
+
+The fixture creates a channel named **Shared Close race**, a repository pane
+and a short-lived shell pane. It captures Close, releases the original worker,
+replaces the terminal in the same card, then delivers the delayed removal at
+the new revision. The unconditional case must remove the replacement; the
+conditional case must preserve it. Open the channel and capture the settled
+state. This exercises the real daemon's mutation API and the native UI's
+projection, using fixture shells and no model provider. The competing window
+and delayed request are scripted; unit tests cover the UI's capture and queue.
+
+For a real native stale Close gesture, run `prepare-live` instead. Open **Native
+Close race**, open the original terminal's Close confirmation, then run
+`replace-live` before confirming it. The fixture stops its own original shell
+and publishes another worker under the same terminal ID and recipe. Confirm
+the old native dialog and inspect the surviving replacement and refusal state.
+The private scene file prevents delivering the replacement twice. These modes
+use a sleeping fixture shell and no model provider; stopping native-evidence
+cleans up its workers. Exercise a fresh native Close afterward as well.
+
+For a saved completed pane with no resident worker, use `prepare-completed`.
+The helper starts, finishes and releases its fixture shell before seeding its
+ended descriptor. Prepare it through `env` while the UI is stopped, then use
+`start SIDE --keep-state`: a running window can adopt the temporary worker
+before the helper places its saved pane. Open **Shared Close race** and close **Original terminal**
+once. Its pane should disappear without starting a replacement or needing a
+retained final screen. This exercises the completed-source absence proof;
+fixtures do not exercise live provider cleanup.
+
 Write the scene as steps, not as instructions in a PR comment, so the next
 agent can rerun it:
 
@@ -500,12 +765,89 @@ Development UI builds under `native-evidence` read
 Copy `tests/fixtures/update-review.json` there with mode 0600, then start the
 session (or wait for the active review's next status poll). The example includes
 running work, a blocked conversation, a daemon notice and a paused terminal.
-The file must contain an awaiting-confirmation job named `fixture-update-review`
-with a blocked daemon preview. Apply is disabled; decisions fail before looking
-up an installation. Remove the file to end the fixture review.
+The file must contain a job named `fixture-update-review`: either awaiting
+confirmation with a blocked daemon preview, or ended (`Failed` or `Cancelled`)
+with no confirmation, to show how a review ended. Decisions fail before looking
+up an installation. Replace the awaiting job with an ended one while the session
+runs to show the window that watched the review receive its outcome at the next
+status poll. Remove the file to end the fixture review.
+
+To show what the header offers when a newer release exists, also copy
+`tests/fixtures/update-release.json` to `home/.config/fixture-update-release.json`
+(mode 0600) before starting. The development build's update check, which
+otherwise never runs, reports that release as available at startup and on
+"Check again". Under native evidence, `apply` refuses every release, so
+"Update to" and "Retry update to" fail without installing anything.
 
 This loads data into the actual native dialog and supports scrolling and Copy
 details. It does not run providers, inspect a live update inventory, perform an
 update, or exercise cancellation/recovery. The grouped Paused heading belongs
 to the CLI review. The native dialog currently omits saved stopped panes, so
 the fixture's paused terminal does not appear in that dialog.
+
+## A refused shared-view seed
+
+[`seed-refusal-scene.sh`](../tests/fixtures/seed-refusal-scene.sh) creates an
+offline Claude conversation with an unsent launch-note draft. Its `refuse`
+step closes only the UI, keeps the daemon and provider alive, then uses
+[`seed-refusal-registry.py`](../tests/fixtures/seed-refusal-registry.py) to
+remove that channel's shared view and its active placement mappings. It keeps
+both monotonic clocks, actor/history records, window retention pins and other
+scopes. The helper then adds a trigger that published-schema admission does
+not recognize. While armed, the real registry can refuse all writes, before
+the trigger's channel-conditional body runs. The native notice reports the
+registry's schema-mismatch reason, not the trigger body's SQLite sentence.
+The fixture does not inject UI state, replace transport or weaken schema checks.
+Dropping the trigger restores admission; the selected panes can register again
+with fresh placement generations.
+
+Run the scene on the native-evidence host, with both fixture scripts in the
+same directory. When comparing a revision that predates the scripts, copy them
+into the evidence task's `tools/` directory and use that copy on both sides.
+Keep the helper outside the before and after checkouts so their recorded source
+stays unchanged. Build both revisions before taking a native slot.
+
+```sh
+export CAGENTS_EVIDENCE_TASK=$HOME/.local/state/cev/seed-refusal
+export CAGENTS_EVIDENCE_TOOL=/path/to/checkout/scripts/native-evidence
+scene=$CAGENTS_EVIDENCE_TASK/tools/seed-refusal-scene.sh
+
+# Once, with a native session running; every later start restores these bytes.
+bash "$scene" seed
+"$CAGENTS_EVIDENCE_TOOL" --task "$CAGENTS_EVIDENCE_TASK" stop
+"$CAGENTS_EVIDENCE_TOOL" --task "$CAGENTS_EVIDENCE_TASK" save-seed
+
+# After starting either side at the comparison's width:
+# Observe the closed inspector's notices icon and set its point. Passing the
+# point to refuse clears unrelated transient headless-desktop notices.
+export NOTICE_CONTROL_POINT=$observed_point
+bash "$scene" refuse wide
+# On the fixed side:
+bash "$scene" notice wide
+bash "$scene" retry wide
+```
+
+`refuse` captures the saved draft before opening notices. `notice` checks the
+existing warning control's tooltip and captures the refusal and Retry action.
+`retry` removes the fixture refusal, presses Retry and waits for the saved pane
+to reopen. Repeat with `narrow` in a new session at the narrower viewport;
+both widths restore the same seed. To avoid taking another native slot, a
+1500×900 session can instead use `native-evidence nested niri msg action
+set-column-width 900` and return to `1500`; first confirm the actual app-window
+size with `drive observe`. Capture the full native window. The manifest retains
+the requested headless viewport and separately records the actual image size;
+report the latter for a resized capture. Apply identical geometry on both sides.
+The notices icon's position depends on that
+viewport and the inspector state, so observe it instead of reusing a guessed
+point. Stop immediately after capturing the states.
+
+The helper refuses a HOME or data directory outside the private evidence
+fixture. Its offline contracts cover selected-view/placement cleanup, foreign-key
+cascades, unchanged unrelated rows and monotonic clocks, and refusal to modify
+an unrelated home or missing channel. A separate direct-SQL check exercises the
+conditional trigger body only; it does not test daemon schema admission. Real
+registry refusal and successful recovery must be checked in the native app:
+
+```sh
+python3 -I -B tests/fixtures/test_seed_refusal_registry.py -v
+```

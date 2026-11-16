@@ -380,7 +380,7 @@ impl Provider {
 
 /// Strip Codex's activity decoration from the conversation name. The app
 /// renders status with icons using observed activity, never inferred title text.
-pub(crate) fn codex_title_without_status(title: &str) -> &str {
+pub fn codex_title_without_status(title: &str) -> &str {
     for marker in ["[ ! ] ", "[ . ] ", "[!] ", "[.] "] {
         if let Some(status) = title.strip_prefix(marker)
             && let Some(rest) = status.strip_prefix("Action Required")

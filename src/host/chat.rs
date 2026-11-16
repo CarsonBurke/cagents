@@ -6,6 +6,7 @@ mod account_recovery_target_tests;
 pub(super) mod capacity;
 mod codex_owners;
 mod console_relaunch;
+pub(super) use console_relaunch::matched_cli;
 #[cfg(test)]
 mod console_relaunch_tests;
 pub(super) mod floor_history;
@@ -601,6 +602,11 @@ fn changed_for_instance(
                 chat_id: id,
                 addresses: addresses.clone(),
             },
+            Update::ActiveModel { revision, model } => ServerMessage::ChatActiveModel {
+                chat_id: id,
+                revision: *revision,
+                model: model.clone(),
+            },
             _ => continue,
         };
         if let Some(delivery) = clients.get(&client) {
@@ -665,6 +671,22 @@ pub(super) fn agent_addresses(host: &SharedHost, chat_id: TerminalId) -> Option<
     // published metadata, a local one from its own lock.
     let addresses = handle.agent_addresses();
     (!addresses.is_empty()).then_some(ServerMessage::ChatAgentAddresses { chat_id, addresses })
+}
+
+pub(super) fn active_model(host: &SharedHost, chat_id: TerminalId) -> Option<ServerMessage> {
+    let handle = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .chats
+        .get(&chat_id)?
+        .handle
+        .clone();
+    let (revision, model) = handle.active_model();
+    Some(ServerMessage::ChatActiveModel {
+        chat_id,
+        revision,
+        model,
+    })
 }
 
 fn current_session_snapshot(
@@ -1886,8 +1908,53 @@ pub(super) fn terminal_claim_pending(state: &HostState, terminal: TerminalId) ->
             .native_actor_startups
             .values()
             .any(|startup| claims(&startup.source) || claims(&startup.requested))
-        || state.native_closing.contains_key(&terminal)
+        || state
+            .native_closing
+            .values()
+            .any(|closing| claims(closing.source()))
         || state.chat_handoffs.contains_key(&terminal)
+}
+
+pub(super) fn shared_removal_in_transition(
+    state: &HostState,
+    before: &crate::workspace_model::views::Pane,
+) -> bool {
+    let crate::model::CardKind::Chat(source) = &before.kind else {
+        unreachable!("chat removal source")
+    };
+    let claims = |session: &crate::chat::Session| {
+        session.id == source.id
+            || session
+                .terminal
+                .as_ref()
+                .is_some_and(|terminal| terminal.id == source.id)
+    };
+    let same = |session: &crate::chat::Session| {
+        crate::workspace_model::views::same_removal_source(
+            before,
+            &crate::workspace_model::views::Pane {
+                kind: crate::model::CardKind::Chat(session.clone()),
+                ..before.clone()
+            },
+        )
+    };
+    state.chat_bindings.contains_key(&source.id)
+        || state.chat_handoffs.contains_key(&source.id)
+        || state
+            .chat_spawning
+            .values()
+            .filter(|session| claims(session))
+            .any(|session| {
+                state.chat_close_reservations.get(&session.id) != Some(session) || !same(session)
+            })
+        || state
+            .native_actor_startups
+            .values()
+            .any(|startup| claims(&startup.source) || claims(&startup.requested))
+        || state
+            .native_closing
+            .values()
+            .any(|closing| claims(closing.source()) && !same(closing.source()))
 }
 
 fn start_with_execution(
@@ -4496,7 +4563,7 @@ pub(super) fn close_captured(
                 "The exact native attachment changed before close",
             ));
         }
-        capacity::Reservation::closing(host, &mut state, &source)?
+        capacity::Reservation::removing(host, &mut state, &source)?
     };
     super::agent_execution::preflight_retirement(host, &source).map_err(unavailable)?;
     target.require_current(host)?;

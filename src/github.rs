@@ -359,6 +359,26 @@ pub struct PullRequest {
     pub status_check_rollup: Option<Vec<PullRequestCheckRollup>>,
 }
 
+/// An open pull request numbered `number`, for tests here and in the UI crate.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn fixture_pull_request(number: u64) -> PullRequest {
+    serde_json::from_value(serde_json::json!({
+        "id": "PR_1",
+        "number": number,
+        "title": format!("Change {number}"),
+        "body": "",
+        "state": "OPEN",
+        "isDraft": false,
+        "headRefName": "feature",
+        "headRefOid": "a".repeat(40),
+        "baseRefName": "main",
+        "updatedAt": "2026-01-01T00:00:00Z",
+        "url": format!("https://github.com/o/r/pull/{number}"),
+    }))
+    .unwrap()
+}
+
 /// The two real GraphQL check variants returned in `gh pr list`'s rollup.
 /// Keep conclusions distinct from execution status so a completed failure
 /// cannot accidentally become a passing check.
@@ -1414,7 +1434,7 @@ pub enum GitHubAvailability {
 }
 
 impl GitHubAvailability {
-    pub(crate) fn refresh_succeeded(&self) -> bool {
+    pub fn refresh_succeeded(&self) -> bool {
         !matches!(self, Self::Failed { .. } | Self::RateLimited { .. })
     }
 

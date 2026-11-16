@@ -39,6 +39,8 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::ReadWorkspaceView { .. }
         | R::ReadWorkspaceSnapshot
         | R::ReadWorkspaceMetadata { .. }
+        | R::ReadTerminalRemovalBasis { .. }
+        | R::ReadCapturedTerminalRemovalBasis { .. }
         | R::Attach { .. }
         | R::Detach { .. }
         | R::SetVisibility { .. }
@@ -66,9 +68,12 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::ClearTerminalScrollback { terminal_id }
         | R::ShutdownTerminal { terminal_id }
         | R::CloseTerminalChecked { terminal_id, .. } => Access::Control(*terminal_id),
-        R::ReleaseCompletedTerminal { session, .. } => Access::Control(session.id),
+        R::ReleaseCompletedTerminal { session, .. } | R::CloseTerminalSource { session, .. } => {
+            Access::Control(session.id)
+        }
         R::Spawn { session, .. } => Access::Spawn(session),
         R::CompletePendingTerminal { .. }
+        | R::RetryPendingTerminalSave { .. }
         | R::DeviceOperation { .. }
         | R::Agent { .. }
         | R::Automation { .. }

@@ -1,0 +1,995 @@
+use super::*;
+use crate::document_link::{self, DocumentLink};
+
+impl Cagents {
+    /// All file links share the editor path, independently of web-link preferences.
+    pub(super) fn open_document_link(
+        &mut self,
+        source: Option<CardId>,
+        target: &str,
+    ) -> Task<Message> {
+        if source.is_some_and(|card| self.workspace.card(card).is_none()) {
+            return Task::none();
+        }
+        let document = source
+            .and_then(|card| match self.cards.get(&card) {
+                Some(CardRuntime::Repository(runtime)) => runtime
+                    .selected_path()
+                    .map(|path| runtime.descriptor.worktree.join(path)),
+                Some(CardRuntime::Chat(runtime)) => Some(
+                    runtime
+                        .session
+                        .launch
+                        .recipe
+                        .working_directory
+                        .join(".chat"),
+                ),
+                _ => None,
+            })
+            .or_else(|| {
+                if !crate::device::is_remote() {
+                    return None;
+                }
+                source
+                    .and_then(|card| self.card_state(card))
+                    .and_then(|card| self.card_worktree(card))
+                    .or(self.active_workspace.as_deref())
+                    .map(|directory| directory.join(".link"))
+            });
+        self.open_document_link_from(source, document.as_deref(), target)
+    }
+
+    /// A chat renderer captures its own origin before dispatching a click.
+    /// A child with no verified cwd must not borrow its parent's directory.
+    pub(super) fn open_document_link_from(
+        &mut self,
+        source: Option<CardId>,
+        document: Option<&Path>,
+        target: &str,
+    ) -> Task<Message> {
+        if source.is_some_and(|card| self.workspace.card(card).is_none()) {
+            return Task::none();
+        }
+        // Chat paths use the conversation's working directory; document
+        // paths use the open file's directory. Explicit file URLs work in both.
+        let (target, position) = document_link::file_position(target);
+        let resolved = if document.is_none()
+            && !Path::new(target).is_absolute()
+            && !Url::parse(target)
+                .is_ok_and(|url| matches!(url.scheme(), "http" | "https" | "file"))
+        {
+            Err(format!(
+                "Cannot open {target:?}: this source has no verified working directory. Ask for an absolute file link."
+            ))
+        } else {
+            document_link::resolve(document.unwrap_or(Path::new("/")), target)
+        };
+        match resolved {
+            Ok(DocumentLink::Local { path, fragment }) => {
+                if crate::device::is_remote() && path.as_os_str().as_encoded_bytes().ends_with(b"/")
+                {
+                    self.update_device(super::device_ui::Action::OpenAt(path))
+                } else if crate::device::is_remote() {
+                    self.update_device(super::device_ui::Action::OpenFile {
+                        path,
+                        fragment: position.or(fragment),
+                    })
+                } else {
+                    self.open_local_file(source, path, position.or(fragment))
+                }
+            }
+            Ok(DocumentLink::External(url)) => self.open_clicked_link(url),
+            Err(error) => {
+                self.status = Some(TransientNotice::error(error));
+                Task::none()
+            }
+        }
+    }
+
+    /// Open a provider-reported filesystem path without applying URL semantics.
+    /// Local callers resolve symlinks off-thread before creating the pane;
+    /// device callers retain components for resolution by the owning daemon.
+    pub(super) fn open_file_path(&mut self, source: CardId, path: PathBuf) -> Task<Message> {
+        if self.workspace.card(source).is_none() || self.workspace_inputs_blocked() {
+            return Task::none();
+        }
+        if !path.is_absolute() || path.as_os_str().as_encoded_bytes().contains(&0) {
+            self.status = Some(TransientNotice::error("The reported file path is invalid."));
+            return Task::none();
+        }
+        if self.refuse_in_deleting_worktree(&path) {
+            return Task::none();
+        }
+        if crate::device::is_remote() {
+            self.update_device(super::device_ui::Action::OpenFile {
+                path,
+                fragment: None,
+            })
+        } else {
+            self.open_local_file(Some(source), path, None)
+        }
+    }
+
+    fn open_local_file(
+        &mut self,
+        source: Option<CardId>,
+        path: PathBuf,
+        fragment: Option<String>,
+    ) -> Task<Message> {
+        if self.workspace_inputs_blocked() || self.refuse_in_deleting_worktree(&path) {
+            return Task::none();
+        }
+        let Some((directory, name)) = path.parent().zip(path.file_name()) else {
+            self.status = Some(TransientNotice::error(
+                "The link does not name a local file",
+            ));
+            return Task::none();
+        };
+        let source = source.or(self.workspace.focused());
+        let channel = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| source.is_some_and(|source| channel.cards.contains(&source)))
+            .map(|channel| (channel.id, channel.project_id));
+        let scope = if channel.is_some() {
+            None
+        } else {
+            source
+                .and_then(|id| self.card_state(id))
+                .and_then(|card| self.card_worktree(card))
+                .map(Path::to_path_buf)
+                .or_else(|| self.active_workspace.clone())
+        };
+        let project = channel
+            .map(|(_, project)| project)
+            .or_else(|| {
+                source
+                    .and_then(|id| self.card_state(id))
+                    .and_then(|card| match &card.kind {
+                        CardKind::Repository(view) => Some(view.project),
+                        _ => None,
+                    })
+            })
+            .or_else(|| {
+                scope.as_deref().and_then(|scope| {
+                    self.sidebar_model
+                        .worktree_at(scope)
+                        .map(|key| key.project_id)
+                        .or_else(|| {
+                            self.sidebar_model
+                                .projects
+                                .iter()
+                                .find(|project| project.repository == scope)
+                                .map(|project| project.id)
+                        })
+                })
+            })
+            .unwrap_or_else(ProjectId::new);
+        // Prefer the exact file, even when dirty. Only dedicated, clean file
+        // panes are candidates for replacement; repository browsing is separate.
+        let candidates = self.workspace.order().filter_map(|card| {
+            // A newly focused editor may still be entering the viewport. Its
+            // reveal animation must not turn a rapid second link into another
+            // pane; unrelated offscreen panes remain ineligible.
+            if self.workspace.focused() != Some(card)
+                && self.workspace.visibility(card) != Some(VisibilityClass::Visible)
+            {
+                return None;
+            }
+            let owner = self
+                .durable
+                .channels
+                .iter()
+                .find(|channel| channel.cards.contains(&card));
+            if owner.map(|channel| channel.id) != channel.map(|(id, _)| id)
+                || (channel.is_none()
+                    && self
+                        .card_state(card)
+                        .and_then(|state| self.card_worktree(state))
+                        != scope.as_deref())
+            {
+                return None;
+            }
+            let CardRuntime::Repository(runtime) = self.cards.get(&card)? else {
+                return None;
+            };
+            let exact = runtime
+                .selected_path()
+                .is_some_and(|selected| runtime.descriptor.worktree.join(selected) == path);
+            (exact || (runtime.descriptor.selected_file.is_some() && !runtime.blocks_navigation()))
+                .then_some((card, exact))
+        });
+        let candidate = candidates.max_by_key(|(_, exact)| *exact);
+        if let Some((card, true)) = candidate {
+            let jump = match (self.cards.get_mut(&card), fragment) {
+                (Some(CardRuntime::Repository(runtime)), Some(fragment)) => {
+                    repository_task(runtime.preview_fragment(card, &fragment))
+                }
+                _ => Task::none(),
+            };
+            let update = self
+                .workspace
+                .focus(card)
+                .unwrap_or_else(|_| ViewportUpdate::unchanged());
+            return Task::batch([jump, self.apply_viewport(update, true, DurableChange::None)]);
+        }
+        let view = RepositoryView {
+            project,
+            repository: directory.to_path_buf(),
+            worktree: directory.to_path_buf(),
+            selected_file: Some(name.into()),
+        };
+        let card = candidate.map_or_else(CardId::new, |(card, _)| card);
+        let title = normalize_card_name(&name.to_string_lossy()).unwrap_or_else(|| "File".into());
+        self.retire_lsp_card(card);
+        if candidate.is_none() {
+            let mut runtime = RepositoryRuntime::new_directory(view.clone());
+            runtime.set_auto_save(self.settings.editor_auto_save);
+            runtime.set_wrap_lines(self.settings.editor_wrap_lines);
+            runtime.set_syntax_theme(self.settings.editor_syntax_theme);
+            runtime.set_external_editors(self.sidebar_model.external_editors.clone());
+            self.cards
+                .insert(card, CardRuntime::Repository(Box::new(runtime)));
+        }
+        let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) else {
+            return Task::none();
+        };
+        let load = repository_task(runtime.retarget_file(card, view.clone()));
+        let jump = fragment.map_or_else(Task::none, |fragment| {
+            repository_task(runtime.preview_fragment(card, &fragment))
+        });
+        let update = if candidate.is_some() {
+            if let Some(state) = self.card_state_mut(card) {
+                state.title = title.clone();
+                state.kind = CardKind::Repository(view);
+            }
+            let _ = self.workspace.rename_card(card, title);
+            self.workspace.focus(card)
+        } else {
+            let (index, durable_index) = source
+                .and_then(|source| {
+                    Some((
+                        self.workspace.order().position(|id| id == source)? + 1,
+                        self.durable
+                            .cards
+                            .iter()
+                            .position(|state| state.id == source)?
+                            + 1,
+                    ))
+                })
+                .unwrap_or_else(|| self.terminal_insertion_indices());
+            let width = self.new_pane_fraction(self.settings.default_native_pane_fraction);
+            let state = CardState {
+                id: card,
+                generation: self.durable.generation,
+                title: title.clone(),
+                width_fraction: width,
+                existence: Existence::Open,
+                kind: CardKind::Repository(view),
+            };
+            let durable = Arc::make_mut(&mut self.durable);
+            durable.cards.insert(durable_index, state);
+            if let Some(scope) = scope {
+                durable.card_scopes.insert(card, scope.clone());
+                self.worktree_owners.insert(card, scope);
+            }
+            if let Some((owner, _)) = channel
+                && let Some(channel) = Arc::make_mut(&mut self.durable)
+                    .channels
+                    .iter_mut()
+                    .find(|channel| channel.id == owner)
+            {
+                channel.cards.push(card);
+                channel.focused = Some(card);
+            }
+            self.set_presence(card, Exposure::Visible, Residency::Hot);
+            self.workspace.add_card(
+                WorkspaceCard::new(card, title, CardWidth::Fraction(width))
+                    .expect("file pane is valid"),
+                index,
+                true,
+            )
+        }
+        .unwrap_or_else(|_| ViewportUpdate::unchanged());
+        Task::batch([
+            load,
+            jump,
+            self.apply_viewport(update, true, DurableChange::Content),
+        ])
+    }
+
+    pub(super) fn preview_local_file(&mut self, card: CardId) -> Task<Message> {
+        let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else {
+            return Task::none();
+        };
+        let Some(path) = runtime.selected_path() else {
+            return Task::none();
+        };
+        if runtime.blocks_navigation() {
+            self.status = Some(TransientNotice::warning(
+                "Save the file before previewing it",
+            ));
+            return Task::none();
+        }
+        let Ok(url) = Url::from_file_path(runtime.descriptor.worktree.join(path)) else {
+            return Task::none();
+        };
+        // Preview is explicit; bypass the normal file-link route back to source.
+        self.add_browser(url)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cosmic::iced::futures::StreamExt;
+
+    fn app() -> Cagents {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        app.settings.editor_auto_save = false;
+        app.settings.link_open_destination = LinkOpenDestination::SystemDefault;
+        app.workspace.resize_viewport(1200.0);
+        app
+    }
+
+    async fn settle(app: &mut Cagents, task: Task<Message>) {
+        let mut pending = vec![task];
+        while let Some(task) = pending.pop() {
+            if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+                while let Some(action) = stream.next().await {
+                    if let iced::runtime::Action::Output(cosmic::Action::App(
+                        message @ Message::Repository(_),
+                    )) = action
+                    {
+                        pending.push(app.update(message));
+                    }
+                }
+            }
+        }
+    }
+
+    fn runtime(app: &Cagents, card: CardId) -> &RepositoryRuntime {
+        let CardRuntime::Repository(runtime) = &app.cards[&card] else {
+            panic!("expected editor")
+        };
+        runtime
+    }
+
+    #[tokio::test]
+    async fn missing_known_source_directory_retargets_the_file_pane_to_a_contextual_error() {
+        if crate::repository_widget::retained_save_tests::isolated_test(
+            "app::file_ui::tests::missing_known_source_directory_retargets_the_file_pane_to_a_contextual_error",
+        ) {
+            return;
+        }
+        let mut app = app();
+        crate::worktree_cleanup::prepare_standalone_editor_protection();
+        let directory = tempfile::tempdir().unwrap();
+        let old = directory.path().join("old.png");
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([217, 0, 217, 255]))
+            .save(&old)
+            .unwrap();
+        let task = app.open_document_link(None, old.to_str().unwrap());
+        settle(&mut app, task).await;
+        let card = app.workspace.focused().unwrap();
+        assert_eq!(
+            runtime(&app, card).inspector_context().document,
+            "Image preview"
+        );
+        assert_eq!(app.card_state(card).unwrap().title, "old.png");
+        let before = app.workspace.order().count();
+
+        // A known but unavailable source directory is different from an
+        // unverified child cwd: resolve the former exactly, then show its own
+        // failure. Neither route may borrow another repository's image.
+        let missing = directory.path().join("retired-history");
+        assert!(!missing.exists());
+        let document = missing.join(".chat");
+        let task = app.open_document_link_from(Some(card), Some(&document), "./image.png");
+        settle(&mut app, task).await;
+        assert_eq!(app.workspace.focused(), Some(card));
+        assert_eq!(app.workspace.order().count(), before);
+        assert_eq!(app.card_state(card).unwrap().title, "image.png");
+        let runtime = runtime(&app, card);
+        assert_eq!(runtime.descriptor.worktree, missing);
+        assert_eq!(runtime.selected_path(), Some(Path::new("image.png")));
+        let context = runtime.inspector_context();
+        assert_eq!(context.document, "Unavailable");
+        let error = context.document_error.expect("explicit-file error");
+        assert!(error.contains(&missing.join("image.png").display().to_string()));
+        assert!(error.contains("on this device"));
+        assert!(error.contains("os error 2"));
+        assert!(runtime.editor_text().is_none());
+    }
+
+    #[tokio::test]
+    async fn chat_image_links_keep_the_rendered_worktree_after_project_and_launch_changes() {
+        use super::super::chat_ui::{Action, Target};
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().join("repository");
+        let worktree = repository.join(".worktrees/review");
+        let selected = directory.path().join("other-project");
+        std::fs::create_dir_all(worktree.join("docs/screens")).unwrap();
+        std::fs::create_dir_all(&selected).unwrap();
+        for path in [
+            worktree.join("image.png"),
+            worktree.join("docs/screens/image.png"),
+            worktree.parent().unwrap().join("parent.png"),
+            worktree.join("docs/screens/été 界 #1%25.png"),
+            worktree.join("docs/screens/literal * {one,two}.png"),
+        ] {
+            image::RgbaImage::from_pixel(2, 2, image::Rgba([7, 23, 42, 255]))
+                .save(path)
+                .unwrap();
+        }
+        for (link, expected) in [
+            ("./image.png", worktree.join("image.png")),
+            (
+                "docs/screens/image.png",
+                worktree.join("docs/screens/image.png"),
+            ),
+            (
+                "../parent.png",
+                worktree.parent().unwrap().join("parent.png"),
+            ),
+            (
+                "docs/screens/été%20界%20%231%2525.png",
+                worktree.join("docs/screens/été 界 #1%25.png"),
+            ),
+            (
+                "docs/screens/literal%20*%20%7Bone,two%7D.png",
+                worktree.join("docs/screens/literal * {one,two}.png"),
+            ),
+        ] {
+            let mut app = app();
+            drop(app.new_native_chat(crate::agent::Provider::Codex, Some(worktree.clone())));
+            let source = app.workspace.focused().unwrap();
+            let target: Target = match app.cards.get_mut(&source).unwrap() {
+                CardRuntime::Chat(runtime) => {
+                    // Simulate a later selection/launch change after rendering.
+                    runtime.session.launch.recipe.working_directory = selected.clone();
+                    runtime.target
+                }
+                _ => panic!("draft chat"),
+            };
+            app.active_workspace = Some(selected.clone());
+            let click = Action::OpenDocumentFrom(target, Some(worktree.join(".chat")), link.into());
+            let task = app.handle_chat_ui(click);
+            settle(&mut app, task).await;
+            let file = runtime(&app, app.workspace.focused().unwrap());
+            assert_eq!(
+                file.descriptor.worktree.join(file.selected_path().unwrap()),
+                expected
+            );
+            assert_eq!(
+                image::open(expected).unwrap().width(),
+                2,
+                "real PNG fixture"
+            );
+        }
+    }
+
+    /// `src/lib.rs:12` in a chat opens the file with its caret on line 12.
+    #[tokio::test]
+    async fn chat_file_position_links_open_at_their_line() {
+        use super::super::chat_ui::{Action, Target};
+        let directory = tempfile::tempdir().unwrap();
+        let worktree = directory.path().to_path_buf();
+        std::fs::create_dir_all(worktree.join("src")).unwrap();
+        let text: String = (1..=40).map(|line| format!("line {line}\n")).collect();
+        std::fs::write(worktree.join("src/lib.rs"), text).unwrap();
+        let mut app = app();
+        drop(app.new_native_chat(crate::agent::Provider::Codex, Some(worktree.clone())));
+        let source = app.workspace.focused().unwrap();
+        let target: Target = match app.cards.get(&source).unwrap() {
+            CardRuntime::Chat(runtime) => runtime.target,
+            _ => panic!("draft chat"),
+        };
+        let click =
+            Action::OpenDocumentFrom(target, Some(worktree.join(".chat")), "src/lib.rs:12".into());
+        let task = app.handle_chat_ui(click);
+        settle(&mut app, task).await;
+        let file = runtime(&app, app.workspace.focused().unwrap());
+        assert_eq!(
+            file.descriptor.worktree.join(file.selected_path().unwrap()),
+            worktree.join("src/lib.rs")
+        );
+        assert_eq!(file.cursor_position().map(|at| at.line), Some(11));
+    }
+
+    #[tokio::test]
+    async fn unknown_child_directory_refuses_relative_links_without_reading_parent_files() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("image.png"),
+            "parent's unrelated file",
+        )
+        .unwrap();
+        let mut app = app();
+        let source = app.workspace.focused().unwrap();
+        let before = app.workspace.cards().len();
+        let task = app.open_document_link_from(Some(source), None, "image.png");
+        settle(&mut app, task).await;
+        assert_eq!(app.workspace.cards().len(), before);
+        assert_eq!(app.workspace.focused(), Some(source));
+        assert!(app.status.as_ref().is_some_and(|notice| {
+            notice.message.contains("image.png")
+                && notice.message.contains("verified working directory")
+        }));
+        let absolute = directory.path().join("absolute.txt");
+        std::fs::write(&absolute, "explicit child artifact").unwrap();
+        let task = app.open_document_link_from(Some(source), None, absolute.to_str().unwrap());
+        settle(&mut app, task).await;
+        assert_eq!(
+            runtime(&app, app.workspace.focused().unwrap())
+                .editor_text()
+                .as_deref(),
+            Some("explicit child artifact")
+        );
+    }
+
+    #[tokio::test]
+    async fn nul_file_links_refuse_editor_creation_and_preserve_workspace_save() {
+        let directory = tempfile::tempdir().unwrap();
+        let valid = directory.path().join("valid.txt");
+        std::fs::write(&valid, "existing editor content").unwrap();
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.settings.editor_auto_save = false;
+        app.workspace.resize_viewport(1200.0);
+        let task = app.open_document_link(None, Url::from_file_path(&valid).unwrap().as_str());
+        settle(&mut app, task).await;
+        let editor = app.workspace.focused().unwrap();
+        let before = Arc::clone(&app.durable);
+        let store = crate::persistence::StateStore::open(
+            directory.path().join("state.sqlite3"),
+            crate::model::BootId::new("owned-invalid-link-proof"),
+        )
+        .unwrap();
+        let empty = std::collections::BTreeMap::new();
+        let committed = store
+            .save_workspace(
+                &before,
+                crate::persistence::SnapshotBase {
+                    workspace: 0,
+                    cards: &empty,
+                },
+            )
+            .unwrap();
+        let task = app.open_document_link(None, "file:///owned/bad%00.txt");
+        settle(&mut app, task).await;
+        assert_eq!(app.workspace.cards().len(), 1);
+        assert_eq!(app.workspace.focused(), Some(editor));
+        assert_eq!(
+            runtime(&app, editor).editor_text().as_deref(),
+            Some("existing editor content")
+        );
+        assert_eq!(app.durable, before);
+        let committed = store
+            .save_workspace(
+                &app.durable,
+                crate::persistence::SnapshotBase {
+                    workspace: committed.generation,
+                    cards: &committed.card_generations,
+                },
+            )
+            .unwrap();
+        let saved = store.load_workspace(app.durable.id, None).unwrap().unwrap();
+        assert_eq!(saved.generation, committed.generation);
+        assert_eq!(saved.cards.len(), 1);
+        let CardKind::Repository(view) = &saved.cards[0].kind else {
+            panic!("existing editor missing")
+        };
+        assert_eq!(view.selected_file.as_deref(), Some(Path::new("valid.txt")));
+    }
+
+    #[tokio::test]
+    async fn non_utf8_file_link_persists_and_restores_the_exact_selected_file() {
+        use std::os::unix::ffi::OsStringExt;
+        let directory = tempfile::tempdir().unwrap();
+        let name = std::ffi::OsString::from_vec(b"byte-\xff.txt".to_vec());
+        let path = directory.path().join(&name);
+        std::fs::write(&path, "owned raw filename content").unwrap();
+        let target = Url::from_file_path(&path).unwrap().to_string();
+        assert!(target.contains("%FF"));
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.settings.editor_auto_save = false;
+        app.workspace.resize_viewport(1200.0);
+        let store = crate::persistence::StateStore::open(
+            directory.path().join("state.sqlite3"),
+            crate::model::BootId::new("owned-byte-path-proof"),
+        )
+        .unwrap();
+        let empty = std::collections::BTreeMap::new();
+        let before = store
+            .save_workspace(
+                &app.durable,
+                crate::persistence::SnapshotBase {
+                    workspace: 0,
+                    cards: &empty,
+                },
+            )
+            .unwrap();
+        let task = app.open_document_link(None, &target);
+        settle(&mut app, task).await;
+        let editor = app
+            .workspace
+            .focused()
+            .expect("real file link opened an editor");
+        assert_eq!(
+            runtime(&app, editor).editor_text().as_deref(),
+            Some("owned raw filename content")
+        );
+        assert_eq!(
+            runtime(&app, editor).descriptor.selected_file.as_deref(),
+            Some(Path::new(&name))
+        );
+        let result = store.save_workspace(
+            &app.durable,
+            crate::persistence::SnapshotBase {
+                workspace: before.generation,
+                cards: &before.card_generations,
+            },
+        );
+        let committed =
+            result.expect("raw selected filenames must not reject the workspace snapshot");
+        let saved = store.load_workspace(app.durable.id, None).unwrap().unwrap();
+        assert_eq!(saved.generation, committed.generation);
+        let CardKind::Repository(view) = saved
+            .cards
+            .iter()
+            .find(|card| card.id == editor)
+            .unwrap()
+            .kind
+            .clone()
+        else {
+            panic!("saved editor missing")
+        };
+        assert_eq!(view.selected_file.as_deref(), Some(Path::new(&name)));
+        let mut restored = RepositoryRuntime::new(view);
+        let task = repository_task(restored.initial_load(editor));
+        app.cards
+            .insert(editor, CardRuntime::Repository(Box::new(restored)));
+        settle(&mut app, task).await;
+        assert_eq!(
+            runtime(&app, editor).editor_text().as_deref(),
+            Some("owned raw filename content")
+        );
+        println!("actual nonUTF8 file link persisted and restored byte-exact selected_file");
+    }
+
+    #[tokio::test]
+    async fn file_links_open_source_beside_the_terminal_reuse_and_restore_the_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("report one.html");
+        let second = directory.path().join("next.txt");
+        std::fs::write(&first, "<h1>Local result</h1>").unwrap();
+        std::fs::write(&second, "second file").unwrap();
+        let mut app = app();
+        let terminal = app.workspace.focused().unwrap();
+        let scope = PathBuf::from("/source-worktree");
+        Arc::make_mut(&mut app.durable)
+            .card_scopes
+            .insert(terminal, scope.clone());
+        app.worktree_owners.insert(terminal, scope.clone());
+        let task = app.update(Message::OpenLink(
+            terminal,
+            Url::from_file_path(&first).unwrap(),
+            LinkOpenGesture::ControlClick,
+        ));
+        settle(&mut app, task).await;
+        let editor = app.workspace.focused().unwrap();
+        assert_ne!(editor, terminal);
+        assert_eq!(
+            app.workspace.order().collect::<Vec<_>>(),
+            vec![terminal, editor]
+        );
+        assert_eq!(
+            runtime(&app, editor).editor_text().as_deref(),
+            Some("<h1>Local result</h1>")
+        );
+        assert!(runtime(&app, editor).is_directory_only());
+        assert_eq!(app.durable.card_scopes.get(&editor), Some(&scope));
+        assert_eq!(
+            app.card_state(editor).unwrap().width_fraction,
+            app.settings.default_native_pane_fraction
+        );
+        assert!(
+            app.workspace.is_animating(),
+            "exercise reuse before the focused editor's reveal animation finishes"
+        );
+
+        let task = app.update(Message::OpenDocumentLink(
+            terminal,
+            Url::from_file_path(&second).unwrap().into(),
+        ));
+        settle(&mut app, task).await;
+        assert_eq!(app.workspace.focused(), Some(editor));
+        assert_eq!(app.workspace.cards().len(), 2);
+        assert_eq!(
+            runtime(&app, editor).editor_text().as_deref(),
+            Some("second file")
+        );
+
+        let saved: WorkspaceState =
+            serde_json::from_slice(&serde_json::to_vec(&*app.durable).unwrap()).unwrap();
+        let CardKind::Repository(view) = saved
+            .cards
+            .iter()
+            .find(|state| state.id == editor)
+            .unwrap()
+            .kind
+            .clone()
+        else {
+            panic!()
+        };
+        assert_eq!(view.selected_file, Some(PathBuf::from("next.txt")));
+        let mut restored = RepositoryRuntime::new(view);
+        let task = restored.initial_load(editor);
+        app.cards
+            .insert(editor, CardRuntime::Repository(Box::new(restored)));
+        settle(&mut app, repository_task(task)).await;
+        assert_eq!(
+            runtime(&app, editor).editor_text().as_deref(),
+            Some("second file")
+        );
+    }
+
+    #[tokio::test]
+    async fn dirty_file_links_preserve_buffers_and_channel_ownership() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.md");
+        let second = directory.path().join("second.txt");
+        std::fs::write(&first, "first").unwrap();
+        std::fs::write(&second, "second").unwrap();
+        let mut app = app();
+        let terminal = app.workspace.focused().unwrap();
+        let channel = crate::model::ChannelId::new();
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.channels.push(crate::model::ProjectChannel {
+            title_source: Default::default(),
+            id: channel,
+            project_id: ProjectId::new(),
+            title: "Results".into(),
+            ordinal: 0,
+            shared: false,
+            cards: vec![terminal],
+            focused: Some(terminal),
+        });
+        durable.active_channel = Some(channel);
+        let task = app.open_document_link(
+            Some(terminal),
+            Url::from_file_path(&first).unwrap().as_str(),
+        );
+        settle(&mut app, task).await;
+        let first_card = app.workspace.focused().unwrap();
+        drop(
+            app.update(Message::Repository(RepositoryAction::EditorAction {
+                card: first_card,
+                action: repository_widget::EditorAction::Edit(
+                    repository_widget::EditorEdit::Insert('!'),
+                ),
+            })),
+        );
+        assert!(runtime(&app, first_card).is_dirty());
+        let dirty = runtime(&app, first_card).editor_text();
+        let task = app.open_document_link(
+            Some(terminal),
+            Url::from_file_path(&first).unwrap().as_str(),
+        );
+        settle(&mut app, task).await;
+        assert_eq!(app.workspace.focused(), Some(first_card));
+        assert_eq!(runtime(&app, first_card).editor_text(), dirty);
+        let task = app.open_document_link(
+            Some(terminal),
+            Url::from_file_path(&second).unwrap().as_str(),
+        );
+        settle(&mut app, task).await;
+        let second_card = app.workspace.focused().unwrap();
+        assert_ne!(first_card, second_card);
+        assert_eq!(runtime(&app, first_card).editor_text(), dirty);
+        assert_eq!(std::fs::read_to_string(first).unwrap(), "first");
+        let channel = &app.durable.channels[0];
+        assert!(channel.cards.contains(&first_card) && channel.cards.contains(&second_card));
+    }
+
+    #[tokio::test]
+    async fn document_link_coordinates_survive_dispatch_and_file_loading() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.md");
+        let target = directory.path().join("target.txt");
+        let encoded_name = directory.path().join("target#part?.txt");
+        let numeric_name = directory.path().join("target.txt:12:3");
+        let text: String = (1..=16)
+            .map(|line| format!("line {line:02} content\n"))
+            .collect();
+        std::fs::write(&source, "[target](target.txt#L12:3)\n").unwrap();
+        std::fs::write(&target, &text).unwrap();
+        std::fs::write(&encoded_name, &text).unwrap();
+        std::fs::write(&numeric_name, &text).unwrap();
+        let file_url = Url::from_file_path(&target).unwrap();
+        for (uri, expected_path, line, column) in [
+            ("target.txt#L12:3".to_owned(), &target, 11, 2),
+            (format!("{}#L12:3", target.display()), &target, 11, 2),
+            (format!("{file_url}#L12:3"), &target, 11, 2),
+            ("target.txt:12:3".to_owned(), &target, 11, 2),
+            ("target.txt?revision=7:3".to_owned(), &target, 0, 0),
+            ("target.txt?revision=7:3#L12:3".to_owned(), &target, 11, 2),
+            ("target%23part%3F.txt:12:3".to_owned(), &encoded_name, 11, 2),
+            (
+                format!("file:{}", numeric_name.display()),
+                &numeric_name,
+                0,
+                0,
+            ),
+            (
+                format!("FILE:{}", numeric_name.display()),
+                &numeric_name,
+                0,
+                0,
+            ),
+        ] {
+            let mut app = app();
+            let terminal = app.workspace.focused().unwrap();
+            let task = app.update(Message::OpenDocumentLink(
+                terminal,
+                Url::from_file_path(&source).unwrap().into(),
+            ));
+            settle(&mut app, task).await;
+            let editor = app.workspace.focused().unwrap();
+            assert_ne!(editor, terminal);
+            assert_eq!(
+                runtime(&app, editor).selected_path(),
+                Some(Path::new("source.md"))
+            );
+
+            // Use the actual rendered-document action and loader callbacks;
+            // the fragment must also survive the deferred Loading state.
+            let task = app.update(Message::Repository(RepositoryAction::MarkdownLink {
+                card: editor,
+                uri: uri.clone(),
+            }));
+            settle(&mut app, task).await;
+            let runtime = runtime(&app, editor);
+            assert_eq!(app.workspace.focused(), Some(editor), "{uri}");
+            assert_eq!(
+                runtime
+                    .descriptor
+                    .worktree
+                    .join(runtime.selected_path().unwrap()),
+                *expected_path,
+                "{uri}"
+            );
+            assert_eq!(
+                runtime.editor_text().as_deref(),
+                Some(text.as_str()),
+                "{uri}"
+            );
+            assert_eq!(
+                runtime.cursor_position(),
+                Some(crate::lsp::LspPosition::new(line, column)),
+                "{uri}"
+            );
+            assert!(!runtime.is_dirty(), "navigation must not edit {uri}");
+            assert_eq!(
+                std::fs::read_to_string(expected_path).unwrap(),
+                text,
+                "{uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn local_document_links_resolve_relative_paths_but_chat_rejects_remote_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.md");
+        std::fs::write(&first, "[next](next%20file.md#result)").unwrap();
+        std::fs::write(directory.path().join("next file.md"), "# Result\nEvidence").unwrap();
+        let mut app = app();
+        let terminal = app.workspace.focused().unwrap();
+        let task =
+            app.open_document_link(Some(terminal), Url::from_file_path(first).unwrap().as_str());
+        settle(&mut app, task).await;
+        let editor = app.workspace.focused().unwrap();
+        let task = app.update(Message::Repository(RepositoryAction::MarkdownLink {
+            card: editor,
+            uri: "next%20file.md#result".into(),
+        }));
+        settle(&mut app, task).await;
+        assert_eq!(
+            runtime(&app, editor).editor_text().as_deref(),
+            Some("# Result\nEvidence")
+        );
+        assert_eq!(
+            runtime(&app, editor).inspector_context().markdown_mode,
+            Some("Preview")
+        );
+        for link in [
+            "file://remote/etc/passwd",
+            "javascript:alert(1)",
+            "relative.txt",
+        ] {
+            let task = app.update(Message::OpenDocumentLink(terminal, link.into()));
+            settle(&mut app, task).await;
+            assert_eq!(app.workspace.cards().len(), 2);
+            assert_eq!(
+                runtime(&app, editor).editor_text().as_deref(),
+                Some("# Result\nEvidence")
+            );
+            assert!(!app.notices.entries.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn source_ownership_beats_sidebar_selection_and_other_visible_file_scopes() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("one.txt");
+        let second = directory.path().join("two.txt");
+        std::fs::write(&first, "one").unwrap();
+        std::fs::write(&second, "two").unwrap();
+        let mut app = app();
+        app.workspace.resize_viewport(1600.0);
+        let source_a = app.workspace.focused().unwrap();
+        app.workspace
+            .set_card_width(source_a, CardWidth::Fixed(180.0))
+            .unwrap();
+        let [project_a, project_b] = [ProjectId::new(), ProjectId::new()];
+        let [scope_a, scope_b] = [PathBuf::from("/scope-a"), PathBuf::from("/scope-b")];
+        for (project, scope) in [(project_a, &scope_a), (project_b, &scope_b)] {
+            app.sidebar_model.projects.push(SidebarProject::new(
+                project,
+                RepositoryId::new(),
+                "Project".into(),
+                scope.clone(),
+                vec![SidebarWorktree::from_durable(
+                    crate::model::WorktreeId::new(),
+                    scope.clone(),
+                    None,
+                )],
+                Vec::new(),
+            ));
+        }
+        Arc::make_mut(&mut app.durable)
+            .card_scopes
+            .insert(source_a, scope_a.clone());
+        app.worktree_owners.insert(source_a, scope_a.clone());
+        drop(app.add_repository_card(project_b, scope_b.clone(), scope_b.clone()));
+        let browser = app.workspace.focused().unwrap();
+        app.workspace
+            .set_card_width(browser, CardWidth::Fixed(180.0))
+            .unwrap();
+        let key = app.sidebar_model.worktree_at(&scope_b).unwrap();
+        app.sidebar_state.apply(&SidebarAction::OpenWorktree {
+            project_id: key.project_id,
+            worktree_id: key.worktree_id,
+            path: scope_b.clone(),
+        });
+        let task =
+            app.open_document_link(Some(source_a), Url::from_file_path(first).unwrap().as_str());
+        settle(&mut app, task).await;
+        let file_a = app.workspace.focused().unwrap();
+        assert_ne!(file_a, browser);
+        assert!(runtime(&app, browser).selected_path().is_none());
+        assert_eq!(runtime(&app, file_a).descriptor.project, project_a);
+        assert_eq!(app.durable.card_scopes.get(&file_a), Some(&scope_a));
+        // Repository loading does not advance the pane's layout/reveal animation.
+        let update = app.workspace.tick(std::time::Duration::from_secs(1));
+        drop(app.apply_viewport(update, true, DurableChange::None));
+        assert_eq!(
+            app.workspace.visibility(file_a),
+            Some(VisibilityClass::Visible)
+        );
+        let task =
+            app.open_document_link(Some(browser), Url::from_file_path(second).unwrap().as_str());
+        settle(&mut app, task).await;
+        let file_b = app.workspace.focused().unwrap();
+        assert_ne!(
+            file_a, file_b,
+            "a file pane owned by another scope cannot be repurposed"
+        );
+        assert_eq!(runtime(&app, file_a).editor_text().as_deref(), Some("one"));
+        assert_eq!(runtime(&app, file_b).editor_text().as_deref(), Some("two"));
+        assert_eq!(runtime(&app, file_b).descriptor.project, project_b);
+        assert_eq!(app.durable.card_scopes.get(&file_b), Some(&scope_b));
+    }
+}

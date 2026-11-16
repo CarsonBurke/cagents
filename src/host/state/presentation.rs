@@ -352,6 +352,11 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(handle.snapshot().scroll.total >= 101);
+        // Published rows do not mean the worker is settled: it can still hold
+        // a later change back for redraw credit, and the next viewport read
+        // would capture it as a new generation. A read is ordered after every
+        // queued command and replies only once nothing is withheld.
+        handle.viewport_snapshot(Some(0), None, true).unwrap();
         (
             Arc::new(crate::host::state::HostLock::new(state)),
             handle,

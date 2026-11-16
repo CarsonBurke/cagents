@@ -111,9 +111,17 @@ def scenario_class(peer, storage, listener):
             descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
             with os.fdopen(descriptor) as stream:
                 state = json.load(stream)
-            if (not {"thread", "child", "latest"} <= set(state)
-                    or set(state) - {"thread", "child", "latest", "child_latest", "interrupting"}):
+            if (not isinstance(state, dict)
+                    or not {"thread", "child", "latest"} <= set(state)
+                    or set(state) - {"thread", "child", "latest", "child_latest", "interrupting",
+                                     "model", "reasoning"}):
                 raise ValueError("invalid persisted rehearsal app-server state")
+            model = state.get("model", "fixture-mini")
+            reasoning = state.get("reasoning")
+            if not isinstance(model, str) or not model:
+                raise ValueError("invalid persisted rehearsal model")
+            if reasoning is not None and (not isinstance(reasoning, str) or not reasoning):
+                raise ValueError("invalid persisted rehearsal reasoning effort")
             thread_path(state["thread"])
             thread_path(state["child"])
             for turn in (state["latest"], state.get("child_latest")):

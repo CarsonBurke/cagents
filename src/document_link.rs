@@ -11,9 +11,17 @@ pub enum DocumentLink {
     },
 }
 
-/// Parse the file coordinates emitted by coding agents, preserving URL ports.
+/// Parse coding-agent coordinates on bare paths, preserving URI query and fragment data.
 pub fn file_position(target: &str) -> (&str, Option<String>) {
-    if target.contains("://") || target.starts_with("mailto:") {
+    if target.contains("://")
+        || target.split_once(':').is_some_and(|(scheme, _)| {
+            ["http", "https", "file", "mailto"]
+                .iter()
+                .any(|known| scheme.eq_ignore_ascii_case(known))
+        })
+        || target.contains('#')
+        || target.contains('?')
+    {
         return (target, None);
     }
     let Some((prefix, last)) = target.rsplit_once(':') else {
@@ -90,6 +98,61 @@ mod tests {
         }
     }
     #[test]
+    fn coding_agent_coordinates_preserve_explicit_schemes_without_authority() {
+        // These are URI schemes even without `://`. Numeric tail bytes belong
+        // to the URI, including a literal colon in an absolute file path.
+        for target in [
+            "http:example.test:8443",
+            "HTTPS:example.test:8443",
+            "file:/repo/report.txt:12:3",
+            "FILE:/repo/report.txt:12:3",
+            "mailto:person@example.test:42",
+            "MAILTO:person@example.test:42",
+        ] {
+            assert_eq!(file_position(target), (target, None), "{target}");
+        }
+        for target in ["file:/repo/report.txt:12:3", "FILE:/repo/report.txt:12:3"] {
+            assert_eq!(
+                resolve(Path::new("/repo/source.md"), target).unwrap(),
+                DocumentLink::Local {
+                    path: "/repo/report.txt:12:3".into(),
+                    fragment: None,
+                },
+                "{target}"
+            );
+        }
+        // Scheme-looking basename coordinates remain the supported bare-path
+        // grammar; recognizing every URL-parsable prefix would swallow these.
+        assert_eq!(
+            file_position("main.rs:12:3"),
+            ("main.rs", Some("L12:3".into()))
+        );
+    }
+
+    #[test]
+    fn coding_agent_coordinates_preserve_uri_query_and_fragment_boundaries() {
+        for target in [
+            "src/main.rs#L12:3",
+            "/repo/src/main.rs#L12:3",
+            "#L12:3",
+            "src/main.rs?revision=7:3",
+            "src/main.rs?revision=7:3#L12:3",
+            "file:///repo/src/main.rs#L12:3",
+            "https://localhost:3000/src/main.rs?revision=7:3#L12:3",
+        ] {
+            assert_eq!(file_position(target), (target, None), "{target}");
+        }
+        // Encoded delimiter bytes belong to the filename, so they do not
+        // prevent a bare-path suffix from supplying coordinates.
+        for (target, path) in [
+            ("src/a%23b.rs:12:3", "src/a%23b.rs"),
+            ("src/a%3Fb.rs:12:3", "src/a%3Fb.rs"),
+        ] {
+            assert_eq!(file_position(target), (path, Some("L12:3".into())));
+        }
+    }
+
+    #[test]
     fn heading_fragments_preserve_duplicate_and_explicit_suffix_collisions() {
         let items: Vec<_> =
             markdown::parse("# Repeated\n# Repeated-1\n# Repeated\n# Repeated-1\n# Repeated\n")
@@ -153,7 +216,7 @@ use cosmic::iced::{
 };
 use cosmic::widget::markdown;
 
-pub(crate) fn heading_index(items: &[markdown::Item], fragment: &str) -> Option<usize> {
+pub fn heading_index(items: &[markdown::Item], fragment: &str) -> Option<usize> {
     let mut used = std::collections::HashSet::new();
     // Each base slug resumes after its last suffix, instead of retrying every
     // preceding duplicate when a generated document repeats a heading.
@@ -199,11 +262,11 @@ pub(crate) fn heading_index(items: &[markdown::Item], fragment: &str) -> Option<
     None
 }
 
-pub(crate) fn heading_id(card: crate::model::CardId, index: usize) -> Id {
+pub fn heading_id(card: crate::model::CardId, index: usize) -> Id {
     Id::new(format!("document-heading-{card}-{index}"))
 }
 
-pub(crate) fn scroll_to_heading<T: Send + 'static>(scroll: Id, target: Id) -> iced::Task<T> {
+pub fn scroll_to_heading<T: Send + 'static>(scroll: Id, target: Id) -> iced::Task<T> {
     scroll_to_heading_anchored(scroll, target, false)
 }
 
@@ -271,7 +334,7 @@ pub(crate) fn scroll_to_heading_anchored<T: Send + 'static>(
     })
 }
 
-pub(crate) struct PreviewViewer;
+pub struct PreviewViewer;
 impl<'a> markdown::Viewer<'a, markdown::Uri, cosmic::Theme, cosmic::Renderer> for PreviewViewer {
     fn on_link_click(uri: markdown::Uri) -> markdown::Uri {
         uri

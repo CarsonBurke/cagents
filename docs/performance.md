@@ -2,11 +2,13 @@
 
 - [Redraw scheduling](#redraw-scheduling)
 - [Activity spinner cost](#activity-spinner-cost)
+- [Idle UI wakeups](#idle-ui-wakeups)
 - [Native chat stage attribution](#native-chat-stage-attribution)
 - [Pane open](#pane-open)
 - [Terminal pipeline](#terminal-pipeline)
 - [Terminal search](#terminal-search)
 - [Busy terminals and the update tail](#busy-terminals-and-the-update-tail)
+- [Workspace model edits](#workspace-model-edits)
 - [Native chat viewport](#native-chat-viewport)
 - [Idle retained actors](#idle-retained-actors)
 - [Work board polling](#work-board-polling)
@@ -58,7 +60,7 @@ coalesced move per frame saves over applying every wheel notch.
 ## Activity spinner cost
 
 Each visible activity spinner asks for a whole-window redraw every
-`SPINNER_FRAME` (100 ms, `src/ui_controls/gauge.rs`) while the main window is
+`SPINNER_FRAME` (100 ms, `crates/cagents-ui/src/ui_controls/gauge.rs`) while the main window is
 focused. An unfocused window may still be in view, so its spinners keep turning,
 but slower: they ask for a frame every `SPINNER_BACKGROUND_FRAME` (500 ms) and
 advance one focused step per frame. Measure the UI process with one busy agent
@@ -97,6 +99,56 @@ unfocused spinners instead of stopping them costs little: an earlier revision
 that stopped them entirely measured 1.0-1.6% with another window focused
 (3 wakeups/s).
 
+## Idle UI wakeups
+
+A focused text cursor blinks for ten seconds after the last input, then rests
+visible and asks for no more frames, following GTK's
+`gtk-cursor-blink-timeout`. Every cursor shares that schedule:
+`iced_core::text::Blink` in `vendor/iced-core`, used by iced's text editor and
+text input (`vendor/iced-widget`), libcosmic's text input, the app's code editor
+and the terminal. Before, each focused cursor repainted the whole window every
+500 ms for as long as it held focus, and the chat composer holds focus after a
+chat opens or a message is sent.
+
+Where the desktop states its own blink through the settings portal
+(`org.gnome.desktop.interface` on GNOME, GTK and COSMIC), cursors use its
+interval and timeout instead, and follow changes while the app runs. With
+blinking turned off, every cursor is steady and asks for no frames, including a
+terminal whose program requested a blinking cursor.
+
+To measure it, seed a fixture with 30 settled chats, start a session with
+`scripts/native-evidence start SIDE --ui-trace`, spawn three agents whose
+first turn stays busy, then interrupt them. Leave the composer focused and the
+pointer still. Sample each UI thread's `voluntary_ctxt_switches` and
+`schedstat` CPU time from `/proc/PID/task/*` over 60 s, 30 s after spawning
+and 20 s after interrupting. The `ui-trace` summaries give the redraw count and
+time per five-second window.
+
+Local reference: fw16 (Ryzen 7 7840HS), `dev-runtime` build, headless nested
+session at 1500x900. Before is `374370965`; after is `2aec4b05c`. CPU is a
+percentage of one core:
+
+| State | Before | After |
+| --- | --- | --- |
+| Agents settled, composer focused: UI thread | 7.0 wakeups/s, 2.0% | 1.7 wakeups/s, 1.1% |
+| Agents settled, composer focused: redraws | 2.7/s | 0.8/s |
+| Agents settled, composer focused: clipboard thread | 6.2 wakeups/s | 2.2 wakeups/s |
+| Three agents working: UI thread | 26.4 wakeups/s, 6.1% | 23.5 wakeups/s, 5.5% |
+
+The after build also has the wgpu-core change below, which makes every frame
+cheaper, so the CPU columns credit both changes. The wakeups and redraws are
+the cursor's alone. With agents working, the spinners already ask for ten
+frames a second, so the cursor's frames made little difference there. Neither side logged a UI-thread
+call over 50 ms after startup. The remaining settled redraws follow the app's
+own updates.
+
+`dev-runtime` builds also turn off wgpu-core's debug assertions. With them,
+WGPU captured a backtrace whenever it took its snatch lock, on every frame, and
+the runner's `RUST_BACKTRACE=1` made that a real stack walk: about 16% of the
+UI thread's profile samples with three agents working. Release builds never
+paid it. The CPU difference in the working row is within the noise of the
+shared build host.
+
 ## UI thread trace
 
 Development UI builds started with `CAGENTS_UI_TRACE` set log, every five
@@ -110,6 +162,24 @@ A nested `update` counts toward the outermost one. Overlays' own layout and
 drawing, the libcosmic chrome around the application view, and the renderer's
 presentation run outside the measured root, so the thread's CPU time exceeds
 the traced total.
+Each five-second report also covers the frames the shell presented, on any of
+its surfaces: how many, the p50/p95/p99/max **work** of each, and the same
+quantiles of the **interval** between consecutive presentations, as
+`ui-trace   Frames n=N work ...` and `ui-trace   Frames interval ...`. A
+frame's work is the wall time the shell spent handling events since it
+presented the previous frame, up to presenting this one: the updates, view,
+layout, drawing and presentation it took, but not time spent waiting for
+events, nor winit's own dispatch outside the shell's event handler. The first
+frame also carries startup, including creating the compositor. The interval
+shows pacing against the display's refresh only while the UI draws
+continuously, as during streaming or an animation: the shell draws on demand,
+so the first frame after an idle stretch reports that stretch as its interval.
+Popups, menus and tooltips are surfaces of their own, so presenting one beside
+the main window adds a short interval and splits the work between the two. A
+window with no frames and no other traced work prints nothing, so an idle UI
+that draws nothing stays silent. The shell reports frames through
+`iced_runtime::frame`, a hook in the vendored runtime; see
+`vendor/iced-winit/README.cagents.md`.
 `scripts/native-evidence start SIDE --ui-trace` sets the variable for a session;
 the lines go to its `logs/ui-SIDE.log`. Without the variable a scope reads one
 flag, and other builds compile the trace out.
@@ -353,7 +423,7 @@ change no metadata, and repaint-only ticks (`ChatUi` ticks and, in the
 integrated build, browser progress ticks), now skip it. A wake whose only
 change is a reported terminal title (OSC 0/2) runs only chrome, which includes
 the window title. Reported titles on their own cause at most one save, and
-one publication to shared views, every three seconds. The unit tests in `src/app/terminal_output_tests.rs`
+one publication to shared views, every three seconds. The unit tests in `crates/cagents-ui/src/app/terminal_output_tests.rs`
 count the tail passes, chrome syncs and saves each message causes.
 
 The native workload has no script. In the browserless development runner,
@@ -386,13 +456,47 @@ resolution, layout, accessibility projection and allocation. After the change,
 the remaining title-churn time is mostly the same view, layout and render work
 that each title causes; `sync_chrome` is about 0.2% of samples.
 
+## Workspace model edits
+
+A pane edit in one window reaches every other window as a model edge. The
+window applies the edge's effects to its copy and, for a settled presentation
+change such as a pane title, projects only that scope. Two trace targets show
+where that work goes; with both disabled these paths read no clock and
+allocate nothing.
+
+- `cagents::workspace_pipeline=debug` records the inclusive wall time of each
+  shared-model update, including its projection tail, and of each replica
+  snapshot timer and capture.
+- `cagents::workspace_projection=trace` records whether each update projected
+  one scope or the whole workspace, with the reason when it fell back. A unit
+  fixture's eligibility does not show that a native workload qualifies, so
+  count selected and full projections in the native run.
+
+Measure edits on the generated large workspace with fixture agents streaming,
+one of them visible, and drive a fixed number of pane title edits at a fixed
+interval through `ApplyWorkspaceEdit` from a separate client. Compare UI
+main-thread CPU and the UI thread trace's update and frame times over the edit
+interval on both sides.
+
+Start the native evidence session with `--ui-trace --workspace-trace` to
+record both inclusive update time and the selected/full projection decisions.
+`scripts/native-evidence open-window window-2` opens the peer through the
+development runner using the same recorded binaries, without compiling under
+the native lock. Its trace is `logs/ui-SIDE-window-2.log`; the primary trace
+is `logs/ui-SIDE.log`.
+
+The current-main comparison for the UI half of this work is tracked in
+[#2789](https://github.com/CarsonBurke/cagents/pull/2789). Its measurement table
+identifies the actual application revisions, workload, raw receipts and
+qualifications; historical #2573 results are not measurements of this branch.
+
 ## Native chat viewport
 
 Run the headless viewport contract with optimized application code, separately
 from native application measurements:
 
 ```sh
-CARGO_BUILD_JOBS=2 cargo test --locked --no-default-features --features ui \
+CARGO_BUILD_JOBS=2 cargo test --locked -p cagents-ui \
   --profile dev-runtime --config 'profile.dev-runtime.opt-level=2' \
   --config 'profile.dev-runtime.debug-assertions=false' --lib \
   chat_ui::view::frame_cost::viewport_cost_with_a_megabyte_answer_and_three_hundred_tools \
@@ -422,7 +526,7 @@ state, process identity, sampled UI CPU/RSS/PSS, and time boundaries alongside
 raw samples. Exercise `huge 1024`, `stream 300 300`, 43 composer characters,
 40 wheel notches, Find, selection/copy, and a hidden `tools 300` child. Opening
 the 1 MiB answer has a 150 MB RSS growth budget. Switching away keeps the
-most recently hidden chats warm (`src/app/chat_ui/warm.rs`): at most 8, within
+most recently hidden chats warm (`crates/cagents-ui/src/app/chat_ui/warm.rs`): at most 8, within
 an estimated 96 MiB of heap together, and none over 32 MiB, which goes cold as
 it hides. The estimate is calibrated against the heap cooling frees, measured
 by `frame_cost::what_a_warm_hidden_chat_holds`. After switching away from a

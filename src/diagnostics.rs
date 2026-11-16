@@ -124,7 +124,7 @@ const CHECK_BYTES: usize = 160;
 impl Check {
     /// Only storage names a rule; it makes one from a
     /// [`crate::persistence::RefusedCheck`], which never holds content.
-    pub(crate) fn new(rule: &str) -> Self {
+    pub fn new(rule: &str) -> Self {
         Self(bounded(rule))
     }
 

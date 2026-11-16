@@ -24,8 +24,8 @@
 # stop the evidence session afterward. Commands only describe synthetic output.
 set -euo pipefail
 
-scene=${1:?usage: reasoning-row-scene.sh wide|narrow|web|coordination|diagnostics|refresh-core|refresh-notices}
-case "$scene" in wide|narrow|web|coordination|diagnostics|refresh-core|refresh-notices) ;; *) exit 2 ;; esac
+scene=${1:?usage: reasoning-row-scene.sh wide|narrow|web|coordination|diagnostics|refresh-core|refresh-notices|activity|agents|plan}
+case "$scene" in wide|narrow|web|coordination|diagnostics|refresh-core|refresh-notices|activity|agents|plan) ;; *) exit 2 ;; esac
 transcript_right=810
 if [ "$scene" = narrow ]; then transcript_right=535; fi
 here=$(cd -- "$(dirname -- "$0")" && pwd)
@@ -104,6 +104,17 @@ click_row() {
     local point
     point=$(find_row "$1" "${2:-0}")
     evidence drive click "$point" >/dev/null
+    sleep 1
+}
+
+# A coordination row's detail opens and closes from its context menu, since
+# pressing the row opens its agent.
+row_detail() {
+    local point
+    point=$(find_row "$1")
+    evidence drive click --button right "$point" >/dev/null
+    sleep 1
+    evidence drive click "$2" >/dev/null
     sleep 1
 }
 
@@ -213,8 +224,16 @@ spawn_scene() {
     channel=$(printf '%s' "$channel_json" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["channel"]["id"])')
     evidence cli --json agent spawn --provider "$provider" --model "$model" --surface chat \
         --repository "$fixture/project" --channel "$channel" --prompt "$prompt" >"$receipt"
-    evidence drive key ctrl+shift+p >/dev/null
-    evidence drive wait 'Search commands' --timeout 5 >/dev/null
+    # A session that has only just started can miss the first shortcut.
+    local opened=false
+    for _ in 1 2 3; do
+        evidence drive key ctrl+shift+p >/dev/null
+        if evidence drive wait 'Search commands' --timeout 5 >/dev/null 2>&1; then opened=true; break; fi
+        # Close a palette that opened too late to be seen before trying again.
+        evidence drive key Escape >/dev/null
+        sleep 1
+    done
+    [ "$opened" = true ] || { printf '%s\n' 'reasoning-row-scene: command palette did not open' >&2; exit 1; }
     evidence drive type "# $title" >/dev/null
     evidence drive key Return >/dev/null
 }
@@ -262,6 +281,96 @@ if [ "$scene" = refresh-core ]; then
     exit 0
 fi
 
+# One turn's activity while it works and after it finishes. An empty thought
+# opens the turn; a background command keeps the command group running while
+# a second empty thought is live, and then while a newer command runs in a
+# group of its own. The receipt arrives and the turn ends.
+if [ "$scene" = activity ]; then
+    cp "$here/reasoning-row-scene/activity.jsonl" "$config/fixture-frames.jsonl.next"
+    mv "$config/fixture-frames.jsonl.next" "$config/fixture-frames.jsonl"
+    evidence cli project open "$fixture/project" >/dev/null
+    spawn_scene claude haiku 'Fixture: wait for the receipt and confirm the worktree.' \
+        "$fixture/state/reasoning-activity-spawn.json" 'Turn activity'
+    ready=false
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        if rg -q '"uuid":"activity-wait-1-ack"' "$config/projects"; then ready=true; break; fi
+        sleep 2
+    done
+    [ "$ready" = true ] || { printf '%s\n' 'reasoning-row-scene: background command did not start' >&2; exit 1; }
+    sleep 4
+    scroll_top
+    shot activity-working
+    ready=false
+    for _ in $(seq 30); do
+        if rg -q '"uuid":"activity-check-1-call"' "$config/projects"; then ready=true; break; fi
+        sleep 1
+    done
+    [ "$ready" = true ] || { printf '%s\n' 'reasoning-row-scene: the second command did not start' >&2; exit 1; }
+    sleep 3
+    scroll_top
+    shot activity-working-next
+    finished=false
+    for _ in $(seq 60); do
+        if rg -q '"uuid":"activity-answer-1"' "$config/projects"; then finished=true; break; fi
+        sleep 1
+    done
+    [ "$finished" = true ] || { printf '%s\n' 'reasoning-row-scene: the turn did not finish' >&2; exit 1; }
+    sleep 3
+    scroll_top
+    shot activity-finished
+    printf '%s\n' 'Captured a working turn at two points and the same turn finished.'
+    exit 0
+fi
+
+# Subagents still working after the lead has answered, beside a finished one
+# and an older background command: the transcript keeps one activity
+# indicator.
+if [ "$scene" = agents ]; then
+    cp "$here/reasoning-row-scene/agents.jsonl" "$config/fixture-frames.jsonl.next"
+    mv "$config/fixture-frames.jsonl.next" "$config/fixture-frames.jsonl"
+    evidence cli project open "$fixture/project" >/dev/null
+    spawn_scene claude haiku 'Fixture: start the reviewers and wait for the receipt.' \
+        "$fixture/state/reasoning-agents-spawn.json" 'Agents at work'
+    ready=false
+    for _ in $(seq 30); do
+        if rg -q '"uuid":"agents-answer-1"' "$config/projects"; then ready=true; break; fi
+        sleep 1
+    done
+    [ "$ready" = true ] || { printf '%s\n' 'reasoning-row-scene: the lead did not answer' >&2; exit 1; }
+    sleep 3
+    scroll_top
+    shot agents-idle
+    printf '%s\n' 'Captured subagents working after the lead answered.'
+    exit 0
+fi
+
+# A Codex turn of running tool, collaboration and event rows with a plan step
+# in progress, held working for 40 seconds, then finished.
+if [ "$scene" = plan ]; then
+    [ -x "$fixture/bin/codex" ] && [ -d "$fixture/home/.codex" ] || {
+        printf '%s\n' 'reasoning-row-scene: start with --codex tool-rows for plan' >&2
+        exit 2
+    }
+    evidence cli project open "$fixture/project" >/dev/null
+    printf '40\n' >"$fixture/home/.codex/fixture-plan"
+    spawn_scene codex fixture-mini 'Plan fixture: work through the recorded rows.' \
+        "$fixture/state/reasoning-plan-spawn.json" 'Plan at work'
+    held_from=$SECONDS
+    evidence drive wait 'Check the running items' --timeout 20 >/dev/null
+    sleep 4
+    scroll_top
+    shot plan-working
+    # The turn, already started, holds for the marker's 40 seconds; the
+    # screen has no text unique to the finished turn, so wait out the hold.
+    while ((SECONDS < held_from + 45)); do sleep 1; done
+    sleep 2
+    scroll_top
+    shot plan-finished
+    rm -f "$fixture/home/.codex/fixture-plan"
+    printf '%s\n' 'Captured a working Codex turn with its plan, then finished.'
+    exit 0
+fi
+
 if [ "$scene" = refresh-notices ]; then
     cp "$here/reasoning-row-scene/notices.jsonl" "$config/fixture-frames.jsonl.next"
     mv "$config/fixture-frames.jsonl.next" "$config/fixture-frames.jsonl"
@@ -305,21 +414,43 @@ if [ "$scene" = coordination ]; then
     evidence drive wait ready --timeout 10 >/dev/null
     scroll_top
     shot rows-coordination-folded
-    click_row '^Show full prompt\b'
-    find_row 'PROMPT[ _]?END\b|invented' >/dev/null
-    shot rows-coordination-prompt-expanded
-    click_row '^Show less\b'
-    scroll_top
-    click_row '^Show tool call\b'
-    find_row '^Input$' >/dev/null
-    shot rows-coordination-tool-expanded
-    # The raw input retains its own hover Copy action. The reviewer also
-    # exercises it and Transcript in the live native handoff.
-    click_row '^Hide tool call\b'
-    click_row '^Show full message\b'
-    find_row 'MESSAGE[ _]?END\b|concise report' >/dev/null
-    shot rows-coordination-message-expanded
-    click_row '^Show less\b'
+    if text_visible '^Show tool call\b'; then
+        # Each step is a card with its prompt or message folded in it.
+        click_row '^Show full prompt\b'
+        find_row 'PROMPT[ _]?END\b|invented' >/dev/null
+        shot rows-coordination-prompt-expanded
+        click_row '^Show less\b'
+        scroll_top
+        click_row '^Show tool call\b'
+        find_row '^Input$' >/dev/null
+        shot rows-coordination-tool-expanded
+        # The raw input retains its own hover Copy action. The reviewer also
+        # exercises it and Transcript in the live native handoff.
+        click_row '^Hide tool call\b'
+        click_row '^Show full message\b'
+        find_row 'MESSAGE[ _]?END\b|concise report' >/dev/null
+        shot rows-coordination-message-expanded
+        click_row '^Show less\b'
+    else
+        # Each step is one row, which opens its agent when pressed; its
+        # detail - the prompt or message in full, then the tool call -
+        # opens from the row's menu. OCR may read a fold's toggle as two
+        # overlapping runs ("Show", "w full prompt"), so match its tail.
+        row_detail 'Started\b.*Fixture' 'Show details'
+        click_row 'full prompt\b'
+        find_row 'PROMPT[ _]?END\b|invented' >/dev/null
+        shot rows-coordination-prompt-expanded
+        click_row 'w less\b'
+        find_row '^Input$' >/dev/null
+        shot rows-coordination-tool-expanded
+        row_detail 'Started\b.*Fixture' 'Hide details'
+        row_detail 'Message to\b.*Fixture' 'Show details'
+        click_row 'full message\b'
+        find_row 'MESSAGE[ _]?END\b|concise report' >/dev/null
+        shot rows-coordination-message-expanded
+        click_row 'w less\b'
+        row_detail 'Message to\b.*Fixture' 'Hide details'
+    fi
     scroll_bottom
     if text_visible '^Details$'; then
         # The baseline keeps a plain heading and separate Details button.
