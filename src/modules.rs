@@ -52,6 +52,8 @@ pub mod document_link;
 pub mod file_url;
 #[doc(hidden)]
 pub mod filesystem_recovery_context;
+#[cfg(any(feature = "ui", feature = "host"))]
+pub mod fixture_workspace;
 mod flock;
 pub mod fs_safety;
 #[cfg(any(feature = "ui", feature = "host"))]

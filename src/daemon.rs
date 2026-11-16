@@ -54,7 +54,8 @@ use crate::{instance, terminal_ipc::SOCKET_FILE_NAME};
 
 #[cfg(feature = "host")]
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
-#[cfg(any(feature = "host", test))]
+// Development seeding opens the daemon lock too, outside the host build.
+#[cfg(any(feature = "host", test, debug_assertions, feature = "development"))]
 const PRIVATE_FILE_MODE: u32 = 0o600;
 const O_NOFOLLOW: c_int = libc::O_NOFOLLOW;
 // Validate the opened descriptor without blocking on an invalid special file.
@@ -338,7 +339,9 @@ impl Drop for RecoveryLease {
     }
 }
 
-pub(crate) struct HostLease {
+/// The daemon's exclusive lease on its instance, released when dropped.
+#[doc(hidden)]
+pub struct HostLease {
     socket_path: PathBuf,
     lock: File,
     shared_handoff: bool,
@@ -440,6 +443,58 @@ impl HostLease {
             return Err(io::Error::last_os_error().into());
         }
         Ok(false)
+    }
+
+    /// Holds the daemon's exclusive lease while a development fixture seeds
+    /// the stores, so no daemon can start against them halfway. Unlike
+    /// maintenance, the instance may never have run: the runtime directory and
+    /// lock file are created as a starting daemon creates them.
+    ///
+    /// A window seeding the instance holds it too, so no daemon starts while
+    /// the window writes.
+    #[cfg(any(debug_assertions, feature = "development"))]
+    #[doc(hidden)]
+    pub fn acquire_for_seeding() -> Result<Self, String> {
+        let paths = RuntimePaths::discover().map_err(|error| error.to_string())?;
+        Self::acquire_for_seeding_at(&paths).map_err(|error| match error {
+            PlatformError::AlreadyRunning { path } => format!(
+                "A cagents daemon is running for this instance ({}). Stop it before seeding: \
+                 `scripts/run-development --stop-instance NAME` for an instance, or stop the \
+                 native-evidence session.",
+                path.display()
+            ),
+            error => error.to_string(),
+        })
+    }
+
+    #[cfg(any(debug_assertions, feature = "development"))]
+    fn acquire_for_seeding_at(paths: &RuntimePaths) -> Result<Self, PlatformError> {
+        #[cfg(feature = "host")]
+        prepare_runtime_directory(&paths.directory)?;
+        #[cfg(not(feature = "host"))]
+        crate::secure_file::prepare_private_directory(&paths.directory)?;
+        let lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .mode(PRIVATE_FILE_MODE)
+            .custom_flags(LOCK_OPEN_FLAGS)
+            .open(&paths.lock)?;
+        validate_lock_file(&paths.lock, &lock.metadata()?, current_uid())?;
+        // SAFETY: flock receives a live, validated descriptor and scalar flags.
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(PlatformError::AlreadyRunning {
+                path: paths.socket.clone(),
+            });
+        }
+        recover_stale_socket(&paths.socket)?;
+        Ok(Self {
+            socket_path: paths.socket.clone(),
+            lock,
+            shared_handoff: false,
+            _store_maintenance: None,
+        })
     }
 
     /// Holds the daemon's exclusive inventory lease without claiming a serving
