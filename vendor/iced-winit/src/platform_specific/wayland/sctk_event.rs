@@ -708,6 +708,7 @@ impl SctkEvent {
             } => match variant {
                 LayerSurfaceEventVariant::Done => {
                     if let Some(id) = surface_ids.remove(&surface.id()) {
+                        forget_accessibility(control_sender, id.inner());
                         if let Some(w) = window_manager.remove(id.inner()) {
                             clipboard.register_dnd_destination(
                                 DndSurface(Arc::new(Box::new(w.raw.clone()))),
@@ -922,6 +923,7 @@ impl SctkEvent {
                         if let Some(e) =
                             surface_ids.remove(&surface.id()).map(|id| {
                                 keyboard_grabs.remove(id.inner());
+                                forget_accessibility(control_sender, id.inner());
                                 if let Some(w) =
                                     window_manager.remove(id.inner())
                                 {
@@ -1401,6 +1403,7 @@ impl SctkEvent {
             }
             SctkEvent::SessionLockSurfaceDone { surface } => {
                 if let Some(id) = surface_ids.remove(&surface.id()) {
+                    forget_accessibility(control_sender, id.inner());
                     _ = window_manager.remove(id.inner());
                 }
             }
@@ -1676,6 +1679,7 @@ impl SctkEvent {
                     if let Some(id_wrapper) =
                         surface_ids.remove(&instance.wl_surface.id())
                     {
+                        forget_accessibility(control_sender, id_wrapper.inner());
                         _ = user_interfaces.remove(&id_wrapper.inner());
 
                         if let Some(w) =
@@ -1775,6 +1779,25 @@ fn keysym_to_vkey_location(keysym: Keysym) -> (Key, Location) {
 
     let location = keymap::keysym_location(raw);
     (key, location)
+}
+
+/// Drops the accessibility adapter of an SCTK surface that is gone, as closing
+/// a window does. The adapter holds the surface's window, which owns its
+/// Wayland objects, so keeping it would keep them alive: a popup would never
+/// send `xdg_popup.destroy` and would stay mapped, holding its grab, after the
+/// application destroyed it.
+fn forget_accessibility(
+    control_sender: &mut mpsc::UnboundedSender<Control>,
+    id: window::Id,
+) {
+    #[cfg(feature = "a11y")]
+    {
+        _ = control_sender.start_send(Control::Cleanup(id));
+    }
+    #[cfg(not(feature = "a11y"))]
+    {
+        _ = (control_sender, id);
+    }
 }
 
 #[cfg(test)]
