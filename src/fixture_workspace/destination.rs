@@ -251,8 +251,12 @@ impl Destination {
             .and_then(|value| self.place(&staging, &store).map(|()| value))
             .and_then(|value| {
                 self.ledger.parts.push(self.part.label());
-                self.ledger.entries = entries(self.data())?;
-                match self.record() {
+                // A placed store the ledger does not record is removed, so a
+                // failed seed leaves nothing behind.
+                match entries(self.data()).and_then(|entries| {
+                    self.ledger.entries = entries;
+                    self.record()
+                }) {
                     Ok(()) => Ok(value),
                     Err(error) => {
                         remove_store(&store);
