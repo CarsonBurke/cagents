@@ -134,6 +134,20 @@ pub(super) fn inventory_proving_absence<C>(
     list(client)
 }
 
+/// Whether the daemon admits ordinary requests, so that an inventory it gives
+/// now can show a terminal is gone. It answers this even while it restores,
+/// so a pane can say why it is waiting rather than relay the refusal.
+pub(super) fn admitted(state: crate::terminal::ipc::StartupState) -> Result<(), String> {
+    use crate::terminal::ipc::StartupState;
+    match state {
+        StartupState::Ready => Ok(()),
+        StartupState::Restoring { .. } => Err(super::terminal_failure::TERMINALS_RESTORING.into()),
+        StartupState::Retained { detail } => Err(format!(
+            "Startup recovery retained original ownership: {detail}"
+        )),
+    }
+}
+
 /// A shared pane attaches only to what the daemon hosts. When it hosts nothing
 /// under this identity, the error says what Retry will find.
 pub(super) fn hosted_or_missing(
@@ -2518,6 +2532,23 @@ mod tests {
             admits: false,
         };
         assert!(inventory_proving_absence(&saved, &mut daemon, list, ready).is_err());
+    }
+
+    #[test]
+    fn only_a_ready_daemon_can_show_that_a_terminal_is_gone() {
+        use crate::terminal::ipc::StartupState;
+        assert_eq!(admitted(StartupState::Ready), Ok(()));
+        // Restoring ends on its own, so the pane says that in its own words.
+        assert_eq!(
+            admitted(StartupState::Restoring { awaiting: 2 }),
+            Err(super::super::terminal_failure::TERMINALS_RESTORING.to_owned())
+        );
+        // A retained failure doesn't, so its detail is kept.
+        let retained = admitted(StartupState::Retained {
+            detail: "holder 7 did not answer".into(),
+        })
+        .unwrap_err();
+        assert!(retained.contains("holder 7 did not answer"), "{retained}");
     }
 
     fn other_boot(incarnation: &str) -> HostSessionProof {

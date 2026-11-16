@@ -75,6 +75,10 @@ pub(super) const TERMINAL_MOVED: &str = "this shared terminal continues under an
 /// conversation. Recovery preserves that terminal, so Retry cannot help.
 pub(super) const TERMINAL_SUPERSEDED: &str =
     "another live terminal holds this shared terminal's work";
+/// The daemon is still restoring the terminals it adopted after a restart, so
+/// it refuses ordinary requests and its listing can't show this one is gone.
+pub(super) const TERMINALS_RESTORING: &str =
+    "the daemon is still restoring terminals after its restart";
 /// What applies to a terminal the daemon does not list. This asks the questions
 /// Retry's reconciliation asks, so what the pane says is what Retry will do.
 pub(super) fn missing_terminal_message(
@@ -104,6 +108,7 @@ pub(super) fn missing_terminal_message(
 }
 fn missing_terminal_code(message: &str) -> Option<&'static str> {
     match message {
+        TERMINALS_RESTORING => Some("terminals_restoring"),
         TERMINAL_NOT_HOSTED => Some("terminal_not_hosted"),
         TERMINAL_RETIRED => Some("terminal_retired"),
         TERMINAL_DAEMON_RESTARTED => Some("terminal_daemon_restarted"),
@@ -116,6 +121,7 @@ pub(super) fn runtime_error_code(message: &str, default: &'static str) -> &'stat
     missing_terminal_code(message).unwrap_or(default)
 }
 const RECONNECT: &str = "Reconnect to the existing terminal.";
+const RETRY_AFTER_RESTORING: &str = "Once restoring has finished, Retry reconnects this terminal, or starts it again if it wasn't restored.";
 const RETRY_REFUSED: &str = "Retry didn't start anything. Open a new terminal to keep working.";
 // A failure isn't re-evaluated, and either obstacle can go away, so these keep
 // the Retry button and say when it can work.
@@ -218,6 +224,11 @@ fn terminal_notice(pane: Option<&str>, text: &str) -> String {
         None => text.to_owned(),
     }
 }
+/// Whether the pane's own sentence explains this failure, so a notice about it
+/// can say the same rather than relay the daemon's wording.
+fn pane_explains(code: &str) -> bool {
+    is_missing_terminal(code) || code == "terminals_restoring"
+}
 fn is_missing_terminal(code: &str) -> bool {
     matches!(
         code,
@@ -230,6 +241,7 @@ fn is_missing_terminal(code: &str) -> bool {
 }
 fn missing_terminal_consequence(code: &str, session: &TerminalSession) -> &'static str {
     match code {
+        "terminals_restoring" => RETRY_AFTER_RESTORING,
         "terminal_moved" => RECONNECT,
         "terminal_retired" => RETRY_BLOCKED_RETIRED,
         "terminal_superseded" => blocked_consequence(session),
@@ -247,6 +259,10 @@ fn known_failure(code: &str) -> (&'static str, &'static str) {
             "This terminal's daemon restarted. Its process may still be running.",
         ),
         "terminal_moved" => ("terminal_moved", "This terminal needs to reconnect."),
+        "terminals_restoring" => (
+            "terminals_restoring",
+            "Terminals are still being restored after the restart.",
+        ),
         "terminal_superseded" => (
             "terminal_superseded",
             "Another running terminal already holds this terminal's work.",
@@ -354,7 +370,7 @@ impl Details {
         } else {
             known_failure(typed.unwrap_or(""))
         };
-        let consequence = if is_missing_terminal(code) {
+        let consequence = if pane_explains(code) {
             missing_terminal_consequence(code, session)
         } else if session.continuity.live_proof().is_some() {
             RECONNECT
@@ -838,14 +854,13 @@ impl Cagents {
             _ => false,
         })
     }
-    /// A missing terminal's notice reads as its pane does, not as the reason
-    /// recovery recorded.
-    /// The notice log is shared by every pane, so a missing terminal's notice
-    /// names its pane before saying what the pane says.
+    /// A notice about a failure its pane explains reads as the pane does, not
+    /// as the reason recovery recorded, and names the pane, because the notice
+    /// log is shared by every pane.
     pub(super) fn missing_terminal_notice(&self, card: CardId) -> Option<String> {
         match self.cards.get(&card) {
             Some(CardRuntime::Failed(Failure::Terminal(details)))
-                if is_missing_terminal(details.code) =>
+                if pane_explains(details.code) =>
             {
                 Some(terminal_notice(
                     self.notice_pane_name(card).as_deref(),
@@ -1468,6 +1483,82 @@ mod tests {
             // A later press can still replace it, so the warning stays.
             assert_eq!(after.output_warning(), Some(OUTPUT_MAY_GO_WITH_RETRY));
         }
+    }
+    #[test]
+    fn a_retry_that_starts_after_a_refusal_clears_the_refusal_notice() {
+        let (mut app, card, _) = app_and_session();
+        let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+            unreachable!()
+        };
+        // A live proof keeps the identity across presses, as after a restart.
+        session.continuity = TerminalContinuity::Live {
+            host_session_id: crate::model::HostSessionId::new("old-host"),
+            boot_id: crate::model::BootId::new("old-boot"),
+            host_incarnation: crate::model::HostIncarnation::new("old"),
+        };
+        let terminal = session.id;
+        app.fail_runtime(card, TERMINAL_NOT_HOSTED.into());
+        drop(app.retry_card(card));
+        let operation = app.terminal_failure.attempts[&card].operation;
+        drop(app.update_terminal_failure(Action::RetryFinished {
+            card,
+            operation,
+            terminal,
+            result: Err("terminal fixture still has a live process (42); preserving it".into()),
+        }));
+        let refused = app.status.clone().unwrap();
+        assert_eq!(refused.key, Some(NoticeKey::TerminalStart(card)));
+        app.notices.record(refused);
+
+        drop(app.retry_card(card));
+        let operation = app.terminal_failure.attempts[&card].operation;
+        let session = match &app.card_state(card).unwrap().kind {
+            CardKind::Terminal(session) => session.clone(),
+            _ => unreachable!(),
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let handle = super::super::tests::unconnected_surface(directory.path(), terminal);
+        drop(app.update_terminal_failure(Action::RetryFinished {
+            card,
+            operation,
+            terminal,
+            result: Ok(StartedTerminal {
+                handle,
+                session,
+                spawned: true,
+                save_failure: None,
+            }),
+        }));
+        assert!(matches!(
+            app.cards.get(&card),
+            Some(CardRuntime::Terminal(_))
+        ));
+        let key = NoticeKey::TerminalStart(card);
+        assert!(
+            !app.status
+                .as_ref()
+                .is_some_and(|notice| notice.key.as_ref() == Some(&key))
+        );
+        assert!(!app.notices.has(key));
+    }
+    #[test]
+    fn a_pane_refused_while_its_daemon_restores_says_so_and_when_retry_helps() {
+        let (mut app, card, _) = app_and_session();
+        app.fail_runtime(card, TERMINALS_RESTORING.into());
+        let details = app.terminal_details(card).unwrap();
+        assert_eq!(details.code, "terminals_restoring");
+        assert_eq!(
+            details.message,
+            "Terminals are still being restored after the restart."
+        );
+        assert_eq!(details.consequence, RETRY_AFTER_RESTORING);
+        // Nothing is replaced while the daemon restores.
+        assert_eq!(details.output_warning(), None);
+        let pane = app.notice_pane_name(card).unwrap();
+        assert_eq!(
+            app.missing_terminal_notice(card).as_deref(),
+            Some(format!("{pane}: {}", details.message).as_str())
+        );
     }
     #[test]
     fn a_refusal_recovery_wrote_for_the_reader_is_what_the_pane_shows() {

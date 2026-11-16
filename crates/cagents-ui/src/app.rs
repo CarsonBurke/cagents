@@ -6282,10 +6282,9 @@ impl Cagents {
                             &mut client,
                             |client| client.list().map_err(|error| error.to_string()),
                             |client| {
-                                client
-                                    .daemon_version()
-                                    .map(drop)
-                                    .map_err(|error| error.to_string())
+                                daemon_recovery::admitted(
+                                    client.startup_state().map_err(|error| error.to_string())?,
+                                )
                             },
                         )?;
                         let proof = client.proof().clone();
@@ -20275,10 +20274,7 @@ fn attach_initial_terminal(
         &mut client,
         |client| client.list().map_err(|error| error.to_string()),
         |client| {
-            client
-                .daemon_version()
-                .map(drop)
-                .map_err(|error| error.to_string())
+            daemon_recovery::admitted(client.startup_state().map_err(|error| error.to_string())?)
         },
     )?;
     saved_terminal::attach_existing(

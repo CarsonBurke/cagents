@@ -289,57 +289,92 @@ mod tests {
             boot_id: proof.boot_id.clone(),
             host_incarnation: proof.host_incarnation.clone(),
         };
-        // Each listing hands out the next inventory; readiness answers in turn.
+        // Each listing hands out the next inventory, or the error it fails
+        // with; the startup state answers in turn.
+        type Listing = Result<Vec<crate::terminal::ipc::TerminalDescriptor>, String>;
         struct Daemon {
-            listings: Vec<Vec<crate::terminal::ipc::TerminalDescriptor>>,
+            listings: Vec<Listing>,
             ready: Result<(), String>,
             asked_ready: bool,
         }
-        let attach = |daemon: &mut Daemon| {
+        let attach_source = |source: &TerminalSession, daemon: &mut Daemon| {
             initial_terminal_proving_absence(
-                &source,
+                source,
                 &proof,
                 daemon,
-                |daemon| Ok(daemon.listings.remove(0)),
+                |daemon| daemon.listings.remove(0),
                 |daemon| {
                     daemon.asked_ready = true;
                     daemon.ready.clone()
                 },
             )
         };
-        let restoring = "the daemon is still restoring terminals".to_owned();
+        let attach = |daemon: &mut Daemon| attach_source(&source, daemon);
+        let restoring = daemon_recovery::admitted(crate::terminal::ipc::StartupState::Restoring {
+            awaiting: 1,
+        });
 
-        // Still restoring: the partial listing yields the readiness refusal,
-        // not a claim that the terminal is gone.
+        // Still restoring: the partial listing yields a pane that says so, not
+        // a claim that the terminal is gone.
         let mut daemon = Daemon {
-            listings: vec![Vec::new()],
-            ready: Err(restoring.clone()),
+            listings: vec![Ok(Vec::new())],
+            ready: restoring.clone(),
             asked_ready: false,
         };
-        assert_eq!(attach(&mut daemon), Err(restoring));
+        let message = attach(&mut daemon).unwrap_err();
+        assert_eq!(
+            terminal_failure::runtime_error_code(&message, "runtime_failed"),
+            "terminals_restoring"
+        );
+
+        // A listing that fails is that failure, and nothing is concluded.
+        let mut daemon = Daemon {
+            listings: vec![Err("connection reset".into())],
+            ready: Ok(()),
+            asked_ready: false,
+        };
+        assert_eq!(attach(&mut daemon), Err("connection reset".into()));
+        assert!(!daemon.asked_ready);
+        let mut daemon = Daemon {
+            listings: vec![Ok(Vec::new()), Err("connection reset".into())],
+            ready: Ok(()),
+            asked_ready: false,
+        };
+        assert_eq!(attach(&mut daemon), Err("connection reset".into()));
+        assert!(daemon.asked_ready);
 
         // Ready, and the terminal was restored meanwhile: it attaches.
         let mut daemon = Daemon {
-            listings: vec![Vec::new(), vec![hosted.clone()]],
+            listings: vec![Ok(Vec::new()), Ok(vec![hosted.clone()])],
             ready: Ok(()),
             asked_ready: false,
         };
         assert_eq!(attach(&mut daemon), Ok(hosted.session.clone()));
 
-        // Ready and still absent: the pane says what Retry will find.
-        let mut daemon = Daemon {
-            listings: vec![Vec::new(), Vec::new()],
-            ready: Ok(()),
-            asked_ready: false,
+        // Ready and still absent: the pane says what Retry will find. A pane
+        // with nothing to prove its terminal by finds it no longer running,
+        // and one this boot's daemon started finds its daemon restarted.
+        let absent = |source: &TerminalSession| {
+            let mut daemon = Daemon {
+                listings: vec![Ok(Vec::new()), Ok(Vec::new())],
+                ready: Ok(()),
+                asked_ready: false,
+            };
+            let message = attach_source(source, &mut daemon).unwrap_err();
+            terminal_failure::runtime_error_code(&message, "runtime_failed")
         };
-        let message = attach(&mut daemon).unwrap_err();
-        assert!(
-            terminal_failure::runtime_error_code(&message, "runtime_failed") != "runtime_failed"
-        );
+        assert_eq!(absent(&source), "terminal_not_hosted");
+        let mut same_boot = source.clone();
+        same_boot.continuity = TerminalContinuity::Live {
+            host_session_id: "earlier".into(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: "earlier".into(),
+        };
+        assert_eq!(absent(&same_boot), "terminal_daemon_restarted");
 
         // A listed terminal attaches without asking for readiness.
         let mut daemon = Daemon {
-            listings: vec![vec![hosted.clone()]],
+            listings: vec![Ok(vec![hosted.clone()])],
             ready: Err("unused".into()),
             asked_ready: false,
         };
