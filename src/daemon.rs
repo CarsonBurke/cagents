@@ -791,6 +791,17 @@ impl ShutdownTarget {
     fn terminate(&self) -> io::Result<()> {
         signal_process(&self.process, libc::SIGTERM)
     }
+
+    /// The pinned process's ID in this PID namespace, for messages only.
+    fn pid(&self) -> Option<u32> {
+        let info =
+            fs::read_to_string(format!("/proc/self/fdinfo/{}", self.process.as_raw_fd())).ok()?;
+        info.lines()
+            .find_map(|line| line.strip_prefix("Pid:"))?
+            .trim()
+            .parse()
+            .ok()
+    }
 }
 
 fn lease_owner_process(
@@ -860,10 +871,14 @@ fn terminate_daemon_at(
     };
     target.terminate()?;
     if !target.wait(timeout)? {
+        let process = target
+            .pid()
+            .map(|pid| format!(" (process {pid})"))
+            .unwrap_or_default();
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
             format!(
-                "the daemon did not exit within {} seconds of SIGTERM; it may still be stopping its sessions. Check `cagents daemon status` before starting another",
+                "the daemon{process} did not exit within {} seconds of SIGTERM; it may still be stopping its sessions. Wait for it to exit before starting another daemon",
                 timeout.as_secs()
             ),
         )
@@ -2297,6 +2312,12 @@ for line in sys.stdin:
         assert!(
             matches!(error, PlatformError::Io(ref error) if error.kind() == io::ErrorKind::TimedOut),
             "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("(process {})", retained.child.id())),
+            "the timeout names the process to wait for: {error}"
         );
         assert!(retained.child.try_wait().unwrap().is_none());
         assert!(HostLease::is_held(&paths).unwrap());

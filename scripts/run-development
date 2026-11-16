@@ -1251,8 +1251,9 @@ stop_instance_session() {
                 printf '%s\n' "$output" >&2
                 exit 1
             fi
-            # Stopping does not rebuild, so the CLI can predate the one that
-            # waits for the daemon to exit; keep waiting for its listener here.
+            # Reached without a rebuild from --stop-instance, whose CLI can
+            # predate the one that waits for the daemon to exit; keep waiting
+            # for its listener. After a --fresh-daemon rebuild this is a no-op.
             remaining=100
             while [ -e "$socket" ]; do
                 if [ "$remaining" -eq 0 ]; then

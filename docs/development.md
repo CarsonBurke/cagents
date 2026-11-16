@@ -559,8 +559,8 @@ changes). A watched source change is not proof that it was safely patched.
 has successfully linked and launched the actual replacement executable, after
 shared argument parsing and before ordinary UI startup.
 It verifies the matched sibling CLI version, stops the development jobs and
-waits for the private socket to close. Any replacement build failure leaves the
-existing daemon running. Help/invalid arguments/internal helper launches cannot
+waits up to 30 seconds for the daemon process to exit. Any replacement build
+failure leaves the existing daemon running. Help/invalid arguments/internal helper launches cannot
 consume restart intent. Valid named/device/new-window arguments remain supported.
 
 Qualification for this lane includes an actual view-only edit, unchanged UI PID
@@ -2287,7 +2287,7 @@ elsewhere before cleanup. Run the pure checks with
 | `Config files in .../mise.toml are not trusted` | Run `mise trust` in that worktree, or trust the whole checkout with `mise settings add trusted_config_paths PATH`. |
 | Something else is missing | `mise run doctor` names each missing prerequisite and its fix. |
 | The UI talks to an old daemon after you changed daemon, host, or IPC code | Relaunch with `--fresh-daemon`. |
-| `the daemon did not exit within 30 seconds of SIGTERM` | `--fresh-daemon` stops the instance's daemon and waits for that process to exit; it is still stopping its sessions. Check `cagents daemon status` (or `pgrep -a cagentsd`), let it exit, then retry `--fresh-daemon`. |
+| `the daemon (process PID) did not exit within 30 seconds of SIGTERM` | `--fresh-daemon` stopped the instance's daemon and waited for that process to exit; it is still stopping its sessions. Let it exit (`ps -p PID`), then retry `--fresh-daemon`. |
 | `instance NAME daemon did not stop within 5 seconds` | `--stop-instance` stopped the daemon with a CLI that may predate waiting for exit, and its socket remained. Look for the lingering daemon with `pgrep -a cagentsd`, let it exit (or stop that process), then retry. |
 | Compilation exhausts RAM or swap | Lower `CARGO_BUILD_JOBS`, use `--browserless`, and build through `scripts/cargo-gate` rather than starting builds side by side; see [resource usage](#build-and-test-resource-usage). |
 | A UI problem needs logs | Add `--debug --log-file /tmp/cagents-ui.log` and read the file after reproducing. |

@@ -4238,7 +4238,7 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
             // Returns only once the original process has exited, so a caller
             // can start its replacement at once without polling the socket.
             let stopped = crate::daemon::terminate_daemon_from_lock(DAEMON_STOP_TIMEOUT)
-                .map_err(|error| AppError::new("daemon_process", error))?;
+                .map_err(rebuild_stop_error)?;
             Ok(CommandOutput {
                 command: "daemon.stop_for_rebuild",
                 data: json!({ "instance": instance::NAME, "stopped": stopped }),
@@ -4249,6 +4249,24 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                 },
             })
         }
+    }
+}
+
+/// A stop that times out is the same condition as an accepted `daemon stop`
+/// that does not finish, so it reports the same kind. Stopping prepares no
+/// runtime, so an I/O failure is reported without that platform prefix.
+fn rebuild_stop_error(error: crate::daemon::PlatformError) -> AppError {
+    match error {
+        crate::daemon::PlatformError::Io(io) => AppError {
+            kind: if io.kind() == std::io::ErrorKind::TimedOut {
+                "shutdown_timeout"
+            } else {
+                "daemon_process"
+            },
+            message: io.to_string(),
+            details: Some(json!({ "instance": instance::NAME, "stopped": false })),
+        },
+        error => AppError::new("daemon_process", error),
     }
 }
 
@@ -6426,6 +6444,18 @@ mod tests {
         assert!(human.contains(&channel.id.to_string()));
         // Channel repository identity is retained; it is not asserted to be a checkout path.
         assert!(human.contains("/repo/.git"));
+    }
+
+    #[test]
+    fn a_rebuild_stop_timeout_reports_an_unfinished_stop() {
+        let message = "the daemon (process 7) did not exit within 30 seconds of SIGTERM";
+        let timeout = rebuild_stop_error(io::Error::new(io::ErrorKind::TimedOut, message).into());
+        assert_eq!(timeout.kind, "shutdown_timeout");
+        assert_eq!(timeout.message, message, "no runtime-preparation prefix");
+        assert_eq!(timeout.details.unwrap()["stopped"], json!(false));
+        let other = rebuild_stop_error(io::Error::other("refused").into());
+        assert_eq!(other.kind, "daemon_process");
+        assert_eq!(other.message, "refused");
     }
 
     #[test]
