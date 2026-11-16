@@ -21,6 +21,17 @@ use std::{
 };
 use streamed_input::StreamedInput;
 
+/// The first Claude Code release whose async input contract (`next` and
+/// `later` priorities, with lifecycle acknowledgments and removal) was
+/// verified. Later releases are assumed to keep it.
+const ASYNC_INPUT_SINCE: semver::Version = semver::Version::new(2, 1, 286);
+
+/// Whether a reported `claude_code_version` is at or after
+/// [`ASYNC_INPUT_SINCE`]. A version that is not semver enables nothing, and a
+/// pre-release sorts before its release, which is all that was verified.
+fn supports_async_input(version: &str) -> bool {
+    semver::Version::parse(version).is_ok_and(|version| version >= ASYNC_INPUT_SINCE)
+}
 const MAX_PENDING: usize = 64;
 const MAX_TOOLS: usize = 512;
 const ATTACHMENTS: AttachmentRules = AttachmentRules::for_provider(Provider::Claude);
@@ -1404,12 +1415,7 @@ impl Claude {
 
     fn metadata(&mut self, data: &Value, step: &mut Step) {
         if let Some(version) = data["claude_code_version"].as_str() {
-            let mut parts = version
-                .split('.')
-                .filter_map(|part| part.parse::<u32>().ok());
-            self.async_input = parts.next() == Some(2)
-                && parts.next() == Some(1)
-                && parts.next().is_some_and(|patch| patch >= 286);
+            self.async_input = supports_async_input(version);
         }
         if let Some(models) = data["models"].as_array() {
             self.models = models.iter().filter_map(Model::from_claude).collect();
@@ -8593,6 +8599,47 @@ mod streamed_input;
 mod tests {
     use super::*;
     use base64::engine::general_purpose::STANDARD;
+
+    /// Steering and queueing stay available on every release from the
+    /// verified one onward, not just later 2.1 patches.
+    #[test]
+    fn async_input_is_enabled_from_the_verified_release_onward() {
+        for version in ["2.1.286", "2.1.300", "2.2.0", "3.0.0", "2.1.286+build.7"] {
+            assert!(supports_async_input(version), "{version}");
+        }
+        for version in [
+            "2.1.285",
+            "2.0.999",
+            "1.9.300",
+            "2.1.286-beta",
+            "2.1",
+            "2.1.286.1",
+            "v2.1.286",
+            "2.x.286",
+            "",
+        ] {
+            assert!(!supports_async_input(version), "{version}");
+        }
+    }
+
+    #[test]
+    fn metadata_sets_async_input_only_from_a_reported_version() {
+        let mut adapter = Claude::default();
+        let mut step = Step::default();
+        adapter.metadata(&json!({ "claude_code_version": "3.0.0" }), &mut step);
+        assert!(adapter.async_input);
+        // A frame without a version, such as `commands_changed`, keeps it.
+        adapter.metadata(&json!({}), &mut step);
+        assert!(adapter.async_input);
+        adapter.metadata(&json!({ "claude_code_version": "2.1.285" }), &mut step);
+        assert!(!adapter.async_input);
+        adapter.metadata(&json!({ "claude_code_version": "unknown" }), &mut step);
+        assert!(!adapter.async_input);
+
+        let mut missing = Claude::default();
+        missing.metadata(&Value::Null, &mut step);
+        assert!(!missing.async_input);
+    }
 
     #[test]
     fn embedded_frames_are_recognized_without_flagging_ordinary_text() {
