@@ -11,7 +11,11 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
+import sys
+import threading
+import time
 from pathlib import Path
 import tempfile
 import unittest
@@ -75,14 +79,21 @@ if __name__ == "__main__":
 
 @contextlib.contextmanager
 def quiet():
-    """Send this process's and its children's output to a scratch file."""
+    """Send this process's and its children's output to a scratch file; yield a reader of it."""
     with tempfile.TemporaryFile() as scratch:
         saved = os.dup(1), os.dup(2)
+        def read():
+            sys.stdout.flush()
+            sys.stderr.flush()
+            scratch.seek(0)
+            return scratch.read().decode()
         try:
             os.dup2(scratch.fileno(), 1)
             os.dup2(scratch.fileno(), 2)
-            yield
+            yield read
         finally:
+            sys.stdout.flush()
+            sys.stderr.flush()
             os.dup2(saved[0], 1)
             os.dup2(saved[1], 2)
             os.close(saved[0])
@@ -93,6 +104,10 @@ class Tree(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="script-contracts-")
         self.addCleanup(temporary.cleanup)
+        # Output and its defaults are those of a local run, here and on GitHub Actions.
+        environment = unittest.mock.patch.dict(os.environ, {"GITHUB_ACTIONS": ""})
+        environment.start()
+        self.addCleanup(environment.stop)
         self.root = Path(temporary.name)
 
     def write(self, relative, text):
@@ -108,9 +123,14 @@ class Tree(unittest.TestCase):
         path = self.root / "calls.jsonl"
         return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
-    def run_job(self, jobs, name, shard=None):
+    def run_job(self, jobs, name, shard=None, verbose=False):
         with quiet():
-            return contracts.run(self.root, name, shard, jobs=jobs)
+            return contracts.run(self.root, name, shard, jobs=jobs, verbose=verbose)
+
+    def job_output(self, jobs, name, verbose=False):
+        with quiet() as read:
+            status = contracts.run(self.root, name, jobs=jobs, verbose=verbose)
+            return status, read()
 
     def verify(self, jobs, **options):
         options.setdefault("unscheduled", ())
@@ -228,11 +248,87 @@ class Running(Tree):
         self.recording("tests/loose.py", "loose")
         jobs = (Job("job", (Suite("strict", "tests/strict.py", env=(("MARKER", "set"),)),
                             Suite("loose", "tests/loose.py", isolated=False))),)
-        self.assertEqual(self.run_job(jobs, "job"), 0)
+        self.assertEqual(self.run_job(jobs, "job", verbose=True), 0)
         self.assertEqual(self.calls(), [
             {"fixture": "strict", "arguments": ["-v"], "isolated": 1, "bytecode": 1, "marker": "set"},
             {"fixture": "loose", "arguments": ["-v"], "isolated": 0, "bytecode": 1, "marker": None},
         ])
+        self.assertEqual(self.run_job(jobs, "job"), 0)
+        self.assertEqual([call["arguments"] for call in self.calls()[2:]], [[], []])
+
+    def test_a_passing_suite_gets_one_line_and_a_failing_one_its_whole_output(self):
+        self.write("tests/good.py", "import unittest\n\nclass Good(unittest.TestCase):\n"
+                                    "    def test_one(self): print('chatter')\n"
+                                    "    @unittest.skip('later')\n    def test_two(self): pass\n\nunittest.main()\n")
+        self.write("tests/bad.py", "import unittest\n\nclass Bad(unittest.TestCase):\n"
+                                   "    def test_broken(self): self.fail('the reason')\n\nunittest.main()\n")
+        jobs = (Job("job", (Suite("good", "tests/good.py", sources=("tests/bad.py",)),
+                            Suite("bad", "tests/bad.py"))),)
+        status, output = self.job_output(jobs, "job")
+        self.assertEqual(status, 1)
+        lines = output.splitlines()
+        self.assertRegex(lines[0], r"^good \.\.\. ok \(2 tests, 1 skipped, \d+\.\ds\)$")
+        self.assertEqual(lines[1], "bad ... FAIL (exit 1)")
+        self.assertIn("AssertionError: the reason", output)
+        self.assertIn("FAILED (failures=1)", output)
+        self.assertEqual(lines[-1], "Failed: bad (exit 1)")
+        for absent in ("chatter", "test_one", "== good", "tests/bad.py\n"):
+            self.assertNotIn(absent, output)
+        status, output = self.job_output(jobs, "job", verbose=True)
+        self.assertEqual(status, 1)
+        self.assertIn("== good", output)
+        self.assertIn("test_one (__main__.Good.test_one) ... ok", output)
+        self.assertIn("chatter", output)
+        self.assertRegex(output, r"[0-9a-f]{64}  tests/bad.py")
+
+    def test_github_actions_runs_verbose_by_default(self):
+        self.recording("tests/one.py", "one")
+        jobs = (Job("job", (Suite("one", "tests/one.py"),)),)
+        for value, arguments in (("true", ["-v"]), ("", [])):
+            with self.subTest(GITHUB_ACTIONS=value), unittest.mock.patch.dict(os.environ, {"GITHUB_ACTIONS": value}):
+                (self.root / "calls.jsonl").unlink(missing_ok=True)
+                with quiet():
+                    self.assertEqual(contracts.run(self.root, "job", jobs=jobs), 0)
+                self.assertEqual(self.calls()[0]["arguments"], arguments)
+
+    def test_a_process_left_behind_does_not_hold_a_compact_run_open(self):
+        self.write("tests/leaky.py", "import subprocess, sys\nfrom pathlib import Path\n"
+                                     "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+                                     "Path('child.pid').write_text(str(child.pid))\n")
+        jobs = (Job("job", (Suite("leaky", "tests/leaky.py"),)),)
+        started = time.monotonic()
+        try:
+            status, output = self.job_output(jobs, "job")
+        finally:
+            pid = self.root / "child.pid"
+            if pid.exists():
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(int(pid.read_text()), 9)
+        self.assertLess(time.monotonic() - started, 30)
+        self.assertEqual(status, 0)
+        self.assertRegex(output, r"^leaky \.\.\. ok \(passed, \d+\.\ds\)\n$")
+
+    def test_an_interrupted_suite_is_named_with_what_it_printed(self):
+        self.write("tests/hung.py", "import time\nprint('progress before hang')\ntime.sleep(60)\n")
+        jobs = (Job("job", (Suite("hung", "tests/hung.py"),)),)
+        timer = threading.Timer(1.0, os.kill, (os.getpid(), signal.SIGINT))
+        started = time.monotonic()
+        with quiet() as read:
+            timer.start()
+            with self.assertRaises(KeyboardInterrupt):
+                contracts.run(self.root, "job", jobs=jobs, verbose=False)
+            output = read()
+        timer.cancel()
+        self.assertLess(time.monotonic() - started, 30)
+        self.assertEqual(output, "hung ... INTERRUPTED\nprogress before hang\n")
+
+    def test_a_failing_log_keeps_prints_and_tracebacks_in_order(self):
+        self.write("tests/order.py", "import unittest\n\nclass Order(unittest.TestCase):\n"
+                                     "    def test_a(self):\n        print('printed first')\n"
+                                     "        self.fail('then failed')\n\nunittest.main()\n")
+        status, output = self.job_output((Job("job", (Suite("order", "tests/order.py"),)),), "job")
+        self.assertEqual(status, 1)
+        self.assertLess(output.index("printed first"), output.index("AssertionError: then failed"))
 
     def test_every_suite_runs_and_the_first_failure_status_is_preserved(self):
         self.recording("tests/one.py", "one", exit_code=19)
@@ -261,7 +357,8 @@ class Running(Tree):
                 Job("last", (Suite("three", "tests/three.py"),)))
         self.recording("tests/source.py", "source", exit_code=4)
         with quiet():
-            self.assertEqual(contracts.run_all(self.root, jobs=jobs, source_fixtures=("tests/source.py",)), 5)
+            self.assertEqual(contracts.run_all(self.root, jobs=jobs, source_fixtures=("tests/source.py",),
+                                               verbose=True), 5)
         calls = self.calls()
         # The source job's suites, which CI runs beside the jobs, run last.
         self.assertEqual([call["fixture"] for call in calls], ["one", "two", "three", "source"])

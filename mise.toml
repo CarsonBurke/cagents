@@ -142,12 +142,13 @@ run = "scripts/test-lib"
 [tasks."test:scripts"]
 description = "Verify and run the script contract suites CI runs (optionally one JOB [SHARD])"
 usage = '''
+flag "--verbose" help="Print every test and each tested file's digest, as CI's log does"
 arg "[job]" help="One job, such as tooling; default: every job unsharded, then the source job's suites"
 arg "[shard]" help="I/N shard of a sharded job"
 '''
 run = [
   "/usr/bin/python3 -I -B scripts/script-contracts verify",
-  '/usr/bin/python3 -I -B scripts/script-contracts run ${usage_job:+"$usage_job"} ${usage_shard:+"$usage_shard"}',
+  '/usr/bin/python3 -I -B scripts/script-contracts run ${usage_verbose:+--verbose} ${usage_job:+"$usage_job"} ${usage_shard:+"$usage_shard"}',
 ]
 
 # Formatting -----------------------------------------------------------------

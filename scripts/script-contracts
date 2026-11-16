@@ -10,10 +10,15 @@ older-head applicability case to tolerate.
                     syntax; every problem is reported at once
   plan              print the CI matrix, one entry per job shard
   protocol-base     print the commit the protocol contract compares with
-  run [JOB [SHARD]] run one job's suites; SHARD (I/N) runs every Nth test of a
+  run [--verbose] [JOB [SHARD]]
+                    run one job's suites; SHARD (I/N) runs every Nth test of a
                     sharded job's single suite, so the shards cover it exactly.
                     Without JOB, run every job unsharded, one after another,
-                    then the source job's suites
+                    then the source job's suites. Each suite that passes gets
+                    one line, and one that fails or is interrupted its whole
+                    output; --verbose,
+                    the default on GitHub Actions, prints every test and the
+                    digest of every file a suite tests, as CI's log records
 """
 
 import argparse
@@ -21,9 +26,12 @@ import hashlib
 import json
 import os
 import re
+import signal
 import stat
 import subprocess
 import sys
+import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -167,7 +175,7 @@ UNSCHEDULED = (
 # Shell entry points that have no suite of their own.
 SHELL_SYNTAX = (("sh", "scripts/run-development"), ("sh", "scripts/refuse-compile"), ("sh", "scripts/check-format"))
 
-# Run as `python3 -I -B -c SHARD FIXTURE INDEX COUNT`: execute the fixture as
+# Run as `python3 -I -B -c SHARD FIXTURE INDEX COUNT VERBOSITY`: execute the fixture as
 # __main__, but let its unittest.main() run only every COUNT-th test, in id
 # order, starting at INDEX. unittest's own loader enumerates the tests, so
 # inherited and generated tests are included and the shards partition the suite.
@@ -177,7 +185,7 @@ import sys
 import unittest
 from pathlib import Path
 
-fixture, index, count = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+fixture, index, count, verbosity = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
 called = False
 
 
@@ -198,7 +206,7 @@ def main(*_arguments, **_options):
     if not selected:
         print("Empty shard: lower the job's shard count", file=sys.stderr)
         raise SystemExit(2)
-    result = unittest.TextTestRunner(verbosity=2).run(unittest.TestSuite(selected))
+    result = unittest.TextTestRunner(verbosity=verbosity).run(unittest.TestSuite(selected))
     raise SystemExit(0 if result.wasSuccessful() else 1)
 
 
@@ -323,15 +331,77 @@ def parse_shard(text, shards):
     return index - 1, count
 
 
-def command(suite, shard=None):
+def command(suite, shard=None, verbose=True):
     flags = ["-I", "-B"] if suite.isolated else ["-B"]
+    if not verbose:
+        # Unbuffered, so a captured log keeps prints and tracebacks in order
+        # and holds everything written before an interruption.
+        flags.append("-u")
     if shard is None:
-        return [sys.executable, *flags, suite.fixture, "-v"]
+        return [sys.executable, *flags, suite.fixture, *(["-v"] if verbose else [])]
     index, count = shard
-    return [sys.executable, *flags, "-c", SHARD, suite.fixture, str(index), str(count)]
+    return [sys.executable, *flags, "-c", SHARD, suite.fixture, str(index), str(count), "2" if verbose else "1"]
 
 
-def run(root, job_name, shard_text=None, jobs=JOBS):
+def default_verbose():
+    return os.environ.get("GITHUB_ACTIONS") == "true"
+
+
+def outcome(log, seconds):
+    """What unittest's closing lines say about a run that passed, such as '12 tests, 1 skipped, 0.4s'."""
+    ran = re.findall(r"^Ran (\d+) tests? in ", log, re.MULTILINE)
+    skipped = re.findall(r"^OK \(.*?skipped=(\d+)", log, re.MULTILINE)
+    counted = f"{ran[-1]} tests" + (f", {skipped[-1]} skipped" if skipped else "") if ran else "passed"
+    return f"{counted}, {seconds:.1f}s"
+
+
+def run_suite(root, suite, shard, verbose):
+    environment = {**os.environ, **dict(suite.env)}
+    if verbose:
+        print(f"::group::{suite.name}" if os.environ.get("GITHUB_ACTIONS") == "true" else f"== {suite.name}", flush=True)
+        for path in (*suite.sources, suite.fixture):
+            print(f"{hashlib.sha256((root / path).read_bytes()).hexdigest()}  {path}", flush=True)
+        returncode = subprocess.run(command(suite, shard), cwd=root, env=environment).returncode
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            print("::endgroup::", flush=True)
+        return returncode
+    # The name comes first, so a slow or hung suite is named while it runs.
+    print(f"{suite.name} ... ", end="", flush=True)
+    started = time.monotonic()
+    # A file rather than a pipe, so a process the suite leaves behind cannot
+    # hold the run open after the suite itself has exited.
+    with tempfile.TemporaryFile() as captured:
+        def show(verdict):
+            captured.seek(0)
+            log = captured.read().decode(errors="replace")
+            print(verdict, flush=True)
+            sys.stdout.write(log if log.endswith("\n") or not log else log + "\n")
+            sys.stdout.flush()
+
+        process = subprocess.Popen(command(suite, shard, verbose=False), cwd=root, env=environment,
+                                   stdout=captured, stderr=subprocess.STDOUT)
+        try:
+            returncode = process.wait()
+        except BaseException:
+            # Interrupted or terminated: say so with what the suite printed, then stop.
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            show("INTERRUPTED")
+            raise
+        if returncode:
+            show(f"FAIL (exit {returncode})")
+            return returncode
+        captured.seek(0)
+        log = captured.read().decode(errors="replace")
+    print(f"ok ({outcome(log, time.monotonic() - started)})", flush=True)
+    return returncode
+
+
+def run(root, job_name, shard_text=None, jobs=JOBS, verbose=None):
     job = next((job for job in jobs if job.name == job_name), None)
     if job is None:
         raise ContractError(f"Unknown job {job_name!r}; choose one of: {', '.join(j.name for j in jobs)}")
@@ -342,15 +412,10 @@ def run(root, job_name, shard_text=None, jobs=JOBS):
     problems = files_and_syntax(root, job.suites)
     if problems:
         raise ContractError("; ".join(problems))
+    verbose = default_verbose() if verbose is None else verbose
     failures = []
     for suite in job.suites:
-        print(f"::group::{suite.name}" if os.environ.get("GITHUB_ACTIONS") == "true" else f"== {suite.name}", flush=True)
-        for path in (*suite.sources, suite.fixture):
-            print(f"{hashlib.sha256((root / path).read_bytes()).hexdigest()}  {path}", flush=True)
-        environment = {**os.environ, **dict(suite.env)}
-        returncode = subprocess.run(command(suite, shard), cwd=root, env=environment).returncode
-        if os.environ.get("GITHUB_ACTIONS") == "true":
-            print("::endgroup::", flush=True)
+        returncode = run_suite(root, suite, shard, verbose)
         if returncode:
             failures.append((suite.name, returncode))
     for name, returncode in failures:
@@ -358,16 +423,16 @@ def run(root, job_name, shard_text=None, jobs=JOBS):
     return failures[0][1] if failures else 0
 
 
-def run_all(root, jobs=JOBS, source_fixtures=SOURCE_JOB_FIXTURES):
+def run_all(root, jobs=JOBS, source_fixtures=SOURCE_JOB_FIXTURES, verbose=None):
     """Run every suite CI runs, continuing past failures; the first failure's status."""
     failures = []
     for job in jobs:
-        returncode = run(root, job.name, jobs=jobs)
+        returncode = run(root, job.name, jobs=jobs, verbose=verbose)
         if returncode:
             failures.append((job.name, returncode))
     if source_fixtures:
         source = Job("source", tuple(Suite(Path(fixture).stem, fixture) for fixture in source_fixtures))
-        returncode = run(root, source.name, jobs=(source,))
+        returncode = run(root, source.name, jobs=(source,), verbose=verbose)
         if returncode:
             failures.append((source.name, returncode))
     for name, returncode in failures:
@@ -409,10 +474,14 @@ def main():
     base_parser.add_argument("--event", required=True)
     base_parser.add_argument("--before")
     run_parser = commands.add_parser("run")
+    run_parser.add_argument("--verbose", action="store_true", default=None,
+                            help="print every test and each tested file's digest (default on GitHub Actions)")
     run_parser.add_argument("job", nargs="?")
     run_parser.add_argument("shard", nargs="?")
     args = parser.parse_args()
     root = args.root.resolve()
+    # A terminated run reports the suite it stopped in, as an interrupted one does.
+    signal.signal(signal.SIGTERM, lambda number, _frame: sys.exit(128 + number))
     try:
         if args.command == "verify":
             problems = verify(root)
@@ -428,8 +497,8 @@ def main():
             print(json.dumps(plan(), separators=(",", ":")))
             return 0
         if args.job is None:
-            return run_all(root)
-        return run(root, args.job, args.shard)
+            return run_all(root, verbose=args.verbose)
+        return run(root, args.job, args.shard, verbose=args.verbose)
     except ContractError as error:
         print(f"Script contracts refused: {error}", file=sys.stderr)
         return 2
