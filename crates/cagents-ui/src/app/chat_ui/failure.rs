@@ -1027,13 +1027,16 @@ impl State {
                     .collect();
             }
         }
+        // The revision keys retained exchanges and expanded previews, neither
+        // of which draws reset evidence. That evidence includes the snapshot
+        // generation, so hashing it would redraw every exchange on each
+        // publication while a limit is active.
         let mut hash = std::hash::DefaultHasher::new();
         for incident in &state.incidents {
             (
                 &incident.key,
                 &incident.summary,
                 &incident.sources,
-                &incident.reset_sources,
                 &incident.first_item,
                 &incident.anchor,
                 &incident.active_recovery,
