@@ -13,14 +13,16 @@ however many targets report it. Errors show from every crate. Cargo replays
 a fresh unit's warnings, so a check that compiles nothing still reports them.
 
 The command exits with Cargo's status; when Cargo succeeded but a workspace
-crate warned, it ends with one line naming where, and exits 1. An explicit
-JSON --message-format is passed through untouched, with nothing filtered.
+crate warned, it ends with one line naming where, and exits 1. A
+--message-format other than `human` or `short`, such as JSON, is passed
+through untouched, with nothing filtered.
 
 Environment:
   CAGENTS_VENDORED_WARNINGS=1  Show the vendored crates' warnings too
 """
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 
@@ -31,12 +33,17 @@ import cargo_warnings
 PROGRAM = "cargo-lane"
 # How many warnings the closing line locates; each was shown in full above.
 LOCATIONS_SHOWN = 10
+# The signals the gate cancels its build on, as it did when the lane tasks
+# ran it directly: mise sends TERM to a lane when a sibling lane fails.
+FORWARDED = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
+# The human formats this reads as JSON in their place.
+HUMAN = {"human", "short"}
 
 
 def split_format(arguments):
-    """The --message-format the caller asked for, if any, and the arguments
-    without it. Only Cargo's options count: those before a `--` that starts
-    the harness's or program's arguments."""
+    """The --message-format values the caller gave, None for one missing its
+    value, and the arguments without them. Only Cargo's options count: those
+    before a `--` that starts the harness's or program's arguments."""
     formats, rest = [], []
     words = iter(arguments)
     for word in words:
@@ -44,16 +51,49 @@ def split_format(arguments):
             rest += [word, *words]
             break
         if word == "--message-format":
-            formats.append(next(words, ""))
+            formats.append(next(words, None))
         elif word.startswith("--message-format="):
             formats.append(word.partition("=")[2])
         else:
             rest.append(word)
-    return ",".join(formats) or None, rest
+    return formats, rest
 
 
 def plural(count, noun):
     return f"{count} {noun}{'s' * (count != 1)}"
+
+
+def run(command, warnings, show_vendored):
+    """Runs the gate, relaying its output; returns its exit status."""
+    started = []
+
+    def forward(number, _frame):
+        # The gate cancels its build and exits; its output is still read.
+        # One that has not started yet is not started.
+        if not started:
+            raise SystemExit(128 + number)
+        if started[0].poll() is None:
+            started[0].send_signal(number)
+
+    for number in FORWARDED:
+        signal.signal(number, forward)
+    process = subprocess.Popen(command, stdout=subprocess.PIPE)
+    started.append(process)
+    # Cargo's standard error, with its progress and its own errors, passes
+    # straight through; its standard output carries the messages, and any
+    # line that is not one, such as a test's, goes out byte for byte.
+    with process:
+        for line in process.stdout:
+            kind, text = warnings.read(line)
+            if kind == cargo_warnings.OUTPUT:
+                sys.stdout.buffer.write(text)
+                sys.stdout.buffer.flush()
+            elif kind in (cargo_warnings.DIAGNOSTIC, cargo_warnings.OWN) or (
+                    kind == cargo_warnings.VENDORED and show_vendored):
+                sys.stderr.write(text)
+                sys.stderr.flush()
+        status = process.wait()
+    return 128 - status if status < 0 else status
 
 
 def main(arguments):
@@ -64,16 +104,18 @@ def main(arguments):
         print(__doc__, end="", file=sys.stderr)
         return 2
     gate = [str(HERE / "cargo-gate"), arguments[0]]
-    requested, rest = split_format(arguments[1:])
-    if requested and any(part.strip().startswith("json") for part in requested.split(",")):
+    formats, rest = split_format(arguments[1:])
+    parts = [part.strip() for value in formats for part in (value or "").split(",")]
+    if None in formats or not set(parts) <= HUMAN:
+        # JSON the caller reads, or a format Cargo is to refuse.
         os.execv(gate[0], [*gate, *arguments[1:]])
-    formats = ["json"]
-    if requested and "short" in requested:
-        formats.append("json-diagnostic-short")
-    elif sys.stderr.isatty():
-        formats.append("json-diagnostic-rendered-ansi")
+    chosen = ["json"]
+    if "short" in parts:
+        chosen.append("json-diagnostic-short")
+    if sys.stderr.isatty():
+        chosen.append("json-diagnostic-rendered-ansi")
     # Cargo's own options follow the subcommand, ahead of any `--`.
-    command = [*gate, "--message-format=" + ",".join(formats), *rest]
+    command = [*gate, "--message-format=" + ",".join(chosen), *rest]
 
     try:
         packages = cargo_warnings.workspace_packages(HERE.parent)
@@ -83,25 +125,7 @@ def main(arguments):
         packages = None
     warnings = cargo_warnings.Warnings(packages)
     show_vendored = os.environ.get("CAGENTS_VENDORED_WARNINGS") == "1"
-    # Cargo's standard error, with its progress and its own errors, passes
-    # straight through; its standard output carries the messages.
-    with subprocess.Popen(command, stdout=subprocess.PIPE, text=True, errors="replace") as process:
-        try:
-            for line in process.stdout:
-                kind, text = warnings.read(line)
-                if kind == cargo_warnings.OUTPUT:
-                    sys.stdout.write(text)
-                    sys.stdout.flush()
-                elif kind in (cargo_warnings.DIAGNOSTIC, cargo_warnings.OWN) or (
-                        kind == cargo_warnings.VENDORED and show_vendored):
-                    sys.stderr.write(text)
-                    sys.stderr.flush()
-            status = process.wait()
-        except KeyboardInterrupt:
-            # The gate got the same interrupt and cancels its build.
-            status = process.wait()
-    if status < 0:
-        status = 128 - status
+    status = run(command, warnings, show_vendored)
     if warnings.vendored and not show_vendored:
         print(f"{PROGRAM}: {plural(len(warnings.vendored), 'warning')} from vendored crates not shown "
               "(CAGENTS_VENDORED_WARNINGS=1 shows them)", file=sys.stderr)

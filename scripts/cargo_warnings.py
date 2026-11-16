@@ -90,19 +90,23 @@ class Warnings:
         self.vendored = set()
 
     def read(self, line):
-        """(kind, text) for one line: what kind it is, and the text Cargo's
-        human output would show for it, or None for a Cargo message that is
-        not a diagnostic."""
+        """(kind, text) for one line, as str or bytes: what kind it is, and
+        the text Cargo's human output would show for it. That is the line
+        itself, unchanged, for OUTPUT; a str for a diagnostic; and None for
+        a Cargo message that is not a diagnostic."""
         try:
             message = json.loads(line)
-        except ValueError:
+        except ValueError:  # Including bytes that are not UTF-8.
             return OUTPUT, line
-        if not isinstance(message, dict) or message.get("reason") not in CARGO_REASONS:
+        reason = message.get("reason") if isinstance(message, dict) else None
+        if not isinstance(reason, str) or reason not in CARGO_REASONS:
             return OUTPUT, line
         diagnostic = message.get("message")
-        if message["reason"] != "compiler-message" or not isinstance(diagnostic, dict):
+        if reason != "compiler-message" or not isinstance(diagnostic, dict):
             return MESSAGE, None
-        rendered = diagnostic.get("rendered") or f"{diagnostic.get('message', '')}\n"
+        rendered = diagnostic.get("rendered")
+        if not isinstance(rendered, str) or not rendered:
+            rendered = f"{diagnostic.get('message', '')}\n"
         if self.packages is None or diagnostic.get("level") != "warning":
             return DIAGNOSTIC, rendered
         package_id = str(message.get("package_id", ""))

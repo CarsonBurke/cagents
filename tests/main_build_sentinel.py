@@ -51,6 +51,9 @@ def diagnostic(package_id, level, text):
                       'message': {'level': level, 'message': text,
                                   'rendered': f'{level}: {text}\\n'}}))
 print('Checking cagents', file=sys.stderr)
+# A line on standard output that is not one of Cargo's messages is logged as is.
+print(json.dumps({'note': 'not from Cargo'}))
+print(json.dumps({'reason': 'compiler-artifact', 'target': {'name': 'cagents'}}))
 # Vendored path dependencies print warnings in every lane; they never count.
 diagnostic('path+file:///src/vendor/libcosmic#1.0.0', 'warning', 'vendored unused import')
 diagnostic('path+file:///src/vendor/iced-core#iced_core@0.14.0', 'warning', 'vendored dead code')
@@ -173,6 +176,8 @@ if sys.argv[1:3] == ['issue', 'create']:
         log = (self.state / "logs" / f"{self.first}-ui.log").read_text()
         self.assertIn("warning: vendored unused import", log)
         self.assertIn("Checking cagents", log)
+        self.assertIn('{"note": "not from Cargo"}\n', log)
+        self.assertNotIn("compiler-artifact", log)
         warned = self.commit("lane-only helper", warning="app")
         self.now += 120
         self.tick()

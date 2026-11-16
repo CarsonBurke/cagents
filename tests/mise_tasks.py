@@ -162,7 +162,10 @@ class Behavior(unittest.TestCase):
         self.log = self.root / "calls.jsonl"
         # The real mise binary, not a shim, under private state that trusts only
         # this copy and installs nothing.
-        self.mise = str(Path(shutil.which("mise")).resolve())
+        found = shutil.which("mise")
+        if found is None:
+            self.skipTest("mise is not installed")
+        self.mise = str(Path(found).resolve())
         self.environment = {
             key: value for key, value in os.environ.items() if not key.startswith("MISE_")
         } | {

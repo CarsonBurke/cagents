@@ -119,14 +119,30 @@ def prepare(cargo, arguments):
              if name.startswith("-") and name not in SELECTION for word in words]
     if not any(name in ("--profile", "--release", "-r") for name, _, _ in parsed):
         build += ["--profile", "test"]
-    command = [cargo, *toolchain, "build", *build, "--package", package["id"],
-               "--bin", "cagentsd", "--message-format=json-render-diagnostics"]
+    # A caller that reads the tests' messages as JSON, such as scripts/cargo-lane,
+    # judges the warnings of what the tests compile, and would get this side
+    # build's again, unfiltered, on standard error: it gets only this build's
+    # errors and other diagnostics that are not warnings.
+    formats = ",".join(value or "" for name, value, _ in parsed if name == "--message-format")
+    errors_only = any(part.strip().startswith("json") for part in formats.split(","))
+    command = [cargo, *toolchain, "build", *build, "--package", package["id"], "--bin", "cagentsd",
+               "--message-format=" + ("json" if errors_only else "json-render-diagnostics")]
     print("cargo-gate: building the matched cagentsd helper for HOST tests", file=sys.stderr)
     artifacts = CargoArtifacts()
     # Cargo keeps the jobserver descriptors MAKEFLAGS names.
     with subprocess.Popen(command, stdout=subprocess.PIPE, text=True, close_fds=False) as child:
         for line in child.stdout:
-            artifacts.read(line, diagnostics=sys.stderr)
+            message = artifacts.read(line, diagnostics=None if errors_only else sys.stderr)
+            if not errors_only:
+                continue
+            if message is None:
+                sys.stderr.write(line)
+                continue
+            diagnostic = message.get("message") if message.get("reason") == "compiler-message" else None
+            if isinstance(diagnostic, dict) and diagnostic.get("level") != "warning":
+                rendered = diagnostic.get("rendered")
+                sys.stderr.write(rendered if isinstance(rendered, str) and rendered
+                                 else f"{diagnostic.get('message', '')}\n")
         status = child.wait()
     if status:
         raise SystemExit(status if status > 0 else 128 - status)

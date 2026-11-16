@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,11 +33,23 @@ def diagnostic(package_id, level, text, file_name="src/lib.rs", line=3):
 # The stand-in gate prints the messages in $LANE_MESSAGES as Cargo's standard
 # output, records its arguments, and exits with $LANE_STATUS.
 GATE = """#!/usr/bin/python3
-import json, os, sys
+import json, os, signal, sys, time
 with open(os.environ["LANE_CALLS"], "a") as calls:
     calls.write(json.dumps(sys.argv[1:]) + "\\n")
-print("    Checking cagents", file=sys.stderr)
-sys.stdout.write(open(os.environ["LANE_MESSAGES"]).read())
+print("    Checking cagents", file=sys.stderr, flush=True)
+sys.stdout.buffer.write(open(os.environ["LANE_MESSAGES"], "rb").read())
+sys.stdout.flush()
+if os.environ.get("LANE_WAIT"):
+    # As the gate does: cancel the build, say so, and exit as the signal.
+    def cancel(number, _frame):
+        print(json.dumps({"reason": "compiler-message", "package_id": "path+file:///src#cagents@0.1.3",
+                          "message": {"level": "error", "message": "cancelled",
+                                      "rendered": f"error: cancelled by {number}\\n"}}), flush=True)
+        sys.exit(128 + number)
+    for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
+        signal.signal(number, cancel)
+    open(os.environ["LANE_WAIT"], "w").close()
+    time.sleep(30)
 sys.exit(int(os.environ.get("LANE_STATUS", "0")))
 """
 
@@ -82,9 +95,24 @@ class Classification(unittest.TestCase):
                 self.assertEqual(self.warnings.read(line), (cargo_warnings.OUTPUT, line))
 
     def test_a_diagnostic_without_rendering_shows_its_message(self):
-        line = json.dumps({"reason": "compiler-message", "package_id": OWN_LIB,
-                           "message": {"level": "error", "message": "bare", "rendered": None}}) + "\n"
-        self.assertEqual(self.warnings.read(line), (cargo_warnings.DIAGNOSTIC, "bare\n"))
+        for rendered in (None, "", ["not", "text"], 7):
+            with self.subTest(rendered=rendered):
+                line = json.dumps({"reason": "compiler-message", "package_id": OWN_LIB,
+                                   "message": {"level": "error", "message": "bare", "rendered": rendered}})
+                self.assertEqual(self.warnings.read(line + "\n"), (cargo_warnings.DIAGNOSTIC, "bare\n"))
+
+    def test_json_whose_reason_is_not_cargos_is_output(self):
+        for line in ('{"reason": []}\n', '{"reason": {"a": 1}}\n', '{"reason": "verdict"}\n',
+                     b'{"reason": 3}\n'):
+            with self.subTest(line=line):
+                self.assertEqual(self.warnings.read(line), (cargo_warnings.OUTPUT, line))
+
+    def test_bytes_lines_come_back_unchanged(self):
+        for line in (b"progress\r50%\r100%\n", b"\xff\xfe not utf-8\n"):
+            with self.subTest(line=line):
+                self.assertEqual(self.warnings.read(line), (cargo_warnings.OUTPUT, line))
+        kind, text = self.warnings.read(diagnostic(VENDORED, "error", "broken").encode())
+        self.assertEqual((kind, text), (cargo_warnings.DIAGNOSTIC, "error: broken\n"))
 
     def test_package_names_come_from_every_form_of_package_id(self):
         self.assertEqual(cargo_warnings.package_name(OWN_LIB), "cagents")
@@ -124,7 +152,7 @@ class Lane(unittest.TestCase):
         self.calls = self.root / "calls"
 
     def lane(self, *arguments, messages=(), status=0, **environment):
-        self.messages.write_text("".join(messages))
+        self.messages.write_bytes(b"".join(m if isinstance(m, bytes) else m.encode() for m in messages))
         env = {key: value for key, value in os.environ.items() if key != "CAGENTS_VENDORED_WARNINGS"}
         env |= {"LANE_MESSAGES": str(self.messages), "LANE_CALLS": str(self.calls),
                 "LANE_STATUS": str(status), **environment}
@@ -185,6 +213,72 @@ class Lane(unittest.TestCase):
             ["check", "--message-format=json,json-diagnostic-short", "--lib"],
             ["check", "--message-format=json", "--lib"],
         ])
+
+    def test_a_format_cargo_would_refuse_reaches_cargo_unchanged(self):
+        for arguments in (["--message-format=bogus"], ["--lib", "--message-format"],
+                          ["--message-format", "short,bogus"]):
+            with self.subTest(arguments=arguments):
+                self.calls.unlink(missing_ok=True)
+                self.lane("check", *arguments)
+                self.assertEqual(self.recorded(), [["check", *arguments]])
+
+    def test_a_terminal_keeps_colour_short_or_not(self):
+        import pty
+        for arguments, expected in (([], "json,json-diagnostic-rendered-ansi"),
+                                    (["--message-format=short"],
+                                     "json,json-diagnostic-short,json-diagnostic-rendered-ansi")):
+            with self.subTest(arguments=arguments):
+                self.calls.unlink(missing_ok=True)
+                self.messages.write_text("")
+                controller, terminal = pty.openpty()
+                env = os.environ | {"LANE_MESSAGES": str(self.messages), "LANE_CALLS": str(self.calls)}
+                try:
+                    subprocess.run([str(self.root / "scripts/cargo-lane"), "check", *arguments],
+                                   cwd=self.root, env=env, stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.DEVNULL, stderr=terminal, timeout=60, check=True)
+                finally:
+                    os.close(terminal)
+                    os.close(controller)
+                self.assertEqual(self.recorded(), [["check", f"--message-format={expected}"]])
+
+    def test_program_output_passes_byte_for_byte(self):
+        output = b"progress\r50%\r100%\n\xff not utf-8\n"
+        self.messages.write_bytes(output)
+        env = os.environ | {"LANE_MESSAGES": str(self.messages), "LANE_CALLS": str(self.calls)}
+        result = subprocess.run([str(self.root / "scripts/cargo-lane"), "test"], cwd=self.root, env=env,
+                                stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, output)
+
+    def test_the_closing_line_locates_ten_warnings_and_counts_the_rest(self):
+        result = self.lane("check", messages=[diagnostic(OWN_LIB, "warning", f"unused {n}", "src/lib.rs", n)
+                                              for n in range(12)])
+        self.assertEqual(result.returncode, 1)
+        last = result.stderr.splitlines()[-1]
+        self.assertIn("12 warnings from the workspace's crates (src/lib.rs:0, ", last)
+        self.assertIn("src/lib.rs:9, and 2 more)", last)
+        self.assertNotIn("src/lib.rs:10", last)
+
+    def test_a_signal_reaches_the_gate_whose_status_and_output_are_kept(self):
+        import signal
+        for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT):
+            with self.subTest(signal=number.name):
+                ready = self.root / f"ready-{number}"
+                self.messages.write_text(diagnostic(OWN_LIB, "warning", "unused"))
+                env = os.environ | {"LANE_MESSAGES": str(self.messages), "LANE_CALLS": str(self.calls),
+                                    "LANE_WAIT": str(ready)}
+                with subprocess.Popen([str(self.root / "scripts/cargo-lane"), "check"], cwd=self.root,
+                                      env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE, text=True) as lane:
+                    deadline = time.monotonic() + 30
+                    while not ready.exists() and time.monotonic() < deadline:
+                        time.sleep(0.05)
+                    # Only the lane: the gate must hear it from the lane.
+                    lane.send_signal(number)
+                    _, stderr = lane.communicate(timeout=30)
+                self.assertEqual(lane.returncode, 128 + number, stderr)
+                self.assertIn(f"error: cancelled by {int(number)}\n", stderr)
+                self.assertIn("1 warning from the workspace's crates", stderr)
 
     def test_an_unreadable_workspace_shows_every_warning_and_fails_on_none(self):
         (self.root / "Cargo.toml").write_text("[workspace\n")
