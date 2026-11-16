@@ -26,16 +26,19 @@
 //! the active workspace, which navigation changes on most saves: its scope
 //! is offered on its own. Everything the publishable filter reads is read
 //! afresh, so a pass keeps the scopes, members and panes a complete
-//! rediscovery would. Their order is not always the same: channels keep
-//! theirs, but worktree scopes come in the order they were first discovered
-//! since the last complete discovery, so one found since then comes last
-//! wherever a rediscovery would place it. Publication depends on that order
-//! no more than on a rediscovery's, which follows the known roots' hash order
-//! and so leaves it unspecified already: each scope's edits are its own, and
-//! transfers go out in map order. Where order does show is a path that two
-//! scopes name, as a listed view under another repository than the topology
-//! resolves can: both list the path's cards, and the first scope published
-//! takes a default card's `InsertIfEmpty` request.
+//! rediscovery would. Their order is not always the same. A rediscovery
+//! lists the channels, then the listed views' scopes in model order, then
+//! the known roots' in hash order, the active workspace's and the cards'.
+//! Here channels keep their order, but worktree scopes come in the order
+//! they were first discovered since the last complete discovery, so one
+//! found since then comes last. Publication does not depend on that order:
+//! each scope's edits are its own, and transfers go out in map order. The
+//! exception is a path two scopes name, which only a listed view under
+//! another repository than the topology resolves for it can add. Both
+//! scopes list the path's cards, and the first published takes a default
+//! card's `InsertIfEmpty` request: the listed view's in a rediscovery, but
+//! here the path's own scope's if that was discovered before the view was
+//! listed.
 
 use super::settlement::KeyChanges;
 use super::*;
@@ -630,8 +633,9 @@ impl Cagents {
     /// without counting that one as the window's own.
     ///
     /// The kept scopes, with the active workspace's, must be every worktree
-    /// scope rediscovery finds, each once, and the publishable filter must
-    /// then keep the same scopes, members and panes.
+    /// scope rediscovery finds, each filed once under its own path and
+    /// counting what discovers it now, and the publishable filter must then
+    /// keep the same scopes, members and panes.
     #[cfg(test)]
     fn assert_rediscovery_agrees(
         &self,
@@ -645,34 +649,66 @@ impl Cagents {
             counters.topology_build_count.get(),
             counters.scope_discovery_count.get(),
         );
-        let counted = |scopes: &mut dyn Iterator<Item = &Scope>| {
-            let mut counts = HashMap::<Scope, usize>::new();
-            for scope in scopes {
-                *counts.entry(scope.clone()).or_default() += 1;
-            }
-            counts
-        };
         let rediscovered = self.discover_view_scopes();
-        let rediscovered = counted(
-            &mut rediscovered
-                .scopes
-                .iter()
-                .map(Cow::as_ref)
-                .filter(|scope| matches!(scope, Scope::Worktree { .. })),
-        );
         let active = self
             .active_workspace
             .as_deref()
             .and_then(|path| topology.worktree_scope(path))
             .filter(|scope| !worktrees.sources.contains_key(scope));
-        let kept = counted(&mut worktrees.sources.keys().chain(active.as_ref()));
-        assert_eq!(kept, rediscovered, "kept worktree scopes");
-        let at_path = counted(&mut worktrees.at_path.values().flatten());
         assert_eq!(
-            at_path,
-            counted(&mut worktrees.sources.keys()),
+            worktrees
+                .sources
+                .keys()
+                .chain(active.as_ref())
+                .collect::<HashSet<_>>(),
+            rediscovered
+                .scopes
+                .iter()
+                .map(Cow::as_ref)
+                .filter(|scope| matches!(scope, Scope::Worktree { .. }))
+                .collect::<HashSet<_>>(),
+            "kept worktree scopes"
+        );
+        let mut filed = HashSet::new();
+        for (path, scopes) in &worktrees.at_path {
+            assert!(!scopes.is_empty(), "no scope left at {path:?}");
+            for scope in scopes {
+                assert!(
+                    matches!(scope, Scope::Worktree { path: own, .. } if own == path),
+                    "{scope:?} filed under {path:?}"
+                );
+                assert!(filed.insert(scope), "{scope:?} filed twice");
+            }
+        }
+        assert_eq!(
+            filed,
+            worktrees.sources.keys().collect::<HashSet<_>>(),
             "scopes by path"
         );
+        // What discovers each scope now: the listed views naming it, a known
+        // root at its path, a card outside every channel there.
+        let mut expected = HashMap::<Scope, (usize, bool, bool)>::new();
+        for view in &self.workspace_model.views {
+            if let Some(scope) = Worktrees::view_scope(topology, &view.scope) {
+                expected.entry(scope.clone()).or_default().0 += 1;
+            }
+        }
+        for root in self.known_worktree_roots.iter() {
+            if let Some(scope) = topology.worktree_scope(root) {
+                expected.entry(scope).or_default().1 = true;
+            }
+        }
+        for (_, path) in &rediscovered.worktree_cards {
+            if let Some(scope) = topology.worktree_scope(path) {
+                expected.entry(scope).or_default().2 = true;
+            }
+        }
+        let sources = worktrees
+            .sources
+            .iter()
+            .map(|(scope, sources)| (scope.clone(), (sources.views, sources.root, sources.cards)))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(sources, expected, "what discovers each kept scope");
         let unsettled = worktrees
             .sources
             .keys()
@@ -1195,13 +1231,11 @@ mod tests {
         }
     }
 
-    /// A terminal starting in a worktree that held no card adds one scope to
-    /// those kept, and the saves around it discover nothing again.
-    #[test]
-    fn a_terminal_in_a_new_worktree_discovers_nothing_again() {
-        let (mut app, _, _directory) = large_workspace(&SMALL);
+    /// A settled workspace's worktree that holds no card yet, with the
+    /// scope that would hold the card, and that scope's members.
+    fn worktree_without_a_card(app: &mut Cagents) -> (SidebarAction, Scope) {
         app.persist();
-        settle_seeds(&mut app);
+        settle_seeds(app);
         app.persist();
         let project = &app.sidebar_model.projects[0];
         let row = project
@@ -1218,20 +1252,20 @@ mod tests {
             worktree_id: row.id,
             path: row.path.clone(),
         };
-        let path = row.path.clone();
-        let reused = app.shared_views.discovery.reused;
+        let scope = Scope::Worktree {
+            repository: project.repository.clone(),
+            path: row.path.clone(),
+        };
+        (action, scope)
+    }
+
+    fn reset_discovery_counts(app: &Cagents) -> usize {
         app.shared_views.scope_discovery_count.set(0);
         app.shared_views.topology_build_count.set(0);
-        drop(app.update(Message::Sidebar(action)));
-        drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
-        app.persist();
-        assert!(
-            app.durable
-                .cards
-                .iter()
-                .any(|card| crate::app::worktree_ui::card_directory(card) == Some(path.as_path())),
-            "a terminal opened in the worktree"
-        );
+        app.shared_views.discovery.reused
+    }
+
+    fn assert_followed(app: &Cagents, reused: usize, scope: &Scope) {
         assert!(
             app.shared_views.discovery.reused > reused,
             "a pass followed"
@@ -1242,6 +1276,60 @@ mod tests {
             "rediscovered"
         );
         assert_eq!(app.shared_views.topology_build_count.get(), 0, "topology");
+        // A rediscovery of its own, once the counts are read.
+        let views = app.local_views();
+        assert!(
+            views
+                .cards
+                .get(scope)
+                .is_some_and(|cards| !cards.is_empty()),
+            "{scope:?} holds the new card"
+        );
+    }
+
+    /// Opening a worktree that holds no card puts a card in a scope the
+    /// sidebar row already discovers, and the saves around it discover
+    /// nothing again.
+    #[test]
+    fn opening_a_worktree_without_a_card_discovers_nothing_again() {
+        let (mut app, _, _directory) = large_workspace(&SMALL);
+        let (action, scope) = worktree_without_a_card(&mut app);
+        let reused = reset_discovery_counts(&app);
+        drop(app.update(Message::Sidebar(action)));
+        drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
+        app.persist();
+        assert_followed(&app, reused, &scope);
+    }
+
+    /// A card in a worktree nothing else discovers, no root nor listed view,
+    /// adds its scope alone.
+    #[test]
+    fn a_card_in_an_undiscovered_worktree_adds_its_scope_alone() {
+        let (mut app, _, _directory) = large_workspace(&SMALL);
+        let (_, scope) = worktree_without_a_card(&mut app);
+        let Scope::Worktree { path, .. } = &scope else {
+            unreachable!();
+        };
+        let roots = app
+            .known_worktree_roots
+            .iter()
+            .filter(|root| *root != path)
+            .cloned()
+            .collect();
+        app.known_worktree_roots = roots;
+        app.workspace_model.views.retain(|view| view.scope != scope);
+        app.persist();
+        let kept = |app: &Cagents| {
+            let worktrees = app.shared_views.discovery.worktrees.as_ref().unwrap();
+            worktrees.sources.contains_key(&scope)
+        };
+        assert!(!kept(&app), "nothing discovers the worktree yet");
+        let reused = reset_discovery_counts(&app);
+        let state = card("shell".into(), terminal(path), Existence::Open);
+        Arc::make_mut(&mut app.durable).cards.push(state);
+        app.persist();
+        assert!(kept(&app), "the card discovers the worktree");
+        assert_followed(&app, reused, &scope);
     }
 
     /// Settling more scopes than a journal holds between two passes makes
