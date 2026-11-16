@@ -783,8 +783,8 @@ step closes only the UI, keeps the daemon and provider alive, then uses
 [`seed-refusal-registry.py`](../tests/fixtures/seed-refusal-registry.py) to
 remove that channel's shared view and, on a registry from before schema 27,
 its active channel-work placement mappings. It keeps the monotonic clocks,
-actor/history records, window retention pins and other scopes. The helper then adds a trigger that published-schema admission does
-not recognize. While armed, the real registry can refuse all writes, before
+actor/history records, window retention pins and other scopes. The helper
+then adds a trigger that published-schema admission does not recognize. While armed, the real registry can refuse all writes, before
 the trigger's channel-conditional body runs. The native notice reports the
 registry's schema-mismatch reason, not the trigger body's SQLite sentence.
 The fixture does not inject UI state, replace transport or weaken schema checks.
