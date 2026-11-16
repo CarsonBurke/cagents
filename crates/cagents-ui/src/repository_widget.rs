@@ -1965,6 +1965,19 @@ impl Drop for DiffState {
         }
     }
 }
+
+/// A comparison kept on screen after it stopped being current.
+struct RetainedDiff {
+    path: PathBuf,
+    basis: DiffBasis,
+    state: DiffState,
+    /// Retained only because its presentation changed. It still compares
+    /// what the surface compares, so the live buffer can rebuild it without
+    /// asking Git. A comparison retained across a Git refresh compares
+    /// a baseline that may have moved, and only Git can replace it.
+    restyle: bool,
+}
+
 /// One immutable snapshot is in flight; further edits only advance the desired
 /// revision/deadline. Cancellation does not release the slot until it returns.
 struct WorkingDiffJob {
@@ -2268,7 +2281,7 @@ pub struct RepositoryRuntime {
     mutation_refresh_pending: bool,
     /// Last comparison stays readable while Git refreshes this file, or
     /// while it is rebuilt in a new presentation.
-    stale_diff: Option<(PathBuf, DiffBasis, DiffState)>,
+    stale_diff: Option<RetainedDiff>,
     /// Advances whenever comparisons must be styled or measured again: a
     /// syntax palette or editor font family change.
     diff_presentation: u64,
@@ -2706,7 +2719,12 @@ impl RepositoryRuntime {
             })
         {
             let (basis, state) = self.diffs.remove(index);
-            self.stale_diff = Some((path, basis, state));
+            self.stale_diff = Some(RetainedDiff {
+                path,
+                basis,
+                state,
+                restyle: true,
+            });
         }
         self.diffs.clear();
         self.diff_layout_revision = self.diff_layout_revision.wrapping_add(1);
@@ -2723,8 +2741,10 @@ impl RepositoryRuntime {
                 layout.set_folding(model, enabled);
             }
         }
-        if let Some((_, _, DiffState::Ready(RenderedDiff::Text { model, .. }, layout))) =
-            &mut self.stale_diff
+        if let Some(RetainedDiff {
+            state: DiffState::Ready(RenderedDiff::Text { model, .. }, layout),
+            ..
+        }) = &mut self.stale_diff
         {
             layout.set_folding(model, enabled);
         }
@@ -3494,11 +3514,30 @@ impl RepositoryRuntime {
             })
         {
             let (basis, state) = self.diffs.remove(index);
-            self.stale_diff = Some((path, basis, state));
+            self.stale_diff = Some(RetainedDiff {
+                path,
+                basis,
+                state,
+                restyle: false,
+            });
         }
         // Resolved branch ranges and commits name immutable objects.
-        self.diffs.retain(|(basis, _)| basis.is_immutable());
+        self.drop_mutable_diffs();
         self.initial_load(card)
+    }
+
+    /// Drops the comparisons Git may since have changed.
+    fn drop_mutable_diffs(&mut self) {
+        self.diffs.retain(|(basis, _)| basis.is_immutable());
+        self.expect_git_comparison();
+    }
+
+    /// A comparison kept on screen may now be out of date in what it
+    /// compares, not just in its style, so only Git may replace it.
+    fn expect_git_comparison(&mut self) {
+        if let Some(retained) = &mut self.stale_diff {
+            retained.restyle = false;
+        }
     }
 
     fn refresh_selected_status(&mut self, card: CardId) -> Task<RepositoryAction> {
@@ -5302,7 +5341,8 @@ impl RepositoryRuntime {
             self.working_diff.applied = self.working_diff.desired.clone();
             self.working_diff.presentation = self.diff_presentation;
             self.working_diff.error = Some("The unsaved buffer exceeds the diff size limit. Editing and safe saving remain available.".into());
-            return Task::none();
+            // A restyle left Git's comparison to this rebuild.
+            return self.ensure_current_diff(card);
         }
         let cancellation = CancellationToken::new();
         let syntax_theme = self.syntax_theme;
@@ -5399,7 +5439,11 @@ impl RepositoryRuntime {
                 }
             }
         }
-        let next = self.working_diff_task(identity.card);
+        let mut next = self.working_diff_task(identity.card);
+        if self.working_diff.error.is_some() {
+            // A restyle may have left Git's comparison to this rebuild.
+            next = Task::batch([next, self.ensure_current_diff(identity.card)]);
+        }
         // A rebuild re-anchors the viewport in rows of the new model; a
         // mounted comparison has to be moved to match.
         if installed && self.source_surface == SourceSurface::Diff {
@@ -5774,7 +5818,11 @@ impl RepositoryRuntime {
                 layout.set_row_height(height);
             }
         }
-        if let Some((_, _, DiffState::Ready(_, layout))) = &mut self.stale_diff {
+        if let Some(RetainedDiff {
+            state: DiffState::Ready(_, layout),
+            ..
+        }) = &mut self.stale_diff
+        {
             layout.set_row_height(height);
         }
         self.diff_layout_revision = self.diff_layout_revision.wrapping_add(1);
@@ -6230,7 +6278,7 @@ impl RepositoryRuntime {
                 let background_changed =
                     std::mem::take(&mut self.background_file_refresh) && changed;
                 if background_changed {
-                    self.diffs.retain(|(basis, _)| basis.is_immutable());
+                    self.drop_mutable_diffs();
                 }
                 let refresh_selected =
                     (self.mutation_refresh_pending || background_changed) && result.is_ok();
@@ -6367,7 +6415,7 @@ impl RepositoryRuntime {
                     }
                     self.push_lsp_close_notification();
                     self.dismiss_editor_results();
-                    self.diffs.retain(|(basis, _)| basis.is_immutable());
+                    self.drop_mutable_diffs();
                 }
                 let card = identity.card;
                 let task = self.update_inner(RepositoryAction::FileLoaded { identity, result });
@@ -6561,7 +6609,7 @@ impl RepositoryRuntime {
                 // comparison is discarded and read again from the target.
                 let followed = self.followed_source().is_some();
                 if followed {
-                    self.diffs.retain(|(basis, _)| basis.is_immutable());
+                    self.drop_mutable_diffs();
                 }
                 let reload = if followed {
                     self.ensure_current_diff(identity.card)
@@ -7705,11 +7753,16 @@ impl RepositoryRuntime {
         if !showing_diff || self.diff_state(&self.diff_basis).is_some() {
             return Task::none();
         }
-        // The retained comparison is rebuilt from the live buffer, as after a
-        // presentation change. Git compares the file on disk instead, so its
-        // rows could replace the retained ones before the buffer's arrive.
-        // A buffer the live comparison could not cover still asks Git.
-        if self.wanted_working_diff().is_some() && self.working_diff.error.is_none() {
+        // A comparison retained for a presentation change is rebuilt from
+        // the live buffer. Git compares the file on disk instead, so its rows
+        // could replace the retained ones before the buffer's arrive. A buffer
+        // the live comparison could not cover still asks Git.
+        if self
+            .retained_diff()
+            .is_some_and(|retained| retained.restyle)
+            && self.wanted_working_diff().is_some()
+            && self.working_diff.error.is_none()
+        {
             return Task::none();
         }
         let Some(selected) = self.selected.as_ref() else {
@@ -7889,6 +7942,7 @@ impl RepositoryRuntime {
         let retained_source = predecessor.as_ref().map(|document| document.source.clone());
         self.document = DocumentState::Loading { predecessor };
         self.diffs.clear();
+        self.expect_git_comparison();
         self.basis_resolution = None;
         self.apply_diff_viewport(
             self.viewports.diff[self.diff_mode_index()].unwrap_or(DiffViewportAnchor::FIRST_CHANGE),
@@ -8330,21 +8384,25 @@ impl RepositoryRuntime {
         }
     }
 
+    /// The retained comparison, while it belongs to the selected file and
+    /// basis.
+    fn retained_diff(&self) -> Option<&RetainedDiff> {
+        self.stale_diff.as_ref().filter(|retained| {
+            retained.basis == self.diff_basis
+                && self
+                    .selected
+                    .as_ref()
+                    .is_some_and(|file| file.path == retained.path)
+        })
+    }
+
     fn displayed_diff_state(&self) -> Option<&DiffState> {
         let current = self.diff_state(&self.diff_basis);
         if matches!(current, Some(DiffState::Ready(..))) {
             return current;
         }
-        self.stale_diff
-            .as_ref()
-            .filter(|(path, basis, _)| {
-                *basis == self.diff_basis
-                    && self
-                        .selected
-                        .as_ref()
-                        .is_some_and(|file| file.path == *path)
-            })
-            .map(|(_, _, state)| state)
+        self.retained_diff()
+            .map(|retained| &retained.state)
             .or(current)
     }
 
@@ -18088,7 +18146,8 @@ mod tests {
     #[test]
     fn a_restyle_rebuilds_from_the_buffer_without_asking_git() {
         let card = CardId::new();
-        let (mut runtime, _) = working_diff_runtime(card, "removed\nkept\n", "added\nkept\n");
+        let (mut runtime, identity) =
+            working_diff_runtime(card, "removed\nkept\n", "added\nkept\n");
         runtime.set_syntax_theme(crate::settings::EditorSyntaxTheme::Mocha);
         drop(runtime.refresh_diff_presentation(card));
         assert!(runtime.diff_state(&DiffBasis::IndexToWorktree).is_none());
@@ -18099,13 +18158,52 @@ mod tests {
         drop(runtime.update(RepositoryAction::ApplySourceSurface { card, diff: true }));
         assert!(runtime.diff_state(&DiffBasis::IndexToWorktree).is_none());
 
-        // A buffer the live comparison could not cover falls back to Git.
-        runtime.working_diff.error = Some("too large".into());
-        drop(runtime.ensure_current_diff(card));
+        // A rebuild that fails falls back to Git.
+        let ticket = runtime.working_diff.timer.unwrap();
+        runtime.working_diff.deadline = Some(Instant::now());
+        drop(runtime.start_working_diff(card, ticket));
+        let active = runtime.working_diff.active.as_ref().unwrap();
+        let (revision, before) = (active.revision, Arc::clone(&active.before));
+        drop(runtime.finish_working_diff(
+            identity,
+            revision,
+            ticket,
+            before,
+            Err("Diff worker failed".into()),
+        ));
         assert!(matches!(
             runtime.diff_state(&DiffBasis::IndexToWorktree),
             Some(DiffState::Loading { .. })
         ));
+        assert!(runtime.diff_model().is_some(), "the retained rows stay");
+    }
+
+    /// Staging, unstaging or committing can move the index a retained
+    /// comparison was built against, so only Git can replace it, even
+    /// while a restyle was rebuilding it from the buffer.
+    #[test]
+    fn a_git_refresh_replaces_a_retained_comparison_from_git() {
+        for restyled in [false, true] {
+            let card = CardId::new();
+            let (mut runtime, _) = working_diff_runtime(card, "removed\nkept\n", "added\nkept\n");
+            if restyled {
+                runtime.set_syntax_theme(crate::settings::EditorSyntaxTheme::Mocha);
+                drop(runtime.refresh_diff_presentation(card));
+                assert!(runtime.diff_state(&DiffBasis::IndexToWorktree).is_none());
+            }
+            drop(runtime.refresh_after_mutation(card));
+            assert!(runtime.diff_model().is_some(), "the rows stay readable");
+            // The status listing that follows the mutation has arrived.
+            runtime.mutation_refresh_pending = false;
+            drop(runtime.ensure_current_diff(card));
+            assert!(
+                matches!(
+                    runtime.diff_state(&DiffBasis::IndexToWorktree),
+                    Some(DiffState::Loading { .. })
+                ),
+                "restyled: {restyled}"
+            );
+        }
     }
 
     #[test]
