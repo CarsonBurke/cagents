@@ -980,3 +980,73 @@ fn blocked_fresh_abandoned_cleanup_keeps_captured_pair_receipt_required() {
             .any(|phase| matches!(phase, Phase::Starting(_)))
     );
 }
+
+/// Closing an open agent's conversation retires the agent and its pane, so a
+/// blocked agent pane offers Close rather than a Fresh with no card to start in.
+#[test]
+fn a_blocked_agent_pane_offers_close_but_not_fresh() {
+    for runtime in [false, true] {
+        for by_card in [false, true] {
+            let (mut app, card) = blocked_app(true, true, runtime);
+            assert!(app.chat_offers_fresh_conversation(card));
+            let source = app.chat_return_session(card).unwrap();
+            let mut agent = crate::app::channel_ui::close_tests::agent(&source);
+            if by_card {
+                agent.id = crate::model::AgentId::from_uuid(card.as_uuid());
+                agent.session = None;
+            }
+            app.workspace_model.agents.push(agent.clone());
+            assert!(
+                !app.chat_offers_fresh_conversation(card),
+                "runtime {runtime}, by card {by_card}"
+            );
+            let (tree, _) = frame(app.card_view(card, true, false), 1200.0, None);
+            let labels = tree
+                .root()
+                .iter()
+                .chain(tree.children())
+                .filter(|node| node.node().role() == Role::Button && !node.node().is_hidden())
+                .filter_map(|node| node.node().label().map(str::to_owned))
+                .collect::<Vec<_>>();
+            assert!(
+                !labels
+                    .iter()
+                    .any(|label| label == "Start a new conversation")
+            );
+            assert!(
+                labels.iter().any(|label| label.starts_with("Close")),
+                "{labels:?}"
+            );
+            app.workspace_model.agents[0].closed = true;
+            assert!(
+                app.chat_offers_fresh_conversation(card),
+                "a closed agent owns nothing"
+            );
+        }
+    }
+}
+
+/// A pane that explains why its conversation couldn't open does not also
+/// invite a first message, as if the conversation were simply empty.
+#[test]
+fn a_failed_empty_pane_does_not_invite_a_first_message() {
+    const INVITATION: &str = "Your conversation appears here. Send a message to begin.";
+    let (mut app, card) = blocked_app(true, true, true);
+    let target = chat_runtime(&app, card).target;
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    runtime.replace_draft(text_editor::Content::new());
+    runtime.refresh_failure_ui();
+    let (tree, _) = frame(app.card_view(card, true, false), 1200.0, None);
+    assert!(labels(&tree).contains(&blocked_recovery::HEADLINE));
+    assert!(!labels(&tree).contains(&INVITATION));
+
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    runtime.start_retry_blocked = false;
+    runtime.error = None;
+    runtime.refresh_failure_ui();
+    let (tree, _) = frame(app.card_view(card, true, false), 1200.0, None);
+    assert!(
+        labels(&tree).contains(&INVITATION),
+        "an empty healthy pane still invites one"
+    );
+}

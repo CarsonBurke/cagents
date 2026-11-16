@@ -52,7 +52,11 @@ fn close_captured_chat_with(
         return Err(captured_chat_changed());
     }
     let mut agents = None;
-    let bound = captured_open_agent(source, read_open_agents(&mut agents, client)?)?;
+    // Closing an open agent's conversation retires the agent and its pane,
+    // which leaves Fresh no card to start in. Refuse before closing anything.
+    if captured_open_agent(source, read_open_agents(&mut agents, client)?)? {
+        return Err(agent_owned_conversation());
+    }
     if live.is_some() {
         // The attachment must still be the captured descriptor after inventory
         // was read. In particular, never close an ID-only handle or derive a
@@ -62,11 +66,9 @@ fn close_captured_chat_with(
             .map_err(|error| error.reason())?;
         agents = None;
         if captured_open_agent(source, read_open_agents(&mut agents, client)?)? {
-            client
-                .close_retained_chat(source.clone())
-                .map_err(|error| error.reason())?;
+            return Err(agent_owned_conversation());
         }
-    } else if may_have_retained_owner(source) || source.terminal.is_some() || bound {
+    } else if may_have_retained_owner(source) || source.terminal.is_some() {
         // Actor absence is not a retained-owner or paired-terminal receipt.
         client
             .close_retained_chat(source.clone())
@@ -91,6 +93,11 @@ fn captured_open_agent(
         }
     }
     Ok(bound)
+}
+
+fn agent_owned_conversation() -> String {
+    "An agent runs this conversation, so it can't start a new one in its place. Close it instead."
+        .into()
 }
 
 fn captured_chat_changed() -> String {
@@ -3938,7 +3945,7 @@ mod tests {
 mod revival_tests;
 
 #[cfg(test)]
-mod close_tests {
+pub(in crate::app) mod close_tests {
     use super::*;
     use crate::agent_execution::{
         Agent, HostedSession, Origin, Placement, Spec, Surface, Target as AgentTarget,
@@ -3956,7 +3963,7 @@ mod close_tests {
         session
     }
 
-    fn agent(session: &crate::chat::Session) -> Agent {
+    pub(in crate::app) fn agent(session: &crate::chat::Session) -> Agent {
         let placement = Placement::Channel(ChannelId::new());
         Agent {
             id: crate::model::AgentId::new(),
@@ -4259,16 +4266,34 @@ mod close_tests {
         );
     }
 
+    /// Closing an open agent's conversation retires the agent and removes its
+    /// pane, so Fresh would start in a card that no longer exists. It refuses
+    /// before closing anything, and again if an agent claims it mid-close.
     #[test]
-    fn fresh_close_retires_only_exact_source_and_remaining_agent() {
+    fn fresh_close_refuses_a_conversation_an_open_agent_runs_as() {
         use crate::terminal::ipc::{ClientRequest, ServerResponse};
         let source = captured_source();
-        assert!(
+        for live in [false, true] {
+            assert_eq!(
+                captured_close(
+                    &source,
+                    vec![
+                        (
+                            ClientRequest::ChatList,
+                            listed(if live { vec![source.clone()] } else { vec![] })
+                        ),
+                        (read_agents(), model(vec![agent(&source)])),
+                    ]
+                ),
+                Err(agent_owned_conversation())
+            );
+        }
+        assert_eq!(
             captured_close(
                 &source,
                 vec![
                     (ClientRequest::ChatList, listed(vec![source.clone()])),
-                    (read_agents(), model(vec![agent(&source)])),
+                    (read_agents(), model(vec![])),
                     (
                         ClientRequest::ChatAttach {
                             session: source.clone()
@@ -4286,15 +4311,9 @@ mod close_tests {
                         }
                     ),
                     (read_agents(), model(vec![agent(&source)])),
-                    (
-                        ClientRequest::ChatCloseRetained {
-                            session: source.clone()
-                        },
-                        ServerResponse::Accepted
-                    ),
                 ]
-            )
-            .is_ok()
+            ),
+            Err(agent_owned_conversation())
         );
     }
 
@@ -4349,41 +4368,9 @@ mod close_tests {
     }
 
     #[test]
-    fn fresh_close_actor_absence_requires_exact_retained_receipt_when_bound() {
-        use crate::terminal::ipc::{ClientRequest, ServerResponse};
+    fn fresh_close_of_an_absent_unretained_conversation_asks_nothing_more() {
+        use crate::terminal::ipc::ClientRequest;
         let source = captured_source();
-        assert!(
-            captured_close(
-                &source,
-                vec![
-                    (ClientRequest::ChatList, listed(vec![])),
-                    (read_agents(), model(vec![agent(&source)])),
-                    (
-                        ClientRequest::ChatCloseRetained {
-                            session: source.clone()
-                        },
-                        ServerResponse::Accepted
-                    ),
-                ]
-            )
-            .is_ok()
-        );
-        assert!(
-            captured_close(
-                &source,
-                vec![
-                    (ClientRequest::ChatList, listed(vec![])),
-                    (read_agents(), model(vec![agent(&source)])),
-                    (
-                        ClientRequest::ChatCloseRetained {
-                            session: source.clone()
-                        },
-                        ServerResponse::Detached
-                    ),
-                ]
-            )
-            .is_err()
-        );
         assert!(
             captured_close(
                 &source,

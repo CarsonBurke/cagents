@@ -9430,7 +9430,22 @@ impl Cagents {
                 // Only an unknown permanent refusal needs a named saved source.
                 (source.launch.session_id.is_some() || !self.chat_retry_blocked(card))
                     && source.fresh_start().is_some()
+                    && !self.chat_runs_as_open_agent(card, &source)
             })
+    }
+    /// An open agent's pane belongs to that agent: closing its conversation
+    /// retires the agent and removes the pane, so Fresh has no card to start
+    /// in. Close is that pane's recovery.
+    fn chat_runs_as_open_agent(&self, card: CardId, source: &chat::Session) -> bool {
+        let managed = crate::model::AgentId::from_uuid(card.as_uuid());
+        self.workspace_model.agents.iter().any(|agent| {
+            !agent.closed
+                && (agent.id == managed
+                    || agent
+                        .session
+                        .as_ref()
+                        .is_some_and(|owner| owner.id() == source.id))
+        })
     }
     pub(super) fn chat_fork_target(&self, card: CardId) -> Option<Target> {
         let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {

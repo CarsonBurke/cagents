@@ -2631,7 +2631,22 @@ impl Runtime {
                     self.disconnected || self.paging().is_some(),
                 ));
             }
-            if self.turns.is_empty() && self.queued.is_none() && !self.closed_elsewhere {
+            let unanchored = |incident: &&failure::Incident| {
+                !incident.active_recovery
+                    && incident.child_scope.is_none()
+                    && incident.anchor.is_none()
+            };
+            // A pane that shows why its conversation couldn't open is not
+            // waiting for a first message; inviting one would contradict it.
+            if self.turns.is_empty()
+                && self.queued.is_none()
+                && !self.closed_elsewhere
+                && !self
+                    .failure_ui
+                    .incidents
+                    .iter()
+                    .any(|incident| unanchored(&incident))
+            {
                 // The empty state says what to do. It used to show whatever the
                 // adapter's last status detail was, which meant an empty
                 // conversation greeted the reader with a connection state instead
@@ -2652,11 +2667,7 @@ impl Runtime {
                     .into(),
                 );
             }
-            for incident in self.failure_ui.incidents.iter().filter(|incident| {
-                !incident.active_recovery
-                    && incident.child_scope.is_none()
-                    && incident.anchor.is_none()
-            }) {
+            for incident in self.failure_ui.incidents.iter().filter(unanchored) {
                 transcript.push(
                     widget::container(
                         self.failure_view_with_reset(incident, reset_controls.as_ref()),
