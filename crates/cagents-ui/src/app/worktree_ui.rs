@@ -1133,13 +1133,42 @@ impl Cagents {
     /// and workloads that seed only the durable state do.
     #[cfg(test)]
     pub(super) fn restore_worktree_scope(&mut self) -> Task<Message> {
-        self.restore_workspace_scope(false)
+        self.restore_workspace_scope(false, None)
     }
 
     /// The nearest surviving project can provide a useful destination after
     /// its saved checkout disappeared. An unrelated project's first worktree
     /// is never a substitute for the removed one.
-    fn surviving_project_scope(&self, removed: &Path) -> Option<PathBuf> {
+    /// The checkout a window saved on `removed` falls back to: one in the
+    /// project its record names, otherwise in the project that contains it.
+    fn surviving_project_scope(
+        &self,
+        removed: &Path,
+        recorded: Option<ProjectId>,
+    ) -> Option<PathBuf> {
+        let available = |path: &Path| path != removed && worktree_directory_available(path);
+        let checkout = |project: &SidebarProject| {
+            project
+                .worktrees
+                .iter()
+                .filter(|worktree| available(&worktree.path))
+                .min_by_key(|worktree| {
+                    !sidebar::is_primary_worktree(&project.repository, &worktree.path)
+                })
+                .map(|worktree| worktree.path.clone())
+                .or_else(|| {
+                    (project.kind == ProjectKind::Folder && available(&project.repository))
+                        .then(|| project.repository.clone())
+                })
+        };
+        // A worktree directory may live outside its repository, where only
+        // the record ties it to the project.
+        if let Some(target) = recorded
+            .and_then(|id| self.sidebar_model.project(id))
+            .and_then(checkout)
+        {
+            return Some(target);
+        }
         self.sidebar_model
             .projects
             .iter()
@@ -1157,20 +1186,7 @@ impl Cagents {
                 {
                     return None;
                 }
-                let available = |path: &Path| path != removed && worktree_directory_available(path);
-                let target = project
-                    .worktrees
-                    .iter()
-                    .filter(|worktree| available(&worktree.path))
-                    .min_by_key(|worktree| {
-                        !sidebar::is_primary_worktree(&project.repository, &worktree.path)
-                    })
-                    .map(|worktree| worktree.path.clone())
-                    .or_else(|| {
-                        (project.kind == ProjectKind::Folder && available(&project.repository))
-                            .then(|| project.repository.clone())
-                    })?;
-                Some((root.components().count(), target))
+                Some((root.components().count(), checkout(project)?))
             })
             .max_by_key(|(depth, _)| *depth)
             .map(|(_, target)| target)
@@ -1181,7 +1197,11 @@ impl Cagents {
     ///
     /// `has_saved_view` says the store came from a build that records the
     /// window's scope, so no saved scope means the window was on home.
-    pub(super) fn restore_workspace_scope(&mut self, has_saved_view: bool) -> Task<Message> {
+    pub(super) fn restore_workspace_scope(
+        &mut self,
+        has_saved_view: bool,
+        scope_project: Option<ProjectId>,
+    ) -> Task<Message> {
         Arc::make_mut(&mut self.durable).normalize_channels();
         // At startup these roots come from every catalog record, including
         // retired ones. Check that evidence before directory-bearing panes add
@@ -1215,7 +1235,7 @@ impl Cagents {
                 return self.select_worktree(scope, false);
             }
             Arc::make_mut(&mut self.durable).active_worktree = None;
-            if let Some(fallback) = self.surviving_project_scope(&scope) {
+            if let Some(fallback) = self.surviving_project_scope(&scope, scope_project) {
                 return self.select_worktree(fallback, false);
             }
         }

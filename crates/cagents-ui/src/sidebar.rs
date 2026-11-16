@@ -2944,6 +2944,28 @@ pub enum ChangeTreeScope {
     Area(ChangeArea),
 }
 
+/// A saved presentation value, or its default when this build does not know
+/// it: a variant renamed later, or one a newer build saved, must not cost
+/// the rest of the window's view.
+pub(crate) fn known_or_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de> + Default,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged, bound = "T: serde::Deserialize<'de>")]
+    enum Saved<T> {
+        Known(T),
+        Unknown(serde::de::IgnoredAny),
+    }
+    Ok(
+        match <Saved<T> as serde::Deserialize>::deserialize(deserializer)? {
+            Saved::Known(value) => value,
+            Saved::Unknown(_) => T::default(),
+        },
+    )
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SidebarView {
     query: String,
@@ -2958,9 +2980,9 @@ pub struct SidebarView {
     collapsed_change_directories: Vec<(ChangeTreeScope, Vec<RepoPath>)>,
     #[serde(default)]
     in_progress_collapsed: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "known_or_default")]
     filter: SidebarFilter,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "known_or_default")]
     toggled_sections: BTreeSet<PanelSection>,
     #[serde(default)]
     panel_open: bool,
@@ -2968,10 +2990,26 @@ pub struct SidebarView {
     files_query: String,
     #[serde(default)]
     files_filter_open: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "known_or_default")]
     change_list_mode: FileListMode,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "known_or_default")]
     changes_tab: ChangesTab,
+}
+
+impl SidebarView {
+    /// This view without the panel state that belonged to the worktree it
+    /// was saved on, as binding another worktree would clear it.
+    pub fn without_worktree_panel(self) -> Self {
+        Self {
+            files_query: String::new(),
+            files_filter_open: false,
+            expanded_directories: BTreeSet::new(),
+            collapsed_change_directories: Vec::new(),
+            toggled_sections: BTreeSet::new(),
+            changes_tab: ChangesTab::default(),
+            ..self
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

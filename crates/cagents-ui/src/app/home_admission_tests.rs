@@ -123,7 +123,7 @@ fn home_admits_retained_worktree_and_channel_views_without_navigation() {
         }
     }
     app.shared_views = shared_views::State::for_workspace(&app.durable);
-    drop(app.restore_window_view(None));
+    drop(app.restore_window_view(None, None));
     assert_eq!(app.active_workspace, None);
     assert_eq!(app.durable.active_channel, None);
     assert_eq!(app.workspace.focused(), None);

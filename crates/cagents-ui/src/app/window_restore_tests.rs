@@ -57,7 +57,18 @@ fn fixture(root: &Path) -> Cagents {
 
 /// Use the same snapshot and WindowView save boundaries as shutdown, then
 /// reopen the actual SQLite store. No runtime tasks or providers are executed.
-fn restart(mut app: Cagents, database: &Path, legacy_view: bool) -> Cagents {
+fn restart(app: Cagents, database: &Path, legacy_view: bool) -> Cagents {
+    restart_with(app, database, legacy_view, None)
+}
+
+/// `scope_project` stands in for the project init reads from the saved
+/// scope's worktree record, which outlives its sidebar row.
+fn restart_with(
+    mut app: Cagents,
+    database: &Path,
+    legacy_view: bool,
+    scope_project: Option<ProjectId>,
+) -> Cagents {
     let boot = BootId::new("window-view-fixture");
     let (session, _) = SessionRuntime::open(database, boot.clone()).unwrap();
     app.session = Some(session);
@@ -117,7 +128,7 @@ fn restart(mut app: Cagents, database: &Path, legacy_view: bool) -> Cagents {
     restored.chrome_ui = chrome_ui::State::default()
         .with_user_titles(view.user_titles.clone())
         .with_projects_collapsed(view.projects_sidebar_collapsed);
-    drop(restored.restore_window_view(Some(view)));
+    drop(restored.restore_window_view(Some(view), scope_project));
     drop(session);
     restored
 }
@@ -187,6 +198,10 @@ fn selected_worktree_and_channel_restore_their_focused_pane_from_stores() {
         }
         drop(app.restore_worktree_scope());
         app.chrome_ui.user_titles.insert(second.id, "Review".into());
+        let mut sidebar = serde_json::to_value(app.sidebar_state.saved_view()).unwrap();
+        sidebar["files_query"] = serde_json::json!("kept");
+        app.sidebar_state
+            .restore_view(serde_json::from_value(sidebar).unwrap());
         let database = directory.path().join(format!("selected-{channel}.sqlite3"));
         let restored = restart(app, &database, false);
         assert_eq!(restored.active_workspace, Some(root));
@@ -197,6 +212,8 @@ fn selected_worktree_and_channel_restore_their_focused_pane_from_stores() {
         );
         assert_eq!(restored.workspace.focused(), Some(second.id));
         assert_eq!(restored.chrome_ui.user_titles[&second.id], "Review");
+        // Back where it was saved, the panel keeps its worktree-local state.
+        assert_eq!(restored.sidebar_state.files_query(), "kept");
     }
 }
 
@@ -290,7 +307,7 @@ fn stale_channel_selection_does_not_enter_a_retained_panes_worktree() {
     assert_eq!(app.durable.focused, Some(retained.id));
     assert_eq!(app.durable.active_worktree, None);
     app.workspace = Cagents::rebuild_workspace(&app.durable);
-    drop(app.restore_window_view(None));
+    drop(app.restore_window_view(None, None));
     assert_eq!(app.active_workspace, None);
     assert_eq!(app.durable.active_channel, None);
     assert_eq!(app.workspace.focused(), None);
@@ -340,16 +357,27 @@ fn sidebar_disclosures_restore_after_initial_source_control_binding() {
 }
 
 #[test]
-fn removed_saved_worktree_restores_a_live_project_or_home_from_store() {
+fn removed_saved_worktree_restores_its_live_project_or_home_from_store() {
     let directory = tempfile::tempdir().unwrap();
-    for (name, nested, lingering) in [
-        ("removed-nested", true, false),
-        ("retired-nested-directory", true, true),
-        ("removed-external", false, false),
-        ("retired-external-directory", false, true),
+    // External worktrees are found through the project their record names;
+    // without a record, only nesting ties a directory to a project.
+    for (name, nested, lingering, recorded) in [
+        ("removed-nested", true, false, false),
+        ("retired-nested-directory", true, true, false),
+        ("removed-external", false, false, true),
+        ("retired-external-directory", false, true, true),
+        ("unrecorded-external", false, false, false),
     ] {
         let mut app = fixture(directory.path());
+        let project = app.sidebar_model.projects[0].id;
         let primary = app.sidebar_model.projects[0].worktrees[0].path.clone();
+        // The removed worktree's own panel state does not follow the window
+        // to another checkout.
+        let mut sidebar = serde_json::to_value(app.sidebar_state.saved_view()).unwrap();
+        sidebar["files_query"] = serde_json::json!("removed only");
+        sidebar["changes_tab"] = serde_json::json!("History");
+        app.sidebar_state
+            .restore_view(serde_json::from_value(sidebar).unwrap());
         let missing = if nested {
             primary.join("worktrees/removed")
         } else {
@@ -371,19 +399,26 @@ fn removed_saved_worktree_restores_a_live_project_or_home_from_store() {
         durable.card_scopes.insert(main.id, primary.clone());
         durable.worktree_focus.insert(primary.clone(), main.id);
         let database = directory.path().join(format!("{name}.sqlite3"));
-        let restored = restart(app, &database, false);
-        let expected = nested.then_some(primary);
+        let restored = restart_with(app, &database, false, recorded.then_some(project));
+        let survives = nested || recorded;
+        let expected = survives.then_some(primary);
         assert_eq!(restored.active_workspace, expected, "{name}");
         assert_eq!(restored.durable.active_worktree, expected, "{name}");
         assert_eq!(restored.durable.active_channel, None, "{name}");
         assert_eq!(
             restored.workspace.focused(),
-            nested.then_some(main.id),
+            survives.then_some(main.id),
             "{name}"
         );
         assert_eq!(
             restored.workspace.order().collect::<Vec<_>>(),
-            if nested { vec![main.id] } else { Vec::new() },
+            if survives { vec![main.id] } else { Vec::new() },
+            "{name}"
+        );
+        assert_eq!(restored.sidebar_state.files_query(), "", "{name}");
+        assert_eq!(
+            restored.sidebar_state.changes_tab(),
+            sidebar::ChangesTab::default(),
             "{name}"
         );
         assert!(
@@ -412,4 +447,55 @@ fn saved_unregistered_directory_still_restores_when_it_exists() {
     let restored = restart(app, &directory.path().join("unregistered.sqlite3"), false);
     assert_eq!(restored.active_workspace, Some(outside));
     assert_eq!(restored.workspace.focused(), Some(card.id));
+}
+
+#[test]
+fn a_restored_file_filter_and_open_folders_are_read_once_restored() {
+    let directory = tempfile::tempdir().unwrap();
+    let reads = |files_query: &str, name: &str| {
+        let mut app = fixture(directory.path());
+        let root = app.sidebar_model.projects[0].worktrees[0].path.clone();
+        let card = terminal(&root);
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards = vec![card.clone()].into();
+        durable.focused = Some(card.id);
+        durable.active_worktree = Some(root.clone());
+        durable.worktree_focus.insert(root, card.id);
+        drop(app.restore_worktree_scope());
+        let mut sidebar = serde_json::to_value(app.sidebar_state.saved_view()).unwrap();
+        sidebar["files_query"] = serde_json::json!(files_query);
+        app.sidebar_state
+            .restore_view(serde_json::from_value(sidebar).unwrap());
+        let restored = restart(app, &directory.path().join(format!("{name}.sqlite3")), false);
+        assert_eq!(restored.sidebar_state.files_query(), files_query);
+        restored.refresh_ui.source_generation
+    };
+    // The first read was built before the filter came back, so one more
+    // read lists what it matches.
+    assert_eq!(reads("restore", "filtered"), reads("", "plain") + 1);
+}
+
+#[test]
+fn a_saved_presentation_value_this_build_does_not_know_keeps_the_rest_of_the_view() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = fixture(directory.path());
+    app.settings_path = Some(directory.path().join("settings.toml"));
+    app.settings_write_blocked = false;
+    let mut view = serde_json::to_value(app.capture_settings_save().unwrap().view).unwrap();
+    view["settings_category"] = serde_json::json!("FromANewerBuild");
+    view["settings_search"] = serde_json::json!("kept");
+    let sidebar = &mut view["sidebar"];
+    sidebar["filter"] = serde_json::json!("FromANewerBuild");
+    sidebar["toggled_sections"] = serde_json::json!(["Untracked", "FromANewerBuild"]);
+    sidebar["change_list_mode"] = serde_json::json!("FromANewerBuild");
+    sidebar["changes_tab"] = serde_json::json!("FromANewerBuild");
+    sidebar["files_query"] = serde_json::json!("kept");
+    let view: WindowView = serde_json::from_value(view).unwrap();
+    assert_eq!(view.settings_category, None);
+    assert_eq!(view.settings_search, "kept");
+    let sidebar = serde_json::to_value(&view.sidebar).unwrap();
+    assert_eq!(sidebar["filter"], serde_json::json!(sidebar::SidebarFilter::default()));
+    assert_eq!(sidebar["toggled_sections"], serde_json::json!([]));
+    assert_eq!(sidebar["changes_tab"], serde_json::json!(sidebar::ChangesTab::default()));
+    assert_eq!(sidebar["files_query"], serde_json::json!("kept"));
 }

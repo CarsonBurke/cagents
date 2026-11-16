@@ -2476,7 +2476,7 @@ struct WindowView {
     #[serde(default)]
     channel_offsets: HashMap<crate::model::ChannelId, f32>,
     /// Absent from a window saved before Settings kept its page.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "sidebar::known_or_default")]
     settings_category: Option<SettingsCategory>,
     #[serde(default)]
     settings_search: String,
@@ -5857,20 +5857,60 @@ impl Cagents {
     /// Strip offsets must be known before the scope binds its camera, and
     /// binding the scope's source control clears the panel's disclosures, so
     /// the sidebar view is applied after that first binding.
-    fn restore_window_view(&mut self, view: Option<WindowView>) -> Task<Message> {
+    /// `scope_project` is the project whose worktree record holds the saved
+    /// scope. The record outlives the worktree's sidebar row, so a removed
+    /// worktree can still fall back to its own project.
+    fn restore_window_view(
+        &mut self,
+        view: Option<WindowView>,
+        scope_project: Option<ProjectId>,
+    ) -> Task<Message> {
         if let Some(view) = &view {
             self.worktree_offsets.clone_from(&view.worktree_offsets);
             self.channel_offsets.clone_from(&view.channel_offsets);
         }
-        let scope = self.restore_workspace_scope(view.is_some());
-        if let Some(view) = view {
-            self.sidebar_state.restore_view(view.sidebar);
-            if let Some(category) = view.settings_category {
-                self.settings_category = category;
+        let saved_scope = (
+            self.durable.active_worktree.clone(),
+            self.durable.active_channel,
+        );
+        let scope = self.restore_workspace_scope(view.is_some(), scope_project);
+        let Some(view) = view else {
+            return scope;
+        };
+        // Binding the restored scope cleared the panel's worktree-local
+        // state, which the view now puts back, but only when the window
+        // came back to the worktree that state was saved for.
+        let kept_scope = match saved_scope {
+            (_, Some(channel)) => self.durable.active_channel == Some(channel),
+            (worktree, None) => {
+                self.durable.active_channel.is_none() && self.durable.active_worktree == worktree
             }
-            self.settings_search = view.settings_search;
+        };
+        self.sidebar_state.restore_view(if kept_scope {
+            view.sidebar
+        } else {
+            view.sidebar.without_worktree_panel()
+        });
+        if let Some(category) = view.settings_category {
+            self.settings_category = category;
         }
-        scope
+        self.settings_search = view.settings_search;
+        // The first read was built before the view restored its file filter
+        // and open folders, so it would list neither.
+        let reload = match self.sidebar_state.active_worktree().cloned() {
+            Some(key)
+                if !self.sidebar_state.files_query().is_empty()
+                    || self
+                        .sidebar_state
+                        .expanded_directory_paths()
+                        .next()
+                        .is_some() =>
+            {
+                self.reload_source_control(&key)
+            }
+            _ => Task::none(),
+        };
+        Task::batch([scope, reload])
     }
 
     fn rebuild_workspace(state: &WorkspaceState) -> Workspace {
@@ -14792,6 +14832,12 @@ impl Application for Cagents {
         } = startup.bootstrap;
         reconcile_restored_projects(&mut projects, &mut worktrees, &durable.project_order);
         let retired = worktree_ui::retire_missing_worktrees(&mut worktrees);
+        let scope_project = durable.active_worktree.as_ref().and_then(|scope| {
+            worktrees
+                .iter()
+                .find(|worktree| worktree.path == *scope)
+                .map(|worktree| worktree.project_id)
+        });
         if let Some(session) = &session {
             session.save_worktrees(retired);
         }
@@ -15138,7 +15184,7 @@ impl Application for Cagents {
             let chrome = app.sync_chrome();
             return (app, chrome);
         }
-        let scope = app.restore_window_view(window_view);
+        let scope = app.restore_window_view(window_view, scope_project);
         // Closed/exited replacements can still owe a lost durable acknowledgement.
         for card in &app.durable.cards {
             let terminal = match &card.kind {
