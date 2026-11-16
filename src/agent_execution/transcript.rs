@@ -769,6 +769,21 @@ mod tests {
     }
 
     #[test]
+    fn a_page_cut_short_at_its_cursor_names_the_entry_by_id() {
+        let items = conversation();
+        let mut query = query(10);
+        query.before = Some(cursor("a1"));
+        let mut builder = Builder::new(&query);
+        // History runs out of reading time right after the cursor's entry.
+        for item in items[7..].iter().rev() {
+            assert!(builder.push(item));
+        }
+        let (entries, earlier) = builder.finish(false).unwrap();
+        assert!(entries.is_empty());
+        assert_eq!(earlier.as_deref(), Some("a1"), "never the cursor itself");
+    }
+
+    #[test]
     fn a_page_ending_in_unread_history_offers_a_cursor() {
         let items = conversation();
         let mut builder = Builder::new(&query(10));

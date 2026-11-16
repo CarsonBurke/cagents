@@ -216,8 +216,11 @@ fn converse(
         None => Err(AppError::new(
             "timeout",
             format!(
-                "{}\nNo reply within {timeout} s. A later reply arrives as a message; read it with `cagents inbox`.",
-                delivery_lines(&handed)
+                "{}\nNo reply within {timeout} s; a later reply arrives as a message.\n{}",
+                delivery_lines(&handed),
+                super::format::hint(&[
+                    (format!("{} inbox", super::format::program()), "reads it",)
+                ])
             ),
         )),
     }

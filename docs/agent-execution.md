@@ -37,22 +37,25 @@ cagents agent interrupt 1a2b
 cagents agent close 1a2b
 ```
 
-`agent list` names agents and runs by their shortest unique prefix, eight
-characters or more. When every agent works in one project, a closing
-`(project NAME at PATH)` line names it once and the DIRECTORY column shows
-each directory relative to it, leaving it out when every agent works in the
-checkout itself. Agents from several projects get a PROJECT column and full
-directories instead. The output of `spawn`, `send`, `status` and `wait` puts
-a `hint:` line after the run's notes and before its result, naming what
-usually comes next: `agent wait` while the run works, `agent requests` while
-it waits for input, `agent send` or `agent close` once it succeeds, and
-`transcript` after it fails or stops.
+Agent commands name agents and runs by their shortest unique prefix, eight
+characters or more, the same in every output. When every agent works in one
+project, `agent list` names it once in a closing `(project NAME at PATH)` line
+(just the path when the project is named for its folder), and the DIRECTORY
+column shows each directory relative to it, leaving it out when every agent
+works in the checkout itself. Agents from several projects get a PROJECT
+column and full directories instead. The output of `spawn`, `send`, `status`
+and `wait` puts a `hint:` line after the run's notes and before its result,
+naming what usually comes next: `agent wait` while the run works, `agent
+requests` while it waits for input, `agent send` or `agent close` once it
+succeeds, and `transcript` after it fails or stops (except for Omp, whose
+conversations can't be read yet). A wait on several runs prints one hint
+after them all, with `AGENT` where more than one agent fits.
 
 ```text
 AGENT     NAME      PROVIDER  STATE      RUN
 ffbf7ea4            claude    Succeeded  28b753a6
 e65cfab6  reviewer  claude    Succeeded  4d29f256
-(project app at /home/me/app)
+(project App at ~/app)
 hint: `cagents agent status AGENT` shows its latest result
 ```
 

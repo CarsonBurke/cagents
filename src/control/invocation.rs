@@ -657,7 +657,7 @@ mod tests {
         assert_eq!(accepted.run.unwrap().agent, "1a2b3c4d");
         let waited = super::outcome(
             &spawn,
-            "agent 1a2b3c4d (codex) run 5e6f7a8b Succeeded\n\nAll green.\n\n\nMessages arrived while waiting:\n\nab12  from the user\n  hi",
+            "agent 1a2b3c4d (codex) run 5e6f7a8b Succeeded\nhint: `cagents agent send 1a2b3c4d PROMPT` follows up\n\nAll green.\n\n\nMessages arrived while waiting:\n\nab12  from the user\n  hi\n\nhint: `cagents reply ab12 MESSAGE` answers it; `cagents agent wait 1a2b3c4d` waits again",
         );
         let run = waited.run.unwrap();
         assert_eq!(run.provider, "codex");
@@ -669,7 +669,7 @@ mod tests {
         // A wait that messages ended before the run answered has no result.
         let interrupted = super::outcome(
             &spawn,
-            "agent 1a2b3c4d (codex) run 5e6f7a8b Running\n\nMessages arrived while waiting:\n\nab12  from the user\n  hi\n\nAnswer one with: cagents reply <id> \"…\"",
+            "agent 1a2b3c4d (codex) run 5e6f7a8b Running\nhint: `cagents agent wait 1a2b3c4d` waits for it\n\nMessages arrived while waiting:\n\nab12  from the user\n  hi\n\nhint: `cagents reply ab12 MESSAGE` answers it; `cagents agent wait 1a2b3c4d` waits again",
         );
         assert_eq!(interrupted.run.unwrap().result, "");
         assert_eq!(interrupted.messages[0].body, "hi");

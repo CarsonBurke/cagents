@@ -68,7 +68,7 @@ pub(super) fn read(arguments: TranscriptArgs) -> Result<CommandOutput, AppError>
 /// The page oldest first, as a conversation reads, under a line naming the
 /// session, then how to read the page before it the same way.
 fn human(page: &Page, query: &Query, program: &str, now: u64) -> String {
-    let mut out = heading(&page.session, now);
+    let mut out = heading(&page.session, &query.session, now);
     if page.entries.is_empty() {
         out.push_str(if query.before.is_some() {
             "\n\nNothing earlier."
@@ -101,8 +101,21 @@ fn human(page: &Page, query: &Query, program: &str, now: u64) -> String {
     out
 }
 
-fn heading(member: &Member, now: u64) -> String {
+/// The session is named by its shortest prefix, or by as much of it as the
+/// caller needed to tell it from the others.
+fn heading(member: &Member, handle: &str, now: u64) -> String {
     let session = &member.session;
+    let id = session.id.to_string();
+    let typed = handle.trim().to_ascii_lowercase();
+    let mut length = if id.starts_with(&typed) {
+        typed.len().max(format::MIN_ABBREVIATION)
+    } else {
+        format::MIN_ABBREVIATION
+    };
+    // As listings name it, never ending at a hyphen.
+    if id.as_bytes().get(length - 1) == Some(&b'-') {
+        length += 1;
+    }
     let provider = session
         .provider
         .map_or("shell", |provider| provider.executable());
@@ -118,7 +131,7 @@ fn heading(member: &Member, now: u64) -> String {
     };
     let mut line = format!(
         "Session {} ({provider}, {state})",
-        format::prefix(&session.id.to_string(), format::MIN_ABBREVIATION)
+        format::prefix(&id, length)
     );
     if let Some(title) = session.title.as_deref().filter(|title| !title.is_empty()) {
         line.push_str(&format!(" \"{}\"", format::plain(title)));
@@ -384,6 +397,13 @@ mod tests {
              hint: `cagents transcript 0000 --before {}` reads the page before",
                 cursor("u0")
             )
+        );
+        // A handle the caller needed at length names the session as long.
+        assert!(
+            human(&page, &query("00000000-"), "cagents", 120_000)
+                .starts_with("Session 00000000-0 (codex"),
+            "{}",
+            human(&page, &query("00000000-"), "cagents", 120_000)
         );
     }
 
