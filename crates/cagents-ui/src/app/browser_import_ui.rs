@@ -47,6 +47,59 @@ mod tests {
                 assert!(content > viewport.height, "the body scrolls instead");
             }
         }
+        /// In an ordinary window the dialog's body fits and only its long
+        /// list scrolls, so the filter, pager or summary stay in view.
+        fn assert_only_the_list_scrolls(app: &Cagents) {
+            use cosmic::iced::advanced::{
+                Layout, layout,
+                widget::{Operation, Tree, operation},
+            };
+            struct Scrollables(Vec<(f32, f32)>);
+            impl Operation for Scrollables {
+                fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                    visit(self);
+                }
+                fn scrollable(
+                    &mut self,
+                    _: Option<&widget::Id>,
+                    bounds: cosmic::iced::Rectangle,
+                    content: cosmic::iced::Rectangle,
+                    _: cosmic::iced::Vector,
+                    _: &mut dyn operation::scrollable::Scrollable,
+                ) {
+                    self.0.push((bounds.height, content.height));
+                }
+            }
+            let mut element = app.browser_import_dialog().unwrap();
+            let renderer = super::super::tests::headless_renderer();
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(
+                    cosmic::iced::Size::ZERO,
+                    cosmic::iced::Size::new(1200.0, 900.0),
+                ),
+            );
+            let mut scrollables = Scrollables(Vec::new());
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut scrollables,
+            );
+            let [(body, body_content), (list, list_content)] = scrollables.0[..] else {
+                panic!("a body and its list scroll: {:?}", scrollables.0);
+            };
+            assert!(
+                body_content <= body,
+                "the body fits: {body_content} in {body}"
+            );
+            assert!(
+                list_content > list,
+                "the list scrolls: {list_content} in {list}"
+            );
+        }
         let mut app = super::super::tests::context_inspector_test_app(false);
         drop(app.update_browser_import(Action::Open));
         drop(app.update_browser_import(Action::Consent));
@@ -69,6 +122,7 @@ mod tests {
         }];
         drop(app.update_browser_import(Action::Scanned(generation, Ok(found))));
         assert!(matches!(app.browser_import.phase, Phase::Selection));
+        assert_only_the_list_scrolls(&app);
         reachable(
             &app,
             &[
@@ -81,6 +135,7 @@ mod tests {
             .map(|index| format!("Profile {index} could not be read: the database is locked."))
             .collect();
         app.browser_import.phase = Phase::Finished("Imported 12 cookies for 3 sites.".into());
+        assert_only_the_list_scrolls(&app);
         reachable(
             &app,
             &["dialog.browser-import.cancel", "dialog.browser-import.scan"],
@@ -771,7 +826,13 @@ impl Cagents {
                         .spacing(space::S)
                         .into(),
                     );
-                    content.push(widget::column::with_children(rows).spacing(space::S).into());
+                    // The rows scroll on their own, so the filter and pager
+                    // stay in view while a page is read; a short window
+                    // scrolls the whole body as well.
+                    content.push(dialog_ui::scrolled_region(
+                        widget::column::with_children(rows).spacing(space::S),
+                        360.0,
+                    ));
                     widget::row::with_children(vec![
                         button("Cancel", Action::Cancel),
                         button("Scan again", Action::Consent),
@@ -782,8 +843,19 @@ impl Cagents {
                 }
                 Phase::Finished(detail) => {
                     content.push(notice_body(detail.clone()));
-                    for error in &state.errors {
-                        content.push(crate::design::body(error.clone()).into());
+                    // The summary stays above however long the error report is.
+                    if !state.errors.is_empty() {
+                        content.push(dialog_ui::scrolled_region(
+                            widget::column::with_children(
+                                state
+                                    .errors
+                                    .iter()
+                                    .map(|error| crate::design::body(error.clone()).into())
+                                    .collect::<Vec<_>>(),
+                            )
+                            .spacing(space::L),
+                            360.0,
+                        ));
                     }
                     widget::row::with_children(vec![
                         button("Done", Action::Cancel),
