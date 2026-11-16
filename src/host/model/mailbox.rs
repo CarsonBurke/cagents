@@ -1075,9 +1075,6 @@ mod tests {
                  DROP INDEX automation_removed_history;
                  DROP INDEX automation_firing_successors;
                  ALTER TABLE automation_firings DROP COLUMN previous_firing;
-                 DROP TABLE channel_work_operations;
-                DROP TABLE channel_work_entries;
-                DROP TABLE channel_work_homes;
                 DROP TABLE mailbox_attention_heads; PRAGMA user_version=11;",
             )
             .unwrap();
@@ -1316,9 +1313,6 @@ mod tests {
                  DROP INDEX automation_removed_history;
                  DROP INDEX automation_firing_successors;
                  ALTER TABLE automation_firings DROP COLUMN previous_firing;
-                 DROP TABLE channel_work_operations;
-                DROP TABLE channel_work_entries;
-                DROP TABLE channel_work_homes;
                 DROP TABLE mailbox_attention_heads; PRAGMA user_version=11;",
             )
             .unwrap();

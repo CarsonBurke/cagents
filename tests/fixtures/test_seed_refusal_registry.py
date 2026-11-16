@@ -11,15 +11,19 @@ import unittest
 import uuid
 
 SCRIPT = Path(__file__).with_name("seed-refusal-registry.py")
+PLACEMENT_TABLES = ("channel_work_placement_epochs", "channel_work_placement_clock")
 TABLES = (
-    "channels", "view_scopes", "panes", "channel_work_placement_epochs",
-    "channel_work_placement_clock", "view_revision_clock", "retired_panes",
-    "view_operations", "shared_view_terminal_sources", "shared_terminal_retention_pins",
-    "terminal_retention_pins", "fixture_actor_history",
+    "channels", "view_scopes", "panes", *PLACEMENT_TABLES, "view_revision_clock",
+    "retired_panes", "view_operations", "shared_view_terminal_sources",
+    "shared_terminal_retention_pins", "terminal_retention_pins", "fixture_actor_history",
 )
 
 
 class SeedRefusalRegistry(unittest.TestCase):
+    """A schema 26 registry, which still has channel-work placement epochs."""
+
+    PLACEMENT = True
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory(prefix="seed-refusal-", dir="/var/tmp")
         self.addCleanup(self.directory.cleanup)
@@ -31,9 +35,9 @@ class SeedRefusalRegistry(unittest.TestCase):
         self.selected = [str(uuid.uuid4()) for _ in range(2)]
         self.unrelated = str(uuid.uuid4())
         with sqlite3.connect(self.db) as db:
-            # These active epoch/clock and FK projection declarations match
-            # host/model/channel_work/placement.rs and views/store.rs. The
-            # parent view columns are limited to those the fixture consumes.
+            # These declarations match views/store.rs and, for schema 26, the
+            # retained channel-work DDL in host/model/retired_channel_work.rs.
+            # The parent view columns are limited to those the fixture consumes.
             db.executescript("""
                 PRAGMA foreign_keys=ON;
                 CREATE TABLE channels(id TEXT PRIMARY KEY,title TEXT);
@@ -79,12 +83,15 @@ class SeedRefusalRegistry(unittest.TestCase):
                 (self.unrelated, 2, "terminal"),
             ], 1):
                 db.execute("INSERT INTO panes VALUES(?,?,?)", (pane, scope, kind))
-                db.execute("INSERT INTO channel_work_placement_epochs VALUES(?,?)", (pane, epoch))
+                if self.PLACEMENT:
+                    db.execute("INSERT INTO channel_work_placement_epochs VALUES(?,?)", (pane, epoch))
                 if kind == "terminal":
                     db.execute("INSERT INTO shared_view_terminal_sources VALUES(?,?,?)", (pane, "source", "ended"))
                     db.execute("INSERT INTO shared_terminal_retention_pins VALUES(?,?)", (pane, "terminal-" + pane))
                     db.execute("INSERT INTO terminal_retention_pins VALUES(?,?)", ("terminal-" + pane, "window-pin"))
                 db.execute("INSERT INTO fixture_actor_history VALUES(?,?)", (pane, "keep actor and history"))
+            if not self.PLACEMENT:
+                db.executescript("DROP TABLE channel_work_placement_epochs; DROP TABLE channel_work_placement_clock;")
         self.env = os.environ | {
             "CAGENTS_EVIDENCE_FIXTURE": str(self.root),
             "HOME": str(self.root / "home"),
@@ -99,7 +106,10 @@ class SeedRefusalRegistry(unittest.TestCase):
 
     def snapshot(self):
         with sqlite3.connect(self.db) as db:
-            return {table: db.execute(f"SELECT * FROM {table} ORDER BY 1,2").fetchall() for table in TABLES}
+            return {
+                table: db.execute(f"SELECT * FROM {table} ORDER BY 1,2").fetchall()
+                for table in TABLES if self.PLACEMENT or table not in PLACEMENT_TABLES
+            }
 
     def test_arm_removes_selected_active_projections_and_preserves_history_and_clocks(self):
         before = self.snapshot()
@@ -109,27 +119,33 @@ class SeedRefusalRegistry(unittest.TestCase):
         after = self.snapshot()
         self.assertEqual(after["view_scopes"], [(2, self.other)])
         self.assertEqual(after["panes"], [(self.unrelated, 2, "terminal")])
-        self.assertEqual(after["channel_work_placement_epochs"], [(self.unrelated, 3)])
+        if self.PLACEMENT:
+            self.assertEqual(after["channel_work_placement_epochs"], [(self.unrelated, 3)])
         for table in ["retired_panes", "view_operations"]:
             scope_column = 0 if table == "retired_panes" else 1
             self.assertEqual(after[table], [row for row in before[table] if row[scope_column] == 2])
         for table in ["shared_view_terminal_sources", "shared_terminal_retention_pins"]:
             self.assertEqual(after[table], [row for row in before[table] if row[0] == self.unrelated])
-        for table in ["channel_work_placement_clock", "view_revision_clock", "terminal_retention_pins", "fixture_actor_history"]:
+        for table in ["view_revision_clock", "terminal_retention_pins", "fixture_actor_history"]:
             self.assertEqual(after[table], before[table], table)
+        if self.PLACEMENT:
+            self.assertEqual(after["channel_work_placement_clock"], before["channel_work_placement_clock"])
         allowed = self.run_script("allow")
         self.assertEqual(allowed.returncode, 0, allowed.stderr)
         # Same-pane registration allocates fresh generations, without the stale
         # non-FK row that caused the actual native retry's UNIQUE refusal.
         with sqlite3.connect(self.db) as db:
-            self.assertEqual(db.execute("PRAGMA foreign_key_list(channel_work_placement_epochs)").fetchall(), [])
+            if self.PLACEMENT:
+                self.assertEqual(db.execute("PRAGMA foreign_key_list(channel_work_placement_epochs)").fetchall(), [])
             db.execute("INSERT INTO view_scopes VALUES(1,?)", (self.channel,))
             for epoch, pane in enumerate(self.selected, 4):
                 db.execute("INSERT INTO panes VALUES(?,1,'chat')", (pane,))
-                db.execute("INSERT INTO channel_work_placement_epochs VALUES(?,?)", (pane, epoch))
-                db.execute("UPDATE channel_work_placement_clock SET last_epoch=?", (epoch,))
-            self.assertEqual(db.execute("SELECT epoch FROM channel_work_placement_epochs WHERE pane=?", (self.unrelated,)).fetchone(), (3,))
-            self.assertEqual(db.execute("SELECT last_epoch FROM channel_work_placement_clock").fetchone(), (5,))
+                if self.PLACEMENT:
+                    db.execute("INSERT INTO channel_work_placement_epochs VALUES(?,?)", (pane, epoch))
+                    db.execute("UPDATE channel_work_placement_clock SET last_epoch=?", (epoch,))
+            if self.PLACEMENT:
+                self.assertEqual(db.execute("SELECT epoch FROM channel_work_placement_epochs WHERE pane=?", (self.unrelated,)).fetchone(), (3,))
+                self.assertEqual(db.execute("SELECT last_epoch FROM channel_work_placement_clock").fetchone(), (5,))
 
     def test_conditional_trigger_body_only_in_plain_sqlite(self):
         # This checks the trigger body only. The real daemon rejects its
@@ -153,6 +169,12 @@ class SeedRefusalRegistry(unittest.TestCase):
         result = self.run_script("arm", str(uuid.uuid4()))
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.snapshot(), before)
+
+
+class SeedRefusalRegistryWithoutChannelWork(SeedRefusalRegistry):
+    """A schema 27 registry, from which channel work was removed."""
+
+    PLACEMENT = False
 
 
 if __name__ == "__main__":

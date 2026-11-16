@@ -791,15 +791,14 @@ the fixture's paused terminal does not appear in that dialog.
 offline Claude conversation with an unsent launch-note draft. Its `refuse`
 step closes only the UI, keeps the daemon and provider alive, then uses
 [`seed-refusal-registry.py`](../tests/fixtures/seed-refusal-registry.py) to
-remove that channel's shared view and its active placement mappings. It keeps
-both monotonic clocks, actor/history records, window retention pins and other
-scopes. The helper then adds a trigger that published-schema admission does
-not recognize. While armed, the real registry can refuse all writes, before
+remove that channel's shared view and, on a registry from before schema 27,
+its active channel-work placement mappings. It keeps the monotonic clocks,
+actor/history records, window retention pins and other scopes. The helper
+then adds a trigger that published-schema admission does not recognize. While armed, the real registry can refuse all writes, before
 the trigger's channel-conditional body runs. The native notice reports the
 registry's schema-mismatch reason, not the trigger body's SQLite sentence.
 The fixture does not inject UI state, replace transport or weaken schema checks.
-Dropping the trigger restores admission; the selected panes can register again
-with fresh placement generations.
+Dropping the trigger restores admission; the selected panes can register again.
 
 Run the scene on the native-evidence host, with both fixture scripts in the
 same directory. When comparing a revision that predates the scripts, copy them

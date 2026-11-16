@@ -32,9 +32,7 @@ pub(super) use automation_attention::AutomationAttentionReceipt;
 pub(super) mod automation_notifications;
 mod automation_proposals;
 mod automations;
-pub(super) mod channel_work;
-#[cfg(test)]
-mod channel_work_integration_tests;
+mod channel_retirement;
 pub(super) use automations::Claimed;
 pub(super) mod console_relaunch;
 mod execution;
@@ -52,6 +50,7 @@ pub(super) use native_actor_retirement::{NativeActorOwnership, NativeActorRetire
 mod navigation;
 #[cfg(test)]
 mod public_delta_tests;
+mod retired_channel_work;
 mod schema;
 mod terminal_owners;
 mod terminal_retention;
@@ -62,7 +61,7 @@ mod views;
 #[cfg(test)]
 mod workspace_snapshot_tests;
 
-const SCHEMA_VERSION: u32 = 26;
+const SCHEMA_VERSION: u32 = 27;
 
 /// Wait for another connection's writer rather than failing at admission.
 /// Read-then-write transactions must start immediate so SQLite can use this
@@ -401,8 +400,11 @@ impl Registry {
         let changed = match edit {
             ModelEdit::SeedView { .. } | ModelEdit::ChangeView { .. } => views::apply_recorded(&transaction, edit, &mut recorder)?,
             ModelEdit::ResetNavigation { .. } | ModelEdit::ReorderNavigation { .. } => navigation::apply(&transaction, edit)?,
-            ModelEdit::AgentsChanged | ModelEdit::ChannelWorkChanged { .. } => {
+            ModelEdit::AgentsChanged => {
                 return Err("Agent model changes are committed by the execution service".into());
+            }
+            ModelEdit::RetiredChannelWorkChanged => {
+                return Err(crate::terminal_ipc::RETIRED_CHANNEL_WORK.into());
             }
             ModelEdit::OpenProject {
                 repository,
@@ -488,11 +490,8 @@ impl Registry {
                     statement.query_map(params![key], |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?
                         .collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?
                 };
-                views::retire_project_placements(&transaction, repository, &mut recorder)?;
+                views::record_project_removal(&transaction, repository, &mut recorder)?;
                 removed_channels.extend(channels.iter().map(|id| parse_channel_id(id)).collect::<Result<Vec<_>, _>>()?);
-                for channel in channels {
-                    channel_work::deleted_in(&transaction, channel.parse().map_err(|_| "The channel identity is unreadable")?)?;
-                }
                 let removed = transaction
                     .execute("DELETE FROM projects WHERE repository = ?1", params![key])
                     .map_err(|error| error.to_string())?
@@ -551,7 +550,6 @@ impl Registry {
                             params![id.to_string(), key, title, ordinal, *title_source as i64],
                         )
                         .map_err(|error| error.to_string())?;
-                    channel_work::created_in(&transaction, *id)?;
                     true
                 }
             }
@@ -595,15 +593,13 @@ impl Registry {
                 retitled
             }
             ModelEdit::RetireEmptyChannel { home, expected_view_revision } => {
-                if channel_work::may_auto_retire_in(&transaction, home, *expected_view_revision)? {
-                    views::retire_channel_placements(&transaction, home.channel, &mut recorder)?;
-                    channel_work::deleted_in(&transaction, home.channel)?;
+                if channel_retirement::may_retire_in(&transaction, home, *expected_view_revision)? {
+                    views::record_channel_removal(&transaction, home.channel, &mut recorder)?;
                     transaction.execute("DELETE FROM channels WHERE id=?1", params![home.channel.to_string()]).map_err(|e| e.to_string())? > 0
                 } else { false }
             }
             ModelEdit::DeleteChannel { id } => {
-                views::retire_channel_placements(&transaction, *id, &mut recorder)?;
-                channel_work::deleted_in(&transaction, *id)?;
+                views::record_channel_removal(&transaction, *id, &mut recorder)?;
                 transaction
                     .execute(
                         "DELETE FROM channels WHERE id = ?1",
@@ -614,14 +610,6 @@ impl Registry {
             }
         };
         if changed {
-            match edit {
-                ModelEdit::RetitleChannel { id, .. }
-                | ModelEdit::SuggestChannelTitle { id, .. }
-                | ModelEdit::SuggestConversationTitle { id, .. } => {
-                    channel_work::renamed_in(&transaction, *id)?
-                }
-                _ => {}
-            }
             transaction
                 .execute(
                     "UPDATE metadata SET sequence = sequence + 1 WHERE key = 0",
@@ -759,7 +747,7 @@ fn public_effects(
         ModelEdit::SeedView { .. }
         | ModelEdit::ChangeView { .. }
         | ModelEdit::AgentsChanged
-        | ModelEdit::ChannelWorkChanged { .. } => {}
+        | ModelEdit::RetiredChannelWorkChanged => {}
     }
     Ok(())
 }
@@ -1006,11 +994,13 @@ fn migrate_through(
         schema::migration_checkpoint(16)?;
     }
     if version < 17 && target >= 17 {
-        channel_work::migrate(tx)?;
+        tx.execute_batch(retired_channel_work::TABLES)
+            .map_err(|error| error.to_string())?;
         schema::migration_checkpoint(17)?;
     }
     if version < 18 && target >= 18 {
-        channel_work::placement::migrate(tx)?;
+        tx.execute_batch(retired_channel_work::PLACEMENT)
+            .map_err(|error| error.to_string())?;
         schema::migration_checkpoint(18)?;
     }
     if version < 19 && target >= 19 {
@@ -1044,6 +1034,10 @@ fn migrate_through(
     if version < 26 && target >= 26 {
         views::bindings::migrate(tx)?;
         schema::migration_checkpoint(26)?;
+    }
+    if version < 27 && target >= 27 {
+        retired_channel_work::remove(tx)?;
+        schema::migration_checkpoint(27)?;
     }
     Ok(())
 }
@@ -1606,11 +1600,6 @@ mod tests {
                  DROP TABLE view_scopes;
                  DROP TABLE view_revision_clock;
                  DROP TABLE automation_notifications;
-                 DROP TABLE channel_work_placement_epochs;
-                 DROP TABLE channel_work_placement_clock;
-                 DROP TABLE channel_work_operations;
-                 DROP TABLE channel_work_entries;
-                 DROP TABLE channel_work_homes;
                  DROP TABLE automation_lifecycle;
                  ALTER TABLE channels DROP COLUMN title_source; PRAGMA user_version = 2;",
             )

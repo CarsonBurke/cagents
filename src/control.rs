@@ -25,7 +25,6 @@ mod agents;
 
 #[cfg(test)]
 mod automation_work_authority_tests;
-mod channel_work;
 mod channels;
 mod chat;
 #[cfg(test)]
@@ -519,11 +518,6 @@ pub enum ProjectCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum ChannelCommand {
-    /// Inspect and declare the work this channel is progressing.
-    Work {
-        #[command(subcommand)]
-        command: channel_work::WorkCommand,
-    },
     /// Move a live pane, hosted session or agent into another channel.
     Move {
         /// Full pane/session ID, agent ID or unique prefix, or unique agent name.
@@ -2233,21 +2227,6 @@ impl ControlClient {
         self.request_strict(request)
     }
 
-    pub(crate) fn channel_work(
-        &mut self,
-        authority: Authority,
-        request: crate::channel_work_api::Request,
-        timeout: Duration,
-    ) -> Result<crate::channel_work_api::Response, ControlError> {
-        match self.request_with_deadline(
-            ClientRequest::ChannelWork { authority, request },
-            Instant::now() + timeout,
-        )? {
-            ServerResponse::ChannelWork(response) => Ok(response),
-            response => Err(unexpected_response("channel_work", &response)),
-        }
-    }
-
     fn request_strict(&mut self, request: ClientRequest) -> Result<ServerResponse, ControlError> {
         self.request(request, None)
     }
@@ -2766,7 +2745,7 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::ChatFileChangePatches { .. } => "chat_file_change_patches",
         ServerResponse::ChatTextCopy { .. } => "chat_text_copy",
         ServerResponse::Work(_) => "work",
-        ServerResponse::ChannelWork(_) => "channel_work",
+        ServerResponse::RetiredChannelWork => "channel_work",
         ServerResponse::StartupState(_) => "startup_state",
         ServerResponse::DeviceOperation { .. } => "device_operation",
     }
@@ -3223,11 +3202,7 @@ where
     // to a staged CLI whose caller-scoped service transport may predate this policy.
     let service_context = (matches!(
         &cli.command,
-        TopCommand::Automation { .. }
-            | TopCommand::Work { .. }
-            | TopCommand::Channel {
-                command: ChannelCommand::Work { .. }
-            }
+        TopCommand::Automation { .. } | TopCommand::Work { .. }
     ) || matches!(
         &cli.command,
         TopCommand::Agent { command } if !matches!(command, AgentCommand::Console { .. })
@@ -3501,12 +3476,6 @@ fn execute_with_model_context(
         TopCommand::Project { command } => match project_channel_context {
             Some(context) => execute_project_as(command, &context),
             None => execute_project(command),
-        },
-        TopCommand::Channel {
-            command: ChannelCommand::Work { command },
-        } => match service_context {
-            Some(context) => channel_work::execute_with_context(command, &context),
-            None => channel_work::execute(command),
         },
         TopCommand::Channel { command } => match project_channel_context {
             Some(context) => execute_channel_as(command, &context),
@@ -4726,7 +4695,7 @@ fn protocol_error(error: ControlError) -> AppError {
     }
 }
 
-/// Agents, Automation, Workboard and channel work share endpoint selection, while
+/// Agents, Automation and Workboard share endpoint selection, while
 /// retaining their business-envelope and connection-authentication contracts.
 #[derive(Clone)]
 struct ServiceRequestContext {
@@ -4767,8 +4736,7 @@ impl ServiceRequestContext {
     }
 }
 
-/// Caller scope for legacy terminal and shared-model CLI mutations. ChannelWork carries
-/// its own explicit authority and never enters this connection path.
+/// Caller scope for legacy terminal and shared-model CLI mutations.
 struct ProjectChannelContext {
     authority: Authority,
     remote: bool,
@@ -4842,7 +4810,7 @@ fn legacy_model_command_mutates(command: &TopCommand) -> bool {
     match command {
         TopCommand::Terminal { command } => terminal_command_mutates(command),
         TopCommand::Project { command } => project_command_mutates(command),
-        TopCommand::Channel { command } => channel_command_mutates(command) == Some(true),
+        TopCommand::Channel { command } => channel_command_mutates(command),
         _ => false,
     }
 }
@@ -4875,13 +4843,12 @@ fn project_command_mutates(command: &ProjectCommand) -> bool {
     }
 }
 
-fn channel_command_mutates(command: &ChannelCommand) -> Option<bool> {
+fn channel_command_mutates(command: &ChannelCommand) -> bool {
     match command {
         ChannelCommand::Spawn { .. }
         | ChannelCommand::Move { .. }
-        | ChannelCommand::Close { .. } => Some(true),
-        ChannelCommand::List { .. } => Some(false),
-        ChannelCommand::Work { .. } => None,
+        | ChannelCommand::Close { .. } => true,
+        ChannelCommand::List { .. } => false,
     }
 }
 
@@ -5107,10 +5074,6 @@ fn project_line(project: &ModelProject) -> String {
 /// point of the shared model is that a channel exists whether or not a window
 /// is running to show it.
 fn execute_channel(command: ChannelCommand) -> Result<CommandOutput, AppError> {
-    let command = match command {
-        ChannelCommand::Work { command } => return channel_work::execute(command),
-        command => command,
-    };
     let context = ProjectChannelContext::capture();
     execute_channel_as(command, &context)
 }
@@ -5127,8 +5090,7 @@ fn execute_channel_with(
     command: ChannelCommand,
     connect: impl FnOnce(bool) -> Result<ControlClient, AppError>,
 ) -> Result<CommandOutput, AppError> {
-    let mutation = channel_command_mutates(&command)
-        .expect("ChannelWork is dispatched before legacy channel execution");
+    let mutation = channel_command_mutates(&command);
     // Reject invalid filesystem paths before starting a daemon. The shared
     // registry then takes precedence over fresh Git discovery for open folders.
     let selected = match &command {
@@ -5180,9 +5142,6 @@ impl ChannelCommand {
         model: Option<&WorkspaceModel>,
     ) -> Result<ResolvedChannel, AppError> {
         Ok(match self {
-            Self::Work { .. } => {
-                unreachable!("channel work is dispatched before legacy channel resolution")
-            }
             Self::Move { target, to } => ResolvedChannel::Move { target, to },
             Self::Spawn { repository, title } => {
                 let location = resolve_project_location(repository, model)?;
