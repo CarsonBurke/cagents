@@ -275,7 +275,10 @@ pub(super) struct State {
     observed_terminals: HashMap<CardId, TerminalSession>,
     applying: bool,
     pub creating_default: bool,
-    pub deferred_default: Option<PathBuf>,
+    /// An automatic empty pane waiting for this scope's shared panes, bound
+    /// to the scope and directory that asked so navigating elsewhere cannot
+    /// replay it into another channel.
+    pub deferred_default: Option<(Scope, PathBuf)>,
     pub defaults: HashMap<CardId, TerminalSession>,
     default_requests: HashSet<CardId>,
     /// Scopes whose local aliases cannot yet adopt their canonical panes.
@@ -296,6 +299,16 @@ pub(super) struct State {
 }
 
 impl State {
+    /// Whether an empty local strip means `scope` is empty rather than not
+    /// yet loaded: its shared panes have been admitted, or the registry
+    /// refused its seed and this window keeps the scope's panes locally.
+    pub(super) fn scope_settled(&self, scope: &Scope) -> bool {
+        self.seed_failures.contains_key(scope)
+            || (self.initialized.contains(scope)
+                && !self.seeding.contains(scope)
+                && !self.blocked.contains(scope))
+    }
+
     /// Treats `scope` as already seeded with `panes`, as an acknowledged seed
     /// leaves it.
     #[cfg(test)]
@@ -2860,6 +2873,9 @@ impl Cagents {
         projection: ViewProjection<'_>,
         topology: Option<&ViewScopeTopology<'_>>,
     ) -> Task<Message> {
+        // Capture before alias or canonical removal can detach a pane. All
+        // views in this snapshot share one final camera/visibility projection.
+        let viewport = self.workspace.capture_viewport_anchor();
         let presentation = matches!(projection, ViewProjection::Selected(_));
         debug_assert_eq!(
             topology.is_none(),
@@ -3103,6 +3119,7 @@ impl Cagents {
             }
             projected_scopes.push(view.scope);
         }
+        tasks.push(self.finish_shared_viewport_projection(viewport));
         phase.mark("selected_project");
         self.shared_views.applying = false;
         // Capture after the active strip snapshot, then share this immutable
@@ -3129,11 +3146,7 @@ impl Cagents {
             app.publish_projected_view_changes(projected, projection);
         });
         phase.mark("selected_save");
-        if let Some(path) = self.shared_views.deferred_default.take() {
-            if self.active_workspace.as_ref() == Some(&path) && self.workspace.cards().is_empty() {
-                tasks.push(self.add_default_pane(path, settings::DefaultPane::Terminal));
-            }
-        }
+        tasks.push(self.run_deferred_default_pane());
         // Presentation-only projection preserves every notification attribution
         // input: source, membership, ownership, placement and project identity.
         // Journal snapshots attribute their own new evidence independently.
@@ -3330,8 +3343,10 @@ impl Cagents {
 
     #[cfg(test)]
     fn project_shared_view(&mut self, view: &View, owned: &HashSet<CardId>) -> Task<Message> {
+        let viewport = self.workspace.capture_viewport_anchor();
         let current = self.local_view_cards(&view.scope);
-        self.project_shared_view_with_cards(view, owned, current)
+        let projection = self.project_shared_view_with_cards(view, owned, current);
+        Task::batch([projection, self.finish_shared_viewport_projection(viewport)])
     }
 
     fn project_shared_view_with_cards(
@@ -3837,7 +3852,7 @@ impl Cagents {
         }
         self.normalize_projected_card_order(&visible);
         if active {
-            tasks.push(self.project_shared_strip(&strip, &visible));
+            self.project_shared_strip(&strip, &visible);
         }
         if !self.shared_views.applying {
             self.persist();
@@ -4077,13 +4092,35 @@ impl Cagents {
         };
         let panes = self.local_view_panes(&scope);
         let visible = self.local_view_cards(&scope);
-        self.project_shared_strip(&panes, &visible)
+        let viewport = self.workspace.capture_viewport_anchor();
+        self.project_shared_strip(&panes, &visible);
+        self.finish_shared_viewport_projection(viewport)
     }
 
-    fn project_shared_strip(&mut self, panes: &[Pane], visible: &[CardId]) -> Task<Message> {
-        let camera = self.workspace.camera().offset();
+    /// Commit a passive strip edit as one layout that keeps the pane being
+    /// read, and any navigation already in flight, where the reader left them.
+    fn finish_shared_viewport_projection(
+        &mut self,
+        anchor: crate::workspace::ViewportAnchor,
+    ) -> Task<Message> {
+        let update = self.workspace.restore_viewport_anchor(anchor);
+        // Most snapshots leave the strip and its focus alone and need no
+        // viewport pass; the sweep still settles descriptors they replaced.
+        let viewport = if update == ViewportUpdate::unchanged()
+            && self.workspace.focused() == self.durable.focused
+        {
+            Task::none()
+        } else {
+            self.apply_viewport(update, true, DurableChange::None)
+        };
+        Task::batch([viewport, self.lifecycle_sweep()])
+    }
+
+    /// Mirrors `panes` into the strip without moving the view: the caller
+    /// captured a [`crate::workspace::ViewportAnchor`] first and restores it
+    /// with [`Self::finish_shared_viewport_projection`] once the batch ends.
+    fn project_shared_strip(&mut self, panes: &[Pane], visible: &[CardId]) {
         let focus = self.workspace.focused();
-        let mut updates = Vec::new();
         let visible = visible.iter().copied().collect::<HashSet<_>>();
         let removed = self
             .workspace
@@ -4109,9 +4146,7 @@ impl Cagents {
             }
             self.set_exposure(id, Exposure::Offscreen);
             if self.workspace.request_close(id).is_ok() {
-                if let Ok(update) = self.workspace.commit_close(id) {
-                    updates.push(update);
-                }
+                let _ = self.workspace.commit_close(id);
             }
         }
         for (index, pane) in panes.iter().enumerate() {
@@ -4130,13 +4165,11 @@ impl Cagents {
                     }),
                     CardWidth::Fraction(pane.width_fraction),
                 ) {
-                    if let Ok(update) = self.workspace.add_card(
+                    let _ = self.workspace.add_card(
                         card,
                         index.min(self.workspace.cards().len()),
                         false,
-                    ) {
-                        updates.push(update);
-                    }
+                    );
                 }
             } else {
                 // A held reported title is newer than the shared one.
@@ -4156,31 +4189,18 @@ impl Cagents {
                     .card(pane.id)
                     .is_some_and(|card| card.width != CardWidth::Fraction(pane.width_fraction))
                 {
-                    if let Ok(update) = self
+                    let _ = self
                         .workspace
-                        .set_card_width(pane.id, CardWidth::Fraction(pane.width_fraction))
-                    {
-                        updates.push(update);
-                    }
+                        .set_card_width(pane.id, CardWidth::Fraction(pane.width_fraction));
                 }
                 if self.workspace.order().nth(index) != Some(pane.id) {
-                    if let Ok(update) = self.workspace.reorder(pane.id, index) {
-                        updates.push(update);
-                    }
+                    let _ = self.workspace.reorder(pane.id, index);
                 }
             }
         }
         if let Some(focus) = focus.filter(|id| self.workspace.card(*id).is_some()) {
             let _ = self.workspace.focus_without_scrolling(focus);
         }
-        self.workspace.record_programmatic_scroll(camera);
-        let lifecycle = self.lifecycle_sweep();
-        Task::batch(
-            updates
-                .into_iter()
-                .map(|update| self.apply_viewport(update, false, DurableChange::None))
-                .chain(std::iter::once(lifecycle)),
-        )
     }
 }
 
@@ -4287,6 +4307,8 @@ mod tests {
     mod seed_refusal;
     mod startup_admission;
     mod startup_terminals;
+    mod window_selection;
+    mod window_startup;
 
     use super::*;
     use crate::model::{

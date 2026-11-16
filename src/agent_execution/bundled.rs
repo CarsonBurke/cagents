@@ -25,6 +25,7 @@ const BUNDLED: &[&str] = &[
     "4f034514d3e8d56b99dfc9a9055edd046ef0977affdcb891c6eb539c0e545019",
     "34dcff6191a4c79016d79a045c2e00f3bdbc2ab6b97be1447860f03eb1022329",
     "f79a1c86a098d3429fbbebe252f767106f4f93b7fc5bf9600d0e6fe6f947a748",
+    "bee21adf0c6b5ae616df0796715a268cd654e6b79feb3fb07ff90573e09a271d",
 ];
 
 /// Recognized copies of the retired cagents-agents skill, used only for cleanup.

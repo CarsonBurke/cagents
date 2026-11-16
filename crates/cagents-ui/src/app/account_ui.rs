@@ -7941,7 +7941,7 @@ mod app_tests {
     /// An app with one worktree, `/repo`, on screen.
     fn app_in_repo() -> Cagents {
         let mut app = context_inspector_test_app(false);
-        app.sidebar_model.projects = vec![SidebarProject::new(
+        *app.sidebar_model.projects = vec![SidebarProject::new(
             crate::model::ProjectId::new(),
             crate::repository::RepositoryId::new(),
             "repo".into(),

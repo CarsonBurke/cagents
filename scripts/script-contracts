@@ -98,6 +98,11 @@ JOBS = (
               sources=("scripts/prepare-validation-checkout",)),
         Suite("process custody", "tests/qualification/test_process_custody.py",
               sources=("scripts/qualification/process_custody.py",)),
+        Suite("fixture workspace generator", "tests/fixture_workspace.py",
+              sources=("scripts/fixture-workspace",
+                       *(f"scripts/fixture_workspace/{module}.py" for module in (
+                           "__init__", "apply", "claude", "cli", "codex", "codex_check", "content",
+                           "determinism", "generate", "profiles", "repositories", "workspace")))),
         Suite("synthetic Claude provider", "tests/chat_composer_provider.py",
               sources=("tests/fixtures/chat-composer-claude.sh",)),
         Suite("synthetic Claude streaming", "tests/chat_composer_streaming.py",

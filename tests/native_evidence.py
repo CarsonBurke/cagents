@@ -2639,6 +2639,12 @@ class RemoteEvidence(unittest.TestCase):
         self.run_tool("open-window", "window-2")
         self.assertIn("open-window window-2", self.tool_calls())
 
+    def test_seed_is_forwarded_to_the_owned_remote_task(self) -> None:
+        checkout = self.checkout("after", {"src.rs": "new\n"})
+        self.run_tool("build", "after", str(checkout))
+        self.run_tool("seed", "--profile", "small", "--seed", "2")
+        self.assertIn("seed --profile small --seed 2", self.tool_calls())
+
     def test_pair_refuses_a_missing_startup_timeout_before_remote_work(self) -> None:
         result = self.run_tool("pair", "--startup-timeout", check=False)
         self.assertEqual(result.returncode, 2)

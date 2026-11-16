@@ -37,6 +37,8 @@ pub(super) use automations::Claimed;
 pub(super) mod console_relaunch;
 mod execution;
 mod execution_deltas;
+#[cfg(any(debug_assertions, feature = "development"))]
+pub(crate) mod fixture_seed;
 pub(super) mod floor;
 pub(super) use execution::{AuthorityError, ResidentRelease};
 mod lineage;
@@ -385,11 +387,26 @@ impl Registry {
         edit: &ModelEdit,
         guard: impl FnOnce(bool, &rusqlite::Connection) -> Result<G, String>,
     ) -> Result<DeltaApplied, String> {
+        self.commit_delta(edit, guard, true)
+    }
+
+    /// [`Registry::apply_delta_guarded`], checking the store's schema and
+    /// layout first unless `check_schema` is false: only for a caller that
+    /// holds the store alone and checked it once already, since another
+    /// process could otherwise have migrated it between edits.
+    fn commit_delta<G>(
+        &mut self,
+        edit: &ModelEdit,
+        guard: impl FnOnce(bool, &rusqlite::Connection) -> Result<G, String>,
+        check_schema: bool,
+    ) -> Result<DeltaApplied, String> {
         let transaction = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
-        schema::require_current(&transaction)?;
+        if check_schema {
+            schema::require_current(&transaction)?;
+        }
         let seen = match edit {
             ModelEdit::ChangeView { operation, .. } => {
                 views::operation_seen(&transaction, *operation)?

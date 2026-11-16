@@ -1554,7 +1554,9 @@ impl Cagents {
                 self.shared_views.registry_unavailable = true;
                 let attach = self.attach_next_restored_agent();
                 let release = self.release_held_terminals();
-                Task::batch([attach, release, self.attach_next_restored_agent()])
+                // No shared panes are coming for a scope that waited on them.
+                let default = self.run_deferred_default_pane();
+                Task::batch([attach, release, self.attach_next_restored_agent(), default])
             }
             ModelUpdate::Connected(model) => {
                 if model.identity == self.workspace_model.identity
@@ -2103,7 +2105,12 @@ impl Cagents {
         }
         self.materialize_replica_snapshot();
         let failed_seeds = std::mem::take(&mut self.shared_views.seed_failures);
+        // A pending automatic composer is a window navigation intent, not
+        // authority from the old registry. The new scope must initialize
+        // before that exact still-selected intent can open anything.
+        let deferred_default = self.shared_views.deferred_default.take();
         self.shared_views = super::shared_views::State::for_workspace(&self.durable);
+        self.shared_views.deferred_default = deferred_default;
         self.clear_closed_chat_drafts();
         let durable = Arc::make_mut(&mut self.durable);
         durable.workspace_model_identity = Some(identity);
@@ -9084,6 +9091,10 @@ mod tests {
                 .collect()
         }
         let (mut app, project, repository) = app_with_project();
+        // A connected publisher keeps a channel's seed pending until the
+        // registry answers, as a running window's does.
+        let (tx, _requests) = test_model_channel();
+        app.workspace_model_tx = tx;
         let storage = tempfile::tempdir().unwrap();
         let database = storage.path().join("channel-order.sqlite3");
         let boot = crate::model::BootId::new("channel-order-reopen");
@@ -9135,6 +9146,13 @@ mod tests {
                 saved[2].id,
             ))),
         );
+        // Its composer waits until the channel's shared panes are admitted.
+        assert!(app.workspace.cards().is_empty());
+        app.acknowledge_view_edit(
+            crate::workspace_model::views::Scope::Channel(saved[2].id),
+            None,
+        );
+        drop(app.reconcile_shared_views());
         let draft_card = app.workspace.focused().expect("the old composer opens");
         let target = match app.cards.get(&draft_card) {
             Some(CardRuntime::Chat(runtime)) => runtime.target,
