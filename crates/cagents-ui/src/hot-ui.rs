@@ -37,7 +37,6 @@ fn main() -> std::process::ExitCode {
 
 fn restart_matched_daemon() -> Result<(), Box<dyn std::error::Error>> {
     use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
     let cli = std::env::current_exe()?.with_file_name("cagents");
     let version = Command::new(&cli).arg("--version").output()?;
     if !version.status.success()
@@ -48,23 +47,14 @@ fn restart_matched_daemon() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!(
         "Restarting the development daemon stops its terminal/chat jobs and all background subagents."
     );
+    // The matched CLI returns only once the daemon has exited.
     if !Command::new(cli)
         .args(["daemon", "stop-for-rebuild", "--including-subagents"])
         .stdout(Stdio::null())
         .status()?
         .success()
     {
-        return Err("matched CLI refused the development daemon restart".into());
-    }
-    let socket = cagents::instance::runtime_directory()?
-        .join(cagents::instance::runtime_subdirectory())
-        .join("cagentsd.sock");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while socket.try_exists()? {
-        if Instant::now() >= deadline {
-            return Err("development daemon did not stop within five seconds".into());
-        }
-        std::thread::sleep(Duration::from_millis(25));
+        return Err("matched CLI could not stop the development daemon".into());
     }
     Ok(())
 }
