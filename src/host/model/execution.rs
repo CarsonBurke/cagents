@@ -196,7 +196,7 @@ pub(super) fn migrate_names(tx: &rusqlite::Transaction<'_>) -> Result<(), String
 }
 
 impl Registry {
-    pub(crate) fn inspect_resident_release(
+    pub(in crate::host) fn inspect_resident_release(
         &mut self,
         source: &HostedSession,
         kind: ResidentRelease,
@@ -210,7 +210,7 @@ impl Registry {
     /// the exact resident. This drains submissions that authenticated before
     /// retirement and excludes new acceptance until the capability is revoked.
     /// Do not hold HostState while acquiring this transaction.
-    pub(crate) fn retire_resident_release(
+    pub(in crate::host) fn retire_resident_release(
         &mut self,
         source: &HostedSession,
         kind: ResidentRelease,
@@ -1029,6 +1029,7 @@ impl Registry {
     /// Invoked only after holder authentication and a successful adoption of
     /// this exact retained source. This CAS rotates only host proof, retaining
     /// the capability already inherited by the surviving process and tools.
+    #[cfg(test)]
     pub(crate) fn adopt_agent_authority(
         &mut self,
         source: &HostedSession,
@@ -1072,6 +1073,7 @@ impl Registry {
 
     /// Only an actual newly spawned session or a proved exact reattachment can
     /// call this. The token never appears in `Agent` or its public descriptor.
+    #[cfg(test)]
     pub(crate) fn register_agent_authority(
         &mut self,
         session: &HostedSession,
@@ -1501,6 +1503,7 @@ impl Registry {
         read_agent(&self.db, id)
     }
 
+    #[cfg(test)]
     pub(crate) fn execution_sequence(&self) -> Result<u64, String> {
         self.db
             .query_row("SELECT sequence FROM metadata WHERE key = 0", [], |row| {
@@ -2351,6 +2354,7 @@ impl Registry {
 
     /// Until exact live prompt evidence can be reconciled, restart records an
     /// uncertain outcome rather than authorizing another delivery of effects.
+    #[cfg(test)]
     pub(crate) fn interrupt_unproven_agent_runs(&mut self, now_ms: u64) -> Result<(), String> {
         self.interrupt_unproven_agent_runs_except(now_ms, &[])
     }

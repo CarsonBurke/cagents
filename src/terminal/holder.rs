@@ -18,6 +18,7 @@ pub(crate) fn evidence(socket: &std::path::Path) -> Result<Option<Record>, Strin
     crate::daemon::holder_registry::evidence(socket, crate::daemon::holder_registry::Kind::Terminal)
 }
 
+#[cfg(test)]
 pub(crate) fn discover(directory: &std::path::Path, boot: &BootId) -> Result<Vec<Record>, String> {
     crate::daemon::holder_registry::discover(
         directory,

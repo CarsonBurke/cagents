@@ -1110,17 +1110,6 @@ impl Store {
     }
 
     #[cfg(feature = "host")]
-    pub(crate) fn try_create_pending(
-        &self,
-        homes: &Homes,
-        provider: Provider,
-        started_at: u64,
-        create: impl FnOnce() -> io::Result<(Uuid, PathBuf)>,
-    ) -> io::Result<(Uuid, PathBuf)> {
-        self.create_pending_with_mode(homes, provider, started_at, create, true, |_| Ok(()))
-    }
-
-    #[cfg(feature = "host")]
     pub(crate) fn try_create_pending_reserved(
         &self,
         reservation: &crate::host::AccountReservation,
@@ -1224,16 +1213,6 @@ impl Store {
         system: &[(Provider, Identity)],
     ) -> io::Result<(Registry, Result<(), AccountId>)> {
         self.register_pending_with_mode(homes, account, system, false, |_| Ok(()))
-    }
-
-    #[cfg(feature = "host")]
-    pub(crate) fn try_register_pending(
-        &self,
-        homes: &Homes,
-        account: Registered,
-        system: &[(Provider, Identity)],
-    ) -> io::Result<(Registry, Result<(), AccountId>)> {
-        self.register_pending_with_mode(homes, account, system, true, |_| Ok(()))
     }
 
     #[cfg(feature = "host")]
@@ -1373,13 +1352,6 @@ impl Store {
     fn lock(&self) -> io::Result<crate::instance::OwnedLock> {
         crate::secure_file::prepare_private_directory(&self.directory)?;
         crate::instance::owned_lock(&self.directory.join(LOCK_NAME), libc::LOCK_EX)
-    }
-
-    #[cfg(all(test, feature = "host"))]
-    pub(crate) fn hold_registry_lock_for_account_test(
-        &self,
-    ) -> io::Result<crate::instance::OwnedLock> {
-        self.lock()
     }
 
     fn try_lock(&self) -> io::Result<crate::instance::OwnedLock> {

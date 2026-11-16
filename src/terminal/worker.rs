@@ -175,6 +175,7 @@ enum Command {
         deadline: std::time::Instant,
         reply: Sender<super::ipc::TerminalCloseResult>,
     },
+    #[cfg(test)]
     Shutdown,
 }
 
@@ -1087,6 +1088,7 @@ impl TerminalHandle {
     /// Physical provenance of the original PTY launch, not caller authority.
     /// A caller must still revalidate its current Host record/source ownership;
     /// these atomic worker checks do not make a source mutation atomic.
+    #[cfg(test)]
     pub(crate) fn pinned_launch_directory(
         &self,
     ) -> Result<(crate::agent_execution::DirectoryIdentity, Arc<File>), String> {
@@ -2301,6 +2303,7 @@ impl TerminalHandle {
             .expect("original retained worker probe")
     }
 
+    #[cfg(test)]
     pub(crate) fn startup_diagnostic(&self) -> Option<String> {
         self.inner
             .published
@@ -4187,6 +4190,7 @@ impl Worker {
             Command::Reveal => self.reveal(),
             Command::Hibernate => self.hibernate_visuals(),
             Command::Restore { visible } => self.restore_visuals(visible),
+            #[cfg(test)]
             Command::Shutdown => return true,
         }
         false

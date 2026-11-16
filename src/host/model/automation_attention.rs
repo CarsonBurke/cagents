@@ -135,7 +135,8 @@ pub(super) fn stage(tx: &Transaction<'_>, run: &Run) -> Result<(), String> {
 impl Registry {
     /// Snapshot for inspection/tests. Transfer must use the short transaction
     /// below: another execution connection can commit behind this mutex.
-    pub(crate) fn pending_automation_attention(
+    #[cfg(test)]
+    pub(in crate::host) fn pending_automation_attention(
         &self,
         limit: usize,
     ) -> Result<Vec<PendingAutomationAttention>, String> {
@@ -157,7 +158,7 @@ impl Registry {
     /// wait for a journal receipt or acquire HostState/control admission. It
     /// retains original receivers outside this transaction before returning.
     /// This transaction never removes source rows, including on failure.
-    pub(crate) fn with_pending_automation_attention<T>(
+    pub(in crate::host) fn with_pending_automation_attention<T>(
         &mut self,
         limit: usize,
         enqueue: impl FnOnce(Vec<PendingAutomationAttention>) -> Result<T, String>,
@@ -173,7 +174,8 @@ impl Registry {
 
     /// A journal commit for A must not acknowledge a later replacement B.
     /// The broker calls this only for its original successful commit receipt.
-    pub(crate) fn ack_automation_attention(
+    #[cfg(test)]
+    pub(in crate::host) fn ack_automation_attention(
         &self,
         receipt: AutomationAttentionReceipt,
     ) -> Result<bool, String> {
@@ -190,7 +192,7 @@ impl Registry {
     /// source transaction. Callers retain every proof until this returns Ok;
     /// any delete/commit error leaves the entire batch unacknowledged. Stale
     /// or duplicate receipts are harmless exact-delete no-ops.
-    pub(crate) fn ack_automation_attention_batch(
+    pub(in crate::host) fn ack_automation_attention_batch(
         &mut self,
         receipts: &[AutomationAttentionReceipt],
     ) -> Result<(), String> {

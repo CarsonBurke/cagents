@@ -859,6 +859,7 @@ impl LocalHandle {
         Ok(response)
     }
 
+    #[cfg(test)]
     pub fn command(&self, command: Command) -> Result<(), String> {
         self.submit_command(None, command, false)
             .map_err(String::from)
@@ -1024,10 +1025,6 @@ impl LocalHandle {
             .map_err(|error| format!("Provider update readiness was not acknowledged: {error}"))
     }
 
-    pub(crate) fn interrupt_run(&self, run: crate::model::RunId) -> Result<(), String> {
-        self.interrupt_owned(Some(run), false)
-    }
-
     pub(crate) fn interrupt_owned(
         &self,
         run: Option<crate::model::RunId>,
@@ -1158,6 +1155,7 @@ impl LocalHandle {
             .clone()
     }
     /// Bounded resident metadata only; never reads or hydrates transcript pages.
+    #[cfg(test)]
     pub(crate) fn notification_content(
         &self,
         kind: crate::notifications::Kind,

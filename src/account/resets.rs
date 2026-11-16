@@ -281,6 +281,7 @@ pub struct ConsumeOutcome {
     pub snapshot: Option<UsageSnapshot>,
 }
 
+#[cfg(any(feature = "ui", feature = "host"))]
 impl ConsumeOutcome {
     pub(crate) fn unavailable(message: impl Into<String>) -> Self {
         Self {

@@ -689,10 +689,6 @@ pub(super) fn unnamed_conversation_for_start(
 
 /// Called only for explicit resume, before the separate Codex close reader.
 /// Returning true grants no provider start, account override or input replay.
-pub(super) fn prepare_resume(host: &SharedHost, source: &Session) -> Result<bool, String> {
-    prepare_resume_verified(host, source, None)
-}
-
 pub(super) fn prepare_resume_verified(
     host: &SharedHost,
     source: &Session,

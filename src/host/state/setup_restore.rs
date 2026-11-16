@@ -36,7 +36,7 @@ pub(super) fn retain_pane(
                 pane.pending_terminal_start = false;
                 pane.kind = crate::model::CardKind::Terminal(session);
                 let expected_revision = registry.view_revision(&view.scope)?;
-                registry.apply(&ModelEdit::ChangeView {
+                registry.apply_delta(&ModelEdit::ChangeView {
                     scope: view.scope.clone(),
                     expected_revision,
                     operation: uuid::Uuid::new_v4(),

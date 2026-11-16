@@ -74,6 +74,7 @@ impl JoinOwner {
     pub(super) fn new(published: Arc<PublishedState>, reservation: Reservation) -> Arc<Self> {
         Self::make(published, Some(reservation))
     }
+    #[cfg(test)]
     pub(super) fn empty(published: Arc<PublishedState>) -> Arc<Self> {
         Self::make(published, None)
     }

@@ -87,6 +87,7 @@ impl Reservation {
         self.source.id == id && state.chat_spawning.get(&id) == Some(&self.source)
     }
 
+    #[cfg(test)]
     pub(super) fn new(host: &SharedHost, source: &Session) -> Result<Option<Self>, ProtocolError> {
         Self::new_with_source(host, source, None)
     }

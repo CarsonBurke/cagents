@@ -227,6 +227,7 @@ impl ExecutionContext {
         self.directory.clone()
     }
     /// Return the descriptor used by spawn, never a new lookup of its pathname.
+    #[cfg(test)]
     pub(crate) fn pinned_launch_directory(
         &self,
     ) -> Result<
@@ -258,6 +259,7 @@ impl ExecutionContext {
             owner: Some(owner),
         };
     }
+    #[cfg(test)]
     pub(crate) fn outcome(&self) -> LaunchOutcome {
         self.ownership
             .lock()

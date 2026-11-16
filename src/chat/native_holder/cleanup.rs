@@ -176,6 +176,7 @@ impl Detached {
         retire_abandoned(&self.record).unwrap_or(false)
     }
 
+    #[cfg(test)]
     pub fn consume_receipt(&self) -> Result<bool, String> {
         self.receipt(false)
     }
@@ -284,26 +285,6 @@ pub(crate) fn retire_abandoned(record: &Record) -> Result<bool, String> {
     }
     record.remove(&registry::directory(Kind::Native)?);
     Ok(true)
-}
-
-/// Whether any close receipt names `terminal`, whichever conversation it
-/// matches. A receipt is evidence that the terminal's owner is accounted for;
-/// one that does not match a request is no permission to treat the request's
-/// owner as lost.
-pub(crate) fn has_receipt(terminal: TerminalId) -> Result<bool, String> {
-    let prefix = format!("{terminal}-");
-    for entry in
-        fs::read_dir(registry::directory(Kind::Native)?).map_err(|error| error.to_string())?
-    {
-        let name = entry.map_err(|error| error.to_string())?.file_name();
-        if name
-            .to_str()
-            .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".closed"))
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 pub(crate) fn closed_pair_holder(

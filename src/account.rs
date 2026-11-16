@@ -46,7 +46,7 @@ pub mod registry;
 pub mod remote;
 pub mod routing;
 pub mod schedule;
-#[cfg(any(feature = "ui", feature = "host"))]
+#[cfg(feature = "host")]
 pub(crate) mod scope;
 
 /// A used fraction past which an account is reported as approaching its

@@ -78,7 +78,7 @@ static WAKEUP_FD: AtomicI32 = AtomicI32::new(-1);
 
 #[cfg(feature = "host")]
 /// A socket pair used purely as a wakeup channel: any byte written to `writer`
-/// interrupts a [`wait_for_activity`] blocked on `reader`.
+/// interrupts a [`wait_for_activity_until`] blocked on `reader`.
 struct Wakeup {
     reader: UnixStream,
     writer: UnixStream,
@@ -124,7 +124,7 @@ fn wakeup() -> io::Result<&'static Wakeup> {
         .map_err(|error| io::Error::new(error.kind(), error.to_string()))
 }
 
-/// Interrupts a blocking [`wait_for_activity`] from any thread. Losing a byte to
+/// Interrupts a blocking [`wait_for_activity_until`] from any thread. Losing a byte to
 /// a full pipe is harmless, because a full pipe is a pending wakeup.
 #[cfg(feature = "host")]
 pub(crate) fn wake() {
@@ -135,7 +135,7 @@ pub(crate) fn wake() {
 
 /// Blocks until `listener` has a connection pending or something calls [`wake`].
 /// There is no timeout: an idle daemon causes no wakeups at all.
-#[cfg(feature = "host")]
+#[cfg(all(test, feature = "host"))]
 pub(crate) fn wait_for_activity(listener: &UnixListener) -> io::Result<()> {
     wait_for_activity_with(listener, wakeup()?)
 }
@@ -152,7 +152,7 @@ pub(crate) fn wait_for_activity_until(
     wait_for_activity_until_with(listener, wakeup()?, deadline, holders)
 }
 
-#[cfg(feature = "host")]
+#[cfg(all(test, feature = "host"))]
 fn wait_for_activity_with(listener: &UnixListener, wakeup: &Wakeup) -> io::Result<()> {
     wait_for_activity_until_with(listener, wakeup, None, &[])
 }

@@ -327,10 +327,6 @@ impl Reservation {
     /// The short writer compares the account map's exact cached token basis
     /// and installs the immutable home token. Existing admitted starts
     /// prevent this writer from overtaking their check/effect boundary.
-    pub(super) fn install(host: &SharedHost, accounts: &[Account]) -> Result<Self, ProtocolError> {
-        Self::install_restoring(host, accounts, None)
-    }
-
     fn install_restoring(
         host: &SharedHost,
         accounts: &[Account],
