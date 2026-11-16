@@ -30,18 +30,22 @@ fn scrolled_body<'a, M: 'a>(
 }
 
 /// A list inside a dialog's body that scrolls on its own once it is taller
-/// than `max_height`, fading into the dialog at its edges. Like the body
+/// than `max_height`, fading into the dialog at its edges. It is as wide as
+/// the body, so its scrollbar runs along the dialog's edge. Like the body
 /// around it, it keeps the dialog's text color.
 pub(crate) fn scrolled_region<'a, M: 'a>(
     content: impl Into<Element<'a, M>>,
     max_height: f32,
 ) -> Element<'a, M> {
     widget::container(crate::interaction::overflow_fade_y(
-        widget::scrollable(scrolled_body(content, Padding::ZERO)).direction(
-            iced::widget::scrollable::Direction::Vertical(design::scrollbar()),
-        ),
+        widget::scrollable(scrolled_body(content, Padding::ZERO))
+            .direction(iced::widget::scrollable::Direction::Vertical(
+                design::scrollbar(),
+            ))
+            .width(Length::Fill),
         design::dialog_base,
     ))
+    .width(Length::Fill)
     .max_height(max_height)
     .class(cosmic::theme::Container::custom(|_| Default::default()))
     .into()
@@ -606,8 +610,8 @@ pub(super) mod tests {
         assert_eq!(viewport.y + viewport.height, button.y);
     }
 
-    /// The window, the scroll viewport, its content height and the bounds of
-    /// the control `id`, in a laid-out dialog.
+    /// The window, the dialog body's scroll viewport, its content height and
+    /// the bounds of the control `id`, in a laid-out dialog.
     pub(in crate::app) fn action_geometry(
         mut element: Element<'_, Message>,
         window: iced::Size,
@@ -630,8 +634,12 @@ pub(super) mod tests {
                 _: iced::Vector,
                 _: &mut dyn operation::scrollable::Scrollable,
             ) {
-                self.1 = bounds;
-                self.2 = content.height;
+                // The dialog's body is the outermost scrollable; lists inside
+                // it come later.
+                if self.1 == iced::Rectangle::default() {
+                    self.1 = bounds;
+                    self.2 = content.height;
+                }
             }
             fn focusable(
                 &mut self,
