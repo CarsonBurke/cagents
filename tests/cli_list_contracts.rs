@@ -1013,7 +1013,7 @@ fn work_alone_lists_the_board_in_its_json_envelope() {
         serde_json::json!({
             // The scope says what the board covers: here every project, since
             // none of them contains this directory.
-            "scope": "All",
+            "scope": "all",
             "projects": [{
                 "name": "Fixture",
                 "root": "/fixture",
@@ -1054,7 +1054,7 @@ fn session_listings_report_compact_rows_and_selected_fields() {
     assert_eq!(
         value["data"],
         serde_json::json!({
-            "scope": "All",
+            "scope": "all",
             "sessions": [{
                 "id": "00000000-0000-4000-8000-000000000001",
                 "provider": "claude",
@@ -1153,6 +1153,35 @@ fn unconfirmed_account_removal_is_rejected_before_device_preparation() {
             .as_str()
             .unwrap()
             .contains("--yes")
+    );
+    assert!(output.stdout.is_empty());
+    assert!(!runtime.exists());
+}
+
+#[test]
+fn an_unknown_field_is_a_json_usage_error_naming_the_fields() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = root.path().join("runtime-must-not-be-created");
+    let command = CommandSpec::new(Path::new(env!("CARGO_BIN_EXE_cagents")))
+        .args(["ls", "--fields=id,bogus"])
+        .env("HOME", root.path())
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("XDG_DATA_HOME", root.path().join("data"))
+        .env("XDG_CACHE_HOME", root.path().join("cache"))
+        .timeout(Duration::from_secs(5))
+        .output_limits(64 * 1024, 64 * 1024);
+    let output = SystemProcessExecutor
+        .execute(&command, &CancellationToken::new())
+        .unwrap();
+    assert_eq!(output.exit_code, Some(2), "{output:?}");
+    // `--fields` asks for JSON, its errors included.
+    let value: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(value["error"]["kind"], "usage", "{value}");
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("bogus") && message.contains("state"),
+        "{message}"
     );
     assert!(output.stdout.is_empty());
     assert!(!runtime.exists());

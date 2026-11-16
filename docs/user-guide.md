@@ -515,8 +515,10 @@ request, no commits ahead or no changed paths, is left out rather than given
 as null or zero. Its pull request has its number, title, check outcome and
 review, `state` unless it is open, and `unpushed` when it does not contain
 the local head; `head` is the commit's first 12 hexadecimal digits.
-`--fields` names the fields of each card to keep, prints only the cards, and
-implies `--json`; an unknown field is refused with the list of valid ones.
+`--fields` names the fields of each card to keep and prints only the cards,
+each with every field named, even one the row would leave out, and
+`data.omitted`. It implies `--json`; an unknown field is refused with the list
+of valid ones.
 
 Every linked worktree has a card, and so does the primary checkout while it is
 dirty, ahead of the default branch or has an agent session. A branch without a

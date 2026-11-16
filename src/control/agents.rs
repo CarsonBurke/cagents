@@ -356,14 +356,15 @@ const LIST_FIELDS: &[&str] = &[
     "worktree",
     "session",
     "console",
-    "created_ms",
+    "created_at",
 ];
 
-/// An agent as `agent list --fields` reports it: a compact row, named by
+/// An agent as `agent list --fields` reports it: a complete row, named by
 /// its project's name where the daemon's `projects` give one, and by its
 /// hosted session's ID rather than that session's launch record.
+/// `created_at` is in Unix seconds.
 fn summary_row(summary: &Summary, projects: &[ModelProject]) -> Value {
-    use super::fields::{Row, word};
+    use super::fields::{Detail, Row, seconds, word};
     let agent = &summary.agent;
     let target = &agent.spec.target;
     let worktree = match &agent.placement {
@@ -374,7 +375,7 @@ fn summary_row(summary: &Summary, projects: &[ModelProject]) -> Value {
         HostedSession::Chat(chat) => json!(chat.id),
         HostedSession::Terminal(terminal) => json!(terminal.id),
     });
-    Row::new()
+    Row::new(Detail::Complete)
         .put("id", agent.id)
         .put("name", &agent.name)
         .put("provider", agent.spec.provider.executable())
@@ -394,7 +395,7 @@ fn summary_row(summary: &Summary, projects: &[ModelProject]) -> Value {
         .put("worktree", worktree)
         .put("session", session)
         .put("console", agent.console.as_ref().map(|console| console.id))
-        .put("created_ms", agent.created_ms)
+        .put("created_at", seconds(agent.created_ms))
         .into_value()
 }
 

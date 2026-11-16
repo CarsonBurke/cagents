@@ -3078,9 +3078,13 @@ where
     T: Into<OsString> + Clone,
 {
     let arguments = arguments.into_iter().map(Into::into).collect::<Vec<_>>();
-    let wants_json = arguments
-        .iter()
-        .any(|argument| argument.as_os_str() == OsStr::new("--json"));
+    // `--fields` implies `--json`, so its usage errors are JSON too.
+    let wants_json = arguments.iter().any(|argument| {
+        let argument = argument.as_os_str();
+        argument == OsStr::new("--json")
+            || argument == OsStr::new("--fields")
+            || argument.as_encoded_bytes().starts_with(b"--fields=")
+    });
     if let Err(error) = crate::daemon::lease_handoff::initialize_inherited_lease() {
         emit_error(wants_json, &AppError::new("daemon_startup", error));
         return ExitCode::FAILURE;
@@ -5942,6 +5946,40 @@ mod tests {
         let mut contradictory = argv.to_vec();
         contradictory.push("--validate-only");
         assert!(super::Cli::try_parse_from(contradictory).is_err());
+    }
+
+    #[test]
+    fn every_listing_that_selects_fields_implies_json() {
+        use clap::Parser;
+        let parsed = |argv: &[&str]| {
+            super::Cli::try_parse_from(std::iter::once("cagents").chain(argv.iter().copied()))
+                .and_then(super::Cli::validated)
+        };
+        for argv in [
+            &["ls", "--fields", "id,state"][..],
+            &["ls", "--channel", "--fields=channel"],
+            &["whoami", "--fields", "id"],
+            &["transcript", "abc", "--fields", "kind,text"],
+            &["work", "--fields", "card"],
+            &["work", "ls", "--all", "--fields", "card,column"],
+            &["agent", "list", "--fields", "id,state"],
+        ] {
+            assert!(parsed(argv).unwrap().command.selects_fields(), "{argv:?}");
+        }
+        for argv in [
+            &["ls"][..],
+            &["work"],
+            &["agent", "list"],
+            &["transcript", "abc"],
+        ] {
+            assert!(!parsed(argv).unwrap().command.selects_fields(), "{argv:?}");
+        }
+        // A field a listing does not report is refused, naming those it does.
+        let error = parsed(&["ls", "--fields", "id,bogus"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+        assert!(error.to_string().contains("active_at"), "{error}");
+        // Only the board's listing takes fields.
+        assert!(parsed(&["work", "--fields", "card", "ls"]).is_err());
     }
 
     #[test]

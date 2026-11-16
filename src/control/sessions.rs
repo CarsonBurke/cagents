@@ -1,4 +1,4 @@
-use super::fields::{self, Row as Fields};
+use super::fields::{self, Detail, Row as Fields};
 use super::*;
 use crate::agent_execution::{
     Authority, Operation, Reply,
@@ -54,7 +54,7 @@ pub(super) fn whoami(arguments: FieldsArgs) -> Result<CommandOutput, AppError> {
         command: "whoami",
         human: whoami_human(&directory, &peers, &super::format::program(), now_ms()),
         data: listing_json(
-            json!({ "scope": directory.scope }),
+            json!({ "scope": fields::word(&directory.scope) }),
             directory.caller.iter().chain(peers.iter().copied()),
             None,
             &arguments.fields,
@@ -158,7 +158,7 @@ pub(super) fn list(arguments: SessionsArgs) -> Result<CommandOutput, AppError> {
         command: "sessions",
         human: sessions_human(&directory, &super::format::program(), now_ms()),
         data: listing_json(
-            json!({ "scope": directory.scope }),
+            json!({ "scope": fields::word(&directory.scope) }),
             directory.caller.iter().chain(&directory.sessions),
             None,
             &arguments.fields.fields,
@@ -241,11 +241,12 @@ pub(super) fn listing_json<'a>(
     selected: &[String],
 ) -> Value {
     let members: Vec<&Member> = members.into_iter().collect();
+    let detail = Detail::of(selected);
     let rows = members
         .iter()
-        .map(|member| session_row(member, channel))
+        .map(|member| session_row(member, channel, detail))
         .collect();
-    if !selected.is_empty() {
+    if detail == Detail::Complete {
         return json!({ "sessions": fields::select(rows, selected) });
     }
     data["sessions"] = Value::Array(rows);
@@ -257,83 +258,81 @@ pub(super) fn listing_json<'a>(
 }
 
 /// A listed session as `--json` reports it, with only the facts it has.
-/// The caller's `relation` is `me`. `state` is the one a listing shows:
+/// `relation` is `me`, `parent` or `child`, and left out for a peer.
+/// `surface` is left out for a chat. `state` is the one a listing shows:
 /// `exited` or `limited` outrank the provider's last activity. `project`
 /// is the open project's name, `worktree` the checkout containing
 /// `directory` where that is not `directory` itself, and `account` the ID
 /// the listing's `accounts` describe. `channel` is left out where the
-/// listing names it, and `lineage` where it is the session's own ID.
-pub(super) fn session_row(member: &Member, channel: Option<ChannelId>) -> Value {
+/// listing names it, `lineage` where it is the session's own ID, and
+/// `owner` where it is the caller. `active_at` is in Unix seconds.
+pub(super) fn session_row(member: &Member, channel: Option<ChannelId>, detail: Detail) -> Value {
     let entry = &member.session;
     let delegation = entry.delegation.as_ref();
     let relation = match entry.relation {
-        Relation::Myself => Some("me"),
-        Relation::Parent => Some("parent"),
-        Relation::Child => Some("child"),
-        Relation::Peer => None,
+        Relation::Myself => "me",
+        Relation::Parent => "parent",
+        Relation::Child => "child",
+        Relation::Peer => "peer",
+    };
+    let surface = match entry.surface {
+        Surface::Chat => "chat",
+        Surface::Terminal => "terminal",
     };
     let worktree_view = match &entry.view_scope {
         Some(crate::agent_execution::Placement::Worktree { path, .. }) => Some(path),
         _ => None,
     };
-    // An agent the caller owns needs no owner named.
-    let owner = delegation
-        .filter(|_| entry.relation != Relation::Child)
-        .map(|delegation| match &delegation.owner {
-            Owner::User => json!("user"),
-            Owner::Session(lineage) => json!(lineage),
-            Owner::Automation(id) => json!({ "automation": id }),
-        });
-    Fields::new()
+    let owner = delegation.map(|delegation| match &delegation.owner {
+        Owner::User => json!("user"),
+        Owner::Session(lineage) => json!(lineage),
+        Owner::Automation(id) => json!({ "automation": id }),
+    });
+    Fields::new(detail)
         .put("id", entry.id)
-        .put("relation", relation)
+        .put_unless("relation", relation, entry.relation == Relation::Peer)
         .put(
             "provider",
             entry.provider.map(|provider| provider.executable()),
         )
-        .put(
-            "surface",
-            (entry.surface == Surface::Terminal).then_some("terminal"),
-        )
+        .put_unless("surface", surface, entry.surface == Surface::Chat)
         .put("state", member.state_label())
         .put("title", &entry.title)
         .put("project", &entry.project_name)
         .put("directory", &entry.directory)
-        .put(
+        .put_unless(
             "worktree",
-            entry
-                .worktree
-                .as_ref()
-                .filter(|worktree| entry.directory.as_ref() != Some(*worktree)),
+            &entry.worktree,
+            entry.worktree.is_some() && entry.worktree == entry.directory,
         )
         .put("worktree_view", worktree_view)
-        .put("channel", entry.channel.filter(|id| Some(*id) != channel))
-        .put(
+        .put_unless(
+            "channel",
+            entry.channel,
+            entry.channel.is_some() && entry.channel == channel,
+        )
+        .put_unless(
             "channel_repository",
-            entry
-                .channel_repository
-                .as_ref()
-                .filter(|repository| entry.project.as_ref() != Some(*repository)),
+            &entry.channel_repository,
+            entry.channel_repository.is_some() && entry.channel_repository == entry.project,
         )
-        .put(
-            "lineage",
-            (entry.lineage.0 != entry.id).then_some(entry.lineage),
-        )
+        .put_unless("lineage", entry.lineage, entry.lineage.0 == entry.id)
         .put(
             "lineage_channel",
             entry.lineage_channel.as_ref().map(|home| {
-                Fields::new()
+                Fields::new(detail)
                     .put("id", home.id)
-                    .put(
+                    .put_unless(
                         "repository",
-                        (entry.project.as_ref() != Some(&home.repository))
-                            .then_some(&home.repository),
+                        &home.repository,
+                        entry.project.as_ref() == Some(&home.repository),
                     )
                     .into_value()
             }),
         )
         .put("agent", delegation.map(|delegation| delegation.agent))
-        .put("owner", owner)
+        // An agent the caller owns needs no owner named.
+        .put_unless("owner", owner, entry.relation == Relation::Child)
         .put("run", delegation.and_then(|delegation| delegation.run))
         .put(
             "run_state",
@@ -348,7 +347,7 @@ pub(super) fn session_row(member: &Member, channel: Option<ChannelId>) -> Value 
         .put(
             "limit",
             member.limit.as_ref().map(|limit| {
-                Fields::new()
+                Fields::new(detail)
                     .put("summary", &limit.summary)
                     .put("reset", &limit.reset)
                     .put("resets_at", limit.resets_at)
@@ -356,7 +355,7 @@ pub(super) fn session_row(member: &Member, channel: Option<ChannelId>) -> Value 
             }),
         )
         .put("failure", &member.failure)
-        .put("active_at", member.active_at)
+        .put("active_at", member.active_at.map(fields::seconds))
         .into_value()
 }
 
@@ -377,7 +376,7 @@ pub(super) fn accounts_json(members: Vec<&Member>) -> serde_json::Map<String, Va
             .remaining
             .iter()
             .map(|window| {
-                Fields::new()
+                Fields::new(Detail::Sparse)
                     .put("window", &window.window.label)
                     .put("left_percent", fields::percent(window.remaining_fraction))
                     .put("resets_at", window.window.resets_at)
@@ -390,7 +389,7 @@ pub(super) fn accounts_json(members: Vec<&Member>) -> serde_json::Map<String, Va
         // row's `account` names one.
         accounts.insert(
             account.id.as_str().to_owned(),
-            Fields::new()
+            Fields::new(Detail::Sparse)
                 .put("label", &account.label)
                 .put("status", account.status.map(fields::word))
                 .put("windows", windows)
@@ -953,7 +952,7 @@ mod tests {
         let sessions = decoded.into_sessions();
         // Its repository is the session's project, so it is not repeated.
         assert_eq!(
-            session_row(sessions.caller.as_ref().unwrap(), None)["lineage_channel"],
+            session_row(sessions.caller.as_ref().unwrap(), None, Detail::Sparse)["lineage_channel"],
             json!({ "id": home.id })
         );
     }
@@ -1016,7 +1015,7 @@ mod tests {
                         "run": "00000000-0000-4000-8000-000000000004",
                         "run_state": "interrupted",
                         "account": "claude/system",
-                        "active_at": 60_000,
+                        "active_at": 60,
                     },
                 ],
                 // The account both run on, once, as whole percentages.
@@ -1032,17 +1031,38 @@ mod tests {
                 }},
             })
         );
-        // Selected fields alone, from every row; one listing a channel
-        // leaves that channel out of its rows.
+        // Selected fields alone, from every row, each stated in full: a
+        // listing of a channel still names it, and a peer and a chat say so.
         let channel = second.session.channel;
         assert_eq!(
             listing_json(
                 json!({}),
                 [&first, &second],
                 channel,
-                &["state".into(), "channel".into()]
+                &[
+                    "state".into(),
+                    "channel".into(),
+                    "relation".into(),
+                    "surface".into(),
+                    "failure".into(),
+                ]
             ),
-            json!({"sessions": [{"state": "limited"}, {"state": "exited"}]})
+            json!({"sessions": [
+                {
+                    "state": "limited",
+                    "channel": first.session.channel,
+                    "relation": "child",
+                    "surface": "chat",
+                    "failure": null,
+                },
+                {
+                    "state": "exited",
+                    "channel": channel,
+                    "relation": "peer",
+                    "surface": "chat",
+                    "failure": null,
+                },
+            ]})
         );
     }
 

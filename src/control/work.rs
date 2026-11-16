@@ -1,5 +1,6 @@
 //! `cagents work`: the daemon's board of every worktree and branch in
 //! progress, newest activity first.
+use super::fields::{Detail, Row, seconds, word};
 use super::*;
 use crate::work::{
     Board, CheckOutcome, Column, ConversationPullRequests, Forge, Item, ItemKey, Keep,
@@ -818,7 +819,7 @@ impl Listing<'_> {
 /// each project once, with the default branch its cards compare against,
 /// and the cards the listing shows, newest activity first, as compact rows.
 /// `omitted` counts the cards of each column the limit left out. With
-/// `selected` fields, only the cards, with only those fields.
+/// `selected` fields, only the cards, with only those fields, and `omitted`.
 fn board_json(
     board: &Board,
     scope: &Scope,
@@ -830,13 +831,23 @@ fn board_json(
         .iter()
         .map(|project| (project.repository.as_path(), project.base.as_deref()))
         .collect();
+    let detail = Detail::of(selected);
     let cards: Vec<Value> = board
         .items
         .iter()
-        .map(|item| card_json(item, bases.get(item.project.as_path()).copied().flatten()))
+        .map(|item| {
+            card_json(
+                item,
+                bases.get(item.project.as_path()).copied().flatten(),
+                detail,
+            )
+        })
         .collect();
-    if !selected.is_empty() {
-        return json!({ "cards": super::fields::select(cards, selected) });
+    if detail == Detail::Complete {
+        return Row::new(Detail::Sparse)
+            .put("cards", super::fields::select(cards, selected))
+            .put("omitted", omitted)
+            .into_value();
     }
     let projects: Vec<Value> = board
         .projects
@@ -848,7 +859,7 @@ fn board_json(
                 Forge::Unavailable { reason } => ("unavailable", Some(reason)),
                 Forge::Synced { error, .. } => ("synced", error.as_ref()),
             };
-            super::fields::Row::new()
+            Row::new(Detail::Sparse)
                 .put("name", &project.name)
                 .put("root", &project.root)
                 .put("base", &project.base)
@@ -858,8 +869,8 @@ fn board_json(
                 .into_value()
         })
         .collect();
-    super::fields::Row::new()
-        .put("scope", scope)
+    Row::new(Detail::Sparse)
+        .put("scope", word(scope))
         .put("projects", projects)
         .put("stale_after_days", board.stale_after_days)
         .put("linear_unavailable", &board.linear_unavailable)
@@ -873,19 +884,20 @@ fn board_json(
 /// and then `branch` names the branch it has. `base` appears only where it
 /// is not the project's. Its pull request carries its number, title, state
 /// unless open, check outcome and review, and `unpushed` when the local
-/// head is not in it; its sessions their ID and state.
-fn card_json(item: &Item, project_base: Option<&str>) -> Value {
-    use super::fields::{Row, word};
+/// head is not in it; its sessions their ID and state. `active_at` is in
+/// Unix seconds.
+fn card_json(item: &Item, project_base: Option<&str>, detail: Detail) -> Value {
     let card = item.label();
     let comparison = item.comparison.as_ref();
     let dirty = item.dirty.as_ref();
     let pull_request = item.pull_request.as_ref().map(|pull| {
-        Row::new()
+        Row::new(detail)
             .put("number", pull.number)
             .put("title", &pull.title)
-            .put(
+            .put_unless(
                 "state",
-                (pull.state != crate::work::PullRequestState::Open).then(|| word(pull.state)),
+                word(pull.state),
+                pull.state == PullRequestState::Open,
             )
             .put("draft", pull.draft)
             .put("checks", pull.checks.and_then(|checks| checks.outcome()))
@@ -894,7 +906,7 @@ fn card_json(item: &Item, project_base: Option<&str>) -> Value {
             .into_value()
     });
     let ticket = item.linear.as_ref().map(|ticket| {
-        Row::new()
+        Row::new(detail)
             .put("identifier", &ticket.identifier)
             .put("title", &ticket.title)
             .into_value()
@@ -904,18 +916,16 @@ fn card_json(item: &Item, project_base: Option<&str>) -> Value {
         .iter()
         .map(|session| json!({ "id": session.id, "state": word(session.state) }))
         .collect();
-    Row::new()
+    Row::new(detail)
         .put("card", &card)
         .put("project", &item.project_name)
         .put("column", item.column)
-        .put(
-            "derived",
-            (item.derived != item.column).then_some(item.derived),
-        )
+        .put_unless("derived", item.derived, item.derived == item.column)
         .put("pinned", item.pinned)
-        .put(
+        .put_unless(
             "branch",
-            item.branch.as_ref().filter(|branch| **branch != card),
+            &item.branch,
+            item.branch.as_ref().is_some_and(|branch| *branch == card),
         )
         .put(
             "worktree",
@@ -939,11 +949,10 @@ fn card_json(item: &Item, project_base: Option<&str>) -> Value {
                 .as_ref()
                 .map(|head| super::format::prefix(&head.oid, HEAD_DIGITS)),
         )
-        .put(
+        .put_unless(
             "base",
-            comparison
-                .map(|comparison| comparison.base.as_str())
-                .filter(|base| Some(*base) != project_base),
+            comparison.map(|comparison| comparison.base.as_str()),
+            comparison.is_some_and(|comparison| Some(comparison.base.as_str()) == project_base),
         )
         .count("ahead", comparison.map_or(0, |comparison| comparison.ahead))
         .count(
@@ -960,7 +969,8 @@ fn card_json(item: &Item, project_base: Option<&str>) -> Value {
         .put("sessions", sessions)
         .put(
             "active_at",
-            item.last_activity.map(|activity| activity.at_unix_ms),
+            item.last_activity
+                .map(|activity| seconds(activity.at_unix_ms)),
         )
         .put("error", &item.error)
         .into_value()
@@ -1429,7 +1439,7 @@ mod tests {
             committed_at_unix_ms: Some(NOW),
         });
         assert_eq!(
-            card_json(&card, Some("origin/main")),
+            card_json(&card, Some("origin/main"), Detail::Sparse),
             json!({
                 "card": "fix/main-12-login",
                 "project": "repo",
@@ -1449,15 +1459,22 @@ mod tests {
                 },
                 "ticket": {"identifier": "MAIN-12"},
                 "sessions": [{"id": "00000000-0000-4000-8000-000000000001", "state": "working"}],
-                "active_at": NOW - 60_000,
+                "active_at": (NOW - 60_000) / 1000,
             })
         );
+        // Selected, it states each field, even the ones that repeat.
+        let complete = card_json(&card, Some("origin/main"), Detail::Complete);
+        assert_eq!(complete["branch"], "fix/main-12-login");
+        assert_eq!(complete["base"], "origin/main");
+        assert_eq!(complete["primary"], false);
+        assert_eq!(complete["pull_request"]["state"], "open");
+        assert_eq!(complete["error"], Value::Null);
         // A card named by its worktree names its branch too, and a base
         // other than the project's is given.
         card.key = ItemKey::Worktree("/repo/.worktrees/login".into());
         card.pull_request.as_mut().unwrap().contains_local_head = false;
         card.pull_request.as_mut().unwrap().state = PullRequestState::Merged;
-        let value = card_json(&card, Some("origin/trunk"));
+        let value = card_json(&card, Some("origin/trunk"), Detail::Sparse);
         assert_eq!(value["card"], "/repo/.worktrees/login");
         assert_eq!(value["branch"], "fix/main-12-login");
         assert_eq!(value["base"], "origin/main");

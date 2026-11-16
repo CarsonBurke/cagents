@@ -99,20 +99,28 @@ pub(super) fn read(arguments: TranscriptArgs) -> Result<CommandOutput, AppError>
 /// its account, each entry as a compact row, oldest first, and `earlier`,
 /// the cursor of the page before, when there is one. Entries are named by
 /// their cursor, which `--before` takes. With `selected` fields, only the
-/// entries, with only those fields.
+/// entries, with only those fields, and `earlier`.
 fn page_json(page: &Page, selected: &[String]) -> Value {
-    let entries = page.entries.iter().map(entry_json).collect();
-    if !selected.is_empty() {
-        return json!({ "entries": super::fields::select(entries, selected) });
-    }
-    let mut data = json!({
-        "session": sessions::session_row(&page.session, None),
-        "entries": entries,
-    });
-    let accounts = sessions::accounts_json(vec![&page.session]);
-    if !accounts.is_empty() {
-        data["accounts"] = Value::Object(accounts);
-    }
+    use super::fields::{self, Detail};
+    let detail = Detail::of(selected);
+    let entries = page
+        .entries
+        .iter()
+        .map(|entry| entry_json(entry, detail))
+        .collect();
+    let mut data = if detail == Detail::Complete {
+        json!({ "entries": fields::select(entries, selected) })
+    } else {
+        let mut data = json!({
+            "session": sessions::session_row(&page.session, None, Detail::Sparse),
+            "entries": entries,
+        });
+        let accounts = sessions::accounts_json(vec![&page.session]);
+        if !accounts.is_empty() {
+            data["accounts"] = Value::Object(accounts);
+        }
+        data
+    };
     if let Some(earlier) = &page.earlier {
         data["earlier"] = json!(cursor(earlier));
     }
@@ -120,11 +128,13 @@ fn page_json(page: &Page, selected: &[String]) -> Value {
 }
 
 /// One entry as a compact row: its `kind` (user, assistant, message,
-/// report, notice, tool or tools) and what that kind carries. `omitted`
-/// counts the bytes clipped from `text`.
-fn entry_json(entry: &Entry) -> Value {
-    use super::fields::{Row, word};
-    let row = Row::new().put("id", cursor(&entry.id)).put("at", entry.at);
+/// report, notice, tool or tools) and what that kind carries, `at` in Unix
+/// seconds. `omitted` counts the bytes clipped from `text`.
+fn entry_json(entry: &Entry, detail: super::fields::Detail) -> Value {
+    use super::fields::{Row, seconds, word};
+    let row = Row::new(detail)
+        .put("id", cursor(&entry.id))
+        .put("at", entry.at.map(seconds));
     let text = |row: Row, text: &Text| {
         row.put("text", &text.text)
             .count("omitted", text.omitted as u64)
@@ -562,7 +572,7 @@ mod tests {
                     "state": "exited",
                     "title": "fix\u{1b}[31m build",
                     "failure": "You've hit your usage limit",
-                    "active_at": 60_000,
+                    "active_at": 60,
                 },
                 "entries": [
                     {"id": cursor("u1"), "kind": "user", "text": "Fix the build"},
@@ -573,9 +583,19 @@ mod tests {
                 "earlier": cursor("u0"),
             })
         );
+        // Selected fields, each stated, and where the page before starts.
+        let selected = page_json(&page, &["kind".into(), "text".into(), "omitted".into()]);
         assert_eq!(
-            page_json(&page, &["kind".into(), "text".into()])["entries"][2],
-            json!({"kind": "assistant", "text": "Done"})
+            selected,
+            json!({
+                "entries": [
+                    {"kind": "user", "text": "Fix the build", "omitted": 0},
+                    {"kind": "tools", "text": null, "omitted": null},
+                    {"kind": "assistant", "text": "Done", "omitted": 40},
+                    {"kind": "notice", "text": "", "omitted": 0},
+                ],
+                "earlier": cursor("u0"),
+            })
         );
     }
 
