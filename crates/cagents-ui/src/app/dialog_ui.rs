@@ -468,7 +468,7 @@ pub(super) mod tests {
             let mut messages = Vec::new();
             element.as_widget_mut().update(
                 tree,
-                &iced::Event::Keyboard(event),
+                &event,
                 Layout::new(&node),
                 iced::mouse::Cursor::Unavailable,
                 &renderer,
@@ -530,19 +530,14 @@ pub(super) mod tests {
             drawn.y >= viewport.y - 0.5
                 && drawn.y + drawn.height <= viewport.y + viewport.height + 0.5
         };
-        let tab = key_press(keyboard::key::Named::Tab);
-        let release = keyboard::Event::KeyReleased {
-            key: keyboard::Key::Named(keyboard::key::Named::Tab),
-            modified_key: keyboard::Key::Named(keyboard::key::Named::Tab),
-            physical_key: keyboard::key::Physical::Unidentified(
-                keyboard::key::NativeCode::Unidentified,
-            ),
-            location: keyboard::Location::Standard,
-            modifiers: keyboard::Modifiers::empty(),
-        };
+        let tab = iced::Event::Keyboard(key_press(keyboard::key::Named::Tab));
+        // A frame follows the key, as it does in the app.
+        let frame = iced::Event::Window(iced::window::Event::RedrawRequested(
+            iced::time::Instant::now(),
+        ));
         for row in &ids[1..] {
             press(&mut element, &mut tree, tab.clone());
-            press(&mut element, &mut tree, release.clone());
+            press(&mut element, &mut tree, frame.clone());
             let (viewport, id, drawn, _) = seen(&mut element, &mut tree);
             assert_eq!(&id, row);
             assert!(
@@ -555,8 +550,8 @@ pub(super) mod tests {
             "the last row is reached by scrolling"
         );
         for _ in 1..ids.len() {
-            press(&mut element, &mut tree, shift_tab());
-            press(&mut element, &mut tree, release.clone());
+            press(&mut element, &mut tree, iced::Event::Keyboard(shift_tab()));
+            press(&mut element, &mut tree, frame.clone());
         }
         let (viewport, id, drawn, scrolled) = seen(&mut element, &mut tree);
         assert_eq!(id, ids[0]);

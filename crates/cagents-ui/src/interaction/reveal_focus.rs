@@ -7,14 +7,19 @@ use cosmic::iced::{Event, Length, Rectangle, Size, Vector, keyboard, mouse, wind
 use cosmic::{Element, Renderer, Theme};
 
 /// `content`, a scrollable, scrolled just far enough to show a control that
-/// takes focus inside it, by Tab, an arrow key or the app, clear of the
-/// fades at its edges. Only a change of focus scrolls it: a person who then
-/// scrolls the focused control away keeps the view they chose.
+/// the keyboard moves focus to inside it, by Tab, an arrow key or a shortcut
+/// the app answers by focusing a control, clear of the fades at its edges.
+/// A control already wholly in view stays where it is, and focus taken by
+/// the pointer never scrolls: the person is looking at what they clicked,
+/// and a person who scrolls the focused control away keeps the view they
+/// chose.
 ///
 /// `content` must be the scrollable itself, or wrap it without other
-/// scrollables in between, as for [`super::overflow_fade_y`]. Like a focus
-/// scope's stops, only controls with an id count, so selecting text in a
-/// dialog's body doesn't move it.
+/// scrollables in between, as for [`super::overflow_fade_y`]. Focus inside a
+/// scrollable nested in it is that scrollable's to reveal, with a
+/// `reveal_focus` of its own. A control that takes focus without an id, as
+/// an iced text editor made without one does, can't be followed and is left
+/// where it is.
 pub fn reveal_focus<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
 ) -> Element<'a, Message> {
@@ -27,24 +32,40 @@ struct RevealFocus<'a, Message> {
     content: Element<'a, Message>,
 }
 
-/// The control last seen with focus inside.
+/// Where focus stood when the last key arrived.
 #[derive(Default)]
-struct Focused(Option<Id>);
+struct State {
+    /// The control focused before the last key was handled.
+    before: Option<Id>,
+    /// A key was handled since the last frame, which shows where it moved
+    /// focus, if anywhere.
+    pending: bool,
+}
 
-/// The outermost scrollable inside, and the focused control under it.
+/// The outermost scrollable inside, and the focused control directly under
+/// it.
 #[derive(Default)]
 struct FindFocus {
     /// The scrollable's viewport, its content height and its offset.
     scrollable: Option<(Rectangle, f32, f32)>,
-    /// The focused control, laid out in the scrollable's content.
-    focused: Option<(Id, Rectangle)>,
+    /// The focused control, laid out in the scrollable's content, or `None`
+    /// for its bounds when it lies in a nested scrollable.
+    focused: Option<(Id, Option<Rectangle>)>,
+    /// How many scrollables enclose the widgets being visited.
+    depth: usize,
+    /// A scrollable was just visited; the next traversal enters it.
+    entering: bool,
 }
 
 impl Operation for FindFocus {
     fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
-        if self.focused.is_none() {
-            operate(self);
+        if self.focused.is_some() {
+            return;
         }
+        let entering = std::mem::take(&mut self.entering);
+        self.depth += usize::from(entering);
+        operate(self);
+        self.depth -= usize::from(entering);
     }
 
     fn scrollable(
@@ -58,6 +79,7 @@ impl Operation for FindFocus {
         if self.scrollable.is_none() {
             self.scrollable = Some((bounds, content.height, translation.y));
         }
+        self.entering = true;
     }
 
     fn focusable(
@@ -66,8 +88,10 @@ impl Operation for FindFocus {
         bounds: Rectangle,
         state: &mut dyn operation::Focusable,
     ) {
-        if let Some(id) = id.filter(|_| state.is_focused() && self.scrollable.is_some()) {
-            self.focused = Some((id.clone(), bounds));
+        if let Some(id) = id.filter(|_| state.is_focused() && self.depth > 0) {
+            // A nested scrollable's content is laid out unscrolled within
+            // it, so these bounds say nothing about where it is drawn here.
+            self.focused = Some((id.clone(), (self.depth == 1).then_some(bounds)));
         }
     }
 }
@@ -100,12 +124,61 @@ impl Operation for ScrollTo {
     }
 }
 
+impl<Message> RevealFocus<'_, Message> {
+    fn find(&mut self, tree: &mut Tree, layout: Layout<'_>, renderer: &Renderer) -> FindFocus {
+        let mut find = FindFocus::default();
+        self.content
+            .as_widget_mut()
+            .operate(&mut tree.children[0], layout, renderer, &mut find);
+        find
+    }
+
+    /// Scrolls to the focused control if focus moved to it since the last
+    /// key arrived, and it isn't wholly in view.
+    fn reveal(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        shell: &mut Shell<'_, Message>,
+    ) {
+        let find = self.find(tree, layout, renderer);
+        let state = tree.state.downcast_mut::<State>();
+        let focused = find.focused.as_ref().map(|(id, _)| id.clone());
+        if state.before == focused {
+            return;
+        }
+        state.before = focused;
+        let (Some((viewport, content, current)), Some((_, Some(control)))) =
+            (find.scrollable, find.focused)
+        else {
+            return;
+        };
+        let top = control.y - viewport.y;
+        let height = control.height.min(viewport.height);
+        if top >= current && top + height <= current + viewport.height {
+            return;
+        }
+        let offset = super::selection_offset(top, height, viewport.height, content, current);
+        if (offset - current).abs() > 0.5 {
+            self.content.as_widget_mut().operate(
+                &mut tree.children[0],
+                layout,
+                renderer,
+                &mut ScrollTo(offset, false),
+            );
+            shell.invalidate_layout();
+            shell.request_redraw();
+        }
+    }
+}
+
 impl<Message> Widget<Message, Theme, Renderer> for RevealFocus<'_, Message> {
     fn tag(&self) -> tree::Tag {
-        tree::Tag::of::<Focused>()
+        tree::Tag::of::<State>()
     }
     fn state(&self) -> tree::State {
-        tree::State::new(Focused::default())
+        tree::State::new(State::default())
     }
     fn children(&self) -> Vec<Tree> {
         vec![Tree::new(&self.content)]
@@ -157,6 +230,15 @@ impl<Message> Widget<Message, Theme, Renderer> for RevealFocus<'_, Message> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        // Only the keyboard's moves count: what has focus before a key is
+        // the baseline, however it got there, and what has it at the next
+        // frame, moved by the key itself or by the app's answer to it, is
+        // the move. That frame's layout is the one the reveal measures.
+        let key = matches!(event, Event::Keyboard(keyboard::Event::KeyPressed { .. }));
+        if key {
+            let before = self.find(tree, layout, renderer).focused.map(|(id, _)| id);
+            tree.state.downcast_mut::<State>().before = before;
+        }
         self.content.as_widget_mut().update(
             &mut tree.children[0],
             event,
@@ -167,48 +249,12 @@ impl<Message> Widget<Message, Theme, Renderer> for RevealFocus<'_, Message> {
             shell,
             viewport,
         );
-        // Focus moves on a key, or between events when the app focuses a
-        // control, which the next frame then shows. Pointer motion never
-        // moves it, so it doesn't walk the content.
-        if !matches!(
-            event,
-            Event::Keyboard(
-                keyboard::Event::KeyPressed { .. } | keyboard::Event::KeyReleased { .. }
-            ) | Event::Window(window::Event::RedrawRequested(_))
-        ) {
-            return;
-        }
-        let mut find = FindFocus::default();
-        self.content
-            .as_widget_mut()
-            .operate(&mut tree.children[0], layout, renderer, &mut find);
-        let focused = find.focused.as_ref().map(|(id, _)| id.clone());
-        let seen = tree.state.downcast_mut::<Focused>();
-        if seen.0 == focused {
-            return;
-        }
-        seen.0 = focused;
-        let (Some((viewport, content, current)), Some((_, control))) =
-            (find.scrollable, find.focused)
-        else {
-            return;
-        };
-        let offset = super::selection_offset(
-            control.y - viewport.y,
-            control.height.min(viewport.height),
-            viewport.height,
-            content,
-            current,
-        );
-        if (offset - current).abs() > 0.5 {
-            self.content.as_widget_mut().operate(
-                &mut tree.children[0],
-                layout,
-                renderer,
-                &mut ScrollTo(offset, false),
-            );
-            shell.invalidate_layout();
-            shell.request_redraw();
+        if key {
+            tree.state.downcast_mut::<State>().pending = true;
+        } else if matches!(event, Event::Window(window::Event::RedrawRequested(_)))
+            && std::mem::take(&mut tree.state.downcast_mut::<State>().pending)
+        {
+            self.reveal(tree, layout, renderer, shell);
         }
     }
     fn mouse_interaction(
@@ -285,6 +331,164 @@ impl<Message> Widget<Message, Theme, Renderer> for RevealFocus<'_, Message> {
             layout,
             renderer,
             destinations,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cosmic::iced::advanced::{clipboard, widget::operation::focusable};
+    use cosmic::iced::{Point, time::Instant};
+    use cosmic::widget;
+
+    /// Twenty 30 px rows in a 100 px tall scrollable; the row `nested` holds
+    /// a scrollable of its own, 30 px tall, around ten rows.
+    struct Harness {
+        element: Element<'static, ()>,
+        tree: Tree,
+        node: layout::Node,
+        renderer: Renderer,
+    }
+
+    fn id(row: usize) -> Id {
+        Id::new(format!("row-{row}"))
+    }
+
+    fn row(row: usize) -> Element<'static, ()> {
+        widget::button::text(format!("Row {row}"))
+            .id(id(row))
+            .height(30)
+            .on_press(())
+            .into()
+    }
+
+    impl Harness {
+        fn new(nested: Option<usize>) -> Self {
+            let rows = (0..20)
+                .map(|index| match nested {
+                    Some(at) if at == index => widget::scrollable(widget::column::with_children(
+                        (100..110).map(row).collect::<Vec<_>>(),
+                    ))
+                    .height(30)
+                    .into(),
+                    _ => row(index),
+                })
+                .collect::<Vec<_>>();
+            let mut element =
+                reveal_focus(widget::scrollable(widget::column::with_children(rows)).height(100));
+            let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+            let mut tree = Tree::new(&element);
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(300.0, 100.0)),
+            );
+            Self {
+                element,
+                tree,
+                node,
+                renderer,
+            }
+        }
+
+        fn operate(&mut self, operation: &mut dyn Operation) {
+            self.element.as_widget_mut().operate(
+                &mut self.tree,
+                Layout::new(&self.node),
+                &self.renderer,
+                operation,
+            );
+        }
+
+        fn event(&mut self, event: Event) {
+            let mut messages = Vec::new();
+            self.element.as_widget_mut().update(
+                &mut self.tree,
+                &event,
+                Layout::new(&self.node),
+                mouse::Cursor::Available(Point::ORIGIN),
+                &self.renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &Rectangle::with_size(Size::new(300.0, 100.0)),
+            );
+        }
+
+        fn focus(&mut self, row: usize) {
+            self.operate(&mut focusable::focus::<()>(id(row)));
+        }
+
+        fn key(&mut self) {
+            self.event(Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Tab),
+                modified_key: keyboard::Key::Named(keyboard::key::Named::Tab),
+                physical_key: keyboard::key::Physical::Unidentified(
+                    keyboard::key::NativeCode::Unidentified,
+                ),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            }));
+        }
+
+        fn frame(&mut self) {
+            self.event(Event::Window(
+                window::Event::RedrawRequested(Instant::now()),
+            ));
+        }
+
+        /// The outer scrollable's offset.
+        fn scrolled(&mut self) -> f32 {
+            let mut find = FindFocus::default();
+            self.operate(&mut find);
+            find.scrollable.expect("a scrollable").2
+        }
+    }
+
+    #[test]
+    fn a_control_the_keyboard_focuses_below_the_fold_scrolls_into_view() {
+        let mut harness = Harness::new(None);
+        harness.key();
+        // The app answers the key by focusing a row; the next frame shows it.
+        harness.focus(10);
+        harness.frame();
+        let scrolled = harness.scrolled();
+        assert!(
+            (300.0 - 100.0 + 30.0..=300.0).contains(&scrolled),
+            "row 10, at 300..330, is in the 100 px viewport at {scrolled}"
+        );
+        // A row already in view stays where it is.
+        harness.key();
+        harness.focus(9);
+        harness.frame();
+        assert_eq!(harness.scrolled(), scrolled);
+    }
+
+    #[test]
+    fn focus_the_pointer_gives_never_scrolls() {
+        let mut harness = Harness::new(None);
+        // A click focuses a row partly under the fold; no key came first.
+        harness.focus(3);
+        harness.frame();
+        assert_eq!(harness.scrolled(), 0.0);
+        // A later key that leaves focus where the click put it moves nothing.
+        harness.key();
+        harness.frame();
+        assert_eq!(harness.scrolled(), 0.0);
+    }
+
+    #[test]
+    fn focus_inside_a_nested_scrollable_is_left_to_it() {
+        let mut harness = Harness::new(Some(12));
+        harness.key();
+        harness.focus(105);
+        harness.frame();
+        assert_eq!(
+            harness.scrolled(),
+            0.0,
+            "a nested control's unscrolled bounds don't place it in the outer view"
         );
     }
 }
