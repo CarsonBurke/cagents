@@ -8534,18 +8534,23 @@ impl Cagents {
     /// Remove only automatic placeholders in the scope being left. This is
     /// synchronous: a delayed close message would target the replacement strip
     /// and could delete the channel rather than just its unused placeholder.
+    ///
+    /// Returns whether a placeholder someone had started using became an
+    /// ordinary pane, which the caller saves now. An unused placeholder was
+    /// never saved or shared (see [`Self::persistent_workspace`]), so removing
+    /// it changes nothing a save writes, and it is saved with the navigation.
     pub(super) fn discard_unused_default_chats(&mut self) -> bool {
         let defaults = self
             .workspace
             .order()
             .filter(|card| self.chat_ui.default_chats.contains(card))
             .collect::<Vec<_>>();
-        let mut removed = false;
+        let mut promoted = false;
         for card in defaults {
             self.chat_ui.default_chats.remove(&card);
             let unused = self.chat_is_unused(card);
             if !unused {
-                removed = true;
+                promoted = true;
                 continue;
             }
             self.chat_discard(card);
@@ -8569,9 +8574,8 @@ impl Cagents {
                     channel.focused = channel.cards.first().copied();
                 }
             }
-            removed = true;
         }
-        removed
+        promoted
     }
 
     /// Closes one conversation's `+` menu, including its fork choices.
@@ -8777,7 +8781,15 @@ impl Cagents {
             };
             self.open_chat(card_id, session, intent)
         };
-        self.persist();
+        // An automatic placeholder is neither saved nor shared until someone
+        // uses it (see `persistent_workspace`), so opening one, as entering an
+        // empty worktree does, saves with the navigation that opened it.
+        let save = if ephemeral {
+            self.save_navigation_soon()
+        } else {
+            self.persist();
+            Task::none()
+        };
         let title = if save_title {
             self.save_settings_task(false)
         } else {
@@ -8789,6 +8801,7 @@ impl Cagents {
             skills,
             self.apply_viewport(update, true, DurableChange::None),
             title,
+            save,
         ])
     }
 
@@ -20715,6 +20728,47 @@ mod tests {
         assert!(app.card_state(explicit).unwrap().existence.is_open());
         let _ = app.select_worktree(FIXTURE_DIRECTORY.into(), true);
         assert_eq!(app.workspace.focused(), Some(explicit));
+    }
+
+    /// Entering an empty worktree from the sidebar opens a placeholder, and
+    /// leaving discards it. Neither is ever saved, so both wait for the
+    /// navigation's own deferred save; a placeholder someone typed into is
+    /// an ordinary pane from then on and is saved as the worktree is left.
+    #[test]
+    fn placeholders_save_with_the_navigation_that_opens_and_leaves_them() {
+        use crate::app::terminal_output_tests::persists;
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let saved = persists();
+        drop(app.navigate_to_worktree(FIXTURE_DIRECTORY.into()));
+        let automatic = app.workspace.focused().unwrap();
+        assert!(app.chat_is_unused_default(automatic));
+        assert_eq!(persists(), saved, "opening the placeholder waits");
+        assert!(app.navigation_save.is_some());
+        drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
+        assert_eq!(persists(), saved + 1, "the navigation is saved once");
+
+        drop(app.navigate_to_worktree("/workspace/elsewhere".into()));
+        assert!(app.card_state(automatic).is_none());
+        assert_eq!(persists(), saved + 1, "discarding the placeholder waits");
+        drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
+        assert_eq!(persists(), saved + 2);
+
+        drop(app.navigate_to_worktree(FIXTURE_DIRECTORY.into()));
+        let used = app.workspace.focused().unwrap();
+        write(&mut app, used, "keep this message");
+        let before = persists();
+        drop(app.navigate_to_worktree("/workspace/elsewhere".into()));
+        assert_eq!(
+            persists(),
+            before + 1,
+            "a used placeholder is saved at once"
+        );
+        assert!(
+            app.persistent_workspace()
+                .cards
+                .iter()
+                .any(|state| state.id == used)
+        );
     }
 
     #[test]

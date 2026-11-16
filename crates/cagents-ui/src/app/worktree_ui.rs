@@ -576,7 +576,7 @@ impl Cagents {
             .durable
             .active_channel
             .filter(|&previous| previous != id);
-        let discarded = if self.durable.active_channel != Some(id) {
+        let promoted = if self.durable.active_channel != Some(id) {
             self.discard_unused_default_chats()
         } else {
             false
@@ -592,7 +592,7 @@ impl Cagents {
         let scoped = scope_descriptor(&self.durable, &path, &[], &self.worktree_owners, focused);
         let offset = self.channel_offsets.get(&id).copied();
         let scope = self.install_workspace_scope(scoped, path, offset, change);
-        if discarded {
+        if promoted {
             self.persist();
         }
         scope
@@ -988,7 +988,7 @@ impl Cagents {
         if was_channel {
             self.snapshot_workspace_scope();
         }
-        let discarded =
+        let promoted_default =
             if !promoted && (was_channel || self.active_workspace.as_ref() != Some(&path)) {
                 self.discard_unused_default_chats()
             } else {
@@ -1020,7 +1020,7 @@ impl Cagents {
         } else {
             Task::none()
         };
-        if discarded {
+        if promoted_default {
             self.persist();
         }
         (true, Task::batch([scope, terminal]))
