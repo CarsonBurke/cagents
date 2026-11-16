@@ -112,7 +112,7 @@ fn automatic_retention_reason(path: &Path) -> String {
     )
 }
 
-#[cfg(any(feature = "host", feature = "ui"))]
+#[cfg(feature = "host")]
 fn exact_merged_head(request: &RemovalRequest, pr: &crate::github::PullRequest) -> bool {
     pr.state.0 == "MERGED"
         && pr.number == request.pull_request.number
@@ -444,6 +444,7 @@ impl Protection {
     /// Independent open descriptions retain shared protection in exec children.
     /// OwnedLock explicitly unlocks on drop, so duplicating its descriptor would
     /// let the parent's retirement unlock the child's shared open description.
+    #[cfg(any(feature = "host", feature = "ui", test))]
     pub(crate) fn retained_child_files(&self) -> io::Result<Vec<std::sync::Arc<std::fs::File>>> {
         use std::os::fd::AsRawFd;
         use std::os::unix::fs::MetadataExt;
@@ -662,6 +663,7 @@ pub fn protect(directory: &Path) -> io::Result<Option<Protection>> {
 
 /// Local mutations need directory protection even outside an initialized UI.
 /// Callers retain this guard until every inherited operation lease has retired.
+#[cfg(any(feature = "host", feature = "ui"))]
 pub(crate) fn protect_operation(directory: &Path) -> io::Result<Protection> {
     acquire(&crate::instance::runtime_directory()?, directory, false)
 }
@@ -852,6 +854,7 @@ mod tests {
     /// A plain `File` holding a lock releases it only when every copy closes, and
     /// a sibling test's fork holds a copy until its exec. That is inferred: the test
     /// passed alone before this wait.
+    #[cfg(any(feature = "host", feature = "ui"))]
     fn acquire_once_released(runtime: &Path, directory: &Path, exclusive: bool) -> Protection {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
@@ -897,6 +900,7 @@ mod tests {
         command
     }
 
+    #[cfg(feature = "host")]
     fn request() -> RemovalRequest {
         let source =
             crate::github_identity::GitHubRepoKey::new("github.com", None, "source", "repository")
@@ -914,7 +918,7 @@ mod tests {
         }
     }
 
-    #[cfg(any(feature = "host", feature = "ui"))]
+    #[cfg(feature = "host")]
     #[test]
     fn merged_eligibility_requires_exact_commit_branch_and_source_identity() {
         let request = request();

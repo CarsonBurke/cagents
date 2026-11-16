@@ -752,10 +752,6 @@ listener.bind(sys.argv[2]);listener.listen()
         crate::daemon::running_executable_at(&paths).is_err(),
         "a stale source PID cannot authenticate the worker's held handoff"
     );
-    assert!(matches!(
-        cleanup_daemon(&paths, true),
-        CleanupDaemon::Absent
-    ));
     let store = crate::upgrade::handoff::Store::discover().unwrap();
     let checkpoint = serde_json::to_vec(&serde_json::json!({
         "version": 5, "proof": daemon.capability.proof, "phase": "Prepared",

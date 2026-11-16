@@ -15,7 +15,7 @@ pub mod pricing;
 pub(crate) const INTERRUPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 pub(crate) const TERMINATE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
-#[cfg(any(feature = "ui", feature = "host"))]
+#[cfg(feature = "host")]
 pub(crate) mod claude_metadata;
 #[cfg(any(feature = "ui", all(test, feature = "host")))]
 pub mod client;
@@ -34,6 +34,7 @@ pub use work_hold::{Held, HeldSubagent, WorkHold};
 
 /// Whether answering a request with `action` turns its work down rather than
 /// authorizing it.
+#[cfg(feature = "host")]
 pub(crate) fn declines(action: &str) -> bool {
     matches!(action, "deny" | "decline" | "reject" | "cancel" | "abort")
 }
@@ -2411,6 +2412,7 @@ pub struct Item {
 }
 
 /// A paged command's label or tool's name as the provider gave it.
+#[cfg(feature = "host")]
 pub(crate) fn without_page_mark(label: &str) -> &str {
     label
         .rsplit_once(" (part ")
@@ -2427,6 +2429,7 @@ pub(crate) fn without_page_mark(label: &str) -> &str {
 impl Item {
     /// Whether this is a later part of an item too long for one, which is still
     /// a single thing the provider did or said.
+    #[cfg(feature = "host")]
     pub(crate) fn continues_paged_item(&self) -> bool {
         TranscriptPart::parse(&self.id).is_some()
     }

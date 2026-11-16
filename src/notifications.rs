@@ -32,6 +32,7 @@ pub enum Target {
 }
 
 impl Target {
+    #[cfg(any(feature = "host", test))]
     pub(crate) fn storage_key(&self) -> String {
         match self {
             Self::Session(id) => id.to_string(),
@@ -244,6 +245,7 @@ impl Event {
 
     /// Only the JSON journal accepts the old shape. Keeping wire decoding
     /// explicit avoids untagged/self-describing serde requirements in postcard.
+    #[cfg(any(feature = "host", test))]
     pub(crate) fn from_journal(value: &str) -> Result<Self, serde_json::Error> {
         #[derive(Deserialize)]
         struct Legacy {

@@ -139,18 +139,6 @@ impl VerifiedView {
     /// `target` must come from the authenticated serving peer, not `current`
     /// or another installation pointer. The caller fences this read with the
     /// same ownership/readiness/inventory checks as the live descriptors.
-    pub(crate) fn load(
-        serving: &HostSessionProof,
-        target: &Path,
-        terminals: &[TerminalDescriptor],
-        chats: &[Session],
-    ) -> Result<Option<Self>, String> {
-        let Some(store) = super::super::handoff::Store::existing()? else {
-            return Ok(None);
-        };
-        Self::load_at(&store.path, serving, target, terminals, chats)
-    }
-
     pub(crate) fn load_for_source(
         expected_source: &HostSessionProof,
         serving: &HostSessionProof,
@@ -164,24 +152,6 @@ impl VerifiedView {
         Self::load_at_with(
             &store.path,
             Some(expected_source),
-            serving,
-            target,
-            terminals,
-            chats,
-            Retention::load,
-        )
-    }
-
-    fn load_at(
-        checkpoint_path: &Path,
-        serving: &HostSessionProof,
-        target: &Path,
-        terminals: &[TerminalDescriptor],
-        chats: &[Session],
-    ) -> Result<Option<Self>, String> {
-        Self::load_at_with(
-            checkpoint_path,
-            None,
             serving,
             target,
             terminals,

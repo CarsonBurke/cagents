@@ -37,7 +37,8 @@ impl Lineage {
         self.edges.is_empty()
     }
 
-    pub fn clear(&mut self) {
+    #[cfg(test)]
+    pub(super) fn clear(&mut self) {
         self.edges.clear();
     }
 

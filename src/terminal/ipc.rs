@@ -2138,7 +2138,7 @@ impl FrameCodec {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, any(feature = "host", feature = "ui")))]
     pub(crate) fn buffer_capacities_for_test(&self) -> (usize, usize) {
         (self.read_buffer.capacity(), self.write_buffer.capacity())
     }
