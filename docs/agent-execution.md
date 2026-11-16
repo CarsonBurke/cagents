@@ -183,7 +183,7 @@ Earlier: cagents transcript 7c0f --before 3f2a1b7c-0d9e-4c8b-a7f6-5e4d3c2b1a00
 [user]
   The login test fails one run in ten; find out why.
 
-[tools] Run ×9, Read ×4, Edit ×2; edited src/account/login.rs
+[tools] Run ×9, Read ×4, Edit ×2; edited tests/login.rs, src/auth.rs
 
 [assistant]
   The session cookie expires during the retry loop. I extended its lifetime in the fixture and ...
@@ -196,7 +196,7 @@ A page holds the last `--limit` messages (10 by default, at most 200): user mess
 Any session, or the user from their own shell, can leave a message for another live session. The message is addressed to the recipient's lineage, so it still arrives if that session is relaunched or recovered before reading it.
 
 ```sh
-cagents send 7c0f 'I am refactoring src/account/login.rs; hold edits there until I report back'
+cagents send 7c0f 'I am refactoring src/auth.rs; hold edits there until I report back'
 cagents send parent 'Blocked: the staging credentials are missing'
 cagents ask 7c0f 'Which branch are you on?' --timeout 300
 cagents reply 9a41 'main'
@@ -221,7 +221,7 @@ A delivered message is a prompt framed for the agent:
 
 ```text
 [cagents message from session 3e81d0aa "Fix flaky login test"]
-I am refactoring src/account/login.rs; hold edits there until I report back
+I am refactoring src/auth.rs; hold edits there until I report back
 [Reply: cagents reply 9a41c2e7 "…" · seal 5f0c…]
 ```
 
