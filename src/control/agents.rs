@@ -1997,7 +1997,7 @@ mod tests {
                 );
                 let cli =
                     Cli::try_parse_from(["cagents", &selection, "agent", "wait", &run]).unwrap();
-                assert_eq!(cli.device.as_deref(), Some(device));
+                assert_eq!(cli.global.device.as_deref(), Some(device));
                 assert!(
                     matches!(cli.command, TopCommand::Agent { command: AgentCommand::Wait { handles, .. } } if handles == [run])
                 );

@@ -1582,7 +1582,7 @@ mod tests {
         assert!(matches!(
             parse(&["work", "--json", "rm", "x", "--dry-run"]),
             Ok(Cli {
-                json: true,
+                global: GlobalOptions { json: true, .. },
                 command: TopCommand::Work {
                     command: Some(WorkCommand::Rm(_)),
                     ..

@@ -121,9 +121,21 @@ const MAX_WAIT_SECONDS: f64 = 24.0 * 60.0 * 60.0;
 #[command(
     name = "cagents",
     version = crate::version(),
-    about = "Manage cagents agents, sessions, automations, projects, channels, terminals, messaging, Linear and accounts"
+    about = "Manage cagents agents, sessions, automations, projects, channels, terminals, messaging, Linear and accounts",
+    mut_subcommands = quiet_global_options
 )]
 pub struct Cli {
+    #[command(flatten)]
+    pub global: GlobalOptions,
+
+    #[command(subcommand)]
+    pub command: TopCommand,
+}
+
+/// Options every command accepts, before or after its name.
+#[derive(Debug, clap::Args)]
+#[command(next_help_heading = "Global options")]
+pub struct GlobalOptions {
     /// Backend device from devices.json; local is the default.
     #[arg(long, global = true)]
     pub device: Option<String>,
@@ -133,9 +145,42 @@ pub struct Cli {
     /// Connect to an existing daemon without starting one (also CAGENTS_NO_START=1).
     #[arg(long, global = true)]
     pub no_start: bool,
+}
 
-    #[command(subcommand)]
-    pub command: TopCommand,
+/// What a subcommand's help says in place of listing the global options.
+const GLOBAL_OPTIONS_NOTE: &str =
+    "Global options --device, --json and --no-start are accepted here too; see `cagents --help`.";
+
+/// Lists the global options in `cagents --help` alone. Each top-level
+/// subcommand gets a hidden copy of them, which clap propagates in place of
+/// the visible originals, since it skips a subcommand that already has an
+/// argument of that ID. The copies are still global, so they reach every
+/// nested subcommand and are accepted wherever the originals were, and a
+/// value given to one still reaches [`GlobalOptions`]. Shell completions keep
+/// offering them: the generators include hidden options.
+fn quiet_global_options(command: clap::Command) -> clap::Command {
+    use clap::Args;
+    let options = GlobalOptions::augment_args(clap::Command::new("cagents"));
+    let hidden = options
+        .get_arguments()
+        .map(|argument| argument.clone().hide(true));
+    note_global_options(command.args(hidden))
+}
+
+/// Ends `command`'s help, and its subcommands', with [`GLOBAL_OPTIONS_NOTE`].
+fn note_global_options(command: clap::Command) -> clap::Command {
+    let note = match command.get_after_help() {
+        Some(help) => {
+            let mut help = help.clone();
+            help.push_str("\n\n");
+            help.push_str(GLOBAL_OPTIONS_NOTE);
+            help
+        }
+        None => GLOBAL_OPTIONS_NOTE.into(),
+    };
+    command
+        .after_help(note)
+        .mut_subcommands(note_global_options)
 }
 
 impl Cli {
@@ -2992,7 +3037,7 @@ where
     // Grammar-only output must work without device selection, installer routing,
     // daemon startup, or a reachable backend.
     if let TopCommand::Completions { shell } = cli.command {
-        emit_success(cli.json, completions::execute(shell));
+        emit_success(cli.global.json, completions::execute(shell));
         return ExitCode::SUCCESS;
     }
     if matches!(
@@ -3003,11 +3048,11 @@ where
     ) {
         return match execute_daemon(DaemonCommand::ProtocolVersion) {
             Ok(output) => {
-                emit_success(cli.json, output);
+                emit_success(cli.global.json, output);
                 ExitCode::SUCCESS
             }
             Err(error) => {
-                emit_error(cli.json, &error);
+                emit_error(cli.global.json, &error);
                 ExitCode::FAILURE
             }
         };
@@ -3018,8 +3063,12 @@ where
     // local installer effects. Presence is enough: malformed/non-Unicode
     // authority must never silently become a User connection.
     let hosted = std::env::var_os(crate::agent_execution::AUTHORITY_ENV).is_some();
-    let local =
-        cli.device.as_deref().is_none_or(|name| name == "local") && !crate::device::is_remote();
+    let local = cli
+        .global
+        .device
+        .as_deref()
+        .is_none_or(|name| name == "local")
+        && !crate::device::is_remote();
     let user_only_message: Option<std::borrow::Cow<'static, str>> = match &cli.command {
         // A development daemon with a runtime of its own, such as a runner
         // instance, is the caller's to stop unless it hosts the caller or a
@@ -3060,7 +3109,7 @@ where
     };
     if hosted && let Some(message) = user_only_message {
         emit_error(
-            cli.json,
+            cli.global.json,
             &AppError::new(
                 "permission_denied",
                 format!(
@@ -3074,7 +3123,12 @@ where
     // These implementations operate on this installation's files or pidfds.
     // Refuse a remote target before selecting/preparing it or touching local
     // recovery state; the selected remote must never imply local consent.
-    if (cli.device.as_deref().is_some_and(|name| name != "local") || crate::device::is_remote())
+    if (cli
+        .global
+        .device
+        .as_deref()
+        .is_some_and(|name| name != "local")
+        || crate::device::is_remote())
         && matches!(
             &cli.command,
             TopCommand::Daemon {
@@ -3094,7 +3148,7 @@ where
         )
     {
         emit_error(
-            cli.json,
+            cli.global.json,
             &AppError::new(
                 "daemon_local_only",
                 "This operation manages the local installation; omit --device or select local",
@@ -3119,16 +3173,16 @@ where
         .any(|name| std::env::var_os(name).is_some());
         return match chat::image_assets::execute(
             command,
-            cli.device.as_deref(),
+            cli.global.device.as_deref(),
             crate::device::is_remote(),
             hosted,
         ) {
             Ok(output) => {
-                emit_success(cli.json, output);
+                emit_success(cli.global.json, output);
                 ExitCode::SUCCESS
             }
             Err(error) => {
-                emit_error(cli.json, &error);
+                emit_error(cli.global.json, &error);
                 ExitCode::FAILURE
             }
         };
@@ -3141,7 +3195,7 @@ where
         }
     );
     let no_start = stopping_daemon
-        || cli.no_start
+        || cli.global.no_start
         || std::env::var("CAGENTS_NO_START")
             .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
     let _start_policy = StartPolicy(NO_START.swap(no_start, std::sync::atomic::Ordering::Relaxed));
@@ -3149,9 +3203,9 @@ where
     // Local evidence must remain readable when a staged owner, backend, or
     // daemon cannot start. Do not select/prepare a device or follow a route.
     if matches!(cli.command, TopCommand::Diagnostics) {
-        if cli.device.is_some() {
+        if cli.global.device.is_some() {
             emit_error(
-                cli.json,
+                cli.global.json,
                 &AppError::new(
                     "diagnostics_local_only",
                     "Diagnostics inspect this device; omit --device",
@@ -3161,11 +3215,11 @@ where
         }
         return match execute(TopCommand::Diagnostics) {
             Ok(output) => {
-                emit_success(cli.json, output);
+                emit_success(cli.global.json, output);
                 ExitCode::SUCCESS
             }
             Err(error) => {
-                emit_error(cli.json, &error);
+                emit_error(cli.global.json, &error);
                 ExitCode::FAILURE
             }
         };
@@ -3174,9 +3228,15 @@ where
     // This cache belongs to gh's local credential context, not the daemon.
     // Reading it must not prepare a remote backend or recover a staged owner.
     if let TopCommand::Gh { command } = cli.command {
-        if cli.device.as_deref().is_some_and(|name| name != "local") || crate::device::is_remote() {
+        if cli
+            .global
+            .device
+            .as_deref()
+            .is_some_and(|name| name != "local")
+            || crate::device::is_remote()
+        {
             emit_error(
-                cli.json,
+                cli.global.json,
                 &AppError::new(
                     "github_status_local_only",
                     "Run GitHub status on the device containing the gh credentials; --device is not supported",
@@ -3187,24 +3247,24 @@ where
         return match gh::execute(command) {
             Ok(output) => {
                 let code = output.exit_code();
-                emit_success(cli.json, output);
+                emit_success(cli.global.json, output);
                 code
             }
             Err(error) => {
-                emit_error(cli.json, &error);
+                emit_error(cli.global.json, &error);
                 ExitCode::FAILURE
             }
         };
     }
 
     let _device_cleanup = crate::device::Cleanup;
-    if let Err(error) = crate::device::select(cli.device.as_deref()) {
-        emit_error(cli.json, &AppError::new("device", error));
+    if let Err(error) = crate::device::select(cli.global.device.as_deref()) {
+        emit_error(cli.global.json, &AppError::new("device", error));
         return ExitCode::FAILURE;
     }
     if crate::device::is_remote() && matches!(cli.command, TopCommand::Linear(_)) {
         emit_error(
-            cli.json,
+            cli.global.json,
             &AppError::new(
                 "linear_remote_unsupported",
                 "Run Linear commands on the device containing the worktree and API key; --device is not supported for Linear",
@@ -3220,7 +3280,7 @@ where
     if let Some(context) = &project_channel_context
         && let Err(error) = context.admit_remote()
     {
-        emit_error(cli.json, &error);
+        emit_error(cli.global.json, &error);
         return ExitCode::FAILURE;
     }
     // Preserve the original caller before operational recovery or delegation
@@ -3236,7 +3296,7 @@ where
     if let Some(context) = &service_context
         && let Err(error) = context.admit_remote()
     {
-        emit_error(cli.json, &error);
+        emit_error(cli.global.json, &error);
         return ExitCode::FAILURE;
     }
     if !crate::device::is_remote()
@@ -3254,18 +3314,18 @@ where
                 // Carry implicit stop/environment policy into the matched CLI.
                 // An older owner that lacks this flag must refuse parsing
                 // rather than recover/start services before handling the read.
-                if no_start && !cli.no_start {
+                if no_start && !cli.global.no_start {
                     command.arg("--no-start");
                 }
                 command.args(&arguments[1..]);
                 crate::install_guard::sanitize_child_environment(&mut command);
                 let error = command.exec();
-                emit_error(cli.json, &AppError::new("deferred_install", error));
+                emit_error(cli.global.json, &AppError::new("deferred_install", error));
                 return ExitCode::FAILURE;
             }
             Ok(None) => (),
             Err(error) => {
-                emit_error(cli.json, &AppError::new("deferred_install", error));
+                emit_error(cli.global.json, &AppError::new("deferred_install", error));
                 return ExitCode::FAILURE;
             }
         }
@@ -3292,24 +3352,24 @@ where
         if let Err(error) = crate::device::prepare() {
             if crate::device::daemon_absent(&error) {
                 if stopping_daemon {
-                    emit_success(cli.json, already_stopped());
+                    emit_success(cli.global.json, already_stopped());
                     return ExitCode::SUCCESS;
                 }
-                emit_error(cli.json, &AppError::new("daemon_not_running", error));
+                emit_error(cli.global.json, &AppError::new("daemon_not_running", error));
                 return ExitCode::FAILURE;
             }
-            emit_error(cli.json, &AppError::new("device", error));
+            emit_error(cli.global.json, &AppError::new("device", error));
             return ExitCode::FAILURE;
         }
     }
     match execute_with_model_context(cli.command, project_channel_context, service_context) {
         Ok(output) => {
             let code = output.exit_code();
-            emit_success(cli.json, output);
+            emit_success(cli.global.json, output);
             code
         }
         Err(error) => {
-            emit_error(cli.json, &error);
+            emit_error(cli.global.json, &error);
             ExitCode::from(if error.kind == "timeout" { 3 } else { 1 })
         }
     }
@@ -7544,7 +7604,7 @@ mod tests {
             "printf ok",
         ])
         .unwrap();
-        assert!(cli.json);
+        assert!(cli.global.json);
         let TopCommand::Terminal {
             command: TerminalCommand::Spawn { cwd, argv },
         } = cli.command
@@ -7572,6 +7632,94 @@ mod tests {
             } if timeout == 0.5
         ));
         Cli::command().debug_assert();
+    }
+
+    /// The global options are listed in `cagents --help` alone, yet every
+    /// command still takes them in any position and they reach `Cli`.
+    #[test]
+    fn global_options_parse_anywhere_but_are_listed_only_at_the_top() {
+        let parse = |arguments: &[&str]| {
+            Cli::try_parse_from(std::iter::once("cagents").chain(arguments.iter().copied()))
+                .unwrap()
+                .global
+        };
+        for arguments in [
+            &["--json", "--device", "work-box", "--no-start", "ls"][..],
+            &["ls", "--json", "--device", "work-box", "--no-start"],
+            &[
+                "agent",
+                "--json",
+                "spawn",
+                "--device",
+                "work-box",
+                "--no-start",
+                "Hi",
+            ],
+            &[
+                "agent",
+                "spawn",
+                "Hi",
+                "--json",
+                "--device=work-box",
+                "--no-start",
+            ],
+            &[
+                "linear",
+                "team",
+                "list",
+                "--json",
+                "--device",
+                "work-box",
+                "--no-start",
+            ],
+            &[
+                "chat",
+                "image-assets",
+                "list",
+                "--no-start",
+                "--json",
+                "--device",
+                "work-box",
+            ],
+        ] {
+            let global = parse(arguments);
+            assert!(global.json && global.no_start, "{arguments:?}");
+            assert_eq!(global.device.as_deref(), Some("work-box"), "{arguments:?}");
+        }
+        assert!(!parse(&["agent", "list"]).json);
+
+        let help = |arguments: &[&str]| {
+            Cli::try_parse_from(
+                std::iter::once("cagents")
+                    .chain(arguments.iter().copied())
+                    .chain(["--help"]),
+            )
+            .unwrap_err()
+            .to_string()
+        };
+        let top = help(&[]);
+        assert!(
+            top.contains("Global options:\n      --device <DEVICE>"),
+            "{top}"
+        );
+        for arguments in [
+            &["ls"][..],
+            &["agent"],
+            &["agent", "spawn"],
+            &["linear", "team", "list"],
+        ] {
+            let page = help(arguments);
+            for option in ["--device <DEVICE>", "--json", "--no-start"] {
+                assert!(
+                    !page.contains(&format!("\n      {option}")),
+                    "{arguments:?}: {page}"
+                );
+            }
+            assert!(
+                page.trim_end().ends_with(GLOBAL_OPTIONS_NOTE),
+                "{arguments:?}: {page}"
+            );
+        }
     }
 
     #[test]

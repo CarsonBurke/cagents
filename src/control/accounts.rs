@@ -266,7 +266,7 @@ mod tests {
     #[test]
     fn account_info_defaults_to_cached_and_refresh_names_one_account() {
         let parsed = Cli::try_parse_from(["cagents", "account", "info", "--json"]).unwrap();
-        assert!(parsed.json);
+        assert!(parsed.global.json);
         assert!(matches!(
             parsed.command,
             TopCommand::Account {
