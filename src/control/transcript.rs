@@ -4,7 +4,7 @@ use super::*;
 use crate::agent_execution::{
     Authority, Operation, Reply,
     directory::Member,
-    transcript::{Content, DEFAULT_LIMIT, Entry, MAX_LIMIT, Page, Query, Text, ToolRun},
+    transcript::{Content, DEFAULT_LIMIT, Entry, MAX_LIMIT, Page, Query, Text, ToolRun, cursor},
 };
 use crate::chat::{DeliveryKind, ToolStatus};
 
@@ -19,8 +19,9 @@ pub struct TranscriptArgs {
     #[arg(long, short = 'n', default_value_t = DEFAULT_LIMIT,
         value_parser = clap::value_parser!(u16).range(1..=i64::from(MAX_LIMIT)))]
     limit: u16,
-    /// Show the page before this entry ID, as the previous page suggests.
-    #[arg(long, value_name = "ENTRY_ID")]
+    /// Show the page before this entry: the cursor the previous page's hint
+    /// gives, or an entry ID from `--json`.
+    #[arg(long, value_name = "CURSOR")]
     before: Option<String>,
     /// List each tool call with its result, instead of a count per run.
     #[arg(long)]
@@ -56,7 +57,7 @@ pub(super) fn read(arguments: TranscriptArgs) -> Result<CommandOutput, AppError>
             ));
         }
     };
-    let human = human(&page, &query, sessions::now_ms());
+    let human = human(&page, &query, &format::program(), sessions::now_ms());
     Ok(CommandOutput {
         command: "transcript",
         data: json!(page),
@@ -65,27 +66,10 @@ pub(super) fn read(arguments: TranscriptArgs) -> Result<CommandOutput, AppError>
 }
 
 /// The page oldest first, as a conversation reads, under a line naming the
-/// session. The paging hint repeats how the caller asked, so the next page
-/// reads the same way.
-fn human(page: &Page, query: &Query, now: u64) -> String {
+/// session, then what to run next: the earlier page, read the same way as
+/// this one, and, from the newest page of a live session, messaging it.
+fn human(page: &Page, query: &Query, program: &str, now: u64) -> String {
     let mut out = heading(&page.session, now);
-    if let Some(cursor) = &page.earlier {
-        let mut hint = format!(
-            "\nEarlier: cagents transcript {} --before {}",
-            format::plain(&query.session),
-            format::plain(cursor)
-        );
-        if query.limit != DEFAULT_LIMIT {
-            hint.push_str(&format!(" -n {}", query.limit));
-        }
-        if query.tools {
-            hint.push_str(" --tools");
-        }
-        if query.full {
-            hint.push_str(" --full");
-        }
-        out.push_str(&hint);
-    }
     if page.entries.is_empty() {
         out.push_str(if query.before.is_some() {
             "\n\nNothing earlier."
@@ -96,6 +80,31 @@ fn human(page: &Page, query: &Query, now: u64) -> String {
     for entry in &page.entries {
         out.push_str("\n\n");
         out.push_str(&render(entry));
+    }
+    let session = format::shell_word(&query.session);
+    let mut steps = Vec::new();
+    if let Some(earlier) = &page.earlier {
+        let mut command = format!(
+            "{program} transcript {session} --before {}",
+            cursor(earlier)
+        );
+        if query.limit != DEFAULT_LIMIT {
+            command.push_str(&format!(" -n {}", query.limit));
+        }
+        if query.tools {
+            command.push_str(" --tools");
+        }
+        if query.full {
+            command.push_str(" --full");
+        }
+        steps.push((command, "reads the page before"));
+    }
+    if query.before.is_none() && !page.session.exited {
+        steps.push((format!("{program} send {session} MESSAGE"), "messages it"));
+    }
+    if !steps.is_empty() {
+        out.push_str("\n\n");
+        out.push_str(&format::hint(&steps));
     }
     out
 }
@@ -115,7 +124,10 @@ fn heading(member: &Member, now: u64) -> String {
             crate::agent::ActivityState::Waiting => "waiting",
         }
     };
-    let mut line = format!("Session {} ({provider}, {state})", session.id);
+    let mut line = format!(
+        "Session {} ({provider}, {state})",
+        format::prefix(&session.id.to_string(), format::MIN_ABBREVIATION)
+    );
     if let Some(title) = session.title.as_deref().filter(|title| !title.is_empty()) {
         line.push_str(&format!(" \"{}\"", format::plain(title)));
     }
@@ -362,10 +374,10 @@ mod tests {
             earlier: Some("u0".into()),
         };
         assert_eq!(
-            human(&page, &query("0000"), 120_000),
-            "Session 00000000-0000-4000-8000-000000000001 (codex, exited) \"fix [31m build\", active 1 min ago\n\
+            human(&page, &query("0000"), "cagents", 120_000),
+            format!(
+                "Session 00000000 (codex, exited) \"fix [31m build\", active 1 min ago\n\
              Failed: You've hit your usage limit\n\
-             Earlier: cagents transcript 0000 --before u0\n\
              \n\
              [user]\n  Fix the build\n  please\n\
              \n\
@@ -375,7 +387,11 @@ mod tests {
              \n\
              [message from reviewer]\n  Looks good\n\
              \n\
-             [Context compacted]"
+             [Context compacted]\n\
+             \n\
+             hint: `cagents transcript 0000 --before {}` reads the page before",
+                cursor("u0")
+            )
         );
     }
 
@@ -420,19 +436,23 @@ mod tests {
             earlier: None,
         };
         assert_eq!(
-            human(&page, &query("0000"), 0),
-            "Session 00000000-0000-4000-8000-000000000001 (codex, idle)\n\nNo conversation yet."
+            human(&page, &query("0000"), "cagents", 0),
+            "Session 00000000 (codex, idle)\n\nNo conversation yet.\n\n\
+             hint: `cagents send 0000 MESSAGE` messages it"
         );
         let mut earlier = query("0000");
         earlier.before = Some("u1".into());
-        assert!(human(&page, &earlier, 0).ends_with("Nothing earlier."));
+        assert!(human(&page, &earlier, "cagents", 0).ends_with("Nothing earlier."));
         page.earlier = Some("u0".into());
         earlier.limit = 3;
         earlier.tools = true;
         assert!(
-            human(&page, &earlier, 0)
-                .contains("\nEarlier: cagents transcript 0000 --before u0 -n 3 --tools\n"),
-            "the hint keeps the view"
+            human(&page, &earlier, "cagents --device fw16", 0).ends_with(&format!(
+                "\n\nhint: `cagents --device fw16 transcript 0000 --before {} -n 3 --tools` \
+                 reads the page before",
+                cursor("u0")
+            )),
+            "the hint keeps the view and the device, and an older page offers no message"
         );
     }
 }
