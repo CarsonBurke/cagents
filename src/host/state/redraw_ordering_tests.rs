@@ -562,6 +562,84 @@ fn a_subscriber_hidden_after_planning_gets_nothing_and_its_reveal_returns_credit
     fixture.acknowledgement_releases_credit(&replay);
 }
 
+/// How the worker of a terminal still being spawned comes to be hidden.
+#[derive(Clone, Copy, Debug)]
+enum HiddenWhileStarting {
+    /// A wake finds only the spawning client, attached hidden for now.
+    ByWake,
+    /// Another client attaches, shows the terminal, then hides it.
+    ByAnotherClient,
+}
+
+/// A spawning client is attached hidden until its spawn is published. Its
+/// worker may be hidden meanwhile, so publishing it visible must reveal the
+/// worker, or it captures nothing more until the terminal exits.
+#[test]
+fn publishing_a_spawn_reveals_a_worker_hidden_while_it_started() {
+    for (hidden_by, initially_visible) in [
+        (HiddenWhileStarting::ByWake, true),
+        (HiddenWhileStarting::ByAnotherClient, true),
+        (HiddenWhileStarting::ByWake, false),
+    ] {
+        let shared = host();
+        let id = TerminalId::new();
+        let stream = RenderStreamFixture::new(|_| {});
+        stream.publish(1);
+        {
+            let mut state = shared.lock().unwrap();
+            state.register_client(1);
+            state.register_client(2);
+            state
+                .install_startup_parent(
+                    1,
+                    super::redraw_identity_tests::session(id),
+                    stream.handle.clone(),
+                    false,
+                    None,
+                    None,
+                )
+                .unwrap();
+            state.publication_pending.insert(
+                id,
+                PendingPublication {
+                    handle: stream.handle.clone(),
+                    source: super::redraw_identity_tests::session(id),
+                    pane: None,
+                    original: None,
+                    reservation: None,
+                },
+            );
+        }
+        match hidden_by {
+            HiddenWhileStarting::ByWake => {
+                broadcast_redraw(&Arc::downgrade(&shared), id, 1, &stream.handle);
+            }
+            HiddenWhileStarting::ByAnotherClient => {
+                let mut state = shared.lock().unwrap();
+                state.attach(2, id).unwrap();
+                state
+                    .set_visibility(2, id, TerminalVisibility::Visible)
+                    .unwrap();
+                state
+                    .set_visibility(2, id, TerminalVisibility::Hidden)
+                    .unwrap();
+            }
+        }
+        assert_eq!(stream.drain_visibility(), Some(false), "{hidden_by:?}");
+
+        let options = TerminalSpawnOptions {
+            initially_visible,
+            ..TerminalSpawnOptions::default()
+        };
+        publish_installed_terminal(&shared, Some(1), id, &stream.handle, &options).unwrap();
+        assert_eq!(
+            stream.drain_visibility(),
+            initially_visible.then_some(true),
+            "{hidden_by:?}, initially visible: {initially_visible}"
+        );
+    }
+}
+
 /// The same property with real threads: two broadcasts race for every
 /// pair of generations the worker publishes, one with the newer generation
 /// and one with the older, as the worker and the shared event notifier can.

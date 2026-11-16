@@ -5132,6 +5132,12 @@ fn publish_installed_terminal(
         .published_terminal_workers
         .observe(id, expected.execution_instance());
     if let Some(client) = client {
+        // Until now the spawning client was attached hidden, so a redraw or
+        // another client may have hidden the worker meanwhile. Apply the
+        // published visibility as `attach` does, or a hidden worker captures
+        // nothing more until it exits. The publication above has committed,
+        // so a refused command cannot undo it.
+        let old_visibility = state.subscriptions.visibility(id);
         state.subscriptions.attach(
             client,
             id,
@@ -5141,6 +5147,12 @@ fn publish_installed_terminal(
                 TerminalVisibility::Hidden
             },
         );
+        let new_visibility = state.subscriptions.visibility(id);
+        if old_visibility != new_visibility
+            && let Err(error) = apply_visibility(expected, new_visibility)
+        {
+            tracing::warn!(terminal_id = %id, %error, "a published terminal kept its startup visibility");
+        }
         state.rearm_output(client, id);
         state.publish_worker(client, id);
     }

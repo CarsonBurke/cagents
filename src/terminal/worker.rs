@@ -1057,6 +1057,24 @@ impl RenderStreamFixture {
     pub(crate) fn queued_commands(&self) -> usize {
         self.commands.len()
     }
+
+    /// Drains the queued commands, returning whether the last one that sets
+    /// visibility leaves the worker visible.
+    pub(crate) fn drain_visibility(&self) -> Option<bool> {
+        fn visibility(command: &Command) -> Option<bool> {
+            match command {
+                Command::Admitted { command, .. } => visibility(command),
+                Command::HostVisibility(visibility) => Some(*visibility == Visibility::Visible),
+                Command::Hide | Command::Hibernate => Some(false),
+                Command::Reveal => Some(true),
+                Command::Restore { visible } => Some(*visible),
+                _ => None,
+            }
+        }
+        self.commands
+            .try_iter()
+            .fold(None, |visible, command| visibility(&command).or(visible))
+    }
 }
 
 impl WeakTerminalHandle {
