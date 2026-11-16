@@ -9,9 +9,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Read the source protocol and refuse it unless live updates start from it.
 /// Version discovery deliberately does not decode an error or session DTO.
 /// Only the subsequent version-specific handshake can authenticate ownership.
-pub(super) fn discover_protocol(
+pub(super) fn discover_qualified_protocol(
     socket: &Path,
     deadline: Instant,
 ) -> Result<u16, crate::control::ControlError> {
@@ -19,15 +20,16 @@ pub(super) fn discover_protocol(
     discovered_version(&bytes).map_err(discovery_error)
 }
 
-/// Read the source protocol without decoding its DTOs. The caller must admit
-/// it and authenticate a fresh handshake before inspecting the installation.
-pub(super) fn discover_installed_protocol(
+/// Read any source protocol, qualified or not, with the peer that served it,
+/// so an unqualified install is told how to cold-install. The caller must
+/// admit the protocol and authenticate a fresh handshake before inspecting
+/// the installation.
+pub(super) fn discover_protocol_and_peer(
     socket: &Path,
     deadline: Instant,
 ) -> Result<(u16, Peer), crate::control::ControlError> {
     let (bytes, peer) = discover_reply(socket, deadline)?;
-    let (version, _) = postcard::take_from_bytes::<u16>(&bytes)
-        .map_err(|_| discovery_error(invalid("Malformed source version header")))?;
+    let version = version_header(&bytes).map_err(discovery_error)?;
     Ok((version, peer))
 }
 
@@ -59,9 +61,14 @@ fn discovery_error(error: UpdateError) -> crate::control::ControlError {
     crate::control::ControlError::Configure(io::Error::other(error.to_string()))
 }
 
+fn version_header(bytes: &[u8]) -> Result<u16, UpdateError> {
+    postcard::take_from_bytes::<u16>(bytes)
+        .map(|(version, _)| version)
+        .map_err(|_| invalid("Malformed source version header"))
+}
+
 fn discovered_version(bytes: &[u8]) -> Result<u16, UpdateError> {
-    let (version, _) = postcard::take_from_bytes::<u16>(bytes)
-        .map_err(|_| invalid("Malformed source version header"))?;
+    let version = version_header(bytes)?;
     if !super::is_qualified_source(version) {
         return Err(super::unsupported_source(version));
     }
