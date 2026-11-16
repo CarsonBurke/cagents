@@ -291,6 +291,24 @@ impl Listing {
                 };
                 ServerResponse::Listed { terminals }
             }
+            // The board is scoped to the open Git project containing the
+            // current directory, which this fixture's projects do not.
+            (
+                Self::Work,
+                ClientRequest::ReadWorkspaceMetadata {
+                    query: cagents::workspace_model::metadata::Query::Projects,
+                },
+            ) => ServerResponse::WorkspaceMetadata(
+                cagents::workspace_model::metadata::Reply::Projects {
+                    identity: Uuid::from_u128(1),
+                    projects: vec![cagents::workspace_model::ModelProject {
+                        repository: "/fixture/.git".into(),
+                        name: "Fixture".into(),
+                        kind: cagents::model::ProjectKind::Git,
+                        ordinal: 0,
+                    }],
+                },
+            ),
             (
                 Self::Work,
                 ClientRequest::Work(cagents::work::Request::Board {
@@ -406,23 +424,35 @@ fn output(listing: Listing, populated: bool, json: bool) -> String {
             .unwrap();
             // Existing-daemon readiness may connect and handshake before the
             // command itself. A probe must close without asking for effects.
-            let Some(request) = read_frame::<ClientEnvelope>(&mut stream).unwrap() else {
+            let Some(mut request) = read_frame::<ClientEnvelope>(&mut stream).unwrap() else {
                 continue;
             };
-            assert_eq!(request.proof.as_ref(), Some(&proof));
-            let response = listing.reply(request.request, populated);
-            write_frame(
-                &mut stream,
-                &ServerEnvelope {
-                    version: PROTOCOL_VERSION,
-                    request_id: Some(request.request_id),
-                    proof: proof.clone(),
-                    message: ServerMessage::Response { response },
-                },
-            )
-            .unwrap();
-            assert!(read_frame::<ClientEnvelope>(&mut stream).unwrap().is_none());
-            return;
+            loop {
+                assert_eq!(request.proof.as_ref(), Some(&proof));
+                // A read that only chooses what a Work listing covers
+                // precedes it on the same connection.
+                let preliminary = matches!(listing, Listing::Work)
+                    && matches!(request.request, ClientRequest::ReadWorkspaceMetadata { .. });
+                let response = listing.reply(request.request, populated);
+                write_frame(
+                    &mut stream,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(request.request_id),
+                        proof: proof.clone(),
+                        message: ServerMessage::Response { response },
+                    },
+                )
+                .unwrap();
+                let next = read_frame::<ClientEnvelope>(&mut stream).unwrap();
+                match next {
+                    Some(next) if preliminary => request = next,
+                    next => {
+                        assert!(next.is_none());
+                        return;
+                    }
+                }
+            }
         }
         panic!("CLI never issued its expected metadata read");
     });
@@ -871,7 +901,7 @@ fn standalone_lists_show_headers_or_explicit_empty_states_without_debug_values()
         (
             Listing::Work,
             "IN PROGRESS (1)\nCARD ",
-            "No cards",
+            "No cards in project Fixture",
             "fixture/branch",
         ),
     ] {
@@ -892,8 +922,12 @@ fn standalone_lists_show_headers_or_explicit_empty_states_without_debug_values()
 #[test]
 fn work_alone_lists_the_board_in_its_json_envelope() {
     let human = output(Listing::Work, true, false);
-    // One project's cards name it once, and an empty column is no column.
-    assert!(human.ends_with("\n(project Fixture)\n"), "{human}");
+    // One project's cards name it once, with the checkout their worktrees
+    // are relative to, and an empty column is no column.
+    assert!(
+        human.ends_with("\n(project Fixture at /fixture)\n"),
+        "{human}"
+    );
     assert!(!human.contains("PROJECT"), "{human}");
     assert!(human.contains(".worktrees/branch"), "{human}");
     let value: serde_json::Value =
@@ -904,6 +938,10 @@ fn work_alone_lists_the_board_in_its_json_envelope() {
         value["data"]["board"]["items"][0]["branch"],
         "fixture/branch"
     );
+    // The scope says what the board covers: here every project, since none
+    // of them contains this directory.
+    assert_eq!(value["data"]["scope"], "All");
+    assert!(value["data"].get("omitted").is_none());
 }
 
 #[test]

@@ -31,7 +31,8 @@ pub enum WorkCommand {
         item: String,
         /// active, in-progress, in-review, landed or stale.
         column: Column,
-        /// The open project the card belongs to, by name or path.
+        /// The open project the card belongs to, by name or path. The
+        /// default is the project containing the current directory.
         #[arg(long)]
         project: Option<PathBuf>,
     },
@@ -39,7 +40,8 @@ pub enum WorkCommand {
     Unpin {
         /// The card's branch, or its worktree's path.
         item: String,
-        /// The open project the card belongs to, by name or path.
+        /// The open project the card belongs to, by name or path. The
+        /// default is the project containing the current directory.
         #[arg(long)]
         project: Option<PathBuf>,
     },
@@ -56,6 +58,8 @@ pub enum WorkCommand {
     /// project.
     Snapshots {
         /// Only the open project with this name, or containing this path.
+        /// The default is the project containing the current directory, or
+        /// every project outside one.
         #[arg(long)]
         project: Option<PathBuf>,
     },
@@ -65,7 +69,8 @@ pub enum WorkCommand {
 pub struct RemoveArgs {
     /// The card's branch, or its worktree's path.
     item: String,
-    /// The open project the card belongs to, by name or path.
+    /// The open project the card belongs to, by name or path. The default
+    /// is the project containing the current directory.
     #[arg(long)]
     project: Option<PathBuf>,
     /// Keep unsaved changes as a snapshot before removing the worktree.
@@ -272,48 +277,101 @@ impl ControlClient {
     }
 }
 
-fn scope(project: Option<PathBuf>) -> Result<Scope, AppError> {
-    Ok(match project {
-        Some(project) => Scope::Project(super::project_argument(project)?),
-        None => Scope::All,
-    })
+/// One connection to the daemon for a work command, which reads what the
+/// command covers and then asks for it. Inside a hosted session the daemon
+/// lets a connection read the board but change it only once it names its
+/// authority, which a changing command's connection does first.
+struct Daemon<'a> {
+    context: &'a ServiceRequestContext,
+    client: ControlClient,
+}
+
+impl<'a> Daemon<'a> {
+    fn connect(context: &'a ServiceRequestContext, changes: bool) -> Result<Self, AppError> {
+        let mut client = context.connect()?;
+        if changes && context.scoped() {
+            client
+                .authenticate(context.authority.clone())
+                .map_err(protocol_error)?;
+        }
+        Ok(Self { context, client })
+    }
+
+    /// The projects a command covers: the open project `project` names, or
+    /// else the one [`Self::here`] finds, or else every project.
+    fn scope(&mut self, project: Option<PathBuf>) -> Result<Scope, AppError> {
+        Ok(match project {
+            Some(project) => Scope::Project(super::project_argument(project)?),
+            None => self.here()?.map_or(Scope::All, Scope::Project),
+        })
+    }
+
+    /// The open Git project containing the current directory, placed among
+    /// the daemon's open projects as the daemon places a session's
+    /// directory; none outside every one. A remote device's projects are not
+    /// where this shell runs, so there it finds none.
+    fn here(&mut self) -> Result<Option<PathBuf>, AppError> {
+        if self.context.remote {
+            return Ok(None);
+        }
+        let Ok(directory) = std::env::current_dir() else {
+            return Ok(None);
+        };
+        let (_, projects) = self
+            .client
+            .read_workspace_projects()
+            .map_err(protocol_error)?;
+        Ok(containing(&directory, &projects))
+    }
+
+    fn send(&mut self, request: Request, timeout: Duration) -> Result<Response, AppError> {
+        self.send_with(request, timeout, protocol_error)
+    }
+
+    fn send_with(
+        &mut self,
+        request: Request,
+        timeout: Duration,
+        failed: impl FnOnce(ControlError) -> AppError,
+    ) -> Result<Response, AppError> {
+        self.client.work(request, timeout).map_err(failed)
+    }
+}
+
+/// The repository key of the open Git project `directory` is in. An open
+/// folder has no worktrees, so it widens the listing like no project.
+fn containing(
+    directory: &Path,
+    projects: &[crate::workspace_model::ModelProject],
+) -> Option<PathBuf> {
+    let repository = crate::project_location::place_among(directory, projects).project?;
+    projects
+        .iter()
+        .any(|project| {
+            project.repository == repository && project.kind == crate::model::ProjectKind::Git
+        })
+        .then_some(repository)
 }
 
 /// A card named by its worktree's path is sent as that path made canonical,
-/// as the daemon knows it; anything else is a branch name.
+/// as the daemon knows it; anything else is a branch name, or a path the
+/// daemon reads relative to the project's primary checkout. A leading `~`
+/// is the home directory, as a listing shows it, even when quoted.
 fn item_argument(item: String) -> String {
-    let path = Path::new(&item);
-    if path.join(".git").exists()
-        && let Ok(canonical) = std::fs::canonicalize(path)
+    item_in(item, std::env::var_os("HOME").as_deref().map(Path::new))
+}
+
+fn item_in(item: String, home: Option<&Path>) -> String {
+    let expanded = match (item.strip_prefix("~/"), home) {
+        (Some(rest), Some(home)) => home.join(rest),
+        _ => PathBuf::from(&item),
+    };
+    if expanded.join(".git").exists()
+        && let Ok(canonical) = std::fs::canonicalize(&expanded)
     {
         return canonical.to_string_lossy().into_owned();
     }
     item
-}
-
-fn send(
-    context: &ServiceRequestContext,
-    request: Request,
-    timeout: Duration,
-) -> Result<Response, AppError> {
-    send_with(context, request, timeout, protocol_error)
-}
-
-fn send_with(
-    context: &ServiceRequestContext,
-    request: Request,
-    timeout: Duration,
-    failed: impl FnOnce(ControlError) -> AppError,
-) -> Result<Response, AppError> {
-    let mut client = context.connect()?;
-    // Inside a hosted session the daemon lets this read the board but never
-    // change it, as it can tell once the connection names its authority.
-    if context.scoped() && matches!(request, Request::Pin { .. } | Request::Remove(_)) {
-        client
-            .authenticate(context.authority.clone())
-            .map_err(protocol_error)?;
-    }
-    client.work(request, timeout).map_err(failed)
 }
 
 pub(super) fn execute(command: WorkCommand) -> Result<CommandOutput, AppError> {
@@ -342,7 +400,8 @@ fn remove(
     arguments: RemoveArgs,
     context: &ServiceRequestContext,
 ) -> Result<CommandOutput, AppError> {
-    let scope = scope(arguments.project)?;
+    let mut daemon = Daemon::connect(context, false)?;
+    let scope = daemon.scope(arguments.project)?;
     let item = item_argument(arguments.item);
     let request = Request::RemovalPlan {
         scope: scope.clone(),
@@ -354,9 +413,11 @@ fn remove(
     } else {
         PLAN_TIMEOUT
     };
-    let Response::RemovalPlan(plan) = send(context, request, timeout)? else {
+    let Response::RemovalPlan(plan) = daemon.send(request, timeout)? else {
         return Err(AppError::new("work", "Unexpected Work board response"));
     };
+    // The removal, which may take minutes, asks on a connection of its own.
+    drop(daemon);
     let described = plan_human(&plan);
     if arguments.dry_run {
         return Ok(CommandOutput {
@@ -420,7 +481,8 @@ fn remove(
         ),
         error => protocol_error(error),
     };
-    let Response::Removed(removed) = send_with(context, request, REMOVE_TIMEOUT, unanswered)?
+    let Response::Removed(removed) =
+        Daemon::connect(context, true)?.send_with(request, REMOVE_TIMEOUT, unanswered)?
     else {
         return Err(AppError::new("work", "Unexpected Work board response"));
     };
@@ -435,10 +497,11 @@ fn snapshots(
     project: Option<PathBuf>,
     context: &ServiceRequestContext,
 ) -> Result<CommandOutput, AppError> {
+    let mut daemon = Daemon::connect(context, false)?;
     let request = Request::Snapshots {
-        scope: scope(project)?,
+        scope: daemon.scope(project)?,
     };
-    let Response::Snapshots(snapshots) = send(context, request, BOARD_TIMEOUT)? else {
+    let Response::Snapshots(snapshots) = daemon.send(request, BOARD_TIMEOUT)? else {
         return Err(AppError::new("work", "Unexpected Work board response"));
     };
     let human = snapshots_human(&snapshots, crate::chat::now_ms().unwrap_or_default());
@@ -572,21 +635,23 @@ fn list(
     arguments: WorkListArgs,
     context: &ServiceRequestContext,
 ) -> Result<CommandOutput, AppError> {
-    let here = (arguments.project.is_none() && !arguments.all)
-        .then(|| std::env::current_dir().and_then(std::fs::canonicalize).ok())
-        .flatten();
-    let mut base = "cagents work".to_owned();
-    if let Some(project) = &arguments.project {
-        base.push_str(&format!(
-            " --project {}",
-            shell_word(&project.display().to_string())
-        ));
-    }
-    if arguments.all {
-        base.push_str(" --all");
-    }
+    let mut daemon = Daemon::connect(context, false)?;
+    let placed = match (&arguments.project, arguments.all) {
+        (None, false) => daemon.here()?,
+        _ => None,
+    };
+    let program = super::format::program();
+    let named = arguments
+        .project
+        .as_ref()
+        .map(|project| super::format::shell_word(&project.display().to_string()));
+    let scope = match (arguments.project, placed.clone()) {
+        (Some(project), _) => Scope::Project(super::project_argument(project)?),
+        (None, Some(repository)) => Scope::Project(repository),
+        (None, None) => Scope::All,
+    };
     let request = Request::Board {
-        scope: scope(arguments.project)?,
+        scope: scope.clone(),
         fresh: arguments.fresh,
     };
     let timeout = if arguments.fresh {
@@ -594,84 +659,38 @@ fn list(
     } else {
         BOARD_TIMEOUT
     };
-    let Response::Board(mut board) = send(context, request, timeout)? else {
+    let Response::Board(mut board) = daemon.send(request, timeout)? else {
         return Err(AppError::new("work", "Unexpected Work board response"));
     };
-    let narrowed = here.as_deref().is_some_and(|here| narrow(&mut board, here));
     if let Some(column) = arguments.column {
         board.items.retain(|item| item.column == column);
     }
-    let human = board_human(
-        &board,
-        &Listing {
-            column: arguments.column,
-            limit: arguments.limit.unwrap_or(DEFAULT_LIMIT),
-            command: &base,
-            narrowed,
-        },
-        crate::chat::now_ms().unwrap_or_default(),
-    );
-    if let Some(limit) = arguments.limit {
-        limit_columns(&mut board.items, limit);
+    // The cards of the worktree this shell is in are always listed.
+    let directory = (!context.remote)
+        .then(|| std::env::current_dir().and_then(std::fs::canonicalize).ok())
+        .flatten();
+    let listing = Listing {
+        column: arguments.column,
+        limit: arguments.limit.unwrap_or(DEFAULT_LIMIT),
+        program: &program,
+        project: named.as_deref(),
+        all: arguments.all,
+        placed: placed.is_some(),
+        here: directory.as_deref(),
+    };
+    let human = board_human(&board, &listing, crate::chat::now_ms().unwrap_or_default());
+    let omitted = arguments
+        .limit
+        .map(|limit| listing.omit(&mut board.items, limit));
+    let mut data = json!({ "board": board, "scope": scope });
+    if let Some(omitted) = omitted {
+        data["omitted"] = json!(omitted);
     }
     Ok(CommandOutput {
         command: "work.list",
-        data: json!({ "board": board }),
+        data,
         human,
     })
-}
-
-/// Narrows a board of every project to the one whose primary checkout or
-/// one of whose worktrees contains `here`, the nearest where several do.
-/// Returns whether any did.
-fn narrow(board: &mut Board, here: &Path) -> bool {
-    let roots = board
-        .projects
-        .iter()
-        .filter_map(|project| Some((project.root.as_deref()?, &project.repository)));
-    let worktrees = board
-        .items
-        .iter()
-        .filter_map(|item| Some((item.worktree.as_ref()?.path.as_path(), &item.project)));
-    let Some(repository) = roots
-        .chain(worktrees)
-        .filter(|(path, _)| here.starts_with(path))
-        .max_by_key(|(path, _)| path.components().count())
-        .map(|(_, repository)| repository.clone())
-    else {
-        return false;
-    };
-    board
-        .projects
-        .retain(|project| project.repository == repository);
-    board.items.retain(|item| item.project == repository);
-    true
-}
-
-/// Keeps the first `limit` cards of each column, in board order; 0 keeps all.
-fn limit_columns(items: &mut Vec<Item>, limit: usize) {
-    if limit == 0 {
-        return;
-    }
-    let mut seen = std::collections::HashMap::<Column, usize>::new();
-    items.retain(|item| {
-        let count = seen.entry(item.column).or_default();
-        *count += 1;
-        *count <= limit
-    });
-}
-
-/// `word` quoted for a POSIX shell when it needs to be.
-fn shell_word(word: &str) -> String {
-    if !word.is_empty()
-        && word
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "-_./~:@%+=,".contains(c))
-    {
-        word.to_owned()
-    } else {
-        format!("'{}'", word.replace('\'', r"'\''"))
-    }
 }
 
 fn pin(
@@ -680,12 +699,13 @@ fn pin(
     project: Option<PathBuf>,
     context: &ServiceRequestContext,
 ) -> Result<CommandOutput, AppError> {
+    let mut daemon = Daemon::connect(context, true)?;
     let request = Request::Pin {
-        scope: scope(project)?,
+        scope: daemon.scope(project)?,
         item: item_argument(item),
         column,
     };
-    let Response::Pinned(item) = send(context, request, BOARD_TIMEOUT)? else {
+    let Response::Pinned(item) = daemon.send(request, BOARD_TIMEOUT)? else {
         return Err(AppError::new("work", "Unexpected Work board response"));
     };
     let human = match column {
@@ -708,13 +728,53 @@ fn pin(
 }
 
 /// How a board is listed: the column it was filtered to, how many cards
-/// of each column to show, the command that listed it, so a hint can extend
-/// it, and whether it was narrowed to the current directory's project.
+/// of each column to show, how the command that listed it named this
+/// program and its projects, so a hint can extend it, whether its project
+/// was the current directory's, and that directory.
 struct Listing<'a> {
     column: Option<Column>,
     limit: usize,
-    command: &'a str,
-    narrowed: bool,
+    program: &'a str,
+    /// `--project`'s value, quoted for the shell.
+    project: Option<&'a str>,
+    all: bool,
+    placed: bool,
+    here: Option<&'a Path>,
+}
+
+impl Listing<'_> {
+    /// Whether `item` is listed when it is the `index`th card of its column:
+    /// one of the newest `limit`, or one whose worktree holds this shell.
+    fn shows(&self, item: &Item, index: usize, limit: usize) -> bool {
+        limit == 0
+            || index < limit
+            || self.here.is_some_and(|here| {
+                item.worktree
+                    .as_ref()
+                    .is_some_and(|worktree| here.starts_with(&worktree.path))
+            })
+    }
+
+    /// Keeps the cards of each column [`Self::shows`] lists, in board order,
+    /// and counts the rest by column.
+    fn omit(
+        &self,
+        items: &mut Vec<Item>,
+        limit: usize,
+    ) -> std::collections::BTreeMap<Column, usize> {
+        let mut seen = std::collections::HashMap::<Column, usize>::new();
+        let mut omitted = std::collections::BTreeMap::new();
+        items.retain(|item| {
+            let index = seen.entry(item.column).or_default();
+            let shown = self.shows(item, *index, limit);
+            *index += 1;
+            if !shown {
+                *omitted.entry(item.column).or_default() += 1;
+            }
+            shown
+        });
+        omitted
+    }
 }
 
 const HEADERS: [&str; 9] = [
@@ -731,25 +791,24 @@ const HEADERS: [&str; 9] = [
 
 /// One table per column, in board order, the newest `limit` cards of each,
 /// then what kept any project from being read in full and what to run next.
-/// A project every card shares is named once, after them, rather than on
-/// every row.
+/// A project every card shares is named once, with where it is, rather than
+/// on every row, and its worktrees are shown relative to it; across projects
+/// each row names its own and shows its worktree in full.
 fn board_human(board: &Board, listing: &Listing<'_>, now_ms: u64) -> String {
-    let single = board
-        .items
-        .first()
-        .filter(|first| board.items.iter().all(|item| item.project == first.project))
-        .map(|first| first.project_name.as_str());
-    let roots: std::collections::HashMap<&Path, &Path> = board
-        .projects
-        .iter()
-        .filter_map(|project| Some((project.repository.as_path(), project.root.as_deref()?)))
-        .collect();
-    let shown = |items: &[&Item]| {
-        items.len().min(match listing.limit {
-            0 => usize::MAX,
-            limit => limit,
-        })
+    let single = match board.projects.as_slice() {
+        [project] => Some(project),
+        _ => board
+            .items
+            .first()
+            .filter(|first| board.items.iter().all(|item| item.project == first.project))
+            .and_then(|first| {
+                board
+                    .projects
+                    .iter()
+                    .find(|project| project.repository == first.project)
+            }),
     };
+    let root = single.and_then(|project| project.root.as_deref());
     let columns: Vec<(Column, Vec<&Item>)> = Column::ALL
         .into_iter()
         .map(|column| {
@@ -767,10 +826,12 @@ fn board_human(board: &Board, listing: &Listing<'_>, now_ms: u64) -> String {
     let rows: Vec<Vec<[String; 9]>> = columns
         .iter()
         .map(|(_, items)| {
-            items[..shown(items)]
+            items
                 .iter()
-                .map(|item| {
-                    let mut row = row(item, roots.get(item.project.as_path()).copied(), now_ms);
+                .enumerate()
+                .filter(|(index, item)| listing.shows(item, *index, listing.limit))
+                .map(|(_, item)| {
+                    let mut row = row(item, root, now_ms);
                     if single.is_some() {
                         row[1].clear();
                     }
@@ -784,7 +845,7 @@ fn board_human(board: &Board, listing: &Listing<'_>, now_ms: u64) -> String {
     let mut truncated = Vec::new();
     for ((column, items), rows) in columns.iter().zip(rows) {
         let count = if rows.len() < items.len() {
-            truncated.push((*column, items.len()));
+            truncated.push(*column);
             format!("{} of {}", rows.len(), items.len())
         } else {
             items.len().to_string()
@@ -796,10 +857,17 @@ fn board_human(board: &Board, listing: &Listing<'_>, now_ms: u64) -> String {
         ));
     }
     if sections.is_empty() {
-        sections.push(match listing.column {
+        let mut empty = match listing.column {
             Some(column) => format!("No cards in {}", column.label()),
             None => "No cards".into(),
-        });
+        };
+        if let Some(project) = single {
+            empty.push_str(&format!(
+                " in project {}",
+                super::format::plain(&project.name)
+            ));
+        }
+        sections.push(empty);
     }
     let notes = board
         .projects
@@ -809,7 +877,7 @@ fn board_human(board: &Board, listing: &Listing<'_>, now_ms: u64) -> String {
             let scan = project.scan_error.as_deref().map(|error| {
                 format!(
                     "{name}: Git could not be read: {}",
-                    super::format::plain(error)
+                    super::format::plain(&super::format::home_shortened(error))
                 )
             });
             let forge = match &project.forge {
@@ -831,10 +899,14 @@ fn board_human(board: &Board, listing: &Listing<'_>, now_ms: u64) -> String {
         })
         .chain(board.items.iter().filter_map(|item| {
             let error = item.error.as_deref()?;
+            let name = match &item.key {
+                ItemKey::Worktree(path) => super::format::location(path, root),
+                ItemKey::Branch(_) => item.label(),
+            };
             Some(format!(
                 "{}: its changes could not be read: {}",
-                super::format::plain(&item.label()),
-                super::format::plain(error)
+                super::format::plain(&name),
+                super::format::plain(&super::format::home_shortened(error))
             ))
         }))
         .chain(board.linear_unavailable.as_deref().map(|reason| {
@@ -844,56 +916,85 @@ fn board_human(board: &Board, listing: &Listing<'_>, now_ms: u64) -> String {
             )
         }))
         .collect::<Vec<_>>();
-    if !notes.is_empty() {
-        sections.push(notes.join("\n"));
-    }
     let mut footer = Vec::new();
-    if let Some(project) = single {
-        footer.push(format!("(project {})", super::format::plain(project)));
+    if let Some(project) = single.filter(|_| !board.items.is_empty()) {
+        let name = super::format::plain(&project.name);
+        footer.push(match root {
+            Some(root) => format!(
+                "(project {name} at {})",
+                super::format::location(root, None)
+            ),
+            None => format!("(project {name})"),
+        });
     }
-    let command = listing.command;
+    let program = listing.program;
+    let projects = match (listing.project, listing.all) {
+        (Some(project), _) => format!(" --project {project}"),
+        (None, true) => " --all".into(),
+        (None, false) => String::new(),
+    };
+    let command = format!("{program} work{projects}");
     let mut steps: Vec<(String, &str)> = Vec::new();
-    match truncated.as_slice() {
-        [] => {}
-        [(column, _)] => steps.push((
+    // One column to finish: the one listed, or the only one cut short.
+    let rest = listing.column.or(match truncated.as_slice() {
+        [only] => Some(*only),
+        _ => None,
+    });
+    match rest {
+        _ if truncated.is_empty() => {}
+        Some(column) => steps.push((
             format!(
                 "{command} --column {} --limit 0",
                 column.as_str().replace('_', "-")
             ),
             "lists the rest",
         )),
-        _ => steps.push((
+        None => steps.push((
             format!("{command} --column COLUMN --limit 0"),
             "lists a whole column",
         )),
     }
-    if listing.narrowed {
-        steps.push(("cagents work --all".into(), "lists every project"));
+    if listing.placed {
+        steps.push((format!("{program} work --all"), "lists every project"));
     }
     if columns.iter().any(|(column, _)| *column == Column::Landed) {
+        // Removal looks in this directory's project unless told otherwise.
+        let project = match (single, listing.project) {
+            (_, Some(project)) => format!(" --project {project}"),
+            (Some(project), None) if listing.all => {
+                format!(" --project {}", super::format::shell_word(&project.name))
+            }
+            (Some(_), None) => String::new(),
+            (None, None) => " --project PROJECT".into(),
+        };
         steps.push((
-            "cagents work rm CARD --dry-run".into(),
+            format!("{program} work rm CARD{project} --dry-run"),
             "shows what removing a landed worktree loses",
         ));
     }
-    if !steps.is_empty() {
-        footer.push(super::format::hint(&steps));
+    if !notes.is_empty() {
+        sections.push(notes.join("\n"));
     }
     let mut human = sections.join("\n\n");
     for line in footer {
         human.push('\n');
         human.push_str(&line);
     }
+    if !steps.is_empty() {
+        human.push('\n');
+        human.push_str(&super::format::hint(&steps));
+    }
     human
 }
 
-/// A card's cells. `root` is its project's primary checkout, which its
-/// worktree is shown relative to.
+/// A card's cells. `root` is the primary checkout of the one project a
+/// listing shows, which its worktree is shown relative to; across projects
+/// the worktree is shown in full.
 fn row(item: &Item, root: Option<&Path>, now_ms: u64) -> [String; 9] {
-    // A detached worktree's card is named by its path, which `~` keeps
-    // runnable from anywhere.
+    // A detached worktree's card is named by its path, which its WORKTREE
+    // cell already shows.
     let mut card = match &item.key {
-        ItemKey::Worktree(path) => super::format::location(path, None),
+        ItemKey::Worktree(_) => "(detached)".to_owned(),
         ItemKey::Branch(_) => item.label(),
     };
     if item.pinned {
@@ -1107,12 +1208,15 @@ mod tests {
         item
     }
 
-    fn listing(limit: usize, narrowed: bool) -> Listing<'static> {
+    fn listing(limit: usize, placed: bool) -> Listing<'static> {
         Listing {
             column: None,
             limit,
-            command: "cagents work",
-            narrowed,
+            program: "cagents",
+            project: None,
+            all: false,
+            placed,
+            here: None,
         }
     }
 
@@ -1132,12 +1236,14 @@ mod tests {
                 ".worktrees/login".into(),
             ]
         );
-        // Outside its project's checkout, a worktree keeps its whole path.
+        // Across projects, a worktree keeps its whole path.
         assert_eq!(row(&item(), None, NOW)[8], "/repo/.worktrees/login");
+        // A detached worktree is named by that path, in its own cell.
         let mut detached = item();
         detached.key = ItemKey::Worktree("/repo/.worktrees/login".into());
         detached.pinned = false;
-        assert_eq!(row(&detached, None, NOW)[0], "/repo/.worktrees/login");
+        let cells = row(&detached, Some(Path::new("/repo")), NOW);
+        assert_eq!([&cells[0], &cells[8]], ["(detached)", ".worktrees/login"]);
     }
 
     #[test]
@@ -1183,7 +1289,7 @@ mod tests {
             human.ends_with(
                 "repo: GitHub is unavailable: gh is not installed\n\
                  Linear tickets could not be looked up: Add a Linear key\n\
-                 (project repo)"
+                 (project repo at /repo)"
             ),
             "{human}"
         );
@@ -1202,6 +1308,15 @@ mod tests {
             ..listing(DEFAULT_LIMIT, false)
         };
         assert_eq!(board_human(&empty, &landed, NOW), "No cards in Landed");
+        // An empty board of one project says which.
+        let scoped = Board {
+            projects: vec![project("repo")],
+            ..empty
+        };
+        assert_eq!(
+            board_human(&scoped, &listing(DEFAULT_LIMIT, true), NOW),
+            "No cards in project repo\nhint: `cagents work --all` lists every project"
+        );
     }
 
     #[test]
@@ -1217,7 +1332,9 @@ mod tests {
             "{human}"
         );
         assert!(
-            human.ends_with("\n(project repo)\nhint: `cagents work --all` lists every project"),
+            human.ends_with(
+                "\n(project repo at /repo)\nhint: `cagents work --all` lists every project"
+            ),
             "{human}"
         );
 
@@ -1228,6 +1345,8 @@ mod tests {
             vec![project("repo"), project("other")],
             vec![card("a", Column::Active), other],
         );
+        let mut both = both;
+        both.items[0].worktree = item().worktree;
         let human = board_human(&both, &listing(DEFAULT_LIMIT, false), NOW);
         // Every section keeps the same columns, so they read as one table.
         let headers: Vec<&str> = human
@@ -1237,8 +1356,24 @@ mod tests {
         assert_eq!(headers.len(), 2);
         assert_eq!(headers[0], headers[1]);
         assert!(headers[0].contains("PROJECT"), "{human}");
+        // With no one root to be relative to, a worktree is shown in full.
+        assert!(human.contains(" /repo/.worktrees/login\n"), "{human}");
         assert!(!human.contains("(project"), "{human}");
         assert!(!human.contains("hint:"), "{human}");
+
+        // A listing of every project names the card's project to remove it.
+        both.items[1].column = Column::Landed;
+        let all = Listing {
+            all: true,
+            ..listing(DEFAULT_LIMIT, false)
+        };
+        assert!(
+            board_human(&both, &all, NOW).ends_with(
+                "hint: `cagents work rm CARD --project PROJECT --dry-run` \
+                 shows what removing a landed worktree loses"
+            ),
+            "{human}"
+        );
     }
 
     #[test]
@@ -1266,51 +1401,125 @@ mod tests {
         assert!(all.contains("IN PROGRESS (12)\n"), "{all}");
         assert!(all.contains("work-11"), "{all}");
 
+        let listed = |items: &mut Vec<Item>, listing: &Listing<'_>, limit| {
+            let omitted = listing.omit(items, limit);
+            (items.iter().map(Item::label).collect::<Vec<_>>(), omitted)
+        };
         let mut items = board.items.clone();
-        limit_columns(&mut items, 2);
-        assert_eq!(
-            items.iter().map(Item::label).collect::<Vec<_>>(),
-            ["work-0", "work-1", "done"]
-        );
-        limit_columns(&mut items, 0);
-        assert_eq!(items.len(), 3);
+        let (labels, omitted) = listed(&mut items, &listing(2, false), 2);
+        assert_eq!(labels, ["work-0", "work-1", "done"]);
+        assert_eq!(omitted, [(Column::InProgress, 10)].into());
+        let (labels, omitted) = listed(&mut items, &listing(0, false), 0);
+        assert_eq!(labels.len(), 3);
+        assert!(omitted.is_empty());
     }
 
+    /// The card of the worktree this shell is in is listed however old, so
+    /// an agent always finds its own branch.
     #[test]
-    fn a_board_narrows_to_the_nearest_project_containing_the_directory() {
-        let mut outer = card("outer", Column::Active);
-        outer.project = "/code/.git".into();
-        let mut inner = card("inner", Column::Active);
-        inner.project = "/code/app/.git".into();
-        let mut linked = card("linked", Column::Active);
-        linked.project = "/code/app/.git".into();
-        linked.worktree = Some(Worktree {
-            path: "/elsewhere/linked".into(),
-            primary: false,
-            locked: false,
-            created_at_unix_ms: None,
-        });
-        let mut projects = vec![project("code"), project("code/app")];
-        projects[1].name = "app".into();
-        let full = board(projects, vec![outer, inner, linked]);
-        let labels = |board: &Board| board.items.iter().map(Item::label).collect::<Vec<_>>();
+    fn a_listing_keeps_the_card_of_the_current_worktree() {
+        let items: Vec<Item> = (0..12)
+            .map(|index| {
+                let mut card = card(&format!("work-{index}"), Column::InProgress);
+                card.worktree = Some(Worktree {
+                    path: format!("/repo/.worktrees/{index}").into(),
+                    primary: false,
+                    locked: false,
+                    created_at_unix_ms: None,
+                });
+                card
+            })
+            .collect();
+        let board = board(vec![project("repo")], items);
+        let inside = Listing {
+            here: Some(Path::new("/repo/.worktrees/11/src")),
+            ..listing(DEFAULT_LIMIT, true)
+        };
+        let human = board_human(&board, &inside, NOW);
+        assert!(human.contains("IN PROGRESS (11 of 12)\n"), "{human}");
+        assert!(human.contains("\nwork-11 "), "{human}");
+        assert!(!human.contains("work-10 "), "{human}");
+        let mut items = board.items.clone();
+        inside.omit(&mut items, 3);
+        assert_eq!(
+            items.iter().map(Item::label).collect::<Vec<_>>(),
+            ["work-0", "work-1", "work-2", "work-11"]
+        );
+    }
 
-        let mut board = full.clone();
-        assert!(narrow(&mut board, Path::new("/code/app/src")));
-        assert_eq!(labels(&board), ["inner", "linked"]);
-        assert_eq!(board.projects.len(), 1);
+    /// The listing's own options carry into its hints: the device, the
+    /// project and the column.
+    #[test]
+    fn hints_extend_the_command_that_listed_the_board() {
+        let items = (0..12)
+            .map(|index| card(&format!("work-{index}"), Column::InProgress))
+            .chain([card("done", Column::Landed)])
+            .collect();
+        let board = board(vec![project("repo")], items);
+        let named = Listing {
+            program: "cagents --device fw16",
+            project: Some("'my repo'"),
+            column: Some(Column::InProgress),
+            ..listing(DEFAULT_LIMIT, false)
+        };
+        let mut filtered = board.clone();
+        filtered
+            .items
+            .retain(|item| item.column == Column::InProgress);
+        assert!(board_human(&filtered, &named, NOW).ends_with(
+            "hint: `cagents --device fw16 work --project 'my repo' --column in-progress --limit 0` \
+                 lists the rest"
+        ));
+        let named = Listing {
+            column: None,
+            ..named
+        };
+        assert!(board_human(&board, &named, NOW).ends_with(
+            "`cagents --device fw16 work rm CARD --project 'my repo' --dry-run` \
+                 shows what removing a landed worktree loses"
+        ));
+    }
 
-        let mut board = full.clone();
-        assert!(narrow(&mut board, Path::new("/elsewhere/linked/src")));
-        assert_eq!(labels(&board), ["inner", "linked"]);
-
-        let mut board = full.clone();
-        assert!(narrow(&mut board, Path::new("/code/docs")));
-        assert_eq!(labels(&board), ["outer"]);
-
-        let mut board = full.clone();
-        assert!(!narrow(&mut board, Path::new("/tmp")));
-        assert_eq!(board, full);
+    /// The current directory is placed as the daemon places a session's: a
+    /// checkout or linked worktree belongs to its open repository; an open
+    /// folder, or no open project, widens to every project.
+    #[test]
+    fn the_current_directory_selects_the_open_git_project_containing_it() {
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let repository = root.join("app/.git");
+        std::fs::create_dir_all(repository.join("worktrees/linked")).unwrap();
+        std::fs::create_dir_all(root.join("app/src")).unwrap();
+        let linked = root.join("linked");
+        std::fs::create_dir_all(linked.join("src")).unwrap();
+        std::fs::write(
+            linked.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                repository.join("worktrees/linked").display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(repository.join("worktrees/linked/commondir"), "../..\n").unwrap();
+        let folder = root.join("notes");
+        std::fs::create_dir_all(&folder).unwrap();
+        let open = |repository: &Path, kind| crate::workspace_model::ModelProject {
+            repository: repository.to_owned(),
+            name: "fixture".into(),
+            kind,
+            ordinal: 0,
+        };
+        let projects = [
+            open(&repository, crate::model::ProjectKind::Git),
+            open(&folder, crate::model::ProjectKind::Folder),
+        ];
+        assert_eq!(
+            containing(&root.join("app/src"), &projects),
+            Some(repository.clone())
+        );
+        assert_eq!(containing(&linked.join("src"), &projects), Some(repository));
+        assert_eq!(containing(&folder, &projects), None);
+        assert_eq!(containing(&root, &projects), None);
     }
 
     #[test]
@@ -1345,12 +1554,24 @@ mod tests {
         assert!(parse(&["work", "--all", "--project", "x"]).is_err());
     }
 
+    /// A detached card is named by the path a listing shows, which a
+    /// quoted `~` must not break.
     #[test]
-    fn hinted_project_names_are_quoted_for_the_shell() {
-        assert_eq!(shell_word("redact"), "redact");
-        assert_eq!(shell_word("/a/b-c"), "/a/b-c");
-        assert_eq!(shell_word("Just Make Money"), "'Just Make Money'");
-        assert_eq!(shell_word("it's"), r"'it'\''s'");
-        assert_eq!(shell_word(""), "''");
+    fn a_card_named_by_a_home_relative_path_is_sent_whole() {
+        let home = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(home.path()).unwrap();
+        std::fs::create_dir_all(home.join("linked")).unwrap();
+        std::fs::write(home.join("linked/.git"), "gitdir: elsewhere\n").unwrap();
+        assert_eq!(
+            item_in("~/linked".into(), Some(&home)),
+            home.join("linked").to_string_lossy()
+        );
+        // A branch, or a path only the daemon can place, is sent as given.
+        assert_eq!(item_in("fix/login".into(), Some(&home)), "fix/login");
+        assert_eq!(item_in("~/absent".into(), Some(&home)), "~/absent");
+        assert_eq!(
+            item_in(".worktrees/linked".into(), Some(&home)),
+            ".worktrees/linked"
+        );
     }
 }
