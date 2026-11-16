@@ -1521,7 +1521,7 @@ mod tests {
         std::os::unix::fs::symlink(&local_target, &path).unwrap();
         let project_id = ProjectId::new();
         let repository = path.join(".git");
-        app.sidebar_model.projects = vec![SidebarProject::new(
+        *app.sidebar_model.projects = vec![SidebarProject::new(
             project_id,
             RepositoryId(project_id.as_uuid()),
             "Remote".into(),

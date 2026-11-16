@@ -24,6 +24,8 @@ use crate::file_manager::open_system_url_with_opener;
 mod browser_backend;
 mod browser_host;
 mod file_ui;
+#[cfg(any(debug_assertions, feature = "development"))]
+mod fixture_seed;
 mod git_ui;
 mod history_ui;
 #[cfg(feature = "latency-harness")]
@@ -66,6 +68,26 @@ mod worktree_dialog;
 mod worktree_operations;
 mod worktree_ui;
 pub use daemon_stop::run_daemon_stop_confirmation;
+
+/// Fills the `slot` window's empty session store from a fixture plan and
+/// returns what it wrote as one JSON line. Refused by production builds and
+/// while that window is open. See docs/fixture-workspace.md.
+pub fn seed_fixture_window(
+    plan: &Path,
+    slot: &str,
+    workspace_model_identity: Option<uuid::Uuid>,
+) -> Result<String, String> {
+    #[cfg(any(debug_assertions, feature = "development"))]
+    {
+        let seeded = fixture_seed::seed(plan, slot, workspace_model_identity)?;
+        serde_json::to_string(&seeded).map_err(|error| error.to_string())
+    }
+    #[cfg(not(any(debug_assertions, feature = "development")))]
+    {
+        let _ = (plan, slot, workspace_model_identity);
+        Err(crate::fixture_workspace::refusal())
+    }
+}
 use worktree_dialog::{
     WorktreeDialog, WorktreeDraft, WorktreeField, WorktreeInputError, worktree_dialog_focus_id,
 };
@@ -20859,7 +20881,7 @@ mod tests {
             },
         );
         let selected = PathBuf::from("/repo/selected");
-        app.sidebar_model.projects = vec![SidebarProject::new(
+        *app.sidebar_model.projects = vec![SidebarProject::new(
             project_id,
             crate::repository::RepositoryId::new(),
             "repo".into(),
@@ -27177,7 +27199,7 @@ mod tests {
 
     fn workspace_switcher_test_app(count: usize) -> Cagents {
         let mut app = context_inspector_test_app(false);
-        app.sidebar_model.projects = (0..count)
+        *app.sidebar_model.projects = (0..count)
             .map(|index| {
                 SidebarProject::new(
                     ProjectId::new(),
@@ -27663,7 +27685,7 @@ mod tests {
         let broken = ProjectId::new();
         let healthy = ProjectId::new();
         let healthy_path = PathBuf::from("/repositories/healthy");
-        app.sidebar_model.projects = vec![
+        *app.sidebar_model.projects = vec![
             restored_sidebar_project(broken, "broken", Path::new("/repositories/broken")),
             restored_sidebar_project(healthy, "healthy", &healthy_path),
         ];
@@ -32753,7 +32775,7 @@ mod tests {
         let git = ProjectId::new();
         let worktree = crate::model::WorktreeId::new();
         let channel = crate::model::ChannelId::new();
-        app.sidebar_model.projects = vec![
+        *app.sidebar_model.projects = vec![
             SidebarProject::new(
                 folder,
                 RepositoryId::new(),
@@ -32972,7 +32994,7 @@ mod tests {
         let expected_project = app.sidebar_model.projects[0].clone();
         for loaded in [aliased, linked_load] {
             drop(app.update(complete(loaded, 1)));
-            assert_eq!(app.sidebar_model.projects, vec![expected_project.clone()]);
+            assert_eq!(*app.sidebar_model.projects, vec![expected_project.clone()]);
             assert_eq!(
                 app.durable
                     .cards
@@ -32991,7 +33013,7 @@ mod tests {
         drop(app.update(Message::RepositorySelected(Ok(root))));
         assert_eq!(app.repository_generations[&first_id], 2);
         drop(app.update(complete(first, 1)));
-        assert_eq!(app.sidebar_model.projects, vec![expected_project]);
+        assert_eq!(*app.sidebar_model.projects, vec![expected_project]);
         assert_eq!(app.active_workspace.as_ref(), Some(&canonical_linked));
     }
 

@@ -46,6 +46,9 @@ pub use attention::{State as AttentionState, Summary as AttentionSummary};
 
 mod rail;
 
+mod revisioned;
+pub use revisioned::Revisioned;
+
 mod selection;
 pub use selection::{Intent as SelectionIntent, Row as SelectionRow};
 
@@ -188,7 +191,9 @@ pub struct SidebarModel {
     pub external_editors: Vec<SidebarEditor>,
     /// Enables standalone editor file actions; other hosts keep editor-only menus.
     pub file_management: bool,
-    pub projects: Vec<SidebarProject>,
+    /// Revisioned so the navigation list can see in one comparison, on every
+    /// frame, that no project changed; see [`NavigationCache`].
+    pub projects: Revisioned<Vec<SidebarProject>>,
     /// Source-control data for the active worktree, and only for it. The panel
     /// shows exactly one worktree, so loading a snapshot per project would read
     /// Git for surfaces nobody is looking at.
@@ -258,7 +263,7 @@ impl SidebarModel {
         Self {
             mode,
             data_state: SidebarDataState::Ready,
-            projects,
+            projects: projects.into(),
             source_control: None,
             external_editors: Vec::new(),
             file_management: false,
@@ -276,7 +281,7 @@ impl SidebarModel {
         Self {
             mode,
             data_state: SidebarDataState::Error(message.into()),
-            projects: Vec::new(),
+            projects: Revisioned::default(),
             source_control: None,
             external_editors: Vec::new(),
             file_management: false,
@@ -5281,6 +5286,12 @@ pub fn view<'a>(
     )
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many times the navigation cache compared every project.
+    static PROJECT_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Default)]
 pub struct NavigationCache(std::cell::RefCell<(Option<NavigationSnapshot>, u64)>);
 
@@ -5290,6 +5301,10 @@ pub struct NavigationCache(std::cell::RefCell<(Option<NavigationSnapshot>, u64)>
 /// number of navigation entities, even in a very large repository.
 struct NavigationSnapshot {
     projects: Vec<SidebarProject>,
+    /// The revision `projects` was last seen equal at. Comparing every
+    /// project is most of what a frame that changes nothing costs in a large
+    /// workspace, so an unchanged revision stands in for it.
+    projects_revision: u64,
     editors: Vec<SidebarEditor>,
     rows: selection::Selection,
     query: String,
@@ -5317,8 +5332,11 @@ struct NavigationSnapshot {
 
 impl NavigationSnapshot {
     fn matches(&self, model: &SidebarModel, state: &SidebarState) -> bool {
-        self.projects == model.projects
-            && self.editors == model.external_editors
+        (self.projects_revision == Revisioned::revision(&model.projects) || {
+            #[cfg(test)]
+            PROJECT_COMPARISONS.with(|count| count.set(count.get() + 1));
+            self.projects == *model.projects
+        }) && self.editors == model.external_editors
             && self.rows == state.rows
             && self.query == state.query
             && self.filter == state.filter
@@ -5345,7 +5363,8 @@ impl NavigationSnapshot {
 
     fn capture(model: &SidebarModel, state: &SidebarState) -> Self {
         Self {
-            projects: model.projects.clone(),
+            projects: (*model.projects).clone(),
+            projects_revision: Revisioned::revision(&model.projects),
             editors: model.external_editors.clone(),
             rows: state.rows.clone(),
             query: state.query.clone(),
@@ -5376,13 +5395,17 @@ impl NavigationSnapshot {
 impl NavigationCache {
     fn generation(&self, model: &SidebarModel, state: &SidebarState) -> u64 {
         let mut snapshot = self.0.borrow_mut();
-        if snapshot
-            .0
-            .as_ref()
-            .is_none_or(|previous| !previous.matches(model, state))
-        {
-            snapshot.0 = Some(NavigationSnapshot::capture(model, state));
-            snapshot.1 = snapshot.1.wrapping_add(1);
+        match &mut snapshot.0 {
+            // A borrow for writing that changed nothing still took a new
+            // revision; once the contents prove equal, adopt it, so later
+            // frames are spared the comparison again.
+            Some(previous) if previous.matches(model, state) => {
+                previous.projects_revision = Revisioned::revision(&model.projects);
+            }
+            _ => {
+                snapshot.0 = Some(NavigationSnapshot::capture(model, state));
+                snapshot.1 = snapshot.1.wrapping_add(1);
+            }
         }
         snapshot.1
     }
@@ -16068,6 +16091,40 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn navigation_cache_compares_projects_only_after_they_may_have_changed() {
+        let comparisons = || super::PROJECT_COMPARISONS.with(std::cell::Cell::get);
+        let mut model = SidebarModel::ready(SidebarMode::Expanded, vec![project()]);
+        let state = SidebarState::default();
+        let cache = NavigationCache::default();
+        let initial = cache.generation(&model, &state);
+        let before = comparisons();
+        for _ in 0..3 {
+            assert_eq!(initial, cache.generation(&model, &state));
+        }
+        assert_eq!(comparisons(), before, "an untouched model is not compared");
+
+        // Borrowed for writing, changed nothing: one comparison proves it,
+        // and the frames after it are spared another.
+        model.projects[0].reloading = false;
+        assert_eq!(initial, cache.generation(&model, &state));
+        assert_eq!(comparisons(), before + 1);
+        assert_eq!(initial, cache.generation(&model, &state));
+        assert_eq!(comparisons(), before + 1);
+
+        // A model built anew with the same projects is still compared, never
+        // mistaken for the one the cache saw.
+        model.projects = vec![project()].into();
+        assert_eq!(initial, cache.generation(&model, &state));
+        assert_eq!(comparisons(), before + 2);
+
+        model.projects[0].reloading = true;
+        let reloading = cache.generation(&model, &state);
+        assert_ne!(initial, reloading, "a change is drawn");
+        assert_eq!(reloading, cache.generation(&model, &state));
+        assert_eq!(comparisons(), before + 3);
+    }
+
+    #[test]
     fn navigation_cache_ignores_large_source_control_and_file_panel_interactions() {
         let mut model = SidebarModel::ready(SidebarMode::Expanded, vec![project()]);
         let mut state = SidebarState::default();
@@ -21643,7 +21700,7 @@ pub(crate) mod tests {
                     let model = SidebarModel {
                         mode,
                         data_state: data_state.clone(),
-                        projects,
+                        projects: projects.into(),
                         source_control: None,
                         external_editors: Vec::new(),
                         file_management: false,
@@ -24409,7 +24466,7 @@ pub(crate) mod tests {
             card_scopes: std::collections::HashMap::from([(root.id, folder.repository.clone())]),
             ..Default::default()
         });
-        sidebar.model.projects = vec![folder.clone()];
+        *sidebar.model.projects = vec![folder.clone()];
         sidebar
             .state
             .apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
@@ -24572,7 +24629,7 @@ pub(crate) mod tests {
         root.id = key.worktree_id;
         root.path = folder.repository.clone();
         git.worktrees = vec![root];
-        model.projects = vec![git];
+        *model.projects = vec![git];
         refresh_attention(&mut state, &mut model, &durable);
         assert_eq!(state.attention_projection_rebuilds, clean_rebuilt + 1);
         assert_eq!(
@@ -24596,7 +24653,7 @@ pub(crate) mod tests {
             Some("main")
         );
         let rebuilt = state.attention_projection_rebuilds;
-        model.projects = vec![folder.clone()];
+        *model.projects = vec![folder.clone()];
         refresh_attention(&mut state, &mut model, &durable);
         assert!(state.attention_projection_rebuilds > rebuilt);
         let rebuilt = state.attention_projection_rebuilds;
@@ -24635,7 +24692,7 @@ pub(crate) mod tests {
             cards: vec![terminal].into(),
             ..Default::default()
         });
-        sidebar.model.projects = vec![folder];
+        *sidebar.model.projects = vec![folder];
         let (quiet_rows, quiet_image) = sidebar.attention_frame();
         assert_eq!(
             quiet_rows.iter().filter(|(name, _)| name == &plain).count(),
@@ -24828,7 +24885,7 @@ pub(crate) mod tests {
             card_scopes: std::collections::HashMap::from([(root.id, folder.repository.clone())]),
             ..Default::default()
         });
-        sidebar.model.projects = vec![folder.clone()];
+        *sidebar.model.projects = vec![folder.clone()];
         sidebar.state.observe_card_update(root.id);
         sidebar.state.observe_card_update(child.id);
         sidebar.state.set_card_activity(
