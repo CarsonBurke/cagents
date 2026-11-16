@@ -13,10 +13,12 @@
 //! Toolkits keep their own grab state for this reason. Here, while a grabbing
 //! popup is open, key presses and releases delivered to its toplevel go to the
 //! topmost grabbing popup instead, just as they would once the compositor
-//! moves focus. Modifier changes still reach the toplevel as well, so its
-//! widgets do not keep a stale modifier state after the popup closes.
+//! moves focus. So does text an input method composes or commits, which would
+//! otherwise still reach the toplevel's focused field. Modifier changes and
+//! the input method opening or closing still reach the toplevel as well, so
+//! its widgets do not keep a stale state after the popup closes.
 
-use iced_runtime::core::{Event, keyboard, window};
+use iced_runtime::core::{Event, input_method, keyboard, window};
 
 /// Open grabbing popups, oldest first, with the toplevel each one belongs to.
 #[derive(Debug, Default)]
@@ -74,6 +76,10 @@ impl KeyboardGrabs {
                     Event::Keyboard(
                         keyboard::Event::KeyPressed { .. }
                         | keyboard::Event::KeyReleased { .. },
+                    )
+                    | Event::InputMethod(
+                        input_method::Event::Preedit(..)
+                        | input_method::Event::Commit(_),
                     ),
                 ) => routed.push((Some(popup), event)),
                 (
@@ -94,7 +100,7 @@ impl KeyboardGrabs {
 mod tests {
     use super::KeyboardGrabs;
     use iced_runtime::core::{
-        Event, keyboard,
+        Event, input_method, keyboard,
         keyboard::{Key, Location, Modifiers, key},
         mouse, window,
     };
@@ -151,6 +157,13 @@ mod tests {
         let click = Event::Mouse(mouse::Event::ButtonPressed(
             mouse::Button::Left,
         ));
+        let composed = Event::InputMethod(input_method::Event::Preedit(
+            "x".into(),
+            None,
+        ));
+        let committed =
+            Event::InputMethod(input_method::Event::Commit("x".into()));
+        let ime_closed = Event::InputMethod(input_method::Event::Closed);
         let mut events = vec![
             (Some(main), key(pressed, key::Named::ArrowDown)),
             (Some(main), key(released, key::Named::ArrowDown)),
@@ -158,6 +171,9 @@ mod tests {
             (Some(main), key(pressed, key::Named::Escape)),
             (Some(main), typed("x")),
             (Some(main), shift.clone()),
+            (Some(main), composed.clone()),
+            (Some(main), committed.clone()),
+            (Some(main), ime_closed.clone()),
             (Some(main), click.clone()),
             (Some(other), key(pressed, key::Named::Enter)),
             (Some(menu), key(pressed, key::Named::ArrowUp)),
@@ -175,6 +191,9 @@ mod tests {
                 (Some(menu), typed("x")),
                 (Some(menu), shift.clone()),
                 (Some(main), shift),
+                (Some(menu), composed),
+                (Some(menu), committed),
+                (Some(main), ime_closed),
                 (Some(main), click),
                 (Some(other), key(pressed, key::Named::Enter)),
                 (Some(menu), key(pressed, key::Named::ArrowUp)),
