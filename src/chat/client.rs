@@ -30,6 +30,23 @@ mod append;
 
 const CHAT_ATTACH_TIMEOUT: Duration = Duration::from_secs(70);
 
+pub fn restore_intent(intent: Intent, policy: crate::instance::WindowRestorePolicy) -> Intent {
+    if intent == Intent::Restore && policy == crate::instance::WindowRestorePolicy::ExistingOnly {
+        Intent::RestoreExisting
+    } else {
+        intent
+    }
+}
+
+fn chat_socket(intent: Intent) -> Result<std::path::PathBuf, StartFailure> {
+    if intent == Intent::RestoreExisting {
+        crate::terminal::existing_daemon_socket_path().map_err(|error| error.to_string().into())
+    } else {
+        crate::terminal::ensure_daemon_ready_for_explicit_action()
+            .map_err(|error| error.to_string().into())
+    }
+}
+
 fn start_failure(error: ipc::ProtocolError) -> StartFailure {
     StartFailure {
         message: error.message,
@@ -103,6 +120,28 @@ fn frame_read_error(error: ipc::FrameError, timeout: Option<Duration>) -> String
     }
 }
 
+/// A conversation's subagents by the address their provider gives them, each
+/// with the ID the snapshot lists it under. Shared, so a surface can keep a
+/// copy for every frame without copying the addresses.
+pub type AgentAddresses = Arc<BTreeMap<String, String>>;
+
+/// Adds the addresses not yet known, which keep the agent they first named,
+/// and says whether any was.
+fn learn_addresses(known: &mut AgentAddresses, addresses: Vec<super::AgentAddress>) -> bool {
+    let new = addresses
+        .into_iter()
+        .filter(|address| !known.contains_key(&address.address))
+        .collect::<Vec<_>>();
+    if new.is_empty() {
+        return false;
+    }
+    let known = Arc::make_mut(known);
+    for address in new {
+        known.entry(address.address).or_insert(address.subagent);
+    }
+    true
+}
+
 #[derive(Debug, Clone)]
 pub enum Wake {
     Changed,
@@ -111,6 +150,12 @@ pub enum Wake {
     Activity,
     /// Consume the reports with `take_account_usage`.
     AccountUsage,
+    /// The daemon's judgement of the usage limit stopping the conversation
+    /// changed; read it with `limit`.
+    Limit,
+    /// The daemon said how the provider addresses more of the conversation's
+    /// subagents; read them with `agent_addresses`.
+    AgentAddresses,
     Disconnected(String),
 }
 #[derive(Clone)]
@@ -121,6 +166,14 @@ struct Wire {
     stream: UnixStream,
     codec: FrameCodec,
     body_requested: Arc<AtomicBool>,
+    /// Whether the last visibility this connection sent was visible. The
+    /// daemon refuses reads from a hidden subscriber, and visibility is sent
+    /// from its own worker, so a read goes out only behind a visible frame.
+    announced: bool,
+    /// How many hidden frames this connection has sent. A read refused
+    /// because a hide overtook it on the daemon is told apart by this count
+    /// having moved since the read was sent.
+    hidings: u64,
 }
 struct PendingCommand {
     prompt: bool,
@@ -137,7 +190,7 @@ const TEXT_COPY_TIMEOUT: Duration = Duration::from_secs(40);
 /// hydration and advances while the provider is quiet without relying on the
 /// display machine's wall clock.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct SourceClock {
+pub struct SourceClock {
     sampled_at: u64,
     received_at: Instant,
 }
@@ -161,7 +214,7 @@ impl SourceClock {
         }
     }
 
-    pub(crate) fn now(self) -> u64 {
+    pub fn now(self) -> u64 {
         self.at(Instant::now())
     }
 
@@ -177,7 +230,7 @@ impl SourceClock {
 /// grant-bound attachment. This is deliberately neither serializable nor
 /// constructible from descriptors outside the handshake.
 #[derive(Clone, Debug)]
-pub(crate) struct UpgradeRecovery {
+pub struct UpgradeRecovery {
     sessions: (Session, Session),
     kind: UpgradeRecoveryKind,
 }
@@ -192,7 +245,7 @@ enum UpgradeRecoveryKind {
 impl UpgradeRecovery {
     /// Shape alone authorizes only an exact lineage query, never activation or
     /// persistence. Only the authenticated handshake can produce a witness.
-    pub(crate) fn is_candidate(source: &Session, replacement: &Session) -> bool {
+    pub fn is_candidate(source: &Session, replacement: &Session) -> bool {
         Self::candidate(source, replacement).is_some()
     }
 
@@ -242,14 +295,14 @@ impl UpgradeRecovery {
         })
     }
 
-    pub(crate) fn source(&self) -> &Session {
+    pub fn source(&self) -> &Session {
         &self.sessions.0
     }
-    pub(crate) fn replacement(&self) -> &Session {
+    pub fn replacement(&self) -> &Session {
         &self.sessions.1
     }
 
-    pub(crate) fn validate(&self) -> bool {
+    pub fn validate(&self) -> bool {
         matches!(
             (
                 self.kind,
@@ -287,7 +340,7 @@ struct PublicationPayload {
     // Ready before installation: hide performs no body/metadata derivation.
     // Metadata nodes have no pair and own no body or append authority.
     hidden: Option<Arc<Publication>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     retirement_complete: Mutex<Option<std::sync::mpsc::Sender<std::thread::ThreadId>>>,
 }
 
@@ -331,7 +384,7 @@ struct RetiredPublication {
 impl RetiredPublication {
     fn finish(self: Box<Self>) {
         debug_assert!(self.next.is_none());
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let complete = self
             .payload
             .retirement_complete
@@ -341,7 +394,7 @@ impl RetiredPublication {
         // Snapshot/control vectors, weak lineage and ready metadata ownership
         // all belong to this same node, regardless of the last Arc's thread.
         drop(self);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(complete) = complete {
             let _ = complete.send(thread::current().id());
         }
@@ -369,7 +422,7 @@ impl Publication {
                     resident,
                     lineage,
                     hidden,
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-support"))]
                     retirement_complete: Mutex::new(None),
                 },
                 next: None,
@@ -410,10 +463,12 @@ impl Publication {
 
     fn next(
         base: &Self,
-        snapshot: Snapshot,
+        mut snapshot: Snapshot,
         resident: bool,
         lineage: append::Lineage,
     ) -> Arc<Self> {
+        snapshot.active_model = base.snapshot.active_model.clone();
+        snapshot.active_model_revision = base.snapshot.active_model_revision;
         let mut clock = base.clock;
         SourceClock::observe(&mut clock, snapshot.sampled_at, Instant::now());
         if resident {
@@ -464,22 +519,26 @@ impl Publications {
 
     fn replace(
         &self,
-        snapshot: Snapshot,
+        mut snapshot: Snapshot,
         body: &AtomicBool,
         sample_clock: bool,
         final_body: bool,
     ) -> Option<bool> {
         let (base, revision) = self.capture();
+        snapshot.active_model = base.snapshot.active_model.clone();
+        snapshot.active_model_revision = base.snapshot.active_model_revision;
         let mut clock = base.clock;
         if sample_clock {
             SourceClock::observe(&mut clock, snapshot.sampled_at, Instant::now());
         }
-        let full = Publication::resident(
-            snapshot,
-            clock,
-            append::Lineage::default(),
-            base.source_thread.clone(),
-        );
+        // A full snapshot over a body this client kept shares every item that
+        // did not change, so the interface keeps what it prepared from them.
+        let mut lineage = append::Lineage::default();
+        if base.resident {
+            lineage = base.lineage.clone();
+            lineage.adopt(&base.snapshot, &mut snapshot);
+        }
+        let full = Publication::resident(snapshot, clock, lineage, base.source_thread.clone());
         let metadata = full
             .hidden
             .as_ref()
@@ -488,6 +547,48 @@ impl Publications {
         #[cfg(test)]
         tests::pause_before_replacement(self as *const Self as usize);
         self.publish(&base, revision, body, Some(full), metadata, final_body)
+    }
+
+    fn active_model(
+        &self,
+        revision: u64,
+        model: Option<super::ActiveModel>,
+        body: &AtomicBool,
+    ) -> bool {
+        loop {
+            let (base, policy_revision) = self.capture();
+            if revision <= base.snapshot.active_model_revision {
+                return false;
+            }
+            let mut snapshot = (*base.snapshot).clone();
+            snapshot.active_model = model.clone();
+            snapshot.active_model_revision = revision;
+            let next = if base.resident {
+                Publication::resident(
+                    snapshot,
+                    base.clock,
+                    base.lineage.clone(),
+                    base.source_thread.clone(),
+                )
+            } else {
+                Publication::owned(
+                    snapshot,
+                    base.clock,
+                    false,
+                    append::Lineage::default(),
+                    None,
+                    base.source_thread.clone(),
+                )
+            };
+            let metadata = next.hidden.as_ref().unwrap_or(&next).clone();
+            let full = base.resident.then_some(next);
+            if self
+                .publish(&base, policy_revision, body, full, metadata, false)
+                .is_some()
+            {
+                return true;
+            }
+        }
     }
 
     /// The connection reader is the only source writer; visibility is a second
@@ -556,6 +657,8 @@ struct InnerPayload {
     activity: Arc<Mutex<ActivityObservation>>,
     observed: Arc<Mutex<OutputObservation>>,
     account_usage: Arc<Mutex<AccountUsage>>,
+    limit: Arc<Mutex<Option<crate::agent_execution::directory::UsageLimit>>>,
+    agent_addresses: Arc<Mutex<AgentAddresses>>,
     next: Arc<AtomicU64>,
     alive: Arc<AtomicBool>,
     visible: Arc<AtomicBool>,
@@ -567,7 +670,7 @@ struct InnerPayload {
     text_copies: AtomicUsize,
     visibility_tx: crossbeam_channel::Sender<()>,
     visibility_worker: Mutex<Option<JoinHandle<()>>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     retirement_complete: Option<std::sync::mpsc::Sender<std::thread::ThreadId>>,
 }
 
@@ -641,14 +744,14 @@ impl RetiredClient {
             let _ = worker.join();
         }
         let id = self.payload.id;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let completed = self.payload.retirement_complete.take();
         // Actual publication, codec scratch, pending replies, session metadata
         // and callback ownership all leave the event thread together.
         drop(self);
         tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "chat_client", chat_id = %id,
             released = true, resident_bytes = 0usize);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(completed) = completed {
             let _ = completed.send(std::thread::current().id());
         }
@@ -907,16 +1010,66 @@ fn transmit(
     id: u64,
     request: ClientRequest,
 ) -> Result<(), String> {
-    let hidden = matches!(
-        &request,
-        ClientRequest::ChatVisibility { visible: false, .. }
-    );
     let mut wire = wire.lock().unwrap_or_else(|p| p.into_inner());
+    write_request(&mut wire, proof, id, request)
+}
+/// Send a presentation read if the daemon was last told the chat is
+/// visible; otherwise the visible frame still to come makes the daemon
+/// announce a change, which reads then. A sent read is returned as its
+/// [`SentRead`].
+fn transmit_read(
+    wire: &Mutex<Wire>,
+    proof: &HostSessionProof,
+    id: u64,
+    request: ClientRequest,
+) -> Result<Option<SentRead>, String> {
+    let mut wire = wire.lock().unwrap_or_else(|p| p.into_inner());
+    if !wire.announced {
+        return Ok(None);
+    }
+    let hidings = wire.hidings;
+    write_request(&mut wire, proof, id, request).map(|()| Some(SentRead { id, hidings }))
+}
+/// A presentation read on the wire: its request id, and how many hidden
+/// frames had been sent before it.
+#[derive(Clone, Copy)]
+struct SentRead {
+    id: u64,
+    hidings: u64,
+}
+impl SentRead {
+    /// Whether `error`, answering `request`, is the daemon refusing this read
+    /// because a hide sent after it arrived first. Showing the chat again
+    /// makes the daemon announce a change, so the read is simply made again.
+    fn overtaken(
+        self,
+        request: Option<u64>,
+        error: &ipc::ProtocolError,
+        wire: &Mutex<Wire>,
+    ) -> bool {
+        request == Some(self.id)
+            && error.code == ipc::ProtocolErrorCode::InvalidRequest
+            && wire.lock().unwrap_or_else(|p| p.into_inner()).hidings != self.hidings
+    }
+}
+fn write_request(
+    wire: &mut Wire,
+    proof: &HostSessionProof,
+    id: u64,
+    request: ClientRequest,
+) -> Result<(), String> {
+    let visibility = match &request {
+        ClientRequest::ChatVisibility { visible, .. } => Some(*visible),
+        _ => None,
+    };
+    let hidden = visibility == Some(false);
     let Wire {
         stream,
         codec,
         body_requested,
-    } = &mut *wire;
+        announced,
+        hidings,
+    } = wire;
     codec
         .write(
             stream,
@@ -928,6 +1081,12 @@ fn transmit(
             },
         )
         .map_err(|e| e.to_string())?;
+    if let Some(visible) = visibility {
+        *announced = visible;
+    }
+    if hidden {
+        *hidings += 1;
+    }
     if hidden || !body_requested.load(Ordering::Acquire) {
         codec.release_spare();
     }
@@ -1088,10 +1247,7 @@ fn native_environment(session: &Session, standalone: bool) -> ipc::ChatExecution
     } else {
         BTreeMap::new()
     };
-    session
-        .launch
-        .recipe
-        .remove_unset_environment(&mut environment);
+    session.launch.recipe.withhold_environment(&mut environment);
     ipc::ChatExecutionEnvironment(environment)
 }
 
@@ -1114,10 +1270,21 @@ fn restore(
     mut session: Session,
     upgrade_recovery: &mut Option<(Session, Session)>,
     resumed_from: &mut Option<Session>,
-    retry_explicit_start: bool,
+    intent: Intent,
 ) -> Result<ClientRequest, StartFailure> {
+    let retry_explicit_start = intent == Intent::RetryStart;
+    let existing_only = intent == Intent::RestoreExisting;
     if session.proof.as_ref() == Some(proof) && !retry_explicit_start {
         return Ok(ClientRequest::ChatAttach { session });
+    }
+    if crate::upgrade::floor::load().is_ok_and(|ledger| {
+        ledger
+            .resume_source(&session)
+            .is_some_and(|original| original.launch.session_id.is_none())
+    }) {
+        return Err(StartFailure::retry(
+            "This conversation was stopped for the update before it recorded a conversation. Its saved pane is kept; start a fresh conversation from the pane.",
+        ));
     }
     let mut refusal = None;
     if retry_explicit_start
@@ -1149,7 +1316,8 @@ fn restore(
         if let Some(hosted) = sessions.into_iter().find(|hosted| hosted.id == session.id) {
             if hosted.proof.as_ref() != Some(proof)
                 || hosted.launch.provider != session.launch.provider
-                || hosted.launch.recipe != session.launch.recipe
+                || (hosted.launch.recipe != session.launch.recipe
+                    && !session.resolved_to_owned_codex_listener(&hosted))
                 || (session.launch.session_id.is_some()
                     && session.launch.session_id != hosted.launch.session_id)
             {
@@ -1275,6 +1443,17 @@ fn restore(
             Err(message) => refusal = Some(message),
         }
     }
+    if crate::upgrade::floor::load().is_ok_and(|ledger| ledger.resume_source(&session).is_some()) {
+        return Err(StartFailure::retry(
+            "This conversation was stopped for the update. Its saved files are kept; the transcript preview could not be attached. Nothing was restarted.",
+        ));
+    }
+    if existing_only {
+        return Err(StartFailure::retry(format!(
+            "This recovery pane could not attach to an existing conversation. Its saved conversation is kept; use the pane's Start or Resume action to continue it explicitly. {}",
+            refusal.unwrap_or_else(|| "No exact daemon-owned conversation was available.".into())
+        )));
+    }
     if matches!(
         session.native_continuity,
         super::NativeContinuity::RetainedClaudeActor { .. }
@@ -1399,8 +1578,9 @@ impl ClientHandle {
     ///
     /// The peer sockets are kept open for the process lifetime so dropping the
     /// handle does not look like a protocol failure to a test that only draws.
-    #[cfg(test)]
-    pub(crate) fn fixture(session: Session, snapshot: Snapshot) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn fixture(session: Session, snapshot: Snapshot) -> Self {
         let retirement = ClientRetirement::shared().expect("start fixture client retirement");
         let body_requested = Arc::new(AtomicBool::new(true));
         let user_item_seen = snapshot
@@ -1430,6 +1610,8 @@ impl ClientHandle {
                         stream,
                         codec: FrameCodec::new(ipc::MAX_FRAME_BYTES),
                         body_requested: body_requested.clone(),
+                        announced: false,
+                        hidings: 0,
                     })),
                     cancel,
                     publication: Arc::new(Publications::new(snapshot)),
@@ -1443,6 +1625,8 @@ impl ClientHandle {
                     })),
                     observed: Arc::new(Mutex::new(OutputObservation::default())),
                     account_usage: Arc::default(),
+                    limit: Arc::default(),
+                    agent_addresses: Arc::default(),
                     next: Arc::new(AtomicU64::new(1)),
                     alive: Arc::new(AtomicBool::new(true)),
                     visible: Arc::new(AtomicBool::new(true)),
@@ -1461,8 +1645,9 @@ impl ClientHandle {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn fixture_upgrade(source: Session, session: Session, snapshot: Snapshot) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn fixture_upgrade(source: Session, session: Session, snapshot: Snapshot) -> Self {
         assert!(super::is_upgrade_recovery(&source, &session));
         assert_eq!(snapshot.session_id, session.launch.session_id);
         let proof = session.proof.clone().unwrap();
@@ -1477,8 +1662,9 @@ impl ClientHandle {
     }
 
     /// A started resume successor of the stranded retained card `source`.
-    #[cfg(test)]
-    pub(crate) fn fixture_resumed(source: Session, session: Session, snapshot: Snapshot) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn fixture_resumed(source: Session, session: Session, snapshot: Snapshot) -> Self {
         assert!(super::is_retained_resume_commit(&source, &session));
         let proof = session.proof.clone().unwrap();
         let mut handle = Self::fixture(session, snapshot);
@@ -1489,13 +1675,14 @@ impl ClientHandle {
     }
 
     /// Drives the production connect/lineage/attach path for UI writer tests.
-    #[cfg(test)]
-    pub(crate) fn fixture_upgrade_handshake(
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn fixture_upgrade_handshake(
         source: Session,
         session: Session,
         snapshot: Snapshot,
     ) -> Result<Self, StartFailure> {
-        tests::restore_with_lineage(source, Some(session), move |request| {
+        fixture::restore_with_lineage(source, Some(session), move |request| {
             let ClientRequest::ChatAttach { session } = request else {
                 panic!("expected exact upgrade attach");
             };
@@ -1507,8 +1694,9 @@ impl ClientHandle {
 
     /// Test-only access to the real start handshake and reader on a private
     /// socket. It never discovers a daemon or launches a provider.
-    #[cfg(test)]
-    pub(crate) fn fixture_start_on(
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn fixture_start_on(
         stream: UnixStream,
         session: Session,
         wake: impl Fn(Wake) + Send + Sync + 'static,
@@ -1528,16 +1716,18 @@ impl ClientHandle {
 
     /// Publishes `snapshot` as the reader thread would on a presentation
     /// frame, so a test can stream a transcript into a surface.
-    #[cfg(test)]
-    pub(crate) fn publish_snapshot_for_test(&self, snapshot: Snapshot) {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn publish_snapshot_for_test(&self, snapshot: Snapshot) {
         self.install_snapshot_for_test(snapshot);
     }
 
     /// Apply a fixture publication through the production delta validator and
     /// append-lineage recorder. A full-snapshot fixture intentionally resets
     /// that lineage and cannot stand in for a streaming delta benchmark.
-    #[cfg(test)]
-    pub(crate) fn publish_presentation_for_test(&self, update: super::presentation::Presentation) {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn publish_presentation_for_test(&self, update: super::presentation::Presentation) {
         let (base, revision) = self.inner.publication.capture();
         let mut lineage = base.lineage.clone();
         let candidates = append::Lineage::candidates(&update, &base.snapshot);
@@ -1560,8 +1750,9 @@ impl ClientHandle {
     /// Build normal daemon-style deltas while retaining the production
     /// transaction validator and weak append authority. Full reset fixtures
     /// deliberately keep using publish_snapshot_for_test instead.
-    #[cfg(test)]
-    pub(crate) fn publish_delta_snapshot_for_test(&self, mut next: Snapshot) {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn publish_delta_snapshot_for_test(&self, mut next: Snapshot) {
         use super::presentation::{ChildUpdate, ItemChange, Presentation};
         let previous = self.snapshot();
         let changes = |old: &[Arc<super::Item>], items: &[Arc<super::Item>]| {
@@ -1610,8 +1801,9 @@ impl ClientHandle {
 
     /// Queues a report as the reader thread would on its arrival, and says
     /// whether it would have woken the surface.
-    #[cfg(test)]
-    pub(crate) fn push_account_usage_for_test(&self, report: LiveReport, observed_at: u64) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn push_account_usage_for_test(&self, report: LiveReport, observed_at: u64) -> bool {
         self.inner
             .account_usage
             .lock()
@@ -1619,10 +1811,37 @@ impl ClientHandle {
             .push(report, observed_at)
     }
 
+    /// Records the subagent addresses the daemon sent as the reader thread
+    /// would on their arrival.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn learn_agent_addresses_for_test(&self, addresses: Vec<super::AgentAddress>) {
+        learn_addresses(
+            &mut self
+                .inner
+                .agent_addresses
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
+            addresses,
+        );
+    }
+
+    /// Records the daemon's judgement of a usage limit as the reader thread
+    /// would on its arrival.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn judge_limit_for_test(
+        &self,
+        limit: Option<crate::agent_execution::directory::UsageLimit>,
+    ) {
+        *self.inner.limit.lock().unwrap_or_else(|p| p.into_inner()) = limit;
+    }
+
     /// Records an activity edge as the reader thread would, and says whether
     /// it would have woken the surface.
-    #[cfg(test)]
-    pub(crate) fn observe_activity_for_test(&self, state: ActivityState) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn observe_activity_for_test(&self, state: ActivityState) -> bool {
         let mut activity = self
             .inner
             .activity
@@ -1633,27 +1852,41 @@ impl ClientHandle {
     }
 
     /// Whether the handle has asked its daemon to keep the snapshot current.
-    #[cfg(test)]
-    pub(crate) fn is_visible_for_test(&self) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn is_visible_for_test(&self) -> bool {
         self.inner.visible.load(Ordering::Acquire)
     }
 
     /// Marks the connection lost, as the reader thread does when its daemon
     /// goes away.
-    #[cfg(test)]
-    pub(crate) fn disconnect_for_test(&self) {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn disconnect_for_test(&self) {
         self.inner.alive.store(false, Ordering::Release);
     }
 
-    #[cfg(test)]
-    pub(crate) fn replace_snapshot_for_test(&self, snapshot: Snapshot) {
+    /// Deliver a full snapshot the way the reader thread takes a daemon's
+    /// `ChatSnapshot` reply, sharing unchanged items with a kept body.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn deliver_snapshot_for_test(&self, snapshot: Snapshot) {
+        self.inner
+            .publication
+            .replace(snapshot, &self.inner.body_requested, false, false);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn replace_snapshot_for_test(&self, snapshot: Snapshot) {
         self.install_snapshot_for_test(snapshot);
     }
 
     /// Observe disposal of this exact publication, independently of the UI's
     /// presentation reclaimer. The signal follows destruction of its payload.
-    #[cfg(test)]
-    pub(crate) fn observe_snapshot_retirement_for_test(
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn observe_snapshot_retirement_for_test(
         &self,
     ) -> std::sync::mpsc::Receiver<std::thread::ThreadId> {
         let (completed, observed) = std::sync::mpsc::channel();
@@ -1789,7 +2022,7 @@ impl ClientHandle {
         // A restore runs right after an application update has stopped the
         // daemon it is about to ask for, so it starts one for the same reason a
         // new conversation does instead of failing on an absent socket.
-        let socket = crate::terminal::ensure_daemon_ready().map_err(|e| e.to_string())?;
+        let socket = chat_socket(intent)?;
         let stream = connect_daemon(&socket)
             .map_err(|e| format!("Cannot connect to the proven chat daemon: {e}"))?;
         Self::connect_on(
@@ -1812,15 +2045,27 @@ impl ClientHandle {
         expected: Session,
         wake: impl Fn(Wake) + Send + Sync + 'static,
     ) -> Result<Self, StartFailure> {
+        Self::connect_upgrade_with_intent(source, expected, Intent::Restore, wake)
+    }
+
+    pub fn connect_upgrade_with_intent(
+        source: Session,
+        expected: Session,
+        intent: Intent,
+        wake: impl Fn(Wake) + Send + Sync + 'static,
+    ) -> Result<Self, StartFailure> {
+        if !matches!(intent, Intent::Restore | Intent::RestoreExisting) {
+            return Err("Canonical recovery must attach an existing conversation".into());
+        }
         if UpgradeRecovery::candidate(&source, &expected).is_none() {
             return Err("The canonical chat is not an exact upgrade of the saved source".into());
         }
-        let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
+        let socket = chat_socket(intent)?;
         let stream = connect_daemon(&socket).map_err(|error| error.to_string())?;
         Self::connect_on(
             stream,
             source,
-            Intent::Restore,
+            intent,
             None,
             false,
             None,
@@ -1838,7 +2083,7 @@ impl ClientHandle {
         if !super::is_account_recovery(&source, &replacement) {
             return Err("Account recovery changed the saved conversation".into());
         }
-        let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
+        let socket = chat_socket(Intent::Start)?;
         let stream = connect_daemon(&socket).map_err(|error| error.to_string())?;
         Self::connect_on(
             stream,
@@ -1862,7 +2107,7 @@ impl ClientHandle {
         if !super::is_account_recovery(&source, &replacement) {
             return Err("Account switch changed the saved conversation".into());
         }
-        let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
+        let socket = chat_socket(Intent::Start)?;
         let stream = connect_daemon(&socket).map_err(|error| error.to_string())?;
         Self::connect_on(
             stream,
@@ -1909,6 +2154,14 @@ impl ClientHandle {
         wake: impl Fn(Wake) + Send + Sync + 'static,
     ) -> Result<Self, StartFailure> {
         let retirement = ClientRetirement::for_client(session.id)?;
+        if intent == Intent::RestoreExisting
+            && (source.is_some()
+                || terminate_source
+                || selection.is_some()
+                || account_recovery.is_some())
+        {
+            return Err("Recovery restoration may only attach existing conversations".into());
+        }
         if intent == Intent::RetryStart
             && (source.is_some()
                 || terminate_source
@@ -1921,8 +2174,24 @@ impl ClientHandle {
         {
             return Err("Only an exact explicit history start can be retried".into());
         }
+        if intent == Intent::Resume
+            && (source.is_some()
+                || terminate_source
+                || selection.is_some()
+                || account_recovery.is_some()
+                || upgrade_expected.is_some()
+                || session.launch.provider != crate::agent::Provider::Claude
+                || !matches!(
+                    session.native_continuity,
+                    super::NativeContinuity::RetainedClaudeActor { .. }
+                ))
+        {
+            return Err(StartFailure::from(
+                "Only a Claude conversation whose provider stopped can be resumed in its card",
+            ));
+        }
         if let Some(expected) = &upgrade_expected
-            && (intent != Intent::Restore
+            && (!matches!(intent, Intent::Restore | Intent::RestoreExisting)
                 || source.is_some()
                 || terminate_source
                 || selection.is_some()
@@ -2022,6 +2291,68 @@ impl ClientHandle {
                     .ok_or("Selected conversation activation requires a proven source terminal")?,
                 token,
             }
+        } else if intent == Intent::Resume {
+            // Only this daemon's own proof names the ended actor it still
+            // holds. A card from an earlier incarnation has no actor here to
+            // retire, and its ordinary restore already resumes it from disk.
+            if session.proof.as_ref() != Some(&proof) {
+                restore(
+                    &mut stream,
+                    &mut codec,
+                    &mut attach_request,
+                    &proof,
+                    session,
+                    &mut upgrade_recovery,
+                    &mut resumed_from,
+                    Intent::Restore,
+                )?
+            } else {
+                resume_retained_claude(
+                    &mut stream,
+                    &mut codec,
+                    &mut attach_request,
+                    &proof,
+                    session,
+                    &mut resumed_from,
+                    None,
+                )?
+            }
+        } else if intent == Intent::Start
+            && let Ok(ledger) = crate::upgrade::floor::load()
+            && let Some(original) = ledger.resume_source(&session).cloned()
+        {
+            let request_id = attach_request;
+            attach_request += 1;
+            codec
+                .write(
+                    &mut stream,
+                    &ClientEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id,
+                        proof: Some(proof.clone()),
+                        request: ClientRequest::ChatPrepareResume { source: original },
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+            let prepared = match receive(&mut stream, &mut codec, request_id, Some(&proof))? {
+                ServerResponse::ChatResumePrepared { session: prepared }
+                    if super::is_retained_resume_successor(&session, &prepared) =>
+                {
+                    prepared
+                }
+                _ => return Err(
+                    "The stopped conversation did not receive its exact proof-checked successor"
+                        .into(),
+                ),
+            };
+            resumed_from = Some(session);
+            let execution_environment = native_environment(&prepared, true);
+            ClientRequest::ChatStart {
+                session: prepared,
+                source: None,
+                terminate_source: false,
+                execution_environment,
+            }
         } else if intent == Intent::Start {
             let execution_environment = native_environment(&session, source.is_none());
             ClientRequest::ChatStart {
@@ -2039,7 +2370,7 @@ impl ClientHandle {
                 session,
                 &mut upgrade_recovery,
                 &mut resumed_from,
-                intent == Intent::RetryStart,
+                intent,
             )?
         };
         if let ClientRequest::ChatStart { session, .. } = &request
@@ -2066,7 +2397,10 @@ impl ClientHandle {
         let mut early_activity = None;
         let mut early_observed = OutputObservation::default();
         let mut early_usage = AccountUsage::default();
-        let (session, initial) = loop {
+        let mut early_limit = None;
+        let mut early_addresses = AgentAddresses::default();
+        let mut early_model = None;
+        let (session, mut initial) = loop {
             #[cfg(feature = "ui")]
             let health_request = crate::daemon_health::begin();
             let frame = codec.read(&mut stream);
@@ -2104,12 +2438,34 @@ impl ClientHandle {
                 {
                     early_observed.observe(epoch);
                 }
+                ServerMessage::ChatActiveModel {
+                    chat_id,
+                    revision,
+                    model,
+                } if chat_id == id && envelope.request_id.is_none() => {
+                    if early_model
+                        .as_ref()
+                        .is_none_or(|(known, _)| *known < revision)
+                    {
+                        early_model = Some((revision, model));
+                    }
+                }
                 ServerMessage::ChatAccountUsage {
                     chat_id,
                     report,
                     observed_at,
                 } if chat_id == id && envelope.request_id.is_none() => {
                     early_usage.push(report, observed_at);
+                }
+                ServerMessage::ChatLimit { chat_id, limit }
+                    if chat_id == id && envelope.request_id.is_none() =>
+                {
+                    early_limit = limit;
+                }
+                ServerMessage::ChatAgentAddresses { chat_id, addresses }
+                    if chat_id == id && envelope.request_id.is_none() =>
+                {
+                    learn_addresses(&mut early_addresses, addresses);
                 }
                 ServerMessage::Response {
                     response: ServerResponse::ChatAttached { session, snapshot },
@@ -2121,11 +2477,23 @@ impl ClientHandle {
                 ServerMessage::Error(error) if envelope.request_id == Some(attach_request) => {
                     #[cfg(feature = "ui")]
                     crate::daemon_health::frame(&stream, None, health_request);
-                    return Err(start_failure(error));
+                    let mut failure = start_failure(error);
+                    if intent == Intent::RestoreExisting {
+                        // An ordinary recovery attachment cannot enter the
+                        // account-recovery path, whose callback starts a
+                        // provider. Account changes remain explicit actions.
+                        failure.recovery = super::Recovery::Retry;
+                        failure.message.push_str(" This recovery pane only attaches existing conversations. Restore its account in Settings if needed, then choose Start or Resume explicitly; Retry only attempts attachment.");
+                    }
+                    return Err(failure);
                 }
                 _ => return Err("Daemon did not attach the exact native chat".into()),
             }
         };
+        if let Some((revision, model)) = early_model {
+            initial.active_model_revision = revision;
+            initial.active_model = model;
+        }
         let upgrade_recovery = upgrade_recovery
             .map(|(source, resolved)| {
                 UpgradeRecovery::confirmed(source, resolved, &session, &initial)
@@ -2139,6 +2507,8 @@ impl ClientHandle {
             stream,
             codec: FrameCodec::new(ipc::MAX_CLIENT_FRAME_BYTES),
             body_requested: body_requested.clone(),
+            announced: false,
+            hidings: 0,
         }));
         let mut activity = ActivityObservation {
             generation: initial.generation,
@@ -2151,6 +2521,8 @@ impl ClientHandle {
         let activity = Arc::new(Mutex::new(activity));
         let observed = Arc::new(Mutex::new(early_observed));
         let account_usage = Arc::new(Mutex::new(early_usage));
+        let limit = Arc::new(Mutex::new(early_limit));
+        let agent_addresses = Arc::new(Mutex::new(early_addresses));
         // Attachment also serves non-UI callers that inspect the initial
         // publication directly. The UI immediately sets its actual visibility;
         // an unvisited hidden pane releases this body without preparing it.
@@ -2186,6 +2558,8 @@ impl ClientHandle {
                 activity: activity.clone(),
                 observed: observed.clone(),
                 account_usage: account_usage.clone(),
+                limit: limit.clone(),
+                agent_addresses: agent_addresses.clone(),
                 next: next.clone(),
                 alive: alive.clone(),
                 wake: wake.clone(),
@@ -2197,7 +2571,7 @@ impl ClientHandle {
                 text_copies: AtomicUsize::new(0),
                 visibility_tx,
                 visibility_worker: Mutex::new(None),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 retirement_complete: None,
             },
             retirement,
@@ -2248,6 +2622,7 @@ impl ClientHandle {
             trace_worker_stack("chat_reader");
             publication.bind_source_thread();
             let mut read_pending = false;
+            let mut sent_read = SentRead { id: 0, hidings: 0 };
             let mut read_again = false;
             let mut resync = false;
             let failure = loop {
@@ -2272,10 +2647,13 @@ impl ClientHandle {
                         let resident = publication.replace(final_snapshot, &body_requested, false, false);
                         if resident != Some(true) && body_requested.load(Ordering::Acquire) {
                             resync = true;
+                            read_again = true;
                             if visible.load(Ordering::Acquire) && !read_pending {
-                                if let Err(error) = transmit(&wire, &proof, next.fetch_add(1, Ordering::Relaxed), ClientRequest::ChatRead { chat_id: id, after_generation: None }) { break error; }
-                                read_pending = true;
-                            } else { read_again = true; }
+                                match transmit_read(&wire, &proof, next.fetch_add(1, Ordering::Relaxed), ClientRequest::ChatRead { chat_id: id, after_generation: None }) {
+                                    Ok(sent) => { read_pending = sent.is_some(); read_again = sent.is_none(); sent_read = sent.unwrap_or(sent_read); }
+                                    Err(error) => break error,
+                                }
+                            }
                         }
                         if let Some(reply) = envelope.request_id.and_then(|id| pending.lock().unwrap_or_else(|p|p.into_inner()).remove(&id)) {
                             let _ = reply.reply.try_send(Ok(terminal));
@@ -2349,10 +2727,29 @@ impl ClientHandle {
                             .observe(generation, state);
                         if changed { wake(Wake::Activity); }
                     },
+                    ServerMessage::ChatActiveModel { chat_id, revision, model } if chat_id == id => {
+                        if publication.active_model(revision, model, &body_requested) { wake(Wake::Changed); }
+                    },
                     ServerMessage::ChatAccountUsage { chat_id, report, observed_at } if chat_id == id => {
                         let first = account_usage.lock().unwrap_or_else(|p| p.into_inner())
                             .push(report, observed_at);
                         if first { wake(Wake::AccountUsage); }
+                    },
+                    ServerMessage::ChatLimit { chat_id, limit: judged } if chat_id == id => {
+                        let changed = {
+                            let mut known = limit.lock().unwrap_or_else(|p| p.into_inner());
+                            let changed = *known != judged;
+                            *known = judged;
+                            changed
+                        };
+                        if changed { wake(Wake::Limit); }
+                    },
+                    ServerMessage::ChatAgentAddresses { chat_id, addresses } if chat_id == id => {
+                        let learned = learn_addresses(
+                            &mut agent_addresses.lock().unwrap_or_else(|p| p.into_inner()),
+                            addresses,
+                        );
+                        if learned { wake(Wake::AgentAddresses); }
                     },
                     ServerMessage::Response { response: ServerResponse::ChatSnapshot { chat_id, snapshot: update } } if chat_id == id => {
                         read_pending = false;
@@ -2413,6 +2810,16 @@ impl ClientHandle {
                         tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "chat_client", chat_id = %id,
                             resident_bytes = state.snapshot.transcript_bytes());
                     },
+                    ServerMessage::Error(error)
+                        if read_pending && sent_read.overtaken(envelope.request_id, &error, &wire) =>
+                    {
+                        // The daemon refused a read that a hide overtook, so
+                        // a kept body is not marked with an error it no
+                        // longer has. If the chat is visible again by now,
+                        // read again; otherwise showing it will.
+                        read_pending = false;
+                        read_again = true;
+                    },
                     ServerMessage::Error(error) => {
                         read_pending = false;
                         loop {
@@ -2441,13 +2848,14 @@ impl ClientHandle {
                     _ => break "Unexpected native chat protocol frame".into(),
                 }
                 if read_again && !read_pending && visible.load(Ordering::Acquire) {
-                    read_again = false;
                     let after_generation = {
                         let state = publication.current.load();
                         (!resync && (state.resident || !body_requested.load(Ordering::Acquire))).then_some(state.snapshot.generation)
                     };
-                    if let Err(error) = transmit(&wire, &proof, next.fetch_add(1, Ordering::Relaxed), ClientRequest::ChatRead { chat_id: id, after_generation }) { break error; }
-                    read_pending = true;
+                    match transmit_read(&wire, &proof, next.fetch_add(1, Ordering::Relaxed), ClientRequest::ChatRead { chat_id: id, after_generation }) {
+                        Ok(sent) => { read_pending = sent.is_some(); read_again = sent.is_none(); sent_read = sent.unwrap_or(sent_read); }
+                        Err(error) => break error,
+                    }
                 }
             };
             alive.store(false, Ordering::Release);
@@ -2489,7 +2897,12 @@ impl ClientHandle {
         session.learn_native_continuity(&snapshot.native_continuity);
         session
     }
-    pub(crate) fn upgrade_recovery(&self) -> Option<&(Session, Session)> {
+    /// The identity negotiated by ChatAttached, before snapshot projection.
+    /// A read-only reader cannot move to another conversation after attachment.
+    pub fn attached_session_id(&self) -> Option<&str> {
+        self.inner.session.launch.session_id.as_deref()
+    }
+    pub fn upgrade_recovery(&self) -> Option<&(Session, Session)> {
         self.inner
             .upgrade_recovery
             .as_ref()
@@ -2497,13 +2910,13 @@ impl ClientHandle {
     }
     /// The saved card whose stranded retained owner this successor replaces,
     /// when the daemon proved that owner gone and prepared a resume.
-    pub(crate) fn resumed_from(&self) -> Option<&Session> {
+    pub fn resumed_from(&self) -> Option<&Session> {
         self.inner.resumed_from.as_ref()
     }
-    pub(crate) fn authenticated_upgrade_recovery(&self) -> Option<&UpgradeRecovery> {
+    pub fn authenticated_upgrade_recovery(&self) -> Option<&UpgradeRecovery> {
         self.inner.upgrade_recovery.as_ref()
     }
-    pub(crate) fn is_connected(&self) -> bool {
+    pub fn is_connected(&self) -> bool {
         self.inner.alive.load(Ordering::Acquire)
     }
 
@@ -2517,9 +2930,7 @@ impl ClientHandle {
 
     /// Control metadata for a hidden runtime, without borrowing its body.
     /// A disconnected client's final publication must remain readable instead.
-    pub(crate) fn hidden_snapshot_with_clock(
-        &self,
-    ) -> Option<(Arc<Snapshot>, Option<SourceClock>)> {
+    pub fn hidden_snapshot_with_clock(&self) -> Option<(Arc<Snapshot>, Option<SourceClock>)> {
         let (mut snapshot, clock) = self.snapshot_with_clock();
         if !self.inner.alive.load(Ordering::Acquire) {
             return None;
@@ -2528,29 +2939,27 @@ impl ClientHandle {
         Some((snapshot, clock))
     }
 
-    pub(crate) fn has_observed_user_item(&self) -> bool {
+    pub fn has_observed_user_item(&self) -> bool {
         self.inner.user_item_seen.load(Ordering::Acquire)
     }
 
     /// A prompt receipt can precede its first transcript publication. Either
     /// authenticated observation forbids offering that prompt as an unsent draft.
-    pub(crate) fn has_accepted_user_input(&self) -> bool {
+    pub fn has_accepted_user_input(&self) -> bool {
         self.has_observed_user_item() || self.inner.prompt_accepted.load(Ordering::Acquire)
     }
 
     /// A renderable publication, absent until a hidden client's full history
     /// has been rehydrated. Metadata-only generations must never clear a
     /// runtime's scroll/disclosure state as if they were empty conversations.
-    pub(crate) fn resident_snapshot_with_clock(
-        &self,
-    ) -> Option<(Arc<Snapshot>, Option<SourceClock>)> {
+    pub fn resident_snapshot_with_clock(&self) -> Option<(Arc<Snapshot>, Option<SourceClock>)> {
         let state = self.inner.publication.current.load();
         state
             .resident
             .then(|| (state.snapshot.clone(), state.clock))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn install_snapshot_for_test(&self, update: Snapshot) {
         self.inner.user_item_seen.fetch_or(
             update
@@ -2580,6 +2989,24 @@ impl ClientHandle {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         activity.take()
+    }
+    /// How the provider addresses this conversation's subagents, by address,
+    /// with the ID its snapshot lists each under.
+    pub fn agent_addresses(&self) -> AgentAddresses {
+        self.inner
+            .agent_addresses
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+    /// The usage limit that stops this conversation, as the daemon last
+    /// judged it.
+    pub fn limit(&self) -> Option<crate::agent_execution::directory::UsageLimit> {
+        self.inner
+            .limit
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
     /// Drains what the provider reported about the account this chat runs
     /// on, oldest first.
@@ -2789,11 +3216,7 @@ impl ClientHandle {
             command,
         })
     }
-    pub(crate) fn known_append(
-        &self,
-        previous: &Arc<super::Item>,
-        current: &Arc<super::Item>,
-    ) -> bool {
+    pub fn known_append(&self, previous: &Arc<super::Item>, current: &Arc<super::Item>) -> bool {
         self.inner
             .publication
             .current
@@ -2808,7 +3231,7 @@ impl ClientHandle {
 
     /// Keep control notifications flowing for queued commands without keeping
     /// renderable history resident in an offscreen UI card.
-    pub(crate) fn set_interest(&self, interested: bool, retain_body: bool) -> Result<(), String> {
+    pub fn set_interest(&self, interested: bool, retain_body: bool) -> Result<(), String> {
         if !self.inner.alive.load(Ordering::Acquire) {
             return Err("Chat is disconnected".into());
         }
@@ -3014,9 +3437,214 @@ impl Drop for Inner {
     }
 }
 
+/// Daemon handshakes for chat-client tests here and in the UI crate.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod fixture {
+    use super::*;
+
+    pub fn host_proof(incarnation: &str) -> HostSessionProof {
+        use crate::model::{BootId, HostIncarnation, HostSessionId};
+        HostSessionProof {
+            host_session_id: HostSessionId::new("session"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new(incarnation),
+        }
+    }
+
+    pub fn restore_with_lineage(
+        session: Session,
+        resolved: Option<Session>,
+        answer: impl FnOnce(ClientRequest) -> ServerMessage + Send + 'static,
+    ) -> Result<ClientHandle, StartFailure> {
+        use crate::terminal_ipc::{ProtocolError, ProtocolErrorCode};
+        let live = resolved
+            .as_ref()
+            .and_then(|session| session.proof.clone())
+            .unwrap_or_else(|| host_proof("live"));
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let proof = live.clone();
+        let worker = thread::spawn(move || {
+            server
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            server
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            let respond = |codec: &mut FrameCodec, server: &mut UnixStream, id, message| {
+                codec
+                    .write(
+                        server,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: Some(id),
+                            proof: proof.clone(),
+                            message,
+                        },
+                    )
+                    .unwrap();
+            };
+            let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            respond(
+                &mut codec,
+                &mut server,
+                connect.request_id,
+                ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: proof.clone(),
+                        resumed: Vec::new(),
+                    },
+                },
+            );
+            let lineage: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            respond(
+                &mut codec,
+                &mut server,
+                lineage.request_id,
+                resolved.map_or_else(
+                    || {
+                        ServerMessage::Error(ProtocolError::new(
+                            ProtocolErrorCode::TerminalUnavailable,
+                            "No durable upgrade replacement exists for this native chat",
+                            false,
+                        ))
+                    },
+                    |session| ServerMessage::Response {
+                        response: ServerResponse::UpgradeChatResolved { session },
+                    },
+                ),
+            );
+            let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            respond(
+                &mut codec,
+                &mut server,
+                start.request_id,
+                answer(start.request),
+            );
+        });
+        let result = ClientHandle::connect_on(
+            client,
+            session,
+            Intent::Restore,
+            None,
+            false,
+            None,
+            None,
+            None,
+            |_| {},
+        );
+        worker.join().unwrap();
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::fixture::{host_proof, restore_with_lineage};
     use super::*;
+
+    #[test]
+    fn active_model_sidechannel_survives_snapshots_patches_and_hidden_publications() {
+        let publications = Publications::new(Snapshot {
+            generation: 4,
+            ..Snapshot::default()
+        });
+        let body = AtomicBool::new(true);
+        let model = super::super::ActiveModel {
+            id: "actual".into(),
+            label: "Actual model".into(),
+            reasoning: Some("high".into()),
+            default_reasoning: Some("medium".into()),
+            aliases: Vec::new(),
+        };
+        assert!(publications.active_model(2, Some(model.clone()), &body));
+        assert!(
+            !publications.active_model(1, None, &body),
+            "late attach status cannot rewind a live update"
+        );
+        assert_eq!(
+            publications.replace(
+                Snapshot {
+                    generation: 5,
+                    ..Snapshot::default()
+                },
+                &body,
+                false,
+                false
+            ),
+            Some(true)
+        );
+        let base = publications.current.load_full();
+        assert_eq!(base.snapshot.active_model.as_ref(), Some(&model));
+        assert_eq!(base.snapshot.active_model_revision, 2);
+        let patch = Publication::next(
+            &base,
+            Snapshot {
+                generation: 6,
+                ..Snapshot::default()
+            },
+            true,
+            append::Lineage::default(),
+        );
+        assert_eq!(patch.snapshot.active_model.as_ref(), Some(&model));
+        body.store(false, Ordering::Release);
+        assert!(publications.active_model(3, None, &body));
+        assert!(!publications.current.load().resident);
+        assert!(publications.current.load().snapshot.active_model.is_none());
+        assert!(publications.active_model(4, Some(model.clone()), &body));
+        assert_eq!(
+            publications.current.load().snapshot.active_model.as_ref(),
+            Some(&model)
+        );
+        assert_eq!(
+            publications.replace(
+                Snapshot {
+                    generation: 7,
+                    ..Snapshot::default()
+                },
+                &body,
+                false,
+                false
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            publications.current.load().snapshot.active_model.as_ref(),
+            Some(&model)
+        );
+    }
+
+    /// The daemon tells a surface every address it knows, as it learns one
+    /// and once on attaching, in whichever order those arrive.
+    #[test]
+    fn agent_addresses_accumulate_in_any_order_they_arrive() {
+        let address = |address: &str, subagent: &str| super::super::AgentAddress {
+            address: address.into(),
+            subagent: subagent.into(),
+        };
+        let mut known = AgentAddresses::default();
+        let shared = known.clone();
+        assert!(learn_addresses(
+            &mut known,
+            vec![
+                address("a1892b93e88999a7d", "toolu_relocate"),
+                address("a77f00d1e2b3c4d5a", "toolu_review"),
+            ]
+        ));
+        // The copy a frame holds is not changed under it.
+        assert!(shared.is_empty());
+        let learned = known.clone();
+        // An older list, sent on attaching after a newer one, adds nothing,
+        // and an address keeps the agent it first named.
+        assert!(!learn_addresses(
+            &mut known,
+            vec![address("a1892b93e88999a7d", "toolu_other")]
+        ));
+        assert!(Arc::ptr_eq(&known, &learned), "nothing new is not a change");
+        assert_eq!(known["a1892b93e88999a7d"], "toolu_relocate");
+        assert_eq!(known.len(), 2);
+    }
 
     static REPLACEMENT_GATES: Mutex<
         BTreeMap<usize, (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
@@ -3618,15 +4246,6 @@ mod tests {
         assert_eq!(activity.take(), ActivityState::Working);
     }
 
-    fn host_proof(incarnation: &str) -> HostSessionProof {
-        use crate::model::{BootId, HostIncarnation, HostSessionId};
-        HostSessionProof {
-            host_session_id: HostSessionId::new("session"),
-            boot_id: BootId::new("boot"),
-            host_incarnation: HostIncarnation::new(incarnation),
-        }
-    }
-
     /// The live installation's own card: a native OMP conversation whose
     /// persisted launch names its session directory and nothing else.
     fn omp_card(conversation: Option<&str>, proof: Option<HostSessionProof>) -> Session {
@@ -3690,6 +4309,78 @@ mod tests {
                 assert!(matches!(asked, ClientRequest::ChatList));
                 assert!(
                     matches!(outcome, Ok(ClientRequest::ChatAttach { session }) if session == hosted)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_lost_codex_resume_reply_attaches_its_allocated_listener() {
+        let live = host_proof("live");
+        let mut saved = omp_card(Some(CONVERSATION), None);
+        saved.launch.provider = crate::agent::Provider::Codex;
+        saved.launch.recipe.program = "codex".into();
+        saved.launch.recipe.arguments = ["resume", CONVERSATION, "--remote", "unix://"]
+            .map(String::from)
+            .into();
+        let mut hosted = saved.clone();
+        assert!(hosted.claim_owned_codex_listener_for_unserved_thread(
+            std::path::Path::new("/run/test-native"),
+            &live,
+        ));
+        hosted.proof = Some(live.clone());
+        for conflict in 0..5 {
+            let mut advertised = hosted.clone();
+            match conflict {
+                0 => {}
+                1 => advertised.launch.session_id = Some("other-thread".into()),
+                2 => advertised.launch.recipe.arguments.push("--search".into()),
+                3 => advertised.launch.recipe.working_directory = "/other".into(),
+                4 => advertised.proof = Some(host_proof("stale")),
+                _ => unreachable!(),
+            }
+            let (mut client, mut server) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let proof = live.clone();
+            let worker = thread::spawn(move || {
+                let envelope: ClientEnvelope = ipc::read_frame(&mut server).unwrap().unwrap();
+                assert!(matches!(envelope.request, ClientRequest::ChatList));
+                ipc::write_frame(
+                    &mut server,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(envelope.request_id),
+                        proof,
+                        message: ServerMessage::Response {
+                            response: ServerResponse::ChatListed {
+                                sessions: vec![advertised],
+                            },
+                        },
+                    },
+                )
+                .unwrap();
+            });
+            let result = restore(
+                &mut client,
+                &mut FrameCodec::new(ipc::MAX_FRAME_BYTES),
+                &mut 1,
+                &live,
+                saved.clone(),
+                &mut None,
+                &mut None,
+                Intent::RetryStart,
+            );
+            worker.join().unwrap();
+            if conflict == 0 {
+                assert!(
+                    matches!(result, Ok(ClientRequest::ChatAttach { session }) if session == hosted)
+                );
+            } else {
+                assert!(
+                    result.is_err(),
+                    "a changed identity must not attach or restart: {conflict}"
                 );
             }
         }
@@ -3869,7 +4560,7 @@ mod tests {
             source,
             &mut None,
             &mut resumed,
-            false,
+            Intent::Restore,
         );
         drop(client);
         (result, resumed, worker.join().unwrap())
@@ -4099,7 +4790,7 @@ mod tests {
                 source,
                 &mut None,
                 &mut None,
-                true,
+                Intent::RetryStart,
             );
             worker.join().unwrap();
             match state {
@@ -4124,6 +4815,19 @@ mod tests {
         live: &HostSessionProof,
         session: Session,
         answer: ServerMessage,
+    ) -> (
+        Result<ClientRequest, StartFailure>,
+        ClientRequest,
+        Option<(Session, Session)>,
+    ) {
+        negotiate_with_restore_policy(live, session, answer, false)
+    }
+
+    fn negotiate_with_restore_policy(
+        live: &HostSessionProof,
+        session: Session,
+        answer: ServerMessage,
+        existing_only: bool,
     ) -> (
         Result<ClientRequest, StartFailure>,
         ClientRequest,
@@ -4161,9 +4865,295 @@ mod tests {
             session,
             &mut recovery,
             &mut None,
-            false,
+            if existing_only {
+                Intent::RestoreExisting
+            } else {
+                Intent::Restore
+            },
         );
         (outcome, worker.join().unwrap(), recovery)
+    }
+
+    #[test]
+    fn recovery_restore_policy_leaves_explicit_provider_actions_unchanged() {
+        use crate::instance::WindowRestorePolicy::{ExistingOnly, Ordinary};
+        for intent in [Intent::Start, Intent::Resume, Intent::RetryStart] {
+            assert_eq!(restore_intent(intent, ExistingOnly), intent);
+            assert_eq!(restore_intent(intent, Ordinary), intent);
+        }
+        assert_eq!(
+            restore_intent(Intent::Restore, ExistingOnly),
+            Intent::RestoreExisting
+        );
+        assert_eq!(restore_intent(Intent::Restore, Ordinary), Intent::Restore);
+    }
+
+    #[test]
+    fn recovery_restore_does_not_autostart_a_missing_daemon() {
+        const CHILD: &str = "CAGENTS_TEST_RECOVERY_ATTACH_WITHOUT_DAEMON";
+        if std::env::var_os(CHILD).is_some() {
+            crate::instance::initialize_window_restore_policy(
+                crate::instance::WindowRestorePolicy::ExistingOnly,
+            )
+            .unwrap();
+            let paths = crate::daemon::RuntimePaths::discover().unwrap();
+            assert!(!paths.lock.exists());
+            // Eager background publishers and device/pane readers share this
+            // entrypoint; they must not create a daemon admission either.
+            let assert_socket_only = |result| match result {
+                Err(crate::terminal::HostedTerminalStartError::HostProtocol(
+                    crate::control::ControlError::Connect(error),
+                )) => assert!(matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                )),
+                other => panic!(
+                    "recovery must fail at the existing socket, before binary lookup or daemon admission: {other:?}"
+                ),
+            };
+            assert_socket_only(crate::terminal::ensure_daemon_ready());
+            assert!(!paths.lock.exists());
+            assert_socket_only(crate::terminal::ensure_daemon_ready_for(
+                crate::notifications::Application::Cagents,
+            ));
+            assert!(!paths.lock.exists());
+            let result = ClientHandle::connect(
+                stranded_claude(Some(CONVERSATION)),
+                Intent::RestoreExisting,
+                None,
+                false,
+                None,
+                |_| {},
+            );
+            let failure = result.err().expect("missing daemon must refuse attachment");
+            assert!(
+                failure
+                    .message
+                    .starts_with("Cannot connect to the proven chat daemon:")
+            );
+            assert!(
+                !paths.lock.exists(),
+                "a read-only recovery attachment tried daemon admission"
+            );
+            assert!(!paths.socket.exists());
+            crate::instance::finish_window_restore();
+            assert_eq!(
+                crate::instance::window_restore_policy(),
+                crate::instance::WindowRestorePolicy::Ordinary
+            );
+            // The ordinary terminal/new-work path now reaches autostart's
+            // executable lookup. This lib-test executable has no daemon
+            // companion, so it refuses there without launching anything.
+            assert!(matches!(
+                crate::terminal::ensure_daemon_ready(),
+                Err(crate::terminal::HostedTerminalStartError::HostBinaryMissing(_))
+            ));
+            // A queued initial attachment keeps its explicit intent even
+            // when the worker does not run until after the startup verdict.
+            let delayed = ClientHandle::connect(
+                stranded_claude(Some(CONVERSATION)),
+                Intent::RestoreExisting,
+                None,
+                false,
+                None,
+                |_| {},
+            )
+            .err()
+            .unwrap();
+            assert!(
+                delayed
+                    .message
+                    .starts_with("Cannot connect to the proven chat daemon:")
+            );
+            let ordinary = ClientHandle::connect(
+                stranded_claude(Some(CONVERSATION)),
+                Intent::Restore,
+                None,
+                false,
+                None,
+                |_| {},
+            )
+            .err()
+            .unwrap();
+            assert!(
+                !ordinary
+                    .message
+                    .starts_with("Cannot connect to the proven chat daemon:")
+            );
+            assert!(!paths.lock.exists());
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        for directory in ["home", "runtime", "config", "data", "cache"] {
+            std::fs::create_dir(root.path().join(directory)).unwrap();
+        }
+        let name = std::thread::current().name().unwrap().to_owned();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", &name, "--nocapture"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", root.path().join("home"))
+            .env("XDG_RUNTIME_DIR", root.path().join("runtime"))
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("XDG_CACHE_HOME", root.path().join("cache"))
+            .env(CHILD, "1");
+        // Keep hosted authority: the exact socket-only error below must prove
+        // policy selection without relying on a separate lifecycle refusal.
+        if let Some(authority) = std::env::var_os(crate::agent_execution::AUTHORITY_ENV) {
+            command.env(crate::agent_execution::AUTHORITY_ENV, authority);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn recovery_restore_missing_claude_and_codex_never_prepare_or_start_a_provider() {
+        for provider in [
+            crate::agent::Provider::Claude,
+            crate::agent::Provider::Codex,
+        ] {
+            for named in [false, true] {
+                for proofless in [false, true] {
+                    let (stream, mut server) = UnixStream::pair().unwrap();
+                    let live = host_proof("recovery");
+                    let mut saved = if provider == crate::agent::Provider::Claude {
+                        stranded_claude(named.then_some(CONVERSATION))
+                    } else {
+                        let mut saved =
+                            omp_card(named.then_some(CONVERSATION), Some(host_proof("old")));
+                        saved.launch.provider = provider;
+                        saved.launch.recipe.program = "codex".into();
+                        saved
+                    };
+                    if proofless {
+                        saved.proof = None;
+                    }
+                    let expected = saved.clone();
+                    let worker = thread::spawn(move || {
+                        server
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        for step in 0..2 {
+                            let envelope: ClientEnvelope =
+                                ipc::read_frame(&mut server).unwrap().unwrap();
+                            let message = match (step, envelope.request) {
+                                (0, ClientRequest::Connect { .. }) => ServerMessage::Response {
+                                    response: ServerResponse::Connected {
+                                        proof: live.clone(),
+                                        resumed: vec![],
+                                    },
+                                },
+                                (1, ClientRequest::ChatList) if proofless => {
+                                    ServerMessage::Response {
+                                        response: ServerResponse::ChatListed { sessions: vec![] },
+                                    }
+                                }
+                                (1, ClientRequest::ResolveUpgradeChat { source })
+                                    if !proofless && source == expected =>
+                                {
+                                    ServerMessage::Error(ipc::ProtocolError::new(
+                                        ipc::ProtocolErrorCode::TerminalUnavailable,
+                                        "The exact retained holder is unavailable",
+                                        false,
+                                    ))
+                                }
+                                other => panic!(
+                                    "recovery must not prepare or start a provider: {other:?}"
+                                ),
+                            };
+                            ipc::write_frame(
+                                &mut server,
+                                &ServerEnvelope {
+                                    version: PROTOCOL_VERSION,
+                                    request_id: Some(envelope.request_id),
+                                    proof: live.clone(),
+                                    message,
+                                },
+                            )
+                            .unwrap();
+                        }
+                        let extra: Option<ClientEnvelope> = ipc::read_frame(&mut server).unwrap();
+                        assert!(
+                            extra.is_none(),
+                            "a missing recovery attachment sent an extra provider request"
+                        );
+                    });
+                    let result = ClientHandle::connect_on(
+                        stream,
+                        saved,
+                        Intent::RestoreExisting,
+                        None,
+                        false,
+                        None,
+                        None,
+                        None,
+                        |_| {},
+                    );
+                    let failure = result.err().expect("missing exact lineage must refuse");
+                    assert_eq!(failure.recovery, super::super::Recovery::Retry);
+                    assert!(failure.message.contains("Start or Resume"));
+                    worker.join().unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_restore_keeps_exact_live_and_issued_history_attachments() {
+        let live = host_proof("recovery");
+        let retained = stranded_claude(Some("6f1f6f1e-4a4b-4c4d-8e8f-909192939495"));
+        for history in [false, true] {
+            let mut saved = retained.clone();
+            if history {
+                saved.native_continuity = super::super::NativeContinuity::ReconnectOnly;
+            }
+            let mut current = saved.clone();
+            current.proof = Some(live.clone());
+            let (outcome, asked, _) = negotiate_with_restore_policy(
+                &live,
+                saved.clone(),
+                ServerMessage::Response {
+                    response: ServerResponse::UpgradeChatResolved {
+                        session: current.clone(),
+                    },
+                },
+                true,
+            );
+            assert!(
+                matches!(asked, ClientRequest::ResolveUpgradeChat { source } if source == saved)
+            );
+            assert!(
+                matches!(outcome, Ok(ClientRequest::ChatAttach { session }) if session == current)
+            );
+        }
+        let mut same_owner = retained;
+        same_owner.proof = Some(live.clone());
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let request = restore(
+            &mut client,
+            &mut FrameCodec::new(ipc::MAX_FRAME_BYTES),
+            &mut 2,
+            &live,
+            same_owner.clone(),
+            &mut None,
+            &mut None,
+            Intent::RestoreExisting,
+        )
+        .unwrap();
+        assert!(matches!(request, ClientRequest::ChatAttach { session } if session == same_owner));
+        drop(client);
+        assert!(
+            ipc::read_frame::<ClientEnvelope>(&mut server)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -4298,7 +5288,7 @@ mod tests {
             omp_card(Some(CONVERSATION), Some(live.clone())),
             &mut None,
             &mut None,
-            false,
+            Intent::Restore,
         )
         .expect("a live proof attaches");
         assert!(matches!(attach, ClientRequest::ChatAttach { .. }));
@@ -4471,92 +5461,6 @@ mod tests {
         answer: impl FnOnce(ClientRequest) -> ServerMessage + Send + 'static,
     ) -> Result<ClientHandle, StartFailure> {
         restore_with_lineage(session, None, answer)
-    }
-
-    pub(super) fn restore_with_lineage(
-        session: Session,
-        resolved: Option<Session>,
-        answer: impl FnOnce(ClientRequest) -> ServerMessage + Send + 'static,
-    ) -> Result<ClientHandle, StartFailure> {
-        use crate::terminal_ipc::{ProtocolError, ProtocolErrorCode};
-        let live = resolved
-            .as_ref()
-            .and_then(|session| session.proof.clone())
-            .unwrap_or_else(|| host_proof("live"));
-        let (client, mut server) = UnixStream::pair().unwrap();
-        let proof = live.clone();
-        let worker = thread::spawn(move || {
-            server
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            server
-                .set_write_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
-            let respond = |codec: &mut FrameCodec, server: &mut UnixStream, id, message| {
-                codec
-                    .write(
-                        server,
-                        &ServerEnvelope {
-                            version: PROTOCOL_VERSION,
-                            request_id: Some(id),
-                            proof: proof.clone(),
-                            message,
-                        },
-                    )
-                    .unwrap();
-            };
-            let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
-            respond(
-                &mut codec,
-                &mut server,
-                connect.request_id,
-                ServerMessage::Response {
-                    response: ServerResponse::Connected {
-                        proof: proof.clone(),
-                        resumed: Vec::new(),
-                    },
-                },
-            );
-            let lineage: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
-            respond(
-                &mut codec,
-                &mut server,
-                lineage.request_id,
-                resolved.map_or_else(
-                    || {
-                        ServerMessage::Error(ProtocolError::new(
-                            ProtocolErrorCode::TerminalUnavailable,
-                            "No durable upgrade replacement exists for this native chat",
-                            false,
-                        ))
-                    },
-                    |session| ServerMessage::Response {
-                        response: ServerResponse::UpgradeChatResolved { session },
-                    },
-                ),
-            );
-            let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
-            respond(
-                &mut codec,
-                &mut server,
-                start.request_id,
-                answer(start.request),
-            );
-        });
-        let result = ClientHandle::connect_on(
-            client,
-            session,
-            Intent::Restore,
-            None,
-            false,
-            None,
-            None,
-            None,
-            |_| {},
-        );
-        worker.join().unwrap();
-        result
     }
 
     #[test]
@@ -5077,6 +5981,429 @@ mod tests {
             256 * 1024,
             "an unreachable daemon cannot rehydrate the last readable publication yet"
         );
+    }
+
+    #[test]
+    fn a_read_refused_because_the_chat_just_hid_leaves_its_kept_body_unmarked() {
+        use super::super::{Item, ItemContent, Role};
+        use crate::terminal_ipc::{ProtocolError, ProtocolErrorCode};
+        let answer = Arc::new(Item {
+            id: "answer".into(),
+            role: Role::Assistant,
+            content: ItemContent::Text {
+                text: "The kept answer.".into(),
+                thinking: false,
+                phase: Default::default(),
+            },
+            started_at: None,
+            at: None,
+        });
+        let body = answer.clone();
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let (stage_tx, stage_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            server
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            server
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let proof = host_proof("hide-race");
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            let respond = |codec: &mut FrameCodec, server: &mut UnixStream, request_id, message| {
+                codec
+                    .write(
+                        server,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id,
+                            proof: proof.clone(),
+                            message,
+                        },
+                    )
+                    .unwrap();
+            };
+            let accepted = || ServerMessage::Response {
+                response: ServerResponse::Accepted,
+            };
+            let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            respond(
+                &mut codec,
+                &mut server,
+                Some(connect.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: proof.clone(),
+                        resumed: vec![],
+                    },
+                },
+            );
+            let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            let ClientRequest::ChatStart { session, .. } = start.request else {
+                panic!("chat start expected");
+            };
+            let chat_id = session.id;
+            respond(
+                &mut codec,
+                &mut server,
+                Some(start.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatAttached {
+                        session,
+                        snapshot: Snapshot {
+                            generation: 1,
+                            ..Default::default()
+                        },
+                    },
+                },
+            );
+            let shown: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(
+                shown.request,
+                ClientRequest::ChatVisibility { visible: true, .. }
+            ));
+            respond(&mut codec, &mut server, Some(shown.request_id), accepted());
+            respond(
+                &mut codec,
+                &mut server,
+                None,
+                ServerMessage::ChatChanged { chat_id },
+            );
+            let read: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(read.request, ClientRequest::ChatRead { .. }));
+            respond(
+                &mut codec,
+                &mut server,
+                Some(read.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatSnapshot {
+                        chat_id,
+                        snapshot: Some(Snapshot {
+                            generation: 2,
+                            ready: true,
+                            items: vec![body],
+                            ..Default::default()
+                        }),
+                    },
+                },
+            );
+            // Something changed; the client reads, and hides before the
+            // daemon answers, so the daemon refuses the read.
+            respond(
+                &mut codec,
+                &mut server,
+                None,
+                ServerMessage::ChatChanged { chat_id },
+            );
+            let raced: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(raced.request, ClientRequest::ChatRead { .. }));
+            stage_tx.send(()).unwrap();
+            let hidden: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(
+                hidden.request,
+                ClientRequest::ChatVisibility { visible: false, .. }
+            ));
+            respond(&mut codec, &mut server, Some(hidden.request_id), accepted());
+            respond(
+                &mut codec,
+                &mut server,
+                Some(raced.request_id),
+                ServerMessage::Error(ProtocolError::new(
+                    ProtocolErrorCode::InvalidRequest,
+                    "Hidden chat has no presentation stream; make it visible before reading",
+                    false,
+                )),
+            );
+            // An ordered edge: the client has consumed the refusal.
+            respond(
+                &mut codec,
+                &mut server,
+                None,
+                ServerMessage::ChatActivity {
+                    chat_id,
+                    state: ActivityState::Working,
+                    generation: 2,
+                },
+            );
+            // Shown again, it reads after the body it kept.
+            let shown: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(
+                shown.request,
+                ClientRequest::ChatVisibility { visible: true, .. }
+            ));
+            respond(&mut codec, &mut server, Some(shown.request_id), accepted());
+            respond(
+                &mut codec,
+                &mut server,
+                None,
+                ServerMessage::ChatChanged { chat_id },
+            );
+            let read: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(
+                matches!(
+                    read.request,
+                    ClientRequest::ChatRead {
+                        after_generation: Some(2),
+                        ..
+                    }
+                ),
+                "the kept body stays the base to read after"
+            );
+            respond(
+                &mut codec,
+                &mut server,
+                Some(read.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatSnapshot {
+                        chat_id,
+                        snapshot: None,
+                    },
+                },
+            );
+            stage_tx.send(()).unwrap();
+        });
+        let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+        let handle = ClientHandle::connect_on(
+            client,
+            omp_card(None, None),
+            Intent::Start,
+            None,
+            false,
+            None,
+            None,
+            None,
+            move |wake| {
+                let _ = wake_tx.send(wake);
+            },
+        )
+        .unwrap();
+        handle.set_interest(true, true).unwrap();
+        while handle.resident_snapshot_with_clock().is_none() {
+            wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        stage_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (shown, _) = handle.resident_snapshot_with_clock().unwrap();
+        assert_eq!(shown.items[0].content, answer.content);
+        // Hidden but keeping its body, as a warm chat does.
+        handle.set_interest(false, true).unwrap();
+        while !matches!(
+            wake_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Wake::Activity
+        ) {}
+        let (kept, _) = handle.resident_snapshot_with_clock().expect("a kept body");
+        assert_eq!(
+            kept.error, None,
+            "a refused stale read is not the chat's error"
+        );
+        assert!(
+            Arc::ptr_eq(&kept.items[0], &shown.items[0]),
+            "the body is the one kept, not one read again"
+        );
+        handle.set_interest(true, true).unwrap();
+        stage_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker.join().unwrap();
+        assert_eq!(handle.snapshot().error, None);
+    }
+
+    #[test]
+    fn a_read_refused_after_a_hide_the_chat_has_undone_is_made_again() {
+        use super::super::{Item, ItemContent, Role};
+        use crate::terminal_ipc::{ProtocolError, ProtocolErrorCode};
+        let answer = Arc::new(Item {
+            id: "answer".into(),
+            role: Role::Assistant,
+            content: ItemContent::Text {
+                text: "The kept answer.".into(),
+                thinking: false,
+                phase: Default::default(),
+            },
+            started_at: None,
+            at: None,
+        });
+        let body = answer.clone();
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let (stage_tx, stage_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            server
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            server
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let proof = host_proof("hide-show-race");
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            let respond = |codec: &mut FrameCodec, server: &mut UnixStream, request_id, message| {
+                codec
+                    .write(
+                        server,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id,
+                            proof: proof.clone(),
+                            message,
+                        },
+                    )
+                    .unwrap();
+            };
+            let accepted = || ServerMessage::Response {
+                response: ServerResponse::Accepted,
+            };
+            let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            respond(
+                &mut codec,
+                &mut server,
+                Some(connect.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: proof.clone(),
+                        resumed: vec![],
+                    },
+                },
+            );
+            let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            let ClientRequest::ChatStart { session, .. } = start.request else {
+                panic!("chat start expected");
+            };
+            let chat_id = session.id;
+            respond(
+                &mut codec,
+                &mut server,
+                Some(start.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatAttached {
+                        session,
+                        snapshot: Snapshot {
+                            generation: 1,
+                            ..Default::default()
+                        },
+                    },
+                },
+            );
+            let shown: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(
+                shown.request,
+                ClientRequest::ChatVisibility { visible: true, .. }
+            ));
+            respond(&mut codec, &mut server, Some(shown.request_id), accepted());
+            respond(
+                &mut codec,
+                &mut server,
+                None,
+                ServerMessage::ChatChanged { chat_id },
+            );
+            let read: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(read.request, ClientRequest::ChatRead { .. }));
+            respond(
+                &mut codec,
+                &mut server,
+                Some(read.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatSnapshot {
+                        chat_id,
+                        snapshot: Some(Snapshot {
+                            generation: 2,
+                            ready: true,
+                            items: vec![body],
+                            ..Default::default()
+                        }),
+                    },
+                },
+            );
+            // Something changed; the client reads, and hides before the
+            // daemon answers, so the daemon refuses the read.
+            respond(
+                &mut codec,
+                &mut server,
+                None,
+                ServerMessage::ChatChanged { chat_id },
+            );
+            let raced: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(raced.request, ClientRequest::ChatRead { .. }));
+            stage_tx.send(()).unwrap();
+            let hidden: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(
+                hidden.request,
+                ClientRequest::ChatVisibility { visible: false, .. }
+            ));
+            respond(&mut codec, &mut server, Some(hidden.request_id), accepted());
+            stage_tx.send(()).unwrap();
+            // The reader shows the chat again before the refusal arrives.
+            let shown: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(
+                shown.request,
+                ClientRequest::ChatVisibility { visible: true, .. }
+            ));
+            respond(&mut codec, &mut server, Some(shown.request_id), accepted());
+            respond(
+                &mut codec,
+                &mut server,
+                Some(raced.request_id),
+                ServerMessage::Error(ProtocolError::new(
+                    ProtocolErrorCode::InvalidRequest,
+                    "Hidden chat has no presentation stream; make it visible before reading",
+                    false,
+                )),
+            );
+            // The refused read is made again, after the body kept.
+            let read: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(
+                matches!(
+                    read.request,
+                    ClientRequest::ChatRead {
+                        after_generation: Some(2),
+                        ..
+                    }
+                ),
+                "the refused read is made again after the kept body"
+            );
+            respond(
+                &mut codec,
+                &mut server,
+                Some(read.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatSnapshot {
+                        chat_id,
+                        snapshot: None,
+                    },
+                },
+            );
+            stage_tx.send(()).unwrap();
+        });
+        let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+        let handle = ClientHandle::connect_on(
+            client,
+            omp_card(None, None),
+            Intent::Start,
+            None,
+            false,
+            None,
+            None,
+            None,
+            move |wake| {
+                let _ = wake_tx.send(wake);
+            },
+        )
+        .unwrap();
+        handle.set_interest(true, true).unwrap();
+        while handle.resident_snapshot_with_clock().is_none() {
+            wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        stage_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (shown, _) = handle.resident_snapshot_with_clock().unwrap();
+        assert_eq!(shown.items[0].content, answer.content);
+        // Hidden, keeping its body as a warm chat does, and shown again
+        // before the daemon's refusal of the raced read arrives.
+        handle.set_interest(false, true).unwrap();
+        stage_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        handle.set_interest(true, true).unwrap();
+        stage_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker.join().unwrap();
+        let (kept, _) = handle.resident_snapshot_with_clock().expect("a kept body");
+        assert_eq!(
+            kept.error, None,
+            "a refused raced read is not the chat's error"
+        );
+        assert!(Arc::ptr_eq(&kept.items[0], &shown.items[0]));
     }
 
     #[test]
@@ -6430,6 +7757,8 @@ mod tests {
             stream,
             codec: FrameCodec::new(ipc::MAX_CLIENT_FRAME_BYTES),
             body_requested: Arc::new(AtomicBool::new(true)),
+            announced: false,
+            hidings: 0,
         });
         let _held = wire.lock().unwrap();
         let error = transmit_text_copy(
@@ -7335,7 +8664,10 @@ mod tests {
         impl Drop for CallbackOwner {
             fn drop(&mut self) {
                 let _ = self.0.send(thread::current().id());
-                panic!("fixture callback owner destructor");
+                // A second panic while unwinding would abort the whole test binary.
+                if !thread::panicking() {
+                    panic!("fixture callback owner destructor");
+                }
             }
         }
         let (destroyed, destruction) = std::sync::mpsc::channel();

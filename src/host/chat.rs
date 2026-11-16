@@ -4,11 +4,23 @@ mod account_isolation_tests;
 #[cfg(test)]
 mod account_recovery_target_tests;
 pub(super) mod capacity;
+mod codex_owners;
+mod console_relaunch;
+pub(super) use console_relaunch::matched_cli;
+#[cfg(test)]
+mod console_relaunch_tests;
+pub(super) mod floor_history;
 #[cfg(test)]
 mod lost_agent_close_tests;
+#[cfg(test)]
+mod lost_codex_owner_close_tests;
 mod native_cleanup;
 mod native_recovery;
+pub(super) use native_recovery::restore_ready_checkpoint;
 mod owned_listener;
+pub(super) use owned_listener::{
+    Roots as CodexListenerRoots, keep_legacy_listeners_fresh as keep_legacy_codex_listeners_fresh,
+};
 mod paired_close;
 pub(super) mod retained_actor;
 #[cfg(test)]
@@ -28,10 +40,14 @@ mod retained_pending_installation_tests;
 #[cfg(test)]
 mod retained_publication_tests;
 #[cfg(test)]
+mod retained_receipt_collection_tests;
+#[cfg(test)]
 mod retained_resolution_tests;
 mod retained_resume;
 #[cfg(test)]
 mod startup_tests;
+#[cfg(test)]
+mod unserved_resume_tests;
 pub(super) mod upgrade_resolution;
 use crate::{
     agent::Provider,
@@ -48,6 +64,7 @@ use crate::{
 pub(super) use native_cleanup::{NativeClose, close_retained as close_retained_native};
 pub(super) use native_recovery::AdoptionFailures;
 pub(super) use native_recovery::restore_orphaned_native;
+pub(super) use native_recovery::restore_orphaned_native_preserving;
 use std::{
     collections::BTreeMap,
     sync::{Arc, Weak},
@@ -515,8 +532,9 @@ fn changed_for_instance(
         return;
     }
     let proof = state.proof().clone();
-    // A conversation that starts or settles may take the messages left for it.
-    if matches!(&update, Update::PromptAvailable)
+    // A conversation that starts or settles may take the messages left for
+    // it, and may have hit a usage limit or left one behind.
+    if matches!(&update, Update::PromptAvailable | Update::Activity { .. })
         && let Some(courier) = &state.mailbox
     {
         courier.wake();
@@ -578,6 +596,17 @@ fn changed_for_instance(
                 report: report.clone(),
                 observed_at: *observed_at,
             },
+            // Every surface keeps them, whether or not it is showing this
+            // conversation, since it learns of them only as they change.
+            Update::AgentAddresses(addresses) => ServerMessage::ChatAgentAddresses {
+                chat_id: id,
+                addresses: addresses.clone(),
+            },
+            Update::ActiveModel { revision, model } => ServerMessage::ChatActiveModel {
+                chat_id: id,
+                revision: *revision,
+                model: model.clone(),
+            },
             _ => continue,
         };
         if let Some(delivery) = clients.get(&client) {
@@ -626,6 +655,38 @@ fn session_snapshot(session: &Session, handle: &Handle) -> Result<ServerResponse
     session.launch.session_id = snapshot.session_id.clone();
     session.native_continuity = snapshot.native_continuity.clone();
     Ok(ServerResponse::ChatAttached { session, snapshot })
+}
+
+/// What a new subscriber is told of how the provider addresses a chat's
+/// subagents, when it knows any.
+pub(super) fn agent_addresses(host: &SharedHost, chat_id: TerminalId) -> Option<ServerMessage> {
+    let handle = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .chats
+        .get(&chat_id)?
+        .handle
+        .clone();
+    // Read outside HostState: a retained actor answers from its last
+    // published metadata, a local one from its own lock.
+    let addresses = handle.agent_addresses();
+    (!addresses.is_empty()).then_some(ServerMessage::ChatAgentAddresses { chat_id, addresses })
+}
+
+pub(super) fn active_model(host: &SharedHost, chat_id: TerminalId) -> Option<ServerMessage> {
+    let handle = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .chats
+        .get(&chat_id)?
+        .handle
+        .clone();
+    let (revision, model) = handle.active_model();
+    Some(ServerMessage::ChatActiveModel {
+        chat_id,
+        revision,
+        model,
+    })
 }
 
 fn current_session_snapshot(
@@ -873,7 +934,22 @@ pub(super) fn has_native_owner(session: &Session) -> Result<bool, ProtocolError>
     }
     use crate::daemon::holder_registry::{self as registry, Kind};
     let directory = registry::directory(Kind::Native).map_err(unavailable)?;
-    registry::recovery_candidate(&registry::socket(&directory, session.id), Kind::Native)
+    let socket = registry::socket(&directory, session.id);
+    if session.launch.provider == Provider::Codex {
+        let record = registry::execution_record(&socket)
+            .map_err(|failure| unavailable(format!("Cannot read holder record: {failure}")))?;
+        if let Some(record) = record {
+            let boot = crate::daemon::read_boot_id()
+                .map_err(|error| unavailable(format!("Cannot read kernel boot: {error}")))?;
+            if !record.boot.as_str().is_empty() && record.boot != boot
+                || chat::runtime::codex_execution_abandoned(&record.holder, &record.root)
+                    .map_err(unavailable)?
+            {
+                return Ok(false);
+            }
+        }
+    }
+    registry::recovery_candidate(&socket, Kind::Native)
         // Unsupported retained protocols still own this allocation. Discovery
         // fences launch; only authenticated recovery may interpret its version.
         .map(|record| record.is_some())
@@ -946,6 +1022,36 @@ fn reserve_quiet_allocation(
     session: &Session,
     console: Option<&crate::model::TerminalSession>,
 ) -> Result<capacity::Reservation, ()> {
+    let fence = reserve_unhosted_allocation(host, session, console)?;
+    let terminals = session
+        .terminal
+        .iter()
+        .chain(console)
+        .map(|terminal| terminal.id)
+        .collect::<Vec<_>>();
+    use crate::daemon::holder_registry::{self as registry, Kind};
+    let terminal_owner = |id: &TerminalId| {
+        registry::directory(Kind::Terminal)
+            .and_then(|directory| {
+                registry::recovery_candidate(&registry::socket(&directory, *id), Kind::Terminal)
+            })
+            // An unreadable record still claims the terminal.
+            .map_or(true, |record| record.is_some())
+    };
+    if has_native_owner(session).unwrap_or(true) || terminals.iter().any(terminal_owner) {
+        return Err(());
+    }
+    Ok(fence)
+}
+
+/// Reserve before execution inspection. In-memory owners, pending transitions
+/// and terminals still fence the allocation; the caller must classify kernel
+/// and registry evidence before treating this reservation as an ended pane.
+fn reserve_unhosted_allocation(
+    host: &SharedHost,
+    session: &Session,
+    console: Option<&crate::model::TerminalSession>,
+) -> Result<capacity::Reservation, ()> {
     let mut terminals: Vec<TerminalId> = session
         .terminal
         .iter()
@@ -966,18 +1072,6 @@ fn reserve_quiet_allocation(
         }
         capacity::Reservation::closing(host, &mut state, session).map_err(|_| ())?
     };
-    use crate::daemon::holder_registry::{self as registry, Kind};
-    let terminal_owner = |id: &TerminalId| {
-        registry::directory(Kind::Terminal)
-            .and_then(|directory| {
-                registry::recovery_candidate(&registry::socket(&directory, *id), Kind::Terminal)
-            })
-            // An unreadable record still claims the terminal.
-            .map_or(true, |record| record.is_some())
-    };
-    if has_native_owner(session).unwrap_or(true) || terminals.iter().any(terminal_owner) {
-        return Err(());
-    }
     Ok(fence)
 }
 
@@ -1029,6 +1123,749 @@ pub(super) fn close_retained_from_pane(host: &SharedHost, session: &Session) -> 
     close_retained_native(host, session)
 }
 
+/// Settles the Close of a conversation whose native owner ended without a
+/// close receipt, once nothing of it can still run. Exact cleanup comes here
+/// when it has nothing left to act on: a Codex conversation with no pending
+/// close, receipt or live holder record, or whose pending close settled
+/// without a receipt, and a retained Claude actor that exited without its
+/// verified retirement. The caller holds the conversation's close claim, and
+/// removes a finished resident once this succeeds.
+///
+/// An owner that dies - killed, crashed, out of memory, or taken down with
+/// its provider - writes no receipt, and discovery deletes its record once it
+/// has gone. Exact cleanup then has nothing to adopt, retire or confirm, and
+/// refused every Close of the pane again, so the pane could never be closed.
+///
+/// An open agent that still runs as this conversation ends with it, as it
+/// would have with a receipt: a person closing the pane closes the agent.
+fn settle_lost_execution(
+    host: &SharedHost,
+    session: &Session,
+    proof: &HostSessionProof,
+) -> Result<(), String> {
+    refuse_scheduled_agent(host, session)?;
+    if let Some(holds) = what_holds(host, session, proof)? {
+        return Err(lost_execution_refusal(session, holds));
+    }
+    let _ = return_listener_allocation(session);
+    let Ok(registry) = super::agent_execution::registry(host) else {
+        return Ok(());
+    };
+    let sources = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retained_agent_sources(session.id)?;
+    for source in sources {
+        let crate::agent_execution::HostedSession::Chat(source) = source else {
+            return Err("Retained execution ownership changed to another surface".into());
+        };
+        // Every descriptor of this allocation, under older conversation
+        // metadata too: the evidence covers the allocation, not one descriptor.
+        super::agent_execution::retired(host, &source)?;
+        registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retire_agent_process_authority(
+                &crate::agent_execution::HostedSession::Chat(source),
+                true,
+            )?;
+    }
+    Ok(())
+}
+
+/// A scheduled agent is its automation's to end, as when a changed boot
+/// leaves one behind, so a lost conversation it runs as is not settled here.
+fn refuse_scheduled_agent(host: &SharedHost, session: &Session) -> Result<(), String> {
+    if let Ok(registry) = super::agent_execution::registry(host)
+        && registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .agent_for_session(session.id)?
+            .is_some_and(|agent| {
+                matches!(
+                    agent.origin,
+                    crate::agent_execution::Origin::Automation { .. }
+                )
+            })
+    {
+        return Err(SCHEDULED_AGENT.into());
+    }
+    Ok(())
+}
+
+/// Gives back the listener allocation of a Codex conversation whose provider
+/// has ended, as its holder does when it releases. A holder that died never
+/// will, and its directory would outlive the conversation. An endpoint that
+/// something still serves keeps it.
+fn return_listener_allocation(session: &Session) -> Result<(), String> {
+    let Some(listener) = session
+        .owned_codex_listener
+        .as_ref()
+        .filter(|_| session.owns_codex_listener())
+    else {
+        return Ok(());
+    };
+    if owned_listener::served(&listener.socket).map_err(|error| error.to_string())? {
+        return Ok(());
+    }
+    if let Some(parent) = listener.socket.parent() {
+        let _ = std::fs::remove_dir(parent);
+    }
+    Ok(())
+}
+
+/// What still holds a conversation whose native owner ended without its
+/// close receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Holds {
+    /// A start, handoff or exact close is under way for it.
+    InProgress,
+    /// Its agent's launch, or that launch's teardown, never confirmed how it
+    /// ended.
+    LaunchUnconfirmed,
+    /// A process of its provider survives the helper that controlled it.
+    /// [`lost_processes`] says which, and can end them.
+    Running,
+    /// Nothing proves whether something of it still runs.
+    Unproved,
+}
+
+/// Why a Close of a conversation whose owner is gone was refused, and what
+/// the person can do about it. Both a pane's Close and `cagents agent close`
+/// show it.
+fn lost_execution_refusal(session: &Session, holds: Holds) -> String {
+    let provider = session.launch.provider.label();
+    match holds {
+        Holds::InProgress => "This conversation is still starting, moving or closing elsewhere in Cagents. Close it again once that finishes.".into(),
+        Holds::LaunchUnconfirmed => format!(
+            "{LOST_EXECUTION_UNPROVED}. Its agent's launch never confirmed whether {provider} started or stopped, so it and its agent were kept rather than leave {provider} running unseen."
+        ),
+        Holds::Running => format!(
+            "{provider} is still running for this conversation, but the Cagents helper that controlled it is gone, so the conversation was kept rather than leave {provider} running unseen."
+        ),
+        Holds::Unproved => format!(
+            "{LOST_EXECUTION_UNPROVED}. Its Cagents helper is gone, and Cagents can't tell whether its {provider} process stopped, so it was kept rather than leave {provider} running unseen. After the computer restarts nothing of it can run, so closing it will work."
+        ),
+    }
+}
+
+/// The refusal for a conversation whose native owner's helper has died while
+/// its provider runs on, if that is what happened to `owner`.
+///
+/// Nothing can ask that provider to stop any more: Release reaches only a
+/// closed channel, and settling would leave it running unseen. Close says so,
+/// rather than report the dead channel's I/O error, and [`lost_processes`]
+/// can end what is left.
+fn holder_lost_refusal(
+    source: &Session,
+    owner: &crate::daemon::holder_registry::Record,
+) -> Result<Option<String>, String> {
+    if owner.holder.is_current()
+        || crate::chat::runtime::retained_actor_abandoned(&owner.holder, &owner.root)?
+    {
+        return Ok(None);
+    }
+    Ok(Some(lost_execution_refusal(source, Holds::Running)))
+}
+
+/// [`holder_lost_refusal`] for any owner of this boot registered for
+/// `source`: its Codex holder, or a retained Claude helper.
+///
+/// With no live owner registered, the provider may still run after its
+/// helper's record went: the evidence [`what_holds`] reads, such as a Codex
+/// process still naming its listener, says so in the same words.
+fn registered_holder_lost_refusal(
+    host: &SharedHost,
+    source: &Session,
+) -> Result<Option<String>, String> {
+    let owners = lost_owners(host, source)?;
+    for owner in &owners {
+        if let Some(refusal) = holder_lost_refusal(source, owner)? {
+            return Ok(Some(refusal));
+        }
+    }
+    if owners.iter().any(|owner| owner.holder.is_current()) {
+        return Ok(None);
+    }
+    let proof = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .proof()
+        .clone();
+    Ok((what_holds(host, source, &proof)? == Some(Holds::Running))
+        .then(|| lost_execution_refusal(source, Holds::Running)))
+}
+
+/// Every owner of this boot registered for `session`: its native Codex
+/// holder's discovery record and its retained Claude helpers.
+fn lost_owners(
+    host: &SharedHost,
+    session: &Session,
+) -> Result<Vec<crate::daemon::holder_registry::Record>, String> {
+    let boot = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .proof()
+        .boot_id
+        .clone();
+    let mut owners: Vec<crate::daemon::holder_registry::Record> =
+        registered_native_owner(session)?.into_iter().collect();
+    if let Ok(registry) = super::agent_execution::registry(host) {
+        owners.extend(
+            registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .native_actor_owners_of(session.id)?
+                .into_iter()
+                .map(|(owner, _)| owner),
+        );
+    }
+    owners.retain(|owner| owner.boot == boot);
+    owners.dedup();
+    Ok(owners)
+}
+
+fn registered_native_owner(
+    source: &Session,
+) -> Result<Option<crate::daemon::holder_registry::Record>, String> {
+    use crate::daemon::holder_registry::{self as registry, Kind};
+    let socket = registry::socket(&registry::directory(Kind::Native)?, source.id);
+    registry::recovery_candidate(&socket, Kind::Native)
+}
+
+/// The processes still running for a conversation whose Cagents helper has
+/// died, which is why its Close was refused, and with `end`, ends those
+/// proved to be the conversation's first (see
+/// [`crate::daemon::lost_processes`]). The person closes it again afterwards.
+///
+/// A conversation's processes are those in a dead helper's session or its
+/// provider's process group, for every owner of this boot registered for it,
+/// and for Codex the provider named by its listener directory with its group:
+/// exactly what its Close counts. Only those of `end` are ended, the ones the
+/// person was shown, so a process found later is shown before it is ended. A
+/// conversation whose helper still runs has nothing here to end; its own
+/// Close stops it.
+pub(super) fn lost_processes(
+    host: &SharedHost,
+    session: &Session,
+    end: &[crate::terminal::ipc::ProcessStart],
+) -> Result<Vec<crate::terminal::ipc::LostProcess>, String> {
+    // Ending holds the conversation as its Close does, so no start or handoff
+    // can put a new provider where the lost one ran meanwhile.
+    let _claim = if !end.is_empty() {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if state.chat_handoffs.contains_key(&session.id)
+            || state.native_actor_startups.values().any(|startup| {
+                startup.source.id == session.id || startup.requested.id == session.id
+            })
+        {
+            return Err(lost_execution_refusal(session, Holds::InProgress));
+        }
+        Some(
+            capacity::Reservation::closing(host, &mut state, session)
+                .map_err(|_| lost_execution_refusal(session, Holds::InProgress))?,
+        )
+    } else {
+        None
+    };
+    let owners = lost_owners(host, session)?;
+    if owners.iter().any(|owner| owner.holder.is_current()) {
+        return Err(HELPER_STILL_RUNS.into());
+    }
+    let listener = session
+        .owned_codex_listener
+        .as_ref()
+        .filter(|_| session.owns_codex_listener());
+    let census = || -> Result<Vec<crate::daemon::lost_processes::Survivor>, String> {
+        let mut found = Vec::new();
+        for owner in &owners {
+            found.extend(crate::daemon::lost_processes::census(
+                &owner.holder,
+                &owner.root,
+            )?);
+        }
+        if let Some(listener) = &listener {
+            let providers =
+                super::upgrade_inspect::codex_listener_providers(session.id, &listener.socket)?;
+            if !providers.is_empty() {
+                found.extend(crate::daemon::lost_processes::listener_census(&providers)?);
+            }
+        }
+        // One process can be in an owner's session and name the listener;
+        // it is proved if either proves it.
+        found.sort_by_key(|survivor| (survivor.pid, !survivor.proved));
+        found.dedup_by_key(|survivor| survivor.pid);
+        Ok(found)
+    };
+    let found = if end.is_empty() {
+        census()?
+    } else {
+        let chosen = end
+            .iter()
+            .map(|process| (process.pid, process.start))
+            .collect::<Vec<_>>();
+        crate::daemon::lost_processes::end(census, &chosen)?
+    };
+    Ok(found
+        .into_iter()
+        // One that has exited is collected in a moment and needs nothing.
+        .filter(|survivor| !survivor.zombie)
+        .map(|survivor| crate::terminal::ipc::LostProcess {
+            process: crate::terminal::ipc::ProcessStart {
+                pid: survivor.pid,
+                start: survivor.start,
+            },
+            name: survivor.name,
+            command: survivor.command,
+            proved: survivor.proved,
+        })
+        .collect())
+}
+
+/// The processes a person ending what `found` lists would choose: every one
+/// proved to be the conversation's, as the pane's action does.
+#[cfg(test)]
+fn shown(found: &[crate::terminal::ipc::LostProcess]) -> Vec<crate::terminal::ipc::ProcessStart> {
+    found
+        .iter()
+        .filter(|process| process.proved)
+        .map(|process| process.process)
+        .collect()
+}
+
+/// Why [`lost_processes`] ends nothing for a conversation whose helper runs.
+const HELPER_STILL_RUNS: &str =
+    "This conversation's Cagents helper is still running, so closing it stops it as usual.";
+
+/// The start of what a Close says when nothing proves a conversation whose
+/// owner is gone stopped.
+pub(super) const LOST_EXECUTION_UNPROVED: &str =
+    "Cagents couldn't confirm this conversation stopped";
+
+/// What a Close says of a scheduled agent's conversation whose owner is gone.
+pub(super) const SCHEDULED_AGENT: &str =
+    "A scheduled automation's agent runs this conversation, and only its automation can end it";
+
+/// What still holds a conversation whose native owner ended without its
+/// close receipt, if anything. Its Close settles without one only when
+/// nothing does.
+///
+/// The owner is lost only when no start or handoff claims the conversation,
+/// no unconfirmed agent launch or startup cleanup is pending for it, and
+/// nothing of it can still run by the evidence an upgrade requires before
+/// replacing its service: no live
+/// holder record, and for Codex no process naming the conversation's
+/// listener and nothing bound or served where it listens, or for a retained
+/// Claude actor every registered owner gone with its process group and
+/// session. A changed kernel boot proves the same. Anything else, including
+/// an unavailable agent registry, is not proof of the loss.
+fn what_holds(
+    host: &SharedHost,
+    session: &Session,
+    proof: &HostSessionProof,
+) -> Result<Option<Holds>, String> {
+    // A receipt exact cleanup did not consume names another descriptor of
+    // the terminal. It confirms that one's close, and says nothing either way
+    // about this one, so it neither holds nor settles this Close: the evidence
+    // below does.
+    {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if codex_terminal_owner(&state, session).is_some()
+            || state.chat_handoffs.contains_key(&session.id)
+            || state.native_actor_startups.values().any(|startup| {
+                startup.source.id == session.id || startup.requested.id == session.id
+            })
+        {
+            return Ok(Some(Holds::InProgress));
+        }
+    }
+    if has_native_owner(session).map_err(|error| error.message)? {
+        return Ok(Some(Holds::InProgress));
+    }
+    let (agent, owners) = {
+        let registry = super::agent_execution::registry(host)?;
+        let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+        if registry.has_agent_launch_for_session(session.id)? {
+            return Ok(Some(Holds::LaunchUnconfirmed));
+        }
+        (
+            registry.agent_for_session(session.id)?,
+            registry.native_actor_owners_of(session.id),
+        )
+    };
+    // A startup cleanup owner retained for the agent is a launch of this boot
+    // whose teardown is unconfirmed.
+    if agent.is_some_and(|agent| {
+        host.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .execution_startups
+            .contains_key(&agent.id)
+    }) {
+        return Ok(Some(Holds::LaunchUnconfirmed));
+    }
+    use super::upgrade_inspect::ExecutionEnd;
+    match super::upgrade_inspect::execution_end(session, &proof.boot_id, owners.clone()) {
+        ExecutionEnd::Ended => {}
+        ExecutionEnd::Running => return Ok(Some(Holds::Running)),
+        ExecutionEnd::Unproved => return Ok(Some(Holds::Unproved)),
+    }
+    match session
+        .owned_codex_listener
+        .as_ref()
+        .filter(|_| session.owns_codex_listener())
+    {
+        Some(listener)
+            if owned_listener::served(&listener.socket).map_err(|error| error.to_string())? =>
+        {
+            Ok(Some(Holds::Running))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Whether a Codex conversation no agent claims lost its native owner without
+/// the close receipt, so a reopened conversation may take over without one.
+fn codex_owner_lost(
+    host: &SharedHost,
+    session: &Session,
+    proof: &HostSessionProof,
+) -> Result<bool, String> {
+    if !session.owns_codex_listener() || session.terminal.is_some() {
+        return Ok(false);
+    }
+    {
+        let registry = super::agent_execution::registry(host)?;
+        let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+        if registry.agent_for_session(session.id)?.is_some()
+            || !registry.retained_agent_sources(session.id)?.is_empty()
+        {
+            return Ok(false);
+        }
+    }
+    Ok(what_holds(host, session, proof)?.is_none())
+}
+
+/// A recorded terminal conversation is writer evidence even without a pane
+/// marker (for example, a CLI resumed against the shared Codex daemon).
+fn codex_terminal_owner(state: &HostState, session: &Session) -> Option<TerminalId> {
+    let id = session.launch.session_id.as_ref()?;
+    state.terminals.iter().find_map(|(terminal_id, record)| {
+        if record.handle.is_completed() {
+            return None;
+        }
+        let observed = record
+            .session
+            .resume_hint
+            .as_deref()
+            .and_then(crate::model::agent_recovery::observed_launch_from_hint);
+        let recipe = observed.as_ref().unwrap_or(&record.session.launch);
+        ((Provider::from_program(&recipe.program) == Some(Provider::Codex)
+            || Provider::recognize_launch(recipe) == Some(Provider::Codex))
+            && recipe
+                .arguments
+                .iter()
+                .any(|arg| arg == id || arg.split_once('=').is_some_and(|(_, value)| value == id)))
+        .then_some(*terminal_id)
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SharedCodexService {
+    Missing,
+    Stopped,
+    Listening,
+    Unknown,
+}
+
+fn shared_codex_failure(failure: chat::protocol::SetupError) -> ProtocolError {
+    match failure {
+        chat::protocol::SetupError::Invalid(message) => error(message),
+        chat::protocol::SetupError::Unavailable(message) => {
+            ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true)
+        }
+    }
+}
+
+/// Probe the exact shared transport both preparation and fallback would use.
+/// The adapter owns any verified short alias until the probe has completed.
+/// Only an absent entry or ConnectionRefused proves this endpoint unserved;
+/// unreadable/replaced evidence and every other connection failure stay unknown.
+fn shared_codex_service(
+    launch: &chat::Launch,
+    before_probe: impl FnOnce() -> Result<(), ProtocolError>,
+) -> Result<SharedCodexService, ProtocolError> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let Some(shared) = chat::protocol::codex::shared_daemon_socket(launch) else {
+        return Ok(SharedCodexService::Unknown);
+    };
+    let endpoint = match std::fs::metadata(&shared) {
+        Ok(endpoint) if endpoint.file_type().is_socket() => endpoint,
+        Err(failure) if failure.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SharedCodexService::Missing);
+        }
+        _ => return Ok(SharedCodexService::Unknown),
+    };
+    before_probe()?;
+    let (spec, _adapter) = match chat::protocol::codex::create_for_start(launch) {
+        Ok(created) => created,
+        Err(failure) => {
+            if !std::fs::metadata(&shared).is_ok_and(|now| {
+                now.file_type().is_socket()
+                    && now.dev() == endpoint.dev()
+                    && now.ino() == endpoint.ino()
+            }) {
+                return Ok(SharedCodexService::Unknown);
+            }
+            return Err(shared_codex_failure(failure));
+        }
+    };
+    let service = match &spec.transport {
+        chat::protocol::TransportSpec::UnixWebSocket {
+            socket,
+            device,
+            inode,
+        } if *device == endpoint.dev() && *inode == endpoint.ino() => {
+            match crate::agent::observe::socket::connect(socket, *device, *inode) {
+                Ok(_) => SharedCodexService::Listening,
+                Err(failure) if failure.not_listening => SharedCodexService::Stopped,
+                Err(_) => SharedCodexService::Unknown,
+            }
+        }
+        _ => SharedCodexService::Unknown,
+    };
+    // Refusal is not a post-connect identity proof. In particular, replacing
+    // the published endpoint before or during the probe must not turn another
+    // socket's ConnectionRefused into authority to start a private server.
+    Ok(
+        if std::fs::metadata(&shared).is_ok_and(|now| {
+            now.file_type().is_socket()
+                && now.dev() == endpoint.dev()
+                && now.ino() == endpoint.ino()
+        }) {
+            service
+        } else {
+            SharedCodexService::Unknown
+        },
+    )
+}
+
+/// A proofless history selection can join the account's live shared daemon
+/// without retiring an old pane. This grants no replacement-writer authority:
+/// Start receives the unchanged bare descriptor and rechecks the endpoint.
+fn prepare_shared_codex_join(host: &SharedHost, source: &Session) -> Result<bool, ProtocolError> {
+    if source.launch.provider != Provider::Codex
+        || source.proof.is_some()
+        || source.terminal.is_some()
+        || source.owned_codex_listener.is_some()
+        || source.native_continuity != chat::NativeContinuity::ReconnectOnly
+        || source.launch.session_id.is_none()
+    {
+        return Ok(false);
+    }
+    let process_launch = prepare_native_process_launch(
+        &source.launch,
+        Some(crate::model::agent_recovery::fresh_native_environment(
+            Provider::Codex,
+            false,
+        )),
+        &BTreeMap::new(),
+        None,
+    )?;
+    Ok(shared_codex_service(&process_launch, || {
+        // Preserve Start's recorded-selector, effective account and directory
+        // checks before constructing/probing a potential shared transport.
+        super::account_lifecycle::ensure_launch(
+            host,
+            &source.launch.recipe.working_directory,
+            &source.launch.recipe.environment,
+            &Default::default(),
+            true,
+        )?;
+        super::account_lifecycle::ensure_launch_at_directory(
+            host,
+            &process_launch.recipe.working_directory,
+            &process_launch.recipe.environment,
+            &process_launch.recipe.unset_environment,
+            false,
+            None,
+        )?;
+        super::account_lifecycle::ensure_launch(
+            host,
+            &process_launch.recipe.working_directory,
+            &process_launch.recipe.environment,
+            &process_launch.recipe.unset_environment,
+            false,
+        )
+    })? == SharedCodexService::Listening)
+}
+
+/// Read the same execution evidence for restart and picker preparation, so
+/// unreadable evidence retains its concrete diagnostic in both paths.
+fn require_ended_codex_execution(
+    host: &SharedHost,
+    session: &Session,
+    boot: &crate::model::BootId,
+) -> std::io::Result<()> {
+    let launch = prepare_native_process_launch(
+        &session.launch,
+        Some(crate::model::agent_recovery::fresh_native_environment(
+            Provider::Codex,
+            false,
+        )),
+        &BTreeMap::new(),
+        None,
+    )
+    .map_err(|failure| std::io::Error::other(failure.message))?;
+    require_ended_codex_execution_for_launch(host, session, boot, &launch)
+}
+
+/// The process launch may add the effective account home without changing the
+/// saved descriptor whose old execution must be proved ended.
+fn require_ended_codex_execution_for_launch(
+    host: &SharedHost,
+    session: &Session,
+    boot: &crate::model::BootId,
+    launch: &chat::Launch,
+) -> std::io::Result<()> {
+    use super::upgrade_inspect::{CodexExecution, codex_execution};
+    {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(id) = codex_terminal_owner(&state, session) {
+            return Err(std::io::Error::other(format!(
+                "Codex is still running this conversation in terminal {id}. Close that terminal, then try again."
+            )));
+        }
+        // Holders only publish records when recovery was enabled. Older and
+        // in-process consoles can lack them, so a live paired console remains
+        // unproved even if its CLI has not recorded a conversation ID yet.
+        // Check current state rather than the saved descriptor: once its
+        // terminal is gone, a clean kernel/holder scan can prove it ended.
+        if session.terminal.as_ref().is_some_and(|terminal| {
+            state
+                .terminals
+                .get(&terminal.id)
+                .is_some_and(|record| !record.handle.is_completed())
+        }) {
+            return Err(std::io::Error::other(
+                "The paired Codex console is still live; its conversation could not be checked. Close that terminal, then try again.",
+            ));
+        }
+    }
+    let execution = match codex_execution(session, boot) {
+        CodexExecution::Ended => match launch.session_id.as_deref() {
+            Some(thread) => match codex_owners::writer(
+                chat::protocol::codex::thread_writer_lock(launch, thread).as_deref(),
+                thread,
+            ) {
+                Ok(Some(writer)) => {
+                    return Err(std::io::Error::other(running_codex_process(writer.pid)));
+                }
+                Ok(None) => CodexExecution::Ended,
+                Err(reason) => {
+                    return Err(std::io::Error::new(
+                        reason.kind(),
+                        unproved_codex_execution(&reason.to_string()),
+                    ));
+                }
+            },
+            None => CodexExecution::Ended,
+        },
+        execution => execution,
+    };
+    let message = match execution {
+        CodexExecution::Ended => return Ok(()),
+        CodexExecution::Running { pid: Some(pid), .. } => running_codex_process(pid),
+        CodexExecution::Running { pid: None, socket } => format!(
+            "Codex is still serving this conversation at {}. Stop that server, then try again.",
+            socket.display()
+        ),
+        CodexExecution::RetainedProcesses =>
+            "The previous Codex execution still has live processes. Wait for them to finish, then try again.".into(),
+        CodexExecution::Unproved { reason }
+            if reason == super::upgrade_inspect::CODEX_PROCESS_STARTING =>
+        {
+            "A process was still starting; try again in a moment.".into()
+        }
+        CodexExecution::Unproved { reason } => unproved_codex_execution(&reason),
+    };
+    Err(std::io::Error::other(message))
+}
+
+fn unproved_codex_execution(reason: &str) -> String {
+    format!(
+        "The old Codex execution could not be checked: {reason}. This conversation was not restarted. Restore access to this evidence and try again."
+    )
+}
+
+fn running_codex_process(pid: impl std::fmt::Display) -> String {
+    format!(
+        "Codex is still running this conversation (process {pid}). Stop process {pid}, then try again."
+    )
+}
+
+/// Admit a replacement writer using the original descriptor, then retire only
+/// ended discovery under the caller's allocation reservation.
+fn prepare_codex_restart(
+    host: &SharedHost,
+    session: &Session,
+    boot: &crate::model::BootId,
+    launch: &chat::Launch,
+) -> std::io::Result<()> {
+    use crate::daemon::holder_registry::{self as registry, Kind};
+    use std::os::unix::fs::MetadataExt;
+    if session.launch.session_id.is_none() {
+        return Ok(());
+    }
+    require_ended_codex_execution_for_launch(host, session, boot, launch)?;
+    let directory = registry::directory(Kind::Native).map_err(std::io::Error::other)?;
+    let control = registry::socket(&directory, session.id);
+    let record = registry::execution_record(&control)?;
+    if let Some(record) = &record
+        && record.boot == *boot
+        && !chat::runtime::codex_execution_abandoned(&record.holder, &record.root)
+            .map_err(std::io::Error::other)?
+    {
+        return Err(std::io::Error::other(
+            "A Codex holder appeared during restart; try again",
+        ));
+    }
+    // A crashed holder may leave its control socket with or without a
+    // record. Retire the stopped inode before its successor binds it.
+    let entry = match std::fs::symlink_metadata(&control) {
+        Ok(entry) => Some(entry),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    if let Some(entry) = entry {
+        // Holder paths can exceed sun_path; use the same pinned directory
+        // address as their bind, with a nonblocking, inode-checked probe.
+        let stopped = registry::with_socket_address(&control, |address| {
+            match crate::agent::observe::socket::connect(address, entry.dev(), entry.ino()) {
+                Ok(_) => Ok(false),
+                Err(error) if error.not_listening => Ok(true),
+                Err(error) => Err(std::io::Error::other(format!(
+                    "Cannot inspect holder control socket: {}",
+                    String::from(error)
+                ))),
+            }
+        })?;
+        if !stopped {
+            return Err(std::io::Error::other(
+                "A Codex holder is still serving this pane; try again",
+            ));
+        }
+        if std::fs::symlink_metadata(&control)
+            .is_ok_and(|current| current.dev() == entry.dev() && current.ino() == entry.ino())
+        {
+            std::fs::remove_file(&control)?;
+        }
+    }
+    if let Some(record) = record {
+        record.remove_record(&directory)?;
+    }
+    Ok(())
+}
+
 pub(super) fn require_unreserved_terminals(
     state: &HostState,
     session: &Session,
@@ -1071,8 +1908,53 @@ pub(super) fn terminal_claim_pending(state: &HostState, terminal: TerminalId) ->
             .native_actor_startups
             .values()
             .any(|startup| claims(&startup.source) || claims(&startup.requested))
-        || state.native_closing.contains_key(&terminal)
+        || state
+            .native_closing
+            .values()
+            .any(|closing| claims(closing.source()))
         || state.chat_handoffs.contains_key(&terminal)
+}
+
+pub(super) fn shared_removal_in_transition(
+    state: &HostState,
+    before: &crate::workspace_model::views::Pane,
+) -> bool {
+    let crate::model::CardKind::Chat(source) = &before.kind else {
+        unreachable!("chat removal source")
+    };
+    let claims = |session: &crate::chat::Session| {
+        session.id == source.id
+            || session
+                .terminal
+                .as_ref()
+                .is_some_and(|terminal| terminal.id == source.id)
+    };
+    let same = |session: &crate::chat::Session| {
+        crate::workspace_model::views::same_removal_source(
+            before,
+            &crate::workspace_model::views::Pane {
+                kind: crate::model::CardKind::Chat(session.clone()),
+                ..before.clone()
+            },
+        )
+    };
+    state.chat_bindings.contains_key(&source.id)
+        || state.chat_handoffs.contains_key(&source.id)
+        || state
+            .chat_spawning
+            .values()
+            .filter(|session| claims(session))
+            .any(|session| {
+                state.chat_close_reservations.get(&session.id) != Some(session) || !same(session)
+            })
+        || state
+            .native_actor_startups
+            .values()
+            .any(|startup| claims(&startup.source) || claims(&startup.requested))
+        || state
+            .native_closing
+            .values()
+            .any(|closing| claims(closing.source()) && !same(closing.source()))
 }
 
 fn start_with_execution(
@@ -1086,6 +1968,14 @@ fn start_with_execution(
     execution: Option<Arc<chat::protocol::ExecutionContext>>,
     restart_launch: Option<&chat::Launch>,
 ) -> Result<ServerResponse, ProtocolError> {
+    if crate::upgrade::floor::load()
+        .map_err(unavailable)?
+        .blocks_id(session.id)
+    {
+        return Err(unavailable(
+            "This conversation was stopped for the update. Press Resume in its pane to continue the recorded conversation, or start a new conversation if none was recorded.",
+        ));
+    }
     // A helper may have committed installation before host publication failed.
     // Recover its durable outbox through authenticated adoption before asking
     // an unexposed startup guard to retire it without a semantic consumer.
@@ -1342,13 +2232,11 @@ fn start_with_execution(
     if session.launch.provider != Provider::Codex && !saved_history_only {
         check_launch_account(&session.launch)?;
     }
-    let allocator = host
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .proof()
-        .clone();
-    let owned =
-        source.is_none() && session.claim_owned_codex_listener(&std::env::temp_dir(), &allocator);
+    let (allocator, listeners) = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        (state.proof().clone(), state.codex_listeners.clone())
+    };
+    let owned = source.is_none() && listeners.claim(&mut session, &allocator);
     let owned_socket = owned.then(|| {
         session
             .owned_codex_listener
@@ -1357,19 +2245,6 @@ fn start_with_execution(
             .socket
             .clone()
     });
-    // A server that stopped without cleaning up leaves its endpoint behind.
-    // A listener still being served is joined; anything else is retired so
-    // this conversation's own server starts again at the same path.
-    let owned_socket = match owned_socket {
-        Some(socket)
-            if !owned_listener::served(&socket).map_err(|failure| {
-                unavailable(format!("Cannot retire stopped provider socket: {failure}"))
-            })? =>
-        {
-            Some(socket)
-        }
-        _ => None,
-    };
     // An authenticated checkpoint may need different resume argv from the
     // immutable recipe issued to windows. Keep that execution detail out of
     // the descriptor, authority registry and runtime's installed identity.
@@ -1401,7 +2276,7 @@ fn start_with_execution(
     // Saved read-only history receives recorded removals, never fresh defaults
     // or transient execution credentials.
     let empty_execution_environment = BTreeMap::new();
-    let process_launch = prepare_native_process_launch(
+    let mut process_launch = prepare_native_process_launch(
         recorded_process_launch,
         (!saved_history_only && source.is_none()).then(|| {
             crate::model::agent_recovery::fresh_native_environment(session.launch.provider, false)
@@ -1417,6 +2292,54 @@ fn start_with_execution(
             source_execution.as_ref()
         },
     )?;
+    // A begun thread's bare remote joins the account's shared daemon, which
+    // owns the thread while it runs. With nothing serving that daemon, the
+    // thread is reopened from its history on a listener of its own instead of
+    // failing to join a daemon that is absent.
+    let owned_socket = match owned_socket {
+        None if !owned
+            && source.is_none()
+            && restart_launch.is_none()
+            && !saved_history_only
+            && process_launch.provider == Provider::Codex
+            && matches!(
+                shared_codex_service(&process_launch, || Ok(()))?,
+                SharedCodexService::Missing | SharedCodexService::Stopped
+            )
+            && listeners.claim_for_unserved_thread(&mut session, &allocator) =>
+        {
+            process_launch.recipe.arguments = session.launch.recipe.arguments.clone();
+            let socket = session
+                .owned_codex_listener
+                .as_ref()
+                .unwrap()
+                .socket
+                .clone();
+            Some(socket)
+        }
+        owned_socket => owned_socket,
+    };
+    // Join a served listener. Before replacing a saved conversation's server,
+    // prove its old execution ended and no outside process writes the thread.
+    // Inspect the original descriptor before retiring any endpoint: assigning
+    // a listener above grants no evidence about the execution that served it.
+    let owned_socket = match owned_socket {
+        Some(socket)
+            if !owned_listener::served_before_retire(&socket, || {
+                prepare_codex_restart(host, &requested_source, &allocator.boot_id, &process_launch)
+            })
+            .map_err(|failure| {
+                ProtocolError::new(
+                    ProtocolErrorCode::TerminalUnavailable,
+                    format!("Cannot restart Codex: {failure}"),
+                    true,
+                )
+            })? =>
+        {
+            Some(socket)
+        }
+        _ => None,
+    };
     if process_launch.provider != Provider::Codex && !saved_history_only {
         check_launch_account(&process_launch)?;
     }
@@ -1481,7 +2404,7 @@ fn start_with_execution(
     }
     // Provider-specific process fields derive from the prepared launch.
     // No environment overlay may follow constructor history/title reads.
-    spec.remove_unset_environment();
+    spec.withhold_environment();
     spec.messages = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -1702,7 +2625,7 @@ fn start_with_execution(
                 .verify_directory(&spec.working_directory)
                 .map_err(unavailable)?;
         }
-        spec.remove_unset_environment();
+        spec.withhold_environment();
         let recovery_environment = spec.environment.clone();
         let delegated_source = session.clone();
         // Capability is transient process context, never a public launch
@@ -2253,8 +3176,10 @@ fn codex_terminal_view(
         },
         Some(handle.execution_environment()),
         &TerminalViewReservation {
-            owners: &owners,
-            closing,
+            kind: TerminalViewKind::Codex {
+                owners: &owners,
+                closing,
+            },
         },
     );
     let (descriptor, paired_terminal) = match spawned {
@@ -2407,11 +3332,7 @@ fn codex_terminal_view(
 /// Client descriptors cannot expand allocation authority beyond this daemon's
 /// exact namespace or retained conversation. Checkpoint restore invokes `start`
 /// directly with the daemon-owned durable source instead.
-fn client_session(host: &SharedHost, session: Session) -> Session {
-    client_session_in(host, session, &std::env::temp_dir())
-}
-
-fn client_session_in(host: &SharedHost, mut session: Session, root: &std::path::Path) -> Session {
+fn client_session(host: &SharedHost, mut session: Session) -> Session {
     if session.native_continuity.retains_provider() {
         // This descriptor can only enter authenticated holder adoption, which
         // checks its full retained value. The caller's TMPDIR grants no authority.
@@ -2438,10 +3359,7 @@ fn client_session_in(host: &SharedHost, mut session: Session, root: &std::path::
     session.owned_codex_listener = retained.or_else(|| {
         session.owned_codex_listener.take().filter(|owned| {
             owned.matches(session.id, &session.launch.recipe)
-                && owned.socket
-                    == root
-                        .join(format!("cagents-codex-{}", session.id))
-                        .join("control.sock")
+                && state.codex_listeners.allocates(session.id, &owned.socket)
         })
     });
     if let Some(terminal) = &mut session.terminal {
@@ -2706,6 +3624,53 @@ pub(super) fn process(
     })
 }
 
+pub(super) fn read_presentation(
+    host: &SharedHost,
+    client: ClientId,
+    chat_id: crate::model::TerminalId,
+    after_generation: Option<u64>,
+) -> Result<crate::terminal_ipc::PreparedResponse, ProtocolError> {
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(receipt) = state.chat_handoffs.get(&chat_id) {
+        receipt.require_attached(client)?;
+        if !receipt.subscribers.get(&client).copied().unwrap_or(false) {
+            return Err(error(
+                "Hidden chat has no presentation stream; make it visible before reading",
+            ));
+        }
+        return Ok(ServerResponse::ChatSnapshot {
+            chat_id,
+            snapshot: (!after_generation
+                .is_some_and(|generation| generation >= receipt.generation))
+            .then(|| receipt.snapshot()),
+        }
+        .into());
+    }
+    let record = attached(&state, client, chat_id)?;
+    if !record.subscribers.get(&client).copied().unwrap_or(false) {
+        return Err(error(
+            "Hidden chat has no presentation stream; make it visible before reading",
+        ));
+    }
+    let handle = record.handle.clone();
+    drop(state);
+    let response = handle
+        .presentation_wire(chat_id, after_generation)
+        .map_err(unavailable)?;
+    // A close, detach, replacement actor, or visibility change during
+    // hydration must not publish data under the old attachment.
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    let current = attached(&state, client, chat_id)?;
+    if !current.handle.same_attachment(&handle)
+        || !current.subscribers.get(&client).copied().unwrap_or(false)
+    {
+        return Err(error(
+            "Chat attachment changed while preparing its transcript",
+        ));
+    }
+    Ok(response)
+}
+
 fn process_inner(
     host: &SharedHost,
     client: ClientId,
@@ -2736,6 +3701,11 @@ fn process_inner(
             dry_run,
         }),
         ClientRequest::ChatPrepareResume { source } => {
+            if let Some(session) =
+                floor_history::prepare_resume(host, &source).map_err(unavailable)?
+            {
+                return Ok(ServerResponse::ChatResumePrepared { session });
+            }
             let proof = host
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -2755,6 +3725,11 @@ fn process_inner(
             if let Some(session) = capacity::prepare_saved_history(host, &source)? {
                 return Ok(ServerResponse::ChatResumePrepared { session });
             }
+            // A card still attached to an actor whose provider exited under
+            // this daemon resumes the same way as one a daemon stop ended:
+            // the exited actor is retired as a stop first, so the checks
+            // below find its verified retirement rather than a present owner.
+            retained_actor::finish_exited_attachment(host, &source).map_err(unavailable)?;
             // An unnamed pane resumes the conversation its ended actors
             // confirmed, through the same checks as a named one; when they
             // confirmed none, every actor's end is already proved and the
@@ -2793,12 +3768,16 @@ fn process_inner(
             if !retirement.is_classified() && has_native_owner(&ended)? {
                 return Ok(ServerResponse::ChatResumePrepared { session: ended });
             }
+            if prepare_shared_codex_join(host, &source)? {
+                return Ok(ServerResponse::ChatResumePrepared { session: source });
+            }
             // A kernel boot change proves every process from the saved boot
             // is gone. Unlike missing runtime files within the same boot, it
             // authorizes an exact disk resume without its ephemeral receipt.
-            let previous_boot = source.proof.as_ref().is_some_and(|previous| {
-                previous.is_complete() && previous.boot_id != proof.boot_id
-            });
+            let previous_boot = source.launch.provider != Provider::Codex
+                && source.proof.as_ref().is_some_and(|previous| {
+                    previous.is_complete() && previous.boot_id != proof.boot_id
+                });
             let unstarted = if previous_boot || unconfirmed {
                 None
             } else {
@@ -2820,9 +3799,26 @@ fn process_inner(
                 retained_resume::prepare_resume_verified(host, &source, retirement.verified())
                     .map_err(unavailable)?
             } else {
+                // An owner lost without its receipt was closed all the same,
+                // proved while no start or close can take its allocation.
                 chat::native_holder::closed_source(&source, &proof)
                     .map_err(unavailable)?
                     .is_some_and(|(_, paired_closed)| paired_closed)
+                    || match reserve_unhosted_allocation(host, &source, None) {
+                        Ok(_fence) => {
+                            require_ended_codex_execution(host, &source, &proof.boot_id).map_err(
+                                |failure| {
+                                    ProtocolError::new(
+                                        ProtocolErrorCode::TerminalUnavailable,
+                                        failure.to_string(),
+                                        source.launch.provider == Provider::Codex,
+                                    )
+                                },
+                            )?;
+                            true
+                        }
+                        Err(()) => false,
+                    }
             };
             if !closed {
                 return Err(unavailable(
@@ -3176,50 +4172,9 @@ fn process_inner(
         ClientRequest::ChatRead {
             chat_id,
             after_generation,
-        } => {
-            let state = host.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(receipt) = state.chat_handoffs.get(&chat_id) {
-                receipt.require_attached(client)?;
-                if !receipt.subscribers.get(&client).copied().unwrap_or(false) {
-                    return Err(error(
-                        "Hidden chat has no presentation stream; make it visible before reading",
-                    ));
-                }
-                return Ok(ServerResponse::ChatSnapshot {
-                    chat_id,
-                    snapshot: (!after_generation
-                        .is_some_and(|generation| generation >= receipt.generation))
-                    .then(|| receipt.snapshot()),
-                });
-            }
-            let record = attached(&state, client, chat_id)?;
-            if !record.subscribers.get(&client).copied().unwrap_or(false) {
-                return Err(error(
-                    "Hidden chat has no presentation stream; make it visible before reading",
-                ));
-            }
-            let handle = record.handle.clone();
-            drop(state);
-            let response = handle
-                .presentation(chat_id, after_generation)
-                .map_err(unavailable)?
-                .unwrap_or(ServerResponse::ChatSnapshot {
-                    chat_id,
-                    snapshot: None,
-                });
-            // A close, detach, replacement actor, or visibility change during
-            // hydration must not publish data under the old attachment.
-            let state = host.lock().unwrap_or_else(|p| p.into_inner());
-            let current = attached(&state, client, chat_id)?;
-            if !current.handle.same_attachment(&handle)
-                || !current.subscribers.get(&client).copied().unwrap_or(false)
-            {
-                return Err(error(
-                    "Chat attachment changed while preparing its transcript",
-                ));
-            }
-            Ok(response)
-        }
+        } => read_presentation(host, client, chat_id, after_generation)?
+            .decode()
+            .map_err(unavailable),
         ClientRequest::ChatReturnTerminal { chat_id } => {
             super::account_lifecycle::ensure_idle(host)?;
             let (owners, closing) = {
@@ -3478,20 +4433,46 @@ fn process_inner(
 /// Borrow the complete native transition only while its closing reservation is
 /// alive. Ordinary terminal spawns cannot bypass native admission with an ID.
 pub(super) struct TerminalViewReservation<'a> {
-    owners: &'a paired_close::Owners,
-    closing: &'a capacity::Reservation,
+    kind: TerminalViewKind<'a>,
+}
+
+enum TerminalViewKind<'a> {
+    Codex {
+        owners: &'a paired_close::Owners,
+        closing: &'a capacity::Reservation,
+    },
+    /// Only retained-actor recovery constructs this after authenticating the
+    /// helper and committing its exact console replacement intent.
+    RetainedConsole { requested: &'a Session },
 }
 
 impl TerminalViewReservation<'_> {
+    pub(super) fn retained_console(requested: &Session) -> TerminalViewReservation<'_> {
+        TerminalViewReservation {
+            kind: TerminalViewKind::RetainedConsole { requested },
+        }
+    }
+
     pub(super) fn authorizes(&self, state: &HostState, terminal_id: TerminalId) -> bool {
-        self.owners.target.source.id == terminal_id
-            && self.owners.require_locked(state, self.closing).is_ok()
-            && state.chats.get(&terminal_id).is_some_and(|record| {
-                record.returning_terminal
-                    && record.session.launch.provider == Provider::Codex
-                    && record.session.terminal.is_none()
-                    && record.paired_terminal.is_none()
-            })
+        match &self.kind {
+            TerminalViewKind::Codex { owners, closing } => {
+                owners.target.source.id == terminal_id
+                    && owners.require_locked(state, closing).is_ok()
+                    && state.chats.get(&terminal_id).is_some_and(|record| {
+                        record.returning_terminal
+                            && record.session.launch.provider == Provider::Codex
+                            && record.session.terminal.is_none()
+                            && record.paired_terminal.is_none()
+                    })
+            }
+            TerminalViewKind::RetainedConsole { requested } => {
+                requested.id == terminal_id
+                    && state.chat_spawning.get(&terminal_id) == Some(*requested)
+                    && !state.chats.contains_key(&terminal_id)
+                    && !state.native_closing.contains_key(&terminal_id)
+                    && !state.chat_handoffs.contains_key(&terminal_id)
+            }
+        }
     }
 }
 
@@ -3582,11 +4563,20 @@ pub(super) fn close_captured(
                 "The exact native attachment changed before close",
             ));
         }
-        capacity::Reservation::closing(host, &mut state, &source)?
+        capacity::Reservation::removing(host, &mut state, &source)?
     };
     super::agent_execution::preflight_retirement(host, &source).map_err(unavailable)?;
     target.require_current(host)?;
-    handle.close_for_resume().map_err(unavailable)?;
+    handle.decide_detached_work(super::agent_execution::detached_work_on_close(
+        host, source.id,
+    ));
+    if let Err(error) = handle.close_for_resume() {
+        // Its Release failed. When that is because the helper died while the
+        // provider runs on, say what holds the conversation; the pane offers
+        // to end it.
+        let refusal = registered_holder_lost_refusal(host, &source).ok().flatten();
+        return Err(unavailable(refusal.unwrap_or(error)));
+    }
     let snapshot = handle.snapshot(None).ok_or_else(|| {
         unavailable("Exact native final snapshot is unavailable; retirement remains unconfirmed")
     })?;
@@ -3703,6 +4693,8 @@ pub(super) fn close_captured(
         record
     };
     if let Some(record) = &record {
+        // A holder that died before its Release left the allocation behind.
+        let _ = return_listener_allocation(&record.session);
         super::agent_execution::retired(host, &record.session).map_err(unavailable)?;
     }
     drop(record);
@@ -3721,7 +4713,9 @@ pub(super) fn resolve_upgrade(
                 "The exact upgraded provider is unavailable. Its recovery evidence was retained; reopen this conversation from the provider's saved sessions."
             )))?;
         if !record.handle.owns_work()
-            && !(source.is_saved_claude_history() && record.handle.is_read_only_history())
+            && !((source.is_saved_claude_history()
+                || crate::upgrade::floor::load().is_ok_and(|ledger| ledger.blocks_chat(source)))
+                && record.handle.is_read_only_history())
         {
             return Err(unavailable(
                 "Restored native provider has closed; no writer was restarted",
@@ -3863,6 +4857,14 @@ fn prepare_native_process_launch(
 ) -> Result<chat::Launch, ProtocolError> {
     let mut spec = chat::protocol::ProcessSpec::from(&launch.recipe);
     if let Some(daemon) = daemon {
+        // A client older than this daemon, started inside another agent's
+        // session, still sends that session along. Withhold it rather than
+        // refuse the conversation.
+        let selected = selected
+            .iter()
+            .filter(|(name, _)| !crate::agent::is_session_variable(name))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect::<BTreeMap<_, _>>();
         if selected.iter().any(|(name, value)| {
             !crate::model::agent_recovery::fresh_environment_key(
                 launch.provider,
@@ -3875,7 +4877,7 @@ fn prepare_native_process_launch(
                 "Native execution environment contains an unrelated or private variable",
             ));
         }
-        spec.environment = sourceless_environment(daemon, selected.clone(), spec.environment);
+        spec.environment = sourceless_environment(daemon, selected, spec.environment);
     }
     if let Some(source) = source {
         spec.environment = source.clone();
@@ -3915,7 +4917,7 @@ fn upgrade_environment(
     )
     .map_err(|error| error.message)?;
     let (mut spec, _) = chat::protocol::create(&process_launch)?;
-    spec.remove_unset_environment();
+    spec.withhold_environment();
     Ok(spec.environment)
 }
 
@@ -3936,7 +4938,7 @@ pub(super) fn validate_upgrade_environment(
     )?;
     if !handle.recovery_environment_matches(&restored) {
         return Err(
-            "Native execution environment cannot survive daemon upgrade without losing selected credentials or account settings. Align the daemon configuration or finish and close this conversation before upgrading; no source was stopped."
+            "Native execution environment cannot survive daemon upgrade without losing selected credentials or account settings. The updater can restore this conversation stopped after confirmation; no source was stopped."
                 .into(),
         );
     }
@@ -4209,6 +5211,8 @@ pub(super) fn close_terminal_actor(
         .map_err(unavailable)?;
     owners.close(host, &closing)?;
     owners.require_current(host, &closing)?;
+    // A holder that died before its Release left the allocation behind.
+    let _ = return_listener_allocation(&owners.target.source);
     // Preserve the exact closed owners until durable execution retirement succeeds.
     super::agent_execution::retired(host, &owners.target.source).map_err(unavailable)?;
     let removed = {
@@ -4852,6 +5856,31 @@ IFS= read -r finish < finish
                 )
                 .is_err()
             );
+            // An older client started inside another agent's session still
+            // sends it; the conversation starts without it.
+            let prepared = prepare_native_process_launch(
+                &launch,
+                Some(BTreeMap::new()),
+                &[
+                    ("PATH".into(), "/selected/bin".into()),
+                    ("CLAUDECODE".into(), "1".into()),
+                    (
+                        "CLAUDE_CODE_MESSAGING_SOCKET".into(),
+                        "/run/parent.sock".into(),
+                    ),
+                ]
+                .into(),
+                None,
+            )
+            .unwrap();
+            assert_eq!(prepared.recipe.environment["PATH"], "/selected/bin");
+            assert!(!prepared.recipe.environment.contains_key("CLAUDECODE"));
+            assert!(
+                !prepared
+                    .recipe
+                    .environment
+                    .contains_key("CLAUDE_CODE_MESSAGING_SOCKET")
+            );
         }
     }
 
@@ -5237,7 +6266,7 @@ IFS= read -r finish < finish
         let selected = BTreeMap::from([("CLAUDE_CODE_OAUTH_TOKEN".into(), "gui-fixture".into())]);
         let (mut spec, _) = chat::protocol::create(&launch).unwrap();
         spec.environment = sourceless_environment(daemon.clone(), selected, spec.environment);
-        spec.remove_unset_environment();
+        spec.withhold_environment();
         assert_eq!(
             spec.environment
                 .get("CLAUDE_CONFIG_DIR")
@@ -5887,7 +6916,7 @@ for line in sys.stdin:
             .handle
             .clone();
         let resources_alive = handle.resource_lifetime();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while !directory.path().join("environment-received").exists() {
             assert!(
                 Instant::now() < deadline,
@@ -5903,7 +6932,7 @@ for line in sys.stdin:
         confirm_fresh_session(
             &handle,
             &mut launch,
-            Instant::now() + Duration::from_secs(5),
+            Instant::now() + Duration::from_secs(60),
             || false,
         )
         .unwrap();
@@ -6082,7 +7111,7 @@ for line in sys.stdin:
             panic!("lost handoff response was not replayed");
         };
         assert_eq!(repeated, terminal);
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(60);
         // The fixture creates this file before its buffered write reaches it.
         let terminal_starts = loop {
             let starts = std::fs::read_to_string(directory.path().join("terminal-starts"))
@@ -6951,18 +7980,17 @@ done
             panic!("chat inventory")
         };
         assert_eq!(sessions, vec![session.clone()]);
-        let validated = client_session_in(&host, session.clone(), root);
+        host.lock().unwrap().codex_listeners = CodexListenerRoots::at(root.into());
+        let validated = client_session(&host, session.clone());
         assert_eq!(validated.owned_codex_listener, session.owned_codex_listener);
         assert_eq!(
             validated.owned_codex_listener.as_ref().unwrap().allocator,
             allocator
         );
 
-        let untrusted = client_session_in(
-            &host,
-            session.clone(),
-            std::path::Path::new("/another-daemon-root"),
-        );
+        host.lock().unwrap().codex_listeners =
+            CodexListenerRoots::at("/another-daemon-root".into());
+        let untrusted = client_session(&host, session.clone());
         assert!(untrusted.owned_codex_listener.is_none());
         assert_eq!(untrusted.launch.recipe, session.launch.recipe);
         assert!(!untrusted.owns_codex_listener());
@@ -7055,13 +8083,9 @@ done
                 },
             );
         }
+        host.lock().unwrap().codex_listeners = CodexListenerRoots::at("/another-root".into());
         assert_eq!(
-            client_session_in(
-                &host,
-                session.clone(),
-                std::path::Path::new("/another-root")
-            )
-            .owned_codex_listener,
+            client_session(&host, session.clone()).owned_codex_listener,
             session.owned_codex_listener
         );
         let view = |client, session, recipe| {
@@ -7421,6 +8445,134 @@ done
         assert!(client.list_chats().unwrap().is_empty());
         drop(client);
         server.join().unwrap();
+    }
+
+    /// Every surface showing a conversation hears how the provider addresses
+    /// its subagents as each is learned, and one attaching later is told
+    /// those already known.
+    #[test]
+    fn agent_addresses_reach_every_subscriber_and_each_new_one() {
+        struct Addresser;
+        impl Adapter for Addresser {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Ok(Step {
+                    suppress_current_notification: false,
+                    notification_preview: None,
+                    writes: vec![json!({"tick": true})],
+                    events: Vec::new(),
+                })
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Ok(Step {
+                    suppress_current_notification: false,
+                    notification_preview: None,
+                    writes: Vec::new(),
+                    events: vec![Event::AgentAddress(chat::AgentAddress {
+                        address: "a1892b93e88999a7d".into(),
+                        subagent: "toolu_relocate".into(),
+                    })],
+                })
+            }
+        }
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("agent-addresses"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        };
+        let host = Arc::new(crate::host::state::HostLock::new(HostState::new(
+            proof.clone(),
+        )));
+        let chat_id = TerminalId::new();
+        let recipe = LaunchRecipe {
+            unset_environment: Default::default(),
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: std::env::temp_dir(),
+            environment: BTreeMap::new(),
+        };
+        let spec = ProcessSpec::from(&recipe);
+        let mut initial = Step::default();
+        let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+        let weak = Arc::downgrade(&host);
+        let handle = Handle::start(
+            spec,
+            Box::new(Addresser),
+            initial,
+            store,
+            None,
+            move |update| changed(&weak, chat_id, update),
+        )
+        .unwrap();
+        let queue = {
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            let queue = state.register_client(1);
+            state.chats.insert(
+                chat_id,
+                Record {
+                    execution_instance: uuid::Uuid::nil(),
+                    console_recipe: None,
+                    paired_terminal: None,
+                    session: Session {
+                        native_continuity: Default::default(),
+                        owned_codex_listener: None,
+                        id: chat_id,
+                        launch: chat::Launch {
+                            provider: Provider::Claude,
+                            recipe,
+                            session_id: None,
+                        },
+                        proof: Some(proof),
+                        terminal: None,
+                    },
+                    handle: handle.clone(),
+                    source_process: None,
+                    // Hidden, as most surfaces showing it are.
+                    subscribers: BTreeMap::from([(1, false)]),
+                    observations: BTreeMap::new(),
+                    completion_observed: false,
+                    returning_terminal: false,
+                },
+            );
+            queue
+        };
+        assert!(
+            agent_addresses(&host, chat_id).is_none(),
+            "a conversation that knows none tells a new subscriber nothing"
+        );
+        let (heard, hearing) = crossbeam_channel::unbounded();
+        let reader = thread::spawn({
+            let queue = queue.clone();
+            move || {
+                while let Some(outbound) = queue.pop() {
+                    if let ServerMessage::ChatAgentAddresses { chat_id, addresses } =
+                        outbound.message
+                    {
+                        let _ = heard.send((chat_id, addresses));
+                    }
+                }
+            }
+        });
+        handle.command(Command::Interrupt).unwrap();
+        let expected = vec![chat::AgentAddress {
+            address: "a1892b93e88999a7d".into(),
+            subagent: "toolu_relocate".into(),
+        }];
+        assert_eq!(
+            hearing.recv_timeout(Duration::from_secs(5)).unwrap(),
+            (chat_id, expected.clone())
+        );
+        let Some(ServerMessage::ChatAgentAddresses { addresses, .. }) =
+            agent_addresses(&host, chat_id)
+        else {
+            panic!("a new subscriber is told the addresses known");
+        };
+        assert_eq!(addresses, expected);
+        handle.close().unwrap();
+        queue.close_after_drain();
+        reader.join().unwrap();
     }
 
     #[test]

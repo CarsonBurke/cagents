@@ -26,22 +26,16 @@ pub struct FontMatchKey {
     pub(crate) font_weight: u16,
     pub(crate) font_stretch: u16,
     pub(crate) id: fontdb::ID,
-    pub(crate) variable_weight_match: bool,
 }
 
 impl FontMatchKey {
-    fn new(attrs: &Attrs, face: &FaceInfo, db: &fontdb::Database) -> FontMatchKey {
+    // Only what the face list already knows. Whether a face of another weight
+    // is variable over the asked one needs its file, so it is asked for only
+    // of the faces a fallback reaches: see `FontSystem::matches_weight`.
+    fn new(attrs: &Attrs, face: &FaceInfo) -> FontMatchKey {
         // TODO: smarter way of detecting emoji
         let not_emoji = !face.post_script_name.contains("Emoji");
         let font_weight_diff = attrs.weight.0.abs_diff(face.weight.0);
-
-        let variable_weight_match = font_weight_diff != 0
-            && db.with_face_data(face.id, |font_data, face_index| {
-                let font_ref = skrifa::FontRef::from_index(font_data, face_index).ok()?;
-                let axis = font_ref.axes().get_by_tag(skrifa::Tag::new(b"wght"))?;
-                let w = attrs.weight.0 as f32;
-                Some(w >= axis.min_value() && w <= axis.max_value())
-            }) == Some(Some(true));
         let font_weight = face.weight.0;
         let font_stretch_diff = attrs.stretch.to_number().abs_diff(face.stretch.to_number());
         let font_stretch = face.stretch.to_number();
@@ -64,7 +58,6 @@ impl FontMatchKey {
             font_weight,
             font_stretch,
             id,
-            variable_weight_match,
         }
     }
 }
@@ -152,6 +145,9 @@ pub struct FontSystem {
 
     /// Cache for font matches.
     font_matches_cache: HashMap<FontMatchAttrs, Arc<Vec<FontMatchKey>>>,
+
+    /// Each face's variable weight range, if it has one, read on first need.
+    weight_axes: HashMap<fontdb::ID, Option<(f32, f32)>>,
 
     /// Scratch buffer for shaping and laying out.
     pub(crate) shape_buffer: ShapeBuffer,
@@ -262,6 +258,7 @@ impl FontSystem {
             per_script_monospace_font_ids,
             font_cache: HashMap::default(),
             font_matches_cache: HashMap::default(),
+            weight_axes: HashMap::default(),
             font_codepoint_support_info_cache: HashMap::default(),
             monospace_fallbacks_buffer: BTreeSet::default(),
             #[cfg(feature = "shape-run-cache")]
@@ -290,6 +287,7 @@ impl FontSystem {
     /// Get a mutable reference to the database.
     pub fn db_mut(&mut self) -> &mut fontdb::Database {
         self.font_matches_cache.clear();
+        self.weight_axes.clear();
         &mut self.db
     }
 
@@ -394,7 +392,7 @@ impl FontSystem {
                 let mut font_match_keys = self
                     .db
                     .faces()
-                    .map(|face| FontMatchKey::new(attrs, face, &self.db))
+                    .map(|face| FontMatchKey::new(attrs, face))
                     .collect::<Vec<_>>();
 
                 // Sort so we get the keys with weight_offset=0 first
@@ -420,7 +418,7 @@ impl FontSystem {
                         font_match_keys.insert(0, match_key);
                     } else if let Some(face) = self.db.face(id) {
                         // else insert in front
-                        let match_key = FontMatchKey::new(attrs, face, &self.db);
+                        let match_key = FontMatchKey::new(attrs, face);
                         font_match_keys.insert(0, match_key);
                     } else {
                         log::error!("Could not get face from db, that should've been there.");
@@ -436,6 +434,35 @@ impl FontSystem {
                 Arc::new(font_match_keys)
             })
             .clone()
+    }
+
+    /// Whether a matched face draws at `weight`: it is that weight, or it is
+    /// variable over a weight range that covers it.
+    ///
+    /// Telling a variable face apart needs its file. Upstream reads it for
+    /// every known face of another weight each time a new family, weight,
+    /// style or stretch is matched, which opens most of the system's font
+    /// files for a first bold or italic span. Reading it here, once per face
+    /// and only for the faces a fallback reaches, finds the same faces. A face
+    /// whose file cannot be read counts as not variable until the database
+    /// changes.
+    pub(crate) fn matches_weight(&mut self, key: &FontMatchKey, weight: fontdb::Weight) -> bool {
+        if key.font_weight_diff == 0 {
+            return true;
+        }
+        let db = &self.db;
+        let range = *self.weight_axes.entry(key.id).or_insert_with(|| {
+            db.with_face_data(key.id, |font_data, face_index| {
+                let font_ref = skrifa::FontRef::from_index(font_data, face_index).ok()?;
+                let axis = font_ref.axes().get_by_tag(skrifa::Tag::new(b"wght"))?;
+                Some((axis.min_value(), axis.max_value()))
+            })
+            .flatten()
+        });
+        range.is_some_and(|(min, max)| {
+            let weight = f32::from(weight.0);
+            weight >= min && weight <= max
+        })
     }
 
     #[cfg(feature = "std")]
@@ -502,3 +529,11 @@ impl<T> DerefMut for BorrowedWithFontSystem<'_, T> {
 #[cfg(all(test, feature = "std", not(feature = "monospace_fallback")))]
 #[path = "system/default_coverage_tests.rs"]
 mod default_coverage_tests;
+
+#[cfg(all(test, feature = "std"))]
+#[path = "system/weight_match_tests.rs"]
+mod weight_match_tests;
+
+#[cfg(all(test, feature = "std"))]
+#[path = "system/fallback_choice_tests.rs"]
+mod fallback_choice_tests;

@@ -13,7 +13,7 @@ use std::{os::unix::fs::MetadataExt, sync::Arc};
 /// observation. This checks the held inode only: it neither repairs permissions
 /// nor proves current placement, ACL policy or atomicity with a later effect.
 /// Directory timestamps are deliberately excluded because payload work changes them.
-pub(crate) fn verify_recovery_directory_private(
+pub fn verify_recovery_directory_private(
     directory: &Root,
     expected: &std::fs::Metadata,
 ) -> io::Result<()> {
@@ -140,7 +140,7 @@ impl std::iter::FusedIterator for RecoveryParentCandidates {}
 /// travel together until the consumer transfers all three into its live owner.
 /// Dropping this value never removes names or claims successful cleanup.
 #[must_use = "retain the publication and its existing reservation through actual resolution"]
-pub(crate) struct RecoveryDirectory<T = ()> {
+pub struct RecoveryDirectory<T = ()> {
     publication: DirectoryPublication,
     owner: T,
     private_metadata: std::fs::Metadata,
@@ -171,7 +171,7 @@ impl<T> RecoveryDirectory<T> {
     /// bare-Root conversion or second reservation is provided. A destructuring
     /// caller must immediately form its aggregate, with native owners before
     /// the slot, before fallible work: separate locals drop in reverse order.
-    pub(crate) fn into_parts(
+    pub fn into_parts(
         self,
     ) -> (
         DirectoryPublication,
@@ -193,7 +193,7 @@ impl<T> RecoveryDirectory<T> {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum RecoveryDirectoryError {
+pub enum RecoveryDirectoryError {
     #[error("Recovery holding preparation was refused: {0}")]
     Rejected(#[source] io::Error),
     #[error("Recovery holding preparation failed: {cause}; retained recovery: {recovery:?}")]
@@ -329,7 +329,7 @@ pub(crate) fn prepare_recovery_directory(
 /// On success into_parts transfers the owner together with all three guards.
 /// A consumer initializes its private-mode phase from initial UID/GID plus
 /// INTENDED700, not initial_metadata.mode(): the factory already established700.
-pub(crate) fn prepare_recovery_directory_with_owner<T: Send + 'static>(
+pub fn prepare_recovery_directory_with_owner<T: Send + 'static>(
     admission: FilesystemRecoveryReservation,
     leaf: &OsStr,
     cancelled: impl Fn() -> bool,
@@ -350,14 +350,14 @@ pub(crate) fn prepare_recovery_directory_with_owner<T: Send + 'static>(
 /// directory-sync success alone does not erase this missing preparation proof.
 #[derive(Debug)]
 #[must_use = "Save preparation durability must propagate to the final Save outcome"]
-pub(crate) enum SavePreparationDurability {
+pub enum SavePreparationDurability {
     Confirmed,
     Unconfirmed(io::Error),
 }
 
 /// Save-only live custody of an actually qualified fresh holding, even when
 /// confirming its directory durability fails. General recovery remains strict.
-pub(crate) fn prepare_save_recovery_directory_with_owner<T: Send + 'static>(
+pub fn prepare_save_recovery_directory_with_owner<T: Send + 'static>(
     admission: FilesystemRecoveryReservation,
     leaf: &OsStr,
     cancelled: impl Fn() -> bool,
@@ -375,7 +375,7 @@ pub(crate) fn prepare_save_recovery_directory_with_owner<T: Send + 'static>(
 }
 
 fn sync_save_preparation_directory(directory: &Root) -> io::Result<()> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if FAIL_NEXT_SAVE_PREPARATION_SYNC.with(|pending| pending.replace(false)) {
         return Err(io::Error::other(
             "injected Save preparation directory sync failure",
@@ -384,7 +384,7 @@ fn sync_save_preparation_directory(directory: &Root) -> io::Result<()> {
     sync_directory(directory)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 std::thread_local! {
     static FAIL_NEXT_SAVE_PREPARATION_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -393,9 +393,10 @@ std::thread_local! {
 /// Save factory preparation-directory sync fails; all later syncs are real.
 /// Dropping the guard clears an unconsumed fault after early qualification
 /// failure, so another test on this worker thread cannot inherit it.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
 #[must_use = "retain the fault guard through the actual Save operation"]
-pub(crate) fn fixture_fail_next_save_preparation_sync() -> impl Drop {
+pub fn fixture_fail_next_save_preparation_sync() -> impl Drop {
     struct FaultGuard(std::marker::PhantomData<std::rc::Rc<()>>);
     impl Drop for FaultGuard {
         fn drop(&mut self) {

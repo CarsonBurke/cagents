@@ -1,4 +1,4 @@
-//! One coalescing semantic-outcome broker for all helper-owned actors. Provider
+//! One coalescing persistence broker for all helper-owned actors. Provider
 //! callbacks only wake it; neither callback return nor enqueueing acknowledges
 //! a durable outcome. No RPC, SQLite transaction or journal wait holds HostState.
 use super::*;
@@ -37,9 +37,20 @@ pub(in crate::host) struct Broker(Arc<Inbox>);
 struct Inbox {
     pending: Mutex<BTreeSet<TerminalId>>,
     wake: Condvar,
+    #[cfg(test)]
+    worker_lifetime: Weak<()>,
 }
 
-pub(super) fn wake(host: &SharedHost, id: TerminalId) {
+#[cfg(test)]
+pub(in crate::host) fn broker_running(host: &SharedHost) -> bool {
+    host.lock()
+        .unwrap()
+        .native_actor_outcomes
+        .as_ref()
+        .is_some_and(|broker| broker.0.worker_lifetime.strong_count() > 0)
+}
+
+pub(in crate::host) fn wake(host: &SharedHost, id: TerminalId) {
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     if state.shutting_down {
         return;
@@ -47,15 +58,23 @@ pub(super) fn wake(host: &SharedHost, id: TerminalId) {
     let broker = match state.native_actor_outcomes.clone() {
         Some(broker) => broker,
         None => {
+            #[cfg(test)]
+            let worker_lifetime = Arc::new(());
             let inbox = Arc::new(Inbox {
                 pending: Mutex::new(BTreeSet::new()),
                 wake: Condvar::new(),
+                #[cfg(test)]
+                worker_lifetime: Arc::downgrade(&worker_lifetime),
             });
             let weak = Arc::downgrade(host);
             let worker = inbox.clone();
             if let Err(error) = thread::Builder::new()
                 .name("cagents-actor-outcomes".into())
-                .spawn(move || run(weak, worker))
+                .spawn(move || {
+                    #[cfg(test)]
+                    let _lifetime = worker_lifetime;
+                    run(weak, worker)
+                })
             {
                 tracing::error!(%error, "cannot start retained actor outcome broker; helper outbox remains unacknowledged");
                 return;
@@ -180,13 +199,27 @@ fn capture_execution_owner<'a>(
     Ok(captured.as_ref())
 }
 
+/// The descriptor `persist_confirmed_identity` publishes for this attachment:
+/// its resident source with the conversation the helper itself confirmed.
+/// Read it before taking the Registry lock.
+fn confirmed_projection(handle: &Handle, source: &Session) -> Option<Session> {
+    let confirmed = handle.confirmed_session_id()?;
+    let mut projected = source.clone();
+    projected.launch.session_id = Some(confirmed);
+    Some(projected)
+}
+
 /// Recheck the exact captured row under the same Registry mutex as settlement.
 /// Revocation, mutation or retirement after helper recognition cannot authorize
-/// a durable run transition or the helper ACK that follows it.
+/// a durable run transition or the helper ACK that follows it. The single
+/// accepted change is a concurrent identity confirmation: it keeps every
+/// authority field and publishes exactly `confirmed`, the attachment's
+/// resident source with the conversation its helper confirmed.
 fn require_execution_owner(
     registry: &super::super::model::Registry,
     captured: Option<&ExecutionOwner>,
     execution: bool,
+    confirmed: Option<&Session>,
 ) -> Result<(), String> {
     if !execution {
         return Ok(());
@@ -195,7 +228,9 @@ fn require_execution_owner(
     let owner = registry
         .native_actor_ownership(captured.0.actor())?
         .ok_or("Retained execution lost its durable ownership registration")?;
-    if owner != captured.0 || owner.is_pending() {
+    let current = owner == captured.0
+        || confirmed.is_some_and(|confirmed| owner == captured.0.with_source(confirmed));
+    if !current || owner.is_pending() {
         return Err("Retained execution ownership changed after source authentication; evidence remains unacknowledged".into());
     }
     if registry.native_actor_retirement(owner.actor())?.is_some() {
@@ -232,6 +267,10 @@ impl SemanticTarget {
         } else {
             Err("Retained actor ownership changed before semantic acknowledgement".into())
         }
+    }
+
+    fn confirmed_projection(&self) -> Option<Session> {
+        confirmed_projection(&self.handle, &self.source)
     }
 }
 
@@ -297,16 +336,19 @@ impl AnswerSync {
 
     fn require_current(&self, host: &SharedHost) -> Result<(), String> {
         self.target.require_current(host)?;
+        let confirmed = self.target.confirmed_projection();
         require_execution_owner(
             &self.registry.lock().unwrap_or_else(|p| p.into_inner()),
             self.owner.as_ref(),
             true,
+            confirmed.as_ref(),
         )
     }
 
     fn require_committed_through(&self, through: u64) -> Result<(), String> {
+        let confirmed = self.target.confirmed_projection();
         let registry = self.registry.lock().unwrap_or_else(|p| p.into_inner());
-        require_execution_owner(&registry, self.owner.as_ref(), true)?;
+        require_execution_owner(&registry, self.owner.as_ref(), true, confirmed.as_ref())?;
         let committed = registry.native_actor_committed_through(
             self.target.identity.instance,
             &self.target.identity.record,
@@ -361,8 +403,99 @@ impl AnswerSync {
     }
 }
 
+/// Persist only the helper's exact confirmed projection. Keep the resident
+/// launch alias unchanged so concurrent controls retain their original process
+/// fences. Failed writes stay on the broker's retry set, without a UI client.
+fn persist_confirmed_identity(
+    host: &SharedHost,
+    target: &SemanticTarget,
+    registry: &super::super::agent_execution::SharedRegistry,
+) -> Result<(), String> {
+    if target.handle.is_close_only() {
+        return Ok(());
+    }
+    let Some(projected) = target.confirmed_projection() else {
+        return Ok(());
+    };
+    let (ownership, bound) = {
+        let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+        (
+            registry.native_actor_ownership(target.identity.instance)?,
+            registry
+                .agent_for_session(target.source.id)?
+                .and_then(|agent| agent.session),
+        )
+    };
+    // Cleanup intent can report attention without installed writer authority.
+    // Keep its existing semantic drain; it cannot publish a new identity.
+    let Some(ownership) = ownership.filter(|owner| !owner.is_pending()) else {
+        return Ok(());
+    };
+    let confirmed = &projected.launch.session_id;
+    if &ownership.source().launch.session_id == confirmed
+        && bound.as_ref().is_none_or(|session| {
+            matches!(session,
+            crate::agent_execution::HostedSession::Chat(source)
+                if &source.launch.session_id == confirmed)
+        })
+    {
+        return Ok(());
+    }
+    let owner = ExecutionOwner::authenticate(
+        Some(ownership),
+        &target.identity,
+        &target.source,
+        target.handle.launch_account_scope(),
+        |sources| target.handle.recognize_retained_sources(sources),
+    )?;
+    target
+        .handle
+        .recognize_retained_sources(std::slice::from_ref(&projected))?;
+    target.require_current(host)?;
+    let mut aliases = vec![owner.0.source().clone(), target.source.clone()];
+    // A startup reply may have bound an earlier issued conversation after the
+    // census advanced. Authenticate that durable alias too before replacing it.
+    if let Some(crate::agent_execution::HostedSession::Chat(bound)) = bound
+        && !aliases.contains(&bound)
+    {
+        target
+            .handle
+            .recognize_retained_sources(std::slice::from_ref(&bound))?;
+        aliases.push(bound);
+    }
+    let aliases = aliases
+        .into_iter()
+        .map(crate::agent_execution::HostedSession::Chat)
+        .collect::<Vec<_>>();
+    let (changed, registered) = {
+        let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+        // Publication replaces exactly the authenticated row. A concurrent
+        // drain or close may already have published this same projection.
+        require_execution_owner(&registry, Some(&owner), true, Some(&projected))?;
+        let changed = registry.adopt_authenticated_agent_session(
+            &aliases,
+            &crate::agent_execution::HostedSession::Chat(projected.clone()),
+        )?;
+        let published = owner.0.with_source(&projected);
+        let registered = if registry
+            .native_actor_ownership(owner.0.actor())?
+            .is_some_and(|current| current == published)
+        {
+            Ok(())
+        } else {
+            registry.confirm_native_actor_identity(&owner.0, &projected)
+        };
+        (changed, registered)
+    };
+    // Adoption may have committed even if census publication needs retry.
+    if changed {
+        super::super::agent_execution::announce(host, registry);
+    }
+    registered
+}
+
 fn drain(host: &SharedHost, id: TerminalId) -> Result<bool, String> {
-    let (handle, source, identity, notifications) = {
+    let target = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let Some(record) = state.chats.get(&id) else {
             return Ok(false);
@@ -370,34 +503,42 @@ fn drain(host: &SharedHost, id: TerminalId) -> Result<bool, String> {
         let Some(identity) = record.handle.actor_identity() else {
             return Ok(false);
         };
-        (
-            record.handle.clone(),
-            record.session.clone(),
+        SemanticTarget {
+            handle: record.handle.clone(),
+            source: record.session.clone(),
             identity,
-            state.notifications.clone(),
-        )
+            notifications: state.notifications.clone(),
+        }
     };
     let registry = super::super::agent_execution::registry(host)?;
     let mut execution_owner = None;
-    handle.refresh_retained_state()?;
+    target.handle.refresh_retained_state()?;
+    persist_confirmed_identity(host, &target, &registry)?;
+    let SemanticTarget {
+        handle,
+        source,
+        identity,
+        ..
+    } = &target;
     let loss = handle.continuity_loss();
     if let Some(loss) = &loss {
         let execution = !loss.affected_runs.is_empty();
         let owner = capture_execution_owner(
             &registry,
-            &handle,
-            &identity,
-            &source,
+            handle,
+            identity,
+            source,
             execution,
             &mut execution_owner,
         )?;
+        let confirmed = target.confirmed_projection();
         let changed = {
             let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-            require_execution_owner(&registry, owner, execution)?;
+            require_execution_owner(&registry, owner, execution, confirmed.as_ref())?;
             registry.commit_native_actor_loss(
                 identity.instance,
                 &identity.record,
-                &source,
+                source,
                 &loss.affected_runs,
                 &loss.reason,
                 chat::now_ms().unwrap_or(0),
@@ -412,9 +553,9 @@ fn drain(host: &SharedHost, id: TerminalId) -> Result<bool, String> {
             .chats
             .get(&id)
             .is_some_and(|record| {
-                record.handle.same_attachment(&handle)
+                record.handle.same_attachment(handle)
                     && record.execution_instance == identity.instance
-                    && record.session == source
+                    && record.session == *source
             });
         if !current {
             return Err("Retained actor changed before continuity-loss acknowledgement".into());
@@ -425,12 +566,6 @@ fn drain(host: &SharedHost, id: TerminalId) -> Result<bool, String> {
     // cannot prove that a notification committed before a previous daemon died.
     let page = handle.uncommitted_outcomes()?;
     let more = !page.is_empty();
-    let target = SemanticTarget {
-        handle,
-        source,
-        identity,
-        notifications,
-    };
     let deadline = Instant::now() + Duration::from_secs(30);
     for entry in page {
         commit_semantic_entry(
@@ -483,9 +618,15 @@ fn commit_semantic_entry(
         execution_owner,
     )?;
     let authenticated = execution || execution_owner.is_some();
+    let confirmed = target.confirmed_projection();
     let (changed, automation) = {
         let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-        require_execution_owner(&registry, execution_owner.as_ref(), authenticated)?;
+        require_execution_owner(
+            &registry,
+            execution_owner.as_ref(),
+            authenticated,
+            confirmed.as_ref(),
+        )?;
         let changed = registry.commit_native_actor_event(
             target.identity.instance,
             &target.identity.record,
@@ -531,10 +672,12 @@ fn commit_semantic_entry(
             .map_err(|_| "The notification journal has not confirmed this attention outcome")??;
     }
     target.require_current(host)?;
+    let confirmed = target.confirmed_projection();
     require_execution_owner(
         &registry.lock().unwrap_or_else(|p| p.into_inner()),
         execution_owner.as_ref(),
         authenticated,
+        confirmed.as_ref(),
     )?;
     target
         .handle
@@ -657,8 +800,9 @@ fn enroll_pending(
 }
 
 #[derive(Clone, Copy)]
-pub(super) enum Publication {
+pub(super) enum Publication<'a> {
     Install,
+    Console(&'a crate::host::model::console_relaunch::ConsoleRelaunch),
     Close,
 }
 
@@ -674,12 +818,20 @@ pub(super) fn publish_authenticated_source(
     retained: &[crate::agent_execution::HostedSession],
     console: Option<crate::model::LaunchRecipe>,
     pair: Option<crate::terminal::holder::Record>,
-    publication: Publication,
+    publication: Publication<'_>,
 ) -> Result<Session, String> {
     if handle.actor_identity().is_none() {
         return Err("Retained publication lost its authenticated actor identity".into());
     }
-    let install = matches!(publication, Publication::Install);
+    let install = !matches!(publication, Publication::Close);
+    if let Publication::Console(intent) = publication {
+        if handle.actor_identity().is_none_or(|identity| {
+            identity.instance != intent.actor || identity.record != intent.owner
+        }) || pair.as_ref() != intent.replacement_holder.as_ref()
+        {
+            return Err("Console publication lost its exact provider or replacement holder".into());
+        }
+    }
     if install == handle.is_close_only() {
         return Err("Retained publication mode does not match its authenticated attachment".into());
     }
@@ -717,19 +869,29 @@ pub(super) fn publish_authenticated_source(
         return Err("Installed Claude actor did not prove retained ownership".into());
     }
     handle.update_native_source(source.clone(), console, pair)?;
-    if install {
-        super::super::agent_execution::registry(host)?
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .adopt_authenticated_agent_session(
-                retained,
-                &crate::agent_execution::HostedSession::Chat(source.clone()),
-            )?;
+    if matches!(publication, Publication::Console(_)) {
+        super::console_relaunch::checkpoint("pair")?;
     }
     if install {
+        let registry = super::super::agent_execution::registry(host)?;
+        let successor = crate::agent_execution::HostedSession::Chat(source.clone());
+        let adopted = {
+            let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+            match publication {
+                Publication::Console(intent) => {
+                    registry.adopt_authenticated_console_session(retained, &successor, intent)?
+                }
+                _ => registry.adopt_authenticated_agent_session(retained, &successor)?,
+            }
+        };
         // Promotion follows the exact helper ACK and Registry transaction and
         // precedes any ordinary HOST input record becoming visible.
         register_ownership(host, handle, &source)?;
+        // The agent's record, and possibly its pane, now name the registered
+        // successor; watching windows learn it from the edge.
+        if adopted {
+            super::super::agent_execution::announce(host, &registry);
+        }
     }
     Ok(source)
 }
@@ -815,6 +977,41 @@ pub(in crate::host) fn finish_interrupted_exit_of(
         Some(owner) if Handle::is_remote_record(&owner) => finish_interrupted_exit(host, &owner),
         _ => Ok(false),
     }
+}
+
+/// Ends the exact hosted actor of `source` whose provider exited while this
+/// daemon kept running, as a stop rather than a close: its agent keeps its
+/// pane and channel and its final attention stays, as after a daemon stop.
+/// The verified retirement this leaves is what lets a resume prepare a
+/// successor on the same conversation; nothing the actor held is resubmitted.
+///
+/// Returns false, changing nothing, unless `source` names this daemon's
+/// attachment, its actor is retained and its provider has exited. A provider
+/// that is still running is never ended here. An exit the provider did not
+/// choose, such as a kill, leaves a failure that keeps the actor owning work
+/// until someone answers it; resuming is that answer.
+pub(in crate::host) fn finish_exited_attachment(
+    host: &SharedHost,
+    source: &Session,
+) -> Result<bool, String> {
+    let target = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(record) = state.chats.get(&source.id) else {
+            return Ok(false);
+        };
+        if source.launch.provider != Provider::Claude
+            || source.proof.as_ref() != Some(state.proof())
+            || record.handle.actor_identity().is_none()
+            || !record.handle.is_completed()
+            || record.handle.is_close_only()
+            || record.returning_terminal
+        {
+            return Ok(false);
+        }
+        super::CloseTarget::from_record(record)
+    };
+    close_with_target(host, source, None, Some(&target), None, Ending::Stopped)?;
+    Ok(true)
 }
 
 /// Whether `issued`'s paired CLI view has no worker here and its original
@@ -963,6 +1160,52 @@ fn restore_actor(
     publish_snapshot: bool,
     replacing: Option<&super::CloseTarget>,
 ) -> Result<ServerResponse, String> {
+    let result = restore_actor_inner(
+        host,
+        client,
+        requested,
+        proof,
+        owner.clone(),
+        publish_snapshot,
+        replacing,
+    );
+    if let Err(error) = &result {
+        let console = publish_snapshot
+            && Handle::inspect_remote(&owner, proof.clone()).is_ok_and(|inspection| {
+                inspection.state.owns_work
+                    && !inspection.state.completed
+                    && !inspection.state.close.closing
+                    && !inspection.state.close.exited
+                    && inspection
+                        .execution_console
+                        .as_ref()
+                        .and_then(crate::agent_execution::console_agent)
+                        .is_some()
+            });
+        let pending = super::super::agent_execution::registry(host)
+            .and_then(|registry| {
+                registry
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .has_console_relaunch(requested.id)
+            })
+            .unwrap_or(true);
+        if publish_snapshot && (console || pending) {
+            host.lock().unwrap_or_else(|p| p.into_inner()).retain_startup_recovery(format!("The retained agent's console could not reconnect; its provider and accepted work remain owned: {error}"));
+        }
+    }
+    result
+}
+
+fn restore_actor_inner(
+    host: &SharedHost,
+    client: ClientId,
+    requested: &Session,
+    proof: &HostSessionProof,
+    owner: crate::daemon::holder_registry::Record,
+    publish_snapshot: bool,
+    replacing: Option<&super::CloseTarget>,
+) -> Result<ServerResponse, String> {
     let inspection = Handle::inspect_remote(&owner, proof.clone())?;
     if inspection.identity.record != owner
         || inspection.source.id != requested.id
@@ -1028,6 +1271,28 @@ fn restore_actor(
     // A presentation alias predating the console cannot release its current
     // exact paired worker. Only authenticated helper metadata names that pair.
     session.terminal = inspection.source.terminal.clone();
+    let replacement = if publish_snapshot
+        && !inspection.state.completed
+        && inspection.state.owns_work
+        && !inspection.state.close.closing
+        && !inspection.state.close.exited
+    {
+        super::console_relaunch::prepare(
+            host,
+            &handle,
+            requested,
+            proof,
+            &inspection.source,
+            &inspection.previous_sources,
+            inspection.execution_console.as_ref(),
+            inspection.paired_holder.as_ref(),
+        )?
+    } else {
+        None
+    };
+    if let Some(replacement) = &replacement {
+        session.terminal = Some(replacement.terminal.clone());
+    }
     // A paired CLI view whose worker is gone may have been closed by the
     // exit that left this helper. Only its original holder's exact close
     // receipt lets cleanup proceed without it; no terminal worker is touched.
@@ -1038,7 +1303,9 @@ fn restore_actor(
             inspection.paired_holder.as_ref(),
             proof,
         )?;
-    let paired = {
+    let paired = if let Some(replacement) = &replacement {
+        Some(replacement.handle.clone())
+    } else {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         match (&mut session.terminal, inspection.paired_holder.as_ref()) {
             (None, None) => None,
@@ -1087,6 +1354,9 @@ fn restore_actor(
     let mut sources = inspection.previous_sources;
     sources.push(inspection.source);
     sources.push(requested.clone());
+    if let Some(replacement) = &replacement {
+        sources.extend(replacement.sources.clone());
+    }
     sources.sort_by_key(|source| serde_json::to_vec(source).unwrap_or_default());
     sources.dedup();
     session = publish_authenticated_source(
@@ -1098,9 +1368,17 @@ fn restore_actor(
             .cloned()
             .map(crate::agent_execution::HostedSession::Chat)
             .collect::<Vec<_>>(),
-        inspection.execution_console.clone(),
-        inspection.paired_holder.clone(),
-        if publish_snapshot {
+        replacement
+            .as_ref()
+            .map(|r| r.terminal.launch.clone())
+            .or_else(|| inspection.execution_console.clone()),
+        replacement
+            .as_ref()
+            .and_then(|r| r.intent.replacement_holder.clone())
+            .or_else(|| inspection.paired_holder.clone()),
+        if let Some(replacement) = &replacement {
+            Publication::Console(&replacement.intent)
+        } else if publish_snapshot {
             Publication::Install
         } else {
             Publication::Close
@@ -1114,7 +1392,10 @@ fn restore_actor(
     let previous_sources = super::native_recovery::retained_upgrade_sources(sources, &session);
     let mut record = Record {
         execution_instance: identity.instance,
-        console_recipe: inspection.execution_console,
+        console_recipe: replacement
+            .as_ref()
+            .map(|r| r.terminal.launch.clone())
+            .or(inspection.execution_console),
         paired_terminal: paired.clone(),
         session,
         handle: handle.clone(),
@@ -1346,8 +1627,40 @@ fn close_with_target(
         .chats
         .contains_key(&requested.id);
     if !present {
-        if let Some(verified) = cleanup_retirement(host, requested, &proof, discovered.as_ref())? {
-            return close_verified_unattached(host, requested, &proof, verified, ending);
+        let exited = match cleanup_retirement(host, requested, &proof, discovered.as_ref())? {
+            CleanupRetirement::Verified(verified) => {
+                return close_verified_unattached(host, requested, &proof, verified, ending);
+            }
+            CleanupRetirement::None => None,
+            CleanupRetirement::ExitedUnproved => {
+                Some("The retained cleanup helper exited without verified retirement")
+            }
+        };
+        // An actor that died - killed, crashed, out of memory - leaves no
+        // verified retirement and nothing to attach. A person's Close settles
+        // once nothing of it can still run; a daemon stop keeps the refusal.
+        if ending == Ending::Closed {
+            match &discovered {
+                // Its helper is gone but something of it runs on, which
+                // nothing can now be asked to stop.
+                Some(owner)
+                    if !owner.holder.is_current()
+                        && !crate::chat::runtime::retained_actor_abandoned(
+                            &owner.holder,
+                            &owner.root,
+                        )? =>
+                {
+                    return Err(super::lost_execution_refusal(
+                        requested,
+                        super::Holds::Running,
+                    ));
+                }
+                Some(owner) if !chat::native_holder::retire_abandoned(owner)? => {}
+                _ => return super::settle_lost_execution(host, requested, &proof),
+            }
+        }
+        if let Some(exited) = exited {
+            return Err(exited.into());
         }
         let owner = discovered.as_ref().ok_or("No authenticated retained Claude actor is available; its saved descriptor was preserved")?;
         if !Handle::is_remote_record(owner) {
@@ -1475,7 +1788,41 @@ fn close_with_target(
                 )
             }
             RetirementInspection::ExitedUnproved => {
-                return Err("The closed helper lacks its exact semantic-retirement receipt".into());
+                // The resident's actor died without its retirement. As with
+                // no resident, a person's Close settles once nothing of it
+                // can still run, and then the resident goes too.
+                if ending != Ending::Closed {
+                    return Err(RETIREMENT_UNPROVED.into());
+                }
+                if !chat::native_holder::retire_abandoned(&identity.record)? {
+                    // Its helper is gone but something of it runs on; the
+                    // pane names it and offers to end it.
+                    let holds = super::Holds::Running;
+                    return Err(super::lost_execution_refusal(&source, holds));
+                }
+                // The actor's roster cannot see a paired console, which runs
+                // outside it. That console's own worker still answers an
+                // exact close, and its receipt proves the console ended; the
+                // roster proves the rest.
+                let actor = Session {
+                    terminal: None,
+                    ..source.clone()
+                };
+                // Everything that can still refuse comes before the console
+                // is closed, so a refused Close keeps the pane as it was.
+                super::refuse_scheduled_agent(host, &actor)?;
+                if let Some(holds) = super::what_holds(host, &actor, &proof)? {
+                    return Err(super::lost_execution_refusal(&source, holds));
+                }
+                if let Some((terminal, worker)) = &paired {
+                    target
+                        .require_current(host)
+                        .map_err(|error| error.message)?;
+                    close_paired_worker(host, terminal, worker, &proof)?;
+                }
+                super::settle_lost_execution(host, &actor, &proof)?;
+                let paired = paired.as_ref();
+                return remove_closed_resident(host, &proof, &source, &target, paired, ending);
             }
         };
     verify_close_ownership(
@@ -1520,20 +1867,7 @@ fn close_with_target(
         .require_current(host)
         .map_err(|error| error.message)?;
     if let Some((terminal, worker)) = &paired {
-        let current = {
-            let state = host.lock().unwrap_or_else(|p| p.into_inner());
-            state.terminals.get(&terminal.id).is_some_and(|current| {
-                current.handle.same_worker(worker)
-                    && super::matches_paired_terminal(&current.session, terminal, state.proof())
-            })
-        };
-        if !current {
-            return Err(
-                "The paired worker changed before retained cleanup; replacement was preserved"
-                    .into(),
-            );
-        }
-        worker.close_with_receipt(terminal, &proof)?;
+        close_paired_worker(host, terminal, worker, &proof)?;
     }
     target
         .require_current(host)
@@ -1548,14 +1882,53 @@ fn close_with_target(
         .map_err(|error| error.message)?;
     // Keep the closed record retryable until durable process retirement succeeds.
     ending.end(host, &source)?;
+    remove_closed_resident(host, &proof, &source, &target, paired.as_ref(), ending)
+}
+
+/// Closes a retained actor's paired console through its own worker, unless
+/// that worker was replaced.
+fn close_paired_worker(
+    host: &SharedHost,
+    terminal: &crate::model::TerminalSession,
+    worker: &crate::terminal::TerminalHandle,
+    proof: &HostSessionProof,
+) -> Result<(), String> {
+    let current = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        state.terminals.get(&terminal.id).is_some_and(|current| {
+            current.handle.same_worker(worker)
+                && super::matches_paired_terminal(&current.session, terminal, state.proof())
+        })
+    };
+    if !current {
+        return Err(
+            "The paired worker changed before retained cleanup; replacement was preserved".into(),
+        );
+    }
+    worker.close_with_receipt(terminal, proof)
+}
+
+/// Removes a resident whose retained actor is closed or proved gone, unless
+/// its record, its paired worker or the daemon's proof changed meanwhile.
+fn remove_closed_resident(
+    host: &SharedHost,
+    proof: &HostSessionProof,
+    source: &Session,
+    target: &super::CloseTarget,
+    paired: Option<&(
+        crate::model::TerminalSession,
+        crate::terminal::TerminalHandle,
+    )>,
+    ending: Ending,
+) -> Result<(), String> {
     let removed = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-        if state.proof() != &proof
+        if state.proof() != proof
             || !state
                 .chats
                 .get(&source.id)
                 .is_some_and(|record| target.matches(record))
-            || paired.as_ref().is_some_and(|(terminal, worker)| {
+            || paired.is_some_and(|(terminal, worker)| {
                 state
                     .terminals
                     .get(&terminal.id)
@@ -1567,7 +1940,7 @@ fn close_with_target(
                     .into(),
             );
         }
-        if let Some((terminal, _)) = &paired {
+        if let Some((terminal, _)) = paired {
             state.retire_terminal(terminal.id);
         }
         let removed = state.chats.remove(&source.id);
@@ -1601,6 +1974,19 @@ fn close_with_target(
     Ok(())
 }
 
+/// Why a resident's Close waits when its helper exited without the receipt.
+const RETIREMENT_UNPROVED: &str = "The closed helper lacks its exact semantic-retirement receipt";
+
+/// What this pane's durable owners record about its retained actor's end.
+enum CleanupRetirement {
+    /// An owner's verified retirement names this exact descriptor.
+    Verified(VerifiedRetirement),
+    /// No owner has ended, or none is registered.
+    None,
+    /// An owner's helper exited without its verified retirement.
+    ExitedUnproved,
+}
+
 /// Discovery disappears at retirement, before the durable HOST transaction.
 /// Consult only this pane's durable owners; absence never authorizes relaunch.
 fn cleanup_retirement(
@@ -1608,7 +1994,7 @@ fn cleanup_retirement(
     requested: &Session,
     proof: &HostSessionProof,
     discovered: Option<&crate::daemon::holder_registry::Record>,
-) -> Result<Option<VerifiedRetirement>, String> {
+) -> Result<CleanupRetirement, String> {
     let registry = super::super::agent_execution::registry(host)?;
     let mut after = None;
     let mut matched = None;
@@ -1618,7 +2004,7 @@ fn cleanup_retirement(
             .unwrap_or_else(|p| p.into_inner())
             .native_actor_ownerships(after, 128)?;
         if page.is_empty() {
-            return Ok(matched);
+            return Ok(matched.map_or(CleanupRetirement::None, CleanupRetirement::Verified));
         }
         for owner in page {
             after = Some(owner.actor());
@@ -1630,9 +2016,7 @@ fn cleanup_retirement(
             match Handle::inspect_retained_retirement(owner.owner(), proof)? {
                 RetirementInspection::Running => {}
                 RetirementInspection::ExitedUnproved => {
-                    return Err(
-                        "The retained cleanup helper exited without verified retirement".into(),
-                    );
+                    return Ok(CleanupRetirement::ExitedUnproved);
                 }
                 RetirementInspection::Verified(verified) => {
                     let receipt = verified.receipt();
@@ -1851,9 +2235,10 @@ pub(in crate::host) fn reconcile_startup_losses(host: &SharedHost) -> Result<(),
                 execution,
                 &mut execution_owner,
             )?;
+            let confirmed = confirmed_projection(&handle, &source);
             let changed = {
                 let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-                require_execution_owner(&registry, owner, execution)?;
+                require_execution_owner(&registry, owner, execution, confirmed.as_ref())?;
                 registry.commit_native_actor_loss(
                     identity.instance,
                     &identity.record,
@@ -2005,6 +2390,58 @@ pub(in crate::host) fn reconcile_previous_boot_history(host: &SharedHost) -> Res
                     tracing::warn!(actor=%ownership.actor(), %error, "Historical task was archived; authenticated helper journal remains for cleanup retry");
                 } else {
                     super::super::agent_execution::retired(host, &inspection.source)?;
+                }
+            }
+        }
+    }
+}
+
+/// Release the transcripts that this boot's retired actors keep in their final
+/// receipts, and return the bytes released.
+///
+/// Only actors whose retirement the registry has committed are touched, and
+/// the receipt itself stays: a resume later in this boot authenticates the
+/// retirement through it. Runs beside the daemon, so it takes the host and
+/// registry locks only to read the roster, never across file work.
+pub(in crate::host) fn compact_retired_receipts(host: &SharedHost) -> Result<u64, String> {
+    let proof = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if state.shutting_down {
+            return Ok(0);
+        }
+        state.proof().clone()
+    };
+    let registry = super::super::agent_execution::registry(host)?;
+    let mut released = 0u64;
+    let mut after = None;
+    loop {
+        let retired = {
+            let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+            let page = registry.native_actor_ownerships(after, 128)?;
+            let Some(last) = page.last() else {
+                return Ok(released);
+            };
+            after = Some(last.actor());
+            page.into_iter()
+                .filter(|ownership| ownership.owner().boot == proof.boot_id)
+                .filter_map(
+                    |ownership| match registry.native_actor_retirement(ownership.actor()) {
+                        Ok(Some(_)) => Some(ownership.owner().clone()),
+                        Ok(None) => None,
+                        // One unreadable row keeps only its own receipt whole.
+                        Err(error) => {
+                            tracing::debug!(actor = %ownership.actor(), %error, "retirement unreadable; receipt kept whole");
+                            None
+                        }
+                    },
+                )
+                .collect::<Vec<_>>()
+        };
+        for owner in retired {
+            match Handle::compact_retired_receipt(&owner, &proof) {
+                Ok(bytes) => released = released.saturating_add(bytes),
+                Err(error) => {
+                    tracing::debug!(terminal = %owner.terminal, %error, "retired receipt kept whole");
                 }
             }
         }
@@ -2229,6 +2666,24 @@ pub(in crate::host) fn finish_close(
         );
     }
     handle.refresh_retained_state()?;
+    let target = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let record = state
+            .chats
+            .get(&requested.id)
+            .filter(|record| record.handle.same_attachment(handle))
+            .ok_or("Actor close ownership changed before final acknowledgement")?;
+        SemanticTarget {
+            handle: handle.clone(),
+            source: record.session.clone(),
+            identity: identity.clone(),
+            notifications: notifications.clone(),
+        }
+    };
+    // Shutdown may already have stopped the background broker, and the
+    // provider can confirm its conversation while Close is in progress.
+    // Flush that final identity before acknowledging outcomes or retirement.
+    persist_confirmed_identity(host, &target, &registry)?;
     let loss = handle.continuity_loss();
     if let Some(loss) = &loss {
         let execution = !loss.affected_runs.is_empty();
@@ -2240,9 +2695,10 @@ pub(in crate::host) fn finish_close(
             execution,
             &mut execution_owner,
         )?;
+        let confirmed = target.confirmed_projection();
         let changed = {
             let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-            require_execution_owner(&registry, owner, execution)?;
+            require_execution_owner(&registry, owner, execution, confirmed.as_ref())?;
             registry.commit_native_actor_loss(
                 identity.instance,
                 &identity.record,
@@ -2298,9 +2754,10 @@ pub(in crate::host) fn finish_close(
                 execution,
                 &mut execution_owner,
             )?;
+            let confirmed = target.confirmed_projection();
             let (changed, automation) = {
                 let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-                require_execution_owner(&registry, owner, execution)?;
+                require_execution_owner(&registry, owner, execution, confirmed.as_ref())?;
                 let changed = registry.commit_native_actor_event(
                     identity.instance,
                     &identity.record,

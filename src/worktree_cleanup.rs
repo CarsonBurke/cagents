@@ -471,7 +471,7 @@ impl Protection {
         Ok(files)
     }
 
-    pub(crate) fn directory(&self) -> &Path {
+    pub fn directory(&self) -> &Path {
         &self.directory
     }
 }
@@ -666,8 +666,9 @@ pub(crate) fn protect_operation(directory: &Path) -> io::Result<Protection> {
     acquire(&crate::instance::runtime_directory()?, directory, false)
 }
 
-#[cfg(test)]
-pub(crate) fn fixture_protection(
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn fixture_protection(
     runtime: &Path,
     directory: &Path,
     exclusive: bool,
@@ -678,7 +679,7 @@ pub(crate) fn fixture_protection(
 /// Selected scopes and restored editor descriptors remain protected even
 /// when their actual widgets are parked or have not mounted yet.
 #[derive(Default)]
-pub(crate) struct WindowProtections {
+pub struct WindowProtections {
     directories: BTreeMap<PathBuf, Protection>,
     resolved: BTreeMap<PathBuf, PathBuf>,
     requested: std::collections::BTreeSet<PathBuf>,
@@ -686,7 +687,7 @@ pub(crate) struct WindowProtections {
     retry_after: Option<std::time::Instant>,
     last_failure: Option<String>,
     missing: std::collections::BTreeSet<PathBuf>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fixture_runtime: Option<PathBuf>,
 }
 
@@ -698,19 +699,20 @@ impl WindowProtections {
         self.last_failure = None;
     }
 
-    #[cfg(test)]
-    pub(crate) fn use_fixture_runtime(&mut self, runtime: PathBuf) {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn use_fixture_runtime(&mut self, runtime: PathBuf) {
         assert!(self.directories.is_empty());
         self.fixture_runtime = Some(runtime);
     }
 
-    pub(crate) fn protect_next(&mut self, directory: &Path) -> io::Result<()> {
-        #[cfg(test)]
+    pub fn protect_next(&mut self, directory: &Path) -> io::Result<()> {
+        #[cfg(any(test, feature = "test-support"))]
         let protection = match &self.fixture_runtime {
             Some(runtime) => Some(acquire(runtime, directory, false)?),
             None => protect(directory)?,
         };
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-support")))]
         let protection = protect(directory)?;
         if let Some(protection) = protection {
             self.resolved
@@ -720,10 +722,7 @@ impl WindowProtections {
         }
         Ok(())
     }
-    pub(crate) fn sync(
-        &mut self,
-        directories: impl IntoIterator<Item = PathBuf>,
-    ) -> io::Result<()> {
+    pub fn sync(&mut self, directories: impl IntoIterator<Item = PathBuf>) -> io::Result<()> {
         if !crate::instance::window_is_initialized() {
             return Ok(());
         }
@@ -849,6 +848,25 @@ impl WindowProtections {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A plain `File` holding a lock releases it only when every copy closes, and
+    /// a sibling test's fork holds a copy until its exec. That is inferred: the test
+    /// passed alone before this wait.
+    fn acquire_once_released(runtime: &Path, directory: &Path, exclusive: bool) -> Protection {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match acquire(runtime, directory, exclusive) {
+                Ok(protection) => return protection,
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                Err(error) => panic!("could not protect {}: {error}", directory.display()),
+            }
+        }
+    }
 
     fn fixture_directory() -> tempfile::TempDir {
         // Positive fixtures need physical paths even when TMPDIR names a symlink.
@@ -1437,8 +1455,8 @@ mod tests {
         assert!(acquire(runtime.path(), &moved, true).is_err());
         child.stdin.take().unwrap().write_all(b"retire\n").unwrap();
         assert!(child.wait().unwrap().success());
-        assert!(acquire(runtime.path(), &directory, true).is_ok());
-        assert!(acquire(runtime.path(), &moved, true).is_ok());
+        acquire_once_released(runtime.path(), &directory, true);
+        acquire_once_released(runtime.path(), &moved, true);
     }
 
     #[test]

@@ -912,19 +912,41 @@ fn restore_keeps_partial_originals_and_raw_prefix_reachable_after_commit_or_stor
     }
 }
 
+/// A Registry failure met by orphan restoration after the holder committed and
+/// its reader activated. Each fault is real persisted state, not an injected
+/// result or a synthetic source DTO.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OrphanRegistryFault {
+    None,
+    /// The published layout is damaged, so the adopted source's publication
+    /// refuses before authority restoration runs.
+    DamagedLayout,
+    /// The layout is intact and publication commits, but this terminal's
+    /// stored authority row cannot be read back.
+    UnreadableAuthority,
+}
+
 #[test]
-fn orphan_authority_restore_failure_keeps_the_committed_original_in_recovery_until_explicit_close()
-{
-    const NAME: &str = "orphan_authority_restore_failure_keeps_the_committed_original_in_recovery_until_explicit_close";
+fn orphan_registry_failure_keeps_the_committed_original_in_recovery_until_explicit_close() {
+    const NAME: &str =
+        "orphan_registry_failure_keeps_the_committed_original_in_recovery_until_explicit_close";
     if isolated(NAME) {
         return;
     }
     let root = std::env::current_dir().unwrap();
     let paths = crate::daemon::RuntimePaths::discover().unwrap();
-    for (index, unavailable_registry_table) in [true, false].into_iter().enumerate() {
-        let case = root.join(format!("orphan-authority-{index}"));
+    for (index, registry_fault) in [
+        OrphanRegistryFault::DamagedLayout,
+        OrphanRegistryFault::UnreadableAuthority,
+        OrphanRegistryFault::None,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let faulted = registry_fault != OrphanRegistryFault::None;
+        let case = root.join(format!("orphan-registry-{index}"));
         fs::create_dir(&case).unwrap();
-        let mut proof = proof(&format!("orphan-authority-{index}"));
+        let mut proof = proof(&format!("orphan-registry-{index}"));
         let mut lease = Some(crate::daemon::HostLease::acquire(&paths, &proof).unwrap());
         let original = host(proof.clone());
         let source = source(&case, QUERY_CHILD);
@@ -955,25 +977,38 @@ fn orphan_authority_restore_failure_keeps_the_committed_original_in_recovery_unt
                 |row| row.get(0),
             )
             .unwrap();
-        if unavailable_registry_table {
-            // A real SQLite query failure AFTER holder commit/activation, not
-            // an injected replacement result or a synthetic source DTO.
-            fault
+        match registry_fault {
+            OrphanRegistryFault::None => {}
+            OrphanRegistryFault::DamagedLayout => fault
                 .execute_batch(
                     "ALTER TABLE agent_authorities RENAME TO unavailable_agent_authorities",
                 )
-                .unwrap();
+                .unwrap(),
+            OrphanRegistryFault::UnreadableAuthority => {
+                fault
+                    .execute(
+                        "INSERT INTO agent_authorities(token, session_id, source)
+                         VALUES ('orphan-registry-fault', ?1, 'not a hosted session')",
+                        [source.id.to_string()],
+                    )
+                    .unwrap();
+            }
         }
         let result = restore_orphaned_holders(&successor);
-        assert_eq!(result.is_err(), unavailable_registry_table, "{result:?}");
+        assert_eq!(result.is_err(), faulted, "{result:?}");
         let adopted = {
             let state = successor.lock().unwrap();
             assert_eq!(state.terminals.len(), 1);
+            assert_eq!(state.startup_recovery().is_some(), faulted);
+            // Whether publication refused or committed, the kept original
+            // resolves by the previous daemon's source.
+            let record = &state.terminals[&source.id];
             assert_eq!(
-                state.startup_recovery().is_some(),
-                unavailable_registry_table
+                record.upgrade_sources.last().map(|s| s.id),
+                Some(source.id),
+                "{registry_fault:?}"
             );
-            state.terminals[&source.id].handle.clone()
+            record.handle.clone()
         };
         assert_eq!(adopted.holder_identity(), Some(&owner));
         assert!(owner.root.is_current() && owner.holder.is_current());
@@ -987,8 +1022,14 @@ fn orphan_authority_restore_failure_keeps_the_committed_original_in_recovery_unt
             fs::read_to_string(case.join("launches")).unwrap(),
             "launch\n"
         );
-        if unavailable_registry_table {
-            assert!(result.unwrap_err().contains("agent_authorities"));
+        if faulted {
+            let error = result.unwrap_err();
+            let expected = match registry_fault {
+                OrphanRegistryFault::DamagedLayout => "layout does not match published schema",
+                OrphanRegistryFault::UnreadableAuthority => "Stored agent execution is unreadable",
+                OrphanRegistryFault::None => unreachable!(),
+            };
+            assert!(error.contains(expected), "{error}");
             let (response, _, _) =
                 super::super::client::process_request(&successor, 0, ClientRequest::List).unwrap();
             assert!(
@@ -1024,53 +1065,74 @@ fn orphan_authority_restore_failure_keeps_the_committed_original_in_recovery_unt
             .unwrap_err();
             // Orphan restoration deliberately leaves client 0 detached. Its
             // unowned Close is refused before any saved-layout query or effect.
-            assert_eq!(error.code, ProtocolErrorCode::PermissionDenied);
+            assert_eq!(
+                error.code,
+                ProtocolErrorCode::PermissionDenied,
+                "{registry_fault:?}: {error:?}"
+            );
             assert!(owner.root.is_current() && owner.holder.is_current());
             assert!(!adopted.worker_joined_for_test());
-            assert!(
-                crate::host::model::Registry::at(&registry_path).is_err(),
-                "the damaged published layout must remain refused"
-            );
-            // Renaming back quotes the table name in sqlite_schema. Recreate
-            // its exact original DDL and preserve every actual row instead;
-            // published-layout admission remains strict throughout.
-            let repair = fault
-                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                .unwrap();
-            repair.execute_batch(&authority_sql).unwrap();
-            repair
-                .execute_batch(
-                    "INSERT INTO agent_authorities(token, session_id, source)
-                     SELECT token, session_id, source FROM unavailable_agent_authorities",
-                )
-                .unwrap();
-            let rows_preserved: bool = repair
-                .query_row(
-                    "SELECT NOT EXISTS(
-                        SELECT token, session_id, source FROM unavailable_agent_authorities
-                        EXCEPT SELECT token, session_id, source FROM agent_authorities
-                     ) AND (SELECT count(*) FROM agent_authorities) =
-                           (SELECT count(*) FROM unavailable_agent_authorities)",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert!(
-                rows_preserved,
-                "repair must preserve every actual authority row"
-            );
-            repair
-                .execute_batch("DROP TABLE unavailable_agent_authorities")
-                .unwrap();
-            repair.commit().unwrap();
-            let repaired_sql: String = fault
-                .query_row(
-                    "SELECT sql FROM sqlite_schema WHERE type='table' AND name='agent_authorities'",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(repaired_sql, authority_sql);
+            match registry_fault {
+                OrphanRegistryFault::DamagedLayout => {
+                    assert!(
+                        crate::host::model::Registry::at(&registry_path).is_err(),
+                        "the damaged published layout must remain refused"
+                    );
+                    // Renaming back quotes the table name in sqlite_schema.
+                    // Recreate its exact original DDL and preserve every
+                    // actual row instead; published-layout admission remains
+                    // strict throughout.
+                    let repair = fault
+                        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                        .unwrap();
+                    repair.execute_batch(&authority_sql).unwrap();
+                    repair
+                        .execute_batch(
+                            "INSERT INTO agent_authorities(token, session_id, source)
+                             SELECT token, session_id, source FROM unavailable_agent_authorities",
+                        )
+                        .unwrap();
+                    let rows_preserved: bool = repair
+                        .query_row(
+                            "SELECT NOT EXISTS(
+                                SELECT token, session_id, source FROM unavailable_agent_authorities
+                                EXCEPT SELECT token, session_id, source FROM agent_authorities
+                             ) AND (SELECT count(*) FROM agent_authorities) =
+                                   (SELECT count(*) FROM unavailable_agent_authorities)",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert!(
+                        rows_preserved,
+                        "repair must preserve every actual authority row"
+                    );
+                    repair
+                        .execute_batch("DROP TABLE unavailable_agent_authorities")
+                        .unwrap();
+                    repair.commit().unwrap();
+                    let repaired_sql: String = fault
+                        .query_row(
+                            "SELECT sql FROM sqlite_schema WHERE type='table' AND name='agent_authorities'",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(repaired_sql, authority_sql);
+                }
+                OrphanRegistryFault::UnreadableAuthority => {
+                    assert_eq!(
+                        fault
+                            .execute(
+                                "DELETE FROM agent_authorities WHERE token = 'orphan-registry-fault'",
+                                [],
+                            )
+                            .unwrap(),
+                        1
+                    );
+                }
+                OrphanRegistryFault::None => unreachable!(),
+            }
             // Repairing the query does not retry adoption or clear quarantine.
             assert!(successor.lock().unwrap().startup_recovery().is_some());
             assert_eq!(adopted.holder_identity(), Some(&owner));

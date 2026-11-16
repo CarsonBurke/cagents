@@ -42,6 +42,14 @@ impl Handle {
     pub(crate) fn fixture_failed_remote() -> Self {
         Self(Owner::Remote(RemoteActor::completed_failure_fixture()))
     }
+    /// Model the provider confirming its conversation after this attachment.
+    #[cfg(test)]
+    pub(crate) fn fixture_confirm_session(&self, session: String) {
+        match &self.0 {
+            Owner::Remote(remote) => remote.confirm_session_fixture(session),
+            Owner::Local(_) => panic!("session confirmation fixture requires a retained actor"),
+        }
+    }
     /// Same retained actor identity, distinct proxy attachment allocations.
     /// Neither fixture has a live helper or permits real provider operations.
     #[cfg(test)]
@@ -177,6 +185,12 @@ impl Handle {
         proof: &crate::model::HostSessionProof,
     ) -> Result<Option<super::retained_actor::transport::RetirementReceipt>, String> {
         RemoteActor::retired_actor_receipt(record, proof)
+    }
+    pub(crate) fn compact_retired_receipt(
+        record: &crate::daemon::holder_registry::Record,
+        proof: &crate::model::HostSessionProof,
+    ) -> Result<u64, String> {
+        RemoteActor::compact_retired_receipt(record, proof)
     }
     pub(crate) fn is_remote_record(record: &crate::daemon::holder_registry::Record) -> bool {
         RemoteActor::is_record(record)
@@ -543,6 +557,22 @@ impl Handle {
             }
         }
     }
+    pub(crate) fn presentation_wire(
+        &self,
+        chat_id: crate::model::TerminalId,
+        after: Option<u64>,
+    ) -> Result<crate::terminal_ipc::PreparedResponse, String> {
+        match &self.0 {
+            Owner::Local(local) => Ok(local
+                .presentation(chat_id, after)
+                .unwrap_or(crate::terminal_ipc::ServerResponse::ChatSnapshot {
+                    chat_id,
+                    snapshot: None,
+                })
+                .into()),
+            Owner::Remote(remote) => remote.presentation_wire(chat_id, after),
+        }
+    }
     pub fn session_id(&self) -> Option<String> {
         match &self.0 {
             Owner::Local(local) => local.session_id(),
@@ -596,6 +626,14 @@ impl Handle {
             Owner::Remote(remote) => remote.state().failure.clone(),
         }
     }
+    /// When the latest turn finished, in daemon Unix milliseconds, which
+    /// dates the failure it may have ended with.
+    pub fn finished_at(&self) -> Option<u64> {
+        match &self.0 {
+            Owner::Local(local) => local.finished_at(),
+            Owner::Remote(remote) => remote.state().finished_at,
+        }
+    }
     pub fn owns_work(&self) -> bool {
         match &self.0 {
             Owner::Local(local) => local.owns_work(),
@@ -608,16 +646,37 @@ impl Handle {
             Owner::Remote(remote) => remote.state().activity,
         }
     }
+    /// Whether the conversation's own turn is under way or awaiting the user,
+    /// apart from its background children.
+    pub(crate) fn turn_accepted(&self) -> bool {
+        match &self.0 {
+            Owner::Local(local) => local.turn_accepted(),
+            Owner::Remote(remote) => {
+                let state = remote.state();
+                state.busy || state.waiting || !state.requests.is_empty()
+            }
+        }
+    }
     pub(crate) fn update_activity(&self) -> (bool, bool) {
         match &self.0 {
             Owner::Local(local) => local.update_activity(),
             Owner::Remote(remote) => {
                 let state = remote.state();
                 (
-                    state.working || state.waiting || !state.requests.is_empty(),
+                    state.working
+                        || state.waiting
+                        || !state.requests.is_empty()
+                        || !state.work_hold().subagents.is_empty(),
                     state.ready,
                 )
             }
+        }
+    }
+    /// What holds the conversation, in the terms its reader knows it by.
+    pub(crate) fn work_hold(&self) -> chat::WorkHold {
+        match &self.0 {
+            Owner::Local(local) => local.work_hold(),
+            Owner::Remote(remote) => remote.state().work_hold(),
         }
     }
     pub(crate) fn is_idle(&self) -> bool {
@@ -642,6 +701,24 @@ impl Handle {
         match &self.0 {
             Owner::Local(local) => local.interrupt_subagents(),
             Owner::Remote(remote) => remote.state().interrupt_subagents.clone(),
+        }
+    }
+    /// Provider-confirmed model status from the local or retained owner.
+    pub(crate) fn active_model(&self) -> (u64, Option<chat::ActiveModel>) {
+        match &self.0 {
+            Owner::Local(local) => local.active_model(),
+            Owner::Remote(remote) => {
+                let state = remote.state();
+                (state.active_model_revision, state.active_model.clone())
+            }
+        }
+    }
+    /// How the provider addresses the conversation's subagents, where that
+    /// is not by the IDs its snapshot lists them under.
+    pub(crate) fn agent_addresses(&self) -> Vec<chat::AgentAddress> {
+        match &self.0 {
+            Owner::Local(local) => local.agent_addresses(),
+            Owner::Remote(remote) => remote.state().agent_addresses.clone(),
         }
     }
     pub(crate) fn title(&self) -> Option<String> {
@@ -682,6 +759,18 @@ impl Handle {
         match &self.0 {
             Owner::Local(local) => local.preserve_for_restart(),
             Owner::Remote(remote) => remote.preserve(),
+        }
+    }
+    /// Decides, before any close, whether it leaves running the work the
+    /// provider had already detached from itself, such as a server a command
+    /// started with `nohup`. Closes that have not decided stop it.
+    pub(crate) fn decide_detached_work(
+        &self,
+        detached: crate::daemon::owned_children::DetachedWork,
+    ) {
+        match &self.0 {
+            Owner::Local(local) => local.decide_detached_work(detached),
+            Owner::Remote(remote) => remote.decide_detached_work(detached),
         }
     }
     pub(crate) fn close_for_resume(&self) -> Result<(), String> {

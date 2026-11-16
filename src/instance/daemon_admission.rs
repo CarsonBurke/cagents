@@ -69,6 +69,20 @@ pub(super) fn publish_capability(lease: &mut File) -> io::Result<()> {
     lease.sync_all()
 }
 
+/// The pid a window recorded in its lease when it took the lease. It is only
+/// a candidate: the bytes can be stale, mid-publication or another user's
+/// claim, so the caller must still prove the lock is that process's.
+pub(super) fn recorded_owner(lease: &File) -> Option<u32> {
+    let length = lease.metadata().ok()?.len();
+    if length == 0 || length > MAX_CAPABILITY_BYTES as u64 {
+        return None;
+    }
+    let mut bytes = vec![0; length as usize];
+    lease.read_exact_at(&mut bytes, 0).ok()?;
+    let capability: WindowCapability = serde_json::from_slice(&bytes).ok()?;
+    Some(capability.owner.pid)
+}
+
 fn validate_private_file(metadata: &fs::Metadata) -> io::Result<()> {
     if !metadata.is_file()
         || metadata.uid() != current_uid()
@@ -80,6 +94,7 @@ fn validate_private_file(metadata: &fs::Metadata) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(any(feature = "host", test))]
 fn compatible_window(window: &VerifiedWindow) -> io::Result<()> {
     if !window.still_owns_lease()? {
         return Err(io::Error::other(
@@ -165,6 +180,7 @@ fn declaration_path_in(runtime: &Path) -> PathBuf {
 
 /// How long an admission waits out starting windows' momentary probes of its
 /// declaration before it proceeds undeclared.
+#[cfg(any(feature = "host", test))]
 const DECLARATION_PATIENCE: Duration = Duration::from_millis(250);
 /// How often a starting window checks whether an admission has finished.
 const ADMISSION_POLL: Duration = Duration::from_millis(50);
@@ -182,6 +198,7 @@ const ADMISSION_WAIT_ALLOWANCE: Duration = Duration::from_secs(10);
 /// exclusively: if it can, no admission holds the fence, so the holder is an
 /// update; if it cannot, an admission does, and the window waits for it.
 /// Holders that predate the declaration still read as updates.
+#[cfg(any(feature = "host", test))]
 pub(crate) struct AdmissionFence {
     // Fields drop in order: the fence is released before its declaration, so
     // a window can never find this admission's fence undeclared.
@@ -189,6 +206,7 @@ pub(crate) struct AdmissionFence {
     _declaration: Option<OwnedLock>,
 }
 
+#[cfg(any(feature = "host", test))]
 impl AdmissionFence {
     pub(crate) fn acquire() -> io::Result<Self> {
         Self::acquire_in(&runtime_directory()?)
@@ -211,6 +229,7 @@ impl AdmissionFence {
 /// after that, or cannot be opened at all, is not worth refusing the admission
 /// over: undeclared, it reads as an update, which is what every holder looked
 /// like before declarations existed.
+#[cfg(any(feature = "host", test))]
 fn declare_admission(runtime: &Path) -> Option<OwnedLock> {
     let deadline = Instant::now() + DECLARATION_PATIENCE;
     loop {
@@ -266,6 +285,30 @@ fn fence_holder(runtime: &Path) -> io::Result<FenceHolder> {
     }
 }
 
+/// Whether an ordinary launch at this instance's local socket would compete
+/// with an update. A daemon admission remains waitable; only authenticated
+/// inherited authority may start a daemon through an update's own fence.
+pub(crate) fn daemon_launch_is_updating(socket: &Path) -> io::Result<bool> {
+    let Some(runtime) = env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    else {
+        return Ok(false);
+    };
+    if socket
+        != runtime
+            .join(runtime_subdirectory())
+            .join(crate::terminal_ipc::SOCKET_FILE_NAME)
+    {
+        return Ok(false);
+    }
+    let runtime = runtime_directory()?;
+    if inherited_fence()?.is_some() {
+        return Ok(false);
+    }
+    Ok(matches!(fence_holder(&runtime)?, FenceHolder::Update))
+}
+
 /// The daemon did not finish its admission within a starting window's wait.
 #[derive(Debug, Error)]
 pub struct DaemonStillStarting {
@@ -289,7 +332,7 @@ impl std::fmt::Display for DaemonStillStarting {
 pub(crate) fn admission_wait_timeout() -> Duration {
     // A daemon restoring an upgrade checkpoint may take as long as its
     // inventory allows. An unreadable checkpoint fails that daemon anyway.
-    crate::upgrade::handoff::startup_timeout().unwrap_or(Duration::from_secs(5))
+    crate::upgrade::handoff::startup_timeout().unwrap_or(crate::upgrade::handoff::STARTUP_BASE)
         + ADMISSION_WAIT_ALLOWANCE
 }
 
@@ -413,9 +456,6 @@ fn forward_fence(
     Ok(())
 }
 
-pub(crate) fn has_inherited_daemon_fence() -> io::Result<bool> {
-    Ok(inherited_fence()?.is_some())
-}
 pub(crate) fn inherit_daemon_fence(command: &mut process::Command) -> io::Result<()> {
     if let Some((file, descriptor)) = inherited_fence()? {
         forward_fence(command, file, Some(descriptor))?;
@@ -425,20 +465,23 @@ pub(crate) fn inherit_daemon_fence(command: &mut process::Command) -> io::Result
 
 /// Acquire before mutable daemon ownership/socket/store operations and keep
 /// through listener readiness. No live window can publish midway through admit.
+#[cfg(any(feature = "host", test))]
 pub(crate) struct DaemonAdmissionGuard {
     _launch: DaemonLaunch,
     _legacy: OwnedLock,
 }
 
+#[cfg(any(feature = "host", test))]
 enum DaemonLaunch {
     /// This daemon's own fence, declared as an admission while it is held.
-    Owned(AdmissionFence),
+    Owned { _fence: AdmissionFence },
     /// An installer's or recovery launcher's fence. It stays held after this
     /// daemon is ready, for that owner's own work, so it is never declared:
     /// a window opened meanwhile reports that owner's update.
-    Inherited(LaunchFence),
+    Inherited { _fence: LaunchFence },
 }
 
+#[cfg(any(feature = "host", test))]
 impl DaemonAdmissionGuard {
     pub(crate) fn acquire() -> io::Result<Self> {
         let runtime = runtime_directory()?;
@@ -449,9 +492,13 @@ impl DaemonAdmissionGuard {
             unsafe {
                 libc::close(descriptor);
             }
-            DaemonLaunch::Inherited(LaunchFence::Inherited { file, descriptor })
+            DaemonLaunch::Inherited {
+                _fence: LaunchFence::Inherited { file, descriptor },
+            }
         } else {
-            DaemonLaunch::Owned(AdmissionFence::acquire_in(&runtime)?)
+            DaemonLaunch::Owned {
+                _fence: AdmissionFence::acquire_in(&runtime)?,
+            }
         };
         let legacy = admit_windows(&runtime)?;
         Ok(Self {
@@ -461,6 +508,7 @@ impl DaemonAdmissionGuard {
     }
 }
 
+#[cfg(any(feature = "host", test))]
 fn upgrade_fence(file: &File) -> io::Result<()> {
     // An SH→EX conversion is NOT atomic. On failure Linux can drop the
     // parent's SH lock: return immediately, before any startup mutation.
@@ -473,6 +521,7 @@ fn upgrade_fence(file: &File) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(any(feature = "host", test))]
 fn admit_windows(runtime: &Path) -> io::Result<OwnedLock> {
     let legacy = owned_lock(
         &runtime.join(APPLICATION_LOCK_FILE),
@@ -488,6 +537,83 @@ fn admit_windows(runtime: &Path) -> io::Result<OwnedLock> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_launch_probe_requires_selected_socket_and_authenticated_inherited_authority() {
+        const CHILD: &str = "CAGENTS_TEST_UPDATE_LAUNCH_AUTHORITY";
+        if let Ok(mode) = env::var(CHILD) {
+            let runtime = runtime_directory().unwrap();
+            let socket = runtime
+                .join(runtime_subdirectory())
+                .join(crate::terminal_ipc::SOCKET_FILE_NAME);
+            let update = UiUpdateGuard::acquire().unwrap();
+            assert!(
+                !daemon_launch_is_updating(
+                    &runtime
+                        .join("unrelated-instance")
+                        .join(crate::terminal_ipc::SOCKET_FILE_NAME)
+                )
+                .unwrap(),
+                "another endpoint must not borrow this runtime's update state"
+            );
+            if mode == "ordinary" {
+                assert!(daemon_launch_is_updating(&socket).unwrap());
+                return;
+            }
+            let descriptor = if mode == "197" { 197 } else { 198 };
+            if mode != "invalid" {
+                // SAFETY: this exact private subprocess owns its reserved FD.
+                // It borrows the update's held open-file description and only
+                // closes the duplicate; validation must not unlock the parent.
+                unsafe {
+                    assert_eq!(
+                        libc::dup2(update.lock.as_ref().unwrap().as_raw_fd(), descriptor),
+                        descriptor
+                    );
+                }
+                assert!(!daemon_launch_is_updating(&socket).unwrap());
+                unsafe { libc::close(descriptor) };
+                assert!(
+                    owned_lock(&fence_path_in(&runtime), libc::LOCK_SH | libc::LOCK_NB).is_err(),
+                    "validating inherited authority must preserve the parent's fence"
+                );
+            } else {
+                assert!(daemon_launch_is_updating(&socket).is_err());
+            }
+            return;
+        }
+        let name = std::thread::current().name().unwrap().to_owned();
+        for mode in ["ordinary", "197", "198", "invalid"] {
+            let runtime = tempfile::tempdir().unwrap();
+            let mut command = process::Command::new(env::current_exe().unwrap());
+            command
+                .args(["--exact", &name, "--nocapture"])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", runtime.path())
+                .env("XDG_RUNTIME_DIR", runtime.path())
+                .env(CHILD, mode);
+            match mode {
+                "197" => {
+                    command.env(INSTALL_GUARD_ENV, "197");
+                }
+                "198" | "invalid" => {
+                    command.env(DAEMON_FENCE_ENV, "198");
+                }
+                _ => {}
+            }
+            if let Some(authority) = env::var_os(crate::agent_execution::AUTHORITY_ENV) {
+                command.env(crate::agent_execution::AUTHORITY_ENV, authority);
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{mode}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
 
     fn fence_wait(runtime: &Path, timeout: Duration) -> (io::Result<OwnedLock>, usize) {
         let mut checks = 0;
@@ -844,7 +970,7 @@ mod tests {
             libc::LOCK_EX | libc::LOCK_NB,
         )
         .unwrap();
-        publish_capability(&mut lease.0).unwrap();
+        publish_capability(lease.file_mut()).unwrap();
         assert!(admit_windows(runtime.path()).is_ok());
         let mut capability = WindowCapability {
             format: 1,

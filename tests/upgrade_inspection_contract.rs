@@ -7,8 +7,8 @@ use cagents::{
     agent_execution::Authority,
     control::{ControlClient, ControlError},
     model::{
-        CardId, CardKind, CardState, Existence, Exposure, LaunchRecipe, Residency,
-        TerminalContinuity, TerminalId, TerminalSession, WorkspaceState,
+        CardId, CardKind, CardState, Existence, LaunchRecipe, TerminalContinuity, TerminalId,
+        TerminalSession, WorkspaceState,
     },
     persistence::{SnapshotBase, StateStore},
     process::{CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor},
@@ -132,8 +132,19 @@ fn inspect(
     if fs::metadata(&output).map_err(|e| e.to_string())?.len() > 16 * 1024 {
         return Err("inspection receipt exceeded limit".into());
     }
-    serde_json::from_slice::<Result<(), String>>(&fs::read(output).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?
+    let inspection = serde_json::from_slice::<
+        Result<cagents::update::source_inspection::SourceInspection, String>,
+    >(&fs::read(output).map_err(|e| e.to_string())?)
+    .map_err(|e| e.to_string())??;
+    if !inspection.stopped.is_empty() || !inspection.stopped_windows.is_empty() {
+        return Err(format!(
+            "original saved terminal unexpectedly stopped: {inspection:?}"
+        ));
+    }
+    if inspection.labels.is_empty() {
+        return Err("saved terminal missing its review label".into());
+    }
+    Ok(())
 }
 fn birth(pid: u32) -> Result<String, String> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|e| e.to_string())?;
@@ -455,8 +466,6 @@ fn actual_same_generation_inspection_and_upgrade_keep_the_original_saved_pty() {
             title: "Original shell".into(),
             width_fraction: 0.6,
             existence: Existence::Open,
-            exposure: Exposure::Visible,
-            residency: Residency::Hot,
             kind: CardKind::Terminal(saved.clone()),
         });
         workspace.focused = Some(workspace.cards[0].id);

@@ -9,6 +9,8 @@
 //! resolve it in every build lane; moving the id types into this module or
 //! re-exporting them would give one identity two spellings for no gain.
 
+pub mod delta;
+pub mod metadata;
 pub mod views;
 
 use std::path::{Path, PathBuf};
@@ -72,6 +74,11 @@ pub use conversation_titles::{channel_title, channel_title_from_prompt};
 /// registry, and it matches no recorded identity - so it takes the safe branch,
 /// where nothing local counts as shared and therefore nothing is retired.
 pub const NO_REGISTRY: Uuid = Uuid::nil();
+
+/// How a daemon that could not open its shared-model store refuses a request
+/// for the model. Clients compare it to tell a daemon without a registry from
+/// one whose registry failed a single read.
+pub const REGISTRY_UNAVAILABLE: &str = "the shared workspace model store is unavailable";
 
 /// Stable identities in a project's manually arranged navigation list.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

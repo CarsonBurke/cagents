@@ -180,6 +180,8 @@ fn lost_agent(host: &SharedHost, directory: &std::path::Path, source: &Session) 
     let accepted = registry
         .submit_agent(&Origin::User, &submit(directory, "lost-agent"), 1)
         .unwrap();
+    // Claimed, so the crash may have left its prompt sent.
+    assert!(registry.claim_agent_dispatch(&accepted, 1).unwrap());
     registry
         .bind_agent(accepted.agent.id, None, HostedSession::Chat(source.clone()))
         .unwrap();
@@ -276,7 +278,10 @@ fn a_missing_agent_provider_in_this_boot_stays_unconfirmed() {
     let fixture = retained_source(&host, "boot");
     let accepted = lost_agent(&host, fixture.directory.path(), &fixture.source);
     let failure = close_agent(&host, accepted.agent.id).unwrap_err();
-    assert!(failure.contains("Cannot confirm teardown"), "{failure}");
+    assert!(
+        failure.contains(super::LOST_EXECUTION_UNPROVED),
+        "{failure}"
+    );
     assert!(super::close_retained_from_pane(&host, &fixture.source).is_err());
     assert!(agent_open(&host, accepted.agent.id));
     assert!(!fixture.marker.exists());
@@ -393,7 +398,7 @@ fn an_unconfirmed_earlier_boot_launch_refuses_close_before_changing_anything() {
     assert_eq!(before.len(), 1);
     for _ in 0..2 {
         let failure = close_agent(&host, accepted.agent.id).unwrap_err();
-        assert!(failure.contains("Cannot confirm teardown"), "{failure}");
+        assert!(failure.contains("launch never confirmed"), "{failure}");
         assert!(super::close_retained_from_pane(&host, source).is_err());
         assert_eq!(fixture.authority_rows(source.id), before);
         assert!(agent_open(&host, accepted.agent.id));
@@ -458,6 +463,7 @@ fn closing_a_lost_childs_pane_ends_only_that_child() {
                     3,
                 )
                 .unwrap();
+            assert!(registry.claim_agent_dispatch(&child, 3).unwrap());
             registry
                 .bind_agent(child.agent.id, None, HostedSession::Chat(source.clone()))
                 .unwrap();
@@ -1208,7 +1214,7 @@ fn a_lost_scheduled_agent_keeps_the_ordinary_refusal() {
     assert!(refused.contains("does not own"), "{refused}");
     let refused = super::close_retained_from_pane(&host, source).unwrap_err();
     assert!(
-        refused.contains("No authenticated retained Claude actor"),
+        refused.contains("only its automation can end it"),
         "{refused}"
     );
     assert!(agent_open(&host, accepted.agent.id));

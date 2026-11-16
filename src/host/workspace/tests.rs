@@ -20,6 +20,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod delta_delivery_tests;
+mod removal_tests;
+
 fn fixture() -> (tempfile::TempDir, SharedHost, Arc<DeliveryQueue>) {
     let directory = tempfile::tempdir().unwrap();
     let mut state = HostState::new(HostSessionProof {
@@ -84,19 +87,85 @@ fn open_project(root: &std::path::Path) -> ModelEdit {
 
 #[test]
 fn sqlite_writer_contention_keeps_terminal_input_and_inventory_responsive() {
+    assert_sqlite_progress(false);
+}
+
+#[test]
+fn source_checked_removal_sqlite_contention_keeps_terminal_input_and_inventory_responsive() {
+    assert_sqlite_progress(true);
+}
+
+fn assert_sqlite_progress(removing: bool) {
     let (directory, host, _) = fixture();
     let (session, _terminal) = terminal(
         &host,
         directory.path(),
         "while IFS= read -r line; do printf '%s' \"$line\" > received; done",
     );
+    let edit = if removing {
+        edit(&host, 1, open_project(directory.path())).unwrap();
+        let scope = Scope::Worktree {
+            repository: directory.path().to_owned(),
+            path: directory.path().to_owned(),
+        };
+        let source = host
+            .lock()
+            .unwrap()
+            .descriptor(1, session.id)
+            .unwrap()
+            .session;
+        let pane = Pane {
+            id: CardId::new(),
+            title: "Contention fixture".into(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: 0.5,
+            kind: CardKind::Terminal(source),
+            scope: None,
+        };
+        let model = edit(
+            &host,
+            1,
+            ModelEdit::SeedView {
+                scope: scope.clone(),
+                panes: vec![pane.clone()],
+                closed: vec![],
+            },
+        )
+        .unwrap();
+        ModelEdit::ChangeView {
+            scope: scope.clone(),
+            expected_revision: model.views[0].revision,
+            operation: uuid::Uuid::new_v4(),
+            change: Change::RemoveSource {
+                registry: model.identity,
+                repository: directory.path().to_owned(),
+                before: pane.clone(),
+                terminal: Some(
+                    crate::workspace_model::views::TerminalRemovalBasis::Worker {
+                        owner: host.lock().unwrap().proof().clone(),
+                        instance: _terminal.0.execution_instance(),
+                    },
+                ),
+                capture: Some(crate::workspace_model::views::CapturedTerminalSource {
+                    registry: model.identity,
+                    repository: directory.path().to_owned(),
+                    scope,
+                    view_revision: model.views[0].revision,
+                    model_sequence: model.sequence,
+                    before: pane,
+                }),
+            },
+        }
+    } else {
+        open_project(directory.path())
+    };
     let blocker = rusqlite::Connection::open(directory.path().join("model.sqlite3")).unwrap();
     blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
     let registry = writer(&host).unwrap();
     let (finished, completion) = mpsc::channel();
     let editor = {
         let host = host.clone();
-        let edit = open_project(directory.path());
         thread::spawn(move || {
             let result = process_request(&host, 2, ClientRequest::EditWorkspaceModel { edit });
             finished.send(()).unwrap();
@@ -181,9 +250,12 @@ fn watching_before_snapshot_cannot_lose_a_concurrent_execution_writer_edge() {
     let edit = open_project(directory.path());
     let applied = execution.apply(&edit);
     if let Ok(applied) = &applied {
-        host.lock()
-            .unwrap()
-            .announce_model_edit(1, applied.model.sequence, &edit);
+        host.lock().unwrap().announce_model_edit(
+            1,
+            applied.model.sequence,
+            &edit,
+            &applied.effects,
+        );
     }
     resume.send(()).unwrap();
     let observed = observer.join().unwrap().unwrap();
@@ -191,7 +263,7 @@ fn watching_before_snapshot_cannot_lose_a_concurrent_execution_writer_edge() {
     delivery.close_after_drain();
     let edges = std::iter::from_fn(|| delivery.pop())
         .filter_map(|envelope| match envelope.message {
-            ServerMessage::WorkspaceModelEdited { sequence, edit } => Some((sequence, edit)),
+            ServerMessage::WorkspaceModelEdited { sequence, edit, .. } => Some((sequence, edit)),
             _ => None,
         })
         .collect::<Vec<_>>();

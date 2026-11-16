@@ -9,7 +9,11 @@ use crate::{
         self, Command, Snapshot,
         protocol::{ExecutionContext, ProcessSpec, TransportSpec},
     },
-    daemon::holder_registry::{self as registry, Kind, Process, Record},
+    daemon::{
+        child_events::ChildEvents,
+        holder_registry::{self as registry, Kind, Process, Record},
+        owned_children::DetachedWork,
+    },
     model::HostSessionProof,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -166,10 +170,26 @@ pub(crate) struct Resident {
     pub close: CloseObservation,
     pub idle: bool,
     pub failure: Option<String>,
+    /// When the latest turn finished, in Unix milliseconds. A helper that
+    /// predates it reports none.
+    #[serde(default)]
+    pub finished_at: Option<u64>,
     pub confirmed_session: Option<String>,
     pub background_subagents: Vec<String>,
     pub interrupt_subagents: Vec<String>,
+    /// What holds the conversation, by name. A helper that predates it
+    /// reports none; see [`Resident::work_hold`].
+    #[serde(default)]
+    work_hold: Option<chat::WorkHold>,
     pub account_reports: Vec<Update>,
+    /// How the provider addresses the conversation's subagents. A helper
+    /// that predates them reports none.
+    #[serde(default)]
+    pub agent_addresses: Vec<chat::AgentAddress>,
+    #[serde(default)]
+    pub active_model: Option<chat::ActiveModel>,
+    #[serde(default)]
+    pub active_model_revision: u64,
     next_input: u64,
     acknowledged_input_count: usize,
     pub continuity_loss: Option<ContinuityLoss>,
@@ -177,6 +197,24 @@ pub(crate) struct Resident {
     pub outbox_ack: u64,
     pub outbox_latest: u64,
     changed: u64,
+}
+impl Resident {
+    /// What holds the conversation. A helper that predates names reports its
+    /// background subagents only as running ones it cannot name; it never
+    /// reports one waiting.
+    pub(crate) fn work_hold(&self) -> chat::WorkHold {
+        self.work_hold.clone().unwrap_or_else(|| chat::WorkHold {
+            turn: self.busy || self.waiting || !self.requests.is_empty(),
+            subagents: self
+                .background_subagents
+                .iter()
+                .map(|_| chat::HeldSubagent {
+                    name: String::new(),
+                    waiting: false,
+                })
+                .collect(),
+        })
+    }
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct ActorInspection {
@@ -290,6 +328,8 @@ struct Remote {
     launch_account_scope: Result<crate::account::scope::LaunchAccountScope, String>,
     recovery_environment: BTreeMap<String, String>,
     desired_visible: Mutex<Option<bool>>,
+    wake: Arc<push::Wake>,
+    binary_codec: std::sync::OnceLock<bool>,
     desired_observe: AtomicBool,
     notified_prompt_revision: std::sync::atomic::AtomicU64,
     input_sequence: Mutex<u64>,
@@ -303,6 +343,9 @@ struct Remote {
     stop: AtomicBool,
     installed: AtomicBool,
     preserved: AtomicBool,
+    /// Whether `close` asks the helper to spare the work the provider
+    /// already detached. See [`DetachedWork`].
+    spare_detached: AtomicBool,
     worker: Mutex<Option<thread::JoinHandle<()>>>,
     startup: Mutex<Option<UnixStream>>,
 }
@@ -440,10 +483,15 @@ impl RemoteActor {
             },
             idle: true,
             failure: None,
+            finished_at: None,
             confirmed_session: None,
             background_subagents: Vec::new(),
             interrupt_subagents: Vec::new(),
+            work_hold: None,
             account_reports: Vec::new(),
+            agent_addresses: Vec::new(),
+            active_model: None,
+            active_model_revision: 0,
             next_input: 1,
             acknowledged_input_count: 0,
             continuity_loss: None,
@@ -484,6 +532,8 @@ impl RemoteActor {
             launch_account_scope: Err("fixture has no account scope".into()),
             recovery_environment: Default::default(),
             desired_visible: Mutex::new(None),
+            binary_codec: std::sync::OnceLock::new(),
+            wake: Arc::new(push::Wake::new().unwrap()),
             desired_observe: AtomicBool::new(false),
             notified_prompt_revision: std::sync::atomic::AtomicU64::new(0),
             input_sequence: Mutex::new(1),
@@ -496,6 +546,7 @@ impl RemoteActor {
             stop: AtomicBool::new(false),
             installed: AtomicBool::new(true),
             preserved: AtomicBool::new(false),
+            spare_detached: AtomicBool::new(false),
 
             worker: Mutex::new(None),
             startup: Mutex::new(None),
@@ -560,6 +611,11 @@ impl RemoteActor {
         other
     }
     #[cfg(test)]
+    pub(in crate::chat::runtime) fn confirm_session_fixture(&self, session: String) {
+        let mut state = self.0.state.lock().unwrap();
+        Arc::make_mut(&mut state).confirmed_session = Some(session);
+    }
+    #[cfg(test)]
     pub(in crate::chat::runtime) fn completed_failure_fixture() -> Self {
         let actor = Self::fixture();
         {
@@ -598,6 +654,16 @@ impl RemoteActor {
         authorize_reader(proof)?;
         validate_evidence_record(record, proof)?;
         super::execution_exit::abandoned(&record.holder, &record.root)
+    }
+    /// Release the transcript a verified retirement's final receipt no longer
+    /// needs. Returns the bytes released; anything not yet retired is kept.
+    pub fn compact_retired_receipt(
+        record: &Record,
+        proof: &HostSessionProof,
+    ) -> Result<u64, String> {
+        authorize_reader(proof)?;
+        validate_evidence_record(record, proof)?;
+        final_snapshot::compact_retired(record, proof)
     }
     pub fn retired_actor_receipt(
         record: &Record,
@@ -723,13 +789,17 @@ impl RemoteActor {
                 resident.idle = false;
                 resident.busy = false;
                 let (changed, generation) = (resident.changed, resident.generation);
+                let active_model_clock = (resident.close.actor_id, resident.active_model_revision);
                 if !self.publish_resident_inner(resident, true) {
                     // Another refresh, such as the outcome broker's while a
                     // close drains the outbox, can publish a newer closed
                     // reply first. This older one is then only stale.
                     let current = self.state();
                     if !(current.completed
-                        && (current.changed > changed || current.generation > generation))
+                        && (current.changed > changed
+                            || current.generation > generation
+                            || (current.close.actor_id == active_model_clock.0
+                                && current.active_model_revision > active_model_clock.1)))
                     {
                         return Err("Closed actor metadata was superseded during refresh".into());
                     }
@@ -771,9 +841,11 @@ impl RemoteActor {
             .desired_visible
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = Some(visible);
+        self.0.wake.notify();
     }
     pub fn observe_next_update(&self) -> u64 {
         self.0.desired_observe.store(true, Ordering::Release);
+        self.0.wake.notify();
         self.state().generation
     }
     pub fn attachment_snapshot(&self) -> Snapshot {
@@ -848,7 +920,7 @@ impl RemoteActor {
         {
             return Err("Retained actors require the Claude stream-json transport".into());
         }
-        spec.remove_unset_environment();
+        spec.withhold_environment();
         let proof = source
             .proof
             .clone()
@@ -1113,6 +1185,8 @@ impl RemoteActor {
             proof,
             socket,
             desired_visible: Mutex::new(None),
+            binary_codec: std::sync::OnceLock::new(),
+            wake: Arc::new(push::Wake::new()?),
             desired_observe: AtomicBool::new(false),
             notified_prompt_revision: std::sync::atomic::AtomicU64::new(0),
             input_sequence: Mutex::new(attached.resident.next_input),
@@ -1131,10 +1205,13 @@ impl RemoteActor {
             stop: AtomicBool::new(false),
             installed: AtomicBool::new(false),
             preserved: AtomicBool::new(false),
+            spare_detached: AtomicBool::new(false),
 
             worker: Mutex::new(None),
             startup: Mutex::new(startup),
         }));
+        let watch = remote.watch()?;
+        let wake = remote.0.wake.clone();
         let weak = Arc::downgrade(&remote.0);
         let worker = thread::Builder::new()
             .name("cagents-actor-proxy".into())
@@ -1170,6 +1247,7 @@ impl RemoteActor {
                     }
                     let old = actor.state();
                     let response = actor.call::<Option<Resident>>("state", json!([old.changed]));
+                    let mut retry_housekeeping = response.is_err();
                     if actor.0.stop.load(Ordering::Acquire) {
                         break;
                     }
@@ -1184,7 +1262,7 @@ impl RemoteActor {
                             break;
                         }
                     }
-                    let _ = actor.reconcile_acknowledged_inputs();
+                    retry_housekeeping |= actor.reconcile_acknowledged_inputs().is_err();
                     let identities: Vec<_> = actor
                         .0
                         .pending
@@ -1194,21 +1272,99 @@ impl RemoteActor {
                         .filter(|pending| pending.reply.is_some())
                         .map(|pending| pending.identity.clone())
                         .collect();
-                    if !identities.is_empty()
-                        && let Ok(receipts) =
-                            actor.call::<Vec<InputReceipt>>("input_receipts", json!([identities]))
-                    {
-                        actor.apply_receipts(&receipts);
+                    if !identities.is_empty() {
+                        match actor.call::<Vec<InputReceipt>>("input_receipts", json!([identities]))
+                        {
+                            Ok(receipts) => actor.apply_receipts(&receipts),
+                            Err(_) => retry_housekeeping = true,
+                        }
                     }
                     actor.resolve_uncertain_input();
-                    let _ = actor.flush_input_retirements();
+                    retry_housekeeping |= actor.flush_input_retirements().is_err();
+                    let retry = if watch.is_none() {
+                        Some(Duration::from_millis(50))
+                    } else {
+                        actor.retry_after(retry_housekeeping)
+                    };
                     drop(actor);
-                    thread::sleep(Duration::from_millis(50));
+                    if let Err(error) = wake.wait(watch.as_ref(), retry) {
+                        if let Some(inner) = weak.upgrade() {
+                            Self(inner).publish_unavailable(&error);
+                        }
+                        break;
+                    }
                 }
             })
             .map_err(|error| error.to_string())?;
         *remote.0.worker.lock().unwrap_or_else(|p| p.into_inner()) = Some(worker);
         Ok(remote)
+    }
+    fn retry_after(&self, failed: bool) -> Option<Duration> {
+        // Accepted inputs finish through helper publication. Only work that
+        // failed, or has a scheduled retransmission, needs a timer.
+        if failed
+            || self.0.recovering_inputs.load(Ordering::Acquire)
+            || self.state().acknowledged_input_count > 0
+            || self.0.desired_observe.load(Ordering::Acquire)
+            || self
+                .0
+                .desired_visible
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_some()
+            || !self
+                .0
+                .retiring_inputs
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty()
+        {
+            return Some(Duration::from_millis(50));
+        }
+        self.0
+            .uncertain_input
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .and_then(|input| input.retransmit.as_ref())
+            .map(|retry| retry.next.saturating_duration_since(Instant::now()))
+    }
+    fn watch(&self) -> Result<Option<UnixStream>, String> {
+        let deadline = Instant::now() + TIMEOUT;
+        let control =
+            registry::connect_until(&self.0.socket, deadline).map_err(|e| e.to_string())?;
+        verify_peer(&control, &self.0.identity.record)?;
+        deadline_io::send_until(
+            &control,
+            &Invocation {
+                proof: self.0.proof.clone(),
+                epoch: Some(self.0.epoch),
+                method: "watch".into(),
+                args: Value::Null,
+            },
+            deadline,
+        )?;
+        let (result, mut fds) =
+            crate::descriptor_frame::receive_json_with_fds_until::<Result<(), String>>(
+                &control,
+                deadline,
+                MAX_FRAME,
+                1,
+                crate::descriptor_frame::FrameByteOrder::LittleEndian,
+            )?;
+        verify_peer(&control, &self.0.identity.record)?;
+        match result {
+            Err(error) if error == UNKNOWN_METHOD => Ok(None),
+            Err(error) => Err(error),
+            Ok(()) => {
+                if fds.len() != 1 {
+                    return Err("Retained watcher did not transfer exactly one descriptor".into());
+                }
+                let watch = UnixStream::from(fds.remove(0));
+                watch.set_nonblocking(true).map_err(|e| e.to_string())?;
+                Ok(Some(watch))
+            }
+        }
     }
     fn publish_resident(&self, resident: Resident) -> bool {
         self.publish_resident_inner(resident, false)
@@ -1227,6 +1383,10 @@ impl RemoteActor {
                     && resident.close.completed))
                 || resident.changed < state.changed
                 || resident.generation < state.generation
+                // A model update can precede its change callback while both
+                // general clocks still match an older in-flight sample.
+                || (resident.close.actor_id == state.close.actor_id
+                    && resident.active_model_revision < state.active_model_revision)
                 // Installation is acknowledged independently of observer
                 // revisions. A state RPC issued before commit can arrive
                 // after its ACK with equal changed/generation values.
@@ -1265,8 +1425,11 @@ impl RemoteActor {
             {
                 updates.push(Update::PromptAvailable);
             }
-            if (resident.outbox_latest > resident.outbox_ack
-                && resident.outbox_latest != state.outbox_latest)
+            // Conversation identity is durable daemon metadata even when no
+            // window subscribes and no semantic outcome accompanies it.
+            if identity_changed
+                || (resident.outbox_latest > resident.outbox_ack
+                    && resident.outbox_latest != state.outbox_latest)
                 || (resident.continuity_loss != state.continuity_loss
                     && resident
                         .continuity_loss
@@ -1282,6 +1445,15 @@ impl RemoteActor {
                     .filter(|report| !state.account_reports.contains(report))
                     .cloned(),
             );
+            if resident.agent_addresses != state.agent_addresses {
+                updates.push(Update::AgentAddresses(resident.agent_addresses.clone()));
+            }
+            if resident.active_model_revision != state.active_model_revision {
+                updates.push(Update::ActiveModel {
+                    revision: resident.active_model_revision,
+                    model: resident.active_model.clone(),
+                });
+            }
             *state = Arc::new(resident);
             updates
         };
@@ -1301,6 +1473,7 @@ impl RemoteActor {
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(snapshot));
         self.0.stop.store(true, Ordering::Release);
+        self.0.wake.notify();
         let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(mut resident) = resident {
             // A close response may also have been issued before installation
@@ -1309,6 +1482,12 @@ impl RemoteActor {
             if state.installed {
                 resident.installed = true;
                 resident.native_continuity = state.native_continuity.clone();
+            }
+            if resident.close.actor_id == state.close.actor_id
+                && resident.active_model_revision < state.active_model_revision
+            {
+                resident.active_model = state.active_model.clone();
+                resident.active_model_revision = state.active_model_revision;
             }
             *state = Arc::new(resident);
         }
@@ -1367,6 +1546,7 @@ impl RemoteActor {
         (self.0.notify)(Update::Observed { generation });
         (self.0.notify)(Update::Presentation);
         self.0.stop.store(true, Ordering::Release);
+        self.0.wake.notify();
     }
     pub(in crate::chat::runtime) fn pinned_launch_directory(
         &self,
@@ -1613,6 +1793,7 @@ impl RemoteActor {
             });
             break;
         }
+        self.0.wake.notify();
         // Preserve the exact identity and envelope before crossing the socket.
         // An ambiguous write keeps the receipt pending and fences new input
         // until the metadata pump observes, retransmits or settles it.
@@ -1654,6 +1835,7 @@ impl RemoteActor {
             });
             uncertain.refusal = refusal;
         }
+        self.0.wake.notify();
         Ok(response)
     }
     /// Inputs reach the helper one at a time, so a caller who arrives while
@@ -1923,6 +2105,9 @@ impl RemoteActor {
             .retiring_inputs
             .lock()
             .unwrap_or_else(|p| p.into_inner());
+        if !completed.is_empty() {
+            self.0.wake.notify();
+        }
         for identity in completed {
             if !retiring.contains(&identity) {
                 retiring.push(identity);
@@ -2059,6 +2244,7 @@ impl RemoteActor {
         self.call::<()>("preserve", Value::Null)?;
         self.0.preserved.store(true, Ordering::Release);
         self.0.stop.store(true, Ordering::Release);
+        self.0.wake.notify();
         Ok(())
     }
     pub fn close_method(&self, method: &str, args: Value) -> Result<(), String> {
@@ -2109,8 +2295,15 @@ impl RemoteActor {
             thread::sleep(Duration::from_millis(10));
         }
     }
+    pub(crate) fn decide_detached_work(&self, detached: DetachedWork) {
+        self.0
+            .spare_detached
+            .store(detached == DetachedWork::Spare, Ordering::Release);
+    }
+    /// A helper from before sparing ignores the decision and stops it all.
     pub fn close(&self) -> Result<(), String> {
-        self.close_method("close", Value::Null)
+        let spare = self.0.spare_detached.load(Ordering::Acquire);
+        self.close_method("close", json!([spare]))
     }
 }
 impl chat::protocol::LaunchCleanup for RemoteActor {
@@ -2123,6 +2316,7 @@ impl chat::protocol::LaunchCleanup for RemoteActor {
 impl Drop for Remote {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        self.wake.notify();
         if let Some(worker) = self
             .worker
             .get_mut()
@@ -2168,10 +2362,13 @@ fn close_only_method(method: &str) -> bool {
     matches!(
         method,
         "state"
+            | "watch"
             | "execution_environment"
             | "recognize_sources"
             | "snapshot"
             | "presentation"
+            | "presentation_codec"
+            | "presentation_binary"
             | "visible"
             | "observe"
             | "readiness"
@@ -2263,10 +2460,15 @@ struct Server {
     installed: bool,
     journal: Arc<Mutex<Journal>>,
     changed: Arc<std::sync::atomic::AtomicU64>,
+    watcher: Arc<push::Watcher>,
+    #[cfg(test)]
+    state_reads: Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(test)]
+    fail_state_reads: Arc<std::sync::atomic::AtomicU64>,
     prompt_revision: Arc<std::sync::atomic::AtomicU64>,
     pending: Vec<(
         InputIdentity,
-        crossbeam_channel::Receiver<Result<(), String>>,
+        crossbeam_channel::Receiver<Result<(), Rejection>>,
         Option<(crate::model::RunId, Arc<std::sync::atomic::AtomicU8>)>,
     )>,
     account_reports: Arc<Mutex<Vec<Update>>>,
@@ -2282,6 +2484,9 @@ struct Server {
     // attachment. A newly authenticated attach may own the still-live actor.
     attachment_preserved: bool,
     close_only: bool,
+    /// Whether teardown stops what the provider leaves running, or leaves it
+    /// as quitting the provider's own CLI does. Decided by a close.
+    detached: DetachedWork,
 }
 impl Server {
     fn start_after_scope_enrollment(
@@ -2348,6 +2553,10 @@ impl Server {
         let journal = Arc::new(Mutex::new(Journal::open(store.directory())?));
         let changed = Arc::new(std::sync::atomic::AtomicU64::new(1));
         let published = changed.clone();
+        let watcher = Arc::new(push::Watcher::default());
+        let published_watcher = watcher.clone();
+        let metadata_changed = changed.clone();
+        let metadata_watcher = watcher.clone();
         let prompt_revision = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let available = prompt_revision.clone();
         let outcomes = journal.clone();
@@ -2381,6 +2590,11 @@ impl Server {
                     }
                 }
                 published.fetch_add(1, Ordering::Release);
+                published_watcher.notify();
+            },
+            move || {
+                metadata_changed.fetch_add(1, Ordering::Release);
+                metadata_watcher.notify();
             },
         )?;
         let provider = actor
@@ -2428,6 +2642,11 @@ impl Server {
             installed: false,
             journal,
             changed,
+            watcher,
+            #[cfg(test)]
+            state_reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            fail_state_reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             prompt_revision,
             pending: Vec::new(),
             account_reports,
@@ -2441,13 +2660,50 @@ impl Server {
             session_stopping: false,
             attachment_preserved: false,
             close_only: false,
+            detached: DetachedWork::Stop,
         })
+    }
+    fn presentation_response(
+        &mut self,
+        id: crate::model::TerminalId,
+        after: Option<u64>,
+    ) -> Result<Option<crate::terminal_ipc::ServerResponse>, String> {
+        if id != self.source.id {
+            return Err("Retained presentation names another chat".into());
+        }
+        // Loss is outside the reducer's transcript generation. Refuse
+        // even an unchanged-generation read instead of hiding it as
+        // an empty publication or inventing a transcript revision.
+        if let Some(loss) = self
+            .journal
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .continuity_loss()?
+        {
+            return Err(loss.reason);
+        }
+        let response = self.actor.presentation(id, after);
+        let snapshot = match &response {
+            Some(crate::terminal_ipc::ServerResponse::ChatSnapshot {
+                snapshot: Some(snapshot),
+                ..
+            }) => Some(snapshot),
+            Some(crate::terminal_ipc::ServerResponse::ChatUpdate { update, .. }) => {
+                Some(&update.metadata)
+            }
+            _ => None,
+        };
+        if let Some(snapshot) = snapshot {
+            self.remember_publication(snapshot.session_id.as_deref(), &snapshot.native_continuity)?;
+        }
+        Ok(response)
     }
     fn notifier(&self) -> impl Fn(Update) + Send + Sync + 'static {
         let outcomes = self.journal.clone();
         let changed = self.changed.clone();
         let available = self.prompt_revision.clone();
         let reports = self.account_reports.clone();
+        let watcher = self.watcher.clone();
         move |update| {
             if matches!(update, Update::PromptAvailable) {
                 available.fetch_add(1, Ordering::Release);
@@ -2467,6 +2723,7 @@ impl Server {
                 }
             }
             changed.fetch_add(1, Ordering::Release);
+            watcher.notify();
         }
     }
     fn revision(&self) -> u64 {
@@ -2494,7 +2751,10 @@ impl Server {
         let waiting = state.waiting;
         let usage = state.usage.clone();
         let requests = state.requests.clone();
+        let active_model = state.active_model.clone();
+        let active_model_revision = state.active_model_revision;
         let sampled_activity = state.activity();
+        let work_hold = state.work_hold();
         let prompt_eligible =
             super::super::accepts_prompt(&state) && !self.actor.0.draining.load(Ordering::Acquire);
         use crate::notifications::Kind;
@@ -2580,10 +2840,15 @@ impl Server {
             completed,
             idle,
             failure,
+            finished_at: self.actor.finished_at(),
             confirmed_session,
             background_subagents,
             interrupt_subagents,
+            work_hold: Some(work_hold),
             account_reports,
+            agent_addresses: self.actor.agent_addresses(),
+            active_model,
+            active_model_revision,
             next_input: journal.next_input()?,
             acknowledged_input_count: journal.acknowledged_input_count(),
             continuity_loss,
@@ -2682,20 +2947,43 @@ impl Server {
         let journal = self.journal.clone();
         let completed = self.actor.is_completed();
         let changed = self.changed.clone();
-        self.pending.retain(|(identity,response,effects)| {
-            if !completed && effects.as_ref().is_some_and(|(_,state)|state.load(Ordering::Acquire)==0) {return true;}
-            let result=match response.try_recv() {Ok(result)=>Some(InputState::Acknowledged(result)),Err(crossbeam_channel::TryRecvError::Disconnected)=>Some(InputState::Unknown("The retained actor stopped before acknowledging this input; never replay it automatically".into())),Err(crossbeam_channel::TryRecvError::Empty)=>None};
-            if let Some(state)=result {
-                let mut journal=journal.lock().unwrap_or_else(|p|p.into_inner());
-                if matches!(&state,InputState::Acknowledged(Err(_))) && let Some((run,effects))=effects && effects.load(Ordering::Acquire)==1 {
-                    if let Err(error)=journal.refuse_unexecuted_run(*run) {let _=journal.record_loss(&error);}
-                }
-                if let Err(error)=journal.finish(identity,state) {let _=journal.record_loss(&format!("Cannot persist retained input outcome: {error}"));}
-                changed.fetch_add(1,Ordering::Release);
-                false
-            } else {true}
+        let revision = self.revision();
+        self.pending.retain(|(identity, response, effects)| {
+            if !completed
+                && effects
+                    .as_ref()
+                    .is_some_and(|(_, state)| state.load(Ordering::Acquire) == 0)
+            {
+                return true;
+            }
+            let state = match response.try_recv() {
+                Ok(Ok(())) => InputState::Acknowledged(Ok(())),
+                Ok(Err(Rejection::Refused(error))) => InputState::Acknowledged(Err(error)),
+                Ok(Err(Rejection::Unacknowledged(error))) => InputState::Unknown(error),
+                Err(crossbeam_channel::TryRecvError::Disconnected) => InputState::Unknown(
+                    "The retained actor stopped before acknowledging this input; never replay it automatically".into(),
+                ),
+                Err(crossbeam_channel::TryRecvError::Empty) => return true,
+            };
+            let mut journal = journal.lock().unwrap_or_else(|p| p.into_inner());
+            if matches!(&state, InputState::Acknowledged(Err(_)))
+                && let Some((run, effects)) = effects
+                && effects.load(Ordering::Acquire) == 1
+                && let Err(error) = journal.refuse_unexecuted_run(*run)
+            {
+                let _ = journal.record_loss(&error);
+            }
+            if let Err(error) = journal.finish(identity, state) {
+                let _ = journal.record_loss(&format!("Cannot persist retained input outcome: {error}"));
+            }
+            changed.fetch_add(1, Ordering::Release);
+            false
         });
+        if self.revision() != revision {
+            self.watcher.notify();
+        }
     }
+
     fn pinned_launch_directory(
         &self,
         request: &Invocation,
@@ -2760,6 +3048,7 @@ impl Server {
                     "Retained actor source/account identity does not match this chat".into(),
                 );
             }
+            self.watcher.clear();
             self.epoch = uuid::Uuid::new_v4();
             self.close_only = close_only;
             self.attachment_preserved = false;
@@ -2804,6 +3093,11 @@ impl Server {
             return Err("This attachment preserved provider ownership; authenticate a new attachment before changing it".into());
         }
         match request.method.as_str() {
+            "watch" => Ok(Value::Null),
+            "presentation_codec" => {
+                let (version,) = decode!((u16,));
+                value!(version == crate::terminal_ipc::PROTOCOL_VERSION)
+            }
             "account_switch_generation"
             | "completed_account_options"
             | "account_switch_notice"
@@ -2857,6 +3151,17 @@ impl Server {
             }
             "execution_environment" => value!(self.environment.clone()),
             "state" => {
+                #[cfg(test)]
+                {
+                    self.state_reads.fetch_add(1, Ordering::Release);
+                    if self
+                        .fail_state_reads
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                        .is_ok()
+                    {
+                        return Err("Temporary fixture observation failure".into());
+                    }
+                }
                 let (after,) = decode!((u64,));
                 if after == self.revision() {
                     Ok(Value::Null)
@@ -3090,37 +3395,7 @@ impl Server {
             }
             "presentation" => {
                 let (id, after) = decode!((crate::model::TerminalId, Option<u64>));
-                if id != self.source.id {
-                    return Err("Retained presentation names another chat".into());
-                }
-                // Loss is outside the reducer's transcript generation. Refuse
-                // even an unchanged-generation read instead of hiding it as
-                // an empty publication or inventing a transcript revision.
-                if let Some(loss) = self
-                    .journal
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .continuity_loss()?
-                {
-                    return Err(loss.reason);
-                }
-                let response = self.actor.presentation(id, after);
-                let snapshot = match &response {
-                    Some(crate::terminal_ipc::ServerResponse::ChatSnapshot {
-                        snapshot: Some(snapshot),
-                        ..
-                    }) => Some(snapshot),
-                    Some(crate::terminal_ipc::ServerResponse::ChatUpdate { update, .. }) => {
-                        Some(&update.metadata)
-                    }
-                    _ => None,
-                };
-                if let Some(snapshot) = snapshot {
-                    self.remember_publication(
-                        snapshot.session_id.as_deref(),
-                        &snapshot.native_continuity,
-                    )?;
-                }
+                let response = self.presentation_response(id, after)?;
                 value!(response)
             }
             "text_copy" => {
@@ -3249,9 +3524,29 @@ impl Server {
                 value!(self.try_close_if_idle(generation)?)
             }
             "close" => {
+                // `[true]` leaves what the provider leaves running when it
+                // quits. A daemon that sends no decision stops everything, as
+                // before.
                 if self.closed_snapshot.is_none() {
+                    let mut detached = if request.args.get(0).and_then(Value::as_bool) == Some(true)
+                    {
+                        DetachedWork::Spare
+                    } else {
+                        DetachedWork::Stop
+                    };
+                    // The provider's scope holds what it detached, too.
+                    self.actor.decide_detached_work(detached);
                     self.actor.close()?;
-                    reap_orphans()?;
+                    // A provider something else killed, such as the system
+                    // for memory, leaves nothing running: what it left would
+                    // hold the memory it needed.
+                    if self.actor.provider_was_force_stopped() {
+                        detached = DetachedWork::Stop;
+                    }
+                    // Only once the provider is gone: until then, the helper's
+                    // exit must prove it is by stopping everything.
+                    self.detached = detached;
+                    reap_orphans(self.detached)?;
                     self.finish_inputs();
                 }
                 value!(self.publish_close()?)
@@ -3339,7 +3634,7 @@ impl Server {
             if !self.actor.try_close_if_idle(generation)? {
                 return Ok(ConditionalClosePublication::Changed);
             }
-            reap_orphans()?;
+            reap_orphans(self.detached)?;
             self.finish_inputs();
         }
         self.publish_close()
@@ -3385,7 +3680,8 @@ impl Server {
             resident: self.resident()?,
         })
     }
-    fn serve(mut self, startup: UnixStream) -> Result<(), String> {
+    /// `children` wakes the loop to reap exited orphans; see [`OrphanSweep`].
+    fn serve(&mut self, startup: UnixStream, children: Option<ChildEvents>) -> Result<(), String> {
         send(
             &startup,
             &Ok::<_, String>(self.attached()?),
@@ -3395,13 +3691,14 @@ impl Server {
             .set_nonblocking(true)
             .map_err(|error| error.to_string())?;
         let connections = connections::Connections::new()?;
-        let mut orphans = OrphanSweep::new();
+        let mut orphans = OrphanSweep::new(children);
+        let mut child_exited = false;
         'serve: loop {
-            orphans.run_if_due();
+            orphans.run_if_due(std::mem::take(&mut child_exited));
             self.finish_inputs();
             if !self.installed && disconnected(&startup)? {
                 self.actor.close()?;
-                reap_orphans()?;
+                reap_orphans(self.detached)?;
                 break;
             }
             let accepting = connections.has_capacity();
@@ -3425,13 +3722,25 @@ impl Server {
                     revents: 0,
                 });
             }
+            let exits = orphans.wakeup().map(|fd| {
+                events.push(libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+                events.len() - 1
+            });
             // An admitted input's completion has no wakeup of its own, so
             // poll for it only while some are pending.
             let mut wait = orphans.until_due();
             if !self.pending.is_empty() {
-                wait = wait.min(INPUT_COMPLETION_POLL);
+                wait = Some(wait.map_or(INPUT_COMPLETION_POLL, |wait| {
+                    wait.min(INPUT_COMPLETION_POLL)
+                }));
             }
-            let millis = wait.as_millis().saturating_add(1).min(i32::MAX as u128) as i32;
+            let millis = wait.map_or(-1, |wait| {
+                wait.as_millis().saturating_add(1).min(i32::MAX as u128) as i32
+            });
             // SAFETY: `events` stays live and initialized for this finite poll.
             if unsafe { libc::poll(events.as_mut_ptr(), events.len() as libc::nfds_t, millis) } < 0
             {
@@ -3441,6 +3750,7 @@ impl Server {
                 }
                 return Err(error.to_string());
             }
+            child_exited = exits.is_some_and(|index| events[index].revents != 0);
             while accepting && connections.has_capacity() {
                 match self.listener.accept() {
                     Ok((control, _)) => connections.admit(control),
@@ -3466,7 +3776,23 @@ impl Server {
                 }
                 let (request, reply) = call.into_parts();
                 let close = request.method == "retire";
+                if request.method == "presentation_binary" {
+                    let response = self.binary_presentation(request);
+                    reply.send(connections::Answer::Binary(response));
+                    orphans.run();
+                    continue;
+                }
+                if request.method == "watch" {
+                    let watch = self.invoke(request).and_then(|_| self.watcher.subscribe());
+                    reply.send(connections::Answer::Watch(watch));
+                    orphans.run();
+                    continue;
+                }
+                let revision = self.revision();
                 let response = self.invoke(request);
+                if self.revision() != revision {
+                    self.watcher.notify();
+                }
                 // Only an explicit retirement after durable semantic ACK exits
                 // the helper; a lost provider-close reply retains its journal.
                 let finished = close && response.is_ok();
@@ -3611,46 +3937,85 @@ fn disconnected(control: &UnixStream) -> Result<bool, String> {
 /// provider and scope requests spawn through `adopted_orphans`, which reserves
 /// their statuses for their owners. Nothing here signals a live child.
 ///
-/// The helper has no log sink, so a sweep failure is retried on the next tick
-/// rather than reported here. Its durable symptom is the per-holder zombie
-/// count that `cagents diagnostics` observes from outside the process.
+/// A sweep runs when a child exits, read from [`ChildEvents`], so an idle
+/// actor does not wake. Without that descriptor, as in a process whose other
+/// threads receive SIGCHLD, it runs every [`Self::INTERVAL`] instead.
+///
+/// The helper has no log sink, so a failed sweep is retried after
+/// [`Self::INTERVAL`] rather than reported here. Its durable symptom is the
+/// per-holder zombie count that `cagents diagnostics` observes from outside
+/// the process.
 struct OrphanSweep {
-    due: Instant,
+    children: Option<ChildEvents>,
+    /// When the next sweep is due without a child exit.
+    due: Option<Instant>,
 }
 impl OrphanSweep {
     const INTERVAL: Duration = Duration::from_millis(250);
     /// Bounds one pass so a large backlog cannot stall the serve loop.
     const LIMIT: usize = 4096;
 
-    fn new() -> Self {
+    fn new(children: Option<ChildEvents>) -> Self {
         Self {
-            due: Instant::now(),
+            children,
+            // Children may have exited before the descriptor existed.
+            due: Some(Instant::now()),
         }
     }
 
-    fn until_due(&self) -> Duration {
-        self.due.saturating_duration_since(Instant::now())
+    /// Readable when a child has exited.
+    fn wakeup(&self) -> Option<RawFd> {
+        self.children.as_ref().map(ChildEvents::fd)
     }
 
-    fn run_if_due(&mut self) {
-        if Instant::now() >= self.due {
+    /// How long the serve loop may wait before the next sweep, if it is
+    /// waiting on [`Self::wakeup`] instead.
+    fn until_due(&self) -> Option<Duration> {
+        self.due
+            .map(|due| due.saturating_duration_since(Instant::now()))
+    }
+
+    fn run_if_due(&mut self, woken: bool) {
+        if woken
+            && let Some(children) = &self.children
+            && children.drain().is_err()
+        {
+            // An unreadable descriptor cannot be trusted to wake us again.
+            self.children = None;
+        }
+        if woken || self.due.is_some_and(|due| Instant::now() >= due) {
             self.run();
         }
     }
 
     fn run(&mut self) {
-        self.due = Instant::now() + Self::INTERVAL;
-        if let Ok(sweep) = crate::daemon::adopted_orphans::reap_exited(Self::LIMIT)
-            && sweep.truncated
-        {
-            // Continue the backlog on the next serve iteration.
-            self.due = Instant::now();
+        self.due = self
+            .children
+            .is_none()
+            .then(|| Instant::now() + Self::INTERVAL);
+        match crate::daemon::adopted_orphans::reap_exited(Self::LIMIT) {
+            // Continue the backlog on the next serve iteration: its exits
+            // were already read from the descriptor.
+            Ok(sweep) if sweep.truncated => self.due = Some(Instant::now()),
+            Ok(_) => {}
+            // No further exit may come to retry it.
+            Err(_) => self.due = Some(Instant::now() + Self::INTERVAL),
         }
     }
 }
 /// Only after the actor's ChildGuard has joined: no competing provider reaper
 /// remains. A child PID cannot be recycled until this sole reaper consumes it.
-fn reap_orphans() -> Result<(), String> {
+/// Ends what the provider left under this helper as `detached` decides:
+/// - `Stop` stops every child and returns once none remain;
+/// - `Spare` reaps the children that have exited and signals none, as a
+///   terminal leaves what an exited CLI left running. The provider itself is
+///   gone: the actor's ChildGuard has stopped and reaped it.
+fn reap_orphans(detached: DetachedWork) -> Result<(), String> {
+    if detached == DetachedWork::Spare {
+        return crate::daemon::adopted_orphans::reap_exited(usize::MAX)
+            .map(drop)
+            .map_err(|error| error.to_string());
+    }
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let children =
@@ -3732,21 +4097,32 @@ pub(crate) fn run_helper_if_requested() -> Option<Result<(), String>> {
         }
         // Every child spawned from here on must register with the sweep.
         crate::daemon::adopted_orphans::become_sweeper();
+        // Before any other thread starts, so all of them inherit the blocked
+        // SIGCHLD that wakes the sweep. Without it the sweep polls instead.
+        let children = ChildEvents::new().ok();
+        let mut detached = DetachedWork::Stop;
         let result = (|| {
             crate::daemon::seal_inherited_descriptors().map_err(|error| error.to_string())?;
-            let server = Server::start_after_scope_enrollment(
+            let mut server = Server::start_after_scope_enrollment(
                 startup,
                 &control,
                 crate::daemon::process_scope::enroll_holder,
             )?;
-            server.serve(control.try_clone().map_err(|error| error.to_string())?)
+            let served = server.serve(
+                control.try_clone().map_err(|error| error.to_string())?,
+                children,
+            );
+            detached = server.detached;
+            served
         })();
         if let Err(error) = result {
             let _ = send(&control, &Err::<Attached, _>(error), TIMEOUT);
         }
         // Exit status 73 means cleanup is proved, even when startup itself was
         // refused. Failure to reap cannot be reported as successful teardown.
-        reap_orphans()
+        // What the provider left running when a close let it quit as its CLI
+        // does is the user's, not the provider's.
+        reap_orphans(detached)
     })())
 }
 fn validate_control_descriptor(fd: RawFd) -> Result<(), String> {
@@ -3977,7 +4353,10 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}
         }
         let mut serving = Serving {
             parent: Some(parent),
-            worker: Some(thread::spawn(move || server.serve(control))),
+            worker: Some(thread::spawn(move || {
+                let mut server = server;
+                server.serve(control, None)
+            })),
         };
         let attached: Result<Attached, String> =
             receive(serving.parent.as_ref().unwrap(), TIMEOUT).unwrap();
@@ -3990,7 +4369,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}
     }
 
     #[test]
-    fn serving_actor_reaps_exited_adopted_orphans_without_touching_live_ones() {
+    fn serving_actor_reaps_adopted_orphans_as_they_exit_and_sleeps_while_idle() {
         if crate::retained_fixture::run_isolated() {
             return;
         }
@@ -3998,7 +4377,17 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}
         if std::env::var_os(CHILD).is_none() {
             let root = tempfile::tempdir_in("/var/tmp").unwrap();
             let test = thread::current().name().unwrap().to_owned();
-            let output = ChildCommand::new(std::env::current_exe().unwrap())
+            let mut command = ChildCommand::new(std::env::current_exe().unwrap());
+            // As in the helper, every thread blocks SIGCHLD before the sweep
+            // reads it, including libtest's own.
+            // SAFETY: the hook runs only async-signal-safe sigprocmask.
+            unsafe {
+                std::os::unix::process::CommandExt::pre_exec(
+                    &mut command,
+                    crate::daemon::child_events::block_sigchld_for_exec,
+                );
+            }
+            let output = command
                 .args(["--exact", &test, "--nocapture"])
                 .env(CHILD, "1")
                 .env("XDG_RUNTIME_DIR", root.path())
@@ -4097,7 +4486,16 @@ while IFS= read -r frame; do :; done
         let server = Server::start_after_scope_enrollment(startup, &control, || Ok(())).unwrap();
         let provider = server.identity.record.root.clone();
         let mut parent = Some(parent);
-        let worker = thread::spawn(move || server.serve(control));
+        let (serving, serving_thread) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            // SAFETY: gettid has no preconditions.
+            serving.send(unsafe { libc::gettid() }).unwrap();
+            // Its owner's thread creates and drops it, as the helper's does.
+            let children = ChildEvents::new().expect("every fixture thread blocks SIGCHLD");
+            let mut server = server;
+            server.serve(control, Some(children))
+        });
+        let serving_thread = serving_thread.recv().unwrap();
         let attached: Result<Attached, String> =
             receive(parent.as_ref().unwrap(), TIMEOUT).unwrap();
         attached.unwrap();
@@ -4128,6 +4526,41 @@ while IFS= read -r frame; do :; done
         }
         assert!(provider.is_current(), "the provider must keep running");
         assert!(!worker.is_finished(), "the actor must keep serving");
+        // Idle, the actor sleeps until a child exits or a client calls: its
+        // serve loop and chat worker arm no timer.
+        let switches = || {
+            let mut total = 0;
+            for task in std::fs::read_dir("/proc/self/task").unwrap() {
+                let task = task.unwrap().path();
+                let name = std::fs::read_to_string(task.join("comm")).unwrap_or_default();
+                let tid: i32 = task.file_name().unwrap().to_str().unwrap().parse().unwrap();
+                if tid != serving_thread && name.trim() != "cagents-chat" {
+                    continue;
+                }
+                let status = std::fs::read_to_string(task.join("status")).unwrap();
+                total += status
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("voluntary_ctxt_switches:"))
+                    .map(|count| count.trim().parse::<u64>().unwrap())
+                    .sum::<u64>();
+            }
+            total
+        };
+        // Only the provider and the live daemon remain to exit.
+        let settle = Instant::now() + Duration::from_secs(5);
+        while crate::daemon::owned_children::direct_children()
+            .unwrap()
+            .len()
+            > 2
+        {
+            assert!(Instant::now() < settle, "short-lived tools did not finish");
+            thread::sleep(Duration::from_millis(20));
+        }
+        let before = switches();
+        thread::sleep(Duration::from_secs(2));
+        let woken = switches() - before;
+        // A 250 ms sweep timer alone woke the serve loop eight times here.
+        assert!(woken <= 1, "an idle actor woke {woken} times in 2 s");
         // The live adopted daemon is still this actor's unsignalled child.
         assert_eq!(state(live), Some('S'));
         assert!(
@@ -4139,6 +4572,45 @@ while IFS= read -r frame; do :; done
         parent.take();
         worker.join().unwrap().unwrap();
         assert!(!provider.is_current(), "original provider must be reaped");
+    }
+
+    #[test]
+    fn an_ordinary_close_leaves_what_the_provider_leaves() {
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
+        use crate::daemon::owned_children::tests as children;
+        // This isolated process stands in for the helper, which owns its
+        // provider through a registration and adopts what the provider's
+        // commands detach.
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let (mut provider, registration) = crate::daemon::adopted_orphans::spawn_owned(
+            &mut children::provider_with_detached_work(root.path()),
+        )
+        .unwrap();
+        let work = children::detached_work(root.path());
+        // As the actor's ChildGuard ends the provider, then the close's reap.
+        unsafe { libc::kill(-(provider.id() as i32), libc::SIGTERM) };
+        provider.wait().unwrap();
+        drop(registration);
+        reap_orphans(DetachedWork::Spare).unwrap();
+        assert!(
+            children::ends(work.running, || {
+                reap_orphans(DetachedWork::Spare).unwrap();
+            }),
+            "the provider stopped its own command as it quit, and it is reaped"
+        );
+        for pid in [work.detached, work.left] {
+            assert!(
+                children::alive(pid) && children::parent(pid) == Some(std::process::id() as i32),
+                "what the provider leaves running keeps running"
+            );
+        }
+        // A close that stops everything, as for an unattended agent, reaps
+        // them too.
+        reap_orphans(DetachedWork::Stop).unwrap();
+        assert!(!children::exists(work.detached) && !children::exists(work.left));
     }
 
     thread_local! {
@@ -4259,6 +4731,10 @@ while IFS= read -r frame; do :; done
                 installed: true,
                 journal: Arc::new(Mutex::new(Journal::open(&journal_directory).unwrap())),
                 changed: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                watcher: Arc::new(push::Watcher::default()),
+                state_reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                #[cfg(test)]
+                fail_state_reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 prompt_revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 pending: Vec::new(),
                 account_reports: Arc::new(Mutex::new(Vec::new())),
@@ -4272,6 +4748,7 @@ while IFS= read -r frame; do :; done
                 session_stopping: false,
                 attachment_preserved: false,
                 close_only: false,
+                detached: DetachedWork::Stop,
             },
             root,
         )
@@ -4938,6 +5415,80 @@ exec /bin/sleep 60
         }
     }
     #[test]
+    fn courier_input_completion_persists_uncertainty_and_retains_affected_runs() {
+        for uncertain in [false, true] {
+            let mut fixture = resident_fixture();
+            let server = &mut fixture.server;
+            let identity = InputIdentity {
+                sequence: 1,
+                id: uuid::Uuid::new_v4(),
+                hash: [8; 32],
+            };
+            let run = crate::model::RunId::new();
+            server
+                .journal
+                .lock()
+                .unwrap()
+                .admit_with_run(&identity, Some(run))
+                .unwrap();
+            let (reply, response) = crossbeam_channel::bounded(1);
+            let error = "fixture input failure".to_owned();
+            reply
+                .send(Err(if uncertain {
+                    Rejection::Unacknowledged(error.clone())
+                } else {
+                    Rejection::Refused(error.clone())
+                }))
+                .unwrap();
+            server.pending.push((
+                identity.clone(),
+                response,
+                Some((
+                    run,
+                    Arc::new(std::sync::atomic::AtomicU8::new(if uncertain {
+                        2
+                    } else {
+                        1
+                    })),
+                )),
+            ));
+            server.finish_inputs();
+            assert!(server.pending.is_empty());
+            let journal = server.journal.lock().unwrap();
+            let receipt = journal.input(&identity).unwrap().unwrap();
+            assert_eq!(
+                receipt.state,
+                if uncertain {
+                    InputState::Unknown(error)
+                } else {
+                    InputState::Acknowledged(Err(error))
+                }
+            );
+            assert_eq!(
+                journal.retained_runs().unwrap(),
+                if uncertain { vec![run] } else { vec![] }
+            );
+            // Helpers keep their Journal for one lifetime. An independent
+            // read-only database connection checks the committed receipt;
+            // reopening the actor Journal itself is intentionally refused.
+            let persisted = rusqlite::Connection::open_with_flags(
+                fixture._root.path().join("journal/actor-journal.sqlite"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let bytes: Vec<u8> = persisted
+                .query_row(
+                    "SELECT state FROM inputs WHERE sequence=?1",
+                    [identity.sequence],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let state: InputState = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(state, receipt.state);
+        }
+    }
+
+    #[test]
     fn input_refusal_and_storage_failure_publish_new_resident_revisions() {
         for storage_failure in [false, true] {
             let mut fixture = resident_fixture();
@@ -4958,7 +5509,9 @@ exec /bin/sleep 60
             let before = server.resident().unwrap();
             assert_eq!(before.retained_runs, vec![run]);
             let (reply, response) = crossbeam_channel::bounded(1);
-            reply.send(Err("fixture refusal".to_owned())).unwrap();
+            reply
+                .send(Err(Rejection::Refused("fixture refusal".to_owned())))
+                .unwrap();
             server.pending.push((
                 identity,
                 response,
@@ -5034,6 +5587,27 @@ exec /bin/sleep 60
         let before = next.prompt_revision;
         notify(Update::Presentation);
         assert_eq!(fixture.server.resident().unwrap().prompt_revision, before);
+    }
+    #[test]
+    fn a_helper_that_predates_named_holds_still_reports_its_background_work() {
+        let mut resident = serde_json::to_value(RemoteActor::fixture().state().as_ref()).unwrap();
+        let fields = resident.as_object_mut().unwrap();
+        assert!(fields.remove("work_hold").is_some());
+        fields.insert("background_subagents".into(), json!(["toolu_old"]));
+        let older: Resident = serde_json::from_value(resident).unwrap();
+        let hold = older.work_hold();
+        assert!(!hold.turn);
+        assert_eq!(
+            hold.subagents,
+            [chat::HeldSubagent {
+                name: String::new(),
+                waiting: false
+            }]
+        );
+        assert_eq!(
+            hold.subagents().detail(),
+            "1 background subagent is still running."
+        );
     }
     #[test]
     fn protocol_one_attachment_is_refused_without_starting_or_retiring_its_owner() {
@@ -5354,17 +5928,22 @@ exec /bin/sleep 60
             let request: Invocation = receive(&control, TIMEOUT).unwrap();
             assert_eq!(request.method, "resolve_source");
             assert_eq!(request.epoch, Some(epoch));
-            let _ = wait.recv_timeout(Duration::from_secs(2));
+            // Stall until the client has returned: a client that ignored its
+            // deadline would never return.
+            let _ = wait.recv();
         });
         let started = Instant::now();
-        let error = actor
-            .resolve_source_until(&source, started + Duration::from_millis(40))
-            .unwrap_err();
-        let elapsed = started.elapsed();
+        let (actor, error) = crate::test_timing::returns("source resolution", move || {
+            let error = actor
+                .resolve_source_until(&source, Instant::now() + Duration::from_millis(40))
+                .unwrap_err();
+            (actor, error)
+        });
         let _ = release.send(());
         peer.join().unwrap();
         assert!(error.contains("deadline"), "{error}");
-        assert!(elapsed < Duration::from_millis(250));
+        // Sooner than the socket timeout an ignored deadline would fall back to.
+        assert!(started.elapsed() < TIMEOUT);
         assert_eq!(actor.0.epoch, epoch);
         assert!(actor.pending_inputs().is_empty());
     }
@@ -5479,25 +6058,27 @@ exec /bin/sleep 60
             assert_eq!(request.method, "inspect");
             assert!(request.epoch.is_none());
             // SO_PEERCRED has identified this exact Record.holder process, but
-            // its inspection response stalls. The client must still return.
-            let _ = wait.recv_timeout(Duration::from_secs(2));
+            // its inspection response stalls until the client has returned.
+            let _ = wait.recv();
         });
         let epoch = fixture.server.epoch;
         let source = fixture.server.source.clone();
+        let proof = fixture.server.proof.clone();
         let started = Instant::now();
-        let error = RemoteActor::inspect_at_until(
-            &record,
-            fixture.server.proof.clone(),
-            &socket,
-            started + Duration::from_millis(40),
-        )
-        .err()
-        .expect("stalled inspection must time out");
-        let elapsed = started.elapsed();
+        let error = crate::test_timing::returns("the stalled inspection", move || {
+            RemoteActor::inspect_at_until(
+                &record,
+                proof,
+                &socket,
+                Instant::now() + Duration::from_millis(40),
+            )
+            .err()
+            .expect("stalled inspection must time out")
+        });
         let _ = release.send(());
         peer.join().unwrap();
-        assert!(error.contains("deadline"));
-        assert!(elapsed < Duration::from_millis(250));
+        assert!(error.contains("deadline"), "{error}");
+        assert!(started.elapsed() < TIMEOUT);
         assert_eq!(fixture.server.epoch, epoch);
         assert_eq!(fixture.server.source, source);
         assert!(!fixture.server.actor.is_completed());
@@ -5863,6 +6444,75 @@ exec /bin/sleep 60
         assert_eq!(actor.snapshot(None), Some(final_snapshot));
     }
     #[test]
+    fn retained_active_model_status_rejects_equal_clock_stale_revisions() {
+        let mut actor = RemoteActor::fixture();
+        let (published, publications) = crossbeam_channel::unbounded();
+        Arc::get_mut(&mut actor.0).unwrap().notify = Arc::new(move |update| {
+            let _ = published.send(update);
+        });
+        let model = |name: &str| chat::ActiveModel {
+            id: name.into(),
+            label: name.into(),
+            reasoning: None,
+            default_reasoning: None,
+            aliases: Vec::new(),
+        };
+        let mut older = actor.state().as_ref().clone();
+        older.active_model_revision = 5;
+        older.active_model = Some(model("older"));
+        let mut newer = older.clone();
+        newer.active_model_revision = 6;
+        newer.active_model = Some(model("newer"));
+        assert_eq!(older.changed, newer.changed);
+        assert_eq!(older.generation, newer.generation);
+        assert!(actor.publish_resident(older.clone()));
+        assert!(actor.publish_resident(newer.clone()));
+        for revision in [5, 6] {
+            assert!(matches!(publications.recv_timeout(TIMEOUT).unwrap(),
+                Update::ActiveModel { revision: actual, .. } if actual == revision));
+        }
+        assert!(!actor.publish_resident(older.clone()));
+        assert!(publications.try_recv().is_err());
+        let attached = actor.state();
+        assert_eq!(attached.active_model_revision, 6);
+        assert_eq!(attached.active_model, newer.active_model);
+        actor.publish_closed_inner(
+            Snapshot {
+                exited: true,
+                ..Snapshot::default()
+            },
+            Some(older),
+        );
+        let closed = actor.state();
+        assert!(closed.completed);
+        assert_eq!(closed.active_model_revision, 6);
+        assert_eq!(closed.active_model, newer.active_model);
+    }
+
+    #[test]
+    fn confirmation_wakes_durable_broker_without_semantic_outcomes() {
+        let mut actor = RemoteActor::fixture();
+        let (sent, received) = crossbeam_channel::unbounded();
+        Arc::get_mut(&mut actor.0).unwrap().notify = Arc::new(move |update| {
+            sent.send(update).unwrap();
+        });
+        let mut confirmed = actor.state().as_ref().clone();
+        confirmed.confirmed_session = Some(uuid::Uuid::new_v4().to_string());
+        assert_eq!(confirmed.outbox_latest, confirmed.outbox_ack);
+        assert!(actor.publish_resident(confirmed.clone()));
+        assert!(
+            received
+                .try_iter()
+                .any(|update| matches!(update, Update::RetainedOutcomes))
+        );
+        assert!(actor.publish_resident(confirmed));
+        assert!(
+            received.try_iter().next().is_none(),
+            "unchanged metadata must not churn the broker"
+        );
+    }
+
+    #[test]
     fn synchronous_refresh_publishes_all_transitions_and_rejects_a_delayed_observer_response() {
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
         let socket = root.path().join("refresh.sock");
@@ -5891,6 +6541,20 @@ exec /bin/sleep 60
             observed_at: 123,
         };
         next.account_reports.push(usage.clone());
+        let addresses = vec![chat::AgentAddress {
+            address: "a1892b93e88999a7d".into(),
+            subagent: "toolu_relocate".into(),
+        }];
+        next.agent_addresses = addresses.clone();
+        // A helper that predates them reports none.
+        let mut predating = serde_json::to_value(&old).unwrap();
+        predating.as_object_mut().unwrap().remove("agent_addresses");
+        assert!(
+            serde_json::from_value::<Resident>(predating)
+                .unwrap()
+                .agent_addresses
+                .is_empty()
+        );
         let delayed = old.clone();
         let expected = vec![
             Update::Observed {
@@ -5905,12 +6569,18 @@ exec /bin/sleep 60
             Update::PromptAvailable,
             Update::RetainedOutcomes,
             usage,
+            Update::AgentAddresses(addresses),
         ];
         let (observed_poll, poll_started) = crossbeam_channel::bounded(1);
         let (release, wait_release) = crossbeam_channel::bounded(1);
         let (processed, poll_processed) = crossbeam_channel::bounded(1);
         let (stop, stopped) = crossbeam_channel::bounded(1);
         let peer = thread::spawn(move || {
+            // This ordering fixture models an older helper without readiness.
+            let (watch, _) = listener.accept().unwrap();
+            let request: Invocation = receive(&watch, TIMEOUT).unwrap();
+            assert_eq!(request.method, "watch");
+            send(&watch, &Err::<Value, _>(UNKNOWN_METHOD.to_owned()), TIMEOUT).unwrap();
             // Hold the observer's response to force refresh_state to publish
             // the new resident before that observer returns an unchanged poll.
             let (observer, _) = listener.accept().unwrap();
@@ -6216,14 +6886,10 @@ exec /bin/sleep 60
             retransmit(&actor).is_none(),
             "an older helper is not asked again"
         );
-        let started = Instant::now();
+        // Refused at once: waiting on the fence would end in UNSETTLED_INPUT.
         assert_eq!(
             actor.enqueue(None, Command::Refresh).unwrap_err(),
             UNSETTLEABLE_INPUT
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "refused without waiting"
         );
         // A receipt the helper reports on its own still lifts the fence.
         actor.apply_receipts(&[InputReceipt {
@@ -6383,14 +7049,10 @@ exec /bin/sleep 60
         });
         assert_eq!(state(&actor), (true, 0, true, true), "refused, still asked");
         assert!(delay(&actor) > TIMEOUT, "asked less often once overdue");
-        let started = Instant::now();
+        // Refused at once: waiting on the fence would end in UNSETTLED_INPUT.
         assert_eq!(
             actor.enqueue(None, Command::Refresh).unwrap_err(),
             UNSETTLEABLE_INPUT
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "refused at once"
         );
         // A helper that returns still settles it, which lifts the fence.
         settle_now(&actor);
@@ -6459,7 +7121,12 @@ exec /bin/sleep 60
                             .lock()
                             .unwrap()
                             .push((request.method.clone(), request.args.clone()));
-                        let response = fixture.server.invoke(request);
+                        // This deliberately models a pre-readiness protocol-2 helper.
+                        let response = if request.method == "watch" {
+                            Err(UNKNOWN_METHOD.into())
+                        } else {
+                            fixture.server.invoke(request)
+                        };
                         let _ = send(&control, &response, TIMEOUT);
                     }
                 })
@@ -6500,6 +7167,7 @@ exec /bin/sleep 60
         fn drop(&mut self) {
             self.actor.0.stop.store(true, Ordering::Release);
             self.stop.store(true, Ordering::Release);
+            self.actor.0.wake.notify();
             if let Some(helper) = self.helper.take() {
                 let _ = helper.join();
             }
@@ -6811,6 +7479,9 @@ done"#;
         // Preserve itself fences new helper input, so manufacturing a command
         // after preserve would test a forbidden ordering rather than a lost ACK.
         actor.0.stop.store(true, Ordering::Release);
+        // An idle pump waits for readiness without a timer. Wake this exact
+        // observer before joining it, as production preservation does.
+        actor.0.wake.notify();
         let pump = actor.0.worker.lock().unwrap().take();
         pump.expect("metadata pump").join().unwrap();
         let identity = InputIdentity {
@@ -7095,3 +7766,13 @@ mod connections;
 #[cfg(test)]
 #[path = "transport_connection_tests.rs"]
 mod connection_tests;
+
+#[cfg(test)]
+#[path = "transport_push_tests.rs"]
+mod push_tests;
+
+#[path = "transport_push.rs"]
+mod push;
+
+#[path = "transport_binary.rs"]
+mod binary;

@@ -13,17 +13,18 @@ use serde::{Deserialize, Serialize};
 use crate::model::{BootId, TerminalId};
 
 mod connection;
+#[cfg(any(feature = "host", test))]
 pub(crate) use connection::connect_until;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum Kind {
+pub enum Kind {
     #[default]
     Terminal,
     Native,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct Process {
+pub struct Process {
     pub pid: i32,
     pub start: u64,
 }
@@ -59,7 +60,7 @@ impl Process {
 
 /// A process reaped between opening and reading its stat file fails the read
 /// with ESRCH. It is as absent as one whose entry is already gone.
-fn exited_as_absent(error: io::Error) -> io::Error {
+pub(crate) fn exited_as_absent(error: io::Error) -> io::Error {
     if error.raw_os_error() == Some(libc::ESRCH) {
         io::Error::new(io::ErrorKind::NotFound, error)
     } else {
@@ -79,8 +80,8 @@ pub(crate) struct BuildIdentity {
 impl BuildIdentity {
     pub(crate) fn current(kind: Kind) -> Self {
         Self {
-            version: crate::VERSION.into(),
-            commit: crate::VERSION
+            version: crate::version().into(),
+            commit: crate::version()
                 .split("+local.")
                 .nth(1)
                 .and_then(|metadata| metadata.split('.').next())
@@ -232,7 +233,7 @@ pub(crate) fn socket_fits(path: &Path) -> bool {
     path.as_os_str().as_bytes().len() < capacity
 }
 
-fn with_socket_address<T>(
+pub(crate) fn with_socket_address<T>(
     path: &Path,
     operation: impl FnOnce(&Path) -> io::Result<T>,
 ) -> io::Result<T> {
@@ -292,7 +293,7 @@ pub(crate) fn connect(path: &Path) -> io::Result<std::os::unix::net::UnixStream>
 impl Record {
     pub(crate) fn is_outdated(&self) -> bool {
         self.build.as_ref().is_none_or(|build| {
-            build.version != crate::VERSION
+            build.version != crate::version()
                 || (self.kind == Kind::Native
                     && !build
                         .capabilities
@@ -312,11 +313,12 @@ impl Record {
         let mut children = std::collections::BTreeSet::new();
         for task in fs::read_dir(format!("/proc/{}/task", self.holder.pid))? {
             let task = task?;
-            let raw = match fs::read_to_string(task.path().join("children")) {
-                Ok(raw) => raw,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
-            };
+            let raw =
+                match fs::read_to_string(task.path().join("children")).map_err(exited_as_absent) {
+                    Ok(raw) => raw,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error),
+                };
             children.extend(
                 raw.split_whitespace()
                     .filter_map(|pid| pid.parse::<i32>().ok()),
@@ -485,6 +487,21 @@ pub(crate) fn recovery_candidate(socket: &Path, kind: Kind) -> Result<Option<Rec
     evidence_inner(socket, kind, true)
 }
 
+/// Read execution evidence without granting discovery or adoption authority.
+/// Old boots and foreign holders still describe execution; callers must check
+/// the boot before interpreting process identities that the kernel can reuse.
+pub(crate) fn execution_record(socket: &Path) -> io::Result<Option<Record>> {
+    let record = match read(&socket.with_extension("json")) {
+        Ok(record) => record,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if socket.file_name() != Some(std::ffi::OsStr::new(&record.terminal.to_string())) {
+        return Err(io::Error::other("Holder record names another pane"));
+    }
+    Ok(Some(record))
+}
+
 fn evidence_inner(socket: &Path, kind: Kind, recovery: bool) -> Result<Option<Record>, String> {
     let path = socket.with_extension("json");
     let record = match read(&path) {
@@ -555,7 +572,7 @@ pub(crate) fn observed(kind: Kind) -> io::Result<Vec<Record>> {
 /// another version, application or kind can't be adopted, but it is still alive.
 /// A record that can't be read is an error, not an absence.
 #[cfg(feature = "ui")]
-pub(crate) fn holding_process(terminal: TerminalId, kind: Kind) -> io::Result<Option<i32>> {
+pub fn holding_process(terminal: TerminalId, kind: Kind) -> io::Result<Option<i32>> {
     let directory = directory(kind).map_err(io::Error::other)?;
     crate::secure_file::reject_symlink_components(&directory)?;
     holding_process_in(&directory, terminal)
@@ -571,6 +588,20 @@ fn holding_process_in(directory: &Path, terminal: TerminalId) -> io::Result<Opti
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+/// Whether nothing of a dead holder's execution is left. A native holder's
+/// record is the only evidence of which session and process group its
+/// conversation ran in, and its Close needs that evidence for as long as a
+/// provider or tool of it runs on (see [`crate::daemon::lost_processes`]).
+fn ended_with_holder(record: &Record) -> bool {
+    #[cfg(feature = "host")]
+    if record.kind == Kind::Native {
+        return crate::daemon::lost_processes::census(&record.holder, &record.root)
+            .is_ok_and(|left| left.iter().all(|survivor| survivor.zombie));
+    }
+    let _ = record;
+    true
 }
 
 pub(crate) fn discover(directory: &Path, boot: &BootId, kind: Kind) -> Result<Vec<Record>, String> {
@@ -624,7 +655,7 @@ fn discover_inner(
         if !record.holder.is_current() {
             // Candidate intake grants no mutation authority over the other
             // package's evidence, including an unresolved orphan root.
-            if record.application == crate::instance::APPLICATION_ID {
+            if record.application == crate::instance::APPLICATION_ID && ended_with_holder(&record) {
                 record.remove(directory);
             }
             continue;

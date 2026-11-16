@@ -6,13 +6,23 @@ host in CAGENTS_BUILD_REMOTE, unless that is `local` or names this host. A
 command that compiles leases a build slot there, copies the
 checkout's sources into it, and runs Cargo there with its output streamed
 back and its exit status kept. What a caller here expects from it comes back:
-executables, documentation, timing reports, artifact directories, fixes to
-the sources, and Cargo's messages with their paths turned into this host's.
+executables, documentation, timing reports, artifact directories, what the
+command wrote in the sources (Cargo's fixes, a test's recording), and Cargo's
+messages with their paths turned into this host's.
 `run` builds there and runs the program here.
 
 Each slot's checkout path never changes, so every worktree built in a slot
 reuses what the previous one compiled there, and the slot a worktree used
-last is preferred. While the host is unreachable, does not answer or is low
+last is preferred. Before each build, its lease bounds the slot's build
+output: it keeps the incremental compilation state of the crates the slot
+compiled most recently, within CAGENTS_BUILD_REMOTE_INCREMENTAL_GIB, and
+every few hours drops compiled units no build has looked at for days. Below
+twice the host's floor it keeps a quarter as much, in every slot no lease
+holds as well. `--trim-slots FLOOR_GIB [--wait]` does the same to this
+host's own idle slots for scripts/build-disk-guard. With
+CAGENTS_BUILD_REMOTE_LOOPBACK=1, the build host's own
+commands build in its slots too, as another host's would, through a local
+stand-in for ssh. While the host is unreachable, does not answer or is low
 on disk, the command waits for it, saying so once a minute, within the gate's
 admission budget; it never builds here instead. Cargo commands that do not
 compile run here directly. A command that compiles but cannot run there
@@ -20,11 +30,14 @@ faithfully is refused with the reason.
 """
 
 import base64
+import contextlib
 import fcntl
+import filecmp
 import hashlib
 import ipaddress
 import json
 import os
+import pwd
 import queue
 import re
 import resource
@@ -76,12 +89,31 @@ VALUED = {
 # sometimes.
 PATHS = {"--manifest-path", "--lockfile-path", "--target-dir", "--artifact-dir", "--out-dir"}
 # Settings naming a path that only this repository's scripts read, never a
-# build or its tests; they stay here.
-SCRIPT_SETTINGS = {"CAGENTS_ZIG"}
+# build or its tests; they stay here. A development instance's daemon gives
+# CAGENTS_DEVELOPMENT_HOSTED_BY, runtime directories on this host, to the
+# terminals and agents it hosts. scripts/native-evidence reads its own, such
+# as the CAGENTS_EVIDENCE_TASK its users export, whose builds come here.
+SCRIPT_SETTINGS = {"CAGENTS_ZIG", "CAGENTS_DEVELOPMENT_HOSTED_BY"}
+SCRIPT_PREFIXES = ("CAGENTS_EVIDENCE_",)
 RUN_MARKER = "cargo-offload-run "
 # What `--hold` gives the command it runs: the build host, the slot it holds
 # there and the checkout it holds it for, and a lock it keeps while it does.
 HELD = "CAGENTS_BUILD_OFFLOAD_HELD"
+# The most incremental compilation state, in GiB, each slot on the build host
+# keeps unless CAGENTS_BUILD_REMOTE_INCREMENTAL_GIB says otherwise; see
+# INCREMENTAL_BUDGET in the agent.
+INCREMENTAL_GIB = 20
+# Set to 1, the build host's own commands build in its slots rather than
+# here: what they make comes back, and the slots keep the build output.
+LOOPBACK = "CAGENTS_BUILD_REMOTE_LOOPBACK"
+# How `--host` reports a build host that is this one, reached by loopback.
+LOOPBACK_MARK = "\tloopback"
+# The shell a loopback runs commands in, instead of the user's login shell.
+LOOPBACK_SHELL = "CAGENTS_BUILD_REMOTE_LOOPBACK_SHELL"
+# Set beside CAGENTS_BUILD_METADATA, whose value it then owns: an empty one is
+# no metadata, and build.rs leaves the checkout alone. Its own value never
+# changes between commits, so watching it costs build.rs no reruns.
+SUPPLIED = "CAGENTS_BUILD_METADATA_SUPPLIED"
 DIRECTORIES_MARKER = "cargo-offload-directories "
 
 
@@ -309,7 +341,8 @@ def path_settings(environment):
     such as the retained-actor helper the HOST tests execute."""
     return [name for name, value in sorted(environment.items())
             if name.startswith("CAGENTS_") and not name.startswith("CAGENTS_BUILD_")
-            and name not in SCRIPT_SETTINGS and value.startswith(("/", "~"))
+            and name not in SCRIPT_SETTINGS and not name.startswith(SCRIPT_PREFIXES)
+            and value.startswith(("/", "~"))
             and not secret(name)]
 
 
@@ -319,9 +352,11 @@ def inside(path, root):
 
 def build_metadata(root, version, environment):
     """The version stamp build.rs would give this checkout, which the build
-    host's copy, having no Git history, cannot work out itself."""
+    host's copy, having no Git history, cannot work out itself. A value the
+    caller sets is kept, unless a gate set it: then it is the stamp of
+    whatever that gate built, which a process it started has inherited."""
     given = environment.get("CAGENTS_BUILD_METADATA", "").strip()
-    if given:
+    if given and environment.get(SUPPLIED) != "1":
         return given
 
     def git(*arguments):
@@ -339,6 +374,40 @@ def build_metadata(root, version, environment):
     if f"v{version}" in tags and not dirty:
         return None
     return f"local.{sha}.dirty" if dirty else f"local.{sha}"
+
+
+def checkout_stamp(arguments, environment):
+    """The stamp for a build here of the workspace these Cargo arguments name,
+    or None outside a Cargo workspace in a Git checkout, where build.rs
+    decides."""
+    manifest = []
+    for index, argument in enumerate(arguments):
+        if argument == "--":
+            break
+        if argument == "--manifest-path" and index + 1 < len(arguments):
+            manifest = ["--manifest-path", arguments[index + 1]]
+        elif argument.startswith("--manifest-path="):
+            manifest = [argument]
+    try:
+        metadata = subprocess.run(
+            [real_cargo(environment), "metadata", "--format-version", "1", "--no-deps",
+             *manifest], capture_output=True, text=True, env=environment)
+        if metadata.returncode:
+            return None
+        workspace = json.loads(metadata.stdout)
+        root = os.path.realpath(workspace["workspace_root"])
+        package = next((package for package in workspace["packages"]
+                        if os.path.dirname(os.path.realpath(package["manifest_path"])) == root),
+                       None)
+        top = subprocess.run(["git", "-C", root, "rev-parse", "--show-toplevel"],
+                             capture_output=True, text=True,
+                             env=dict(environment, GIT_OPTIONAL_LOCKS="0"))
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if package is None or top.returncode:
+        return None
+    return build_metadata(os.path.realpath(top.stdout.strip()), package["version"],
+                          environment) or ""
 
 
 def uncommitted(top, workspace, environment):
@@ -447,6 +516,65 @@ def is_this_host(host):
     return bool(addresses & (local_addresses() | {"127.0.0.1", "::1"}))
 
 
+# ssh's options that take a value, as `-o NAME=VALUE` does.
+SSH_VALUED = set("BbcDEeFIiJLlmOoPpQRSWw")
+
+
+def loopback_shell(arguments):
+    """Stands in for `ssh [OPTIONS] HOST COMMAND...` to this host. It runs
+    COMMAND as sshd would: in the user's login shell, from the home
+    directory, with only the basics a session starts from (the shell's own
+    configuration adds the rest), so nothing of the caller's build, such as
+    its CARGO_TARGET_DIR, reaches the slot. sshd's SSH_CONNECTION, ~/.ssh/rc
+    and ~/.ssh/environment have no counterpart. A control command (`-O`) has
+    no shared connection to act on.
+
+    The command reads its input through this process, as through an ssh
+    connection: when this ends, even by SIGKILL, the command sees its input
+    close and ends what it started, as the build host's agent does when its
+    caller's connection drops. A shell that does not `exec` its command
+    would otherwise leave that running."""
+    while arguments and arguments[0].startswith("-") and len(arguments[0]) > 1:
+        option = arguments.pop(0)
+        if option[1] == "O":
+            return 0
+        if option[1] in SSH_VALUED and len(option) == 2 and arguments:
+            arguments.pop(0)
+    if len(arguments) < 2:
+        say("loopback: missing host or command")
+        return 2
+    account = pwd.getpwuid(os.getuid())
+    shell = os.environ.get(LOOPBACK_SHELL) or account.pw_shell or "/bin/sh"
+    environment = {"HOME": account.pw_dir, "USER": account.pw_name,
+                   "LOGNAME": account.pw_name, "SHELL": shell,
+                   "PATH": "/usr/local/bin:/usr/bin:/bin"}
+    for name in ("LANG", "LC_ALL", "LC_CTYPE"):
+        if name in os.environ:
+            environment[name] = os.environ[name]
+    runtime = f"/run/user/{os.getuid()}"
+    if os.path.isdir(runtime):
+        environment["XDG_RUNTIME_DIR"] = runtime
+    home = account.pw_dir if os.path.isdir(account.pw_dir) else "/"
+    # ssh passes the command to the shell as one string, its words joined.
+    command = subprocess.Popen([shell, "-c", " ".join(arguments[1:])], env=environment,
+                               cwd=home, stdin=subprocess.PIPE)
+
+    def relay():
+        try:
+            while data := os.read(0, 65536):
+                command.stdin.write(data)
+                command.stdin.flush()
+        except OSError:
+            pass  # The command stopped reading; its status says why.
+        finally:
+            with contextlib.suppress(OSError):
+                command.stdin.close()
+    threading.Thread(target=relay, daemon=True).start()
+    status = command.wait()
+    sys.stdout.flush()
+    os._exit(status if status >= 0 else 128 - status)
+
+
 def resolve(name, found):
     try:
         found.extend(info[4][0] for info in socket.getaddrinfo(name, None))
@@ -463,8 +591,15 @@ def real_cargo(environment):
 # Runs on the build host as `python3 -c REMOTE_AGENT COMMAND ...`. Every
 # command ends with what it started when its standard input closes: the
 # connection to this host dropped or the gate here was cancelled.
+# What runs a build on the build host, sent with each command: build-host and
+# the helpers beside it. The host test helper and its artifact reader travel
+# when this checkout has them.
+TOOLS = ("build-host", "memory-capped")
+OPTIONAL_TOOLS = ("cargo-host-test-helper.py", "cargo_artifacts.py")
+
+
 REMOTE_AGENT = r'''
-import fcntl, hashlib, json, os, re, resource, shutil, signal, stat, subprocess, sys, threading, time
+import base64, fcntl, glob, hashlib, json, os, resource, shutil, signal, stat, subprocess, sys, threading, time
 command, base = sys.argv[1], os.path.expanduser(sys.argv[2])
 DIRECTORIES_MARKER = "cargo-offload-directories "
 
@@ -556,75 +691,362 @@ def clear(root):
 
 
 GIB = 2**30
-# A build whose cost is unknown, and a slot leased without one, is priced as
-# the largest: a UI link, as scripts/cargo-gate measures it.
-LARGEST = 9 * GIB
-# Memory pressure (`some avg10` in /proc/pressure/memory, a percentage) at
-# which a build waits rather than start beside others: tasks are already
-# stalling on reclaim.
-MEMORY_PRESSURE_LIMIT = 10
-# The least any build is priced at: even a check of one crate runs rustc and
-# Cargo beside the build's other processes.
-LEAST = 2 * GIB
-# CPU pressure (`some avg10` in /proc/pressure/cpu) at which a build waits
-# rather than start beside others: runnable tasks already wait this share of
-# the time, so another build would only slow the running ones.
-CPU_PRESSURE_LIMIT = 40
 # What a further slot's build output is expected to take on disk, beyond the
 # floor the host keeps free, before one is made. The variable is for tests
 # standing in for the build host; ssh does not pass it on.
 SLOT_DISK = int(os.environ.get("CAGENTS_OFFLOAD_SLOT_DISK_BYTES") or 50 * GIB)
-# Where memory and CPU figures are read. This too is for tests, whose results
-# must not depend on how busy the host running them is.
-FIGURES = os.environ.get("CAGENTS_OFFLOAD_FIGURES") or "/proc"
 # How long a new slot is taken to be filling to that size.
 SLOT_FILLS = 12 * 3600
+# The most incremental compilation state a slot keeps, unless its lease names
+# another amount. Each feature lane, profile and kind of target of the large
+# `cagents` crate keeps a session of 1-6 GiB, and slots kept 40-60 GiB of
+# them, beside the 20-30 GiB their compiled dependencies take. Rustc remakes
+# an evicted session, at the cost of that crate's next build being a full one.
+INCREMENTAL_BUDGET = 20 * GIB  # INCREMENTAL_GIB on the calling side
+# Below twice the floor, a slot keeps this share of it.
+PRESSED_SHARE = 4
+# A compiled unit whose fingerprint no build has read for this long is
+# removed, and Cargo builds it again if a build needs it: old versions and
+# feature sets otherwise stay for good. Not where access times are not kept.
+DEPENDENCY_IDLE = 3 * 86400
+# How often a slot's compiled dependencies are looked through for those, unless
+# the disk is below twice the floor.
+DEPENDENCY_SWEEPS = 6 * 3600
 
 
-def available_memory():
-    try:
-        with open(f"{FIGURES}/meminfo") as file:
-            for line in file:
-                if line.startswith("MemAvailable:"):
-                    return int(line.split()[1]) * 1024
-    except (OSError, ValueError, IndexError):
-        pass
-    return None
+def free_space(path):
+    """The bytes free to this user on the file system holding `path`."""
+    space = os.statvfs(path)
+    return space.f_bavail * space.f_frsize
 
 
-def memory_pressure(resource="memory"):
-    try:
-        with open(f"{FIGURES}/pressure/{resource}") as file:
-            for line in file:
-                if line.startswith("some "):
-                    return float(line.split("avg10=")[1].split()[0])
-    except (OSError, ValueError, IndexError):
-        pass
-    return None
+def pressure_floor(path, floor):
+    """The free space on the file system holding `path` below which slots
+    keep less: twice the larger of `floor` and the floor scripts/build-disk-guard
+    keeps there by default, 5% of the file system and at most 64 GiB."""
+    space = os.statvfs(path)
+    return 2 * max(floor, min(64 * GIB, space.f_blocks * space.f_frsize // 20))
 
 
-def resident(roots):
-    """The resident memory of each process tree rooted at a pid in `roots`."""
-    parent, size = {}, {}
-    page = os.sysconf("SC_PAGE_SIZE")
-    for name in os.listdir("/proc"):
-        if not name.isdigit():
+def target_directories(slot, pattern):
+    """The directories `pattern` names in each profile of the slot's
+    target, with or without a `--target` triple: `<profile>/<pattern>` and
+    `<triple>/<profile>/<pattern>`."""
+    target = glob.escape(os.path.join(slot, "src", "target"))
+    return sorted(path for depth in ("*", "*/*")
+                  for path in glob.glob(os.path.join(target, depth, pattern))
+                  if os.path.isdir(path) and not os.path.islink(path))
+
+
+def tree_size(path, seen):
+    """The bytes the files under `path` hold on disk, counting each inode
+    in `seen` once: rustc hard-links a session's files into the next."""
+    size = 0
+    for directory, names, files in os.walk(path):
+        for name in files + names:
+            try:
+                status = os.lstat(os.path.join(directory, name))
+            except OSError:
+                continue
+            if (status.st_dev, status.st_ino) not in seen:
+                seen.add((status.st_dev, status.st_ino))
+                size += status.st_blocks * 512
+    return size
+
+
+def in_use(crate):
+    """Whether a rustc holds one of the sessions in the incremental
+    directory `crate`: it holds an flock(2) on the session's lock file for
+    as long as it compiles the crate."""
+    for name in os.listdir(crate):
+        if not (name.startswith("s-") and name.endswith(".lock")):
             continue
         try:
-            with open(f"/proc/{name}/stat") as file:
-                fields = file.read().rsplit(")", 1)[1].split()
-        except (OSError, IndexError):
+            with open(os.path.join(crate, name), "rb") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        except OSError:
+            pass
+    return False
+
+
+def evict(slot, path):
+    """Moves `path` out of the slot's target, in one rename, into the slot's
+    `evicted` directory, which nothing builds in: a build never finds part
+    of it. REMOVER removes it later."""
+    evicted = os.path.join(slot, "evicted")
+    os.makedirs(evicted, exist_ok=True)
+    os.rename(path, os.path.join(evicted, f"{time.time_ns()}-{os.getpid()}-{os.path.basename(path)}"))
+
+
+def trim(slot, budget, pressed):
+    """Bounds the build output of `slot`, whose lease and `running` lock the
+    caller holds, so no build of its own runs there: keeps the incremental
+    sessions of the crates its builds compiled most recently until they
+    fill `budget` bytes, or a quarter of it when `pressed`, and moves out
+    the rest, and every few hours, or at once when `pressed`, compiled
+    units no build has looked at for days.
+    Returns the bytes moved out. A crate whose session a rustc holds stays,
+    whatever started it."""
+    if pressed:
+        budget //= PRESSED_SHARE
+    # A finalized session never changes, and rustc names each new one
+    # afresh, so the size of each is measured once, when first seen.
+    record = os.path.join(slot, "incremental-sizes")
+    try:
+        with open(record) as file:
+            known = json.load(file)
+        if not isinstance(known, dict):
+            known = {}
+    except (OSError, ValueError):
+        known = {}
+    measured, crates = {}, []
+    for incremental in target_directories(slot, "incremental"):
+        for crate in os.scandir(incremental):
+            if not crate.is_dir(follow_symlinks=False):
+                continue
+            size, last, seen = 0, 0.0, set()
+            for session in os.scandir(crate.path):
+                try:
+                    last = max(last, session.stat(follow_symlinks=False).st_mtime)
+                except OSError:
+                    continue
+                if not session.is_dir(follow_symlinks=False):
+                    continue
+                key = os.path.relpath(session.path, slot)
+                if session.name.endswith("-working"):
+                    # Being written, or left by a build that was stopped.
+                    size += tree_size(session.path, seen)
+                    continue
+                if not isinstance(known.get(key), int) or known[key] < 0:
+                    known[key] = tree_size(session.path, set())
+                measured[key] = known[key]
+                size += known[key]
+            crates.append((last, size, crate.path))
+    kept = moved = 0
+    # The crates compiled most recently stay until they fill the budget,
+    # the one that crosses it included: the next build most likely needs
+    # the large session it compiled last. The rest go.
+    for last, size, crate in sorted(crates, reverse=True):
+        if kept < budget:
+            kept += size
             continue
-        parent[int(name)] = int(fields[1])
-        size[int(name)] = int(fields[21]) * page
-    held = dict.fromkeys(roots, 0)
-    for pid, rss in size.items():
-        node = pid
-        while node not in held and node in parent and node > 1:
-            node = parent[node]
-        if node in held:
-            held[node] += rss
-    return held
+        try:
+            if in_use(crate):
+                kept += size
+                continue
+            evict(slot, crate)
+        except OSError:
+            continue
+        moved += size
+    # Only a record: on a full disk the trim goes on without it.
+    try:
+        with open(record + ".new", "w") as file:
+            json.dump({key: size for key, size in measured.items()
+                       if os.path.isdir(os.path.join(slot, key))}, file)
+        os.replace(record + ".new", record)
+    except OSError:
+        pass
+    swept = os.path.join(slot, "dependencies-swept")
+    try:
+        due = pressed or time.time() - os.stat(swept).st_mtime >= DEPENDENCY_SWEEPS
+    except OSError:
+        due = True
+    # Where reading a file leaves its access time alone, every dependency
+    # would look unread.
+    if due and not os.statvfs(slot).f_flag & os.ST_NOATIME:
+        try:
+            moved += sweep_dependencies(slot, time.time() - DEPENDENCY_IDLE)
+            open(swept, "a").close()
+            os.utime(swept)
+        except OSError:
+            pass
+    return moved
+
+
+def newest_file(path):
+    """The latest time any file under `path` was read or written, and the
+    bytes they hold. By its files alone: looking through a directory reads
+    it."""
+    newest, size = 0.0, 0
+    for directory, _names, files in os.walk(path):
+        for name in files:
+            try:
+                status = os.lstat(os.path.join(directory, name))
+            except OSError:
+                continue
+            newest = max(newest, status.st_atime, status.st_mtime)
+            size += status.st_blocks * 512
+    return newest, size
+
+
+def sweep_dependencies(slot, cutoff):
+    """Moves out of each profile of the slot's target the compiled units
+    that no build has looked at since `cutoff`, and returns the bytes moved.
+    Cargo reads the fingerprint of every unit in a build's graph, whether
+    or not it compiles it, so `.fingerprint/<package>-<hash>` dates a unit:
+    the rlib of a build dependency or a compiled build script is read only
+    when it is built again, and judged by itself would look unused in a
+    lane that builds daily. A stale unit goes with its fingerprint first,
+    so one moved out only in part is built again, then with the
+    `deps/<crate>-<hash>` files and `build/<package>-<hash>` directory
+    sharing its hash. Cargo builds again whatever a build needs of it."""
+    moved = 0
+    for fingerprints in target_directories(slot, ".fingerprint"):
+        profile = os.path.dirname(fingerprints)
+        outputs = {}
+        for kind in ("deps", "build"):
+            try:
+                entries = list(os.scandir(os.path.join(profile, kind)))
+            except OSError:
+                continue
+            for entry in entries:
+                unit = entry.name.split(".", 1)[0].rpartition("-")[2]
+                outputs.setdefault(unit, []).append(entry)
+        for entry in os.scandir(fingerprints):
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            unit = entry.name.rpartition("-")[2]
+            newest, size = newest_file(entry.path)
+            parts = [(entry.path, size)]
+            for output in outputs.get(unit, ()):
+                if output.is_dir(follow_symlinks=False):
+                    used, held = newest_file(output.path)
+                else:
+                    try:
+                        status = output.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    used, held = max(status.st_atime, status.st_mtime), status.st_blocks * 512
+                newest = max(newest, used)
+                parts.append((output.path, held))
+            if newest >= cutoff:
+                continue
+            for path, held in parts:
+                try:
+                    evict(slot, path)
+                except OSError:
+                    if path == entry.path:
+                        break
+                    continue
+                moved += held
+    return moved
+
+
+# Removes what trim moved out of each slot named after its first argument
+# until nothing is left there; nothing else uses any of it, and nothing
+# writes there but trim's renames. Unless that argument is "wait", it takes
+# turns per slot with the other removers that nothing waits for: the one
+# holding a slot's `evicted.lock` takes what is added before it lets go,
+# and looks again after. One a build waits for takes no turn: it removes
+# beside an idle remover rather than after it, each passing over what the
+# other has removed. One that is stopped leaves the rest to the next.
+REMOVER = """
+import fcntl, os, shutil, sys
+def drain(evicted):
+    while True:
+        try:
+            names = os.listdir(evicted)
+        except OSError:
+            return
+        if not names:
+            return
+        for name in names:
+            path = os.path.join(evicted, name)
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path, ignore_errors=True)
+                if os.path.lexists(path):
+                    sys.exit(1)
+            else:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    sys.exit(1)
+def left(evicted):
+    try:
+        return bool(os.listdir(evicted))
+    except OSError:
+        return False
+waited = sys.argv[1] == "wait"
+for slot in sys.argv[2:]:
+    evicted = os.path.join(slot, "evicted")
+    if waited:
+        drain(evicted)
+        continue
+    while left(evicted):
+        with open(os.path.join(slot, "evicted.lock"), "a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                break
+            drain(evicted)
+"""
+
+
+def evicted_left(slot):
+    """Whether anything trim moved out of `slot` is still there."""
+    try:
+        return bool(os.listdir(os.path.join(slot, "evicted")))
+    except OSError:
+        return False
+
+
+def remove_evicted(slots, wait=False):
+    """Removes what trim moved out of `slots` in a session of its own,
+    waiting for it only when asked: then it removes everything left there,
+    beside any idle removal already under way, at low priority rather than
+    idle, which the I/O of running builds could starve."""
+    slots = [slot for slot in slots if evicted_left(slot)]
+    if not slots:
+        return
+    lower = [shutil.which("nice") or "nice", "-n", "10" if wait else "19"]
+    if shutil.which("ionice"):
+        lower += [shutil.which("ionice"), *(("-c2", "-n7") if wait else ("-c3",))]
+    remover = subprocess.Popen([*lower, sys.executable, "-c", REMOVER,
+                                "wait" if wait else "idle", *slots],
+                               cwd="/", stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, start_new_session=True)
+    if wait:
+        remover.wait()
+
+
+def trim_free(base, budget, floor, mine=None):
+    """Trims each of the slots under `base` but `mine` that no lease holds,
+    under its lease and `running` locks, as a lease would; a slot taken
+    meanwhile is passed over. Returns each slot it trimmed with the bytes
+    it moved out. The lease lock is shared: a lease cannot take the slot
+    meanwhile, while a `--hold` whose lease has ended, which takes it
+    shared, still finds that it ended. Trims of one slot take turns on its
+    `running` lock."""
+    trimmed = []
+    for index in slot_indices(base):
+        slot = os.path.join(base, f"slot-{index}")
+        if slot == mine:
+            continue
+        try:
+            lock = open(os.path.join(slot, "lock"), "a")
+        except OSError:
+            continue
+        with lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                continue
+            with open(os.path.join(slot, "running"), "a") as running:
+                try:
+                    fcntl.flock(running, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    continue
+                try:
+                    moved = trim(slot, budget, free_space(slot) < pressure_floor(slot, floor))
+                except OSError:
+                    # What it moved out before failing is still to remove.
+                    moved = 0
+                trimmed.append((slot, moved))
+    return trimmed
 
 
 def read_claim(slot):
@@ -634,16 +1056,6 @@ def read_claim(slot):
         return claimed if isinstance(claimed, dict) else {}
     except (OSError, ValueError):
         return {}
-
-
-def claim(slot):
-    """What a leased slot's build is expected to need and the process its
-    command runs as, once it has started."""
-    claimed = read_claim(slot)
-    try:
-        return int(claimed.get("cost") or LARGEST), claimed.get("pid")
-    except (ValueError, TypeError):
-        return LARGEST, None
 
 
 def slot_indices(base):
@@ -662,11 +1074,13 @@ def leased(slot):
 
 
 def leased_lock(path):
-    """Whether something holds the lock file at `path`."""
+    """Whether something holds the lock file at `path` exclusively, as a
+    lease or build does. A trim of an idle slot, or a hold's check that its
+    lease lasts, holds it shared, and is no build."""
     try:
         with open(path, "a") as lock:
             try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
             except BlockingIOError:
                 return True
             fcntl.flock(lock, fcntl.LOCK_UN)
@@ -675,330 +1089,56 @@ def leased_lock(path):
         return False
 
 
-def room(base, mine, cost):
-    """None when a build expected to need `cost` bytes fits beside the builds
-    in the other leased slots, as scripts/cargo-gate admits builds on its
-    host: the memory available now, less what those builds are expected to
-    take beyond what they already hold, covers it, and neither the memory nor
-    the CPUs are under pressure. A lone build always fits. Otherwise why it
-    waits."""
-    others = []
-    for index in slot_indices(base):
-        slot = os.path.join(base, f"slot-{index}")
-        if slot != mine and leased(slot):
-            others.append(claim(slot))
-    others += registered(base)
-    if not others:
-        return None
-    pressure = memory_pressure()
-    if pressure is not None and pressure >= MEMORY_PRESSURE_LIMIT:
-        return f"pressure {pressure:.0f} {MEMORY_PRESSURE_LIMIT}"
-    pressure = memory_pressure("cpu")
-    if pressure is not None and pressure >= CPU_PRESSURE_LIMIT:
-        return f"cpu {pressure:.0f} {CPU_PRESSURE_LIMIT}"
-    available = available_memory()
-    if available is None:
-        return None
-    held = resident([pid for _, pid in others if isinstance(pid, int)])
-    outstanding = sum(max(0, need - held.get(pid, 0)) for need, pid in others)
-    if available - outstanding >= cost:
-        return None
-    return f"memory {max(0, available - outstanding) / GIB:.1f} {cost / GIB:.1f} {len(others)}"
+# The mark an offloaded command's processes carry in their environment, into
+# whatever session they move: the slot it runs in.
+SLOT_MARK = "CAGENTS_OFFLOAD_SLOT"
 
 
-# Where this host's builds record themselves, whichever slot family runs
-# them: scripts/cargo-gate's shared families here and these offloaded slots
-# each price the others' running builds beside their own. Empty disables it;
-# tests standing in for the build host name a private one.
-REGISTRY = os.environ.get("CAGENTS_BUILD_REGISTRY", f"/var/tmp/cagents-builds-{os.getuid()}")
+CHECKOUT_BEFORE = "checkout-before.json"
 
-
-class deciding:
-    """Holds the host's admission decision, which scripts/cargo-gate's
-    families take too, while this build is priced and recorded."""
-
-    def __enter__(self):
-        self.lock = None
-        if REGISTRY:
+def checkout_state(source, skip):
+    """Each file and link of the slot's checkout outside the directories in
+    `skip`, by its path in bytes, with what writing it changes: its size,
+    times and inode. A write that keeps the old modification time, as a
+    copy that preserves it does, still changes the status-change time."""
+    root = os.fsencode(source)
+    skip = {os.fsencode(os.path.realpath(path)) for path in skip}
+    state = {}
+    for directory, names, files in os.walk(root):
+        links = [name for name in names if os.path.islink(os.path.join(directory, name))]
+        names[:] = [name for name in names if name not in links
+                    and os.path.realpath(os.path.join(directory, name)) not in skip]
+        for name in files + links:
+            path = os.path.join(directory, name)
             try:
-                os.makedirs(REGISTRY, mode=0o700, exist_ok=True)
-                self.lock = open(os.path.join(REGISTRY, ".decision"), "a")
-                fcntl.flock(self.lock, fcntl.LOCK_EX)
-            except OSError:
-                self.lock = None
-        return self
-
-    def __exit__(self, *_exception):
-        if self.lock is not None:
-            self.lock.close()
-
-
-# Once refused room this long, the build refused longest on the host starts
-# beside the running builds whatever their memory, as scripts/cargo-gate
-# admits its own: while a build admitted that way may still be ramping up,
-# none other is. This host's setting, as the gate reads its own.
-try:
-    WAIT_PRIORITY = max(0, int(os.environ.get("CAGENTS_BUILD_WAIT_PRIORITY_SECS") or 120))
-except ValueError:
-    WAIT_PRIORITY = 120
-# How recently a waiting build must have been refused room to keep its place,
-# and how long a build admitted as overdue keeps the next one waiting.
-WAIT_FRESH = 10
-OVERDUE_RAMP = 600
-
-
-def registry_entry(slot, kind="offload-"):
-    # One spelling of the slot, however the path that leased or ran it read.
-    slot = os.path.realpath(slot)
-    return os.path.join(REGISTRY, kind + hashlib.sha256(os.fsencode(slot)).hexdigest()[:16])
-
-
-def write_record(entry, text):
-    with open(entry + ".new", "w") as file:
-        file.write(text)
-    os.replace(entry + ".new", entry)
-
-
-def register(slot, cost, pid, overdue=None):
-    """Records the build in `slot` as the gate records its own: its holder,
-    expected cost in KiB, start in seconds since boot, the lock it holds and
-    whether it was admitted as overdue. `overdue` None keeps the record's."""
-    if not REGISTRY:
-        return
-    entry = registry_entry(slot)
-    if overdue is None:
-        try:
-            with open(entry) as file:
-                overdue = (file.read().splitlines() + [""] * 4)[3] == "overdue"
-        except OSError:
-            overdue = False
-    try:
-        os.makedirs(REGISTRY, mode=0o700, exist_ok=True)
-        since = uptime()
-        lock = os.path.join(os.path.realpath(slot), "lock")
-        write_record(entry, f"{pid or 0} {cost // 1024}\n{since}\n{lock}\n"
-                            f"{'overdue' if overdue else ''}\n")
-    except OSError:
-        pass
-
-
-def reprice(slot, cost):
-    """Prices the command running in `slot` at `cost` for builds deciding
-    from now on, in its claim and its host record, keeping the record's
-    start and overdue mark."""
-    claimed = read_claim(slot)
-    claimed["cost"] = cost
-    with open(os.path.join(slot, "claim.new"), "w") as file:
-        json.dump(claimed, file)
-    os.replace(os.path.join(slot, "claim.new"), os.path.join(slot, "claim"))
-    if not REGISTRY:
-        return
-    entry = registry_entry(slot)
-    try:
-        with open(entry) as file:
-            lines = file.read().splitlines()
-        pid = lines[0].split()[0]
-        lines[0] = f"{pid} {cost // 1024}"
-        write_record(entry, "\n".join(lines) + "\n")
-    except (OSError, IndexError):
-        pass
-
-
-# Programs that compile, link or drive a native build. While one runs in a
-# command's session, the command is building.
-COMPILER = re.compile(r"(?:.+-)?(?:rustc|rustdoc|cc|c\+\+|gcc|g\+\+|clang|clang\+\+|cc1|cc1plus"
-                      r"|cc1obj|collect2|ld|ld\.[a-z]+|lld|mold|as|ar|zig|cmake|make|gmake|ninja)"
-                      r"(?:-[0-9][0-9.]*)?")
-# How often a running command's phase is looked at, and the least a test run
-# is priced at. The variables are for tests standing in for the build host;
-# ssh does not pass them on.
-PHASE_INTERVAL = float(os.environ.get("CAGENTS_OFFLOAD_PHASE_INTERVAL") or 2)
-TEST_LEAST = int(os.environ.get("CAGENTS_OFFLOAD_TEST_LEAST_BYTES") or LEAST)
-
-
-def session_phase(session):
-    """"build" while a process in `session` compiles or runs a build script,
-    "test" while one instead runs an executable Cargo built into a `deps`
-    directory (a test harness, benchmark, or what they start beside it), and
-    None while neither does: Cargo between steps, or the command ending."""
-    testing = False
-    for name in os.listdir("/proc"):
-        if not name.isdigit():
-            continue
-        try:
-            with open(f"/proc/{name}/stat") as file:
-                fields = file.read().rsplit(")", 1)[1].split()
-            if int(fields[3]) != session:
+                status = os.lstat(path)
+            except FileNotFoundError:
                 continue
-            executable = os.readlink(f"/proc/{name}/exe")
-        except (OSError, ValueError, IndexError):
-            continue
-        executable = executable.removesuffix(" (deleted)")
-        directory, program = os.path.split(executable)
-        if COMPILER.fullmatch(program) or program.startswith(("build-script-", "build_script_")):
-            return "build"
-        if os.path.basename(directory) == "deps":
-            testing = True
-    return "test" if testing else None
+            state[os.path.relpath(path, root)] = [
+                status.st_size, status.st_mtime_ns, status.st_ctime_ns, status.st_ino]
+    return state
 
+def record_checkout(slot, skip):
+    """What the slot's checkout holds as a command starts, for `written`."""
+    record = {"skip": list(skip), "files": {
+        base64.b64encode(name).decode(): state
+        for name, state in checkout_state(os.path.join(slot, "src"), skip).items()}}
+    with open(os.path.join(slot, CHECKOUT_BEFORE + ".new"), "w") as file:
+        json.dump(record, file)
+    os.replace(os.path.join(slot, CHECKOUT_BEFORE + ".new"), os.path.join(slot, CHECKOUT_BEFORE))
 
-def price_by_phase(slot, cost, session, ended):
-    """Prices the command in `slot`, whose processes form `session`, by its
-    phase. Cargo runs tests only once it has built everything they need, and
-    a test run needs what its tests hold, not what compiling them did: while
-    it tests, the command is priced at the most its processes have held
-    since its tests began, as sampled each pass, and never below the least
-    any build is priced at. Builds the host admits meanwhile then take memory
-    the compile no longer reserves, while what the tests do hold stays
-    counted, however much that is; growth beyond that peak is not reserved,
-    as tests run by the gate here are not, and the host's memory pressure
-    holds further builds back. When it compiles again, as doctests do, it is
-    priced as a build. Once `ended` is set, the slot is priced as a build
-    again, for whatever builds in it next under the same lease, and pricing
-    stops."""
-    priced, peak, repriced = cost, 0, False
-    while not ended.wait(PHASE_INTERVAL):
-        try:
-            phase = session_phase(session)
-            if phase == "test":
-                peak = max(peak, resident([os.getpid()]).get(os.getpid(), 0))
-                price = max(TEST_LEAST, peak)
-            elif phase == "build":
-                price = cost
-            else:
-                continue
-            # Small changes in what the tests hold are not worth rewriting for.
-            if price != priced and (price == cost or priced == cost
-                                    or abs(price - priced) >= 64 * 2**20):
-                repriced = True
-                reprice(slot, price)
-                priced = price
-        except Exception:
-            # Repricing never ends a command. A failed pass, such as a claim
-            # the full disk could not take, is tried again at the next.
-            continue
-    # Even a pass that failed partway may have changed the claim.
-    if repriced:
-        try:
-            reprice(slot, cost)
-        except Exception:
-            pass
-
-
-def start_time(pid):
-    """When process `pid` started, in clock ticks since boot, or None."""
+def written_since(slot):
+    """The files the last command added to the slot's checkout or wrote in
+    it, by base64 path, each with whether it is new."""
     try:
-        with open(f"/proc/{pid}/stat") as file:
-            return int(file.read().rsplit(")", 1)[1].split()[19])
-    except (OSError, ValueError, IndexError):
-        return None
-
-
-def uptime():
-    """Seconds since boot, which the wall clock's steps cannot reorder."""
-    with open("/proc/uptime") as file:
-        return int(float(file.read().split()[0]))
-
-
-def record_refusal(slot, since, now):
-    """Records the build in `slot` as refused room since `since` and again at
-    `now`, so that another family's build can tell which of them has been
-    refused longest."""
-    if REGISTRY:
-        try:
-            pid = os.getpid()
-            write_record(registry_entry(slot, "wait-offload-"),
-                         f"{pid} {start_time(pid)} {since} {now}\n")
-        except OSError:
-            pass
-
-
-def forget_wait(slot):
-    if REGISTRY:
-        try:
-            os.unlink(registry_entry(slot, "wait-offload-"))
-        except OSError:
-            pass
-
-
-def overdue(slot, since):
-    """Whether the build in `slot`, refused room since `since`, has been
-    refused for the priority time, longer than every other build refused on
-    the host now, and no build admitted that way may still be ramping up."""
-    if not REGISTRY or WAIT_PRIORITY <= 0:
-        return False
-    now = uptime()
-    if now - since < WAIT_PRIORITY:
-        return False
-    mine, pid = registry_entry(slot, "wait-offload-"), os.getpid()
-    try:
-        names = os.listdir(REGISTRY)
-    except OSError:
-        return False
-    for name in names:
-        path = os.path.join(REGISTRY, name)
-        if name.endswith(".new"):
-            continue
-        try:
-            with open(path) as file:
-                text = file.read().splitlines() + [""] * 4
-        except OSError:
-            continue
-        if name.startswith("wait-") and path != mine:
-            try:
-                other, started, other_since, last = (int(field) for field in text[0].split())
-            except ValueError:
-                continue
-            if (now - last <= WAIT_FRESH and (other_since, other) < (since, pid)
-                    and start_time(other) == started):
-                return False
-        elif name.startswith(("gate-", "offload-")) and text[3] == "overdue":
-            try:
-                holder = int(text[0].split()[0])
-                started = int(text[1])
-            except (ValueError, IndexError):
-                continue
-            if (now - started < OVERDUE_RAMP
-                    and (holder == 0 or os.path.exists(f"/proc/{holder}"))
-                    and os.path.isfile(text[2]) and leased_lock(text[2])):
-                return False
-    return True
-
-
-def registered(base):
-    """The expected cost and holder of each running build that another slot
-    family on this host recorded: one whose record's lock is held."""
-    found = []
-    try:
-        names = os.listdir(REGISTRY) if REGISTRY else []
-    except OSError:
-        return found
-    for name in names:
-        if name.startswith(".") or name.endswith(".new"):
-            continue
-        try:
-            with open(os.path.join(REGISTRY, name)) as file:
-                first, _since, lock = (file.read().splitlines() + ["", "", ""])[:3]
-            pid, kib = (int(field) for field in first.split())
-        except (OSError, ValueError):
-            continue
-        if not name.startswith(("gate-", "offload-")):
-            continue
-        if not lock or os.path.commonpath([os.path.realpath(base), os.path.realpath(lock)]) == os.path.realpath(base):
-            continue
-        # Opening anything but a regular file could fail or block.
-        if not os.path.isfile(lock) or not leased_lock(lock):
-            continue
-        if pid == 0:
-            # An offloaded build whose command has not started: its cost.
-            found.append((kib * 1024, None))
-        elif os.path.exists(f"/proc/{pid}"):
-            found.append((kib * 1024, pid))
-        else:
-            # Its holder has exited: priced as unknown, the largest cost.
-            found.append((LARGEST, None))
-    return found
-
+        with open(os.path.join(slot, CHECKOUT_BEFORE)) as file:
+            record = json.load(file)
+    except (OSError, ValueError):
+        return []
+    before = {base64.b64decode(name): state for name, state in record["files"].items()}
+    return [[base64.b64encode(name).decode(), name not in before]
+            for name, state in sorted(checkout_state(os.path.join(slot, "src"), record["skip"]).items())
+            if before.get(name) != state]
 
 def enclosing_checkout(path):
     """A Git marker above `path`, under which tests that check Git ancestry
@@ -1012,10 +1152,11 @@ def enclosing_checkout(path):
 if command == "lease":
     slots, key, floor = int(sys.argv[3]), sys.argv[4], int(sys.argv[5]) * 2**30
     profiles = sys.argv[6]
-    cost = max(LEAST, int(sys.argv[7]) if len(sys.argv) > 7 and sys.argv[7] else LARGEST)
     # The checkout and Cargo command this build is: another request for the
     # same one waits for its slot rather than build it again elsewhere.
-    build = sys.argv[8] if len(sys.argv) > 8 else ""
+    build = sys.argv[7] if len(sys.argv) > 7 else ""
+    # The most incremental compilation state the slot keeps, in GiB.
+    budget = int(sys.argv[8]) * GIB if len(sys.argv) > 8 and sys.argv[8] else INCREMENTAL_BUDGET
     os.makedirs(base, exist_ok=True)
     leases = []
     waiting_for = None
@@ -1025,11 +1166,6 @@ if command == "lease":
         if leases:
             with open(os.path.join(leases[0], "running"), "a") as running:
                 fcntl.flock(running, fcntl.LOCK_EX)
-            try:
-                os.unlink(registry_entry(leases[0]))
-            except OSError:
-                pass
-            forget_wait(leases[0])
         os._exit(0)
     until_closed(release)
     # Waiters line up on a queue lock, and the one at its head takes the
@@ -1060,7 +1196,7 @@ if command == "lease":
     # This checkout's last slot, then one another checkout built in, whose
     # compiled dependencies it shares, then an empty one. Up to `slots` are
     # made, each only while the disk holds another build's output beside the
-    # floor; how many build at once is then down to memory and CPU, below.
+    # floor; how many build at once is then down to their memory shares.
     def built(index):
         return os.path.isdir(os.path.join(base, f"slot-{index}", "src", "target"))
     def free():
@@ -1128,36 +1264,11 @@ if command == "lease":
             continue
         break
     leases.append(slot)
-    # What this build is, at once, so that builds deciding meanwhile price it
-    # and do not take it for a build it is not.
+    # What this build is, at once, so that a request for the same build
+    # waits for it rather than build it again elsewhere.
     with open(os.path.join(slot, "claim.new"), "w") as file:
-        json.dump({"cost": cost, "pid": None, "build": build, "key": key}, file)
+        json.dump({"build": build, "key": key}, file)
     os.replace(os.path.join(slot, "claim.new"), os.path.join(slot, "claim"))
-    # At the head of the queue: the build starts once the memory it is
-    # expected to need is free beside the builds already running here.
-    waiting = None
-    refused_since = refused_last = None
-    while True:
-        # Recorded only once admitted, and in the same decision, so that the
-        # host's other slot families neither miss it nor count it waiting.
-        with deciding():
-            why = room(base, slot, cost)
-            late = (why is not None and refused_since is not None
-                    and uptime() - refused_last <= WAIT_FRESH and overdue(slot, refused_since))
-            if why is None or late:
-                register(slot, cost, None, overdue=late)
-                forget_wait(slot)
-                break
-            now = uptime()
-            if refused_since is None or now - refused_last > WAIT_FRESH:
-                refused_since = now
-            refused_last = now
-            record_refusal(slot, refused_since, now)
-        if why.split()[0] != waiting:
-            say("wait", why)
-            announced = True
-            waiting = why.split()[0]
-        time.sleep(1)
     queue.close()
     # A previous build's command or prune may outlive its lease's
     # connection; nothing in the slot changes until it has ended.
@@ -1169,6 +1280,32 @@ if command == "lease":
                 say("wait")
                 announced = True
             fcntl.flock(running, fcntl.LOCK_EX)
+    # Before this build adds to it, the slot keeps only the build output its
+    # builds used last within its budget; below twice the floor, so does
+    # every slot no lease holds. The removal itself goes on after.
+    pressed = free() < pressure_floor(base, floor)
+    if not announced:
+        # Measuring sessions it has not seen before may take a while.
+        slow = threading.Timer(5, say, ("wait", "trim"))
+        slow.daemon = True
+        slow.start()
+    trimmed = [slot]
+    try:
+        trim(slot, budget, pressed)
+        if pressed:
+            trimmed += [other for other, _ in trim_free(base, budget, floor, mine=slot)]
+    except OSError:
+        pass
+    if not announced:
+        slow.cancel()
+        slow.join()
+    if free() < floor:
+        # What it moved out may be enough.
+        say("wait")
+        announced = True
+        remove_evicted(trimmed, wait=True)
+    else:
+        remove_evicted(trimmed)
     if free() < floor:
         # This slot's build output is the one this build may discard.
         say("wait")
@@ -1256,6 +1393,31 @@ elif command == "prune":
         if relative not in keep_dirs and not os.listdir(directory):
             os.rmdir(directory)
 
+elif command == "written":
+    # What the last command wrote in the slot's checkout, once it and
+    # whatever it left running have ended: see record_checkout.
+    running = open(os.path.join(base, "running"), "a")
+    fcntl.flock(running, fcntl.LOCK_EX)
+    print(json.dumps(written_since(base)))
+
+elif command == "trim":
+    # Trims the slots no lease holds, of every repository under `base`, the
+    # offload root, for scripts/build-disk-guard: the most incremental state
+    # each keeps in GiB, the floor in GiB, and whether to wait for the
+    # removal.
+    budget, floor = int(sys.argv[3]) * GIB, int(sys.argv[4]) * GIB
+    wait = sys.argv[5:6] == ["--wait"]
+    trimmed = []
+    for repository in sorted(glob.glob(os.path.join(glob.escape(base), "*", ""))):
+        trimmed += trim_free(repository.rstrip(os.sep), budget, floor)
+    # Waiting, for every slot's removal, including those of a trim that
+    # held a slot this one passed over.
+    remove_evicted(sorted(glob.glob(os.path.join(glob.escape(base), "*", "slot-*"))) if wait
+                   else [slot for slot, _ in trimmed], wait=wait)
+    moved = sum(size for _, size in trimmed)
+    if moved:
+        say(f"moved {moved / GIB:.1f} GiB of build output out of {len(trimmed)} idle build slots")
+
 elif command == "exists":
     # Whether a result the caller may copy back is there.
     sys.exit(0 if os.path.exists(base) else 1)
@@ -1283,39 +1445,18 @@ elif command == "run":
         resource.setrlimit(resource.RLIMIT_CORE, (0, resource.getrlimit(resource.RLIMIT_CORE)[1]))
     running = open(os.path.join(base, "running"), "a")
     fcntl.flock(running, fcntl.LOCK_EX)
-    # Builds admitted later price this one by what its processes hold. Under
-    # a hold, a command before this one may have repriced the claim for its
-    # tests and been killed before restoring it, so each starts from what the
-    # lease was priced at, which the first records.
-    cost, _ = claim(base)
-    with open(os.path.join(base, "claim.new"), "w") as file:
-        claimed = read_claim(base)
-        try:
-            cost = int(claimed.get("leased") or cost)
-        except (ValueError, TypeError):
-            pass
-        json.dump({"cost": cost, "leased": cost, "pid": os.getpid(),
-                   "build": claimed.get("build", ""), "key": claimed.get("key", "")}, file)
-    os.replace(os.path.join(base, "claim.new"), os.path.join(base, "claim"))
-    register(base, cost, os.getpid())
     os.chdir(os.path.join(base, "src", directory))
     environment = dict(os.environ, **environment)
-    if "CARGO_BUILD_JOBS" not in environment:
-        # The CPUs shared by the builds running now, this one included, but
-        # never so few that one build's slow crates stall it.
-        builds = sum(leased(os.path.join(os.path.dirname(base), f"slot-{index}"))
-                     for index in slot_indices(os.path.dirname(base)))
-        # At most 8 and half the CPUs, as scripts/cargo-gate gives builds on
-        # its host: the memory builds are expected to need was measured so.
-        cpus = len(os.sched_getaffinity(0))
-        environment["CARGO_BUILD_JOBS"] = str(
-            min(max(4, cpus // max(1, builds)), max(4, min(8, cpus // 2))))
-    # Temporary files go on disk in a directory of this slot's own, rather
-    # than in the host's /tmp, which may be memory and which others use. The
-    # path stays short: tests bind Unix sockets under it, whose paths are
-    # limited to 108 bytes. The slot runs one command at a time, so whatever
-    # the last one left there is stale.
+    # Temporary files go in a directory of this slot's own, rather than in
+    # the host's /tmp, which others use: temporary_directory puts it in the
+    # runtime directory, which is memory on a systemd host such as fw16, or
+    # in the slot when that is unsafe or unavailable. The path stays short:
+    # tests bind Unix sockets under it, whose paths are limited to 108 bytes.
+    # The slot runs one command at a time, so whatever the last one left
+    # there is stale.
     environment["TMPDIR"] = temporary = temporary_directory(base)
+    # What the command starts is this build's, whichever session it moves to.
+    environment[SLOT_MARK] = os.path.realpath(base)
     clear(temporary)
     os.makedirs(temporary, mode=0o700, exist_ok=True)
 
@@ -1347,16 +1488,37 @@ elif command == "run":
             directories = {}
         sys.stdout.write(DIRECTORIES_MARKER + json.dumps(directories) + "\n")
         sys.stdout.flush()
+    # Outside its build output, as the command starts: what it writes comes back.
+    outputs = [os.path.join(base, "src", "target"), *request.get("outputs", [])]
+    if request.get("directories") is not None:
+        outputs += directories.values()
+    record_checkout(base, outputs)
+    # The gate's helpers travel with this invocation, including installed
+    # gates and arbitrary Cargo workspaces that have no repository scripts.
+    # They go outside src, which a checkout copy or prune would replace.
+    # build-host takes the build's shares, runs it in the build slice with the
+    # host's jobserver, and then runs its tests without them.
+    tools = os.path.join(base, "tools")
+    os.makedirs(tools, exist_ok=True)
+    # A helper an earlier command sent and this one did not must not run.
+    for name in set(os.listdir(tools)) - set(request["tools"]):
+        os.unlink(os.path.join(tools, name))
+    for name, text in request["tools"].items():
+        if name != os.path.basename(name):
+            sys.exit(f"cargo-offload: a helper may not be named {name}")
+        with open(os.path.join(tools, name + ".new"), "w") as file:
+            file.write(text)
+        os.chmod(os.path.join(tools, name + ".new"), 0o755)
+        os.replace(os.path.join(tools, name + ".new"), os.path.join(tools, name))
+    admission = ["--shares", str(request.get("shares") or 1)]
+    if request.get("admission_seconds") is not None:
+        admission += ["--wait-seconds", str(request["admission_seconds"])]
+    # Each invocation supplies its own source. Do not leave bytecode that
+    # could alias a later same-size source update within one timestamp tick.
+    arguments = [sys.executable, "-I", "-B", os.path.join(tools, "build-host"), "cargo",
+                 *admission, "--", *arguments]
     child = subprocess.Popen(arguments, env=environment, stdin=subprocess.DEVNULL,
                              start_new_session=True)
-    ended = threading.Event()
-    pricing = threading.Thread(target=price_by_phase, args=(base, cost, child.pid, ended),
-                               daemon=True)
-    pricing.start()
-    def priced_as_built():
-        # A hold builds again in this slot under the same lease and claim.
-        ended.set()
-        pricing.join(10)
     def end(sent_first):
         """Signals the command's process group until it is gone: children
         that ignore an interrupt, as a shell's background jobs do, get a
@@ -1376,7 +1538,6 @@ elif command == "run":
     def cancel():
         cancelling.set()
         end(signal.SIGINT)
-        priced_as_built()
         os._exit(130)
     until_closed(cancel)
     status = child.wait()
@@ -1386,7 +1547,6 @@ elif command == "run":
             time.sleep(3600)
     # What the command left running would keep the connection open.
     end(signal.SIGTERM)
-    priced_as_built()
     os._exit(status if status >= 0 else 128 - status)
 '''
 
@@ -1459,24 +1619,92 @@ def sweep_connections(directory, age=120):
         shutil.rmtree(path, ignore_errors=True)
 
 
+def file_state(path):
+    """What writing a file here changes, as the build host's checkout_state
+    records it there, or None when there is nothing at `path`."""
+    try:
+        status = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    return [status.st_size, status.st_mtime_ns, status.st_ctime_ns, status.st_ino]
+
+
+def same_content(first, second):
+    if os.path.islink(first) or os.path.islink(second):
+        return (os.path.islink(first) and os.path.islink(second)
+                and os.readlink(first) == os.readlink(second))
+    return filecmp.cmp(first, second, shallow=False)
+
+
+def install(staged, path, expected):
+    """Puts the staged copy of a file at `path`: a new one only while nothing
+    is there, an existing one only while it is still as it was sent,
+    `expected`. Returns "taken", "same", "changed" or "appeared"."""
+    if expected is not None:
+        if file_state(path) != expected:
+            return "changed"
+        if same_content(staged, path):
+            return "same"
+    directory = os.path.dirname(path)
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except OSError:
+        return "appeared"  # Something other than a directory is in the way.
+    temporary = os.path.join(directory, b".cagents-offload-" + os.urandom(8).hex().encode())
+    if os.path.islink(staged):
+        os.symlink(os.readlink(staged), temporary)
+    else:
+        shutil.copy2(staged, temporary)
+    try:
+        if expected is None:
+            # Linking, unlike renaming, never replaces what is there.
+            try:
+                os.link(temporary, path, follow_symlinks=False)
+            except FileExistsError:
+                return "appeared"
+            return "taken"
+        if file_state(path) != expected:
+            return "changed"
+        os.replace(temporary, path)
+        temporary = None
+        return "taken"
+    finally:
+        if temporary is not None:
+            os.unlink(temporary)
+
+
 class Offload:
-    def __init__(self, host, plan, environment):
+    def __init__(self, host, plan, environment, loopback=False):
         self.host = host
+        self.loopback = loopback
+        if plan is not None:
+            try:
+                self.tools = {name: Path(__file__).with_name(name).read_text() for name in TOOLS}
+            except OSError as error:
+                raise Refusal(f"the build host needs {error.filename} beside cargo-offload") from error
+            here = Path(__file__).with_name
+            if all(here(name).is_file() for name in OPTIONAL_TOOLS):
+                self.tools |= {name: here(name).read_text() for name in OPTIONAL_TOOLS}
         self.plan = plan
         self.environment = environment
         self.slots = positive(environment, "CAGENTS_BUILD_REMOTE_SLOTS", 8)
         # Unset: the host shares its CPUs among the builds running there.
         self.jobs = positive(environment, "CAGENTS_BUILD_REMOTE_JOBS", 0) or None
         self.floor = positive(environment, "CAGENTS_BUILD_REMOTE_FREE_FLOOR_GIB", 40)
+        self.incremental = positive(environment, "CAGENTS_BUILD_REMOTE_INCREMENTAL_GIB",
+                                    INCREMENTAL_GIB, least=0)
         self.answer = positive(environment, "CAGENTS_BUILD_REMOTE_ANSWER_SECONDS", 30)
         self.retry = positive(environment, "CAGENTS_BUILD_REMOTE_RETRY_SECONDS", 15)
-        # What the build is expected to need at its peak, as scripts/cargo-gate
-        # prices it for its own admission; the build host admits by it too.
-        self.cost = positive(environment, "CAGENTS_BUILD_EXPECTED_KIB", 0) * 1024 or ""
+        # The build host's memory shares the build takes, as scripts/cargo-gate
+        # counts them.
+        self.shares = positive(environment, "CAGENTS_BUILD_SHARES", 1)
         self.ssh = [
             "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
             "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4",
         ]
+        if loopback:
+            # The same commands and copies, run here as ssh would run them there.
+            self.ssh = [sys.executable, os.path.abspath(__file__), "--loopback-shell"]
         self.control = None
         self.children = []
         self.command = None
@@ -1670,7 +1898,9 @@ class Offload:
         results it takes back) one ssh session to the host rather than one
         each: every session costs a login there, which its sshd audits. The
         session is this build's alone, so cancelling it, which ends what it
-        started, cuts no other build's."""
+        started, cuts no other build's. A loopback has no connection."""
+        if self.loopback:
+            return
         candidates = [self.environment.get("XDG_RUNTIME_DIR") or "", tempfile.gettempdir(), "/tmp"]
         for directory in dict.fromkeys(candidates):
             if not os.path.isdir(directory):
@@ -1761,8 +1991,9 @@ class Offload:
         ("status"/"cancelled", exit status) when the command ends."""
         lease = self.lease = self.spawn(
             self.remote("lease", base, self.slots, f"{os.uname().nodename}:{top}", self.floor,
-                        profile_config(os.path.expanduser("~/.cargo/config.toml")), self.cost,
-                        self.build_identity(os.path.relpath(os.path.realpath(os.getcwd()), top))),
+                        profile_config(os.path.expanduser("~/.cargo/config.toml")),
+                        self.build_identity(os.path.relpath(os.path.realpath(os.getcwd()), top)),
+                        self.incremental),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
         )
         lines = Lines(lease.stdout)
@@ -1792,15 +2023,8 @@ class Offload:
                 reason = words[1] if len(words) > 1 else "slot"
                 if reason not in told:
                     told.add(reason)
-                    if reason == "memory":
-                        say(f"waiting for memory on {self.host}: {words[2]} GiB is free beside its "
-                            f"{words[4]} running builds, and this one is expected to need {words[3]} GiB")
-                    elif reason == "pressure":
-                        say(f"waiting for memory on {self.host}: its memory pressure is "
-                            f"{words[2]}%, at or above the {words[3]}% limit")
-                    elif reason == "cpu":
-                        say(f"waiting for CPU on {self.host}: its CPU pressure is "
-                            f"{words[2]}%, at or above the {words[3]}% limit")
+                    if reason == "trim":
+                        say(f"waiting while {self.host} trims old build output from this build's slot")
                     elif reason == "same":
                         say(f"waiting for the same build of this checkout on {self.host} to "
                             f"finish, which leaves this one little to compile")
@@ -1891,11 +2115,9 @@ class Offload:
         environment.update(self.inputs(slot, top, local_target, remote_target,
                                        {os.fsdecode(name) for name in files}))
         shell = " ".join(shlex.quote(word) for word in self.ssh)
-        sent = {}
-        if plan.fixes:
-            for name in files:
-                status = os.lstat(os.path.join(os.fsencode(top), name))
-                sent[os.fsdecode(name)] = (status.st_size, status.st_mtime_ns)
+        # What each file was as sent, so that one edited here meanwhile keeps
+        # that edit over what the command writes there.
+        sent = {name: file_state(os.path.join(os.fsencode(top), name)) for name in files}
         # Files are compared by content and a changed one is written with
         # the time it arrives, not the time it has here. Cargo judges path
         # crates, such as the vendored patches, by modification time: a
@@ -1930,6 +2152,7 @@ class Offload:
         stamp = build_metadata(top, root["version"] if root else "", self.environment)
         if stamp:
             environment["CAGENTS_BUILD_METADATA"] = stamp
+        environment[SUPPLIED] = "1"
 
         def mapped():
             # Longest first, so the target directory wins over the checkout
@@ -1945,7 +2168,16 @@ class Offload:
         )
         try:
             request = {"environment": environment,
-                       "core_dumps": self.environment.get("CAGENTS_BUILD_REMOTE_CORE_DUMPS") == "1"}
+                       "core_dumps": self.environment.get("CAGENTS_BUILD_REMOTE_CORE_DUMPS") == "1",
+                       # Build output in the checkout, which does not come back as written.
+                       "outputs": sorted({remote_target, *(remote for remote, _ in directories.values())})}
+            request["tools"] = self.tools
+            request["shares"] = self.shares
+            # The rest of the gate's admission budget covers the wait for
+            # the build's shares there.
+            left = remaining(admission_deadline(self.environment))
+            if left is not None:
+                request["admission_seconds"] = max(0, int(left))
             if plan.captures:
                 request["directories"] = [arg for value in configs for arg in ("--config", value)]
             command.stdin.write((json.dumps(request) + "\n").encode())
@@ -1990,10 +2222,9 @@ class Offload:
             return status
 
         # What the command left for this host, whether or not it succeeded:
-        # fixes it applied before failing, and a failed build's timings.
-        back = 0
-        if plan.fixes:
-            back = back or self.take_fixes(source, top, listing, sent, shell)
+        # what it wrote in the checkout, such as fixes it applied before
+        # failing or a test's recording, and a failed build's timings.
+        back = self.take_written(slot, source, top, sent, shell)
         if plan.timings:
             back = back or self.fetch(f"{remote_target}/cargo-timings/",
                                       os.path.join(local_target, "cargo-timings") + "/", shell,
@@ -2085,38 +2316,68 @@ class Offload:
         back = self.spawn(command + [f"{self.host}:{remote}", local],
                           stdin=subprocess.PIPE if files is not None else subprocess.DEVNULL)
         if files is not None:
-            back.communicate(("\0".join(files) + "\0").encode())
+            back.communicate(b"".join(os.fsencode(name) + b"\0" for name in files))
         else:
             back.wait()
         return 0 if self.cancelled else back.returncode
 
-    def take_fixes(self, source, top, listing, sent, shell):
-        """Brings back the sources Cargo fixed on the build host, unless the
-        file here changed after it was sent: that edit is newer, and is kept."""
-        differing = subprocess.run(
-            ["rsync", "-a", "-c", "-n", "--from0", "--files-from=-", "--out-format=%n",
-             "-e", shell, f"{self.host}:{source}/", top + "/"],
-            input=listing, capture_output=True)
-        if differing.returncode:
-            return differing.returncode
-        fixed, kept = [], []
-        for name in os.fsdecode(differing.stdout).splitlines():
-            if not name or name.endswith("/"):
+    def take_written(self, slot, source, top, sent, shell):
+        """Brings back what the command wrote in the slot's checkout, as it
+        would have written it here: Cargo's fixes, a test's recording, an
+        updated lockfile. A file here that changed after it was sent, or a new
+        one that appears here meanwhile, is newer and is kept; a new file this
+        checkout ignores is left there."""
+        found = subprocess.run(self.remote("written", slot), stdin=subprocess.DEVNULL,
+                               capture_output=True)
+        if found.returncode:
+            return found.returncode
+        written = [(base64.b64decode(name), new) for name, new in json.loads(found.stdout)]
+        here = os.fsencode(top)
+        added = [name for name, new in written if new]
+        ignored = set()
+        if added:
+            check = subprocess.run(["git", "-C", top, "check-ignore", "-z", "--stdin"],
+                                   input=b"".join(name + b"\0" for name in added),
+                                   capture_output=True)
+            if check.returncode in (0, 1):
+                ignored = set(check.stdout.split(b"\0"))
+            else:
+                say("cannot tell which files the command added are ignored here; left on "
+                    f"{self.host}: {', '.join(map(os.fsdecode, added))}")
+                ignored = set(added)
+        wanted = []
+        for name, new in written:
+            path = os.path.join(here, name)
+            if new and name in ignored:
                 continue
-            try:
-                status = os.lstat(os.path.join(top, name))
-                now = (status.st_size, status.st_mtime_ns)
-            except OSError:
-                now = None
-            (fixed if now == sent.get(name) else kept).append(name)
-        for name in kept:
-            say(f"not applying the build host's fixes to {name}, which changed here meanwhile")
-        if not fixed:
+            if new and os.path.lexists(path):
+                say(f"not taking {os.fsdecode(name)} from {self.host}: it appeared here "
+                    "while the command ran")
+            elif not new and file_state(path) != sent.get(name):
+                say(f"not taking {os.fsdecode(name)} from {self.host}: it changed here "
+                    "while the command ran")
+            else:
+                wanted.append((name, new))
+        if not wanted:
             return 0
-        status = self.fetch(f"{source}/", top + "/", shell, files=fixed)
-        if not status:
-            say(f"applied fixes to {len(fixed)} file{'s' if len(fixed) != 1 else ''}")
-        return status
+        # Copied beside the checkout first, so that nothing here is written
+        # until each file is installed with its own check.
+        with tempfile.TemporaryDirectory(prefix="cagents-offload-written-") as staging:
+            status = self.fetch(f"{source}/", staging + "/", shell, files=[name for name, _ in wanted])
+            if status or self.cancelled:
+                return status
+            taken = []
+            for name, new in wanted:
+                outcome = install(os.path.join(os.fsencode(staging), name), os.path.join(here, name),
+                                  None if new else sent[name])
+                if outcome == "taken":
+                    taken.append(os.fsdecode(name))
+                elif outcome != "same":
+                    say(f"not taking {os.fsdecode(name)} from {self.host}: it {outcome} here "
+                        "while the command ran")
+        if taken:
+            say(f"took back what the command wrote here: {', '.join(taken)}")
+        return 0
 
     def triple(self, plan):
         """The target `cargo run` builds for: the one given, or this host's."""
@@ -2138,6 +2399,9 @@ class Offload:
             return 101
         executable = rewrite(launch["program"], mappings)
         environment = dict(self.environment)
+        # The gate's share count was for the build; a gate the program
+        # starts counts its own.
+        environment.pop("CAGENTS_BUILD_SHARES", None)
         for name, value in launch["environment"].items():
             environment[name] = rewrite(value, mappings)
         environment["CARGO"] = shutil.which(real_cargo(self.environment)) or environment.get("CARGO", "")
@@ -2189,13 +2453,12 @@ class Offload:
 class Hold(Offload):
     """Leases one slot on the build host and holds it while `command` runs
     here, for a script of builds such as the development runner's: each
-    gated Cargo command in it builds in that slot, one at a time, with no
-    admission of its own. Tests run there too, priced by what they hold while
-    they run and at the hold's cost again once they end. The slot stays
-    leased until the command ends, so hold only for builds."""
+    gated Cargo command in it builds in that slot, one at a time, each taking
+    its own memory shares there. The slot stays leased until the command
+    ends, so hold only for builds."""
 
-    def __init__(self, host, command, environment):
-        super().__init__(host, None, environment)
+    def __init__(self, host, command, environment, loopback=False):
+        super().__init__(host, None, environment, loopback)
         self.program = command
 
     def build_identity(self, directory):
@@ -2281,12 +2544,12 @@ RUNNER = ["python3", "-c",
           "'CARGO_PRIMARY_PACKAGE')}}), flush=True)"]
 
 
-def positive(environment, name, default):
+def positive(environment, name, default, least=1):
     value = environment.get(name, "")
     if not value:
         return default
-    if not value.isdigit() or value.startswith("0"):
-        say(f"{name} must be a positive integer")
+    if not value.isdigit() or value.startswith("0") and value != "0" or int(value) < least:
+        say(f"{name} must be a {'positive' if least else 'nonnegative'} integer")
         sys.exit(2)
     return int(value)
 
@@ -2339,20 +2602,60 @@ def say(message):
 
 
 def main(arguments):
+    if arguments[:1] == ["--loopback-shell"]:
+        return loopback_shell(arguments[1:])
+    if arguments[:1] == ["--trim-slots"]:
+        # Bounds this host's own idle offload slots, as their leases do,
+        # for scripts/build-disk-guard: FLOOR in GiB, then --wait to wait
+        # for what they free.
+        if len(arguments) < 2 or not arguments[1].isdigit() or arguments[2:] not in ([], ["--wait"]):
+            say("usage: cargo-offload --trim-slots FLOOR_GIB [--wait]")
+            return 2
+        # The slots sshd's sessions make, under the account's home, whatever
+        # HOME a fixture or native-evidence build gives this process.
+        root = os.environ.get("CAGENTS_BUILD_OFFLOAD_SLOTS",
+                              os.path.join(pwd.getpwuid(os.getuid()).pw_dir, ".cache", "cagents-offload"))
+        if not root or not os.path.isdir(root):
+            return 0
+        # It may outlive the build that started it, which must not stay
+        # holding the build's locks through it.
+        os.closerange(3, resource.getrlimit(resource.RLIMIT_NOFILE)[0])
+        budget = positive(os.environ, "CAGENTS_BUILD_REMOTE_INCREMENTAL_GIB", INCREMENTAL_GIB, least=0)
+        sys.argv = ["cargo-offload", "trim", root, str(budget), *arguments[1:]]
+        exec(compile(REMOTE_AGENT, "cargo-offload", "exec"), {"__name__": "cargo-offload-agent"})
+        return 0
     # The gate passes on where it found builds go, so this cannot decide
     # otherwise, such as when a slow name lookup ends differently, and exit
     # FALL_BACK having built nothing. Nothing this starts inherits it.
     decided = os.environ.pop("CAGENTS_BUILD_OFFLOAD_HOST", "")
+    decided, loopback = decided.removesuffix(LOOPBACK_MARK), decided.endswith(LOOPBACK_MARK)
     environment = dict(os.environ)
+    if arguments[:1] == ["--stamp"]:
+        # The version stamp for a build here of the workspace the Cargo
+        # arguments that follow name, which the gate passes to Cargo as a
+        # build host's offload would: a line, empty for none. Status 1
+        # outside a Cargo workspace in a Git checkout.
+        stamp = checkout_stamp(arguments[1:], environment)
+        if stamp is None:
+            return 1
+        print(stamp)
+        return 0
     # Only `local` builds here; an empty setting is no setting.
     host = decided or environment.get("CAGENTS_BUILD_REMOTE") or "fw16"
-    here = not decided and (host == "local" or is_this_host(host))
+    here = False
+    if not decided and host == "local":
+        here = True
+    elif not decided and is_this_host(host):
+        # The build host itself builds in place, unless asked to use its slots.
+        loopback = environment.get(LOOPBACK) == "1"
+        here = not loopback
     if arguments[:1] == ["--host"]:
-        # Where builds go: 0, printing the build host, or FALL_BACK when
-        # this host builds. Any other status is a failure.
+        # Where builds go: 0, printing the build host, marked when that is
+        # this host reached by loopback, or FALL_BACK when this host builds
+        # in place. Any other status is a failure.
         if here:
             return FALL_BACK
-        print(host)
+        print(host + (LOOPBACK_MARK if loopback else ""))
         return 0
     if here:
         return FALL_BACK
@@ -2360,7 +2663,7 @@ def main(arguments):
         if len(arguments) < 2:
             say("missing command for --hold")
             return 2
-        return Hold(host, arguments[1:], environment).run()
+        return Hold(host, arguments[1:], environment, loopback).run()
     try:
         plan = parse(arguments)
     except Refusal as refusal:
@@ -2369,7 +2672,11 @@ def main(arguments):
     if plan is None:
         cargo = real_cargo(environment)
         os.execvp(cargo, [cargo, *arguments])
-    return Offload(host, plan, environment).run()
+    try:
+        return Offload(host, plan, environment, loopback).run()
+    except Refusal as refusal:
+        say(str(refusal))
+        return REFUSED
 
 
 if __name__ == "__main__":

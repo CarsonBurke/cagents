@@ -172,6 +172,14 @@ impl NativeActorOwnership {
     pub(in crate::host) fn scope(&self) -> Result<&LaunchAccountScope, &str> {
         self.scope.as_ref().map_err(String::as_str)
     }
+    /// The row an identity confirmation publishes: same phase, actor, owner
+    /// and account; only the descriptor gains its confirmed conversation.
+    pub(in crate::host) fn with_source(&self, source: &chat::Session) -> Self {
+        Self {
+            source: source.clone(),
+            ..self.clone()
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -292,6 +300,37 @@ pub(super) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+// Shared shape checks for registration and authenticated metadata refresh.
+// Refreshing an existing row does not revalidate or reselect its account path.
+fn validate_actor_source(
+    actor: Uuid,
+    owner: &Record,
+    source: &chat::Session,
+    phase: NativeActorPhase,
+) -> Result<(), String> {
+    if actor.is_nil()
+        || owner.kind != crate::daemon::holder_registry::Kind::Native
+        || !crate::daemon::holder_registry::record_application_matches(owner)
+        || owner.terminal != source.id
+        || source.launch.provider != crate::agent::Provider::Claude
+        || !source
+            .proof
+            .as_ref()
+            .is_some_and(|proof| proof.is_complete() && proof.boot_id == owner.boot)
+        || !valid_continuity(source, phase)
+        || source.owned_codex_listener.is_some()
+        || source
+            .launch
+            .session_id
+            .as_ref()
+            .is_some_and(|id| Uuid::parse_str(id).is_err())
+        || !source.has_valid_native_continuity()
+    {
+        return Err("Retained actor census has invalid authenticated ownership".into());
+    }
+    Ok(())
+}
+
 impl Registry {
     /// Publish after authenticating installation/adoption and before exposing
     /// a handle that accepts input. This is a known-owner census, not launch
@@ -326,26 +365,7 @@ impl Registry {
         scope: Result<&LaunchAccountScope, &str>,
         phase: NativeActorPhase,
     ) -> Result<(), String> {
-        if actor.is_nil()
-            || owner.kind != crate::daemon::holder_registry::Kind::Native
-            || !crate::daemon::holder_registry::record_application_matches(owner)
-            || owner.terminal != source.id
-            || source.launch.provider != crate::agent::Provider::Claude
-            || !source
-                .proof
-                .as_ref()
-                .is_some_and(|proof| proof.is_complete() && proof.boot_id == owner.boot)
-            || !valid_continuity(source, phase)
-            || source.owned_codex_listener.is_some()
-            || source
-                .launch
-                .session_id
-                .as_ref()
-                .is_some_and(|id| Uuid::parse_str(id).is_err())
-            || !source.has_valid_native_continuity()
-        {
-            return Err("Retained actor census has invalid authenticated ownership".into());
-        }
+        validate_actor_source(actor, owner, source, phase)?;
         let scope = match scope {
             Ok(scope)
                 if scope.provider == source.launch.provider
@@ -426,6 +446,67 @@ impl Registry {
         }
         tx.execute("INSERT INTO native_actor_ownerships(actor,ownership) VALUES (?1,?2) ON CONFLICT(actor) DO UPDATE SET ownership=excluded.ownership",params![actor.to_string(),encoded]).map_err(|e|e.to_string())?;
         tx.commit().map_err(|e| e.to_string())
+    }
+
+    /// Refresh helper-authenticated metadata of an existing installed actor.
+    /// The captured physical scope remains unchanged, including after its path
+    /// disappears. This neither installs a writer nor promotes cleanup intent.
+    pub(in crate::host) fn confirm_native_actor_identity(
+        &mut self,
+        expected: &NativeActorOwnership,
+        source: &chat::Session,
+    ) -> Result<(), String> {
+        if expected.is_pending()
+            || source.launch.session_id.is_none()
+            || !compatible_source(&expected.source, source)
+        {
+            return Err("Retained metadata does not match its installed actor".into());
+        }
+        validate_actor_source(
+            expected.actor,
+            &expected.owner,
+            source,
+            NativeActorPhase::Installed,
+        )?;
+        let next = expected.with_source(source);
+        let encoded = serde_json::to_string(&next).map_err(|error| error.to_string())?;
+        if encoded.len() > MAX_RECEIPT_BYTES {
+            return Err("Retained actor census exceeds its metadata bound".into());
+        }
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let current: Option<String> = tx
+            .query_row(
+                "SELECT ownership FROM native_actor_ownerships WHERE actor=?1",
+                [expected.actor.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let current = current.ok_or("Retained metadata lost its installed actor")?;
+        if current.len() > MAX_RECEIPT_BYTES {
+            return Err("Stored actor census exceeds its metadata bound".into());
+        }
+        let current: NativeActorOwnership =
+            serde_json::from_str(&current).map_err(|error| error.to_string())?;
+        let retired: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM native_actor_retirements WHERE actor=?1)",
+                [expected.actor.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if current != *expected || retired {
+            return Err("Retained metadata ownership changed before publication".into());
+        }
+        tx.execute(
+            "UPDATE native_actor_ownerships SET ownership=?2 WHERE actor=?1",
+            params![expected.actor.to_string(), encoded],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())
     }
 
     /// Exact bounded census lookup. Absence is distinct from an unreadable row;
@@ -529,6 +610,46 @@ impl Registry {
         Ok(None)
     }
 
+    /// Every owner the census registered for allocation `terminal`, under its
+    /// conversation or as its own allocation, each with whether its retirement
+    /// is recorded: the roster the upgrade inspector reads from the store
+    /// file, read here through the daemon's own connection.
+    pub(in crate::host) fn native_actor_owners_of(
+        &self,
+        terminal: crate::model::TerminalId,
+    ) -> Result<Vec<(Record, bool)>, String> {
+        // As above, the prefilter only spares decoding other allocations' rows.
+        let mut statement = self
+            .db
+            .prepare(
+                "SELECT o.actor,o.ownership,r.actor IS NOT NULL FROM native_actor_ownerships o
+                 LEFT JOIN native_actor_retirements r ON r.actor=o.actor
+                 WHERE instr(o.ownership, ?1) > 0 ORDER BY o.rowid",
+            )
+            .map_err(|e| e.to_string())?;
+        let mut rows = statement
+            .query([terminal.to_string()])
+            .map_err(|e| e.to_string())?;
+        let mut owners = Vec::new();
+        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            let actor: String = row.get(0).map_err(|e| e.to_string())?;
+            let encoded: String = row.get(1).map_err(|e| e.to_string())?;
+            let retired: bool = row.get(2).map_err(|e| e.to_string())?;
+            if encoded.len() > MAX_RECEIPT_BYTES {
+                return Err("Stored actor census exceeds its metadata bound".into());
+            }
+            let ownership: NativeActorOwnership =
+                serde_json::from_str(&encoded).map_err(|e| e.to_string())?;
+            if ownership.actor.to_string() != actor || ownership.actor.is_nil() {
+                return Err("Stored actor census key changed its identity".into());
+            }
+            if ownership.source.id == terminal || ownership.owner.terminal == terminal {
+                owners.push((ownership.owner, retired));
+            }
+        }
+        Ok(owners)
+    }
+
     /// Call only after the authenticated handle's finish_retained_close proves
     /// semantic/loss ACK, exact helper disappearance and discovery retirement.
     /// A completed provider, Stop ACK or an absent socket is never sufficient.
@@ -610,6 +731,13 @@ impl Registry {
             )
             .map_err(|e| e.to_string())?;
         }
+        // Exact provider retirement also ends a pending view replacement.
+        // Its console intent must never revive an explicitly closed agent.
+        tx.execute(
+            "DELETE FROM console_relaunches WHERE actor=?1",
+            [actor.to_string()],
+        )
+        .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())
     }
 
@@ -1281,6 +1409,79 @@ mod tests {
                 .is_err(),
             "a finally retired unknown owner cannot acquire a later caller's account identity"
         );
+    }
+
+    #[test]
+    fn identity_metadata_preserves_captured_scope_and_rejects_changed_ownership() {
+        for case in 0..11 {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let home = directory.path().join("home");
+            std::fs::create_dir(&home).unwrap();
+            let mut registry = Registry::at(&directory.path().join("registry")).unwrap();
+            let (actor, owner, original, scope) = fixture(&home);
+            registry
+                .register_native_actor_ownership(actor, &owner, &original, Ok(&scope))
+                .unwrap();
+            let mut expected = registry.native_actor_ownership(actor).unwrap().unwrap();
+            let mut confirmed = original.clone();
+            confirmed.launch.session_id = Some("11111111-1111-4111-8111-111111111111".into());
+            match case {
+                0 => std::fs::remove_dir(&home).unwrap(),
+                1 => {
+                    std::fs::rename(&home, directory.path().join("previous-home")).unwrap();
+                    std::fs::create_dir(&home).unwrap();
+                }
+                2 => expected.phase = NativeActorPhase::Pending,
+                3 => expected.owner.root.start += 1,
+                4 => expected.scope = Err("changed account".into()),
+                5 => registry
+                    .commit_native_actor_retirement(actor, &owner, &original, Ok(&scope), None)
+                    .unwrap(),
+                6 => {
+                    registry
+                        .db
+                        .execute(
+                            "DELETE FROM native_actor_ownerships WHERE actor=?1",
+                            [actor.to_string()],
+                        )
+                        .unwrap();
+                }
+                7 => confirmed.proof.as_mut().unwrap().boot_id = "different-boot".into(),
+                8 => confirmed
+                    .launch
+                    .recipe
+                    .arguments
+                    .push("different-process".into()),
+                9 => confirmed.id = crate::model::TerminalId::new(),
+                10 => confirmed.launch.session_id = None,
+                _ => unreachable!(),
+            }
+            let result = registry.confirm_native_actor_identity(&expected, &confirmed);
+            if case <= 1 {
+                result.unwrap();
+                let updated = registry.native_actor_ownership(actor).unwrap().unwrap();
+                assert_eq!(updated.source(), &confirmed);
+                assert_eq!(updated.scope(), Ok(&scope));
+                assert_eq!(updated.owner(), &owner);
+                assert!(
+                    registry
+                        .register_native_actor_ownership(actor, &owner, &confirmed, Ok(&scope))
+                        .is_err(),
+                    "ordinary writer registration must still validate the account path"
+                );
+            } else {
+                assert!(
+                    result.is_err(),
+                    "case {case} must not gain metadata authority"
+                );
+                let current = registry.native_actor_ownership(actor).unwrap();
+                if case == 6 {
+                    assert!(current.is_none());
+                } else {
+                    assert_eq!(current.unwrap().source(), &original);
+                }
+            }
+        }
     }
 
     #[test]
