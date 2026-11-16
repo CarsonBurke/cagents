@@ -22932,6 +22932,13 @@ mod tests {
                 card,
                 CardRuntime::Repository(Box::new(RepositoryRuntime::shown_diff_fixture(card))),
             );
+            let CardRuntime::Repository(runtime) = &app.cards[&card] else {
+                unreachable!()
+            };
+            assert!(
+                !runtime.requests_shown_diff(),
+                "already requested: {field:?}"
+            );
             drop(app.apply_setting_input(field, value.into()));
             let CardRuntime::Repository(runtime) = &app.cards[&card] else {
                 unreachable!()
