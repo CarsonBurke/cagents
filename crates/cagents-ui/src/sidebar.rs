@@ -16190,6 +16190,49 @@ pub(crate) mod tests {
         assert_eq!(comparisons(), before + 3);
     }
 
+    /// A channel's mark and count come from its members, so a change in who
+    /// is at work redraws the list, and a refresh that finds the same members
+    /// does not.
+    #[test]
+    fn navigation_cache_redraws_when_a_channels_members_change() {
+        use crate::agent::Provider;
+        let mut project = project();
+        project.channels.push(SidebarChannel::new(
+            ChannelId::new(),
+            "Release prep".into(),
+            false,
+            None,
+            false,
+            1,
+            true,
+            1,
+        ));
+        let mut model = SidebarModel::ready(SidebarMode::Expanded, vec![project]);
+        let state = SidebarState::default();
+        let cache = NavigationCache::default();
+        let alone = cache.generation(&model, &state);
+
+        let mut members = ChannelMembers::default();
+        members.add_agent(Provider::Claude, ChannelMemberState::Working);
+        let channel = &mut model.projects[0].channels[0];
+        *channel = channel.clone().with_members(members);
+        let working = cache.generation(&model, &state);
+        assert_ne!(alone, working, "an agent joining is drawn");
+
+        let channel = &mut model.projects[0].channels[0];
+        *channel = channel.clone().with_members(members);
+        assert_eq!(working, cache.generation(&model, &state));
+
+        members.add_agent(Provider::Codex, ChannelMemberState::Idle);
+        let channel = &mut model.projects[0].channels[0];
+        *channel = channel.clone().with_members(members);
+        assert_ne!(
+            working,
+            cache.generation(&model, &state),
+            "a second agent is drawn"
+        );
+    }
+
     #[test]
     fn navigation_cache_ignores_large_source_control_and_file_panel_interactions() {
         let mut model = SidebarModel::ready(SidebarMode::Expanded, vec![project()]);

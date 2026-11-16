@@ -613,7 +613,7 @@ mod tests {
     #[test]
     fn a_cut_masks_everything_the_artwork_draws() {
         let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" fill="black"><path d="M0 0h22v22H0z"/></svg>"#;
-        let cut = cut(
+        let masked = cut(
             svg,
             11.0,
             Hole::Circle {
@@ -624,7 +624,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            cut,
+            masked,
             r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" fill="black"><defs><mask id="cagents-cut" maskUnits="userSpaceOnUse" x="0" y="0" width="22" height="22"><rect x="0" y="0" width="22" height="22" fill="white"/><ellipse cx="2" cy="4" rx="6" ry="6" fill="black"/></mask></defs><g mask="url(#cagents-cut)"><path d="M0 0h22v22H0z"/></g></svg>"#
         );
         assert!(
@@ -659,9 +659,9 @@ mod tests {
                     height: 13.0,
                 },
             ] {
-                let cut = cut(svg, LEAD, hole).unwrap_or_else(|| panic!("{provider:?}"));
-                assert!(cut.contains(r#"<g mask="url(#cagents-cut)">"#));
-                assert!(cut.ends_with("</g></svg>"), "{provider:?}");
+                let masked = cut(svg, LEAD, hole).unwrap_or_else(|| panic!("{provider:?}"));
+                assert!(masked.contains(r#"<g mask="url(#cagents-cut)">"#));
+                assert!(masked.ends_with("</g></svg>"), "{provider:?}");
             }
         }
     }
