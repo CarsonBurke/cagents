@@ -98,7 +98,7 @@ pub struct RemoveArgs {
     yes: bool,
 }
 
-#[derive(Debug, clap::Args)]
+#[derive(Debug, Default, PartialEq, clap::Args)]
 pub struct WorkListArgs {
     /// Only the open project with this name, or containing this path. The
     /// default is the project containing the current directory, or every
@@ -1526,6 +1526,7 @@ mod tests {
     fn work_alone_lists_and_takes_the_list_options() {
         let parse = |arguments: &[&str]| {
             Cli::try_parse_from(std::iter::once("cagents").chain(arguments.iter().copied()))
+                .and_then(Cli::validated)
         };
         let Ok(Cli {
             command:
@@ -1551,6 +1552,18 @@ mod tests {
             })
         ));
         assert!(parse(&["work", "--all", "rm", "x"]).is_err());
+        // Global options still combine with a subcommand.
+        assert!(matches!(
+            parse(&["work", "--json", "rm", "x", "--dry-run"]),
+            Ok(Cli {
+                json: true,
+                command: TopCommand::Work {
+                    command: Some(WorkCommand::Rm(_)),
+                    ..
+                },
+                ..
+            })
+        ));
         assert!(parse(&["work", "--all", "--project", "x"]).is_err());
     }
 

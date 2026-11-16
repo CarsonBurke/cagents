@@ -138,6 +138,27 @@ pub struct Cli {
     pub command: TopCommand,
 }
 
+impl Cli {
+    /// What the grammar alone cannot refuse. `work`'s list options sit beside
+    /// its subcommands so `cagents work` lists, but mean nothing to one.
+    /// Clap's own conflict would also refuse the global options there.
+    fn validated(self) -> Result<Self, clap::Error> {
+        if let TopCommand::Work {
+            command: Some(_),
+            list,
+        } = &self.command
+            && *list != WorkListArgs::default()
+        {
+            use clap::CommandFactory;
+            return Err(Self::command().error(
+                ClapErrorKind::ArgumentConflict,
+                "the list options of `cagents work` cannot be used with a subcommand",
+            ));
+        }
+        Ok(self)
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub enum TopCommand {
     /// Generate a shell completion script without contacting services.
@@ -182,7 +203,6 @@ pub enum TopCommand {
     /// Read the messages left for this session.
     Inbox(InboxArgs),
     /// List this project's worktrees and branches in progress, newest activity first; or pin or remove one.
-    #[command(args_conflicts_with_subcommands = true)]
     Work {
         #[command(subcommand)]
         command: Option<WorkCommand>,
@@ -2950,7 +2970,7 @@ where
         emit_error(wants_json, &AppError::new("daemon_startup", error));
         return ExitCode::FAILURE;
     }
-    let cli = match Cli::try_parse_from(arguments.clone()) {
+    let cli = match Cli::try_parse_from(arguments.clone()).and_then(Cli::validated) {
         Ok(cli) => cli,
         Err(error)
             if matches!(
