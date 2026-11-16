@@ -5,11 +5,11 @@ use crate::{
         Account,
         cache::{Cache, Entry},
         home::Homes,
-        info::{AccountInfo, Caller, Query, Report},
+        info::{AccountInfo, Caller, Query, RemainingWindow, Report},
         probe,
         registry::Store,
     },
-    agent_execution::Authority,
+    agent_execution::{Authority, directory::SessionAccount},
 };
 
 pub(super) fn read(
@@ -228,6 +228,58 @@ pub(super) fn read(
     })
 }
 
+/// Consume uses the same registry and lifecycle boundary as a usage refresh.
+/// The wire request carries only an ID, so remote clients cannot select a home.
+/// The caller holds shared control admission until the provider and refresh end.
+pub(in crate::host) fn consume(
+    host: &SharedHost,
+    request: crate::account::resets::ConsumeRequest,
+) -> Result<crate::account::resets::ConsumeOutcome, String> {
+    let registry = Store::installation()
+        .ok_or("Account registry is unavailable")?
+        .load()
+        .map_err(|error| error.to_string())?;
+    if registry.is_newer() {
+        return Err("Account registry needs a newer cagents version".into());
+    }
+    let homes = Homes::installation();
+    let account = registry
+        .accounts(homes.as_ref())
+        .into_iter()
+        .find(|account| account.id() == request.account)
+        .ok_or("This account is no longer configured; refresh accounts")?;
+    if let Some(registered) = account
+        .registry_key()
+        .and_then(|key| registry.registered().iter().find(|entry| entry.key == key))
+    {
+        let registered = registered.identity();
+        if registered.email.is_some()
+            && request
+                .expected_identity
+                .as_ref()
+                .is_some_and(|expected| !registered.claims_same_login(expected))
+        {
+            return Err(
+                "The confirmed login no longer matches the registered account; refresh accounts"
+                    .into(),
+            );
+        }
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?;
+    with_refresh_admission(host, &account, || {
+        runtime.block_on(probe::consume(
+            account.clone(),
+            request.reset_id,
+            request.idempotency_key,
+            request.expected_identity,
+            Cache::installation(),
+        ))
+    })
+}
+
 /// The caller already holds shared control admission through the refresh.
 /// This is only a negative lifecycle check, not account selection/read authority.
 /// Keep it immediately before provider work; cached reads never invoke it.
@@ -259,15 +311,78 @@ fn report_accounts(
 }
 
 fn apply(info: &mut AccountInfo, entry: Entry, now: u64) {
-    info.identity_conflict = info.registered_identity.as_ref().is_some_and(|registered| {
-        entry.identity.as_ref().is_some_and(|observed| {
-            registered.email.is_some()
-                && observed.email.is_some()
-                && !registered.same_login(observed)
-        })
-    });
+    // A login whose records disagree about who it is conflicts with itself.
+    let disputed = entry
+        .identity
+        .as_ref()
+        .is_some_and(|observed| observed.disputed_by.is_some());
+    info.identity_conflict = disputed
+        || info.registered_identity.as_ref().is_some_and(|registered| {
+            entry.identity.as_ref().is_some_and(|observed| {
+                registered.email.is_some()
+                    && observed.email.is_some()
+                    && !registered.claims_same_login(observed)
+            })
+        });
     info.observed_identity = entry.identity;
     info.set_usage(entry.snapshot, now);
+}
+
+/// The configured accounts and their cached usage, read once so a listing
+/// can name each session's account without re-reading them per session.
+pub(super) struct Accounts {
+    registry: crate::account::registry::Registry,
+    all: Vec<Account>,
+    cached: std::collections::BTreeMap<String, Entry>,
+    now: u64,
+}
+
+impl Accounts {
+    /// `None` when the installation has no readable account registry, as a
+    /// listing then names no accounts rather than failing.
+    pub(super) fn load(now: u64) -> Option<Self> {
+        let registry = Store::installation()?.load().ok()?;
+        if registry.is_newer() {
+            return None;
+        }
+        let all = registry.all_accounts(Homes::installation().as_ref());
+        let cached = Cache::installation()
+            .map(|cache| cache.load(now))
+            .unwrap_or_default();
+        Some(Self {
+            registry,
+            all,
+            cached,
+            now,
+        })
+    }
+
+    /// The account a chat's provider runs on, by the environment it was
+    /// started with, and its last observed allowance.
+    pub(super) fn of(
+        &self,
+        provider: crate::agent::Provider,
+        environment: &std::collections::BTreeMap<String, String>,
+    ) -> Option<SessionAccount> {
+        let account = select(&self.all, provider, environment)?;
+        let usage = account
+            .cache_key()
+            .and_then(|key| self.cached.get(&key))
+            .map(|entry| &entry.snapshot);
+        let remaining = usage.map_or_else(Vec::new, |usage| RemainingWindow::of(usage, self.now));
+        Some(SessionAccount {
+            id: account.id(),
+            label: self.registry.label(&account).map(str::to_owned),
+            status: usage.map(|usage| usage.status),
+            stale: RemainingWindow::stale(
+                usage.and_then(|usage| self.now.checked_sub(usage.observed_at)),
+                &remaining,
+            ),
+            remaining,
+            observed_at: usage.map(|usage| usage.observed_at),
+            ordinary_usage_allowed: usage.and_then(|usage| usage.ordinary_usage_allowed),
+        })
+    }
 }
 
 /// Match the effective environment captured by the executing host. Durable

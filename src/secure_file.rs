@@ -49,7 +49,7 @@ pub(crate) fn reject_symlink_components(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-pub(crate) fn validate_owned_directory(path: &Path) -> io::Result<()> {
+pub fn validate_owned_directory(path: &Path) -> io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(storage_error(path, "expected a real directory"));

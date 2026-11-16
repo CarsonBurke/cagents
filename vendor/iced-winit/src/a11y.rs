@@ -134,7 +134,11 @@ pub(crate) fn tree_update(
                 .root()
                 .iter()
                 .chain(widgets.children())
-                .find(|node| IdEq::eq(node.id(), &focused))
+                // Keep widget focus for a clipped control so it can return,
+                // but publish only focus that is visible in this snapshot.
+                .find(|node| {
+                    IdEq::eq(node.id(), &focused) && !node.node().is_hidden()
+                })
                 .map(|node| NodeId::from(node.id().clone()))
         })
         .unwrap_or(root);
@@ -181,6 +185,59 @@ mod tests {
         assert_eq!(update.nodes.len(), 2);
         assert_eq!(update.nodes[1].1.children(), &[update.focus]);
         assert_eq!(update.nodes[1].1.label(), Some("Workspace"));
+    }
+
+    #[test]
+    fn clipped_retained_focus_uses_window_until_target_returns() {
+        use iced_accessibility::A11yNode;
+
+        let root = core::id::window_node_id();
+        for nested in [false, true] {
+            let emitted = Id::new("clipped-workspace-control");
+            let focused = Id::new("clipped-workspace-control");
+            let emitted_id =
+                NodeId::from(iced_accessibility::A11yId::from(emitted.clone()));
+            let widgets = |hidden: bool| {
+                let mut node = Node::new(Role::TextInput);
+                if hidden {
+                    node.set_hidden();
+                }
+                let target = A11yTree::leaf(node, emitted.clone());
+                if nested {
+                    A11yTree::node_with_child_tree(
+                        A11yNode::new(Node::new(Role::Group), Id::unique()),
+                        target,
+                    )
+                } else {
+                    target
+                }
+            };
+
+            let clipped = tree_update(
+                root,
+                String::new(),
+                widgets(true),
+                Some(focused.clone()),
+                1.5,
+            );
+            assert_eq!(clipped.focus, NodeId(root));
+            assert!(
+                clipped.nodes.iter().any(|(id, node)| {
+                    *id == emitted_id && node.is_hidden()
+                })
+            );
+
+            // Camera/slot changes must not require a new focus operation or
+            // discard the retained widget's original accessibility identity.
+            let returned = tree_update(
+                root,
+                String::new(),
+                widgets(false),
+                Some(focused),
+                1.5,
+            );
+            assert_eq!(returned.focus, emitted_id);
+        }
     }
 
     #[test]

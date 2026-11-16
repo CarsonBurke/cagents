@@ -5,15 +5,19 @@ use crate::process::{CancellationToken, CommandSpec, ProcessExecutor, SystemProc
 use std::{
     fs,
     io::Write,
-    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
     time::Duration,
 };
 
 // Isolate before application code snapshots GIT_CONFIG_PARAMETERS/COUNT. A
 // launch-only executor scrub cannot undo their later controlled re-export.
-pub(crate) fn isolated_fixture_case(qualified: &str) -> bool {
-    let prefix = concat!(env!("CARGO_CRATE_NAME"), "::");
-    let case = qualified.strip_prefix(prefix).unwrap_or(qualified);
+//
+// `qualified` starts with the calling crate's name, as `module_path!()` does;
+// libtest names a case without it. Callers are in this crate and the UI crate.
+pub fn isolated_fixture_case(qualified: &str) -> bool {
+    let case = qualified
+        .split_once("::")
+        .map_or(qualified, |(_crate, case)| case);
     if std::env::var("CAGENTS_PR_FIXTURE_CASE").as_deref() == Ok(case) {
         assert!(
             std::env::vars_os().all(|(name, _)| !name.as_encoded_bytes().starts_with(b"GIT_")),
@@ -32,15 +36,8 @@ pub(crate) fn isolated_fixture_case(qualified: &str) -> bool {
         }
         return false;
     }
-    let private = |prefix: &str| {
-        tempfile::Builder::new()
-            .prefix(prefix)
-            .permissions(fs::Permissions::from_mode(0o700))
-            .tempdir()
-            .unwrap()
-    };
-    let runtime = private("cagents-pr-runtime-");
-    let data = private("cagents-pr-data-");
+    let runtime = crate::test_fixture::tempdir_with_prefix("cagents-pr-runtime-").unwrap();
+    let data = crate::test_fixture::tempdir_with_prefix("cagents-pr-data-").unwrap();
     let mut command = CommandSpec::new(std::env::current_exe().unwrap())
         .args([
             case,
@@ -103,7 +100,8 @@ pub(crate) fn isolated_fixture_case(qualified: &str) -> bool {
             .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;")),
         "exact selector must run one owning case: {stdout}\n{stderr}"
     );
-    print!("{stdout}");
-    eprint!("{stderr}");
+    // The outer harness owns the result stream. Keep successful child output
+    // private so its libtest summary cannot be mistaken for another outer test.
+    // The assertions above include both bounded streams when the child fails.
     true
 }

@@ -12,3 +12,4 @@ launch.sh
 nested.kdl
 observed.json
 shots/
+__pycache__/

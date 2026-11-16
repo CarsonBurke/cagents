@@ -30,6 +30,65 @@ const SUPERVISOR: &str = "--automation-precheck-supervisor";
 const EXECUTOR: &str = "--automation-precheck-executor";
 const MAX_RECORD: u64 = 128 * 1024;
 const CLEANUP_WINDOW: Duration = Duration::from_secs(2);
+const RETIREMENT_VERSION: u32 = 1;
+const MAX_RETIREMENT_RECORD: u64 = 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Retirement {
+    version: u32,
+    firing: Uuid,
+    revision: u64,
+    device: u64,
+    inode: u64,
+}
+
+/// A launch that spawned no helper. `nothing_created` means this firing left no
+/// private files, so there is never anything to retire; the error alone does
+/// not establish that, because a partial directory may survive a failed launch.
+#[derive(Debug)]
+pub struct LaunchError {
+    pub error: io::Error,
+    pub nothing_created: bool,
+}
+
+fn retirement_name(firing: Uuid) -> String {
+    format!("{firing}.retired")
+}
+
+fn read_retirement(root: &Path, firing: Uuid) -> io::Result<Option<(Retirement, File)>> {
+    crate::secure_file::reject_symlink_components(root)?;
+    crate::secure_file::validate_owned_directory(root)?;
+    if root.metadata()?.mode() & 0o077 != 0 {
+        return Err(io::Error::other("Precheck retirement root is not private"));
+    }
+    let mut file = match private_file(&root.join(retirement_name(firing))) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if file.metadata()?.len() > MAX_RETIREMENT_RECORD {
+        return Err(io::Error::other(
+            "Precheck retirement record exceeds its limit",
+        ));
+    }
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(MAX_RETIREMENT_RECORD + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_RETIREMENT_RECORD as usize {
+        return Err(io::Error::other(
+            "Precheck retirement record exceeds its limit",
+        ));
+    }
+    let record: Retirement = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+    if record.version != RETIREMENT_VERSION || record.firing != firing {
+        return Err(io::Error::other(
+            "Precheck retirement identity does not match",
+        ));
+    }
+    Ok(Some((record, file)))
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(in crate::host::automations) struct Request {
@@ -68,18 +127,121 @@ pub(in crate::host::automations) struct Worker {
     firing: Uuid,
     revision: u64,
     child: Option<Child>,
+    retirement: Option<Retirement>,
+    retirement_unlinked: bool,
 }
 
 impl Worker {
-    pub fn launch(root: &Path, request: &Request) -> io::Result<Self> {
-        validate_request(request)?;
-        crate::secure_file::prepare_private_directory(root)?;
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn retirement_is_unlinked(&self) -> bool {
+        self.retirement_unlinked
+    }
+
+    pub fn retirement_revision(root: &Path, firing: Uuid) -> io::Result<Option<u64>> {
+        read_retirement(root, firing).map(|record| record.map(|(record, _)| record.revision))
+    }
+
+    fn original_directory(&self) -> io::Result<Option<fs::Metadata>> {
+        match self.directory.symlink_metadata() {
+            Ok(metadata) if metadata.is_dir() => Ok(Some(metadata)),
+            Ok(_) => Err(io::Error::other(
+                "Precheck retirement directory was replaced",
+            )),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn launch(root: &Path, request: &Request) -> Result<Self, LaunchError> {
+        let unclaimed = |error| LaunchError {
+            error,
+            nothing_created: true,
+        };
+        let held = |error| LaunchError {
+            error,
+            nothing_created: false,
+        };
+        validate_request(request).map_err(unclaimed)?;
+        crate::secure_file::prepare_private_directory(root).map_err(unclaimed)?;
+        match root
+            .join(retirement_name(request.firing))
+            .symlink_metadata()
+        {
+            Ok(_) => {
+                return Err(held(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "This precheck still has durable retirement custody",
+                )));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(held(error)),
+        }
         let directory = root.join(request.firing.to_string());
         // Never reuse a firing's files, even if a previous launch died before
         // its first receipt. Retrying an arbitrary precheck could charge twice.
         std::os::unix::fs::DirBuilderExt::mode(&mut fs::DirBuilder::new(), 0o700)
-            .create(&directory)?;
-        create_record(&directory, "request", request)?;
+            .create(&directory)
+            .map_err(|error| LaunchError {
+                nothing_created: error.kind() != io::ErrorKind::AlreadyExists,
+                error,
+            })?;
+        let (lease, mut command) = match Self::prepare_launch(&directory, request) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                // This call made the directory and no helper exists yet, so
+                // only a durable removal leaves nothing that needs retiring.
+                let nothing_created = fs::remove_dir_all(&directory)
+                    .and_then(|()| File::open(root)?.sync_all())
+                    .is_ok();
+                return Err(LaunchError {
+                    error,
+                    nothing_created,
+                });
+            }
+        };
+        let child = match command.spawn() {
+            Ok(child) => {
+                // Only a successfully exec'd supervisor receives custody.
+                // Failure paths retain scoped ownership and unlock on return.
+                drop(lease.into_file());
+                Some(child)
+            }
+            Err(error) => {
+                // spawn reports exec failure before any helper could launch
+                // the user's command. This is a proved safe terminal result.
+                create_record(
+                    &directory,
+                    "receipt",
+                    &Receipt {
+                        firing: request.firing,
+                        revision: request.revision,
+                        outcome: failed(format!("Precheck helper could not start: {error}")),
+                    },
+                )
+                .map_err(held)?;
+                drop(lease);
+                None
+            }
+        };
+        Ok(Self {
+            directory,
+            firing: request.firing,
+            revision: request.revision,
+            child,
+            retirement: None,
+            retirement_unlinked: false,
+        })
+    }
+
+    /// Everything before spawn: failure here proves no helper can exist.
+    fn prepare_launch(
+        directory: &Path,
+        request: &Request,
+    ) -> io::Result<(crate::instance::OwnedLock, Command)> {
+        create_record(directory, "request", request)?;
         let lease = OpenOptions::new()
             .read(true)
             .write(true)
@@ -87,16 +249,17 @@ impl Worker {
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(directory.join("lease"))?;
-        if unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let lease = crate::instance::owned_file_lock(lease, libc::LOCK_EX | libc::LOCK_NB)?;
         lease.sync_all()?;
-        File::open(&directory)?.sync_all()?;
+        File::open(directory)?.sync_all()?;
         let fd = lease.as_raw_fd();
+        #[cfg(not(test))]
         let mut command = Command::new(std::env::current_exe()?);
+        #[cfg(test)]
+        let mut command = Command::new(test_helper_executable()?);
         command
             .args([SUPERVISOR])
-            .arg(&directory)
+            .arg(directory)
             .arg(fd.to_string())
             .env_remove(crate::agent_execution::AUTHORITY_ENV)
             .stdin(Stdio::null())
@@ -115,30 +278,7 @@ impl Worker {
                 Ok(())
             });
         }
-        let child = match command.spawn() {
-            Ok(child) => Some(child),
-            Err(error) => {
-                // spawn reports exec failure before any helper could launch
-                // the user's command. This is a proved safe terminal result.
-                create_record(
-                    &directory,
-                    "receipt",
-                    &Receipt {
-                        firing: request.firing,
-                        revision: request.revision,
-                        outcome: failed(format!("Precheck helper could not start: {error}")),
-                    },
-                )?;
-                None
-            }
-        };
-        drop(lease);
-        Ok(Self {
-            directory,
-            firing: request.firing,
-            revision: request.revision,
-            child,
-        })
+        Ok((lease, command))
     }
 
     pub fn recover(root: &Path, firing: Uuid, revision: u64) -> Self {
@@ -147,6 +287,8 @@ impl Worker {
             firing,
             revision,
             child: None,
+            retirement: None,
+            retirement_unlinked: false,
         }
     }
 
@@ -167,6 +309,11 @@ impl Worker {
         }
     }
 
+    #[cfg(test)]
+    pub fn owns_child_for_test(&self) -> bool {
+        self.child.is_some()
+    }
+
     pub fn reaped(&mut self) -> io::Result<bool> {
         if let Some(child) = &mut self.child
             && child.try_wait()?.is_some()
@@ -183,29 +330,68 @@ impl Worker {
         if !self.reaped()? {
             return Ok(false);
         }
-        if !self.directory.try_exists()? {
+        let root = self
+            .directory
+            .parent()
+            .ok_or_else(|| io::Error::other("Precheck retirement has no owning root"))?;
+        let retirement = read_retirement(root, self.firing)?;
+        if retirement.as_ref().is_some_and(|(record, _)| {
+            record.revision != self.revision
+                || self
+                    .retirement
+                    .as_ref()
+                    .is_some_and(|expected| expected != record)
+        }) {
+            return Err(io::Error::other(
+                "Precheck retirement revision does not match",
+            ));
+        }
+        let directory_identity = self.original_directory()?;
+        if directory_identity.is_none() {
+            if retirement.is_none() && self.retirement_unlinked {
+                // This exact live owner already unlinked its receipt after
+                // ACK; only the failed final parent fsync remains to retry.
+                File::open(root)?.sync_all()?;
+                return Ok(true);
+            }
+            let Some((record, file)) = retirement else {
+                return Err(io::Error::other(
+                    "Missing precheck directory has no retirement proof",
+                ));
+            };
+            file.sync_all()?;
+            File::open(root)?.sync_all()?;
+            self.retirement = Some(record);
             return Ok(true);
         }
         crate::secure_file::reject_symlink_components(&self.directory)?;
         crate::secure_file::validate_owned_directory(&self.directory)?;
+        let identity = directory_identity.expect("original directory was checked");
+        if identity.mode() & 0o077 != 0 {
+            return Err(io::Error::other(
+                "Precheck retirement directory is not private",
+            ));
+        }
+        if retirement.as_ref().is_some_and(|(record, _)| {
+            (record.device, record.inode) != (identity.dev(), identity.ino())
+        }) {
+            return Err(io::Error::other(
+                "Precheck retirement directory was replaced",
+            ));
+        }
         let lease = match private_file(&self.directory.join("lease")) {
-            Ok(lease) => lease,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                // A crash after unlinking the final lease can leave only an
-                // empty directory. remove_dir refuses any remaining content.
-                fs::remove_dir(&self.directory)?;
-                return Ok(true);
-            }
+            Ok(lease) => Some(lease),
+            Err(error) if error.kind() == io::ErrorKind::NotFound && retirement.is_some() => None,
             Err(error) => return Err(error),
         };
-        if unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            let error = io::Error::last_os_error();
-            return if error.kind() == io::ErrorKind::WouldBlock {
-                Ok(false)
-            } else {
-                Err(error)
-            };
-        }
+        let lease = match lease
+            .map(|lease| crate::instance::owned_file_lock(lease, libc::LOCK_EX | libc::LOCK_NB))
+            .transpose()
+        {
+            Ok(lease) => lease,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+            Err(error) => return Err(error),
+        };
         // Only our bounded, flat proof files are reclaimable. An unexpected
         // directory or symlink is never traversed as part of housekeeping.
         let entries = fs::read_dir(&self.directory)?
@@ -231,17 +417,81 @@ impl Worker {
             }
             private_file(&entry.path())?;
         }
+        let expected = Retirement {
+            version: RETIREMENT_VERSION,
+            firing: self.firing,
+            revision: self.revision,
+            device: identity.dev(),
+            inode: identity.ino(),
+        };
+        if retirement.is_none() {
+            create_record(root, &retirement_name(self.firing), &expected)?;
+        }
+        // Publication may previously have reached rename but failed parent
+        // fsync. Validate and sync that same receipt before any proof unlink.
+        let (record, file) = read_retirement(root, self.firing)?
+            .ok_or_else(|| io::Error::other("Precheck retirement proof disappeared"))?;
+        if record != expected {
+            return Err(io::Error::other(
+                "Precheck retirement identity does not match",
+            ));
+        }
+        file.sync_all()?;
+        File::open(root)?.sync_all()?;
+        let current = self.directory.symlink_metadata()?;
+        if !current.is_dir() || (current.dev(), current.ino()) != (identity.dev(), identity.ino()) {
+            return Err(io::Error::other(
+                "Precheck retirement directory was replaced",
+            ));
+        }
         for entry in entries {
             if entry.file_name() != "lease" {
                 fs::remove_file(entry.path())?;
             }
         }
-        fs::remove_file(self.directory.join("lease"))?;
+        if lease.is_some() {
+            fs::remove_file(self.directory.join("lease"))?;
+        }
         fs::remove_dir(&self.directory)?;
         if let Some(parent) = self.directory.parent() {
             File::open(parent)?.sync_all()?;
         }
+        self.retirement = Some(expected);
         Ok(true)
+    }
+
+    /// Only after the database ACK committed (or its firing was already
+    /// compacted). Absence alone never authorizes producing that ACK.
+    pub fn forget_retirement(&mut self) -> io::Result<()> {
+        if !self.reaped()? || self.original_directory()?.is_some() {
+            return Err(io::Error::other("Precheck retirement is not complete"));
+        }
+        let root = self
+            .directory
+            .parent()
+            .ok_or_else(|| io::Error::other("Precheck retirement has no owning root"))?;
+        let expected = self
+            .retirement
+            .as_ref()
+            .ok_or_else(|| io::Error::other("Precheck retirement has no verified receipt"))?;
+        let Some((record, file)) = read_retirement(root, self.firing)? else {
+            // A prior unlink may have succeeded before its parent fsync failed.
+            return File::open(root)?.sync_all();
+        };
+        if record.revision != self.revision || &record != expected {
+            return Err(io::Error::other(
+                "Precheck retirement revision does not match",
+            ));
+        }
+        let held = file.metadata()?;
+        let path = root.join(retirement_name(self.firing));
+        let named = path.symlink_metadata()?;
+        if (held.dev(), held.ino()) != (named.dev(), named.ino()) {
+            return Err(io::Error::other("Precheck retirement proof was replaced"));
+        }
+        fs::remove_file(path)?;
+        self.retirement_unlinked = true;
+        File::open(root)?.sync_all()
     }
 
     pub fn status(&mut self) -> io::Result<Status> {
@@ -259,36 +509,35 @@ impl Worker {
             Err(error) => return Err(error),
         }
         let lease = private_file(&self.directory.join("lease"))?;
-        if unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            // The owner can publish between the first read and releasing its
-            // lease. Check again while excluding a still-starting owner.
-            if let Ok(receipt) = read_record::<Receipt>(&self.directory.join("receipt")) {
-                if receipt.firing == self.firing && receipt.revision == self.revision {
-                    return Ok(Status::Complete(receipt.outcome));
+        match crate::instance::owned_file_lock(lease, libc::LOCK_EX | libc::LOCK_NB) {
+            Ok(_lease) => {
+                // The owner can publish between the first read and releasing its
+                // lease. Check again while excluding a still-starting owner.
+                if let Ok(receipt) = read_record::<Receipt>(&self.directory.join("receipt")) {
+                    if receipt.firing == self.firing && receipt.revision == self.revision {
+                        return Ok(Status::Complete(receipt.outcome));
+                    }
                 }
+                if let Ok(started) = read_record::<Started>(&self.directory.join("started")) {
+                    if started.firing != self.firing || started.revision != self.revision {
+                        return Err(io::Error::other(
+                            "Precheck start proof belongs to another firing",
+                        ));
+                    }
+                    if started.boot != crate::daemon::read_boot_id().map_err(io::Error::other)? {
+                        // A different kernel boot proves old descendants extinct,
+                        // but says nothing about command effects before shutdown.
+                        return Ok(Status::Complete(Outcome::Stopped {
+                            state: FiringState::Interrupted,
+                            skip: None,
+                            diagnostic: "The system restarted before the precheck result was recorded; its effects are uncertain and it was not repeated".into(),
+                        }));
+                    }
+                }
+                Ok(Status::CleanupUnconfirmed)
             }
-            if let Ok(started) = read_record::<Started>(&self.directory.join("started")) {
-                if started.firing != self.firing || started.revision != self.revision {
-                    return Err(io::Error::other(
-                        "Precheck start proof belongs to another firing",
-                    ));
-                }
-                if started.boot != crate::daemon::read_boot_id().map_err(io::Error::other)? {
-                    // A different kernel boot proves old descendants extinct,
-                    // but says nothing about command effects before shutdown.
-                    return Ok(Status::Complete(Outcome::Stopped {
-                        state: FiringState::Interrupted, skip: None,
-                        diagnostic: "The system restarted before the precheck result was recorded; its effects are uncertain and it was not repeated".into(),
-                    }));
-                }
-            }
-            return Ok(Status::CleanupUnconfirmed);
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::WouldBlock {
-            Ok(Status::Running)
-        } else {
-            Err(error)
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(Status::Running),
+            Err(error) => Err(error),
         }
     }
 }
@@ -490,6 +739,22 @@ fn supervisor(directory: &Path, request: &Request, _lease: File) -> io::Result<(
     )
 }
 
+#[cfg(test)]
+fn test_helper_executable() -> io::Result<PathBuf> {
+    let path = PathBuf::from(
+        std::env::var_os("CAGENTS_TEST_RETAINED_ACTOR_HELPER").ok_or_else(|| {
+            io::Error::other("Precheck Worker tests require the same-head cagentsd helper")
+        })?,
+    );
+    let metadata = path.metadata()?;
+    if !path.is_absolute() || !metadata.is_file() || metadata.mode() & 0o111 == 0 {
+        return Err(io::Error::other(
+            "Precheck Worker test helper must be an absolute executable file",
+        ));
+    }
+    Ok(path)
+}
+
 fn failed(diagnostic: String) -> Outcome {
     Outcome::Stopped {
         state: FiringState::Failed,
@@ -613,6 +878,8 @@ mod tests {
     #[test]
     fn unlocked_worker_without_receipt_is_never_inferred_successful() {
         let root = tempfile::tempdir().unwrap();
+        crate::secure_file::prepare_private_directory(root.path()).unwrap();
+        assert_eq!(root.path().metadata().unwrap().mode() & 0o777, 0o700);
         let firing = Uuid::new_v4();
         let directory = root.path().join(firing.to_string());
         crate::secure_file::prepare_private_directory(&directory).unwrap();
@@ -628,10 +895,7 @@ mod tests {
             worker.status().unwrap(),
             Status::CleanupUnconfirmed
         ));
-        assert_eq!(
-            unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
+        let lease = crate::instance::owned_file_lock(lease, libc::LOCK_EX | libc::LOCK_NB).unwrap();
         assert!(matches!(worker.status().unwrap(), Status::Running));
         create_record(
             &directory,
@@ -658,6 +922,302 @@ mod tests {
             !directory.exists(),
             "settled proof files are reclaimed after owner exit"
         );
+        assert_eq!(
+            Worker::retirement_revision(root.path(), firing).unwrap(),
+            Some(1)
+        );
+        worker.forget_retirement().unwrap();
+        assert_eq!(
+            Worker::retirement_revision(root.path(), firing).unwrap(),
+            None
+        );
+    }
+
+    fn retirement_fixture() -> (tempfile::TempDir, Worker, Retirement) {
+        let root = tempfile::tempdir().unwrap();
+        crate::secure_file::prepare_private_directory(root.path()).unwrap();
+        assert_eq!(root.path().metadata().unwrap().mode() & 0o777, 0o700);
+        let firing = Uuid::new_v4();
+        let directory = root.path().join(firing.to_string());
+        crate::secure_file::prepare_private_directory(&directory).unwrap();
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(directory.join("lease"))
+            .unwrap();
+        create_record(
+            &directory,
+            "receipt",
+            &Receipt {
+                firing,
+                revision: 1,
+                outcome: Outcome::Passed,
+            },
+        )
+        .unwrap();
+        let identity = directory.metadata().unwrap();
+        let retirement = Retirement {
+            version: RETIREMENT_VERSION,
+            firing,
+            revision: 1,
+            device: identity.dev(),
+            inode: identity.ino(),
+        };
+        let worker = Worker::recover(root.path(), firing, 1);
+        (root, worker, retirement)
+    }
+
+    #[test]
+    fn durable_retirement_replays_full_and_partial_unlink_without_replacing_evidence() {
+        for partial in [false, true] {
+            let (root, mut worker, retirement) = retirement_fixture();
+            let marker = root.path().join(retirement_name(retirement.firing));
+            if partial {
+                // A previously published receipt survives a crash after the
+                // final lease unlink but before removing the same directory.
+                create_record(
+                    root.path(),
+                    &retirement_name(retirement.firing),
+                    &retirement,
+                )
+                .unwrap();
+                fs::remove_file(worker.directory.join("receipt")).unwrap();
+                fs::remove_file(worker.directory.join("lease")).unwrap();
+            } else {
+                let lease = private_file(&worker.directory.join("lease")).unwrap();
+                let lease =
+                    crate::instance::owned_file_lock(lease, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+                assert!(!worker.retire().unwrap());
+                assert!(!marker.exists(), "live lease cannot mint retirement proof");
+                drop(lease);
+                assert!(worker.retire().unwrap());
+            }
+            let original = fs::read(&marker).unwrap();
+            assert!(worker.retire().unwrap());
+            assert!(!worker.directory.exists());
+            assert_eq!(fs::read(&marker).unwrap(), original);
+            let target = root.path().metadata().unwrap();
+            let request = Request {
+                firing: retirement.firing,
+                revision: 1,
+                directory: root.path().into(),
+                target_identity: crate::automations::DirectoryIdentity {
+                    device: target.dev(),
+                    inode: target.ino(),
+                },
+                precheck: Precheck {
+                    command: "exit 7".into(),
+                    timeout_seconds: 5,
+                },
+            };
+            assert_eq!(
+                Worker::launch(root.path(), &request)
+                    .err()
+                    .unwrap()
+                    .error
+                    .kind(),
+                io::ErrorKind::AlreadyExists
+            );
+            let mut wrong = Worker::recover(root.path(), retirement.firing, 2);
+            assert!(wrong.retire().is_err());
+            assert!(marker.exists());
+            let mut recovered = Worker::recover(root.path(), retirement.firing, 1);
+            assert!(recovered.retire().unwrap());
+            std::os::unix::fs::symlink(root.path().join("missing-target"), &recovered.directory)
+                .unwrap();
+            assert!(
+                recovered.retire().is_err(),
+                "dangling replacement is not absence"
+            );
+            assert!(recovered.forget_retirement().is_err());
+            assert!(
+                marker.exists(),
+                "final cleanup erased a dangling replacement's custody"
+            );
+            fs::remove_file(&recovered.directory).unwrap();
+            let mut replacement = retirement.clone();
+            replacement.inode += 1;
+            fs::remove_file(&marker).unwrap();
+            create_record(
+                root.path(),
+                &retirement_name(retirement.firing),
+                &replacement,
+            )
+            .unwrap();
+            assert!(recovered.forget_retirement().is_err());
+            assert!(
+                marker.exists(),
+                "same-ID replacement retirement proof was removed"
+            );
+            fs::remove_file(&marker).unwrap();
+            create_record(
+                root.path(),
+                &retirement_name(retirement.firing),
+                &retirement,
+            )
+            .unwrap();
+            recovered.forget_retirement().unwrap();
+            assert!(!marker.exists());
+            assert!(
+                recovered.retire().unwrap(),
+                "exact post-ACK fsync retry remains possible"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_launch_that_left_nothing_reports_nothing_created() {
+        let root = tempfile::tempdir().unwrap();
+        let firing = Uuid::new_v4();
+        let target = root.path().metadata().unwrap();
+        let request = Request {
+            firing,
+            revision: 1,
+            directory: root.path().into(),
+            target_identity: crate::automations::DirectoryIdentity {
+                device: target.dev(),
+                inode: target.ino(),
+            },
+            precheck: Precheck {
+                command: "exit 7".into(),
+                timeout_seconds: 5,
+            },
+        };
+        // The private root cannot exist: nothing was made.
+        let blocked = root.path().join("file");
+        fs::write(&blocked, b"").unwrap();
+        let failure = Worker::launch(&blocked, &request).err().unwrap();
+        assert!(failure.nothing_created, "{failure:?}");
+
+        // Another owner's directory or receipt is not ours to call absent.
+        let private = root.path().join("private");
+        crate::secure_file::prepare_private_directory(&private).unwrap();
+        fs::create_dir(private.join(firing.to_string())).unwrap();
+        let failure = Worker::launch(&private, &request).err().unwrap();
+        assert_eq!(failure.error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(!failure.nothing_created);
+        fs::remove_dir(private.join(firing.to_string())).unwrap();
+        fs::write(private.join(retirement_name(firing)), b"").unwrap();
+        let failure = Worker::launch(&private, &request).err().unwrap();
+        assert_eq!(failure.error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(!failure.nothing_created);
+    }
+
+    #[test]
+    fn retirement_refuses_missing_legacy_and_replaced_directories() {
+        let root = tempfile::tempdir().unwrap();
+        crate::secure_file::prepare_private_directory(root.path()).unwrap();
+        assert_eq!(root.path().metadata().unwrap().mode() & 0o777, 0o700);
+        let firing = Uuid::new_v4();
+        let mut missing = Worker::recover(root.path(), firing, 1);
+        assert!(missing.retire().is_err());
+        crate::secure_file::prepare_private_directory(&missing.directory).unwrap();
+        assert!(
+            missing.retire().is_err(),
+            "an empty legacy directory is not cleanup proof"
+        );
+        assert!(missing.directory.exists());
+        assert!(!root.path().join(retirement_name(firing)).exists());
+
+        let (root, mut worker, retirement) = retirement_fixture();
+        create_record(
+            root.path(),
+            &retirement_name(retirement.firing),
+            &retirement,
+        )
+        .unwrap();
+        let original = root.path().join("original-directory");
+        fs::rename(&worker.directory, &original).unwrap();
+        crate::secure_file::prepare_private_directory(&worker.directory).unwrap();
+        fs::write(
+            worker.directory.join("replacement"),
+            b"preserve replacement",
+        )
+        .unwrap();
+        assert!(
+            worker
+                .retire()
+                .unwrap_err()
+                .to_string()
+                .contains("replaced")
+        );
+        assert_eq!(
+            fs::read(worker.directory.join("replacement")).unwrap(),
+            b"preserve replacement"
+        );
+        assert!(original.join("receipt").exists());
+        assert!(
+            root.path()
+                .join(retirement_name(retirement.firing))
+                .exists()
+        );
+
+        let (root, mut worker, retirement) = retirement_fixture();
+        create_record(
+            root.path(),
+            &retirement_name(retirement.firing),
+            &retirement,
+        )
+        .unwrap();
+        let original = root.path().join("original-directory");
+        fs::rename(&worker.directory, &original).unwrap();
+        std::os::unix::fs::symlink(root.path().join("missing-target"), &worker.directory).unwrap();
+        assert!(worker.retire().is_err());
+        assert!(
+            worker
+                .directory
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(original.join("receipt").exists());
+        assert!(
+            root.path()
+                .join(retirement_name(retirement.firing))
+                .exists()
+        );
+    }
+
+    #[test]
+    fn retirement_receipts_reject_foreign_unsafe_malformed_and_oversized_records() {
+        use std::os::unix::fs::PermissionsExt;
+        for case in 0..9 {
+            let (root, mut worker, mut retirement) = retirement_fixture();
+            let marker = root.path().join(retirement_name(retirement.firing));
+            match case {
+                0 => retirement.version += 1,
+                1 => retirement.firing = Uuid::new_v4(),
+                2 => retirement.revision += 1,
+                3 => retirement.inode += 1,
+                _ => {}
+            }
+            match case {
+                4 => fs::write(&marker, b"malformed private receipt").unwrap(),
+                5 => fs::write(&marker, vec![b'x'; MAX_RETIREMENT_RECORD as usize + 1]).unwrap(),
+                _ => create_record(
+                    root.path(),
+                    marker.file_name().unwrap().to_str().unwrap(),
+                    &retirement,
+                )
+                .unwrap(),
+            }
+            fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
+            if case == 6 {
+                fs::set_permissions(&marker, fs::Permissions::from_mode(0o644)).unwrap();
+            } else if case == 7 {
+                let target = root.path().join("saved-receipt");
+                fs::rename(&marker, &target).unwrap();
+                std::os::unix::fs::symlink(&target, &marker).unwrap();
+            } else if case == 8 {
+                fs::hard_link(&marker, root.path().join("extra-link")).unwrap();
+            }
+            assert!(worker.retire().is_err(), "unsafe receipt case {case}");
+            assert!(worker.directory.join("lease").exists());
+            assert!(worker.directory.join("receipt").exists());
+            assert!(marker.symlink_metadata().is_ok());
+        }
     }
 
     #[test]

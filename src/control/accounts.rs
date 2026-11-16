@@ -5,16 +5,34 @@ mod link;
 mod list;
 mod preferences;
 mod removal;
+mod reset;
 
 #[derive(Debug, clap::Subcommand)]
 pub enum AccountCommand {
+    /// Spend an available reset after confirming the account and scope.
+    Reset {
+        /// Stable provider/account ID from account list.
+        account: crate::account::AccountId,
+        /// Window to refill, or the original scope label when retrying a reset.
+        #[arg(long)]
+        scope: Option<String>,
+        /// Select an exact reset; retries must also use the original idempotency key.
+        #[arg(long)]
+        reset_id: Option<String>,
+        /// Confirm spending one reset without an interactive prompt.
+        #[arg(long)]
+        yes: bool,
+        /// Reuse this key only to resolve the same previously submitted reset.
+        #[arg(long, requires = "reset_id")]
+        idempotency_key: Option<String>,
+    },
     /// Register an existing provider home on this device, or on --device.
     /// Does not transfer credentials or verify coding access.
     Link {
         /// Provider whose existing home is registered: claude or codex.
         #[arg(value_parser = link::parse_provider)]
         provider: crate::agent::Provider,
-        /// Absolute home on the selected device, or quoted '~/path'.
+        /// Absolute home on the selected device, or one starting with ~/ (quote it).
         #[arg(value_parser = link::parse_home)]
         home: String,
     },
@@ -56,6 +74,15 @@ pub enum AccountCommand {
 
 pub(super) fn execute(command: AccountCommand) -> Result<CommandOutput, AppError> {
     let (query, listing) = match command {
+        AccountCommand::Reset {
+            account,
+            scope,
+            reset_id,
+            yes,
+            idempotency_key,
+        } => {
+            return reset::execute(account, scope, reset_id, yes, idempotency_key);
+        }
         AccountCommand::Link { provider, home } => return link::execute(provider, home),
         AccountCommand::Default {
             provider,
@@ -174,7 +201,7 @@ fn human(report: &Report) -> String {
             },
             if account.archived { " (archived)" } else { "" },
             if account.identity_conflict {
-                " — login identity changed"
+                " — login identity conflict"
             } else {
                 ""
             }
@@ -188,6 +215,9 @@ fn human(report: &Report) -> String {
                 usage.observed_at,
                 if account.stale { " (stale)" } else { "" }
             ));
+            if let Some(tier) = &usage.rate_limit_tier {
+                lines.push(format!("  Reported tier: {tier}"));
+            }
             for remaining in &account.remaining {
                 lines.push(format!(
                     "  {}: {:.0}% remaining; resets {}{}",
@@ -205,6 +235,12 @@ fn human(report: &Report) -> String {
                     }
                 ));
             }
+            let now_secs = i64::try_from(report.sampled_at / 1000).unwrap_or(i64::MAX);
+            lines.extend(
+                crate::account::resets::inventory_lines(&usage.resets, now_secs)
+                    .into_iter()
+                    .map(|line| format!("  {line}")),
+            );
             if let Some(credits) = &account.credits {
                 lines.push(format!("  Extra usage: {}", credits.summary()));
                 if let Some(remaining) = &account.credits_remaining {

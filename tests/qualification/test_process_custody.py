@@ -16,6 +16,8 @@ import os
 from pathlib import Path
 import re
 import select
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -306,6 +308,232 @@ class ProcessCustodyExitTests(unittest.TestCase):
             self.assertFalse(family.owner.exited(family.node))
             self.assertFalse(family.node["settled"])
             self.assertNotIn("exit_code", family.node)
+
+    def test_a_process_already_exiting_is_signalled_through_its_original_pidfd(self):
+        cases = {
+            "executable gone": FileNotFoundError(errno.ENOENT, "Injected exiting executable"),
+            "process gone": ProcessLookupError(errno.ESRCH, "Injected exiting process"),
+            "zombie": {"state": "Z"},
+            "dead": {"state": "X"},
+        }
+        for name, observed in cases.items():
+            with self.subTest(name), OwnedFamily(self, self.module) as family:
+                owner, node = family.owner, family.node
+                with mock.patch.object(owner, "current", side_effect=[observed]), \
+                        mock.patch.object(self.module.signal, "pidfd_send_signal") as send:
+                    owner.signal_owned(node, signal.SIGTERM)
+                send.assert_called_once_with(node["pidfd"], signal.SIGTERM, None, 0)
+                self.assertEqual([item["signal"] for item in node["signals"]], [signal.SIGTERM])
+                self.assertFalse(node["settled"])
+                node["signals"].clear()
+
+    def test_a_process_whose_main_thread_exited_is_settled_without_a_report(self):
+        program = ("import ctypes, threading, time\n"
+                   "threading.Thread(target=time.sleep, args=(30,)).start()\n"
+                   "ctypes.CDLL(None).pthread_exit(None)\n")
+        with tempfile.TemporaryDirectory() as directory:
+            owner = self.module.Custody(lambda: False)
+            child = owner.launch([sys.executable, "-I", "-c", program], directory, "fixture-owned-parent")
+            node = owner.nodes[child.pid]
+            deadline = time.monotonic() + HANDSHAKE_SECONDS
+            while owner.current(node)["state"] != "Z":
+                self.assertLess(time.monotonic(), deadline, "The main thread did not exit")
+                time.sleep(0.01)
+            self.assertFalse(owner.exited(node))
+            reports = []
+            started = time.monotonic()
+            owner.settle_all(lambda: None, lambda stage, error: reports.append(error))
+            self.assertLess(time.monotonic() - started, 4, "It needed no more than the first signal")
+            self.assertEqual(reports, [])
+            self.assertEqual(node["exit_code"], -signal.SIGTERM)
+            owner.close_pidfds()
+
+    def test_a_process_whose_main_thread_exited_still_gets_sigkill(self):
+        program = ("import ctypes, signal, threading, time\n"
+                   "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                   "threading.Thread(target=time.sleep, args=(30,)).start()\n"
+                   "ctypes.CDLL(None).pthread_exit(None)\n")
+        with tempfile.TemporaryDirectory() as directory:
+            owner = self.module.Custody(lambda: False)
+            child = owner.launch([sys.executable, "-I", "-c", program], directory, "fixture-owned-parent")
+            node = owner.nodes[child.pid]
+            deadline = time.monotonic() + HANDSHAKE_SECONDS
+            while owner.current(node)["state"] != "Z":
+                self.assertLess(time.monotonic(), deadline, "The main thread did not exit")
+                time.sleep(0.01)
+            reports = []
+            owner.settle_all(lambda: None, lambda stage, error: reports.append(error))
+            self.assertEqual(reports, [])
+            self.assertEqual(node["exit_code"], -signal.SIGKILL)
+            owner.close_pidfds()
+
+    def test_another_metadata_failure_is_fatal_and_settlement_reports_it(self):
+        with OwnedFamily(self, self.module) as family:
+            owner, node = family.owner, family.node
+            denied = PermissionError(errno.EACCES, "Injected denied metadata")
+            with mock.patch.object(owner, "current", side_effect=denied), \
+                    mock.patch.object(self.module.signal, "pidfd_send_signal") as send, \
+                    self.assertRaises(PermissionError):
+                owner.signal_owned(node, signal.SIGTERM)
+            send.assert_not_called()
+
+            real = owner.current
+            denials = [denied]
+
+            def denied_once(candidate, executable=False):
+                # The worker: settlement signals it first, and its child may exit with it.
+                if candidate is owner.nodes[family.worker.pid] and executable and denials:
+                    raise denials.pop()
+                return real(candidate, executable=executable)
+
+            reports = []
+            with mock.patch.object(owner, "current", side_effect=denied_once):
+                owner.settle_all(lambda: None, lambda stage, error: reports.append((stage, error)))
+            self.assertEqual(reports, [("owned-child-settlement-blocked", denied)])
+            family.worker.wait(timeout=HANDSHAKE_SECONDS)
+
+    def test_an_identity_that_can_be_read_is_still_checked_before_signalling(self):
+        with OwnedFamily(self, self.module) as family:
+            owner, node = family.owner, family.node
+            changes = (
+                ({"pinned_executable": "/changed", "pinned_executable_identity": [0, 0]},
+                 owner.expected_daemon, "no retargeting"),
+                ({"pinned_executable": family.executable, "pinned_executable_identity": [0, 0]},
+                 owner.expected_daemon, "no retargeting"),
+                ({}, family.executable, "held-lock corroboration"),
+            )
+            for node_change, expected_daemon, message in changes:
+                with self.subTest(message), mock.patch.dict(node, node_change), \
+                        mock.patch.object(owner, "expected_daemon", expected_daemon), \
+                        mock.patch.object(self.module.signal, "pidfd_send_signal") as send:
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        owner.signal_owned(node, signal.SIGTERM)
+                    send.assert_not_called()
+
+    def test_a_process_released_during_a_read_is_not_a_custody_failure(self):
+        real_stat, real_read = Path.stat, Path.read_text
+        with OwnedFamily(self, self.module) as family:
+            owner, node = family.owner, family.node
+            released = []
+
+            # The kernel's order: root owns a released process, and its stat is gone.
+            def stat(path, *args, **kwargs):
+                if path.name != str(node["pid"]):
+                    return real_stat(path, *args, **kwargs)
+                released.append(path)
+                return mock.Mock(st_uid=0)
+
+            def read_text(path, *args, **kwargs):
+                if released and path.name == "stat":
+                    raise FileNotFoundError(errno.ENOENT, "Injected released process")
+                return real_read(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "stat", stat), mock.patch.object(Path, "read_text", read_text), \
+                    self.assertRaises(FileNotFoundError):
+                owner.current(node)
+            self.assertEqual(self.module.process_state(node["pid"])["uid"], os.getuid())
+
+            denied = PermissionError(errno.EACCES, "Injected denied executable")
+            with mock.patch.object(self.module.os, "readlink", side_effect=denied):
+                with self.assertRaises(PermissionError):
+                    owner.current(node, executable=True)
+                with mock.patch.object(owner, "exited", return_value=True), \
+                        self.assertRaises(ProcessLookupError):
+                    owner.current(node, executable=True)
+
+            tasks = ProcessLookupError(errno.ESRCH, "Injected released process")
+            with mock.patch.object(Path, "iterdir", side_effect=tasks):
+                self.assertEqual(self.module.child_ids(node["pid"]), set())
+            with mock.patch.object(Path, "read_text", side_effect=tasks):
+                self.assertEqual(self.module.child_ids(node["pid"]), set())
+
+    def test_a_child_read_as_parentless_is_only_believed_released_by_its_pidfd(self):
+        with OwnedFamily(self, self.module) as family:
+            owner, pid = family.owner, family.child_pid
+            released = {**self.module.process_state(pid), "ppid": 0, "state": "X"}
+            os.close(owner.nodes.pop(pid)["pidfd"])
+            with mock.patch.object(self.module, "process_state", return_value=released):
+                with self.assertRaisesRegex(RuntimeError, "Child provenance"):
+                    owner.pin(pid, family.worker.pid)
+                with mock.patch.object(owner, "exited", return_value=True), \
+                        self.assertRaises(ProcessLookupError):
+                    owner.pin(pid, family.worker.pid)
+            # Or it has no entry left by the time the check has failed.
+            with mock.patch.object(self.module, "process_state",
+                                   side_effect=[released, FileNotFoundError(errno.ENOENT, "Released")]), \
+                    mock.patch.object(owner, "exited", return_value=True), \
+                    self.assertRaises(ProcessLookupError):
+                owner.pin(pid, family.worker.pid)
+            # A zombie stays readable: its failed check still counts.
+            zombie = {**released, "ppid": owner.pid, "state": "Z", "uid": owner.uid + 1}
+            with mock.patch.object(self.module, "process_state", return_value=zombie), \
+                    mock.patch.object(owner, "exited", return_value=True), \
+                    self.assertRaisesRegex(RuntimeError, "not newly owned"):
+                owner.pin(pid, family.worker.pid)
+            self.assertNotIn(pid, owner.nodes)
+            owner.pin(pid, family.worker.pid)
+
+    def test_a_process_whose_name_is_not_text_can_be_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            # The kernel cuts the name to 15 bytes, in the middle of a character.
+            named = Path(directory) / ("\u00e9" * 8)
+            named.symlink_to(shutil.which("sleep"))
+            child = subprocess.Popen([named, "30"])
+            self.addCleanup(child.wait)
+            self.addCleanup(child.kill)
+            comm = Path("/proc") / str(child.pid) / "comm"
+            deadline = time.monotonic() + HANDSHAKE_SECONDS
+            while not comm.read_bytes().startswith(b"\xc3"):
+                self.assertLess(time.monotonic(), deadline, "The child did not exec")
+                time.sleep(0.01)
+            self.assertEqual(self.module.process_state(child.pid)["ppid"], os.getpid())
+
+    def test_a_new_child_that_lost_its_metadata_is_waited_for(self):
+        vanished = FileNotFoundError(errno.ENOENT, "Injected exiting executable")
+        with tempfile.TemporaryDirectory() as directory:
+            owner = self.module.Custody(lambda: False)
+            for error in (vanished, ProcessLookupError(errno.ESRCH, "Injected released process")):
+                with self.subTest(error=error), mock.patch.object(owner, "pin", side_effect=error):
+                    child = owner.launch(["sh", "-c", "sleep 0.3; exit 7"], directory, "fixture-owned-parent")
+                self.assertEqual(owner.nodes[child.pid]["exit_code"], 7)
+                self.assertTrue(owner.nodes[child.pid]["settled"])
+
+            with mock.patch.object(owner, "pin", side_effect=vanished), \
+                    mock.patch.object(self.module, "NEW_CHILD_EXIT_SECONDS", 0.1), \
+                    self.assertRaisesRegex(RuntimeError, "without original wait status"):
+                owner.launch(["sleep", "60"], directory, "fixture-owned-parent")
+            for live in owner.direct.values():
+                if live.poll() is None:
+                    live.kill()
+                    live.wait()
+
+    def test_a_process_that_vanished_is_only_believed_gone_by_its_pidfd(self):
+        for number in (errno.ENOENT, errno.ESRCH):
+            with self.subTest(metadata_errno=number), OwnedFamily(self, self.module) as family:
+                owner, node = family.owner, family.node
+                current = owner.current
+
+                def missing(candidate, executable=False):
+                    if candidate is node:
+                        raise OSError(number, "Injected vanished process")
+                    return current(candidate, executable=executable)
+
+                # Pinning found it moments ago; it vanishes before the scan descends.
+                with mock.patch.object(owner, "current", side_effect=missing), \
+                        mock.patch.object(owner, "pin", side_effect=lambda pid, parent: owner.nodes[pid]):
+                    with self.assertRaisesRegex(RuntimeError, "without pidfd exit"):
+                        owner.scan()
+                    with mock.patch.object(owner, "exited", return_value=True):
+                        owner.scan()
+
+                # An unreachable process that has gone counts as reaped by its parent.
+                with mock.patch.object(owner, "exited", return_value=True), \
+                        mock.patch.object(self.module.os, "waitpid", side_effect=ChildProcessError), \
+                        mock.patch.object(self.module, "process_state", side_effect=OSError(number, "Gone")):
+                    self.assertTrue(owner.reap(node))
+                node["settled"] = False
+                node.pop("exit_code")
+                node.pop("exit_status_source")
 
     def test_owned_metadata_disappearance_waits_only_on_original_pidfds(self):
         for number in (errno.ENOENT, errno.ESRCH):

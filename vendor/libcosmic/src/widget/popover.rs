@@ -45,6 +45,9 @@ struct AccessibilityState {
     // Geometry from the real overlay pass, paired with this popup's Tree.
     // Base layout has no popup child and cannot stand in for its position.
     popup_layout: Option<layout::Node>,
+    // The translation the overlay pass placed this popover's content by. The
+    // popup is laid out on screen; ancestors expect the content's frame.
+    translation: Vector,
     modal: bool,
     order: usize,
     scope: Option<std::rc::Rc<AccessibilityScope>>,
@@ -451,6 +454,10 @@ where
             // Round position to prevent rendering issues
             overlay_position.x = overlay_position.x.round();
             overlay_position.y = overlay_position.y.round();
+            #[cfg(feature = "a11y")]
+            {
+                tree.state.downcast_mut::<AccessibilityState>().translation = translation;
+            }
             translation.x += overlay_position.x;
             translation.y += overlay_position.y;
             Some(overlay::Element::new(Box::new(Overlay {
@@ -508,9 +515,33 @@ where
                 .popup_layout
                 .as_ref()
                 .map(|node| {
+                    let mut popup =
+                        popup
+                            .as_widget()
+                            .a11y_nodes(Layout::new(node), &state.children[1], p);
+                    // The popup is laid out on screen, but ancestors expect
+                    // the content's frame. The overlay translation is minus
+                    // every scroll offset above the content; its virtual
+                    // offset is the share offset-aware widgets subtract
+                    // themselves. The rest belongs to ancestors that move
+                    // their descendants by their offset, so it is added back
+                    // here for them to remove, instead of moving it twice.
+                    let moved = accessibility.translation + layout.virtual_offset();
+                    let (dx, dy) = (f64::from(moved.x), f64::from(moved.y));
+                    let reframe = |node: &mut iced_accessibility::A11yNode| {
+                        let node = node.node_mut();
+                        if let Some(bounds) = node.bounds() {
+                            node.set_bounds(iced_accessibility::accesskit::Rect::new(
+                                bounds.x0 - dx,
+                                bounds.y0 - dy,
+                                bounds.x1 - dx,
+                                bounds.y1 - dy,
+                            ));
+                        }
+                    };
+                    popup.root_mut().iter_mut().for_each(reframe);
+                    popup.children_mut().iter_mut().for_each(reframe);
                     popup
-                        .as_widget()
-                        .a11y_nodes(Layout::new(node), &state.children[1], p)
                 })
                 .unwrap_or_default();
             // Record this actual popup's roots before selecting a deeper modal.

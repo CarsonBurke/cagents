@@ -62,8 +62,10 @@ manifest_version() {
 
 if [[ -z $VERSION ]]; then
     VERSION=$(manifest_version < "$ROOT_DIR/Cargo.toml")
-    [[ $(manifest_version < "$ROOT_DIR/crates/ceditor/Cargo.toml") == "$VERSION" ]] \
-        || fail 'checkout cagents and ceditor versions differ'
+    for manifest in crates/cagents-ui/Cargo.toml crates/ceditor/Cargo.toml; do
+        [[ $(manifest_version < "$ROOT_DIR/$manifest") == "$VERSION" ]] \
+            || fail "checkout cagents and $manifest versions differ"
+    done
 fi
 [[ $VERSION =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
     || fail 'version must be a stable semantic version without a leading v'
@@ -71,7 +73,7 @@ TAG=v$VERSION
 SOURCE_COMMIT=$(checkout_git rev-parse --verify "refs/tags/$TAG^{commit}") \
     || fail "missing local commit tag: $TAG"
 TAG_OBJECT=$(checkout_git rev-parse --verify "refs/tags/$TAG")
-for manifest in Cargo.toml crates/ceditor/Cargo.toml; do
+for manifest in Cargo.toml crates/cagents-ui/Cargo.toml crates/ceditor/Cargo.toml; do
     tagged_version=$(checkout_git show "$SOURCE_COMMIT:$manifest" | manifest_version)
     [[ $tagged_version == "$VERSION" ]] || fail "$manifest at $TAG does not declare version $VERSION"
 done
