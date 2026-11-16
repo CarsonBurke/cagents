@@ -392,7 +392,7 @@ impl Recovery {
 /// process ended without recording its close. Only a later boot proves that
 /// process gone, so a client reads this exact sentence as
 /// [`Recovery::AfterRestart`]. The protocol has no code of its own for it.
-pub const UNPROVEN_OWNER_REFUSAL: &str = "This conversation's earlier Claude process ended without recording its close, and cagents cannot prove that nothing else still holds the conversation, so nothing was started in its place. It can be resumed after you restart this computer.";
+pub const UNPROVEN_OWNER_REFUSAL: &str = "This conversation's earlier Claude process ended without recording its close, and cagents cannot prove that nothing else still holds the conversation, so nothing was started in its place. It can be reopened after you restart this computer.";
 
 impl StartFailure {
     pub fn retry(message: impl Into<String>) -> Self {

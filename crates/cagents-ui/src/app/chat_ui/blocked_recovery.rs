@@ -6,10 +6,10 @@ pub(in crate::app) const RESTART_HEADLINE: &str =
     "This conversation can't be reopened until you restart this computer.";
 pub(super) const DRAFT_HEADLINE: &str = "This conversation couldn't start.";
 pub(super) const DRAFT_GUIDANCE: &str = "Your message is kept. Copy it into a new conversation, or see Details for why this one couldn't start.";
-pub(super) const FRESH_EXPLANATION: &str = "Starts a new conversation in this tab and keeps your unsent message. The old conversation isn't deleted, but this tab stops pointing at it.";
+pub(super) const FRESH_EXPLANATION: &str = "Starts a new conversation in this tab, keeping any unsent message; closing the tab discards it. The old conversation isn't deleted, but this tab stops pointing at it.";
 pub(super) const RESTART_GUIDANCE: &str = "Leave this tab open and restart this computer when convenient. The next time cagents starts, it reopens the conversation here, with any unsent message.";
-pub(super) const RESTART_FRESH_TRADEOFF: &str = "Starting a new conversation here gives that up but keeps your unsent message. Closing the tab gives it up and discards the message. Either way, the old conversation isn't deleted.";
-pub(super) const RESTART_CLOSE_TRADEOFF: &str = "Closing the tab gives that up and discards any unsent message, though the conversation isn't deleted.";
+pub(super) const RESTART_FRESH_TRADEOFF: &str = "Starting a new conversation keeps the message; closing the tab discards it. Either way, the old conversation won't reopen here, though it isn't deleted.";
+pub(super) const RESTART_CLOSE_TRADEOFF: &str = "Closing the tab discards the message, and the conversation won't reopen, though it isn't deleted.";
 pub(super) const CLOSE_GUIDANCE: &str = "Details say why. Closing this tab discards any unsent message; the conversation itself isn't deleted.";
 
 /// When a permanently refused saved conversation can come back, as far as
