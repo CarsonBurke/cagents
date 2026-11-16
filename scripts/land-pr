@@ -1,0 +1,474 @@
+#!/usr/bin/python3
+"""Squash-merge a reviewed pull request once its CI is green.
+
+  scripts/land-pr PR [-R OWNER/REPO] [--update] [--dry-run] [--timeout MINUTES]
+
+The merge is pinned to the head CI passed on, and its message is built from the
+PR's commit messages with AI attribution removed; the landing is refused if
+attribution remains. The branch is brought up to date with main only when
+GitHub reports a conflict that Git merges cleanly, or with --update when its CI
+is stale against a change it depends on: by a merge commit made without
+touching any checkout and a plain push, never a rebase or force-push. CI is
+read through scripts/gh-pr-status, whose shared cache allows one GitHub read
+per PR every two minutes.
+
+Exit status: 0 merged (with --dry-run: nothing found in the way, though CI may
+still be running), 1 unexpected error, 2 usage, 3 conflicts with main, 4 the
+head moved, 5 refused, 6 CI failed, 7 CI did not finish in time.
+"""
+import argparse
+import contextlib
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import subprocess
+import sys
+import time
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE = "main"
+REFRESH = 120  # gh-pr-status shares one read per PR in this interval.
+MINIMUM_WAIT = 15
+SYNC_ROUNDS = 3
+CONFLICT, HEAD_MOVED, REFUSED, CI_FAILED, TIMED_OUT = 3, 4, 5, 6, 7
+# Variables that would point git at another repository than the one asked for.
+GIT_LOCATION = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_PREFIX")
+
+AI = r"\b(claude|anthropic|openai|codex|chatgpt|gpt|copilot)(?![a-z])"
+# Lines removed from commit messages. Only lines shaped as a whole trailer or
+# footer go: commit bodies here often discuss Claude and Codex as providers,
+# and wrapped prose can start a line with "written by Codex ...".
+ATTRIBUTION = [re.compile(pattern, re.IGNORECASE) for pattern in (
+    # Co-Authored-By, Generated-by, Assisted-by ... whose value is an AI.
+    rf"^\s*[a-z]+(-[a-z]+)*-by:\s*\W*{AI}",
+    rf"^\s*ai(-[a-z]+)+:",  # AI-Assisted: and the like.
+    # A footer that is the whole line, with an optional emoji and link.
+    rf"^\W*(generated|made|created|built|written)\s+(with|by|using)\s+\W*(openai\s+)?{AI}"
+    r"([\s-]+(code|cli|opus|sonnet|haiku|agent|[\d.]+[a-z]?))*\W*(\([^)]*\))?\W*$",
+    r"noreply@(anthropic|openai)\.com",
+    r"claude\.com/claude-code",
+)]
+# Attribution that may not remain anywhere: the title, which is never
+# stripped, and trailers quoted or indented mid-line. Prose that only
+# mentions a provider, a trailer or a footer passes.
+SURVIVORS = [re.compile(pattern, re.IGNORECASE) for pattern in (
+    *(pattern.pattern for pattern in ATTRIBUTION),
+    rf"\b[a-z]+-by:\s*\W*{AI}[^\n]*<[^>\s]+@[^>\s]+>",
+)]
+# Subjects of merges that only bring main into the branch.
+MAIN_SYNC = re.compile(rf"Merge (remote-tracking )?(branch )?'?(origin/)?{BASE}'?( of \S+)?( into \S+)?\s*",
+                       re.IGNORECASE)
+
+
+class Stop(Exception):
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+
+
+def listing(paths, limit=8):
+    shown = ", ".join(paths[:limit]) or "unknown files"
+    return shown + (f" and {len(paths) - limit} more" if len(paths) > limit else "")
+
+
+def say(message):
+    print(f"land-pr: {message}", flush=True)
+
+
+def sleep(seconds):
+    time.sleep(seconds)
+
+
+def git(root, *args, check=True):
+    env = {name: value for name, value in os.environ.items() if name not in GIT_LOCATION}
+    result = subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True, env=env)
+    if check and result.returncode:
+        raise Stop(1, f"git {' '.join(args)} failed: {result.stderr.strip()}")
+    return result
+
+
+def gh(*args):
+    env = dict(os.environ, GH_PROMPT_DISABLED="1", GH_PAGER="cat", NO_COLOR="1")
+    for variable in ("GH_REPO", "GH_FORCE_TTY"):
+        env.pop(variable, None)
+    return subprocess.run(["gh", *args], capture_output=True, text=True, env=env, timeout=120)
+
+
+def api(path):
+    result = gh("api", path)
+    if result.returncode:
+        raise Stop(1, f"GitHub read of {path} failed: {result.stderr.strip()}")
+    return json.loads(result.stdout)
+
+
+def origin_repository(root):
+    """OWNER/REPO of a GitHub origin, or None."""
+    url = git(root, "remote", "get-url", "origin", check=False).stdout.strip()
+    match = re.search(r"github\.com[:/]([\w.-]+)/([\w.-]+?)(\.git)?/?$", url)
+    return f"{match[1]}/{match[2]}" if match else None
+
+
+# ---- Commit message -------------------------------------------------------
+
+def clean(message):
+    """A commit message without attribution lines or runs of blank lines."""
+    lines, blank = [], False
+    for line in message.splitlines():
+        if any(pattern.search(line) for pattern in ATTRIBUTION):
+            continue
+        line = line.rstrip()
+        if not line and (blank or not lines):
+            continue
+        blank = not line
+        lines.append(line)
+    while lines and not lines[-1]:
+        lines.pop()
+    return "\n".join(lines)
+
+
+def squash_message(number, title, commits):
+    """Title and body from the PR's commits: (message, parent count) in order."""
+    entries = []
+    for message, parents in commits:
+        text = clean(message)
+        if not text:
+            continue
+        subject, _, rest = text.partition("\n")
+        if parents > 1 and MAIN_SYNC.fullmatch(subject) and not rest.strip():
+            continue
+        entries.append("* " + text)
+    title = f"{title} (#{number})"
+    body = "\n\n".join(entries)
+    survivors = [line for line in (title + "\n" + body).splitlines()
+                 if any(pattern.search(line) for pattern in SURVIVORS)]
+    if survivors:
+        raise Stop(REFUSED, "AI attribution remains in the squash message; refusing:\n  "
+                   + "\n  ".join(survivors))
+    if not body:
+        # An empty message would let GitHub substitute its own, trailers included.
+        raise Stop(REFUSED, "the PR's commits leave an empty squash message; refusing")
+    return title, body
+
+
+def pr_commits(repository, number):
+    commits = []
+    for page in range(1, 4):  # GitHub lists at most 250 commits.
+        batch = api(f"repos/{repository}/pulls/{number}/commits?per_page=100&page={page}")
+        commits += [(entry["commit"]["message"], len(entry.get("parents", []))) for entry in batch]
+        if len(batch) < 100:
+            break
+    return commits
+
+
+# ---- Preconditions ----------------------------------------------------------
+
+def read_pr(repository, number):
+    pr = api(f"repos/{repository}/pulls/{number}")
+    if pr.get("merged"):
+        raise Stop(REFUSED, f"#{number} is already merged")
+    if pr.get("state") != "open":
+        raise Stop(REFUSED, f"#{number} is {pr.get('state')}")
+    if pr.get("draft"):
+        raise Stop(REFUSED, f"#{number} is a draft")
+    head_repo = (pr["head"].get("repo") or {}).get("full_name", "")
+    if head_repo.lower() != pr["base"]["repo"]["full_name"].lower():
+        raise Stop(REFUSED, f"#{number} comes from another repository ({head_repo or 'deleted'})")
+    if pr["base"]["ref"] != BASE:
+        raise Stop(REFUSED, f"#{number} targets {pr['base']['ref']}, not {BASE}")
+    return pr
+
+
+def fetch(root, branch, head):
+    git(root, "check-ref-format", "--branch", branch)
+    git(root, "fetch", "--quiet", "--no-tags", "origin", f"+refs/heads/{BASE}:refs/remotes/origin/{BASE}",
+        f"+refs/heads/{branch}:refs/remotes/origin/{branch}")
+    remote = git(root, "rev-parse", f"refs/remotes/origin/{branch}").stdout.strip()
+    if remote != head:
+        raise Stop(HEAD_MOVED, f"origin/{branch} is at {remote[:12]} but GitHub reports {head[:12]}; "
+                   "run again once they agree")
+
+
+def worktrees(root):
+    """(path, branch ref or None) for every worktree, detached ones included."""
+    found = []
+    for block in git(root, "worktree", "list", "--porcelain").stdout.strip().split("\n\n"):
+        fields = dict((line.split(" ", 1) + [""])[:2] for line in block.splitlines())
+        if "worktree" in fields and "bare" not in fields and "prunable" not in fields:
+            found.append((fields["worktree"], fields.get("branch")))
+    return found
+
+
+def check_local(root, branch, head):
+    """Refuse when landing would leave local work for this branch behind."""
+    ref = f"refs/heads/{branch}"
+    local = git(root, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", check=False)
+    if local.returncode == 0 and git(root, "merge-base", "--is-ancestor", local.stdout.strip(), head,
+                                     check=False).returncode:
+        raise Stop(REFUSED, f"local {branch} has commits the PR does not; push or drop them first")
+    for path, checked_out in worktrees(root):
+        # A rebase detaches HEAD; its state names the branch it will rewrite.
+        if not Path(path).is_dir():
+            continue  # A locked worktree whose directory is gone holds no work here.
+        for state in ("rebase-merge/head-name", "rebase-apply/head-name"):
+            name = Path(path, git(path, "rev-parse", "--git-path", state).stdout.strip())
+            if name.is_file() and name.read_text().strip() == ref:
+                raise Stop(REFUSED, f"{path} is rebasing {branch}; finish or abort it first")
+        if checked_out != ref:
+            continue
+        if git(path, "status", "--porcelain", "--untracked-files=no").stdout.strip():
+            raise Stop(REFUSED, f"{path} has uncommitted changes to {branch}")
+        for marker in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"):
+            if Path(path, git(path, "rev-parse", "--git-path", marker).stdout.strip()).exists():
+                raise Stop(REFUSED, f"{path} has a merge in progress on {branch}")
+
+
+@contextlib.contextmanager
+def landing_lock(root, repository, number):
+    common = Path(git(root, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip())
+    directory = common / "land-pr"
+    directory.mkdir(mode=0o700, exist_ok=True)
+    with open(directory / f"{repository.replace('/', '_').lower()}-{number}.lock", "a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Stop(REFUSED, f"another landing of #{number} is running") from None
+        yield
+
+
+# ---- Bringing the branch up to date -----------------------------------------
+
+def merged_tree(root, head):
+    """The tree of main merged into HEAD, or raise with the conflicting paths."""
+    result = git(root, "merge-tree", "--write-tree", "--name-only", "--no-messages",
+                 f"refs/remotes/origin/{BASE}", head, check=False)
+    if result.returncode == 1:
+        return None, result.stdout.splitlines()[1:]
+    if result.returncode:
+        raise Stop(1, f"git merge-tree failed: {result.stderr.strip()}")
+    return result.stdout.split()[0], []
+
+
+def push(root, branch, commit):
+    """A plain push, so another session's push to the branch is never overwritten."""
+    result = git(root, "push", "--porcelain", "origin", f"{commit}:refs/heads/{branch}", check=False)
+    if result.returncode:
+        if any(line.startswith("!") and "[rejected]" in line
+               and ("(fetch first)" in line or "(non-fast-forward)" in line)
+               for line in result.stdout.splitlines()):
+            raise Stop(HEAD_MOVED, f"{branch} moved on GitHub while it was being updated; run again")
+        raise Stop(1, f"push to {branch} failed: {(result.stderr or result.stdout).strip()}")
+
+
+def sync(root, branch, head, update, dry_run):
+    """The head to land: HEAD itself, or HEAD with main merged in when asked to."""
+    if git(root, "merge-base", "--is-ancestor", f"refs/remotes/origin/{BASE}", head,
+           check=False).returncode == 0:
+        return head
+    tree, paths = merged_tree(root, head)
+    if tree is None:
+        raise Stop(CONFLICT, f"{branch} conflicts with {BASE} in {listing(paths)}; "
+                   "resolve it in your worktree and push")
+    if not update:
+        return head
+    main = git(root, "rev-parse", f"refs/remotes/origin/{BASE}").stdout.strip()
+    # The same merge commit `git merge` would make, built without a checkout.
+    sign = git(root, "config", "--bool", "commit.gpgsign", check=False).stdout.strip() == "true"
+    commit = git(root, "commit-tree", *(["-S"] if sign else []), tree, "-p", head, "-p", main,
+                 "-m", f"Merge origin/{BASE} into {branch}").stdout.strip()
+    if dry_run:
+        say(f"would push {commit[:12]}, {branch} with {BASE} merged in")
+        return commit
+    push(root, branch, commit)
+    say(f"pushed {commit[:12]}: merged {BASE} into {branch}")
+    return commit
+
+
+# ---- Waiting for CI ---------------------------------------------------------
+
+def passed(context):
+    if context.get("__typename") == "StatusContext":
+        return context.get("state") == "SUCCESS"
+    return context.get("status") == "COMPLETED" and context.get("conclusion") in ("SUCCESS", "NEUTRAL", "SKIPPED")
+
+
+def failed(context):
+    if context.get("__typename") == "StatusContext":
+        return context.get("state") in ("FAILURE", "ERROR")
+    return context.get("conclusion") in ("FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE")
+
+
+def assess(report, head, since, superseded=()):
+    """('wait'|'green'|'failed'|'moved'|'conflict'|'closed', detail) for one status read.
+
+    A read fetched before SINCE, when this head was pushed or confirmed, may
+    only confirm this head's own state; one reporting a SUPERSEDED head is
+    GitHub not yet showing a push this run made.
+    """
+    data = report.get("data") or {}
+    snapshot = data.get("snapshot")
+    if not snapshot:
+        return "wait", data.get("error") or report.get("error") or "no status yet"
+    pr = snapshot["pull_request"]
+    current = (data.get("fetched_at") or 0) >= since
+    if pr["headRefOid"] != head:
+        if not current or pr["headRefOid"] in superseded:
+            return "wait", "waiting for GitHub to report this head"
+        return "moved", pr["headRefOid"]
+    if pr["state"] != "OPEN":
+        return "closed", pr["state"].lower()
+    if pr.get("isDraft"):
+        return "closed", "converted to draft"
+    if pr.get("mergeable") == "CONFLICTING":
+        # Only a current read decides; an older one may predate main's move.
+        return ("conflict", "GitHub reports a conflict with main") if current else ("wait", "mergeability unsettled")
+    state = snapshot.get("checks_state")
+    if report.get("limitations") or state is None:
+        return "wait", "checks unknown" if report.get("limitations") else "no checks reported yet"
+    contexts = snapshot.get("checks", [])
+    if state in ("FAILURE", "ERROR"):
+        names = [context.get("name") or context.get("context") for context in contexts if failed(context)]
+        return "failed", ", ".join(filter(None, names)) or state.lower()
+    # The aggregate covers every context, even past the 100 listed.
+    if state == "SUCCESS" and all(map(passed, contexts)):
+        return "green", "checks passed"
+    return "wait", "checks running"
+
+
+def read_status(root, repository, number):
+    try:
+        result = subprocess.run([str(root / "scripts/gh-pr-status"), str(number), "-R", repository, "--json"],
+                                capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.SubprocessError) as error:
+        return {"error": f"gh-pr-status did not answer: {error}"}
+    try:
+        report = json.loads(result.stdout)
+    except ValueError:
+        report = {}
+    if not (report.get("data") or {}).get("snapshot") and result.stderr.strip():
+        report["error"] = result.stderr.strip().splitlines()[-1]
+    return report
+
+
+def wait_for_ci(root, repository, number, head, since, deadline, superseded):
+    last = None
+    while True:
+        report = read_status(root, repository, number)
+        verdict, detail = assess(report, head, since, superseded)
+        if (verdict, detail) != last:
+            say(f"#{number} at {head[:12]}: {detail}")
+            last = (verdict, detail)
+        if verdict != "wait":
+            return verdict, detail
+        data = report.get("data") or {}
+        now = time.time()
+        if now >= deadline:
+            raise Stop(TIMED_OUT, f"CI on {head[:12]} did not finish in time ({detail}); run again to keep waiting")
+        # Read again when the shared cache can refresh, never sooner.
+        refresh = (data.get("fetched_at") or now) + REFRESH
+        due = max(data.get("retry_at") or 0, refresh, now + MINIMUM_WAIT)
+        sleep(min(due, deadline) - now + 1)
+
+
+# ---- Landing ----------------------------------------------------------------
+
+def merge(repository, number, head, title, body):
+    result = gh("api", "-X", "PUT", f"repos/{repository}/pulls/{number}/merge", "-f", f"sha={head}",
+                "-f", "merge_method=squash", "-f", f"commit_title={title}", "-f", f"commit_message={body}")
+    if result.returncode:
+        error = result.stderr.strip()
+        if "HTTP 409" in error:
+            raise Stop(HEAD_MOVED, f"GitHub refused the merge, the head moved: {error}")
+        raise Stop(REFUSED if re.search(r"HTTP 4\d\d", error) else 1, f"GitHub refused the merge: {error}")
+    return json.loads(result.stdout).get("sha", "")
+
+
+DRY_RUN_STATUS = {"failed": CI_FAILED, "moved": HEAD_MOVED, "closed": REFUSED, "conflict": CONFLICT}
+
+
+def land(root, repository, number, update=False, dry_run=False, timeout=60):
+    deadline = time.time() + timeout * 60
+    superseded = set()
+    with landing_lock(root, repository, number):
+        for attempt in range(SYNC_ROUNDS):
+            pr = read_pr(repository, number)
+            branch, head = pr["head"]["ref"], pr["head"]["sha"]
+            since = int(time.time())  # gh-pr-status reports whole seconds.
+            fetch(root, branch, head)
+            check_local(root, branch, head)
+            target = sync(root, branch, head, update or pr.get("mergeable_state") == "dirty", dry_run)
+            if target != head:
+                superseded.add(head)
+                since = int(time.time())
+            title, body = squash_message(number, pr["title"], pr_commits(repository, number))
+            if dry_run:
+                if target != head:
+                    verdict, detail = "wait", f"would push it, then wait for CI on {target[:12]}"
+                else:
+                    verdict, detail = assess(read_status(root, repository, number), head, since)
+                    detail = f"CI on {head[:12]}: " + (f"moved to {detail[:12]}" if verdict == "moved" else detail)
+                say(f"dry run: {detail}; would merge {target[:12]} as:")
+                print(f"\n{title}\n\n{body}\n", flush=True)
+                return DRY_RUN_STATUS.get(verdict, 0)
+            verdict, detail = wait_for_ci(root, repository, number, target, since, deadline, superseded)
+            if verdict == "green":
+                merged = merge(repository, number, target, title, body)
+                git(root, "fetch", "--quiet", "--no-tags", "origin",
+                    f"+refs/heads/{BASE}:refs/remotes/origin/{BASE}", check=False)
+                say(f"landed #{number} at {target[:12]} as {merged[:12]} on {BASE}")
+                return 0
+            if verdict == "failed":
+                raise Stop(CI_FAILED, f"CI failed on {target[:12]}: {detail}")
+            if verdict == "moved":
+                raise Stop(HEAD_MOVED, f"#{number} moved to {detail[:12]} while waiting; review it and run again")
+            if verdict == "closed":
+                raise Stop(REFUSED, f"#{number} is {detail}")
+            # GitHub sees a conflict: main may have moved. Look again once it can have settled.
+            if attempt + 1 < SYNC_ROUNDS:
+                if time.time() + REFRESH >= deadline:
+                    raise Stop(TIMED_OUT, f"GitHub still reports #{number} conflicting with {BASE}")
+                sleep(REFRESH)
+        raise Stop(CONFLICT, f"GitHub still reports #{number} conflicting with {BASE} after {SYNC_ROUNDS} checks")
+
+
+def main(argv=None, root=ROOT):
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("number", type=int, metavar="PR")
+    parser.add_argument("-R", "--repo", metavar="OWNER/REPO")
+    parser.add_argument("--update", action="store_true",
+                        help=f"merge {BASE} in even without a conflict, when CI is stale against a change")
+    parser.add_argument("--dry-run", action="store_true", help="check and report; push and merge nothing")
+    parser.add_argument("--timeout", type=int, default=60, metavar="MINUTES", help="CI wait (default 60)")
+    args = parser.parse_args(argv)
+    if args.number < 1 or args.timeout < 1:
+        parser.error("PR and --timeout must be positive")
+    try:
+        origin = origin_repository(root)
+        repository = args.repo or origin
+        if not repository:
+            raise Stop(2, "cannot tell the repository from origin; pass -R OWNER/REPO")
+        if not re.fullmatch(r"[\w.-]+/[\w.-]+", repository):
+            raise Stop(2, "use -R OWNER/REPO")
+        if origin and origin.lower() != repository.lower():
+            raise Stop(REFUSED, f"origin is {origin}, not {repository}; run from a checkout of {repository}")
+        return land(root, repository, args.number, args.update, args.dry_run, args.timeout)
+    except Stop as stop:
+        print(f"land-pr: {stop}", file=sys.stderr, flush=True)
+        return stop.status
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+        print(f"land-pr: {error!r}", file=sys.stderr, flush=True)
+        return 1
+
+
+if __name__ == "__main__":
+    def terminated(number, _frame):
+        raise SystemExit(128 + number)
+    signal.signal(signal.SIGTERM, terminated)
+    signal.signal(signal.SIGHUP, terminated)
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

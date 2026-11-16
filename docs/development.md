@@ -1748,6 +1748,60 @@ cooldowns between requests, or apply a GraphQL reset to REST. One gh command
 may create multiple contents, and independent repositories do not share this
 slot; this is not enforcement of an account-wide GitHub quota.
 
+### Landing a pull request
+
+Once CI is green and the reviewer is satisfied, land the PR with:
+
+```sh
+scripts/land-pr 1234 -R CarsonBurke/cagents
+```
+
+It squash-merges the PR pinned to the head CI passed on (a REST merge with
+`sha=`), so nothing lands that was not tested. The squash message is the PR
+title with `(#1234)` and a `*` bullet per commit message, with AI attribution
+lines removed: a `…-by:` trailer whose value is Claude, Anthropic, OpenAI,
+Codex, ChatGPT, GPT or Copilot (`Co-Authored-By`, `Generated-by`,
+`Assisted-by`), an `AI-…:` trailer, a line that is only a "Generated with",
+"Made with" or similar footer naming one of them, with an optional emoji and
+link, and lines with `noreply@anthropic.com`, `noreply@openai.com` or
+`claude.com/claude-code`. Prose that mentions a provider, a trailer or a
+footer stays, even when it wraps onto a line starting "written by Codex".
+Attribution of those shapes in the title, which is never stripped, or a
+trailer quoted mid-line with an email address refuses the landing, as does an
+empty message. Bullets for merges that only brought `main` into the branch
+are dropped; a merge whose message explains a conflict resolution is kept.
+
+It refuses a PR that is closed, a draft, from another repository or based on
+something other than `main`, and a `-R` that is not this checkout's `origin`.
+It also refuses when the local branch has commits the PR lacks, a worktree on
+the branch has uncommitted changes or a merge in progress, any worktree is
+rebasing the branch, or another landing of the same PR is running. It waits
+for CI on the head through `scripts/gh-pr-status`, reading again only when the
+shared cache can refresh, about every two minutes, or later when `retry_at`
+says so. Unknown or missing checks count as not passed. A read from before the
+head was known, or one that has not yet caught up with the script's own push,
+cannot report that the head moved.
+
+Per the merge policy, it does not bring the branch up to date with `main`
+merely because `main` moved, and it compiles nothing. When the branch
+conflicts with `main` in Git, it stops and lists the conflicting files for you
+to resolve. When GitHub reports a conflict that Git merges cleanly, or with
+`--update` when CI is stale against a change the branch depends on, it makes
+the merge commit `git merge` would make (signed when `commit.gpgsign` is
+set), with `git merge-tree` and `git commit-tree` so no checkout is touched,
+and pushes it plainly. It never rebases or force-pushes, and a push rejected
+because someone else pushed stops the landing. Pull the branch afterwards if
+you keep working on it.
+
+`--dry-run` makes the same checks, reads CI once without waiting, prints the
+squash message it would use, and pushes and merges nothing; when it would
+first push a merge with `main`, it says so rather than judge the current
+head. `--timeout MINUTES` bounds the wait for CI (default 60). Exit status: 0
+merged (for a dry run, nothing in the way, though CI may still be running), 3
+conflicts with `main`, 4 the head moved, 5 refused, 6 CI failed, 7 CI did not
+finish in time, 2 usage, 1 anything else. Offline coverage, `python3 -I -B tests/land_pr.py
+-v`, uses disposable Git history and stand-ins for `gh` and `gh-pr-status`.
+
 ## Native evidence
 
 For which fixture to use, how they fit together and how to extend or repair
