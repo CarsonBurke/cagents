@@ -148,16 +148,28 @@ const RETRY_RESUME: &str = "Retry resumes the saved conversation in this pane.";
 const RETRY_PICKER: &str = "Retry opens the agent's conversation picker in this pane.";
 const RETRY_SHELL: &str = "Retry starts a new shell in this pane.";
 /// What Retry launches for a terminal with no live process to reconcile.
-fn new_terminal_consequence(session: &TerminalSession) -> &'static str {
+enum NewTerminal {
+    Resume,
+    Shell,
+    Fresh,
+}
+fn new_terminal(session: &TerminalSession) -> NewTerminal {
     if session.agent_resume_recipe().is_some() {
-        RETRY_RESUME
+        NewTerminal::Resume
     } else if matches!(
         crate::upgrade::recovery_plan(session),
         Ok((_, crate::upgrade::RecoveryKind::Shell))
     ) {
-        RETRY_SHELL
+        NewTerminal::Shell
     } else {
-        RETRY_FRESH
+        NewTerminal::Fresh
+    }
+}
+fn new_terminal_consequence(session: &TerminalSession) -> &'static str {
+    match new_terminal(session) {
+        NewTerminal::Resume => RETRY_RESUME,
+        NewTerminal::Shell => RETRY_SHELL,
+        NewTerminal::Fresh => RETRY_FRESH,
     }
 }
 /// What Retry will do once the daemon has restored its terminals. A pane with a
@@ -166,10 +178,10 @@ fn restoring_consequence(session: &TerminalSession) -> &'static str {
     if session.continuity.live_proof().is_some() {
         return RETRY_AFTER_RESTORING;
     }
-    match new_terminal_consequence(session) {
-        RETRY_RESUME => RETRY_AFTER_RESTORING_RESUME,
-        RETRY_SHELL => RETRY_AFTER_RESTORING_SHELL,
-        _ => RETRY_AFTER_RESTORING_FRESH,
+    match new_terminal(session) {
+        NewTerminal::Resume => RETRY_AFTER_RESTORING_RESUME,
+        NewTerminal::Shell => RETRY_AFTER_RESTORING_SHELL,
+        NewTerminal::Fresh => RETRY_AFTER_RESTORING_FRESH,
     }
 }
 /// What Retry does for a terminal whose daemon is gone: the plan recovery will

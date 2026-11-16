@@ -302,13 +302,29 @@ fn reconcile_with(
             .map_err(|error| format!("cannot serialize terminal recovery: {error}"))?,
     );
     let mut client = ControlClient::connect(socket).map_err(|error| error.to_string())?;
-    // While the daemon restores, its inventory can miss this terminal and it
-    // refuses what Retry would ask of it, so a press says that instead.
-    if explicit_retry {
-        ensure_admitted(&mut client)?;
-    }
     let proof = client.proof().clone();
-    let terminals = client.list().map_err(|error| error.to_string())?;
+    let mut terminals = client.list().map_err(|error| error.to_string())?;
+    // A daemon still restoring lists and attaches, so a terminal it lists is
+    // reached as before. One it doesn't list may be among those still being
+    // restored, and the replacement a press would go on to ask for is refused
+    // until then, so the press says that, and reads the inventory again once
+    // the daemon is ready.
+    let reaches = |terminals: &[TerminalDescriptor]| {
+        (proof == expected
+            && terminals.iter().any(|terminal| {
+                terminal.session.id == session.id
+                    && terminal.session.launch == session.launch
+                    && terminal.session.continuity.can_resume_live(&expected)
+            }))
+            || !matches!(
+                adoptable_lineage(&session, &expected, &proof, terminals),
+                Ok(None)
+            )
+    };
+    if explicit_retry && !reaches(&terminals) {
+        ensure_admitted(&mut client)?;
+        terminals = client.list().map_err(|error| error.to_string())?;
+    }
     let original = terminals.iter().find(|terminal| {
         terminal.session.id == session.id && terminal.session.launch == session.launch
     });
@@ -1123,42 +1139,31 @@ mod tests {
                 },
             )
             .unwrap();
-            let mut list: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
-            // A press asks whether the daemon admits it before discovery.
-            if list.request == ClientRequest::StartupState {
+            // Recovery is read-only: it lists, and a press asks whether the
+            // daemon admits it, but no Spawn, Attach, Shutdown, or Input
+            // reaches this connection. A returned plan must use a fresh handle.
+            while let Some(request) = read_frame::<ClientEnvelope>(&mut stream).unwrap() {
+                assert_eq!(request.proof, Some(proof.clone()));
+                let response = match request.request {
+                    ClientRequest::List => ServerResponse::Listed {
+                        terminals: terminals.clone(),
+                    },
+                    ClientRequest::StartupState => {
+                        ServerResponse::StartupState(crate::terminal::ipc::StartupState::Ready)
+                    }
+                    other => panic!("recovery sent {other:?}"),
+                };
                 write_frame(
                     &mut stream,
                     &ServerEnvelope {
                         version: PROTOCOL_VERSION,
-                        request_id: Some(list.request_id),
+                        request_id: Some(request.request_id),
                         proof: proof.clone(),
-                        message: ServerMessage::Response {
-                            response: ServerResponse::StartupState(
-                                crate::terminal::ipc::StartupState::Ready,
-                            ),
-                        },
+                        message: ServerMessage::Response { response },
                     },
                 )
                 .unwrap();
-                list = read_frame(&mut stream).unwrap().unwrap();
             }
-            assert_eq!(list.proof, Some(proof.clone()));
-            assert_eq!(list.request, ClientRequest::List);
-            write_frame(
-                &mut stream,
-                &ServerEnvelope {
-                    version: PROTOCOL_VERSION,
-                    request_id: Some(list.request_id),
-                    proof,
-                    message: ServerMessage::Response {
-                        response: ServerResponse::Listed { terminals },
-                    },
-                },
-            )
-            .unwrap();
-            // Recovery is read-only: no Spawn, Attach, Shutdown, or Input reaches
-            // this connection. A newly returned plan must use a fresh handle.
-            assert_eq!(read_frame::<ClientEnvelope>(&mut stream).unwrap(), None);
             for _ in 0..probes {
                 accept_within(&listener);
             }
@@ -2603,6 +2608,22 @@ mod tests {
                 "live {live}"
             );
         }
+        // A restoring daemon still lists and attaches, so a press reaches a
+        // terminal it lists without waiting for the restore to finish.
+        let directory = tempfile::tempdir().unwrap();
+        let saved = session(directory.path(), &proof("current"));
+        let (server, socket) = served(
+            directory.path(),
+            Inventory {
+                terminals: vec![hosted(&saved)],
+                ..restoring()
+            },
+        );
+        let result = reconcile_at(saved.clone(), true, &socket, directory.path());
+        server.join().unwrap();
+        let recovered = result.unwrap();
+        assert_eq!(recovered.session.id, saved.id);
+        assert!(!recovered.attach_completed);
         // Once restored, a Retry without a proof goes ahead.
         let directory = tempfile::tempdir().unwrap();
         let saved = saved_shell(directory.path(), false);
