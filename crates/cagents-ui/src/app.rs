@@ -885,6 +885,51 @@ fn notice_surface_action<'a>(
         .into()
 }
 
+/// A notice's action that is busy while its work runs: it then shows
+/// `busy_label` and can't be pressed again. It keeps the room of the wider
+/// label throughout, so the notice's other controls stay where they are.
+fn notice_surface_busy_action<'a>(
+    severity: NoticeSeverity,
+    label: &'a str,
+    busy_label: &'a str,
+    busy: bool,
+    accessible_name: &'a str,
+    id: widget::Id,
+    message: Message,
+) -> Element<'a, Message> {
+    // The look of COSMIC's text button, which takes only one label.
+    let theme = cosmic::theme::active();
+    let spacing = theme.cosmic();
+    let text = |label: &'a str| -> Element<'a, Message> {
+        widget::text(label)
+            .size(14)
+            .line_height(iced::widget::text::LineHeight::Absolute(20.0.into()))
+            .wrapping(iced::widget::text::Wrapping::None)
+            .into()
+    };
+    let (shown, kept) = if busy {
+        (busy_label, label)
+    } else {
+        (label, busy_label)
+    };
+    widget::button::custom(
+        widget::container(crate::ui_controls::reserved(
+            text(shown),
+            [text(kept)],
+            iced::alignment::Horizontal::Center,
+        ))
+        .padding([0, spacing.space_s()])
+        .height(Length::Fixed(spacing.space_l().into()))
+        .center_y(Length::Fixed(spacing.space_l().into())),
+    )
+    .padding(0)
+    .id(id)
+    .name(if busy { busy_label } else { accessible_name })
+    .class(notice_surface_button(severity))
+    .on_press_maybe((!busy).then_some(message))
+    .into()
+}
+
 /// The save-health notices: the writer lane's state, and the writes storage
 /// refused, which the lane reports beside its state rather than as one.
 /// `card_title` names the card a refused terminal identity belongs to.
@@ -989,22 +1034,25 @@ fn save_quarantine_view<'a>(
     // An exhausted lane offers the one retry on its own notice; a retry
     // re-offers these writes too, so a second button would only repeat it.
     let lane_offers_retry = matches!(health.health, SessionSaveHealth::RetryExhausted { .. });
-    let (guidance, action) = if health.retry_requested {
-        ("Retry requested; waiting for the session writer.", None)
+    let guidance = if health.retry_requested {
+        "Retry requested; waiting for the session writer."
     } else {
-        (
-            QUARANTINE_GUIDANCE,
-            (health.offers_retry() && !lane_offers_retry).then(|| {
-                notice_surface_action(
-                    NoticeSeverity::Error,
-                    "Retry save",
-                    "Offer the refused changes to storage again",
-                    widget::Id::new("session-save.retry"),
-                    Message::RetrySessionSave,
-                )
-            }),
-        )
+        QUARANTINE_GUIDANCE
     };
+    // A requested retry keeps its button, busy, so the recovery action
+    // beside it stays put.
+    let action =
+        ((health.offers_retry() || health.retry_requested) && !lane_offers_retry).then(|| {
+            notice_surface_busy_action(
+                NoticeSeverity::Error,
+                "Retry save",
+                "Retrying save…",
+                health.retry_requested,
+                "Offer the refused changes to storage again",
+                widget::Id::new("session-save.retry"),
+                Message::RetrySessionSave,
+            )
+        });
     let actions: Vec<_> = action.into_iter().chain(recovery).collect();
     let action = (!actions.is_empty()).then(|| {
         widget::row::with_children(actions)
@@ -1062,20 +1110,22 @@ fn save_lane_view(health: &SaveHealthState, path: String) -> Option<Element<'_, 
             first_failed_at_unix_ms,
             attempts,
         } => {
-            let (guidance, action) = if health.retry_requested {
-                ("Retry requested; waiting for the session writer.", None)
+            let guidance = if health.retry_requested {
+                "Retry requested; waiting for the session writer."
             } else {
-                (
-                    category.guidance(),
-                    Some(notice_surface_action(
-                        NoticeSeverity::Error,
-                        "Retry save",
-                        "Retry saving the session",
-                        widget::Id::new("session-save.retry"),
-                        Message::RetrySessionSave,
-                    )),
-                )
+                category.guidance()
             };
+            // A requested retry keeps its button, busy, so the notice
+            // doesn't jump while the writer works.
+            let action = Some(notice_surface_busy_action(
+                NoticeSeverity::Error,
+                "Retry save",
+                "Retrying save…",
+                health.retry_requested,
+                "Retry saving the session",
+                widget::Id::new("session-save.retry"),
+                Message::RetrySessionSave,
+            ));
             (
                 NoticeSeverity::Error,
                 format!("Session changes are not saved — {}", category.label()),

@@ -311,17 +311,16 @@ impl Cagents {
         let terminal = session.id;
         let suffix = if popup { "popup" } else { "pane" };
         let severity = NoticeSeverity::Error;
-        let retry = if entry.retry.is_some() {
-            notice_surface_detail(severity, "Retrying save…")
-        } else {
-            notice_surface_action(
-                severity,
-                "Retry save",
-                "Retry saving this terminal",
-                card_control_id(card, &format!("terminal-save.retry.{suffix}")),
-                Message::TerminalSave(Action::Retry(card, terminal)),
-            )
-        };
+        // While it works, Retry stays, busy, so Copy beside it stays put.
+        let retry = notice_surface_busy_action(
+            severity,
+            "Retry save",
+            "Retrying save…",
+            entry.retry.is_some(),
+            "Retry saving this terminal",
+            card_control_id(card, &format!("terminal-save.retry.{suffix}")),
+            Message::TerminalSave(Action::Retry(card, terminal)),
+        );
         let copy = crate::interaction::tooltip(
             widget::button::icon(Icon::Copy)
                 .id(card_control_id(
@@ -567,6 +566,72 @@ mod tests {
         pane.kind = app.card_state(card).unwrap().kind.clone();
         model.views[0].revision += 1;
         model
+    }
+
+    /// While a retry runs, its button stays, busy, as wide as before, so
+    /// Copy beside it stays put, and it can't be pressed twice.
+    #[test]
+    fn a_running_retry_keeps_its_button_and_its_neighbor_in_place() {
+        use cosmic::iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree, operation::Focusable},
+        };
+        let retry = widget::Id::new("retry");
+        let copy = widget::Id::new("copy");
+        let laid_out = |busy: bool| {
+            let mut row: Element<'_, Message> = widget::row::with_children(vec![
+                notice_surface_busy_action(
+                    NoticeSeverity::Error,
+                    "Retry save",
+                    "Retrying save…",
+                    busy,
+                    "Retry saving this terminal",
+                    retry.clone(),
+                    Message::CancelDialog,
+                ),
+                widget::button::text("Copy")
+                    .id(copy.clone())
+                    .on_press(Message::CancelDialog)
+                    .into(),
+            ])
+            .into();
+            let renderer = crate::app::tests::headless_renderer();
+            let mut tree = Tree::new(row.as_widget());
+            let node = row.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 80.0)),
+            );
+            #[derive(Default)]
+            struct Controls(Vec<(widget::Id, iced::Rectangle, bool)>);
+            impl Operation for Controls {
+                fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                    operate(self);
+                }
+                fn focusable(
+                    &mut self,
+                    id: Option<&widget::Id>,
+                    bounds: iced::Rectangle,
+                    state: &mut dyn Focusable,
+                ) {
+                    if let Some(id) = id {
+                        self.0.push((id.clone(), bounds, state.is_focus_stop()));
+                    }
+                }
+            }
+            let mut controls = Controls::default();
+            row.as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut controls);
+            controls.0
+        };
+        let idle = laid_out(false);
+        let running = laid_out(true);
+        assert_eq!(idle.len(), 2, "{idle:?}");
+        for ((id, before, _), (_, after, _)) in idle.iter().zip(&running) {
+            assert_eq!(before, after, "{id:?} moved while the retry runs");
+        }
+        assert!(idle[0].2, "Retry can be pressed while idle");
+        assert!(!running[0].2, "a running retry can't be pressed again");
     }
 
     #[test]
