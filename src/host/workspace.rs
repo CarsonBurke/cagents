@@ -147,6 +147,9 @@ fn edit_then<T>(
             return Ok((receipt, then(&registry)?));
         }
     }
+    if super::chat::pane_start::requires_edit_check(&edit) {
+        super::chat::pane_start::validate_edit(host, &registry, &edit)?;
+    }
     let applied = if matches!(
         &edit,
         ModelEdit::ChangeView {
