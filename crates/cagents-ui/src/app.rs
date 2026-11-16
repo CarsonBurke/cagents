@@ -19638,19 +19638,19 @@ impl Application for Cagents {
                     .into(),
             );
         }
-        rows.push(dialog_ui::confirmation_actions(
+        let actions = dialog_ui::confirmation_actions(
             crate::ui_controls::button::secondary("Cancel").on_press(Message::CancelDialog),
             crate::ui_controls::button::primary("Create").on_press_maybe(
                 self.pull_request_submission_allowed()
                     .then_some(Message::SubmitPullRequest),
             ),
-        ));
+        );
         Some(dialog_ui::overlay(
-            dialog_ui::scrolling_surface(
+            dialog_ui::scrolling_surface_with_actions(
                 widget::column::with_children(rows).spacing(space::M),
+                actions,
                 620.0,
-                (self.window_height - 112.0).clamp(120.0, 620.0),
-                Length::Shrink,
+                620.0,
             ),
             Some(Message::CancelDialog),
             1.0,

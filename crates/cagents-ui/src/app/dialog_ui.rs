@@ -16,6 +16,37 @@ pub(crate) fn surface<'a, M: 'a>(
     .into()
 }
 
+/// A dialog's scrolled content, held off the scrollbar's rail by `padding`.
+/// It keeps the dialog's text color: cosmic's default container would set
+/// the window background's instead, dimming everything inside.
+fn scrolled_body<'a, M: 'a>(
+    content: impl Into<Element<'a, M>>,
+    padding: Padding,
+) -> Element<'a, M> {
+    widget::container(content)
+        .padding(design::with_vertical_rail(padding))
+        .class(cosmic::theme::Container::custom(|_| Default::default()))
+        .into()
+}
+
+/// A list inside a dialog's body that scrolls on its own once it is taller
+/// than `max_height`, fading into the dialog at its edges. Like the body
+/// around it, it keeps the dialog's text color.
+pub(crate) fn scrolled_region<'a, M: 'a>(
+    content: impl Into<Element<'a, M>>,
+    max_height: f32,
+) -> Element<'a, M> {
+    widget::container(crate::interaction::overflow_fade_y(
+        widget::scrollable(scrolled_body(content, Padding::ZERO)).direction(
+            iced::widget::scrollable::Direction::Vertical(design::scrollbar()),
+        ),
+        design::dialog_base,
+    ))
+    .max_height(max_height)
+    .class(cosmic::theme::Container::custom(|_| Default::default()))
+    .into()
+}
+
 /// A [`surface`] whose whole body scrolls when the window is too short for
 /// it. `height` is the dialog's own: `Shrink` to fit its content, or `Fill`
 /// to take `max_height` whatever it holds.
@@ -34,13 +65,14 @@ pub(crate) fn scrolling_surface<'a, M: 'a>(
     let edge = space::L - design::BORDER_WIDTH;
     crate::interaction::opaque(
         widget::container(crate::interaction::overflow_fade_y(
-            widget::scrollable(
-                widget::container(content).padding(design::with_vertical_rail(Padding {
+            widget::scrollable(scrolled_body(
+                content,
+                Padding {
                     top: edge,
                     bottom: edge,
                     ..Padding::ZERO
-                })),
-            )
+                },
+            ))
             .direction(iced::widget::scrollable::Direction::Vertical(
                 design::scrollbar(),
             ))
@@ -57,6 +89,54 @@ pub(crate) fn scrolling_surface<'a, M: 'a>(
         })
         .width(Length::Fill)
         .height(height)
+        .max_width(max_width)
+        .max_height(max_height),
+    )
+    .into()
+}
+
+/// A [`scrolling_surface`] whose closing `actions` stay below the body,
+/// always in reach: when the window is too short for the whole dialog, only
+/// the body gives up height and scrolls. The dialog fits its content up to
+/// `max_height`.
+///
+/// The viewport runs from the dialog's top border down to the actions, so
+/// content fades into the gap above them; the gap and the top padding scroll
+/// with the content.
+pub(crate) fn scrolling_surface_with_actions<'a, M: 'a>(
+    content: impl Into<Element<'a, M>>,
+    actions: impl Into<Element<'a, M>>,
+    max_width: f32,
+    max_height: f32,
+) -> Element<'a, M> {
+    crate::interaction::opaque(
+        widget::container(crate::interaction::footed(
+            crate::interaction::overflow_fade_y(
+                widget::scrollable(scrolled_body(
+                    content,
+                    Padding {
+                        top: space::L - design::BORDER_WIDTH,
+                        bottom: space::M,
+                        ..Padding::ZERO
+                    },
+                ))
+                .direction(iced::widget::scrollable::Direction::Vertical(
+                    design::scrollbar(),
+                ))
+                .width(Length::Fill)
+                .height(Length::Shrink),
+                design::dialog_base,
+            ),
+            actions,
+        ))
+        .class(cosmic::theme::Container::Dialog(false))
+        .padding(Padding {
+            top: design::BORDER_WIDTH,
+            bottom: space::L,
+            left: space::L,
+            right: space::L,
+        })
+        .width(Length::Fill)
         .max_width(max_width)
         .max_height(max_height),
     )
@@ -484,5 +564,102 @@ pub(super) mod tests {
             window,
         );
         assert_eq!(dialog.height, 100.0 + 2.0 * space::L);
+    }
+
+    /// The minimum 900x600 window at the supported 150% interface scale lays
+    /// a dialog out in 600x400 logical pixels, less the overlay's inset.
+    #[test]
+    fn scrolling_dialog_actions_stay_in_reach_and_only_the_body_scrolls() {
+        let action = widget::Id::new("dialog.test.action");
+        let dialog = |body: f32| {
+            overlay(
+                scrolling_surface_with_actions(
+                    widget::Space::new().height(body),
+                    widget::button::text("Action")
+                        .id(action.clone())
+                        .height(32.0)
+                        .on_press(Message::CancelDialog),
+                    600.0,
+                    560.0,
+                ),
+                None,
+                1.0,
+            )
+        };
+        let scaled = iced::Size::new(600.0, 400.0);
+        let (window, viewport, content, button) = action_geometry(dialog(2000.0), scaled, &action);
+        assert!(
+            button.y >= 0.0 && button.y + button.height <= window.height,
+            "the action is inside the window: {button:?}"
+        );
+        assert_eq!(button.height, 32.0);
+        assert!(viewport.y + viewport.height <= button.y);
+        assert!(content > viewport.height, "the body scrolls instead");
+        // A roomy window caps the dialog at its maximum height.
+        let (_, viewport, _, button) =
+            action_geometry(dialog(2000.0), iced::Size::new(1200.0, 900.0), &action);
+        let top = viewport.y - design::BORDER_WIDTH;
+        assert_eq!(button.y + button.height + space::L - top, 560.0);
+        // A short body fits: no scrolling and no gap above the actions.
+        let (_, viewport, content, button) = action_geometry(dialog(100.0), scaled, &action);
+        assert_eq!(content, viewport.height);
+        assert_eq!(viewport.y + viewport.height, button.y);
+    }
+
+    /// The window, the scroll viewport, its content height and the bounds of
+    /// the control `id`, in a laid-out dialog.
+    pub(in crate::app) fn action_geometry(
+        mut element: Element<'_, Message>,
+        window: iced::Size,
+        id: &widget::Id,
+    ) -> (iced::Rectangle, iced::Rectangle, f32, iced::Rectangle) {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree, operation},
+        };
+        struct Geometry<'a>(&'a widget::Id, iced::Rectangle, f32, iced::Rectangle);
+        impl Operation for Geometry<'_> {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn scrollable(
+                &mut self,
+                _: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                content: iced::Rectangle,
+                _: iced::Vector,
+                _: &mut dyn operation::scrollable::Scrollable,
+            ) {
+                self.1 = bounds;
+                self.2 = content.height;
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                _: &mut dyn operation::Focusable,
+            ) {
+                if id == Some(self.0) {
+                    self.3 = bounds;
+                }
+            }
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, window),
+        );
+        let mut geometry = Geometry(
+            id,
+            iced::Rectangle::default(),
+            0.0,
+            iced::Rectangle::default(),
+        );
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut geometry);
+        (node.bounds(), geometry.1, geometry.2, geometry.3)
     }
 }

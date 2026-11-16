@@ -17,6 +17,8 @@ use serde::Deserialize;
 
 mod composer_popover;
 pub use composer_popover::composer_popover;
+mod footed;
+pub use footed::footed;
 mod context_menu;
 mod keyed_list;
 mod list_navigation;
