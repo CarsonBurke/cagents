@@ -108,6 +108,7 @@ fn pause(at: Pause) {
 }
 
 /// The outcome of one edit.
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct Applied {
     pub(crate) model: WorkspaceModel,
@@ -348,6 +349,7 @@ impl Registry {
     ///
     /// The caller has already resolved the edit's repository key; this never
     /// touches the filesystem, so an edit is decided entirely from the store.
+    #[cfg(test)]
     pub(crate) fn apply(&mut self, edit: &ModelEdit) -> Result<Applied, String> {
         let applied = self.apply_delta(edit)?;
         Ok(Applied {

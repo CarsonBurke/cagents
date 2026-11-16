@@ -610,26 +610,6 @@ mod tests {
         bytes
     }
 
-    #[cfg(feature = "host")]
-    fn frozen_request(
-        protocol: u16,
-        id: u64,
-        proof: Option<&HostSessionProof>,
-        tag: u8,
-        payload: &[u8],
-    ) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        frozen_uint(protocol.into(), &mut bytes);
-        frozen_uint(id, &mut bytes);
-        bytes.push(u8::from(proof.is_some()));
-        if let Some(proof) = proof {
-            frozen_proof(proof, &mut bytes);
-        }
-        bytes.push(tag);
-        bytes.extend_from_slice(payload);
-        bytes
-    }
-
     fn frozen_response(
         protocol: u16,
         id: u64,

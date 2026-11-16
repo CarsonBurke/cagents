@@ -614,15 +614,6 @@ impl Registry {
     /// The most recently registered ownership of allocation `terminal` by an
     /// owner from a boot other than `boot`. Registration order is the table's
     /// row order: refreshing an ownership updates its row in place.
-    pub(in crate::host) fn newest_native_actor_ownership(
-        &self,
-        terminal: crate::model::TerminalId,
-        boot: &crate::model::BootId,
-    ) -> Result<Option<NativeActorOwnership>, String> {
-        self.newest_native_actor_ownership_for_start(terminal, boot)
-            .map_err(|error| error.to_string())
-    }
-
     pub(in crate::host) fn newest_native_actor_ownership_for_start(
         &self,
         terminal: crate::model::TerminalId,

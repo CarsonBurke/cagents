@@ -35,6 +35,7 @@ impl ArchivedHistory {
 }
 
 impl Registry {
+    #[cfg(test)]
     pub(in crate::host) fn archived_history(
         &self,
         source: &Session,
@@ -251,6 +252,7 @@ impl Registry {
         }))
     }
 
+    #[cfg(test)]
     pub(in crate::host) fn recheck_archived_history(
         &self,
         witness: &ArchivedHistory,

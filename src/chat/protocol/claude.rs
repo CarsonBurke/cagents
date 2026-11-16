@@ -7327,9 +7327,11 @@ impl History {
         history.subagent_dir = Some(path.with_extension("").join("subagents"));
         Ok(history)
     }
+    #[cfg(test)]
     fn index(file: File, id: &str) -> Result<Self, String> {
         Self::index_with_tool_budget(file, id, 32 * 1024 * 1024, 200_000)
     }
+    #[cfg(test)]
     fn index_with_tool_budget(
         file: File,
         id: &str,
@@ -8091,10 +8093,6 @@ impl History {
             ));
         }
         Ok(children)
-    }
-    fn read_record(&mut self, offset: u64, len: u64, base: usize) -> Result<Value, String> {
-        self.read_record_for_start(offset, len, base)
-            .map_err(|error| error.to_string())
     }
     fn read_record_for_start(
         &mut self,

@@ -77,6 +77,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         )
     }
 
+    #[cfg(feature = "ui")]
     pub(super) fn ensure_creation_destination_ignored(
         &self,
         request: &CreateWorktreeRequest,

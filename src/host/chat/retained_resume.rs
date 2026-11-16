@@ -219,6 +219,11 @@ fn same_home_across_boots(left: &LaunchAccountScope, right: &LaunchAccountScope)
 /// another account home than the one it last ran under before a restart.
 pub(super) const PRIOR_BOOT_ACCOUNT_CHANGED: &str = "This conversation last ran under a different Claude account home before the computer restarted, so it was not resumed here. Continue it on another account to choose which account it runs under";
 
+#[cfg(test)]
+pub(super) fn ensure_prior_boot_account(host: &SharedHost, source: &Session) -> Result<(), String> {
+    ensure_prior_boot_account_for_start(host, source).map_err(|error| error.to_string())
+}
+
 /// A kernel boot change proves an earlier owner of this pane is gone, but not
 /// that the recorded launch still selects the account home it ran under. The
 /// newest earlier-boot ownership row of the pane names that home; refuse if
@@ -226,10 +231,6 @@ pub(super) const PRIOR_BOOT_ACCOUNT_CHANGED: &str = "This conversation last ran 
 /// older boot's home may have been changed deliberately since, so only the
 /// newest counts. A pane with no such row, or whose newest row captured no
 /// home, has nothing to compare; the launch's own account checks still apply.
-pub(super) fn ensure_prior_boot_account(host: &SharedHost, source: &Session) -> Result<(), String> {
-    ensure_prior_boot_account_for_start(host, source).map_err(|error| error.to_string())
-}
-
 pub(super) fn ensure_prior_boot_account_for_start(
     host: &SharedHost,
     source: &Session,
@@ -475,10 +476,6 @@ const OPEN_ELSEWHERE: &str = "Another pane may still be writing to this Claude c
 /// resumes. Nothing in this daemon may run, start or admit its conversation,
 /// and every other registered owner of that conversation must be proved
 /// ended, since a second process on it would be a second writer.
-pub(super) fn unstarted(host: &SharedHost, source: &Session) -> Result<Option<Unstarted>, String> {
-    unstarted_for_start(host, source).map_err(|error| error.to_string())
-}
-
 pub(super) fn unstarted_for_start(
     host: &SharedHost,
     source: &Session,
@@ -581,13 +578,6 @@ const UNRECORDED: &str = "The saved Claude actor ended without a retirement that
 /// place: Claude names a conversation it was given before it answers
 /// anything, so an actor that never confirmed one never had a prompt
 /// accepted.
-pub(super) fn unnamed_conversation(
-    host: &SharedHost,
-    source: &Session,
-) -> Result<Option<String>, String> {
-    unnamed_conversation_for_start(host, source).map_err(|error| error.to_string())
-}
-
 pub(super) fn unnamed_conversation_for_start(
     host: &SharedHost,
     source: &Session,
@@ -689,10 +679,6 @@ pub(super) fn unnamed_conversation_for_start(
 
 /// Called only for explicit resume, before the separate Codex close reader.
 /// Returning true grants no provider start, account override or input replay.
-pub(super) fn prepare_resume(host: &SharedHost, source: &Session) -> Result<bool, String> {
-    prepare_resume_verified(host, source, None)
-}
-
 pub(super) fn prepare_resume_verified(
     host: &SharedHost,
     source: &Session,

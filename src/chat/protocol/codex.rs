@@ -254,6 +254,7 @@ pub(crate) fn create_for_start(
     create_inner(launch, None, None)
 }
 
+#[cfg(test)]
 pub(crate) fn create_with_listener(
     launch: &Launch,
     socket: PathBuf,
@@ -285,12 +286,6 @@ pub(crate) fn create_with_listener_for_start(
 
 /// Only authenticated holder recovery supplies this identity. The runtime
 /// additionally verifies the exact retained app-server peer before initialize.
-pub(crate) fn create_restored(
-    recovery: &crate::chat::native_holder::Recovery,
-) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
-    create_restored_for_start(recovery).map_err(|error| error.to_string())
-}
-
 pub(crate) fn create_restored_for_start(
     recovery: &crate::chat::native_holder::Recovery,
 ) -> Result<(ProcessSpec, Box<dyn Adapter>), super::SetupError> {

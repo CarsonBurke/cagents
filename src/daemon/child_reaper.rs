@@ -175,11 +175,13 @@ pub(crate) fn reserve() -> io::Result<Reservation> {
 
 /// Explicit recovery uses only already retained original ownership; it never
 /// opens a new pidfd by a remembered numeric PID.
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct RetryReport {
     pub(crate) rearmed: usize,
     pub(crate) retained: usize,
 }
+#[cfg(test)]
 pub(crate) fn retry_preserved() -> io::Result<RetryReport> {
     match SERVICE.get() {
         None => Ok(RetryReport {
@@ -473,6 +475,7 @@ impl Service {
             ticket,
         })
     }
+    #[cfg(test)]
     fn retry_preserved(&self) -> io::Result<RetryReport> {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         if state.stopping || state.fatal || !state.worker_alive {

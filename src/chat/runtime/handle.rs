@@ -1,5 +1,5 @@
 //! One handle for a daemon-local actor or its authenticated retained owner.
-use super::retained_actor::journal::{InputIdentity, InputReceipt, OutboxEntry};
+use super::retained_actor::journal::OutboxEntry;
 use super::retained_actor::transport::{ActorIdentity, RemoteActor};
 use super::{LocalHandle, Rejection, Store, TitleUnavailable, Update, UpdateReadiness};
 use crate::chat::{
@@ -180,6 +180,7 @@ impl Handle {
     ) -> Result<bool, String> {
         RemoteActor::inspect_abandoned(record, proof)
     }
+    #[cfg(test)]
     pub(crate) fn retired_actor_receipt(
         record: &crate::daemon::holder_registry::Record,
         proof: &crate::model::HostSessionProof,
@@ -241,22 +242,7 @@ impl Handle {
             _ => Err("This actor has no retained source authority".into()),
         }
     }
-    /// Physical launch-directory evidence. The service caller must separately
-    /// validate that this is still its current exact actor before using it.
-    pub(crate) fn pinned_launch_directory(
-        &self,
-    ) -> Result<
-        (
-            crate::agent_execution::DirectoryIdentity,
-            std::sync::Arc<std::fs::File>,
-        ),
-        String,
-    > {
-        match &self.0 {
-            Owner::Local(local) => local.pinned_launch_directory(),
-            Owner::Remote(remote) => remote.pinned_launch_directory(),
-        }
-    }
+    #[cfg(test)]
     pub(crate) fn provider_process(&self) -> Option<crate::daemon::holder_registry::Process> {
         match &self.0 {
             Owner::Local(local) => local.provider_process(),
@@ -267,12 +253,6 @@ impl Handle {
         match &self.0 {
             Owner::Remote(remote) => Some(remote.identity()),
             _ => None,
-        }
-    }
-    pub(crate) fn retained_outcomes(&self, after: u64) -> Result<Vec<OutboxEntry>, String> {
-        match &self.0 {
-            Owner::Remote(remote) => remote.call("outbox", serde_json::json!([after])),
-            _ => Err("This actor has no remote outbox".into()),
         }
     }
     pub(crate) fn commit_retained_outcomes(&self, through: u64) -> Result<(), String> {
@@ -293,34 +273,13 @@ impl Handle {
             _ => Err("This actor has no retained outcome outbox".into()),
         }
     }
-    pub(crate) fn retained_input(
+    #[cfg(test)]
+    pub(crate) fn pending_retained_inputs(
         &self,
-        identity: InputIdentity,
-    ) -> Result<Option<InputReceipt>, String> {
-        match &self.0 {
-            Owner::Remote(remote) => remote.call("input_receipt", serde_json::json!([identity])),
-            _ => Err("This actor has no remote input journal".into()),
-        }
-    }
-    pub(crate) fn pending_retained_inputs(&self) -> Vec<InputIdentity> {
+    ) -> Vec<super::retained_actor::journal::InputIdentity> {
         match &self.0 {
             Owner::Remote(remote) => remote.pending_inputs(),
             _ => Vec::new(),
-        }
-    }
-    pub(crate) fn retry_retained_input(
-        &self,
-        identity: &InputIdentity,
-    ) -> Result<InputReceipt, String> {
-        match &self.0 {
-            Owner::Remote(remote) => remote.retry_input(identity),
-            _ => Err("This actor has no retained input envelope".into()),
-        }
-    }
-    pub(crate) fn commit_retained_inputs(&self, through: u64) -> Result<(), String> {
-        match &self.0 {
-            Owner::Remote(remote) => remote.call("ack_inputs", serde_json::json!([through])),
-            _ => Err("This actor has no remote input journal".into()),
         }
     }
     pub(crate) fn same_actor(&self, other: &Self) -> bool {
@@ -380,20 +339,6 @@ impl Handle {
         match &self.0 {
             Owner::Local(local) => local.command_for_run(run, command),
             Owner::Remote(remote) => remote.submit(Some(run), command).map_err(String::from),
-        }
-    }
-    pub(crate) fn close_if_idle(&self, generation: u64) -> Result<(), String> {
-        match &self.0 {
-            Owner::Local(local) => local.try_close_if_idle(generation).and_then(|closed| {
-                if closed {
-                    Ok(())
-                } else {
-                    Err("Provider state changed before conditional idle close".into())
-                }
-            }),
-            Owner::Remote(remote) => {
-                remote.close_method("close_if_idle", serde_json::json!([generation]))
-            }
         }
     }
     pub(crate) fn close_if_idle_for_resume(&self, generation: u64) -> Result<(), String> {
@@ -533,6 +478,7 @@ impl Handle {
             Owner::Remote(remote) => remote.state().retained_runs.clone(),
         }
     }
+    #[cfg(test)]
     pub(crate) fn attachment_snapshot(&self) -> Snapshot {
         match &self.0 {
             Owner::Local(local) => local.snapshot(None).expect("unconditional local snapshot"),
@@ -543,18 +489,6 @@ impl Handle {
         match &self.0 {
             Owner::Local(local) => local.snapshot(after),
             Owner::Remote(remote) => remote.snapshot(after),
-        }
-    }
-    pub(crate) fn presentation(
-        &self,
-        chat_id: crate::model::TerminalId,
-        after: Option<u64>,
-    ) -> Result<Option<crate::terminal_ipc::ServerResponse>, String> {
-        match &self.0 {
-            Owner::Local(local) => Ok(local.presentation(chat_id, after)),
-            Owner::Remote(remote) => {
-                remote.call("presentation", serde_json::json!([chat_id, after]))
-            }
         }
     }
     pub(crate) fn presentation_wire(
@@ -789,15 +723,6 @@ impl Handle {
         match &self.0 {
             Owner::Local(local) => local.decline_answer(command),
             Owner::Remote(remote) => remote.decline_answer(command),
-        }
-    }
-    pub(crate) fn notification_content(
-        &self,
-        kind: crate::notifications::Kind,
-    ) -> crate::notifications::Content {
-        match &self.0 {
-            Owner::Local(local) => local.notification_content(kind),
-            Owner::Remote(remote) => remote.notification_content(kind),
         }
     }
     pub(crate) fn conversation_title(

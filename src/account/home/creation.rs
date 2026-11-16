@@ -10,13 +10,36 @@ use std::os::{
 /// is creation provenance only; it does not grant provider/history read access.
 /// Deliberately has no Clone, Deserialize or public constructor.
 pub(crate) struct NewHomeCreationReceipt {
+    #[cfg_attr(
+        not(any(test, feature = "host")),
+        expect(
+            dead_code,
+            reason = "only host enrollment reads the identity a receipt proves"
+        )
+    )]
     provider: Provider,
+    #[cfg_attr(
+        not(any(test, feature = "host")),
+        expect(
+            dead_code,
+            reason = "only host enrollment reads the identity a receipt proves"
+        )
+    )]
     key: Uuid,
     path: PathBuf,
     parent_path: PathBuf,
     parent: fs::File,
     directory: fs::File,
 }
+impl NewHomeCreationReceipt {
+    pub(crate) fn revalidate(&self) -> io::Result<()> {
+        crate::secure_file::reject_symlink_components(&self.path)?;
+        same_directory(&self.parent, &self.parent_path)?;
+        same_directory(&self.directory, &self.path)
+    }
+}
+/// What host enrollment and initializers read from a fresh home.
+#[cfg(any(test, feature = "host"))]
 impl NewHomeCreationReceipt {
     pub(crate) fn provider(&self) -> Provider {
         self.provider
@@ -27,16 +50,12 @@ impl NewHomeCreationReceipt {
     pub(crate) fn home(&self) -> &Path {
         &self.path
     }
+    #[cfg(test)]
     pub(crate) fn parent(&self) -> &fs::File {
         &self.parent
     }
     pub(crate) fn directory(&self) -> &fs::File {
         &self.directory
-    }
-    pub(crate) fn revalidate(&self) -> io::Result<()> {
-        crate::secure_file::reject_symlink_components(&self.path)?;
-        same_directory(&self.parent, &self.parent_path)?;
-        same_directory(&self.directory, &self.path)
     }
 }
 fn same_directory(held: &fs::File, path: &Path) -> io::Result<()> {

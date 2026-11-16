@@ -87,6 +87,7 @@ impl Reservation {
         self.source.id == id && state.chat_spawning.get(&id) == Some(&self.source)
     }
 
+    #[cfg(test)]
     pub(super) fn new(host: &SharedHost, source: &Session) -> Result<Option<Self>, ProtocolError> {
         Self::new_with_source(host, source, None)
     }
@@ -2194,10 +2195,6 @@ fn load_history_for_start(session: &Session) -> Result<LoadedHistory, chat::prot
         ));
     }
     Ok((spec, adapter, initial))
-}
-
-fn require_unmanaged(host: &SharedHost, id: TerminalId) -> Result<(), String> {
-    require_unmanaged_for_start(host, id).map_err(|error| error.to_string())
 }
 
 fn require_unmanaged_for_start(

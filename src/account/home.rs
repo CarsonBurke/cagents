@@ -325,45 +325,6 @@ impl Homes {
         Ok(Some(parked))
     }
 
-    /// Called only with a supported, existing registry and both locks held.
-    /// A grace period also protects homes being created by an older window
-    /// that predates atomic creation/registration.
-    #[cfg(test)]
-    pub(crate) fn park_orphans(&self, registry: &super::registry::Registry) -> io::Result<()> {
-        for provider in super::Account::PROVIDERS {
-            let directory = self.provider_directory(provider);
-            if !directory.exists() {
-                continue;
-            }
-            crate::secure_file::reject_symlink_components(&directory)?;
-            crate::secure_file::validate_owned_directory(&directory)?;
-            for entry in fs::read_dir(&directory)? {
-                let entry = entry?;
-                let Some(key) = entry
-                    .file_name()
-                    .to_str()
-                    .and_then(|name| Uuid::parse_str(name).ok())
-                else {
-                    continue;
-                };
-                if entry.path() != self.path(provider, key) {
-                    continue;
-                }
-                if registry.contains_managed_home(self, provider, key) {
-                    continue;
-                }
-                let metadata = entry.path().symlink_metadata()?;
-                if !metadata.is_dir()
-                    || metadata.modified()?.elapsed().unwrap_or_default() < ORPHAN_AGE
-                {
-                    continue;
-                }
-                self.park(provider, key)?;
-            }
-        }
-        Ok(())
-    }
-
     // Legacy destructive fixture support only. Never sweep parked evidence
     // from discovery, sign-in cleanup, or any product lifecycle request.
     #[cfg(test)]

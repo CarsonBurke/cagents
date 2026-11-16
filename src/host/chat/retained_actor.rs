@@ -703,6 +703,7 @@ pub(super) fn forget_startup(
     }
 }
 
+#[cfg(test)]
 pub(super) fn reconcile_startup(host: &SharedHost, source: &Session) -> Result<bool, String> {
     reconcile_startup_for_start(host, source).map_err(|failure| failure.to_string())
 }
@@ -753,13 +754,6 @@ pub(super) fn reconcile_startup_for_start(
 /// Preparation finishes that exact normal Close and returns only its original
 /// requested launch. An unrelated or successful retained actor never gains a
 /// restart grant through this path.
-pub(super) fn prepare_failed_start(
-    host: &SharedHost,
-    source: &Session,
-) -> Result<Option<Session>, String> {
-    prepare_failed_start_for_start(host, source).map_err(|failure| failure.to_string())
-}
-
 pub(super) fn prepare_failed_start_for_start(
     host: &SharedHost,
     source: &Session,
@@ -1166,11 +1160,7 @@ pub(super) enum Publication<'a> {
     Close,
 }
 
-/// Commit normal installation before projecting ownership, then publish one
-/// exact acknowledged tuple to Registry and return that same tuple to the HOST.
-/// Close-only attachment keeps its existing ownership and never installs input.
-/// Every caller supplies previously authenticated/issued aliases and revalidates
-/// exact actor/pair ownership before exposing the returned record.
+#[cfg(test)]
 pub(super) fn publish_authenticated_source(
     host: &SharedHost,
     handle: &Handle,
@@ -1192,6 +1182,11 @@ pub(super) fn publish_authenticated_source(
     .map_err(|failure| failure.to_string())
 }
 
+/// Commit normal installation before projecting ownership, then publish one
+/// exact acknowledged tuple to Registry and return that same tuple to the HOST.
+/// Close-only attachment keeps its existing ownership and never installs input.
+/// Every caller supplies previously authenticated/issued aliases and revalidates
+/// exact actor/pair ownership before exposing the returned record.
 pub(super) fn publish_authenticated_source_for_start(
     host: &SharedHost,
     handle: &Handle,
@@ -1295,8 +1290,7 @@ pub(super) fn publish_authenticated_source_for_start(
     Ok(source)
 }
 
-/// Reattach to the resident Claude reducer; never open provider stdin, reload
-/// its transcript as a replacement, or reconstruct command/control UUIDs.
+#[cfg(test)]
 pub(super) fn restore(
     host: &SharedHost,
     client: ClientId,
@@ -1307,6 +1301,8 @@ pub(super) fn restore(
     restore_actor(host, client, requested, proof, owner, true, None)
 }
 
+/// Reattach to the resident Claude reducer; never open provider stdin, reload
+/// its transcript as a replacement, or reconstruct command/control UUIDs.
 pub(super) fn restore_for_start(
     host: &SharedHost,
     client: ClientId,
@@ -1384,13 +1380,6 @@ fn finish_interrupted_exit_for_start(
 
 /// [`finish_interrupted_exit`] for the helper that owns `session`, when no
 /// attachment holds it, for an owner startup discovery did not finish.
-pub(in crate::host) fn finish_interrupted_exit_of(
-    host: &SharedHost,
-    session: &Session,
-) -> Result<bool, String> {
-    finish_interrupted_exit_of_for_start(host, session).map_err(|failure| failure.to_string())
-}
-
 pub(in crate::host) fn finish_interrupted_exit_of_for_start(
     host: &SharedHost,
     session: &Session,
@@ -1428,13 +1417,6 @@ pub(in crate::host) fn finish_interrupted_exit_of_for_start(
 /// that is still running is never ended here. An exit the provider did not
 /// choose, such as a kill, leaves a failure that keeps the actor owning work
 /// until someone answers it; resuming is that answer.
-pub(in crate::host) fn finish_exited_attachment(
-    host: &SharedHost,
-    source: &Session,
-) -> Result<bool, String> {
-    finish_exited_attachment_for_start(host, source).map_err(|failure| failure.to_string())
-}
-
 pub(in crate::host) fn finish_exited_attachment_for_start(
     host: &SharedHost,
     source: &Session,

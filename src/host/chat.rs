@@ -1556,28 +1556,6 @@ fn what_holds(
     }
 }
 
-/// Whether a Codex conversation no agent claims lost its native owner without
-/// the close receipt, so a reopened conversation may take over without one.
-fn codex_owner_lost(
-    host: &SharedHost,
-    session: &Session,
-    proof: &HostSessionProof,
-) -> Result<bool, String> {
-    if !session.owns_codex_listener() || session.terminal.is_some() {
-        return Ok(false);
-    }
-    {
-        let registry = super::agent_execution::registry(host)?;
-        let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-        if registry.agent_for_session(session.id)?.is_some()
-            || !registry.retained_agent_sources(session.id)?.is_empty()
-        {
-            return Ok(false);
-        }
-    }
-    Ok(what_holds(host, session, proof)?.is_none())
-}
-
 /// A recorded terminal conversation is writer evidence even without a pane
 /// marker (for example, a CLI resumed against the shared Codex daemon).
 fn codex_terminal_owner(state: &HostState, session: &Session) -> Option<TerminalId> {
@@ -5272,6 +5250,7 @@ pub(super) fn preflight_for_terminal_close(
 
 /// A terminal card restored after a GUI restart has no parked UI runtime, but
 /// the daemon still owns its exact native actor. Explicit card close retires both.
+#[cfg(test)]
 pub(super) fn close_for_terminal(
     host: &SharedHost,
     terminal_id: TerminalId,

@@ -106,12 +106,6 @@ impl PendingInput {
             .front()
             .map_or(&[], |frame| &frame.bytes[frame.offset..])
     }
-    #[cfg(test)]
-    pub(super) fn clear(&mut self) {
-        self.frames.clear();
-        self.owners.clear();
-        self.bytes = 0;
-    }
     fn reservations(&self) -> usize {
         self.owners.iter().filter(|owner| !owner.releasing).count()
     }
