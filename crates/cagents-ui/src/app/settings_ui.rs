@@ -217,6 +217,10 @@ pub(super) struct SettingsContext<'a> {
     pub accounts: Vec<(crate::agent::Provider, Vec<account_ui::DefaultChoice>)>,
     pub updates: update_ui::UpdateSummary,
     pub testing_notification: bool,
+    /// Room the pane keeps at its top-right corner for the inspector toggle
+    /// floating there, which the search field and the page's save report
+    /// must not run under.
+    pub trailing_clearance: f32,
 }
 
 fn settings_category_controls<'a>(
@@ -285,17 +289,14 @@ fn settings_category_controls<'a>(
             controls.push(setting_field(
                 "Test notification",
                 "Your desktop controls presentation and sound. Unavailable delivery keeps attention inside cagents; the result appears in notices.",
-                crate::ui_controls::button::secondary(if testing_notification {
-                    "Sending test notification…"
-                } else {
-                    "Send test notification"
-                })
-                .id(widget::Id::new("settings.notifications.test"))
-                .on_press_maybe(
-                    (!testing_notification)
-                        .then_some(Message::NotificationUi(notification_ui::Action::Test)),
-                )
-                .into(),
+                crate::ui_controls::button::secondary("Send test notification")
+                    .instead("Sending test notification…", testing_notification)
+                    .id(widget::Id::new("settings.notifications.test"))
+                    .on_press_maybe(
+                        (!testing_notification)
+                            .then_some(Message::NotificationUi(notification_ui::Action::Test)),
+                    )
+                    .into(),
             )
             .label_in_control());
             vec![settings_group(
@@ -1065,7 +1066,14 @@ fn settings_layout<'a>(
     // adds a row that pushes the settings down under the pointer.
     let mut status = save_status(feedback, invalid.len());
     let navigation: Element<'a, Message> = if narrow {
-        let mut rows: Vec<Element<'a, Message>> = vec![search.into()];
+        // The field ends short of the inspector toggle floating over the
+        // pane's top-right corner rather than running under it.
+        let mut rows: Vec<Element<'a, Message>> = vec![
+            widget::container(search)
+                .padding(iced::Padding::ZERO.right((context.trailing_clearance - gutter).max(0.0)))
+                .width(Length::Fill)
+                .into(),
+        ];
         // Search results span every category, so the picker gives its room
         // to them while a query is active.
         if !searching {
@@ -1212,14 +1220,21 @@ fn settings_layout<'a>(
             iced::widget::Space::new().width(Length::Fill).into()
         };
         header.push(
-            widget::row::with_children(std::iter::once(title).chain(status))
-                .align_y(Alignment::Center)
-                .spacing(space::S)
-                .width(Length::Fill)
-                // The height of the search field beside it, so the page
-                // title and the field share one centre line.
-                .height(design::DENSE_ROW_HEIGHT)
-                .into(),
+            // The save report at the title's end stays clear of the
+            // inspector toggle; the description below keeps the body's
+            // measure.
+            widget::container(
+                widget::row::with_children(std::iter::once(title).chain(status))
+                    .align_y(Alignment::Center)
+                    .spacing(space::S)
+                    .width(Length::Fill)
+                    // The height of the search field beside it, so the page
+                    // title and the field share one centre line.
+                    .height(design::DENSE_ROW_HEIGHT),
+            )
+            .padding(iced::Padding::ZERO.right((context.trailing_clearance - gutter).max(0.0)))
+            .width(Length::Fill)
+            .into(),
         );
     }
     if let Some(description) = page_description {
@@ -1580,6 +1595,7 @@ fn shortcut_input<'a>(
 
 #[cfg(test)]
 mod keyboard_table_tests {
+    use super::super::pane_inspector::TOGGLE_CLEARANCE;
     use super::*;
 
     #[test]
@@ -1800,6 +1816,7 @@ mod keyboard_table_tests {
                 detail: String::new(),
             },
             testing_notification: false,
+            trailing_clearance: TOGGLE_CLEARANCE,
         };
         let mut element = settings_layout(category, &draft, "", &context, width);
         let mut tree = Tree::new(element.as_widget());
@@ -1839,6 +1856,52 @@ mod keyboard_table_tests {
             assert!(
                 saved.1.iter().any(|(text, _)| text == "Saved"),
                 "no save report at {width}"
+            );
+        }
+    }
+
+    /// The inspector toggle floats over the pane's top-right corner, so
+    /// neither the narrow page's search field nor the wide page's save report
+    /// runs under it.
+    #[test]
+    fn the_search_field_and_save_report_end_short_of_the_inspector_toggle() {
+        use super::super::pane_inspector::TOGGLE_INSET;
+        // The floating toggle and the standard gap before it.
+        let toggle = |width: f32| iced::Rectangle {
+            x: width - TOGGLE_CLEARANCE,
+            y: 0.0,
+            width: TOGGLE_CLEARANCE,
+            height: TOGGLE_INSET + design::PRIMARY_CONTROL_SIZE,
+        };
+        let clear = |bounds: iced::Rectangle, width: f32| {
+            toggle(width)
+                .intersection(&bounds)
+                .is_none_or(|overlap| overlap.width <= 0.0 || overlap.height <= 0.0)
+        };
+        let narrow = 400.0;
+        let search = laid_out_settings(SettingsCategory::Appearance, narrow)[0];
+        assert!(
+            clear(search, narrow),
+            "the search field runs under the toggle: {search:?}"
+        );
+        assert!(
+            search.x + search.width >= toggle(narrow).x - 1.0,
+            "the search field still fills its row up to the toggle: {search:?}"
+        );
+        for width in [narrow, 900.0] {
+            let saved = laid_out_with(
+                SettingsCategory::Appearance,
+                width,
+                Some(&SettingsFeedback::Saved),
+            )
+            .1;
+            let (_, report) = saved
+                .iter()
+                .find(|(text, _)| text == "Saved")
+                .expect("a save report");
+            assert!(
+                clear(*report, width),
+                "the save report runs under the toggle at {width}: {report:?}"
             );
         }
     }

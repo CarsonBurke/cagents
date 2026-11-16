@@ -255,46 +255,39 @@ impl State {
                 .into(),
             );
         }
-        let primary = if self.existing_checkout.completed.is_some() {
-            crate::ui_controls::button::secondary("Open existing worktree").on_press_maybe(
-                (!modal_open && !busy && current && !self.refreshing).then(|| action(Action::Open)),
-            )
-        } else {
-            let label = if busy {
-                "Reconciling checkout…"
+        let completed = self.existing_checkout.completed.is_some();
+        let label = match plan.disposition() {
+            PrCheckoutDisposition::OpenPreservingLocal => "Keep existing local work",
+            PrCheckoutDisposition::RepairTrackingPreservingLocal => {
+                "Configure upstream and open local work"
+            }
+            PrCheckoutDisposition::AlreadyCurrent => "Verify existing checkout",
+            PrCheckoutDisposition::FastForward => "Update checkout",
+            PrCheckoutDisposition::RepairTracking => "Set PR upstream",
+            PrCheckoutDisposition::FastForwardAndRepair => "Update checkout and set PR upstream",
+        };
+        // One control from the offer to the outcome, so Dismiss beside it
+        // stays put while the checkout reconciles and once it is done.
+        let primary = crate::ui_controls::button::secondary(label)
+            .instead("Open existing worktree", completed)
+            .instead("Reconciling checkout…", busy)
+            .on_press_maybe(if completed {
+                (!modal_open && !busy && current && !self.refreshing).then(|| action(Action::Open))
             } else {
-                match plan.disposition() {
-                    PrCheckoutDisposition::OpenPreservingLocal => "Keep existing local work",
-                    PrCheckoutDisposition::RepairTrackingPreservingLocal => {
-                        "Configure upstream and open local work"
-                    }
-                    PrCheckoutDisposition::AlreadyCurrent => "Verify existing checkout",
-                    PrCheckoutDisposition::FastForward => "Update checkout",
-                    PrCheckoutDisposition::RepairTracking => "Set PR upstream",
-                    PrCheckoutDisposition::FastForwardAndRepair => {
-                        "Update checkout and set PR upstream"
-                    }
-                }
-            };
-            crate::ui_controls::button::secondary(label).on_press_maybe(
                 (!modal_open
                     && !busy
                     && !self.refreshing
                     && current
                     && !self.existing_checkout.accepted)
-                    .then(|| action(Action::Confirm)),
-            )
-        };
+                    .then(|| action(Action::Confirm))
+            });
         rows.push(
             widget::row::with_children(vec![
                 primary.into(),
-                crate::ui_controls::button::quiet(if busy {
-                    "Cancel reconciliation"
-                } else {
-                    "Dismiss"
-                })
-                .on_press_maybe((!modal_open).then(|| action(Action::Cancel)))
-                .into(),
+                crate::ui_controls::button::quiet("Dismiss")
+                    .instead("Cancel reconciliation", busy)
+                    .on_press_maybe((!modal_open).then(|| action(Action::Cancel)))
+                    .into(),
             ])
             .spacing(space::S)
             .into(),

@@ -886,13 +886,10 @@ impl Cagents {
             widget::row::with_children(vec![
                 input.into(),
                 widget::text(count).into(),
-                crate::ui_controls::button::quiet(if find.case_sensitive {
-                    "Aa ✓"
-                } else {
-                    "Aa"
-                })
-                .on_press(message(Action::Case(card)))
-                .into(),
+                crate::ui_controls::button::quiet("Aa")
+                    .instead("Aa ✓", find.case_sensitive)
+                    .on_press(message(Action::Case(card)))
+                    .into(),
                 crate::ui_controls::icon_button(
                     Icon::ChevronUp,
                     "Previous match — Shift+Enter in search",
@@ -970,11 +967,10 @@ impl Cagents {
             crate::design::title("Paste multiple lines?").into(),
             notice_body("This program does not use bracketed paste. Each newline may run a command immediately."),
             widget::text(format!("{} lines · {} characters", text.lines().count(), text.chars().count())).into(),
-            widget::row::with_children(vec![
-                crate::ui_controls::button::secondary("Cancel").id(widget::Id::from("terminal-paste-cancel"))
-                    .on_press(Message::TerminalFind(Action::ConfirmPaste(card, false))).into(),
-                crate::ui_controls::button::primary("Paste").on_press(Message::TerminalFind(Action::ConfirmPaste(card, true))).into(),
-            ]).spacing(space::S).into(),
-        ]).spacing(space::M), 480.0), Some(Message::TerminalFind(Action::ConfirmPaste(card, false))), 1.0))
+        ]).spacing(space::M), widget::row::with_children(vec![
+            crate::ui_controls::button::secondary("Cancel").id(widget::Id::from("terminal-paste-cancel"))
+                .on_press(Message::TerminalFind(Action::ConfirmPaste(card, false))).into(),
+            crate::ui_controls::button::primary("Paste").on_press(Message::TerminalFind(Action::ConfirmPaste(card, true))).into(),
+        ]).spacing(space::S), 480.0), Some(Message::TerminalFind(Action::ConfirmPaste(card, false))), 1.0))
     }
 }

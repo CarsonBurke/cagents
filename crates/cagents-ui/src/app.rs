@@ -11422,6 +11422,11 @@ impl Cagents {
                     accounts: self.default_account_choices(),
                     updates: self.update_summary(),
                     testing_notification: self.notification_ui.testing,
+                    trailing_clearance: if self.pane_inspector_layout(id).is_none() {
+                        pane_inspector::TOGGLE_CLEARANCE
+                    } else {
+                        0.0
+                    },
                 },
             ),
             Some(CardRuntime::Accounts) => self.accounts_pane(),
@@ -11582,15 +11587,12 @@ impl Cagents {
                             controls.push(
                                 {
                                     let closing = self.terminal_close_in_progress(id);
-                                    crate::ui_controls::button::secondary(if closing {
-                                        "Checking…"
-                                    } else {
-                                        "Close"
-                                    })
-                                    .id(card_control_id(id, "failed.close"))
-                                    .name(format!("Close {}", labels.type_label))
-                                    .on_press_maybe((!closing).then_some(Message::CloseCard(id)))
-                                    .into()
+                                    crate::ui_controls::button::secondary("Close")
+                                        .instead("Checking…", closing)
+                                        .id(card_control_id(id, "failed.close"))
+                                        .name(format!("Close {}", labels.type_label))
+                                        .on_press_maybe((!closing).then_some(Message::CloseCard(id)))
+                                        .into()
                                 },
                             );
                             controls
@@ -19361,12 +19363,11 @@ impl Application for Cagents {
                         notice_detail(self.window_close_transient_blocker().unwrap_or(
                             "The pending work is complete. Cancel this dialog and close again.",
                         )),
-                        widget::row::with_children(controls)
-                            .spacing(space::S)
-                            .wrap()
-                            .into(),
                     ])
                     .spacing(space::M),
+                    widget::row::with_children(controls)
+                        .spacing(space::S)
+                        .wrap(),
                     480.0,
                 ),
                 Some(Message::CancelTransientWorkClose),
@@ -19438,16 +19439,16 @@ impl Application for Cagents {
                              pane widths, and the configured language servers.",
                         ),
                         notice_detail("This cannot be undone."),
-                        dialog_ui::confirmation_actions(
-                            crate::ui_controls::button::secondary("Cancel")
-                                .id(widget::Id::new("dialog.reset-settings.cancel"))
-                                .on_press(Message::CancelResetSettings),
-                            crate::ui_controls::button::destructive("Reset settings")
-                                .id(widget::Id::new("dialog.reset-settings.confirm"))
-                                .on_press(Message::ConfirmResetSettings),
-                        ),
                     ])
                     .spacing(space::M),
+                    dialog_ui::confirmation_actions(
+                        crate::ui_controls::button::secondary("Cancel")
+                            .id(widget::Id::new("dialog.reset-settings.cancel"))
+                            .on_press(Message::CancelResetSettings),
+                        crate::ui_controls::button::destructive("Reset settings")
+                            .id(widget::Id::new("dialog.reset-settings.confirm"))
+                            .on_press(Message::ConfirmResetSettings),
+                    ),
                     480.0,
                 ),
                 Some(Message::CancelResetSettings),
@@ -19523,28 +19524,26 @@ impl Application for Cagents {
                 );
             }
             controls.push(
-                crate::ui_controls::button::primary(if runtime.has_save_conflict() {
-                    "Overwrite and close"
-                } else if runtime.has_durability_warning() {
-                    "Retry save and close"
-                } else {
-                    "Save and close"
-                })
-                .id(dirty_close_control_id(card, DirtyCloseControl::Save))
-                .on_press_maybe(save_message)
-                .into(),
+                crate::ui_controls::button::primary("Save and close")
+                    .instead("Overwrite and close", runtime.has_save_conflict())
+                    .instead("Retry save and close", runtime.has_durability_warning())
+                    .id(dirty_close_control_id(card, DirtyCloseControl::Save))
+                    .on_press_maybe(save_message)
+                    .into(),
             );
             let dismiss = controls.remove(0);
-            rows.push(dialog_ui::confirmation_actions(
+            let actions = dialog_ui::confirmation_actions(
                 dismiss,
                 widget::row::with_children(controls).spacing(space::S),
-            ));
-
+            );
+            // A long path or save error scrolls; the answers stay in reach.
             return Some(dialog_ui::overlay(
-                dialog_ui::surface(
+                dialog_ui::scrolling_surface_with_actions(
                     widget::container(widget::column::with_children(rows).spacing(space::M))
                         .id(widget::Id::new(format!("dialog.dirty-close.{card}"))),
+                    actions,
                     560.0,
+                    dialog_ui::MAX_HEIGHT,
                 ),
                 (!runtime.is_saving()).then_some(Message::CancelRepositoryClose),
                 1.0,

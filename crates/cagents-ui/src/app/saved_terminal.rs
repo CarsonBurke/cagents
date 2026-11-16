@@ -817,11 +817,10 @@ impl Cagents {
                 }
             }
         };
-        let reconnect =
-            crate::ui_controls::button::primary(if pending { "Checking…" } else { "Reconnect" })
-                .reserve_labels(["Reconnect", "Checking…"])
-                .id(control_id("reconnect"))
-                .name("Reconnect saved terminal");
+        let reconnect = crate::ui_controls::button::primary("Reconnect")
+            .instead("Checking…", pending)
+            .id(control_id("reconnect"))
+            .name("Reconnect saved terminal");
         let closing = self.terminal_close_in_progress(card);
         let reconnect =
             if pending || closing || !allows_command(&entry.authority, Command::Reconnect) {
@@ -863,8 +862,8 @@ impl Cagents {
                         .then(|| action(Command::NewTerminal)),
                 )
                 .into(),
-            crate::ui_controls::button::secondary(if closing { "Checking…" } else { "Close" })
-                .reserve_labels(["Close", "Checking…"])
+            crate::ui_controls::button::secondary("Close")
+                .instead("Checking…", closing)
                 .id(control_id("close"))
                 .name("Close saved terminal pane")
                 .on_press_maybe(
