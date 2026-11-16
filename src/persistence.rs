@@ -658,9 +658,14 @@ struct RefusedClosure {
 }
 
 impl RefusedClosure {
-    /// Whether offering `card` over `stored` is the offer already refused,
-    /// with nothing left for it to store.
-    fn repeats(&self, card: &CardState, stored: Option<&ExistingCard>) -> bool {
+    /// Whether offering `card` over `stored` in `workspace` is the offer
+    /// already refused, with nothing left for it to store.
+    fn repeats(
+        &self,
+        workspace: WorkspaceId,
+        card: &CardState,
+        stored: Option<&ExistingCard>,
+    ) -> bool {
         // Destructured in full so that a field added to `CardState` has to be
         // classified here: what a card write stores is compared, and what
         // only describes the running window is not.
@@ -675,6 +680,7 @@ impl RefusedClosure {
         // An open row still has the tombstone to take, so only a row that is
         // absent or already closed makes the offer a pure repeat.
         stored.is_none_or(|stored| !stored.existence.is_open())
+            && self.workspace == workspace
             && self.generation == stored.map_or(0, |stored| stored.generation)
             && *title == card.title
             && *width_fraction == card.width_fraction
@@ -4724,7 +4730,7 @@ fn save_closed_card(
         return tombstone_card(transaction, card.id, stored, &card.existence, timestamp);
     }
     if let Some(refused) = offered_cards.refused.get(&card.id)
-        && refused.repeats(card, stored)
+        && refused.repeats(workspace, card, stored)
     {
         return Ok(refused.generation);
     }
