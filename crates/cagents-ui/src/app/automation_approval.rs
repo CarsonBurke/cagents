@@ -721,22 +721,10 @@ impl Cagents {
             ])
             .spacing(space::S),
         );
-        let surface = widget::column::with_children(vec![
-            crate::interaction::overflow_fade_y(
-                widget::scrollable(
-                    content.padding(design::with_vertical_rail(iced::Padding::ZERO)),
-                )
-                .direction(iced::widget::scrollable::Direction::Vertical(
-                    design::scrollbar(),
-                ))
-                .height(Length::Fixed(440.0)),
-                design::dialog_base,
-            ),
-            controls,
-        ])
-        .spacing(space::M);
+        // The request scrolls; the decision stays in reach at any window size
+        // and interface scale.
         let overlay = dialog_ui::overlay(
-            dialog_ui::surface(surface, 680.0),
+            dialog_ui::scrolling_surface_with_actions(content, controls, 680.0, 640.0),
             (!state.deciding).then_some(dismiss),
             1.0,
         );
@@ -1331,6 +1319,36 @@ mod tests {
             mouse::Event::ButtonReleased(mouse::Button::Left),
         ));
         messages
+    }
+
+    /// At the minimum 900x600 window with 150% interface scale, a long
+    /// request scrolls and every decision stays inside the window.
+    #[test]
+    fn approval_decisions_stay_in_reach_at_the_scaled_minimum_window() {
+        let (mut app, _) = reviewing();
+        app.automation_approval
+            .proposal
+            .as_mut()
+            .unwrap()
+            .definition
+            .prompt = "Read all of the saved request before deciding.\n".repeat(80);
+        let generation = app.automation_approval.generation;
+        for role in ["dismiss", "decline", "approve"] {
+            let (window, viewport, content, control) =
+                super::super::dialog_ui::tests::action_geometry(
+                    app.automation_approval_dialog().unwrap(),
+                    cosmic::iced::Size::new(600.0, 400.0),
+                    &approval_control_id(generation, role),
+                );
+            assert!(
+                control.height > 0.0
+                    && control.y >= 0.0
+                    && control.y + control.height <= window.height,
+                "{role} must stay inside the window: {control:?}"
+            );
+            assert!(viewport.y + viewport.height <= control.y);
+            assert!(content > viewport.height, "the request scrolls instead");
+        }
     }
 
     #[test]
