@@ -51,18 +51,22 @@ pub struct OlderClient {
     /// Variants of `agent_execution::Reply`. A later one answers only an
     /// operation the older client cannot encode.
     agent_replies: u32,
+    /// Variants of `device_service::Reply`. A later one answers only an
+    /// operation the older client cannot encode.
+    device_replies: u32,
 }
 
 /// The install candidate line, 0.1.3+local.c68275e94. Its chats are carried
 /// across an update to this release and keep running its CLI.
 const CANDIDATE_LINE: OlderClient = OlderClient {
     protocol: CANDIDATE_LINE_PROTOCOL,
-    proven_at: 183,
+    proven_at: 184,
     client_requests: 74,
     server_messages: 17,
     server_responses: 40,
     work_responses: 6,
     agent_replies: 11,
+    device_replies: 15,
 };
 
 const OLDER_CLIENTS: &[OlderClient] = &[CANDIDATE_LINE];
@@ -98,6 +102,20 @@ pub(crate) const ENDED_TOOL_STATUS: u16 = 177;
 
 /// Earlier clients receive retryable Internal errors for store contention.
 pub(super) const STORE_BUSY_ERROR: u16 = 179;
+
+/// The first protocol whose account usage readings carry reset inventories and
+/// reported plan details. An earlier client is sent the reading without them.
+pub(crate) const PLAN_AND_RESET_READINGS: u16 = 184;
+
+/// Fields a later protocol added to a struct, which a client from before it is
+/// sent without: the struct's type name, the fields, and the protocol that
+/// added them. The wire format proof accepts exactly these.
+#[cfg(test)]
+const OMITTED_FIELDS: &[(&str, &[&str], u16)] = &[(
+    "cagents::account::info::UsageReading",
+    &["resets", "plan_display_name", "rate_limit_tier"],
+    PLAN_AND_RESET_READINGS,
+)];
 
 /// Variants a later protocol appended that a client from before it is sent as
 /// a variant it knows: the enum's type name, the variant, and the protocol that
@@ -169,6 +187,7 @@ impl OlderClient {
             server_responses,
             work_responses: u32::MAX,
             agent_replies: u32::MAX,
+            device_replies: u32::MAX,
         }
     }
 
@@ -241,6 +260,9 @@ impl OlderClient {
                     }
                     ServerResponse::Agent(reply) => {
                         variant_index(reply).is_some_and(|index| index < self.agent_replies)
+                    }
+                    ServerResponse::DeviceOperation { reply } => {
+                        variant_index(reply).is_some_and(|index| index < self.device_replies)
                     }
                     _ => true,
                 };
@@ -527,6 +549,91 @@ mod tests {
         assert_eq!(variant_index(&TerminalCloseResult::Closed), Some(0));
         assert_eq!(variant_index("not an enum"), None);
         assert_eq!(variant_index(&Some(ClientRequest::List)), None);
+    }
+
+    #[test]
+    fn an_older_client_reads_usage_without_resets_or_plan_details() {
+        use crate::account::{
+            UsageSource, UsageStatus,
+            info::UsageReading,
+            resets::{ResetKind, ResetScope, UsageReset},
+        };
+        /// The reading as protocol 183 and earlier decode it.
+        #[derive(Debug, PartialEq, serde::Deserialize)]
+        struct Before {
+            windows: Vec<crate::account::UsageWindow>,
+            credits: Option<crate::account::Credits>,
+            status: UsageStatus,
+            ordinary_usage_allowed: Option<bool>,
+            observed_at: u64,
+            source: UsageSource,
+            plan: Option<String>,
+            detail: Option<String>,
+        }
+        let reading = |observed_at| UsageReading {
+            resets: vec![UsageReset {
+                id: "fable-fixture".into(),
+                kind: ResetKind::Granted,
+                scopes: vec![ResetScope::Model("Fable".into())],
+                available_count: 2,
+                expires_at: Some(1_900_000_000),
+                usable: true,
+            }],
+            windows: Vec::new(),
+            credits: None,
+            status: UsageStatus::Limited,
+            ordinary_usage_allowed: Some(false),
+            observed_at,
+            source: UsageSource::Probe,
+            plan: Some("Max".into()),
+            plan_display_name: Some("Ultra".into()),
+            rate_limit_tier: Some("default_claude_max_20x".into()),
+            detail: Some("Fable limit".into()),
+        };
+        // Two in a row: a misaligned first reading would corrupt the second.
+        let readings = vec![reading(1), reading(2)];
+        let current = postcard::to_stdvec(&readings).unwrap();
+        assert_eq!(
+            postcard::from_bytes::<Vec<UsageReading>>(&current).unwrap(),
+            readings
+        );
+        let json = serde_json::to_value(&readings[0]).unwrap();
+        assert_eq!(json["plan_display_name"], "Ultra");
+        assert_eq!(json["resets"][0]["id"], "fable-fixture");
+        let older = encoding_for(CANDIDATE_LINE_PROTOCOL, || {
+            postcard::to_stdvec(&readings).unwrap()
+        });
+        let (decoded, rest) = postcard::take_from_bytes::<Vec<Before>>(&older).unwrap();
+        assert!(rest.is_empty(), "the older reading has trailing bytes");
+        assert_eq!(
+            decoded,
+            [1, 2].map(|observed_at| Before {
+                windows: Vec::new(),
+                credits: None,
+                status: UsageStatus::Limited,
+                ordinary_usage_allowed: Some(false),
+                observed_at,
+                source: UsageSource::Probe,
+                plan: Some("Max".into()),
+                detail: Some("Fable limit".into()),
+            })
+        );
+        assert_eq!(
+            encoding_for(PLAN_AND_RESET_READINGS, || postcard::to_stdvec(&readings)
+                .unwrap()),
+            current
+        );
+    }
+
+    #[test]
+    fn a_device_reply_after_the_older_protocol_is_refused() {
+        use crate::device_service::Reply;
+        let client = older_client(CANDIDATE_LINE_PROTOCOL).unwrap();
+        let reply = |reply| ServerMessage::Response {
+            response: ServerResponse::DeviceOperation { reply },
+        };
+        assert!(client.admits_message(&reply(Reply::Saved)));
+        assert!(!client.admits_message(&reply(Reply::AccountReset(serde_json::Value::Null))));
     }
 
     #[test]
@@ -925,6 +1032,7 @@ mod tests {
             server_responses: detached,
             work_responses: u32::MAX,
             agent_replies: u32::MAX,
+            device_replies: u32::MAX,
         };
         assert!(!client.admits_request(&ClientRequest::List));
         assert!(client.admits_request(&ClientRequest::Connect {

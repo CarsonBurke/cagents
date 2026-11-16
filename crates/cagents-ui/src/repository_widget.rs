@@ -960,6 +960,7 @@ struct EditorDocument {
     active_save: Option<SaveTicket>,
     conflict: bool,
     error: Option<String>,
+    error_from_document_watch: bool,
     durability_warning: Option<String>,
     cleanup_recovery: Option<crate::recovery_authority::RecoveryAuthority>,
     /// Undo and redo for this buffer. It lives exactly as long as the buffer:
@@ -1028,11 +1029,29 @@ impl EditorDocument {
             active_save: None,
             conflict: false,
             error: None,
+            error_from_document_watch: false,
             durability_warning: None,
             cleanup_recovery: None,
             history: History::default(),
             #[cfg(test)]
             history_time: None,
+        }
+    }
+
+    fn note_document_watch_error(&mut self, error: String) {
+        self.conflict = true;
+        // An observation must not replace a newer Save failure.
+        if self.error.is_none() || self.error_from_document_watch {
+            self.error = Some(error);
+            self.error_from_document_watch = true;
+        }
+    }
+
+    fn clear_document_watch_error(&mut self) {
+        if self.error_from_document_watch {
+            self.conflict = false;
+            self.error = None;
+            self.error_from_document_watch = false;
         }
     }
 
@@ -1201,6 +1220,7 @@ impl EditorDocument {
         debug_assert!(self.active_save.is_none());
         self.conflict = false;
         self.error = None;
+        self.error_from_document_watch = false;
         edits
     }
 
@@ -5743,6 +5763,7 @@ impl RepositoryRuntime {
                 document.error = Some(
                     "The original read root is unavailable; reopen this file before saving.".into(),
                 );
+                document.error_from_document_watch = false;
             }
             return Task::none();
         };
@@ -5753,6 +5774,7 @@ impl RepositoryRuntime {
         else {
             if let DocumentState::Editable(document) = &mut self.document {
                 document.error = Some("File recovery custody is unavailable; the save was refused before changing files.".into());
+                document.error_from_document_watch = false;
             }
             return Task::none();
         };
@@ -5783,6 +5805,7 @@ impl RepositoryRuntime {
             Err(error) => {
                 if let DocumentState::Editable(document) = &mut self.document {
                     document.error = Some(error);
+                    document.error_from_document_watch = false;
                 }
                 return Task::none();
             }
@@ -5806,6 +5829,7 @@ impl RepositoryRuntime {
             // explicit Save seals that group at its public entry point.
             document.active_save = Some(ticket.clone());
             document.error = None;
+            document.error_from_document_watch = false;
         }
         // Keep diff review mounted while saving. Only a real save failure or
         // conflict reveals recovery; explicit saves may still leave preview.
@@ -5930,10 +5954,18 @@ impl RepositoryRuntime {
         self.document_reload_pending = false;
         self.document_reading = true;
         let identity = self.current_identity(card, selected.path.clone());
+        let retained_source = match &self.document {
+            DocumentState::Editable(document)
+            | DocumentState::Loading {
+                predecessor: Some(document),
+            } => Some(document.source.clone()),
+            _ => None,
+        };
         file_task(
             identity,
             self.document_tone,
             self.original_editor_root.clone(),
+            retained_source,
             Some(watch.clone()),
             true,
         )
@@ -6152,12 +6184,31 @@ impl RepositoryRuntime {
                     if let DocumentState::Editable(document) = &mut self.document {
                         let unchanged = matches!(&result, Ok(LoadedFile { source, content: FileContent::Editable { content_hash, .. } }) if *content_hash == document.disk_hash && *source == document.source);
                         if unchanged {
+                            // The validated original-root read may recover a
+                            // failed explicit Reload without replacing its
+                            // retained buffer or clearing a newer Save error.
+                            self.original_read_attested = attested;
+                            document.clear_document_watch_error();
                             return Task::none();
                         }
-                        if document.dirty || document.durability_warning().is_some() {
-                            document.conflict = true;
-                            document.error = Some(match &result {
-                                Err(error) => format!("File unavailable on disk: {error}. Your edits are preserved."),
+                        // A missing or refused symlink target is classified
+                        // as read-only rather than an I/O error. It still
+                        // cannot replace the last readable editor buffer.
+                        if result.is_err()
+                            || matches!(
+                                &result,
+                                Ok(LoadedFile {
+                                    content: FileContent::ReadOnly(ReadOnlyReason::Symlink { .. }),
+                                    ..
+                                })
+                            )
+                            || document.dirty
+                            || document.durability_warning().is_some()
+                            || (document.error.is_some() && !document.error_from_document_watch)
+                        {
+                            document.note_document_watch_error(match &result {
+                                Err(error) => format!("File unavailable on disk: {error}. Your text is preserved. Reload to retry."),
+                                Ok(LoadedFile { source, content: FileContent::ReadOnly(reason @ ReadOnlyReason::Symlink { .. }) }) => format!("File unavailable on disk: {} Your text is preserved. Reload to retry.", read_only_detail(source, reason)),
                                 _ => "File changed on disk. Your edits are preserved. Reload or overwrite to resolve.".into(),
                             });
                             return Task::none();
@@ -6221,6 +6272,7 @@ impl RepositoryRuntime {
                     document.error = Some(format!(
                         "Reload did not replace the editor buffer; your edits were kept. {detail}"
                     ));
+                    document.error_from_document_watch = false;
                     self.document = DocumentState::Editable(document);
                     // A location requested for the rejected disk read must not
                     // move the retained buffer's original caret or selection.
@@ -6736,12 +6788,14 @@ impl RepositoryRuntime {
                             "The save result did not match the active document snapshot; the disk state is unknown. Reload or overwrite before leaving."
                                 .into(),
                         );
+                        document.error_from_document_watch = false;
                     }
                     return Task::none();
                 }
                 let mut saved = false;
                 if let DocumentState::Editable(document) = &mut self.document {
                     let ticket = document.active_save.take().expect("matched save ticket");
+                    document.error_from_document_watch = false;
                     match result {
                         Ok(SaveOutcome::Saved {
                             content_hash,
@@ -7664,6 +7718,7 @@ impl RepositoryRuntime {
             }
             _ => None,
         };
+        let retained_source = predecessor.as_ref().map(|document| document.source.clone());
         self.document = DocumentState::Loading { predecessor };
         self.diffs.clear();
         self.basis_resolution = None;
@@ -7687,6 +7742,7 @@ impl RepositoryRuntime {
             identity,
             self.document_tone,
             self.original_editor_root.clone(),
+            retained_source,
             Some(watch),
             false,
         )
@@ -8298,6 +8354,7 @@ fn file_task(
     identity: AsyncIdentity,
     tone: crate::editor::PdfTone,
     original: Option<Arc<crate::fs_safety::Root>>,
+    retained_source: Option<PathBuf>,
     watch: Option<DocumentWatch>,
     background: bool,
 ) -> Task<RepositoryAction> {
@@ -8306,6 +8363,14 @@ fn file_task(
     cosmic::task::future(async move {
         let result = tokio::task::spawn_blocking(move || {
             let mut targets = vec![worktree.join(&path)];
+            // A dangling link read names the refused link, so it cannot
+            // rediscover its old target. Keep watching the retained buffer's
+            // source for recreation, including across a failed Reload.
+            if let Some(source) = retained_source
+                && !targets.contains(&worktree.join(&source))
+            {
+                targets.push(worktree.join(source));
+            }
             if let Some(watch) = &watch {
                 watch.arm(targets.clone());
             }

@@ -21,6 +21,7 @@ const RECORD: &str = "CAGENTS_RECORD_WIRE_FORMAT";
 /// By full name, because other enums are also called `Response`.
 const WORK_RESPONSE: &str = "cagents::work::Response";
 const AGENT_REPLY: &str = "cagents::agent_execution::Reply";
+const DEVICE_REPLY: &str = "cagents::device_service::Reply";
 const AUTOMATION_RESPONSE: &str = "cagents::automations::Response";
 const SERVER_MESSAGE: &str = "cagents::terminal::ipc::ServerMessage";
 
@@ -208,7 +209,7 @@ struct Comparison<'a> {
     /// contents need not match. Their positions still must.
     refused: Vec<(&'static str, &'static [&'static str])>,
     /// Appended variants of the named enum that the older client is sent as
-    /// one it knows.
+    /// one it knows, and added fields of the named struct it is sent without.
     restated: Vec<(&'static str, &'static str)>,
     /// When present, only these outer variants belong to the proven contract.
     /// Nested enums remain unrestricted and must agree in full.
@@ -248,7 +249,17 @@ impl Comparison<'_> {
                 self.shapes(direction, old, new, path);
             }
             (Container::Struct(old), Container::Struct(new)) => {
-                self.named(direction, old, new, path);
+                // A field the daemon omits for this client is one it never
+                // receives. A request still has to carry every field.
+                let new: Vec<_> = new
+                    .iter()
+                    .filter(|(name, _)| {
+                        direction == Direction::Request
+                            || !self.restated.contains(&(current, name.as_str()))
+                    })
+                    .cloned()
+                    .collect();
+                self.named(direction, old, &new, path);
             }
             (Container::Enum(old), Container::Enum(new)) => {
                 let gate = self
@@ -480,7 +491,8 @@ fn every_older_client_is_proven_against_its_recorded_format() {
                 client.server_messages,
                 client.server_responses,
                 client.work_responses,
-                client.agent_replies
+                client.agent_replies,
+                client.device_replies
             ),
             (
                 variant_count(&older, "ClientRequest"),
@@ -488,6 +500,7 @@ fn every_older_client_is_proven_against_its_recorded_format() {
                 variant_count(&older, "ServerResponse"),
                 variant_count(&older, WORK_RESPONSE),
                 variant_count(&older, AGENT_REPLY),
+                variant_count(&older, DEVICE_REPLY),
             ),
             "protocol {}'s variant counts",
             client.protocol
@@ -500,6 +513,7 @@ fn every_older_client_is_proven_against_its_recorded_format() {
                 ("ServerResponse", client.server_responses as usize),
                 (WORK_RESPONSE, client.work_responses as usize),
                 (AGENT_REPLY, client.agent_replies as usize),
+                (DEVICE_REPLY, client.device_replies as usize),
             ],
             [
                 (client.protocol < FIRING_WITH_SKIPPED_OCCURRENCES)
@@ -526,12 +540,21 @@ fn every_older_client_is_proven_against_its_recorded_format() {
     }
 }
 
-/// Appended variants a client of `protocol` is sent as ones it knows.
+/// Appended variants a client of `protocol` is sent as ones it knows, and
+/// added fields it is sent without, as (container, variant or field).
 fn restated_for(protocol: u16) -> Vec<(&'static str, &'static str)> {
     RESTATED_VARIANTS
         .iter()
         .filter(|(.., since)| protocol < *since)
         .map(|(container, variant, _)| (*container, *variant))
+        .chain(
+            OMITTED_FIELDS
+                .iter()
+                .filter(|(.., since)| protocol < *since)
+                .flat_map(|(container, fields, _)| {
+                    fields.iter().map(move |field| (*container, *field))
+                }),
+        )
         .collect()
 }
 
