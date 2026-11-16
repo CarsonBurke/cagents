@@ -157,6 +157,13 @@ impl<'a, Message: Clone + 'a> From<Button<'a, Message>> for Element<'a, Message>
         let mut content = widget::row::with_capacity(2)
             .spacing(space::XS + space::XXS)
             .align_y(Alignment::Center);
+        // A glyph and its label read as one: the label stays beside it, and
+        // the room kept for a longer label trails it.
+        let label_align = if icon.is_some() {
+            iced::alignment::Horizontal::Left
+        } else {
+            iced::alignment::Horizontal::Center
+        };
         if let Some(icon) = icon {
             content = content.push(widget::icon(icon).size(design::ROW_ICON_SIZE));
         }
@@ -172,7 +179,7 @@ impl<'a, Message: Clone + 'a> From<Button<'a, Message>> for Element<'a, Message>
             super::reserved(
                 heading(label.clone()),
                 labels.into_iter().map(heading),
-                iced::alignment::Horizontal::Center,
+                label_align,
             )
         });
         let mut button = widget::button::custom(
@@ -462,6 +469,47 @@ mod tests {
             laid_out_row(&mut wide, &mut Tree::empty(), 900.0).0[0].width,
             "the swapped-in button keeps the room of the one it replaces"
         );
+    }
+
+    /// A glyph and its label stay together whichever label shows: the room
+    /// kept for a longer one trails the label rather than splitting them,
+    /// as it would for a disclosure such as "Hide options".
+    #[test]
+    fn a_shorter_label_stays_beside_its_glyph() {
+        use cosmic::iced::advanced::{layout, widget::Tree};
+        use cosmic::iced::{Point, Rectangle, Size, Vector};
+
+        fn leaves(node: &layout::Node, origin: Point, found: &mut Vec<Rectangle>) {
+            let bounds = node.bounds() + Vector::new(origin.x, origin.y);
+            if node.children().is_empty() {
+                found.push(bounds);
+            }
+            for child in node.children() {
+                leaves(child, bounds.position(), found);
+            }
+        }
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let gap = |advanced: bool| {
+            let mut element: Element<'_, ()> = quiet("Base branch & destination")
+                .instead("Hide options", advanced)
+                .icon(widget::icon::from_name("pan-down-symbolic"))
+                .on_press(())
+                .into();
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(900.0, 80.0)),
+            );
+            let mut found = Vec::new();
+            leaves(&node, Point::ORIGIN, &mut found);
+            let [glyph, label] = found[..] else {
+                panic!("expected a glyph and a label, found {found:?}");
+            };
+            label.x - (glyph.x + glyph.width)
+        };
+        assert_eq!(gap(true), gap(false));
+        assert_eq!(gap(false), space::XS + space::XXS);
     }
 
     #[test]

@@ -1056,9 +1056,6 @@ mod tests {
         }
     }
 
-    /// Escape closes the dialog on the first press although its focused
-    /// field captures the key to blur itself, and stops a running
-    /// resolution.
     /// A long Git error scrolls with the fields; Cancel and Create stay in
     /// reach at the scaled minimum window, with the options open too.
     #[test]
@@ -1080,6 +1077,9 @@ mod tests {
         );
     }
 
+    /// Escape closes the dialog on the first press although its focused
+    /// field captures the key to blur itself, and stops a running
+    /// resolution.
     #[test]
     fn escape_from_a_focused_field_closes_the_dialog() {
         let Fixture { mut app, .. } = fixture();
