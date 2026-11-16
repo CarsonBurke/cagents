@@ -10,6 +10,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import termios
 import time
 import unittest
 
@@ -26,6 +27,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import subprocess
 import sys
 import time
 
@@ -34,7 +36,8 @@ config = json.loads((root / "control.json").read_text())
 program = Path(sys.argv[0]).name
 cargo = program == "cargo"
 phase = ("metadata" if cargo and sys.argv[1:2] == ["metadata"] else
-    "compiler" if cargo else "disk" if program == "df" else
+    "compiler" if cargo and "--no-run" in sys.argv else
+    "cargo-run" if cargo else "disk" if program == "df" else
     "prune" if program == "prune-build-dirs" else
     "list-ignored" if "--ignored" in sys.argv else
     "list-all" if "--list" in sys.argv else "test")
@@ -64,10 +67,11 @@ def interrupted(number, _frame):
         time.sleep(0.01)
     raise SystemExit(128 + number)
 
-for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
-    signal.signal(number, interrupted)
-record()
-(root / (phase + ".ready")).touch()
+if phase != "cargo-run":
+    for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
+        signal.signal(number, interrupted)
+    record()
+    (root / (phase + ".ready")).touch()
 if config.get("hold") == phase:
     deadline = time.monotonic() + 6
     while not (root / "release").exists() and time.monotonic() < deadline:
@@ -100,41 +104,46 @@ if phase == "prune":
     raise SystemExit(config.get("prune_exit", 0))
 
 if phase == "compiler":
-    application = sys.argv[sys.argv.index("--package") + 1] == "cagents-ui"
-    manifest = root / "crates/cagents-ui/Cargo.toml" if application else root / "Cargo.toml"
-    artifact = dict(reason="compiler-artifact", manifest_path=str(manifest),
-                    target=dict(name="cagents_ui" if application else "cagents", kind=["lib"]),
-                    profile=dict(test=True), executable=str(root / "libtest"))
-    variant = config.get("artifact", "valid")
-    if variant == "wrong-manifest":
-        artifact["manifest_path"] = str(root / "other/Cargo.toml")
-    elif variant == "wrong-name":
-        artifact["target"]["name"] = "other"
-    elif variant == "wrong-kind":
-        artifact["target"]["kind"] = ["bin"]
-    elif variant == "wrong-profile":
-        artifact["profile"]["test"] = False
-    elif variant == "relative":
-        artifact["executable"] = "libtest"
-    elif variant == "non-string":
-        artifact["executable"] = 1
-    elif variant == "missing-file":
-        artifact["executable"] = str(root / "absent")
-    elif variant == "directory":
-        artifact["executable"] = str(root / "private-home")
     if config.get("diagnostics"):
         print("plain compiler output")
-        print(json.dumps(dict(reason="compiler-message", message=dict(rendered="rendered warning\n"))))
         print("compiler stderr", file=sys.stderr)
-    if variant != "missing":
-        print(json.dumps(artifact))
-    if variant == "duplicate":
-        print(json.dumps(artifact))
-    if variant == "malformed-json":
-        print("[]")
-    if variant == "truncated-json":
-        print("{broken")
     raise SystemExit(config.get("build_exit", 0))
+
+if phase == "cargo-run":
+    # Runs the tests as Cargo does, as observed on the build host: the
+    # runner's relative path is resolved from Cargo's working directory, it
+    # starts in the package's root with CARGO_MANIFEST_DIR set, and gets the
+    # harness's path and the arguments after `--`, then `--quiet` for `-q`.
+    # Cargo waits through an interrupt and exits with the runner's status.
+    arguments = sys.argv[1:]
+    split = arguments.index("--") if "--" in arguments else len(arguments)
+    options, trailing = arguments[:split], arguments[split + 1:]
+    settings = [value for option, value in zip(options, options[1:]) if option == "--config"]
+    key = "target.'cfg(all())'.runner="
+    runners = [json.loads(value[len(key):]) for value in settings if value.startswith(key)]
+    package = options[options.index("--package") + 1]
+    manifest = root / "crates/cagents-ui" if package == "cagents-ui" else root
+    variant = config.get("artifact", "valid")
+    environment = dict(os.environ, CARGO_PKG_NAME=package, CARGO_MANIFEST_DIR=str(manifest))
+    environment.update(config.get("cargo_environment", {}))
+    if variant == "wrong-package":
+        environment["CARGO_PKG_NAME"] = "other"
+    elif variant == "wrong-manifest":
+        environment["CARGO_MANIFEST_DIR"] = str(root / "other")
+    executable = {"relative": "libtest", "missing-file": str(root / "absent"),
+                  "directory": str(root / "private-home")}.get(variant, str(root / "libtest"))
+    trailing = [word for word in trailing if word not in config.get("cargo_drops", [])]
+    if len(runners) != 1:
+        raise SystemExit("fixture Cargo needs exactly one runner")
+    program, *rest = runners[0]
+    if "/" in program:
+        program = os.path.join(os.getcwd(), program)
+    signal.signal(signal.SIGINT, lambda _number, _frame: None)
+    child = subprocess.Popen([program, *rest, executable, *trailing, *config.get("cargo_adds", [])],
+                             cwd=manifest, env=environment)
+    record(child=child.pid, runner=runners[0], trailing=trailing)
+    status = child.wait()
+    raise SystemExit(status if status >= 0 else 101)
 
 if phase.startswith("list"):
     record(stdin=sys.stdin.read())
@@ -155,7 +164,8 @@ if phase.startswith("list"):
         print("module::benchmark: benchmark")
     raise SystemExit(config.get(phase + "_exit", 0))
 
-record(stdin=sys.stdin.read())
+record(stdin="" if config.get("no_stdin") else sys.stdin.read(), metadata={name: os.environ.get(name) for name in
+       ("CAGENTS_BUILD_METADATA", "CAGENTS_BUILD_METADATA_SUPPLIED")})
 raise SystemExit(config.get("test_exit", 0))
 '''
 
@@ -179,6 +189,7 @@ class TestLib(unittest.TestCase):
             path.chmod(0o700)
         for name in ("private-home", "private-codex", "caller", "tmp"):
             (self.root / name).mkdir(mode=0o700)
+        (self.root / "crates/cagents-ui").mkdir(parents=True)
         self.lock = self.root / "slot.lock"
         self.env = {
             "PATH": str(self.root / "bin") + ":/usr/bin:/bin",
@@ -270,25 +281,40 @@ class TestLib(unittest.TestCase):
         (self.root / "pruner.scheduled").touch()
         return environment
 
-    def assert_one_build_then_direct_harness(self):
+    def runner(self, lane):
+        return ["scripts/test-lib", "--cargo-runner", lane]
+
+    def assert_one_build_then_harness_under_cargo(self):
         events = self.events()
         self.assertEqual(len(self.events("metadata")), 1)
         compiler = self.events("compiler")
         self.assertEqual(len(compiler), 1)
+        self.assertEqual(len(self.events("cargo-run")), 1)
         after = events[events.index(compiler[0]) + 1:]
-        self.assertEqual({event["phase"] for event in after}, {"list-all", "list-ignored", "test"})
-        self.assertTrue(all(event["program"] == "libtest" for event in after), after)
+        self.assertEqual({event["phase"] for event in after},
+                         {"cargo-run", "list-all", "list-ignored", "test"})
+        self.assertTrue(all(event["program"] == "libtest"
+                            for event in after if event["phase"] != "cargo-run"), after)
         self.assertTrue(all(not event["held"] for event in after), after)
+        # The runner Cargo started replaced itself with the harness.
+        self.assertEqual(self.events("test")[0]["pid"], self.events("cargo-run")[0]["child"])
 
-    def test_the_test_binary_runs_under_a_memory_limit(self):
+    def test_cargo_runs_the_tests_under_a_memory_limit(self):
         ran = self.root / "limited"
         limit = self.root / "scripts/memory-capped"
-        limit.write_text(f'#!/bin/sh\necho "$1 $2" >"{ran}"\nshift\nexec "$@"\n')
+        limit.write_text("import json, os, sys\n"
+                         f"open({str(ran)!r}, 'w').write(json.dumps(sys.argv[1:]))\n"
+                         "os.execvp(sys.argv[4], sys.argv[4:])\n")
         limit.chmod(0o755)
         result = self.invoke("cli", "module::one")
         self.assertEqual(result.returncode, 0, result.stderr)
-        # What a test leaves running is stopped with it.
-        self.assertEqual(ran.read_text().strip(), f"--stop-leftovers {self.root / 'libtest'}")
+        # The whole Cargo command that runs the tests is capped, the runner and
+        # harness within it, and what they leave running is stopped with them.
+        limited = json.loads(ran.read_text())
+        self.assertEqual(limited[:5], ["--slice", "app-cagents-test.slice", "--stop-leftovers",
+                                       "cargo", "test"])
+        self.assertEqual(limited[4:], self.events("cargo-run")[0]["arguments"])
+        self.assert_one_build_then_harness_under_cargo()
 
     def test_isolated_lane_arguments_cwd_profile_and_admission_release(self):
         for lane, profile in (("cli", None), ("host", "dev-runtime"), ("shared-ui", "test"),
@@ -299,28 +325,34 @@ class TestLib(unittest.TestCase):
                 result = self.invoke(lane, "module::one", "--test-threads", "2", *extra)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 events = self.events()
-                compiler = self.events("compiler")[0]
                 package = "cagents-ui" if lane == "ui" else "cagents"
-                expected = ["test", "--locked", "--no-default-features", "--manifest-path",
-                            str(self.root / "Cargo.toml"), "--package", package, "--lib",
-                            "--no-run", "--message-format=json-render-diagnostics"]
-                expected += {"host": ["--features", "host"],
-                             "shared-ui": ["--features", "ui"]}.get(lane, [])
-                self.assertEqual(compiler["arguments"], expected + extra)
+                options = ["--locked", "--no-default-features", "--manifest-path",
+                           str(self.root / "Cargo.toml"), "--package", package, "--lib"]
+                options += {"host": ["--features", "host"],
+                            "shared-ui": ["--features", "ui"]}.get(lane, [])
+                options += ["--config", "target.'cfg(all())'.runner="
+                            + json.dumps(self.runner(lane)), *extra]
+                compiler = self.events("compiler")[0]
+                self.assertEqual(compiler["arguments"], ["test", "--no-run", *options])
                 self.assertTrue(compiler["held"], events)
+                cargo = self.events("cargo-run")[0]
+                self.assertEqual(cargo["arguments"],
+                                 ["test", *options, "--", "--test-lib-selection", "module::one",
+                                  "--test-threads", "2"])
+                self.assertFalse(cargo["held"], events)
                 metadata = self.events("metadata")[0]
                 self.assertEqual(metadata["arguments"], ["metadata", "--format-version", "1", "--no-deps"])
                 self.assertEqual(events[:2], [metadata, compiler])
-                self.assertEqual({event["phase"] for event in events},
-                                 {"metadata", "compiler", "list-all", "list-ignored", "test"})
+                manifest = self.root / "crates/cagents-ui" if lane == "ui" else self.root
                 for event in events:
-                    self.assertEqual(event["cwd"], str(self.root))
+                    # Cargo runs from the checkout; the tests from their package.
+                    self.assertEqual(event["cwd"], str(manifest if event["program"] == "libtest"
+                                                       else self.root), event)
                     self.assertEqual(event["protected"], {key: self.env[key] for key in PROTECTED})
-                    if event["phase"] != "compiler":
-                        self.assertFalse(event["held"], event)
                 self.assertEqual(self.events("test")[0]["arguments"],
                                  ["--exact", "module::one", "--test-threads", "2"])
-                self.assert_one_build_then_direct_harness()
+                self.assertIn(f"test-lib: running 1 exact {lane} tests", result.stderr)
+                self.assert_one_build_then_harness_under_cargo()
                 self.assertFalse(self.held())
 
     def test_disk_guard_refuses_before_compile_or_test_with_private_tools(self):
@@ -356,7 +388,7 @@ class TestLib(unittest.TestCase):
         self.assertEqual([event["phase"] for event in self.events()[:5]],
                          ["metadata", "disk", "prune", "disk", "compiler"])
         self.assertTrue(self.events("compiler")[0]["held"])
-        self.assert_one_build_then_direct_harness()
+        self.assert_one_build_then_harness_under_cargo()
 
     def test_failed_or_pathless_metadata_bypasses_disk_guard(self):
         environment = self.disk_policy()
@@ -373,7 +405,7 @@ class TestLib(unittest.TestCase):
                 self.assertEqual(self.events("prune"), [])
                 self.assertEqual([event["phase"] for event in self.events()[:2]], ["metadata", "compiler"])
                 self.assertTrue(self.events("compiler")[0]["held"])
-                self.assert_one_build_then_direct_harness()
+                self.assert_one_build_then_harness_under_cargo()
 
     def test_disk_guard_uses_the_build_directory_else_the_target(self):
         environment = self.disk_policy()
@@ -392,20 +424,63 @@ class TestLib(unittest.TestCase):
                                  ["-Pk", "--", str(self.root / guarded)])
                 self.assertEqual(self.events("compiler"), [])
 
-    def test_artifact_must_be_unique_matching_absolute_and_runnable(self):
-        for variant in ("missing", "duplicate", "wrong-manifest", "wrong-name", "wrong-kind",
-                        "wrong-profile", "relative", "non-string", "missing-file", "directory",
-                        "unrunnable", "malformed-json", "truncated-json"):
+    def test_runner_refuses_another_package_or_an_unrunnable_harness(self):
+        for variant in ("wrong-package", "wrong-manifest", "relative", "missing-file",
+                        "directory", "unrunnable"):
             with self.subTest(variant=variant):
                 self.clear()
                 self.configure(artifact=variant)
                 (self.root / "libtest").chmod(0o600 if variant == "unrunnable" else 0o700)
                 result = self.invoke("cli", "module::one")
-                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertIn("test-lib:", result.stderr)
-                self.assertEqual([event["phase"] for event in self.events()], ["metadata", "compiler"])
-                self.assert_no_test()
+                self.assertEqual([event["phase"] for event in self.events()],
+                                 ["metadata", "compiler", "cargo-run"])
                 self.assertFalse(self.held())
+
+    def test_cargo_quiet_reaches_the_harness_and_other_arguments_are_refused(self):
+        self.configure(cargo_adds=["--quiet"])
+        result = self.invoke("cli", "module::one")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.events("test")[0]["arguments"], ["--exact", "module::one", "--quiet"])
+        self.clear()
+        self.configure(cargo_adds=["--nocapture"])
+        result = self.invoke("cli", "module::one")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual([event["phase"] for event in self.events()],
+                         ["metadata", "compiler", "cargo-run"])
+
+    def test_a_runner_without_the_selection_marker_is_refused(self):
+        # Cargo prefers a runner configured for the exact target, which would
+        # pass the names to the harness itself: the marker makes that fail.
+        self.configure(cargo_drops=["--test-lib-selection"])
+        result = self.invoke("cli", "module::one")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("--test-lib-selection", result.stderr)
+        self.assert_no_test()
+
+    def test_tests_get_the_callers_stamp_back_instead_of_the_gates(self):
+        gate = {"CAGENTS_BUILD_METADATA": "gate-stamp", "CAGENTS_BUILD_METADATA_SUPPLIED": "1"}
+        for caller, expected in ((None, None), ("caller.stamp-1", "caller.stamp-1"),
+                                 ("not a stamp", None)):
+            with self.subTest(caller=caller):
+                self.clear()
+                self.configure(cargo_environment=gate)
+                environment = self.env.copy()
+                if caller is not None:
+                    environment["CAGENTS_BUILD_METADATA"] = caller
+                result = self.invoke("cli", "module::one", env=environment)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.events("test")[-1]["metadata"],
+                                 {"CAGENTS_BUILD_METADATA": expected,
+                                  "CAGENTS_BUILD_METADATA_SUPPLIED": None})
+        # A stamp the gate did not supply is the caller's, and stays.
+        self.clear()
+        self.configure()
+        result = self.invoke("cli", "module::one",
+                             env=self.env | {"CAGENTS_BUILD_METADATA": "own"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.events("test")[-1]["metadata"]["CAGENTS_BUILD_METADATA"], "own")
 
     def test_missing_exact_name_is_refused_instead_of_running_zero_tests(self):
         for names in (("missing::name",), ("module::one", "missing::name")):
@@ -432,7 +507,7 @@ class TestLib(unittest.TestCase):
         result = self.invoke("ui", "module::one", "--prefix", "module::", "--prefix", "module::")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("skipping ignored module::ignored", result.stderr)
-        self.assertIn("running 2 exact ui tests outside build admission", result.stderr)
+        self.assertIn("running 2 exact ui tests", result.stderr)
         self.assertEqual(self.events("test")[0]["arguments"],
                          ["--exact", "module::one", "module::two"])
 
@@ -444,8 +519,10 @@ class TestLib(unittest.TestCase):
         self.assertIn("skipping ignored module::ignored", result.stderr)
         self.assertEqual(self.events("test")[0]["arguments"],
                          ["--exact", "other::three", "--test-threads", "3"])
-        self.assertEqual(self.events("compiler")[0]["arguments"][-4:],
-                         ["--features", "ui", "--profile", "dev-runtime"])
+        self.assertEqual(self.events("compiler")[0]["arguments"][-2:], ["--profile", "dev-runtime"])
+        self.assertEqual(self.events("cargo-run")[0]["trailing"],
+                         ["--test-lib-selection", "other::three", "--prefix", "module::",
+                          "--test-threads", "3"])
 
     def test_ignored_explicit_empty_prefix_and_ignored_only_are_refused(self):
         for names, config, message in (
@@ -487,8 +564,8 @@ class TestLib(unittest.TestCase):
         self.configure(diagnostics=True, build_exit=41)
         result = self.invoke("cli", "module::one")
         self.assertEqual(result.returncode, 41, result.stderr)
-        for text in ("plain compiler output", "rendered warning", "compiler stderr"):
-            self.assertIn(text, result.stderr)
+        self.assertIn("plain compiler output", result.stdout)
+        self.assertIn("compiler stderr", result.stderr)
         self.assertEqual([event["phase"] for event in self.events()], ["metadata", "compiler"])
         self.assert_no_test()
         self.assertFalse(self.held())
@@ -500,7 +577,8 @@ class TestLib(unittest.TestCase):
         self.assertEqual(process.returncode, 43, stderr)
         self.assertEqual(stdout, "")
         final = self.events("test")
-        self.assertEqual(final[0]["pid"], process.pid, "final harness must replace wrapper")
+        self.assertEqual(final[0]["pid"], self.events("cargo-run")[0]["child"],
+                         "the harness must replace Cargo's runner")
         self.assertEqual(final[-1]["stdin"], "private synthetic stdin\n")
         for phase in ("list-all", "list-ignored"):
             self.assertEqual(self.events(phase)[-1]["stdin"], "")
@@ -658,45 +736,231 @@ class TestLib(unittest.TestCase):
                 self.assertIn("test executable changed", result.stderr)
                 self.assert_no_test()
 
-    def test_direct_cancellation_waits_for_owned_compiler_and_listing_cleanup(self):
-        for phase in ("compiler", "list-all", "list-ignored"):
+    def test_cancellation_waits_for_the_owned_compiler(self):
+        for number in SIGNALS:
+            with self.subTest(signal=number):
+                self.clear()
+                self.configure(hold="compiler")
+                process = self.start("cli", "module::one")
+                self.wait_for(lambda: (self.root / "compiler.ready").exists(), "compiler")
+                self.assertTrue(self.held())
+                process.send_signal(number)
+                self.wait_for(lambda: (self.root / "compiler.signalled").exists(), "signal forwarding")
+                self.assertIsNone(process.poll(), "wrapper released a live owned child")
+                self.assertTrue(self.held())
+                (self.root / "release").touch()
+                _stdout, stderr = process.communicate("", timeout=5)
+                # The gate ends as the signal it was sent, once its build has.
+                self.assertEqual(process.returncode, -number, stderr)
+                # The build host interrupts the build, whatever it was sent.
+                received = [event["signal"] for event in self.events("compiler") if "signal" in event]
+                self.assertEqual(received, [signal.SIGINT])
+                self.assertFalse(self.held())
+                self.assertEqual(self.events("cargo-run"), [])
+
+    def test_a_signal_to_test_lib_reaches_a_listing_and_runs_no_tests(self):
+        # Locally the gate becomes Cargo, which ignores an interrupt; test-lib
+        # passes a signal sent to it alone to the whole command.
+        for phase in ("list-all", "list-ignored"):
             for number in SIGNALS:
                 with self.subTest(phase=phase, signal=number):
                     self.clear()
                     self.configure(hold=phase)
                     process = self.start("cli", "module::one")
                     self.wait_for(lambda: (self.root / (phase + ".ready")).exists(), phase)
-                    self.assertEqual(self.held(), phase == "compiler")
                     process.send_signal(number)
-                    self.wait_for(lambda: (self.root / (phase + ".signalled")).exists(), "signal forwarding")
-                    self.assertIsNone(process.poll(), "wrapper released a live owned child")
-                    self.assertEqual(self.held(), phase == "compiler")
+                    self.wait_for(lambda: (self.root / (phase + ".signalled")).exists(), "the signal")
                     (self.root / "release").touch()
                     _stdout, stderr = process.communicate("", timeout=5)
-                    self.assertEqual(process.returncode, 128 + number, stderr)
-                    received = [event["signal"] for event in self.events(phase) if "signal" in event]
-                    # build-host interrupts the build as Ctrl-C would, whatever
-                    # signal cancelled it; test-lib forwards a listing's own.
-                    self.assertIn(signal.SIGINT if phase == "compiler" else number, received)
-                    self.assertFalse(self.held())
+                    self.assertEqual(process.returncode,
+                                     128 + number if number == signal.SIGINT else -number, stderr)
+                    self.assertIn(number, [event["signal"] for event in self.events(phase)
+                                           if "signal" in event])
                     self.assert_no_test()
 
-    def test_final_exec_has_ordinary_direct_signal_behavior(self):
+    def test_a_signal_to_test_lib_reaches_the_harness(self):
         for number in SIGNALS:
             with self.subTest(signal=number):
                 self.clear()
                 self.configure(hold="test")
                 process = self.start("cli", "module::one")
-                self.wait_for(lambda: (self.root / "test.ready").exists(), "final harness")
-                self.assertEqual(self.events("test")[0]["pid"], process.pid)
+                self.wait_for(lambda: (self.root / "test.ready").exists(), "the harness")
                 process.send_signal(number)
-                self.wait_for(lambda: (self.root / "test.signalled").exists(), "final signal")
+                self.wait_for(lambda: (self.root / "test.signalled").exists(), "the signal")
+                (self.root / "release").touch()
+                _stdout, stderr = process.communicate("", timeout=5)
+                self.assertEqual(process.returncode,
+                                 128 + number if number == signal.SIGINT else -number, stderr)
+                self.assertIn(number, [event["signal"] for event in self.events("test")
+                                       if "signal" in event])
+
+    def test_test_lib_outlives_what_a_signal_left_running(self):
+        # Cargo ends at once on SIGTERM while the harness still handles it.
+        self.configure(hold="test")
+        process = self.start("cli", "module::one")
+        self.wait_for(lambda: (self.root / "test.ready").exists(), "the harness")
+        harness = self.events("test")[0]["pid"]
+        process.send_signal(signal.SIGTERM)
+        self.wait_for(lambda: (self.root / "test.signalled").exists(), "the signal")
+        _stdout, stderr = process.communicate("", timeout=10)
+        self.assertEqual(process.returncode, -signal.SIGTERM, stderr)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(harness, 0)
+
+    def in_terminal(self):
+        """test-lib as the foreground job of a terminal of its own."""
+        controller, terminal = os.openpty()
+        self.addCleanup(os.close, controller)
+
+        def take_terminal():
+            fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+        try:
+            process = subprocess.Popen(
+                [sys.executable, "-I", "-B", str(self.root / "scripts/test-lib"), "cli",
+                 "module::one"],
+                cwd=self.root / "caller", env=self.env, stdin=terminal, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, start_new_session=True,
+                preexec_fn=take_terminal)
+        finally:
+            os.close(terminal)
+        self.children.append(process)
+        return process, controller
+
+    def test_in_a_terminal_ctrl_c_and_a_direct_signal_each_reach_the_harness_once(self):
+        for how in ("ctrl-c", "direct"):
+            with self.subTest(how=how):
+                self.clear()
+                self.configure(hold="test")
+                process, controller = self.in_terminal()
+                self.wait_for(lambda: (self.root / "test.ready").exists(), "the harness")
+                if how == "ctrl-c":
+                    os.write(controller, b"\x03")
+                else:
+                    process.send_signal(signal.SIGINT)
+                self.wait_for(lambda: (self.root / "test.signalled").exists(), "the interrupt")
+                time.sleep(0.2)
+                (self.root / "release").touch()
+                _stdout, stderr = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 128 + signal.SIGINT, stderr)
+                self.assertEqual([event["signal"] for event in self.events("test")
+                                  if "signal" in event], [signal.SIGINT])
+
+    def test_in_a_terminal_ctrl_z_stops_the_job_and_it_continues(self):
+        self.configure(hold="test")
+        process, controller = self.in_terminal()
+        self.wait_for(lambda: (self.root / "test.ready").exists(), "the harness")
+        harness = self.events("test")[0]["pid"]
+        state = lambda pid: Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+        os.write(controller, b"\x1a")
+        self.wait_for(lambda: state(process.pid) == "T", "test-lib to stop with its job")
+        self.assertEqual(state(harness), "T")
+        os.kill(process.pid, signal.SIGCONT)
+        self.wait_for(lambda: state(harness) != "T", "the job to continue")
+        (self.root / "release").touch()
+        # The harness reads the terminal, which it has again: end its input.
+        os.write(controller, b"\x04")
+        _stdout, stderr = process.communicate(timeout=10)
+        self.assertEqual(process.returncode, 0, stderr)
+
+    def test_a_job_continued_in_the_background_leaves_the_shell_its_terminal(self):
+        # A minimal job-control shell: it gives test-lib the terminal, takes
+        # it back when Ctrl-Z stops the job, and continues it as `bg` or `fg`.
+        shell = self.root / "shell.py"
+        shell.write_text(r"""
+import fcntl, json, os, signal, subprocess, sys, termios, time
+fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+mode, report, *command = sys.argv[1:]
+job = subprocess.Popen(command, process_group=0)
+os.tcsetpgrp(0, job.pid)
+_pid, status = os.waitpid(job.pid, os.WUNTRACED)
+stopped = os.WIFSTOPPED(status)
+os.tcsetpgrp(0, os.getpgrp())
+if mode == "fg":
+    os.tcsetpgrp(0, job.pid)
+os.killpg(job.pid, signal.SIGCONT)
+time.sleep(0.5)
+resumed = os.tcgetpgrp(0)
+open(sys.argv[2] + ".resumed", "w").close()
+_pid, status = os.waitpid(job.pid, 0)
+json.dump(dict(stopped=stopped, shell=os.getpgrp(), job=job.pid, resumed=resumed,
+               ended=os.tcgetpgrp(0), status=os.waitstatus_to_exitcode(status)),
+          open(report, "w"))
+""")
+        for mode in ("bg", "fg"):
+            with self.subTest(mode=mode):
+                self.clear()
+                self.configure(hold="test", no_stdin=True)
+                report = self.root / f"report-{mode}.json"
+                controller, terminal = os.openpty()
+                self.addCleanup(os.close, controller)
+                try:
+                    process = subprocess.Popen(
+                        [sys.executable, "-I", "-B", str(shell), mode, str(report),
+                         sys.executable, "-I", "-B", str(self.root / "scripts/test-lib"), "cli",
+                         "module::one"],
+                        cwd=self.root / "caller", env=self.env, stdin=terminal,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                        start_new_session=True)
+                finally:
+                    os.close(terminal)
+                self.children.append(process)
+                self.wait_for(lambda: (self.root / "test.ready").exists(), "the harness")
+                os.write(controller, b"\x1a")
+                self.wait_for(lambda: Path(str(report) + ".resumed").exists(), "the job to continue")
+                (self.root / "release").touch()
+                _stdout, stderr = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 0, stderr)
+                result = json.loads(report.read_text())
+                self.assertTrue(result["stopped"], result)
+                self.assertEqual(result["status"], 0, stderr)
+                self.assertEqual(result["resumed"], result["shell"] if mode == "bg" else
+                                 self.events("cargo-run")[0]["pid"], result)
+                # Ended, the job hands back only a terminal it held.
+                self.assertEqual(result["ended"], result["shell"] if mode == "bg" else result["job"],
+                                 result)
+
+    def test_an_interrupt_during_a_listing_waits_for_it_and_runs_no_tests(self):
+        # A terminal interrupts the whole foreground group. Cargo waits for
+        # its runner, which waits for the listing it started.
+        for phase in ("list-all", "list-ignored"):
+            with self.subTest(phase=phase):
+                self.clear()
+                self.configure(hold=phase)
+                process = self.start("cli", "module::one")
+                self.wait_for(lambda: (self.root / (phase + ".ready")).exists(), phase)
+                self.assertFalse(self.held())
+                os.killpg(process.pid, signal.SIGINT)
+                self.wait_for(lambda: (self.root / (phase + ".signalled")).exists(), "the interrupt")
+                time.sleep(0.2)
+                self.assertIsNone(process.poll(), "runner left before its listing ended")
+                (self.root / "release").touch()
+                _stdout, stderr = process.communicate("", timeout=5)
+                self.assertEqual(process.returncode, 128 + signal.SIGINT, stderr)
+                self.assertIn(signal.SIGINT, [event["signal"] for event in self.events(phase)
+                                              if "signal" in event])
+                self.assert_no_test()
+
+    def test_the_harness_has_ordinary_signal_behavior(self):
+        for number in SIGNALS:
+            with self.subTest(signal=number):
+                self.clear()
+                self.configure(hold="test")
+                process = self.start("cli", "module::one")
+                self.wait_for(lambda: (self.root / "test.ready").exists(), "the harness")
+                self.assertEqual(self.events("test")[0]["pid"], self.events("cargo-run")[0]["child"])
+                os.killpg(process.pid, number)
+                self.wait_for(lambda: (self.root / "test.signalled").exists(), "the signal")
                 self.assertFalse(self.held())
                 (self.root / "release").touch()
                 _stdout, stderr = process.communicate("", timeout=5)
-                self.assertEqual(process.returncode, 128 + number, stderr)
-                self.assertIn(number, [event["signal"] for event in self.events("test") if "signal" in event])
-
+                # Cargo exits with the harness's status after an interrupt;
+                # another signal ends Cargo itself, as it would end real Cargo.
+                self.assertEqual(process.returncode,
+                                 128 + number if number == signal.SIGINT else -number, stderr)
+                self.assertIn(number, [event["signal"] for event in self.events("test")
+                                       if "signal" in event])
 
 if __name__ == "__main__":
     unittest.main()
