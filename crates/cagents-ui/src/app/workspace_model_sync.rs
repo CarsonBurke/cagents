@@ -9018,6 +9018,10 @@ mod tests {
                 .collect()
         }
         let (mut app, project, repository) = app_with_project();
+        // A connected publisher keeps a channel's seed pending until the
+        // registry answers, as a running window's does.
+        let (tx, _requests) = test_model_channel();
+        app.workspace_model_tx = tx;
         let storage = tempfile::tempdir().unwrap();
         let database = storage.path().join("channel-order.sqlite3");
         let boot = crate::model::BootId::new("channel-order-reopen");

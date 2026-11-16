@@ -1,7 +1,12 @@
 use super::*;
 
-fn loading_channel() -> (Cagents, ChannelId, ChannelId) {
+/// A window selecting `channel` before its shared panes load. Its publisher
+/// stays connected, so a seed waits for the registry rather than being
+/// refused at once; keep the returned requests alive while it matters.
+fn loading_channel() -> (Cagents, ChannelId, ChannelId, TestModelRequests) {
     let (mut app, channel, other, _) = fixture();
+    let (tx, requests) = test_model_channel();
+    app.workspace_model_tx = tx;
     app.active_workspace = Some(PathBuf::from("/repo"));
     Arc::make_mut(&mut app.durable).active_channel = Some(channel);
     app.shared_views
@@ -9,7 +14,7 @@ fn loading_channel() -> (Cagents, ChannelId, ChannelId) {
         .remove(&Scope::Channel(channel));
     app.workspace_model.identity = crate::workspace_model::NO_REGISTRY;
     app.settings.default_channel_pane = settings::DefaultPane::NativeChat;
-    (app, channel, other)
+    (app, channel, other, requests)
 }
 
 fn peer_draft() -> Pane {
@@ -25,7 +30,7 @@ fn peer_draft() -> Pane {
 
 #[test]
 fn a_copied_empty_channel_waits_for_its_shared_panes_before_opening_a_default() {
-    let (mut app, channel, _) = loading_channel();
+    let (mut app, channel, _, _requests) = loading_channel();
     drop(app.ensure_default_pane());
     assert!(
         app.workspace.cards().is_empty(),
@@ -55,7 +60,7 @@ fn a_copied_empty_channel_waits_for_its_shared_panes_before_opening_a_default() 
 
 #[test]
 fn a_proven_empty_channel_still_gets_exactly_one_default_composer() {
-    let (mut app, channel, _) = loading_channel();
+    let (mut app, channel, _, _requests) = loading_channel();
     drop(app.ensure_default_pane());
     app.workspace_model.identity = uuid::Uuid::new_v4();
     app.workspace_model.views = vec![View::empty(channel)];
@@ -75,7 +80,7 @@ fn a_proven_empty_channel_still_gets_exactly_one_default_composer() {
 
 #[test]
 fn deferred_default_cannot_follow_navigation_to_another_channel_in_the_same_directory() {
-    let (mut app, channel, other) = loading_channel();
+    let (mut app, channel, other, _requests) = loading_channel();
     drop(app.ensure_default_pane());
     // Both scopes use /repo; matching the path alone would create the old
     // scope's automatic composer in this newly selected channel.
@@ -90,7 +95,7 @@ fn deferred_default_cannot_follow_navigation_to_another_channel_in_the_same_dire
 
 #[test]
 fn joining_the_first_registry_keeps_the_selected_scope_default_intent() {
-    let (mut app, channel, _) = loading_channel();
+    let (mut app, channel, _, _requests) = loading_channel();
     drop(app.ensure_default_pane());
     let identity = uuid::Uuid::new_v4();
     let model = crate::workspace_model::WorkspaceModel {
@@ -126,7 +131,7 @@ fn joining_the_first_registry_keeps_the_selected_scope_default_intent() {
 
 #[test]
 fn a_daemon_without_a_shared_model_still_opens_the_waiting_default() {
-    let (mut app, channel, _) = loading_channel();
+    let (mut app, channel, _, _requests) = loading_channel();
     drop(app.ensure_default_pane());
     assert!(app.workspace.cards().is_empty());
     // This daemon will never admit the scope, so the window stops waiting.
@@ -141,9 +146,43 @@ fn a_daemon_without_a_shared_model_still_opens_the_waiting_default() {
     assert!(app.shared_views.deferred_default.is_none());
 
     // Opening another empty scope afterwards does not wait either.
-    let (mut later, other, _) = loading_channel();
+    let (mut later, selected, _, _later_requests) = loading_channel();
     later.shared_views.registry_unavailable = true;
     drop(later.ensure_default_pane());
     assert!(later.chat_is_unused_default(later.workspace.focused().unwrap()));
-    assert_eq!(later.durable.active_channel, Some(other));
+    assert_eq!(later.durable.active_channel, Some(selected));
+}
+
+#[test]
+fn a_refused_seed_opens_the_waiting_default_for_local_use() {
+    let (mut app, channel, _, _requests) = loading_channel();
+    let scope = Scope::Channel(channel);
+    app.workspace_model.identity = uuid::Uuid::new_v4();
+    app.workspace_model.views.clear();
+    Arc::make_mut(&mut app.durable).workspace_model_identity = Some(app.workspace_model.identity);
+    drop(app.ensure_default_pane());
+    drop(app.reconcile_shared_views());
+    assert!(app.shared_views.seeding.contains(&scope));
+    assert!(
+        app.workspace.cards().is_empty(),
+        "the channel waits while its seed is pending"
+    );
+
+    // The registry keeps this channel's panes local to the window, so the
+    // window stops waiting rather than leaving it without a composer.
+    drop(app.apply_workspace_model_update(
+        super::super::super::workspace_model_sync::ModelUpdate::SeedRefused {
+            scope: scope.clone(),
+            attempt: app.shared_views.seed_attempts[&scope],
+            error: "The registry could not store these panes".into(),
+        },
+    ));
+    assert!(app.refused_view_seeds_notice().is_some());
+    let card = app
+        .workspace
+        .focused()
+        .expect("the refused channel opens its composer");
+    assert!(app.chat_is_unused_default(card));
+    assert_eq!(app.workspace.order().collect::<Vec<_>>(), [card]);
+    assert!(app.shared_views.deferred_default.is_none());
 }

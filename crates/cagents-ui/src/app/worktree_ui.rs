@@ -2165,6 +2165,10 @@ mod tests {
     #[test]
     fn legacy_unscoped_terminals_remain_accessible_without_owning_new_worktrees() {
         let mut app = super::super::tests::context_inspector_test_app(false);
+        // A connected publisher keeps the new scope's seed pending until the
+        // registry answers, as a running window's does.
+        let (tx, _requests) = super::super::workspace_model_sync::test_model_channel();
+        app.workspace_model_tx = tx;
         // These selection checks run after the shared registry has hydrated.
         app.workspace_model.identity = uuid::Uuid::new_v4();
         app.settings.default_worktree_pane = settings::DefaultPane::Terminal;
@@ -2877,6 +2881,10 @@ mod tests {
         let nested = root.path().join("worktrees/topic");
         let project = ProjectId::new();
         let mut app = super::super::tests::context_inspector_test_app(false);
+        // A connected publisher keeps the new scope's seed pending until the
+        // registry answers, as a running window's does.
+        let (tx, _requests) = super::super::workspace_model_sync::test_model_channel();
+        app.workspace_model_tx = tx;
         // These selection checks run after the shared registry has hydrated.
         app.workspace_model.identity = uuid::Uuid::new_v4();
         app.settings.default_worktree_pane = settings::DefaultPane::Terminal;

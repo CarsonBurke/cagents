@@ -1401,11 +1401,13 @@ impl Workspace {
             })
             .flatten();
         ViewportAnchor {
+            // With several panes in view, the selected one is where the
+            // reader types, so it keeps its place before any other pane.
             position: ViewportPoint::capture(
                 self.presentation_geometry(),
                 self.camera.offset(),
                 self.viewport_width,
-                None,
+                self.focused,
             ),
             destination,
             destination_reveals_focus: destination
@@ -2144,6 +2146,40 @@ mod tests {
             .unwrap();
         assert_eq!(body.start, projection.offset);
         assert_eq!(body.end(), projection.offset + 800.0);
+    }
+
+    #[test]
+    fn passive_insertion_beside_a_visible_selection_keeps_the_selection_in_place() {
+        // A third pane keeps the strip wider than the viewport, so no pane is
+        // stretched to fill it and every width survives the insertion.
+        let mut workspace = workspace_with_widths(&[CardWidth::Fixed(500.0); 3], 1100.0);
+        let selected = workspace.order().nth(1).unwrap();
+        workspace.focus(selected).unwrap();
+        while workspace.camera().is_animating() {
+            workspace.tick(Duration::from_millis(16));
+        }
+        workspace.take_widget_focus_request();
+        let before = workspace.geometry().card(selected).unwrap();
+        let on_screen = before.start - workspace.camera().offset();
+        assert!(before.end - workspace.camera().offset() <= 1100.0);
+        let anchor = workspace.capture_viewport_anchor();
+        // A peer pane lands between the leftmost visible pane and the
+        // selection; keeping the leftmost pane would push the selection out.
+        workspace
+            .add_card(card(CardWidth::Fixed(500.0)), 1, false)
+            .unwrap();
+
+        workspace.restore_viewport_anchor(anchor);
+        let after = workspace.geometry().card(selected).unwrap();
+        assert_eq!(after.width(), before.width());
+        assert!(after.start > before.start);
+        assert_eq!(after.start - workspace.camera().offset(), on_screen);
+        assert_eq!(workspace.focused(), Some(selected));
+        assert_eq!(workspace.pending_widget_focus, None);
+        assert_eq!(
+            workspace.visibility(selected),
+            Some(VisibilityClass::Visible)
+        );
     }
 
     #[test]

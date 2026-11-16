@@ -248,12 +248,14 @@ pub(super) struct State {
 }
 
 impl State {
-    /// Whether `scope`'s shared panes have been admitted, so an empty local
-    /// strip means the scope is empty rather than not yet loaded.
-    pub(super) fn scope_initialized(&self, scope: &Scope) -> bool {
-        self.initialized.contains(scope)
-            && !self.seeding.contains(scope)
-            && !self.blocked.contains(scope)
+    /// Whether an empty local strip means `scope` is empty rather than not
+    /// yet loaded: its shared panes have been admitted, or the registry
+    /// refused its seed and this window keeps the scope's panes locally.
+    pub(super) fn scope_settled(&self, scope: &Scope) -> bool {
+        self.seed_failures.contains_key(scope)
+            || (self.initialized.contains(scope)
+                && !self.seeding.contains(scope)
+                && !self.blocked.contains(scope))
     }
 
     /// Treats `scope` as already seeded with `panes`, as an acknowledged seed

@@ -8273,7 +8273,7 @@ impl Cagents {
             && let Some(scope) = self.default_pane_scope(&directory)
             && (self.shared_registry_connecting()
                 || (self.workspace_model.identity != crate::workspace_model::NO_REGISTRY
-                    && !self.shared_views.scope_initialized(&scope)))
+                    && !self.shared_views.scope_settled(&scope)))
         {
             self.shared_views.deferred_default = Some((scope, directory));
             return Task::none();
