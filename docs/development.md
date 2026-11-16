@@ -1562,8 +1562,9 @@ types or aliases, expand macros, evaluate enclosing-module `cfg` or numeric
 expressions, or inspect custom serializers, dependency changes
 and semantic compatibility rules. Changes outside these seven declarations
 still need protocol review and, where applicable, a version bump. Two divergent
-branches cannot detect one another before comparison or merge. The historical
-upgrade inspector's supported-version policy remains a separate decision.
+branches cannot detect one another before comparison or merge. Which
+protocols live updates start from is a separate decision, recorded in
+`RELEASED_SOURCES` and enforced by `scripts/check-update-sources`.
 
 The four named-tree reconciliation contracts share their cases between the root
 UI target and a focused workspace package. For edits confined to vendored
@@ -2224,8 +2225,9 @@ code is recompiled. The script stages the archive with
 `install.sh --stage-only` and runs `cagents daemon upgrade`, which shows each
 affected session and asks before replacing anything. `--stage-only` stops
 after staging; finish later with `cagents daemon upgrade`. The staged build
-always supplies the updater. A source daemon whose protocol is too old needs
-an intermediate build first.
+always supplies the updater. A source daemon whose protocol live updates do
+not start from is refused before anything changes; follow the cold
+installation the refusal describes.
 
 The build runs in the repository's `.worktrees/.install-local`, a detached
 checkout the script owns, so its target directory stays warm and edits in your

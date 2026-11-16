@@ -166,7 +166,7 @@ impl Client {
         Self::connect_selected(
             socket,
             deadline,
-            discovery::discover_protocol(socket, deadline)?,
+            discovery::discover_qualified_protocol(socket, deadline)?,
         )
     }
 
@@ -399,7 +399,7 @@ impl InstalledIdentity {
 /// historical unsolicited chat traffic, must match in full.
 /// ShutdownV1 includes preflight, stop and confirmed shutdown; List/BuildInfo
 /// include status reads. StartupState and every nested phase are frozen for
-/// readiness checks on all admitted Current sources. A source sends the chat
+/// readiness checks on every qualified source. A source sends the chat
 /// events in [`UNSOLICITED_SINCE`] unasked once its protocol has them.
 /// Keep this beside source admission so adding support always runs the proof.
 #[cfg(test)]
@@ -618,7 +618,7 @@ pub(super) fn inspect_installed_identity() -> Result<InstalledIdentity, UpdateEr
     }
     let socket = crate::terminal_ipc::daemon_socket_path()?;
     let deadline = Instant::now() + Duration::from_secs(5);
-    match discovery::discover_installed_protocol(&socket, deadline) {
+    match discovery::discover_protocol_and_peer(&socket, deadline) {
         Ok((protocol, peer)) => {
             if !is_qualified_source(protocol) {
                 return Err(unsupported_source(protocol));
