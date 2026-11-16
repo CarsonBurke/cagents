@@ -550,10 +550,10 @@ fn a_peer_deleting_a_channel_only_closes_conversations_it_could_have_seen() {
 
 #[test]
 fn an_empty_channel_is_not_retired_under_a_conversation_it_has_not_published() {
-    use crate::channel_work::Home;
+    use crate::workspace_model::ChannelIncarnation;
     for used in [false, true] {
         let mut world = world();
-        let home = Home {
+        let home = ChannelIncarnation {
             registry: world.app.workspace_model.identity,
             channel: world.channel,
             creation_ordinal: 1,

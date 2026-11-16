@@ -56,7 +56,9 @@ fn access(request: &ClientRequest) -> Access<'_> {
             | crate::work::Request::RemovalPlan { .. }
             | crate::work::Request::Snapshots { .. },
         )
-        | R::WatchWork => Access::Open,
+        | R::WatchWork
+        // Admitted only so its handler can explain that it was removed.
+        | R::RetiredChannelWork => Access::Open,
         R::Input { terminal_id, .. }
         | R::Paste { terminal_id, .. }
         | R::Key { terminal_id, .. }
@@ -77,7 +79,6 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::DeviceOperation { .. }
         | R::Agent { .. }
         | R::Automation { .. }
-        | R::ChannelWork { .. }
         | R::Shutdown
         | R::ShutdownV1 { .. }
         | R::PrepareUpgrade { .. }
