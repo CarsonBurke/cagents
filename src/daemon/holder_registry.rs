@@ -13,17 +13,18 @@ use serde::{Deserialize, Serialize};
 use crate::model::{BootId, TerminalId};
 
 mod connection;
+#[cfg(any(feature = "host", test))]
 pub(crate) use connection::connect_until;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum Kind {
+pub enum Kind {
     #[default]
     Terminal,
     Native,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct Process {
+pub struct Process {
     pub pid: i32,
     pub start: u64,
 }
@@ -571,7 +572,7 @@ pub(crate) fn observed(kind: Kind) -> io::Result<Vec<Record>> {
 /// another version, application or kind can't be adopted, but it is still alive.
 /// A record that can't be read is an error, not an absence.
 #[cfg(feature = "ui")]
-pub(crate) fn holding_process(terminal: TerminalId, kind: Kind) -> io::Result<Option<i32>> {
+pub fn holding_process(terminal: TerminalId, kind: Kind) -> io::Result<Option<i32>> {
     let directory = directory(kind).map_err(io::Error::other)?;
     crate::secure_file::reject_symlink_components(&directory)?;
     holding_process_in(&directory, terminal)

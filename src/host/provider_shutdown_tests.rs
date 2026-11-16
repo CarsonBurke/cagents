@@ -1196,3 +1196,307 @@ fn ordinary_shutdown_keeps_managed_agents_with_their_panes_and_channels() {
             .closed
     );
 }
+
+/// A managed Codex chat bound to its agent and shown in its channel pane, as
+/// a previous boot left it: its prompt settled, its process gone.
+fn reopenable_codex_agent(
+    directory: &Path,
+) -> (
+    model::Registry,
+    crate::agent_execution::Agent,
+    chat::Session,
+    crate::workspace_model::views::Pane,
+) {
+    use crate::{
+        agent_execution::{Destination, HostedSession, Origin, Spec, Submit, Surface, Target},
+        model::{CardId, CardKind, ProjectKind},
+        workspace_model::{ModelEdit, views::Scope},
+    };
+    let repository = directory.canonicalize().unwrap();
+    let mut registry = model::Registry::at(&directory.join("model.sqlite3")).unwrap();
+    registry
+        .apply(&ModelEdit::OpenProject {
+            repository: repository.clone(),
+            name: "Reopen fixture".into(),
+            kind: ProjectKind::Folder,
+        })
+        .unwrap();
+    let accepted = registry
+        .submit_agent(
+            &Origin::User,
+            &Submit {
+                name: None,
+                destination: Destination::New(Spec {
+                    provider: crate::agent::Provider::Codex,
+                    account: None,
+                    target: Target {
+                        repository: repository.clone(),
+                        directory: repository.clone(),
+                        placement: None,
+                    },
+                    surface: Surface::Chat,
+                    model: None,
+                    permission_mode: None,
+                    reasoning_effort: None,
+                }),
+                prompt: "Find the flaky login test".into(),
+                idempotency_key: "reopen-in-place".into(),
+            },
+            1,
+        )
+        .unwrap();
+    let session = chat::Session {
+        id: TerminalId::new(),
+        launch: chat::Launch {
+            provider: crate::agent::Provider::Codex,
+            recipe: LaunchRecipe {
+                program: "/bin/cat".into(),
+                arguments: Vec::new(),
+                working_directory: repository,
+                environment: Default::default(),
+                unset_environment: Default::default(),
+            },
+            session_id: Some(Uuid::new_v4().to_string()),
+        },
+        native_continuity: Default::default(),
+        owned_codex_listener: None,
+        proof: Some(boot_proof("first")),
+        terminal: None,
+    };
+    let source = HostedSession::Chat(session.clone());
+    registry
+        .bind_agent(accepted.agent.id, None, source.clone())
+        .unwrap();
+    registry.register_agent_authority(&source).unwrap();
+    registry
+        .update_agent_run(
+            accepted.run.id,
+            accepted.run.revision,
+            crate::agent_execution::Update::Started {
+                provider_key: "turn".into(),
+            },
+            2,
+        )
+        .unwrap();
+    // The next daemon finds no proof of the turn's outcome.
+    registry.interrupt_unproven_agent_runs(3).unwrap();
+    let pane = crate::workspace_model::views::Pane {
+        id: CardId::from_uuid(accepted.agent.id.as_uuid()),
+        title: "Codex".into(),
+        user_title: None,
+        pending_terminal_start: false,
+        width_fraction: 1.0,
+        kind: CardKind::Chat(session.clone()),
+        scope: None,
+    };
+    registry
+        .apply(&ModelEdit::SeedView {
+            scope: Scope::Channel(accepted.agent.channel().unwrap()),
+            panes: vec![pane.clone()],
+            closed: vec![],
+        })
+        .unwrap();
+    let agent = registry.agent(accepted.agent.id).unwrap();
+    (registry, agent, session, pane)
+}
+
+fn boot_proof(boot: &str) -> HostSessionProof {
+    HostSessionProof {
+        host_session_id: HostSessionId::new(format!("{boot}-daemon")),
+        boot_id: crate::model::BootId::new(boot),
+        host_incarnation: HostIncarnation::new(format!("{boot}-incarnation")),
+    }
+}
+
+/// Whether the window may open the view showing `agent`'s pane: a managed
+/// pane that disagrees with its agent blocks its whole view.
+fn pane_opens(registry: &model::Registry, agent: crate::model::AgentId) -> bool {
+    let model = registry.model().unwrap();
+    let agent = registry.agent(agent).unwrap();
+    let id = crate::model::CardId::from_uuid(agent.id.as_uuid());
+    let pane = model
+        .views
+        .iter()
+        .flat_map(|view| &view.panes)
+        .find(|pane| pane.id == id)
+        .unwrap();
+    crate::workspace_model::views::ManagedDisplayIndex::new(&model).permits_projection(&agent, pane)
+}
+
+/// After an unclean restart a Codex chat reopens under its own chat ID with
+/// the new daemon's proof. Its agent must follow, or the pane the window then
+/// saves disagrees with the agent and blocks the channel at the next start.
+#[test]
+fn a_chat_reopened_in_place_after_a_reboot_keeps_its_agent_and_pane() {
+    use crate::{agent_execution::HostedSession, model::CardKind};
+    let directory = tempfile::tempdir().unwrap();
+    let (mut registry, agent, session, pane) = reopenable_codex_agent(directory.path());
+    let same_boot = chat::Session {
+        proof: Some(HostSessionProof {
+            host_session_id: HostSessionId::new("first-daemon-again"),
+            ..boot_proof("first")
+        }),
+        ..session.clone()
+    };
+    assert!(
+        registry.adopt_successor(&session, &same_boot).is_err(),
+        "within one boot the process it replaces may still be running"
+    );
+
+    let current = boot_proof("second");
+    let mut state = HostState::new(current.clone());
+    state.install_model(registry);
+    let host = Arc::new(state::HostLock::new(state));
+    let reopened = chat::Session {
+        proof: Some(current),
+        ..session.clone()
+    };
+    assert!(agent_execution::adopt_resumed(&host, &reopened).unwrap());
+
+    let registry = agent_execution::registry(&host).unwrap();
+    let registry = registry.lock().unwrap();
+    let adopted = registry.agent(agent.id).unwrap();
+    assert!(!adopted.closed);
+    assert_eq!(adopted.session, Some(HostedSession::Chat(reopened.clone())));
+    assert!(
+        registry.retained_agent_authority(session.id).is_err(),
+        "the earlier boot's authority is gone"
+    );
+    let model = registry.model().unwrap();
+    let shown = model
+        .views
+        .iter()
+        .flat_map(|view| &view.panes)
+        .find(|candidate| candidate.id == pane.id)
+        .unwrap();
+    assert_eq!(shown.kind, CardKind::Chat(reopened.clone()));
+    assert!(pane_opens(&registry, agent.id));
+    drop(registry);
+    assert!(
+        !agent_execution::adopt_resumed(&host, &reopened).unwrap(),
+        "adopting the running process again changes nothing"
+    );
+}
+
+/// A pane already saved with an in-place reopen its agent never adopted
+/// blocks its channel, so the reopen that would adopt it never happens. The
+/// next boot's startup lets the agent follow the pane once neither process
+/// can still run.
+#[test]
+fn startup_lets_an_agent_follow_its_pane_reopened_in_an_earlier_boot() {
+    use crate::{
+        agent_execution::HostedSession,
+        model::CardKind,
+        workspace_model::{
+            ModelEdit,
+            views::{Change, Scope},
+        },
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let (mut registry, agent, session, pane) = reopenable_codex_agent(directory.path());
+    let reopened = chat::Session {
+        proof: Some(boot_proof("second")),
+        ..session.clone()
+    };
+    let scope = Scope::Channel(agent.channel().unwrap());
+    let revision = registry
+        .model()
+        .unwrap()
+        .views
+        .iter()
+        .find(|view| view.scope == scope)
+        .unwrap()
+        .revision;
+    // The window saves the reopened process into the pane, as builds without
+    // in-place adoption did.
+    registry
+        .apply(&ModelEdit::ChangeView {
+            scope,
+            expected_revision: revision,
+            operation: Uuid::new_v4(),
+            change: Change::Update {
+                before: pane.clone(),
+                pane: crate::workspace_model::views::Pane {
+                    kind: CardKind::Chat(reopened.clone()),
+                    ..pane.clone()
+                },
+            },
+        })
+        .unwrap();
+    assert!(!pane_opens(&registry, agent.id), "the diverged pane blocks");
+
+    assert_eq!(
+        registry
+            .adopt_reopened_panes(&crate::model::BootId::new("second"))
+            .unwrap(),
+        0,
+        "the reopened process may still run in its own boot"
+    );
+    assert!(!pane_opens(&registry, agent.id));
+
+    assert_eq!(
+        registry
+            .adopt_reopened_panes(&crate::model::BootId::new("third"))
+            .unwrap(),
+        1
+    );
+    let adopted = registry.agent(agent.id).unwrap();
+    assert_eq!(adopted.session, Some(HostedSession::Chat(reopened)));
+    assert!(registry.retained_agent_authority(session.id).is_err());
+    assert!(pane_opens(&registry, agent.id), "the channel opens again");
+    assert_eq!(
+        registry
+            .adopt_reopened_panes(&crate::model::BootId::new("third"))
+            .unwrap(),
+        0
+    );
+}
+
+/// A daemon that stops cleanly records that the agent's process ended, so a
+/// later daemon in the same boot may reopen the chat in place and keep the
+/// agent. Without that record the earlier process may still be running.
+#[test]
+fn a_chat_reopened_in_place_after_a_recorded_stop_keeps_its_agent() {
+    use crate::agent_execution::HostedSession;
+    let directory = tempfile::tempdir().unwrap();
+    let (registry, agent, session, _) = reopenable_codex_agent(directory.path());
+    let first = session.proof.clone().unwrap();
+    let mut state = HostState::new(first.clone());
+    state.install_model(registry);
+    let handle = quiet_chat(&directory.path().canonicalize().unwrap());
+    state
+        .chats
+        .insert(session.id, record(session.clone(), handle.clone()));
+    let host = Arc::new(state::HostLock::new(state));
+    let restarted = HostSessionProof {
+        host_session_id: HostSessionId::new("first-daemon-again"),
+        ..first
+    };
+    let reopened = chat::Session {
+        proof: Some(restarted.clone()),
+        ..session.clone()
+    };
+    assert!(
+        agent_execution::registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .adopt_successor(&session, &reopened)
+            .is_err(),
+        "nothing yet proves the running process ended"
+    );
+
+    finish_chat_shutdown(&host).unwrap();
+    assert!(handle.is_completed());
+    drop(host);
+    let registry = model::Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+    let mut state = HostState::new(restarted);
+    state.install_model(registry);
+    let host = Arc::new(state::HostLock::new(state));
+    assert!(agent_execution::adopt_resumed(&host, &reopened).unwrap());
+    let registry = agent_execution::registry(&host).unwrap();
+    assert_eq!(
+        registry.lock().unwrap().agent(agent.id).unwrap().session,
+        Some(HostedSession::Chat(reopened))
+    );
+}

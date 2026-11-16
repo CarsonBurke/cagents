@@ -22,9 +22,11 @@ use crate::repository::{
     ProcessOutput, SystemProcessExecutor,
 };
 
+mod authored;
 #[cfg(feature = "ui")]
 pub mod avatar;
 pub mod checkout;
+mod conditional;
 pub mod polling;
 pub use crate::github_status as pr_status;
 pub mod review_actions;
@@ -32,16 +34,13 @@ mod review_batches;
 mod review_refresh;
 pub mod review_requests;
 mod sidebar;
+pub use authored::AuthoredPullRequests;
+pub use conditional::{Revalidation, checks_settling};
 pub use review_batches::VIEWED_BATCH_SIZE;
 pub use review_refresh::ReviewRefresh;
-pub use sidebar::append_recent_history;
+pub use sidebar::{SidebarProbe, SidebarValidator, append_recent_history};
 
 const PR_LIST_FIELDS: &str = "id,number,title,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,baseRefOid,author,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,statusCheckRollup";
-/// The Work board's view of the user's own pull requests: identity and state
-/// only. Check rollups are the expensive part of a listing (a hundred of them
-/// can time out GitHub's GraphQL), so they are read for open ones alone.
-const PR_AUTHORED_FIELDS: &str = "number,title,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,updatedAt,url";
-const PR_AUTHORED_REVIEW_FIELDS: &str = "number,title,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,updatedAt,url,reviewDecision,statusCheckRollup";
 const PR_VIEW_FIELDS: &str = "id,number,title,body,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,baseRefOid,author,createdAt,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,additions,deletions,changedFiles,statusCheckRollup";
 /// The fields every review comment carries, whichever query returns it.
 const REVIEW_COMMENT_FIELDS: &str = "id author{login} body createdAt url viewerDidAuthor viewerCanUpdate viewerCanDelete commentState:state";
@@ -360,6 +359,26 @@ pub struct PullRequest {
     pub status_check_rollup: Option<Vec<PullRequestCheckRollup>>,
 }
 
+/// An open pull request numbered `number`, for tests here and in the UI crate.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn fixture_pull_request(number: u64) -> PullRequest {
+    serde_json::from_value(serde_json::json!({
+        "id": "PR_1",
+        "number": number,
+        "title": format!("Change {number}"),
+        "body": "",
+        "state": "OPEN",
+        "isDraft": false,
+        "headRefName": "feature",
+        "headRefOid": "a".repeat(40),
+        "baseRefName": "main",
+        "updatedAt": "2026-01-01T00:00:00Z",
+        "url": format!("https://github.com/o/r/pull/{number}"),
+    }))
+    .unwrap()
+}
+
 /// The two real GraphQL check variants returned in `gh pr list`'s rollup.
 /// Keep conclusions distinct from execution status so a completed failure
 /// cannot accidentally become a passing check.
@@ -378,6 +397,9 @@ pub enum PullRequestCheckRollup {
         started_at: Option<String>,
         #[serde(default)]
         completed_at: Option<String>,
+        /// The workflow the run belongs to, when Actions ran it.
+        #[serde(default)]
+        workflow_name: String,
     },
     #[serde(rename_all = "camelCase")]
     StatusContext {
@@ -399,7 +421,7 @@ impl PullRequest {
             .unwrap_or_default()
             .iter()
             .map(|check| {
-                let (name, state, link, started_at, completed_at) = match check {
+                let (name, state, link, started_at, completed_at, workflow) = match check {
                     PullRequestCheckRollup::CheckRun {
                         name,
                         status,
@@ -407,6 +429,7 @@ impl PullRequest {
                         details_url,
                         started_at,
                         completed_at,
+                        workflow_name,
                     } => (
                         name,
                         if status.0 == "COMPLETED" {
@@ -420,13 +443,21 @@ impl PullRequest {
                         details_url,
                         started_at.clone(),
                         completed_at.clone(),
+                        workflow_name.clone(),
                     ),
                     PullRequestCheckRollup::StatusContext {
                         context,
                         state,
                         target_url,
                         created_at,
-                    } => (context, state, target_url, created_at.clone(), None),
+                    } => (
+                        context,
+                        state,
+                        target_url,
+                        created_at.clone(),
+                        None,
+                        String::new(),
+                    ),
                 };
                 let bucket = match state.0.as_str() {
                     "SUCCESS" | "NEUTRAL" | "SKIPPED" => "pass",
@@ -449,7 +480,7 @@ impl PullRequest {
                     name: name.clone(),
                     started_at,
                     state: state.clone(),
-                    workflow: String::new(),
+                    workflow,
                 }
             })
             .collect()
@@ -473,6 +504,22 @@ pub struct PullRequestCheck {
     pub state: RemoteValue,
     #[serde(default)]
     pub workflow: String,
+}
+
+impl PullRequestCheck {
+    /// The check's actual state. gh's coarse buckets treat cancellation as
+    /// failure and skips as passes, so inspect those conclusions first.
+    pub fn work_state(&self) -> Option<crate::work::CheckState> {
+        use crate::work::CheckState;
+        match (self.state.0.as_str(), self.bucket.0.as_str()) {
+            ("CANCELLED", _) => Some(CheckState::Cancelled),
+            ("SKIPPED", _) => Some(CheckState::Skipped),
+            (_, "pass") => Some(CheckState::Passed),
+            (_, "fail") => Some(CheckState::Failed),
+            (_, "pending") => Some(CheckState::Pending),
+            _ => None,
+        }
+    }
 }
 
 /// Read-only inspector data. A failed section remains an error, never an empty
@@ -671,16 +718,6 @@ impl PullRequestStateFilter {
             Self::All => "all",
         }
     }
-}
-
-/// The signed-in user's pull requests, most recently updated first.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuthoredPullRequestsRequest {
-    pub repository: GitHubRepoKey,
-    pub state: PullRequestStateFilter,
-    pub limit: u16,
-    /// Also read review decisions and check rollups.
-    pub review: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1332,6 +1369,15 @@ pub enum GitHubError {
 }
 
 impl GitHubError {
+    /// What a surface reports about this failure: for a `gh` that exited
+    /// non-zero, the line it wrote about why, rather than its exit status.
+    pub fn reported_detail(&self) -> String {
+        match self {
+            Self::Process(failure) => failure.reported_detail(),
+            other => other.to_string(),
+        }
+    }
+
     pub fn rate_limit(&self) -> Option<polling::RateLimit> {
         match self {
             Self::RateLimited { limit } => Some(limit.clone()),
@@ -1388,7 +1434,7 @@ pub enum GitHubAvailability {
 }
 
 impl GitHubAvailability {
-    pub(crate) fn refresh_succeeded(&self) -> bool {
+    pub fn refresh_succeeded(&self) -> bool {
         !matches!(self, Self::Failed { .. } | Self::RateLimited { .. })
     }
 
@@ -1698,30 +1744,6 @@ impl<E: ProcessExecutor> GitHubService<E> {
         ])
     }
 
-    pub fn list_authored_command(&self, request: &AuthoredPullRequestsRequest) -> CommandSpec {
-        self.gh_command([
-            OsString::from("pr"),
-            OsString::from("list"),
-            OsString::from("-R"),
-            request.repository.gh_selector().into(),
-            OsString::from("--author"),
-            OsString::from("@me"),
-            OsString::from("--state"),
-            request.state.as_str().into(),
-            OsString::from("--search"),
-            OsString::from("sort:updated-desc"),
-            OsString::from("--limit"),
-            request.limit.clamp(1, 200).to_string().into(),
-            OsString::from("--json"),
-            if request.review {
-                PR_AUTHORED_REVIEW_FIELDS
-            } else {
-                PR_AUTHORED_FIELDS
-            }
-            .into(),
-        ])
-    }
-
     pub fn view_command(&self, key: &PullRequestKey) -> CommandSpec {
         self.gh_command([
             OsString::from("pr"),
@@ -1876,19 +1898,6 @@ impl<E: ProcessExecutor> GitHubService<E> {
         )
     }
 
-    pub fn list_authored(
-        &self,
-        request: &AuthoredPullRequestsRequest,
-        cancellation: &CancellationToken,
-    ) -> Result<Vec<PullRequest>, GitHubError> {
-        let command = self.list_authored_command(request);
-        let output = self.run_checked(&command, &request.repository, cancellation)?;
-        attach_process(
-            parse_pull_request_list(&output.stdout, &request.repository),
-            &output,
-        )
-    }
-
     pub fn view(
         &self,
         key: &PullRequestKey,
@@ -2022,7 +2031,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
                 scope.spawn(|| self.cached_checks(repository, &pull_request, cancellation));
             let conversation = self
                 .conversation(&key, cancellation)
-                .map_err(|error| error.to_string());
+                .map_err(|error| error.reported_detail());
             (
                 checks
                     .join()
@@ -2334,7 +2343,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
         let (checks, ttl) = match self.checks(&key.pull_request, cancellation) {
             Ok(checks) => (checks, CHECKS_CACHE_TTL),
             Err(GitHubError::ChecksPending { checks, .. }) => (checks, Duration::from_secs(2)),
-            Err(error) => return Err(error.to_string()),
+            Err(error) => return Err(error.reported_detail()),
         };
         if !cancellation.is_cancelled() {
             lock_checks_cache().insert(
@@ -3912,6 +3921,7 @@ mod tests {
             name: name.into(),
             fetch_url: Some(fetch_url.into()),
             push_url: None,
+            gh_resolved: None,
         }
     }
 
@@ -4032,6 +4042,7 @@ mod tests {
                     name: "origin".into(),
                     fetch_url: None,
                     push_url: None,
+                    gh_resolved: None,
                 }],
                 &key,
             ),
@@ -4066,54 +4077,12 @@ mod tests {
     }
 
     #[test]
-    fn authored_listing_asks_for_rollups_only_when_reviews_are_wanted() {
-        let service = GitHubService::new("gh", Arc::new(FakeExecutor::default()));
-        let arguments = |review| {
-            service
-                .list_authored_command(&AuthoredPullRequestsRequest {
-                    repository: repository(),
-                    state: PullRequestStateFilter::All,
-                    limit: 500,
-                    review,
-                })
-                .arguments
-                .into_iter()
-                .map(|argument| argument.into_string().unwrap())
-                .collect::<Vec<_>>()
-        };
-        let cheap = arguments(false);
-        assert_eq!(
-            cheap[..12],
-            [
-                "pr",
-                "list",
-                "-R",
-                "github.com/owner/repo",
-                "--author",
-                "@me",
-                "--state",
-                "all",
-                "--search",
-                "sort:updated-desc",
-                "--limit",
-                "200"
-            ]
-        );
-        assert!(!cheap.last().unwrap().contains("statusCheckRollup"));
-        assert!(
-            arguments(true)
-                .last()
-                .unwrap()
-                .contains("statusCheckRollup")
-        );
-    }
-
-    #[test]
     fn remote_association_requires_public_github_or_a_known_enterprise_host() {
         let remote = |url: &str| crate::repository::RemoteRecord {
             name: "origin".into(),
             fetch_url: Some(url.into()),
             push_url: None,
+            gh_resolved: None,
         };
         let service = GitHubService::new("gh", Arc::new(FakeExecutor::default()));
         assert!(

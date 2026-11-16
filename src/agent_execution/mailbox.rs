@@ -14,7 +14,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::Lineage;
-use crate::model::{MessageId, TerminalId};
+use crate::model::{AgentId, MessageId, RunId, TerminalId};
 
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 /// How many undelivered messages one lineage may hold, so that two agents
@@ -169,6 +169,55 @@ pub struct Delivery {
     pub recipient: Option<super::directory::Member>,
 }
 
+/// How an agent cagents hosts takes a message: as its next run, so its owner
+/// sees the work and its outcome like any prompt.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Handoff {
+    /// The message is the prompt of this run of the agent.
+    Run {
+        agent: AgentId,
+        run: RunId,
+        start: super::Start,
+    },
+    /// The message waits until the agent's current work ends, and then
+    /// becomes its next run.
+    Waiting {
+        agent: AgentId,
+        behind: Option<RunId>,
+    },
+    /// The agent cannot take it as a run, for this reason; the message waits
+    /// as one to any other session would.
+    Held { agent: AgentId, reason: String },
+    /// Earlier messages to the agent have not reached it yet; this one waits
+    /// behind them, then becomes a run.
+    Behind { agent: AgentId },
+    /// Every agent slot is taken; the message waits until one frees, then
+    /// becomes a run.
+    NoSlot { agent: AgentId },
+    /// The agent received the message as this run, which then ended without
+    /// finishing, for this reason.
+    Ended {
+        agent: AgentId,
+        run: RunId,
+        reason: String,
+    },
+    /// The message is the prompt of this run, which ended, for this reason,
+    /// with no proof of whether the agent received it. It is not sent again.
+    Unknown {
+        agent: AgentId,
+        run: RunId,
+        reason: String,
+    },
+}
+
+/// A sent message, what its recipient can do with it now, and, for an agent
+/// recipient, how that agent takes it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Handed {
+    pub delivery: Delivery,
+    pub agent: Option<Handoff>,
+}
+
 /// A read of the caller's messages. Each message it returns that its recipient
 /// had not yet received is marked read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -237,6 +286,17 @@ const SEAL: &str = " · seal ";
 /// who sent it, the last how to answer; the body between them is the sender's
 /// own.
 pub fn frame(message: &Message, now: u64) -> String {
+    // A question that waited out a busy recipient still asks, but no one
+    // waits for the answer any more.
+    framed(
+        message,
+        message.wait_until_ms.is_some_and(|until| until > now),
+    )
+}
+
+/// The prompt `message` becomes, saying the sender waits for the reply only
+/// when `waiting`.
+fn framed(message: &Message, waiting: bool) -> String {
     let kind = if message.reply_to.is_some() {
         "reply"
     } else if message.wait_until_ms.is_some() {
@@ -248,9 +308,7 @@ pub fn frame(message: &Message, now: u64) -> String {
     if let Some(original) = message.reply_to {
         heading.push_str(&format!(" to your message {}", short(original)));
     }
-    // A question that waited out a busy recipient still asks, but no one
-    // waits for the answer any more.
-    if message.wait_until_ms.is_some_and(|until| until > now) {
+    if waiting {
         heading.push_str("; they are waiting for your reply");
     }
     format!(
@@ -358,7 +416,16 @@ impl Seal {
 
     /// The prompt that delivers `message` at `now`.
     pub(crate) fn seal(&self, message: &Message, now: u64) -> String {
-        let framed = frame(message, now);
+        self.sealed(frame(message, now))
+    }
+
+    /// The prompt of the agent run that delivers `message`. A run can start
+    /// long after it is accepted, so it never says the sender is waiting.
+    pub(crate) fn seal_run(&self, message: &Message) -> String {
+        self.sealed(framed(message, false))
+    }
+
+    fn sealed(&self, framed: String) -> String {
         let tag = self.tag(&framed);
         format!("{framed}{SEAL}{tag}]")
     }
@@ -533,6 +600,21 @@ mod tests {
                 .is_none()
         );
         assert!(seal.recognizer().open(&frame(&message, 0)).is_none());
+
+        // A question taken as an agent run is still a question, but the run
+        // may start after the asker stopped waiting, so it never says they
+        // wait; it opens like any sealed message.
+        let mut question = message.clone();
+        question.wait_until_ms = Some(u64::MAX);
+        let run = seal.seal_run(&question);
+        assert!(run.starts_with("[cagents question from session"), "{run}");
+        assert!(!run.contains("waiting for your reply"), "{run}");
+        assert_eq!(
+            run,
+            seal.seal_run(&question),
+            "a run's prompt is its retry key's"
+        );
+        assert!(seal.recognizer().open(&run).is_some());
 
         // A title that reads like a reply's tail is still only a title.
         message.from.title = Some("Fix to your message 1234abcd".into());

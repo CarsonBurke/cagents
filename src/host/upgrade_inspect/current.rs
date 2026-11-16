@@ -159,7 +159,9 @@ impl Client {
                 | ServerMessage::ChatObserved { chat_id, .. }
                 | ServerMessage::ChatChanged { chat_id }
                 | ServerMessage::ChatAccountUsage { chat_id, .. }
-                | ServerMessage::ChatLimit { chat_id, .. } => Some(chat_id),
+                | ServerMessage::ChatActiveModel { chat_id, .. }
+                | ServerMessage::ChatLimit { chat_id, .. }
+                | ServerMessage::ChatAgentAddresses { chat_id, .. } => Some(chat_id),
                 _ => None,
             };
             if envelope.request_id.is_some()

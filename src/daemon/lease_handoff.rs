@@ -52,16 +52,34 @@ impl HandoffSource {
     }
 
     pub(crate) fn exited(&self) -> io::Result<bool> {
-        let mut poll = libc::pollfd {
-            fd: self.process.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: one live initialized pollfd; pidfd pins the original process.
-        if unsafe { libc::poll(&mut poll, 1, 0) } < 0 {
-            return Err(io::Error::last_os_error());
+        self.exited_within(std::time::Duration::ZERO)
+    }
+
+    /// Whether the pinned process exits within `timeout`. A daemon releases
+    /// its lease before its process has finished exiting, so lease ownership
+    /// alone does not prove the source has stopped.
+    pub(crate) fn exited_within(&self, timeout: std::time::Duration) -> io::Result<bool> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let mut poll = libc::pollfd {
+                fd: self.process.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let milliseconds = c_int::try_from(remaining.as_millis()).unwrap_or(c_int::MAX);
+            // SAFETY: one live initialized pollfd; pidfd pins the original process.
+            if unsafe { libc::poll(&mut poll, 1, milliseconds) } < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if poll.revents != 0 || remaining.is_zero() {
+                return Ok(poll.revents != 0);
+            }
         }
-        Ok(poll.revents != 0)
     }
 }
 

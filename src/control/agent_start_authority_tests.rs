@@ -37,6 +37,14 @@ fn original_submit() -> Submit {
         idempotency_key: KEY.into(),
     }
 }
+/// How `agent send` asks for the follow-up: a prompt that waits behind the
+/// agent's current work unless told to interrupt it.
+fn original_prompt() -> Operation {
+    Operation::Prompt {
+        request: original_submit(),
+        interrupt: false,
+    }
+}
 fn proof() -> HostSessionProof {
     HostSessionProof {
         host_session_id: HostSessionId::new("agent-start-fixture"),
@@ -162,12 +170,12 @@ impl Peer {
                         )),
                     );
                     let request = next(&mut peer);
-                    assert_operation(&request, &authority, &Operation::Submit(original_submit()));
-                    // Lose precisely the first Submit reply. Do not fabricate
+                    assert_operation(&request, &authority, &original_prompt());
+                    // Lose precisely the first Prompt reply. Do not fabricate
                     // an acceptance, receipt, or backend side effect.
                     peer.shutdown(std::net::Shutdown::Both).unwrap();
                 } else {
-                    assert_operation(&request, &authority, &Operation::Submit(original_submit()));
+                    assert_operation(&request, &authority, &original_prompt());
                     reply(
                         &mut peer,
                         &request,
@@ -179,7 +187,7 @@ impl Peer {
                     );
                     assert!(
                         read_frame::<ClientEnvelope>(&mut peer).unwrap().is_none(),
-                        "one exact retry; no third Submit or User fallback"
+                        "one exact retry; no third Prompt or User fallback"
                     );
                 }
             }
@@ -254,7 +262,7 @@ fn exercise(role: &str) {
         assert_eq!(
             ready,
             if !scoped && !no_start { connections } else { 0 },
-            "{business:?}: both initial and exact Submit retry must retain startup policy"
+            "{business:?}: both initial and exact Prompt retry must retain startup policy"
         );
         assert_eq!(raw, if !scoped && no_start { connections } else { 0 });
     }

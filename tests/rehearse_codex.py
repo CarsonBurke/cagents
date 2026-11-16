@@ -28,6 +28,62 @@ adapter = module("rehearsal_codex", "rehearsal-codex.py")
 peer = module("rehearsal_peer", "codex-tool-rows.py")
 
 
+class ConfigurationTests(unittest.TestCase):
+    def test_private_configuration_restores_existing_peer_knobs(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ):
+            root = Path(directory)
+            (root / "codex-fixture.json").write_text(json.dumps({
+                "pause": 90, "never_confirm_interrupt": True, "never_confirm_close": False}))
+            adapter.configure_peer(root)
+            self.assertEqual(os.environ["CAGENTS_TOOL_ROWS_PAUSE"], "90")
+            scenario = peer.Scenario()
+            self.assertTrue(scenario.never_confirm_interrupt)
+            self.assertFalse(scenario.never_confirm_close)
+            configured = module("configured_rehearsal_peer", "codex-tool-rows.py").Scenario()
+            replies = configured.request({'id':1,'method':'turn/start','params':{
+                'threadId':configured.thread}},str(root))
+            self.assertIn({'_sleep':90},replies)
+
+    def test_history_opens_only_the_first_turn_with_earlier_messages(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ):
+            root = Path(directory)
+            (root / "codex-fixture.json").write_text(json.dumps({"pause": 1, "history": [5, 200]}))
+            adapter.configure_peer(root)
+            self.assertEqual(os.environ["CAGENTS_TOOL_ROWS_HISTORY"], "5 200")
+            scenario = peer.Scenario()
+            def history(turn):
+                replies = scenario.notifications(turn)
+                completed = next(reply for reply in replies if reply.get("method") == "turn/completed"
+                                 and reply["params"]["threadId"] == scenario.thread)
+                return [item for item in completed["params"]["turn"]["items"]
+                        if item["id"].startswith("history-")], replies
+            first, replies = history("first")
+            self.assertEqual([item["id"] for item in first], [f"history-{at}" for at in range(5)])
+            self.assertTrue(all(len(item["text"]) == len(f"Step {at}: ") + 200
+                                for at, item in enumerate(first)))
+            started = [reply["params"]["item"]["id"] for reply in replies
+                       if reply.get("method") == "item/completed"][:5]
+            self.assertEqual(started, [item["id"] for item in first])
+            self.assertEqual(history("second")[0], [])
+
+    def test_rejects_unknown_invalid_and_symlink_configuration(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ):
+            root = Path(directory)
+            path = root / "codex-fixture.json"
+            for settings in ({"arbitrary_env": "value"}, {"pause": True}, {"pause": 0},
+                             {"pause": 301}, {"never_confirm_close": "1"}, {"history": 5},
+                             {"history": [5]}, {"history": [5, -1]}, {"history": [5, True]}):
+                path.write_text(json.dumps(settings))
+                with self.subTest(settings=settings), self.assertRaises(ValueError):
+                    adapter.configure_peer(root)
+            path.unlink()
+            target = root / "other.json"
+            target.write_text('{}')
+            path.symlink_to(target)
+            with self.assertRaises(OSError):
+                adapter.configure_peer(root)
+
+
 class ListenerTests(unittest.TestCase):
     def test_accepts_private_runtime_and_old_build_convention(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -35,12 +91,11 @@ class ListenerTests(unittest.TestCase):
             path = runtime / "control.sock"
             self.assertEqual(adapter.listener_path(["--listen", f"unix://{path}"], runtime), path)
             old = Path("/tmp") / f"cagents-codex-{uuid.uuid4()}"
-            old.mkdir(mode=0o700)
-            try:
+            # Check the historical path convention without writing to /tmp.
+            # Private-directory ownership is exercised by the real runtime case.
+            with mock.patch.object(adapter, "private_directory", return_value=old):
                 path = old / "control.sock"
                 self.assertEqual(adapter.listener_path([f"--listen=unix://{path}"], runtime), path)
-            finally:
-                old.rmdir()
 
     def test_rejects_public_symlink_existing_and_unrelated_sockets(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -91,6 +146,38 @@ class PersistenceTests(unittest.TestCase):
             self.assertEqual(resumed["thread"]["id"], first.thread)
             self.assertEqual(resumed["initialTurnsPage"]["data"], [first.latest])
             self.assertEqual(successor.child, first.child)
+
+    def test_model_and_effort_survive_listener_restart_and_thread_resume(self):
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Path(directory) / "state"
+            first = adapter.scenario_class(peer, storage, Path("/first/control.sock"))()
+            first.request({"id": 1, "method": "thread/start"}, directory)
+            first.request({"id": 2, "method": "turn/start", "params": {
+                "threadId": first.thread, "model": "fixture-mini", "effort": "high"}}, directory)
+            restarted = adapter.scenario_class(peer, storage, Path("/first/control.sock"))()
+            self.assertEqual((restarted.model, restarted.reasoning), ("fixture-mini", "high"))
+            successor = adapter.scenario_class(peer, storage, Path("/second/control.sock"))()
+            resumed = successor.request({"id": 3, "method": "thread/resume", "params": {
+                "threadId": first.thread}}, directory)[0]["result"]
+            self.assertEqual(resumed["model"], "fixture-mini")
+            self.assertEqual(resumed["reasoningEffort"], "high")
+            self.assertEqual(successor.state(), first.state())
+
+    def test_invalid_model_effort_and_unknown_state_keys_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Path(directory) / "state"
+            scenario = adapter.scenario_class(peer, storage, Path("/first/control.sock"))()
+            scenario.request({"id": 1, "method": "thread/start"}, directory)
+            baseline = scenario.state()
+            index = next(storage.glob("listener-*.json"))
+            for extra in ({"unknown": True}, {"model": None}, {"model": ""}, {"model": 42},
+                          {"reasoning": ""}, {"reasoning": 42}, {"reasoning": []}):
+                index.write_text(json.dumps({**baseline, **extra}))
+                with self.subTest(extra=extra), self.assertRaisesRegex(ValueError, "invalid persisted rehearsal"):
+                    adapter.scenario_class(peer, storage, Path("/first/control.sock"))()
+            index.write_text(json.dumps(list(baseline)))
+            with self.assertRaisesRegex(ValueError, "invalid persisted rehearsal"):
+                adapter.scenario_class(peer, storage, Path("/first/control.sock"))()
 
     def test_observed_completion_is_saved_without_a_later_request(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -164,18 +251,22 @@ class PersistenceTests(unittest.TestCase):
             self.assertEqual(sent, [])
             self.assertEqual(first.state(), other.state())
 
-    def test_legacy_parent_only_state_does_not_invent_a_child_completion(self):
+    def test_legacy_state_defaults_model_effort_without_inventing_child_completion(self):
         with tempfile.TemporaryDirectory() as directory:
             storage = Path(directory) / "state"
             first = adapter.scenario_class(peer, storage, Path("/first/control.sock"))()
             self.start_paused(first, directory)
             legacy = first.state()
             del legacy["child_latest"]
+            del legacy["model"]
+            del legacy["reasoning"]
             for path in storage.glob("*.json"):
                 path.write_text(json.dumps(legacy))
             restarted = adapter.scenario_class(peer, storage, Path("/first/control.sock"))()
             self.assertEqual(restarted.latest, first.latest)
             self.assertIsNone(restarted.child_latest)
+            self.assertEqual(restarted.model, "fixture-mini")
+            self.assertIsNone(restarted.reasoning)
 
     def test_probe_listener_does_not_replace_conversation_state(self):
         with tempfile.TemporaryDirectory() as directory:

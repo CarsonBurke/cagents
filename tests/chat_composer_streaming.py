@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import selectors
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
@@ -34,17 +35,25 @@ class Peer:
     def __init__(self, project, config):
         self.process = subprocess.Popen(
             [str(SCRIPT)], cwd=project, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, env={"HOME": str(config.parent),
+            stderr=subprocess.PIPE, start_new_session=True, env={"HOME": str(config.parent),
                                        "CLAUDE_CONFIG_DIR": str(config),
                                        "PATH": "/usr/local/bin:/usr/bin:/bin"})
         self.selector = selectors.DefaultSelector()
         self.selector.register(self.process.stdout, selectors.EVENT_READ)
         self.buffer = b""
         self.frames = []
+        self.closed = False
 
     def close(self):
-        if self.process.poll() is None:
-            self.process.kill()
+        if self.closed:
+            return
+        self.closed = True
+        # This peer created its own process group. Settle a sleeper as well as
+        # the shell if a replay regression fails before graceful interruption.
+        try:
+            os.killpg(self.process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
         self.process.wait(timeout=5)
         self.selector.close()
         for pipe in (self.process.stdin, self.process.stdout, self.process.stderr):
@@ -107,6 +116,109 @@ class Streaming(unittest.TestCase):
     def history(self):
         return [json.loads(line) for path in (self.config / "projects").glob("*/*.jsonl")
                 for line in path.read_text().splitlines()]
+
+    def start_replay(self, *frames):
+        marker = {"type": "assistant", "uuid": "replay-start-@TURN@",
+                  "message": {"id": "replay-start-@TURN@", "role": "assistant",
+                              "content": [{"type": "text", "text": "Replay started."}]}}
+        (self.config / "fixture-frames.jsonl").write_text(
+            "".join(json.dumps(frame) + "\n" for frame in (marker, *frames)))
+        peer = Peer(self.project, self.config)
+        self.addCleanup(peer.close)
+        peer.send(prompt(1))
+        peer.until(lambda f: f.get("uuid") == "replay-start-1")
+        return peer
+
+    def test_permission_settings_read_is_valid_idle_and_while_replying_without_stopping_the_peer(self):
+        peer = Peer(self.project, self.config)
+        self.addCleanup(peer.close)
+        process_id = peer.process.pid
+
+        def settings(identifier):
+            peer.send(control("get_settings", identifier))
+            response = peer.response(identifier)["response"]
+            self.assertEqual(response["subtype"], "success")
+            self.assertEqual(response["response"], {"effective": {}, "sources": []})
+            self.assertIsNone(peer.process.poll(), "reading settings must keep the provider alive")
+            self.assertEqual(peer.process.pid, process_id)
+
+        settings("idle-settings")
+        peer.send(prompt(1))
+        peer.until(delta)
+        settings("busy-settings")
+        self.assertFalse(any(frame.get("type") == "result" for frame in peer.frames),
+                         "reading settings must not settle the active turn")
+        peer.interrupt()
+        settings("settled-settings")
+        self.assertEqual(sum(frame.get("type") == "result" for frame in peer.frames), 1)
+
+    def test_long_replay_pause_services_controls_and_interrupts_without_late_frames(self):
+        (self.config / "fixture-usage.json").write_text('{"remaining":17}')
+        late = {"type": "assistant", "uuid": "replay-never-@TURN@",
+                "message": {"id": "replay-never-@TURN@", "role": "assistant",
+                            "content": [{"type": "text", "text": "Must not escape interruption."}]}}
+        peer = self.start_replay({"_sleep": 600}, late, {"_end": True})
+        started = time.monotonic()
+        peer.send(control("get_usage"))
+        self.assertEqual(peer.response("get_usage")["response"]["response"], {"remaining": 17})
+        peer.send(control("stop_task", task_id="fixture-background-command"))
+        peer.response("stop_task")
+        peer.until(lambda f: f.get("task_id") == "fixture-background-command" and
+                   f.get("patch", {}).get("status") == "killed")
+        peer.send(prompt(99))
+        peer.until(lambda f: f.get("command_uuid") == "prompt-99" and f.get("state") == "queued")
+        peer.interrupt()
+        self.assertLess(time.monotonic() - started, 3, "the 600-second replay remains duplex")
+        self.assertEqual([f["uuid"] for f in self.history()], ["prompt-1", "replay-start-1"])
+        self.assertEqual(sum(f.get("type") == "result" for f in peer.frames), 1)
+        self.assertFalse(any(f.get("uuid", "").startswith("replay-never-") for f in peer.frames))
+
+        # Resume input in this same shell, without a delayed replay writer
+        # persisting or publishing any part of the interrupted turn.
+        (self.config / "fixture-frames.jsonl").unlink()
+        self.reply.write_text("The next turn completed.")
+        peer.send(prompt(2))
+        peer.until(lambda f: f.get("type") == "result")
+        history = self.history()
+        self.assertEqual([f["uuid"] for f in history],
+                         ["prompt-1", "replay-start-1", "prompt-2", "fixture-message-2"])
+        self.assertEqual(history[2]["parentUuid"], "replay-start-1")
+        peer.process.stdin.close()
+        self.assertEqual(peer.process.wait(timeout=3), 0)
+        self.assertEqual(peer.process.stderr.read(), b"")
+
+    def test_partial_interrupt_survives_a_replay_pause_deadline(self):
+        continued = {"type": "assistant", "uuid": "replay-next-@TURN@",
+                     "message": {"id": "replay-next-@TURN@", "role": "assistant",
+                                 "content": [{"type": "text", "text": "Next replay frame."}]}}
+        peer = self.start_replay({"_sleep": 0.12}, continued, {"_sleep": 600})
+        request = (json.dumps(control("interrupt")) + "\n").encode()
+        peer.write(request[:25])
+        peer.until(lambda f: f.get("uuid") == "replay-next-1")
+        peer.write(request[25:])
+        peer.response("interrupt")
+        peer.until(lambda f: f.get("type") == "result")
+        peer.send(control("initialize", "barrier"))
+        peer.response("barrier")
+        self.assertEqual(sum(f.get("type") == "result" for f in peer.frames), 1)
+        self.assertFalse(any(f.get("uuid") == "fixture-message-1" for f in self.history()))
+
+    def test_eof_during_long_replay_pause_exits_without_a_sleeper(self):
+        peer = self.start_replay({"_sleep": 600})
+        peer.process.stdin.close()
+        self.assertEqual(peer.process.wait(timeout=3), 0)
+        self.assertEqual(peer.process.stderr.read(), b"")
+        self.assertEqual([f["uuid"] for f in self.history()], ["prompt-1", "replay-start-1"])
+
+    def test_scripted_end_releases_busy_state_for_the_next_turn(self):
+        result = {"type": "result", "uuid": "replay-result-@TURN@",
+                  "subtype": "success", "is_error": False}
+        peer = self.start_replay({"_sleep": 0.01}, result, {"_end": True})
+        peer.until(lambda f: f.get("uuid") == "replay-result-1")
+        peer.send(prompt(2))
+        peer.until(lambda f: f.get("uuid") == "replay-result-2")
+        self.assertEqual([f["uuid"] for f in self.history()],
+                         ["prompt-1", "replay-start-1", "prompt-2", "replay-start-2"])
 
     def test_interrupt_settles_before_the_remaining_long_reply_and_can_start_another_turn(self):
         peer = self.start()
@@ -241,6 +353,49 @@ class Streaming(unittest.TestCase):
                                              "PATH": "/usr/local/bin:/usr/bin:/bin"})
                 self.assertEqual(result.returncode, 2)
                 self.assertIn("fixture-stream-reply must hold seconds", result.stderr)
+
+    def test_the_second_line_sets_the_characters_per_delta(self):
+        # Slicing is by character, so multibyte text must survive the split.
+        text = "Token-sized deltas approximate a provider's stream: é😀中. " * 20
+        self.reply.write_text(text)
+        (self.config / "fixture-stream-reply").write_text("0\n24\n")
+        result = subprocess.run(
+            [str(SCRIPT)], cwd=self.project, capture_output=True, text=True,
+            input=json.dumps(prompt(1)) + "\n", timeout=10,
+            env={"HOME": str(self.config.parent), "CLAUDE_CONFIG_DIR": str(self.config),
+                 "PATH": "/usr/local/bin:/usr/bin:/bin"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        chunks = [f["event"]["delta"]["text"]
+                  for f in map(json.loads, result.stdout.splitlines()) if delta(f)]
+        self.assertEqual("".join(chunks), text)
+        self.assertEqual({len(chunk) for chunk in chunks[:-1]}, {24})
+        self.assertEqual(len(chunks), -(-len(text) // 24))
+
+    def test_a_delay_alone_keeps_the_default_delta_size(self):
+        text = "x" * 16385
+        self.reply.write_text(text)
+        (self.config / "fixture-stream-reply").write_text("0\n")
+        result = subprocess.run(
+            [str(SCRIPT)], cwd=self.project, capture_output=True, text=True,
+            input=json.dumps(prompt(1)) + "\n", timeout=10,
+            env={"HOME": str(self.config.parent), "CLAUDE_CONFIG_DIR": str(self.config),
+                 "PATH": "/usr/local/bin:/usr/bin:/bin"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        chunks = [f["event"]["delta"]["text"]
+                  for f in map(json.loads, result.stdout.splitlines()) if delta(f)]
+        self.assertEqual([len(chunk) for chunk in chunks], [16384, 1])
+
+    def test_invalid_delta_sizes_fail_with_a_fixture_error(self):
+        for value in ("0", "-4", "many", "1.5"):
+            with self.subTest(value=value):
+                (self.config / "fixture-stream-reply").write_text("0.1\n" + value + "\n")
+                result = subprocess.run([str(SCRIPT)], cwd=self.project, input="", text=True,
+                                        capture_output=True, timeout=5,
+                                        env={"HOME": str(self.config.parent),
+                                             "CLAUDE_CONFIG_DIR": str(self.config),
+                                             "PATH": "/usr/local/bin:/usr/bin:/bin"})
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("second line must be a positive number", result.stderr)
 
 
 if __name__ == "__main__":

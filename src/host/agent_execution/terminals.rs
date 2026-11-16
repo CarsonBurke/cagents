@@ -36,6 +36,11 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::WatchTerminals
         | R::WatchWorkspaceModel
         | R::ReadWorkspaceModel
+        | R::ReadWorkspaceView { .. }
+        | R::ReadWorkspaceSnapshot
+        | R::ReadWorkspaceMetadata { .. }
+        | R::ReadTerminalRemovalBasis { .. }
+        | R::ReadCapturedTerminalRemovalBasis { .. }
         | R::Attach { .. }
         | R::Detach { .. }
         | R::SetVisibility { .. }
@@ -63,9 +68,12 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::ClearTerminalScrollback { terminal_id }
         | R::ShutdownTerminal { terminal_id }
         | R::CloseTerminalChecked { terminal_id, .. } => Access::Control(*terminal_id),
-        R::ReleaseCompletedTerminal { session, .. } => Access::Control(session.id),
+        R::ReleaseCompletedTerminal { session, .. } | R::CloseTerminalSource { session, .. } => {
+            Access::Control(session.id)
+        }
         R::Spawn { session, .. } => Access::Spawn(session),
         R::CompletePendingTerminal { .. }
+        | R::RetryPendingTerminalSave { .. }
         | R::DeviceOperation { .. }
         | R::Agent { .. }
         | R::Automation { .. }
@@ -77,6 +85,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::PrepareConfirmedUpgrade { .. }
         | R::ResolveUpgradeChat { .. }
         | R::EditWorkspaceModel { .. }
+        | R::ApplyWorkspaceEdit { .. }
         | R::RefreshAgentActivity { .. }
         | R::ObserveReviewRequests { .. }
         | R::WatchNotifications { .. }

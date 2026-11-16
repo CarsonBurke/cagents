@@ -5,8 +5,8 @@ use super::{model::Registry, state::SharedHost};
 use crate::{
     account::{Account, home::Homes, registry::Store},
     agent_execution::{
-        Accepted, Agent, Authority, Destination, HostedSession, Origin, Run, Spec, State, Submit,
-        Surface, Update,
+        Accepted, Agent, Authority, Destination, HostedSession, Origin, Run, Spec, Start, State,
+        Submit, Surface, Update,
     },
     chat::{self, Command, PromptMode},
     model::{AgentId, RunId, TerminalId},
@@ -17,7 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-mod account_info;
+pub(super) mod account_info;
 mod directory;
 pub(super) use directory::{live_sessions, named};
 pub(super) mod mailbox;
@@ -25,13 +25,14 @@ mod ownership;
 pub(super) mod terminals;
 mod transcript;
 pub(super) use ownership::{
-    Reconciliation, cancel_agent_run, cancel_agent_run_under_control, interactive,
-    reconcile_agent_run, reconcile_agent_run_under_control,
+    Reconciliation, cancel_agent_run_under_control, interactive, reconcile_agent_run_under_control,
 };
+#[cfg(test)]
+pub(super) use ownership::{cancel_agent_run, reconcile_agent_run};
 
 // Client IDs allocated to external sockets begin at one. This subscriber owns
 // only accepted execution sessions and never requests presentation delivery.
-const EXECUTION_CLIENT: u64 = 0;
+pub(super) const EXECUTION_CLIENT: u64 = 0;
 pub(super) type SharedRegistry = Arc<Mutex<Registry>>;
 
 pub(super) fn registry(host: &SharedHost) -> Result<SharedRegistry, String> {
@@ -52,12 +53,19 @@ pub(super) fn caller(
     host: &SharedHost,
     authority: &Authority,
 ) -> Result<(Origin, Option<TerminalId>), String> {
+    checked_caller(host, authority).map_err(|error| error.to_string())
+}
+
+pub(super) fn checked_caller(
+    host: &SharedHost,
+    authority: &Authority,
+) -> Result<(Origin, Option<TerminalId>), super::model::AuthorityError> {
     let registry = registry(host)?;
     let (origin, source) = {
         let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
         (
             registry.execution_origin(authority)?,
-            registry.agent_authority_source(authority)?,
+            registry.checked_agent_authority_source(authority)?,
         )
     };
     let session = source.as_ref().map(HostedSession::id);
@@ -79,7 +87,9 @@ pub(super) fn caller(
             }
         };
         if !live {
-            return Err("The issuing agent session is no longer live or proved adopted".into());
+            return Err(super::model::AuthorityError::Denied(
+                "The issuing agent session is no longer live or proved adopted".into(),
+            ));
         }
     }
     Ok((origin, session))
@@ -155,19 +165,67 @@ pub(super) fn submit(
     authority: &Authority,
     request: Submit,
 ) -> Result<Accepted, String> {
-    request.validate()?;
+    // An older caller learns of a failed start from the run, as before.
+    accept(host, authority, request).map(|(accepted, _)| accepted)
+}
+
+/// Gives an existing agent `request` as its next run: now, when its provider
+/// can take it, or once its current work ends. `interrupt` stops that work so
+/// the prompt goes as soon as it has.
+pub(super) fn prompt(
+    host: &SharedHost,
+    authority: &Authority,
+    request: Submit,
+    interrupt: bool,
+) -> Result<(Accepted, Start), String> {
+    let Destination::Existing(agent) = request.destination else {
+        return Err("Only an existing agent takes a follow-up prompt".into());
+    };
+    let (accepted, start) = accept(host, authority, request)?;
+    let start = start.map_err(|error| unstarted(host, &accepted, error))?;
+    if interrupt && let Start::Queued { behind } = start {
+        interrupt_ahead(host, agent, behind).map_err(|error| {
+            format!(
+                "Run {} waits behind the agent's current work, which could not be interrupted: {error}",
+                accepted.run.id
+            )
+        })?;
+    }
+    Ok((accepted, start))
+}
+
+/// Accepts `request` and starts it. A follow-up that could not start is
+/// still accepted, and its run records why; the error says so too.
+fn accept(
+    host: &SharedHost,
+    authority: &Authority,
+    request: Submit,
+) -> Result<(Accepted, Result<Start, String>), String> {
+    request.validate_client()?;
     let origin = origin(host, authority)?;
     let registry = registry(host)?;
-    if let Some(previous) = registry
+    let previous = registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .previous_agent_acceptance(&origin, &request)?
-    {
-        return Ok(previous);
+        .previous_agent_acceptance(&origin, &request)?;
+    if let Some(previous) = previous {
+        // A retry whose answer was lost: its run may still be waiting.
+        let start = match &request.destination {
+            Destination::Existing(_) => start(host, &previous),
+            Destination::New(_) => Ok(Start::Sent { resumed: false }),
+        };
+        return Ok((previous, start));
     }
-    if let Destination::Existing(agent) = &request.destination {
-        refuse_limited(host, &registry, *agent)?;
-    }
+    // One reading of the agent's usage limit both refuses the follow-up and
+    // decides how the messages sent before it go.
+    let limit = match &request.destination {
+        Destination::Existing(agent) => usage_limit(host, &registry, *agent)?,
+        Destination::New(_) => None,
+    };
+    refuse_limited(limit.as_ref())?;
+    // Earlier messages are held exactly when the follow-up is refused: a
+    // limit of unknown end lets both through, in order, to test it.
+    let limited = limit.is_some_and(|limit| limit.resets_at.is_some());
     let selected = if let Destination::New(spec) = &request.destination {
         let mut selected = spec.clone();
         let model = registry.lock().unwrap_or_else(|p| p.into_inner()).model()?;
@@ -183,31 +241,383 @@ pub(super) fn submit(
     } else {
         None
     };
-    let accepted = registry
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .submit_agent_with_spec(&origin, &request, selected.as_ref(), now())?;
+    // Messages sent to the agent earlier go first, so its runs keep the
+    // order they were accepted in. One sent meanwhile is handed over too.
+    let mut attempts = 0;
+    let accepted = loop {
+        if let Destination::Existing(agent) = &request.destination {
+            mailbox::hand_earlier(host, &registry, *agent, limited)?;
+        }
+        match registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .submit_agent_with_spec(&origin, &request, selected.as_ref(), now())
+        {
+            Err(error) if error == crate::host::model::EARLIER_MESSAGES && attempts < 3 => {
+                attempts += 1;
+            }
+            accepted => break accepted?,
+        }
+    };
     announce(host, &registry);
-    dispatch_accepted(host, accepted.clone())?;
-    Ok(accepted)
+    let start = match &request.destination {
+        Destination::Existing(_) => start(host, &accepted),
+        Destination::New(_) => {
+            dispatch_accepted(host, accepted.clone())?;
+            Ok(Start::Sent { resumed: false })
+        }
+    };
+    Ok((accepted, start))
 }
 
-/// Refuses a follow-up run for an agent whose conversation a usage limit stops
-/// until a known reset: its provider would refuse the prompt at once, and the
-/// caller is better told now. A limit of unknown end is let through, since a
-/// new turn is what shows whether it still holds, as after the conversation's
-/// account changed.
-fn refuse_limited(
+/// What an agent's provider can do with a prompt now.
+enum Provider {
+    /// It is idle and takes the prompt, or is starting and takes it once
+    /// ready, which its dispatcher waits for.
+    Ready,
+    /// It runs a turn or waits on a question; the prompt waits.
+    Busy,
+    /// It has no running process, so its conversation must be reopened first.
+    Gone(chat::Session),
+}
+
+fn provider(
+    host: &SharedHost,
+    registry: &SharedRegistry,
+    agent: &Agent,
+) -> Result<Option<Provider>, String> {
+    let Some(HostedSession::Chat(session)) = &agent.session else {
+        // A launch that never bound starts with its run; a terminal agent's
+        // dispatch states its own refusal.
+        return Ok(None);
+    };
+    if registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .agent_process_ended(agent.id)?
+    {
+        return Ok(Some(Provider::Gone(session.clone())));
+    }
+    let handle = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .chats
+        .get(&session.id)
+        .filter(|record| {
+            record.session.proof == session.proof
+                && record.session.launch.recipe == session.launch.recipe
+        })
+        .map(|record| record.handle.clone());
+    Ok(Some(match handle {
+        Some(handle) if !handle.is_completed() => {
+            if handle.is_ready() && !handle.is_idle() {
+                Provider::Busy
+            } else {
+                Provider::Ready
+            }
+        }
+        _ => Provider::Gone(session.clone()),
+    }))
+}
+
+/// How `start` reports a run that ended with no diagnostic.
+const RUN_ENDED: &str = "The run ended ";
+/// How many reopened runs `start` remembers; see `reopened_runs`.
+const REOPENED_KEPT: usize = 64;
+
+/// Why `accepted` did not start, beginning with what its run's end proves
+/// about its prompt, so the CLI knows whether retrying its key can help.
+fn unstarted(host: &SharedHost, accepted: &Accepted, error: String) -> String {
+    use crate::agent_execution::{ENDED, NOT_SENT, OUTCOME_UNKNOWN};
+    let full = accepted.run.id.to_string();
+    let id = &full[..8];
+    let run = registry(host).and_then(|registry| {
+        registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .agent_run(accepted.run.id)
+    });
+    let reason = error.strip_prefix(NOT_SENT).unwrap_or(&error);
+    let mut chars = reason.chars();
+    let reason = chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect::<String>())
+        .unwrap_or_default();
+    match run.map(|run| (run.state, run.provider_key.is_some())) {
+        // The provider acknowledged the turn, so the agent had the prompt.
+        Ok((state @ (State::Failed | State::Cancelled), true)) => {
+            let ended = format!(
+                "{ENDED}run {id} ended {} after the agent received it.",
+                format!("{state:?}").to_lowercase()
+            );
+            // Without a diagnostic the reason only repeats how it ended.
+            if error.starts_with(RUN_ENDED) {
+                ended
+            } else {
+                format!("{ended} {reason}")
+            }
+        }
+        Ok((State::Failed | State::Cancelled, false)) => {
+            format!("{NOT_SENT}run {id} ended before the agent received it. {reason}")
+        }
+        Ok((State::Interrupted, _)) => format!(
+            "{OUTCOME_UNKNOWN}run {id} was interrupted without proof of whether the agent received it. {reason}"
+        ),
+        // Still waiting, so a retry with its key can still start it.
+        _ => format!("Run {id} has not started: {error}"),
+    }
+}
+
+/// Sends an accepted prompt for an existing agent to its provider if nothing
+/// is ahead of it and the provider can take it, reopening the agent's
+/// conversation first when its process has ended. Otherwise the prompt waits
+/// unsent, and the mailbox courier starts it once the agent's work ends.
+///
+/// A prompt that cannot go now or later is recorded failed, with why, rather
+/// than retried: a reopening that failed, or work ahead whose outcome is
+/// unknown. The next prompt tries again.
+pub(super) fn start(host: &SharedHost, accepted: &Accepted) -> Result<Start, String> {
+    let registry = registry(host)?;
+    let id = accepted.run.id;
+    let gate = start_gate(host, accepted.agent.id);
+    let _starting = gate.lock().unwrap_or_else(|p| p.into_inner());
+    let (agent, run, queued, behind) = {
+        let store = registry.lock().unwrap_or_else(|p| p.into_inner());
+        (
+            store.agent(accepted.agent.id)?,
+            store.agent_run(id)?,
+            store.agent_run_is_queued(id)?,
+            store.run_ahead_of(id)?,
+        )
+    };
+    if !queued {
+        // Another starter sent it, or it ended, while this one waited, or
+        // this is a retry of a run that already ended.
+        return match run.state {
+            State::Failed | State::Cancelled | State::Interrupted => Err(run
+                .result
+                .diagnostic
+                .unwrap_or_else(|| format!("{RUN_ENDED}{:?}", run.state))),
+            _ => Ok(Start::Sent {
+                resumed: host
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .reopened_runs
+                    .contains(&id),
+            }),
+        };
+    }
+    if let Some(behind) = behind {
+        return Ok(Start::Queued {
+            behind: Some(behind),
+        });
+    }
+    if agent.closed {
+        return Err("The agent is closed".into());
+    }
+    // Work ahead of it ended without proof of what it did, as at a restart
+    // during that run, so nothing more goes until someone has looked.
+    if registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .agent_has_unverified_run(agent.id)?
+    {
+        let refusal = crate::host::model::UNVERIFIED_BEHIND.to_owned();
+        if finish_failure_registry(&registry, id, State::Failed, refusal.clone()) {
+            announce(host, &registry);
+        }
+        return Err(refusal);
+    }
+    let current = |agent| Accepted {
+        agent,
+        run: run.clone(),
+        created: true,
+    };
+    match provider(host, &registry, &agent)? {
+        Some(Provider::Busy) => Ok(Start::Queued { behind: None }),
+        None | Some(Provider::Ready) => {
+            dispatch_accepted(host, current(agent))?;
+            Ok(Start::Sent { resumed: false })
+        }
+        Some(Provider::Gone(source)) => {
+            if let Err(error) = resume(host, &registry, &agent, &source) {
+                if finish_failure_registry(&registry, id, State::Failed, error.clone()) {
+                    announce(host, &registry);
+                }
+                return Err(error);
+            }
+            let agent = registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .agent(agent.id)?;
+            dispatch_accepted(host, current(agent))?;
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            if state.reopened_runs.len() == REOPENED_KEPT {
+                state.reopened_runs.pop_front();
+            }
+            state.reopened_runs.push_back(id);
+            Ok(Start::Sent { resumed: true })
+        }
+    }
+}
+
+/// Starts each agent's next waiting prompt that its agent can now take.
+/// Called by the mailbox courier whenever a conversation or a run changes,
+/// outside any client request, so it takes the upgrade barrier itself, one
+/// prompt at a time.
+pub(super) fn start_queued(host: &SharedHost) -> Result<(), String> {
+    let queued = registry(host)?
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .queued_agent_runs()?;
+    for accepted in queued {
+        let Some(started) = mailbox::with_control(host, || start(host, &accepted)) else {
+            break;
+        };
+        if let Err(error) = started {
+            tracing::warn!(%error, run = %accepted.run.id, "cannot start a queued agent prompt");
+        }
+    }
+    Ok(())
+}
+
+/// Reopens the conversation of an agent whose process ended, as its pane's
+/// Resume would, and binds the agent to the reopened process. The reopened
+/// conversation joins the agent's lineage, so its messages and channel stay.
+fn resume(
+    host: &SharedHost,
+    registry: &SharedRegistry,
+    agent: &Agent,
+    source: &chat::Session,
+) -> Result<(), String> {
+    if !matches!(
+        source.native_continuity,
+        chat::NativeContinuity::RetainedClaudeActor { .. }
+    ) {
+        return Err(
+            "This agent's provider stopped, and only a Claude conversation reopens by itself. Resume it from its pane"
+                .into(),
+        );
+    }
+    let unavailable = |error: crate::terminal_ipc::ProtocolError| {
+        format!("Cannot reopen the agent's conversation: {}", error.message)
+    };
+    let response = super::chat::process(
+        host,
+        EXECUTION_CLIENT,
+        ClientRequest::ChatPrepareResume {
+            source: source.clone(),
+        },
+    )
+    .map_err(unavailable)?;
+    let ServerResponse::ChatResumePrepared { session: prepared } = response else {
+        return Err("Reopening the agent's conversation returned an unexpected response".into());
+    };
+    if prepared.id == source.id {
+        // The daemon found the conversation's provider still owned, as by a
+        // process restoring after a restart, and nothing replaces it.
+        return Err(
+            "The agent's earlier provider still holds its conversation. Wait for it to come back, or resume it from its pane"
+                .into(),
+        );
+    }
+    if !chat::is_retained_resume_successor(source, &prepared) {
+        return Err("Reopening the agent's conversation would not resume it exactly".into());
+    }
+    let response = super::chat::process(
+        host,
+        EXECUTION_CLIENT,
+        ClientRequest::ChatStart {
+            session: prepared,
+            source: None,
+            terminate_source: false,
+            // With no source terminal the daemon starts the provider with its
+            // own native environment, as for a new agent.
+            execution_environment: Default::default(),
+        },
+    )
+    .map_err(unavailable)?;
+    let ServerResponse::ChatAttached { session, .. } = response else {
+        return Err("Starting the agent's conversation returned an unexpected response".into());
+    };
+    let bound = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .agent(agent.id)?
+        .session
+        .is_some_and(|bound| bound.id() == session.id);
+    if !bound {
+        // Nothing else asked for this process; leave nothing running.
+        let _ = super::chat::process(
+            host,
+            EXECUTION_CLIENT,
+            ClientRequest::ChatClose {
+                chat_id: session.id,
+            },
+        );
+        return Err("The reopened conversation did not take over the agent".into());
+    }
+    Ok(())
+}
+
+/// Stops what the agent is doing so the prompt queued behind it goes next:
+/// the run ahead, or a turn no run started.
+fn interrupt_ahead(host: &SharedHost, agent: AgentId, behind: Option<RunId>) -> Result<(), String> {
+    let gate = agent_gate(host, agent);
+    let mut dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
+    let registry = registry(host)?;
+    let (record, head) = {
+        let store = registry.lock().unwrap_or_else(|p| p.into_inner());
+        let head = behind
+            .map(|run| store.agent_run(run))
+            .transpose()?
+            .filter(|run| !run.state.is_terminal());
+        (store.agent(agent)?, head)
+    };
+    if let Some(head) = &head
+        && withdraw_undelivered(host, &mut dispatch, Some(head.id))?
+    {
+        return Ok(());
+    }
+    let not_running =
+        || "The agent's provider is not running, so there was nothing to interrupt".to_owned();
+    let Some(HostedSession::Chat(session)) = &record.session else {
+        return Err(not_running());
+    };
+    let handle = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .chats
+        .get(&session.id)
+        .filter(|record| !record.handle.is_completed())
+        .map(|record| record.handle.clone());
+    let Some(handle) = handle else {
+        return Err(not_running());
+    };
+    // A head that is itself waiting unsent stays first; the turn it waits on
+    // is what stops.
+    let running = head.filter(|head| {
+        !registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .agent_run_is_queued(head.id)
+            .unwrap_or(true)
+    });
+    handle.interrupt_owned(running.map(|run| run.id), false)
+}
+
+/// The usage limit that stops `agent`'s live conversation, if one does.
+fn usage_limit(
     host: &SharedHost,
     registry: &SharedRegistry,
     agent: crate::model::AgentId,
-) -> Result<(), String> {
+) -> Result<Option<crate::agent_execution::directory::UsageLimit>, String> {
     let agent = registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .agent(agent)?;
     let Some(HostedSession::Chat(session)) = &agent.session else {
-        return Ok(());
+        return Ok(None);
     };
     let Some((provider, handle)) = host
         .lock()
@@ -217,10 +627,10 @@ fn refuse_limited(
         .filter(|record| !record.handle.is_completed())
         .map(|record| (record.session.launch.provider, record.handle.clone()))
     else {
-        return Ok(());
+        return Ok(None);
     };
     let now = now();
-    let Some(limit) = directory::chat_limit(
+    Ok(directory::chat_limit(
         provider,
         &handle,
         || {
@@ -228,8 +638,18 @@ fn refuse_limited(
                 .and_then(|accounts| accounts.of(provider, &handle.execution_environment().0))
         },
         now,
-    )
-    .filter(|limit| limit.resets_at.is_some()) else {
+    ))
+}
+
+/// Refuses a follow-up run for an agent whose conversation a usage limit stops
+/// until a known reset: its provider would refuse the prompt at once, and the
+/// caller is better told now. A limit of unknown end is let through, since a
+/// new turn is what shows whether it still holds, as after the conversation's
+/// account changed.
+fn refuse_limited(
+    limit: Option<&crate::agent_execution::directory::UsageLimit>,
+) -> Result<(), String> {
+    let Some(limit) = limit.filter(|limit| limit.resets_at.is_some()) else {
         return Ok(());
     };
     let reset = limit
@@ -388,6 +808,7 @@ fn withdraw_undelivered(
 }
 
 const UNDELIVERED_CANCELLATION: &str = "Cancelled before the provider received the prompt";
+const WITHDRAWN: &str = "Withdrawn by an interrupt before it was sent";
 
 /// Waits, without the agent's gate, until a bound provider can take its
 /// first prompt.
@@ -423,9 +844,7 @@ fn await_provider_ready_until(
         }
         if snapshot.ready {
             if snapshot.busy || snapshot.waiting || !snapshot.requests.is_empty() {
-                return Err(before(
-                    "The hosted provider is not idle; no additional prompt was submitted".into(),
-                ));
+                return Err(before(NOT_IDLE.into()));
             }
             return Ok(());
         }
@@ -437,6 +856,8 @@ fn await_provider_ready_until(
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+
+const NOT_IDLE: &str = "The hosted provider is not idle; no additional prompt was submitted";
 
 /// An unavailable remote snapshot proves neither provider exit nor safe retry.
 fn provider_launch_snapshot(
@@ -652,6 +1073,12 @@ fn dispatch(
             }
         }
         announce(host, &registry);
+        // Startup may capture its reply before identity publication finishes.
+        // Reconcile once more after binding, even if that confirmation's edge
+        // was already consumed while the launch was private.
+        if handle.actor_identity().is_some() {
+            super::chat::retained_actor::wake(host, session.id);
+        }
         (session, handle)
     };
     // A visible, bound startup may be closed or interrupted while a provider
@@ -671,6 +1098,24 @@ fn dispatch(
     };
     let mut dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
     let claim = dispatch.take_if(|claim| claim.run == accepted.run.id);
+    // A turn began after the run was judged startable, such as one a
+    // background task woke. Nothing was sent, so the prompt waits again for
+    // that turn to end; an automation's run keeps its own refusal.
+    if let Err((_, error)) = &ready
+        && error == NOT_IDLE
+        && !matches!(accepted.agent.origin, Origin::Automation { .. })
+        && claim.is_some_and(|claim| !claim.withdrawn)
+        && registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .release_agent_dispatch(accepted.run.id)
+            .map_err(before)?
+    {
+        // The courier's next pass starts it. Waking it now could repeat this
+        // at once while the provider and its retained state disagree.
+        drop(dispatch);
+        return Ok(());
+    }
     ready?;
     if claim.is_none_or(|claim| claim.withdrawn) {
         return Err((State::Cancelled, UNDELIVERED_CANCELLATION.into()));
@@ -799,20 +1244,19 @@ fn finish_failure_registry(
         if current.state.is_terminal() {
             return Ok(false);
         }
-        registry
-            .update_agent_run(
-                run,
-                current.revision,
-                Update::Finished {
-                    state,
-                    result: crate::agent_execution::ResultSummary {
-                        diagnostic: Some(diagnostic),
-                        ..Default::default()
-                    },
+        registry.update_agent_run(
+            run,
+            current.revision,
+            Update::Finished {
+                state,
+                result: crate::agent_execution::ResultSummary {
+                    diagnostic: Some(diagnostic),
+                    ..Default::default()
                 },
-                now(),
-            )
-            .map(|_| true)
+            },
+            now(),
+        )?;
+        Ok(true)
     });
     result.unwrap_or_else(|error| {
         tracing::error!(%error, %run, "cannot persist failed agent dispatch");
@@ -840,20 +1284,27 @@ fn now() -> u64 {
 }
 
 pub(super) fn announce(host: &SharedHost, registry: &SharedRegistry) {
-    let sequence = registry
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .execution_sequence();
-    if let Ok(sequence) = sequence {
-        host.lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .announce_model_edit(
-                EXECUTION_CLIENT,
-                sequence,
-                &crate::workspace_model::ModelEdit::AgentsChanged,
-            );
+    // Retain the connection mutex through delivery: an announcer that follows
+    // this drain cannot overtake its scope revisions on the watcher socket.
+    let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+    match registry.execution_delta() {
+        Ok((sequence, effects)) if !effects.is_empty() => {
+            host.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .announce_model_edit(
+                    EXECUTION_CLIENT,
+                    sequence,
+                    &crate::workspace_model::ModelEdit::AgentsChanged,
+                    &effects,
+                );
+        }
+        Ok(_) => {}
+        Err(error) => tracing::error!(%error, "cannot publish agent execution changes"),
     }
+    drop(registry);
     super::automations::wake(host);
+    // A run that ended may let the prompt waiting behind it start.
+    mailbox::wake(host);
 }
 
 pub(super) fn retired(host: &SharedHost, session: &chat::Session) -> Result<(), String> {
@@ -926,7 +1377,22 @@ pub(in crate::host) fn adopt_resumed(
         _ => None,
     });
     let Some(predecessor) = predecessors.next() else {
-        return Ok(false);
+        // A conversation reopened in place keeps its chat ID, so the agent
+        // bound to it is no predecessor in its lineage but holds the
+        // descriptor of the process it replaced.
+        let bound = registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .agent_for_session(successor.id)?;
+        let next = HostedSession::Chat(successor.clone());
+        return match bound.and_then(|agent| agent.session) {
+            Some(HostedSession::Chat(previous))
+                if !HostedSession::Chat(previous.clone()).same_process(&next) =>
+            {
+                adopt_successor(host, &previous, successor)
+            }
+            _ => Ok(false),
+        };
     };
     if predecessors.next().is_some() {
         return Err("More than one open agent claims the resumed conversation's lineage".into());
@@ -959,10 +1425,12 @@ pub(in crate::host) fn adopt_successor(
     let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
     {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        if state
-            .chats
-            .get(&predecessor.id)
-            .is_some_and(|record| !record.handle.is_completed())
+        // A chat reopened in place is itself the one running under its ID.
+        if predecessor.id != successor.id
+            && state
+                .chats
+                .get(&predecessor.id)
+                .is_some_and(|record| !record.handle.is_completed())
         {
             return Err("The predecessor is still running in this daemon".into());
         }
@@ -1120,22 +1588,39 @@ pub(super) fn preflight_retirement(
 /// released the gate to await provider readiness: until that dispatcher
 /// takes it back, the provider has not received the run's prompt.
 fn agent_gate(host: &SharedHost, id: AgentId) -> Arc<Mutex<Option<Undelivered>>> {
-    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    shared_gate(
+        &mut host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .execution_gates,
+        id,
+    )
+}
+
+/// Serializes starting an agent's waiting prompts; see `start`.
+fn start_gate(host: &SharedHost, id: AgentId) -> Arc<Mutex<()>> {
+    shared_gate(
+        &mut host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .execution_starts,
+        id,
+    )
+}
+
+fn shared_gate<T: Default>(
+    gates: &mut std::collections::BTreeMap<AgentId, std::sync::Weak<Mutex<T>>>,
+    id: AgentId,
+) -> Arc<Mutex<T>> {
     // A holder or waiter keeps its Arc alive, so pruning cannot split an
     // active agent's serialization. Failed and repeated closes need no
     // special cleanup, and unused entries survive only until the next lookup.
-    state
-        .execution_gates
-        .retain(|_, gate| gate.strong_count() > 0);
-    if let Some(gate) = state
-        .execution_gates
-        .get(&id)
-        .and_then(std::sync::Weak::upgrade)
-    {
+    gates.retain(|_, gate| gate.strong_count() > 0);
+    if let Some(gate) = gates.get(&id).and_then(std::sync::Weak::upgrade) {
         return gate;
     }
-    let gate = Arc::new(Mutex::new(None));
-    state.execution_gates.insert(id, Arc::downgrade(&gate));
+    let gate = Arc::new(Mutex::new(T::default()));
+    gates.insert(id, Arc::downgrade(&gate));
     gate
 }
 
@@ -1253,18 +1738,10 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
     }
     // No dispatch can race this proof: it uses this same per-agent gate and
     // revalidates the durable open/accepted record before creating any child.
+    // That includes every prompt still waiting behind the current run.
     let mut store = registry.lock().unwrap_or_else(|p| p.into_inner());
-    let current = store.latest_agent_run(id)?;
-    if !current.state.is_terminal() {
-        store.update_agent_run(
-            current.id,
-            current.revision,
-            Update::Finished {
-                state: State::Cancelled,
-                result: current.result,
-            },
-            now(),
-        )?;
+    for current in store.unfinished_agent_runs(id)? {
+        store.cancel_agent_run_at_close(&current, now())?;
     }
     let result = store.close_agent(&origin, id)?;
     drop(store);
@@ -1277,8 +1754,8 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
     Ok(result)
 }
 
-/// Preserve typed mailbox backpressure at the service boundary. Existing
-/// operations retain their original validation and String-returning API.
+/// Preserve typed mailbox capacity and store contention at the service boundary.
+/// Other operations retain their original validation and String-returning API.
 pub(super) fn process_request(
     host: &SharedHost,
     authority: Authority,
@@ -1290,6 +1767,19 @@ pub(super) fn process_request(
         }
         crate::agent_execution::Operation::Send(outgoing) => {
             mailbox::post(host, &authority, outgoing).map(crate::agent_execution::Reply::Delivered)
+        }
+        crate::agent_execution::Operation::Deliver(outgoing) => {
+            mailbox::hand(host, &authority, outgoing).map(crate::agent_execution::Reply::Handed)
+        }
+        crate::agent_execution::Operation::Inbox(query) => {
+            mailbox::inbox(host, &authority, query).map(crate::agent_execution::Reply::Inbox)
+        }
+        crate::agent_execution::Operation::PeekInbox(query) => {
+            mailbox::peek(host, &authority, query).map(crate::agent_execution::Reply::Inbox)
+        }
+        crate::agent_execution::Operation::AcknowledgeInbox(receipt) => {
+            mailbox::acknowledge(host, &authority, receipt)
+                .map(|()| crate::agent_execution::Reply::InboxAcknowledged)
         }
         other => process(host, authority, other).map_err(Into::into),
     }
@@ -1340,6 +1830,9 @@ pub(super) fn process(
         Operation::Directory(scope) => {
             directory::read(host, &authority, scope).map(Reply::Directory)
         }
+        Operation::Context { scope, standing } => {
+            directory::context(host, &authority, scope, standing).map(Reply::Context)
+        }
         Operation::AccountInfo(query) => {
             account_info::read(host, &authority, query).map(Reply::AccountInfo)
         }
@@ -1354,11 +1847,15 @@ pub(super) fn process(
         Operation::SendMessage(outgoing) => mailbox::send(host, &authority, outgoing)
             .map(Reply::Sent)
             .map_err(|error| error.to_string()),
-        Operation::Inbox(query) => mailbox::inbox(host, &authority, query).map(Reply::Inbox),
-        Operation::PeekInbox(query) => mailbox::peek(host, &authority, query).map(Reply::Inbox),
-        Operation::AcknowledgeInbox(receipt) => {
-            mailbox::acknowledge(host, &authority, receipt).map(|()| Reply::InboxAcknowledged)
-        }
+        Operation::Inbox(query) => mailbox::inbox(host, &authority, query)
+            .map(Reply::Inbox)
+            .map_err(|error| error.to_string()),
+        Operation::PeekInbox(query) => mailbox::peek(host, &authority, query)
+            .map(Reply::Inbox)
+            .map_err(|error| error.to_string()),
+        Operation::AcknowledgeInbox(receipt) => mailbox::acknowledge(host, &authority, receipt)
+            .map(|()| Reply::InboxAcknowledged)
+            .map_err(|error| error.to_string()),
         Operation::Transcript(query) => {
             transcript::read(host, &authority, query).map(Reply::Transcript)
         }
@@ -1371,6 +1868,11 @@ pub(super) fn process(
         Operation::Send(outgoing) => mailbox::post(host, &authority, outgoing)
             .map(Reply::Delivered)
             .map_err(|error| error.to_string()),
+        Operation::Deliver(outgoing) => mailbox::hand(host, &authority, outgoing)
+            .map(Reply::Handed)
+            .map_err(|error| error.to_string()),
+        Operation::Prompt { request, interrupt } => prompt(host, &authority, request, interrupt)
+            .map(|(accepted, start)| Reply::Prompted { accepted, start }),
     }
 }
 
@@ -1467,8 +1969,74 @@ fn control(
         Control::Interrupt {
             including_subagents,
         } => {
-            if !withdraw_undelivered(host, &mut dispatch, Some(run.id))? {
-                handle.interrupt_owned(Some(run.id), including_subagents)?;
+            // An interrupt stops all of the owner's work, so the prompts
+            // they queued behind the current run are withdrawn unsent.
+            // Messages others sent stay queued as runs, in order, and still
+            // arrive once the interrupted turn ends.
+            let registry = registry(host)?;
+            let (unfinished, queued) = {
+                let store = registry.lock().unwrap_or_else(|p| p.into_inner());
+                let unfinished = store.unfinished_agent_runs(id)?;
+                let queued = unfinished
+                    .iter()
+                    .map(|run| {
+                        Ok(match store.agent_run_is_queued(run.id)? {
+                            false => Queued::No,
+                            true if store.run_is_message(run.id)? => Queued::Message,
+                            true => Queued::Prompt,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                (unfinished, queued)
+            };
+            #[derive(PartialEq)]
+            enum Queued {
+                No,
+                Prompt,
+                Message,
+            }
+            let mut active = None;
+            let mut withdrawn = 0;
+            for (run, queued) in unfinished.iter().zip(queued) {
+                if queued == Queued::Message {
+                    continue;
+                }
+                if queued == Queued::Prompt {
+                    withdrawn += usize::from(finish_failure_registry(
+                        &registry,
+                        run.id,
+                        State::Cancelled,
+                        WITHDRAWN.into(),
+                    ));
+                } else {
+                    active.get_or_insert(run.id);
+                }
+            }
+            if withdrawn > 0 {
+                announce(host, &registry);
+            }
+            // The queue is already withdrawn, so a failure says so too.
+            let stopped = |error: String| match withdrawn {
+                0 => error,
+                count => format!(
+                    "{error}. The {count} prompt(s) waiting behind it were withdrawn unsent"
+                ),
+            };
+            match active {
+                Some(active) => {
+                    if !withdraw_undelivered(host, &mut dispatch, Some(active))? {
+                        handle
+                            .interrupt_owned(Some(active), including_subagents)
+                            .map_err(stopped)?;
+                    }
+                }
+                // The withdrawn prompts waited on a turn no run started.
+                None if !handle.is_idle() => {
+                    handle
+                        .interrupt_owned(None, including_subagents)
+                        .map_err(stopped)?;
+                }
+                None => {}
             }
             None
         }
@@ -1558,12 +2126,7 @@ fn create_console(
     session: &chat::Session,
     handle: &chat::runtime::Handle,
 ) -> Result<(), ConsoleError> {
-    let program = crate::companion::Product::Cli
-        .beside_current()
-        .map_err(|e| e.to_string())?;
-    if !program.is_file() {
-        return Err("The matched cagents CLI for the console is unavailable".into());
-    }
+    let program = super::chat::matched_cli()?;
     let recipe = crate::model::LaunchRecipe {
         program: program
             .into_os_string()
@@ -1991,6 +2554,7 @@ fn console_line(item: &chat::Item, now: u64) -> Option<String> {
         ToolStatus::Failed => " (failed)",
         ToolStatus::Denied => " (denied)",
         ToolStatus::Stopped => " (stopped)",
+        ToolStatus::Ended => " (ended)",
         ToolStatus::Waiting => " (waiting on its own background work)",
     };
     let first_line = |text: &str| text.trim().lines().next().unwrap_or_default().to_owned();

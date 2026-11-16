@@ -416,13 +416,17 @@ impl<O: FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>> FloorSour
                 // Saved panes can predate ChatList's confirmed conversation ID.
                 // Capture their exact aliases before preparation changes ownership.
                 let presentation = capture_floor(self.guard, presentation)?;
-                Ok(crate::upgrade::recovery::Census {
+                let mut census = crate::upgrade::recovery::Census {
                     terminals,
                     chats,
                     snapshots: snapshots.finish(),
                     aliases: presentation.aliases,
                     presentations: presentation.presentations,
-                })
+                };
+                census
+                    .fit_pages(&self.proof, daemon, self.guard.prepared_window_slots())
+                    .map_err(invalid)?;
+                Ok(census)
             },
         )?;
         if let Some(census) = &self.original_census {

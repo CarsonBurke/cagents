@@ -1,4 +1,4 @@
-//! Schema 22 <-> 23 conversion, applied-operation retention and the row-level
+//! Schema 22 <-> current conversion, applied-operation retention and the row-level
 //! writer, against real stores on disk.
 use super::*;
 use crate::host::model::{Registry, SCHEMA_VERSION, channel_work, migrate_through};
@@ -278,7 +278,10 @@ fn schema_22_views_convert_whole_and_convert_back_unchanged() {
     );
     drop(registry);
 
-    assert_eq!(Registry::downgrade_at(&path, 22).unwrap(), Some(23));
+    assert_eq!(
+        Registry::downgrade_at(&path, 22).unwrap(),
+        Some(SCHEMA_VERSION)
+    );
     assert_eq!(user_version(&path), 22);
     assert_eq!(
         rows_22(&Connection::open(&path).unwrap()),
@@ -291,7 +294,7 @@ fn schema_22_views_convert_whole_and_convert_back_unchanged() {
 }
 
 #[test]
-fn edits_made_under_schema_23_survive_the_conversion_back() {
+fn edits_made_under_current_schema_survive_the_conversion_back() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("model.sqlite3");
     let (a, b) = schema_22(&path);
@@ -341,7 +344,10 @@ fn edits_made_under_schema_23_survive_the_conversion_back() {
     );
     drop(registry);
 
-    assert_eq!(Registry::downgrade_at(&path, 22).unwrap(), Some(23));
+    assert_eq!(
+        Registry::downgrade_at(&path, 22).unwrap(),
+        Some(SCHEMA_VERSION)
+    );
     let db = Connection::open(&path).unwrap();
     for view in &edited {
         let (revision, saved, retired): (i64, String, String) = db
@@ -900,6 +906,24 @@ fn a_move_or_retitle_rewrites_only_the_rows_that_changed() {
         (0..10).map(|index| browser(&index.to_string())).collect(),
     );
     let mut view = read(&registry.db, &scope).unwrap();
+    let original_revision = view.revision;
+    let inventory = || {
+        registry
+            .db
+            .query_row(
+                "SELECT COUNT(*), MIN(before_revision), MAX(after_revision)
+                 FROM temp.execution_view_changes",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, u64>(0)?,
+                        row.get::<_, Option<u64>>(1)?,
+                        row.get::<_, Option<u64>>(2)?,
+                    ))
+                },
+            )
+            .unwrap()
+    };
     let moved = view.panes.remove(7);
     view.panes.insert(2, moved);
     view.revision = next_revision(&registry.db).unwrap();
@@ -907,8 +931,12 @@ fn a_move_or_retitle_rewrites_only_the_rows_that_changed() {
     store(&registry.db, &view).unwrap();
     assert_eq!(
         registry.db.total_changes() - before,
-        2,
-        "one position and the revision"
+        3,
+        "one position, the revision, and one connection-local inventory update"
+    );
+    assert_eq!(
+        inventory(),
+        (1, Some(original_revision), Some(view.revision))
     );
     assert_eq!(read(&registry.db, &scope).unwrap(), view);
 
@@ -918,8 +946,12 @@ fn a_move_or_retitle_rewrites_only_the_rows_that_changed() {
     store(&registry.db, &view).unwrap();
     assert_eq!(
         registry.db.total_changes() - before,
-        2,
-        "one pane and the revision"
+        3,
+        "one pane, the revision, and one connection-local inventory update"
+    );
+    assert_eq!(
+        inventory(),
+        (1, Some(original_revision), Some(view.revision))
     );
     assert_eq!(read(&registry.db, &scope).unwrap(), view);
 }
@@ -1033,12 +1065,15 @@ fn a_real_store_converts_forward_and_back_without_losing_a_pane() {
         .unwrap();
 
     let started = std::time::Instant::now();
-    assert_eq!(Registry::downgrade_at(&path, 22).unwrap(), Some(23));
+    assert_eq!(
+        Registry::downgrade_at(&path, 22).unwrap(),
+        Some(SCHEMA_VERSION)
+    );
     let back = started.elapsed();
     assert_eq!(rows_22(&Connection::open(&path).unwrap()), original);
     println!(
         "views {} panes {} operations {edits}: converted in {converted:?}, model read in {read_model:?}, \
-         converted back in {back:?}; {before} bytes at 22, {} bytes at 23 after VACUUM",
+         converted back in {back:?}; {before} bytes at 22, {} bytes at current schema after VACUUM",
         expected.len(),
         expected.iter().map(|view| view.panes.len()).sum::<usize>(),
         size(&vacuumed),

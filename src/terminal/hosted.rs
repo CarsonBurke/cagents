@@ -215,6 +215,7 @@ impl InputRejectionReason {
 }
 
 struct HostedPublishedState {
+    execution_instance: Mutex<Option<uuid::Uuid>>,
     snapshot: ArcSwap<RenderSnapshot>,
     /// The last grid a hibernated view showed.
     ///
@@ -258,6 +259,19 @@ struct HostedPublishedState {
 }
 
 impl HostedPublishedState {
+    fn observe_worker(&self, instance: uuid::Uuid) -> bool {
+        let mut current = self
+            .execution_instance
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if instance.is_nil() || current.is_some_and(|current| current != instance) {
+            return false;
+        }
+        *current = Some(instance);
+        self.request_semantic_wake();
+        true
+    }
+
     fn new(
         expected_host: Option<HostSessionProof>,
         visible: bool,
@@ -265,6 +279,7 @@ impl HostedPublishedState {
     ) -> Self {
         let (acknowledgement_tx, acknowledgement_rx) = crossbeam_channel::bounded(1);
         Self {
+            execution_instance: Mutex::new(None),
             snapshot: ArcSwap::from_pointee(RenderSnapshot::empty()),
             retained: ArcSwapOption::empty(),
             generation: AtomicU64::new(0),
@@ -1090,6 +1105,15 @@ impl HostedTerminalHandle {
         self.inner.terminal_id
     }
 
+    pub(crate) fn execution_instance(&self) -> Option<uuid::Uuid> {
+        *self
+            .inner
+            .published
+            .execution_instance
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
     /// Returns the fenced host identity only after the daemon accepted this terminal.
     pub fn proof(&self) -> Option<HostSessionProof> {
         let confirmed = self
@@ -1105,7 +1129,7 @@ impl HostedTerminalHandle {
     /// Why the daemon refused this terminal's attachment for good, if it did.
     /// Unlike a detached snapshot, which a hibernated view also holds, this
     /// is only set by the refusal itself.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn attachment_failure(&self) -> Option<String> {
         self.inner
             .published
@@ -1308,15 +1332,27 @@ impl HostedTerminalHandle {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(crate) fn visibility(&self) -> TerminalVisibility {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn visibility(&self) -> TerminalVisibility {
         self.inner.published.desired_visibility()
     }
 
     /// Ends the connection for good, as giving up on a lost daemon does.
-    #[cfg(test)]
-    pub(crate) fn stop_for_test(&self) {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn stop_for_test(&self) {
         self.inner.stop.request();
+    }
+
+    /// A stopped surface with an authenticated receipt for reducer fixtures.
+    /// Framed-socket tests exercise transport authentication separately.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_worker_receipt_for_test(&self, owner: &HostSessionProof, worker: uuid::Uuid) {
+        self.inner.stop.request();
+        assert!(self.inner.published.pin_proof(owner));
+        assert!(self.inner.published.observe_worker(worker));
+        self.inner.published.confirm_attachment(owner);
     }
 
     pub fn hibernate(&self) -> Result<(), TerminalSendError> {
@@ -1413,7 +1449,7 @@ pub fn ensure_daemon_ready() -> Result<PathBuf, HostedTerminalStartError> {
     ensure_daemon_ready_for(crate::notifications::Application::Cagents)
 }
 
-pub(crate) fn existing_daemon_socket_path() -> io::Result<PathBuf> {
+pub fn existing_daemon_socket_path() -> io::Result<PathBuf> {
     match crate::device::existing_socket_path()? {
         Some(socket) => Ok(socket),
         None => daemon_socket_path(),
@@ -1440,8 +1476,7 @@ pub fn ensure_daemon_ready_for(
 
 /// Provider activation requested by a person, after an attach-only recovery.
 /// Its transport is separate from the window's automatic read-only readers.
-pub(crate) fn ensure_daemon_ready_for_explicit_action() -> Result<PathBuf, HostedTerminalStartError>
-{
+pub fn ensure_daemon_ready_for_explicit_action() -> Result<PathBuf, HostedTerminalStartError> {
     if let Some(socket) = crate::device::socket_path_for_explicit_action()
         .map_err(HostedTerminalStartError::SocketPath)?
     {
@@ -2603,6 +2638,7 @@ fn serve_connection(
             && matches!(
                 &envelope.message,
                 ServerMessage::TerminalObserved { terminal_id: id, .. }
+                    | ServerMessage::TerminalWorker { terminal_id: id, .. }
                     | ServerMessage::Redraw { terminal_id: id, .. }
                     | ServerMessage::Snapshot { terminal_id: id, .. }
                     | ServerMessage::Event { terminal_id: id, .. }
@@ -2629,6 +2665,23 @@ fn serve_connection(
         }
 
         match envelope.message {
+            ServerMessage::TerminalWorker {
+                terminal_id: id,
+                instance,
+            } if envelope.request_id.is_none() && id == terminal_id => {
+                if !published.observe_worker(instance) {
+                    return reject_handshake(
+                        events,
+                        published,
+                        stop,
+                        ProtocolError::new(
+                            ProtocolErrorCode::ProofMismatch,
+                            "The attached terminal worker changed",
+                            false,
+                        ),
+                    );
+                }
+            }
             ServerMessage::Response { response } => {
                 let Some(request_id) = envelope.request_id else {
                     return ConnectionEnd::Retry;
@@ -3163,6 +3216,17 @@ mod tests {
 
     use super::*;
     #[test]
+    fn attachment_worker_receipt_cannot_change_on_an_existing_surface() {
+        let state = HostedPublishedState::new(None, true, Arc::new(|_| {}));
+        let original = uuid::Uuid::new_v4();
+        assert!(!state.observe_worker(uuid::Uuid::nil()));
+        assert!(state.observe_worker(original));
+        assert!(state.observe_worker(original));
+        state.mark_detached();
+        assert!(!state.observe_worker(uuid::Uuid::new_v4()));
+        assert_eq!(*state.execution_instance.lock().unwrap(), Some(original));
+    }
+    #[test]
     fn stopping_an_attachment_interrupts_blocked_socket_io() {
         let stop = Arc::new(WorkerStop::default());
         let (mut client, _server) = UnixStream::pair().unwrap();
@@ -3633,6 +3697,10 @@ mod tests {
 
     #[test]
     fn scoped_launch_passes_reserved_lease_through_the_scope_launcher() {
+        #[cfg(target_os = "linux")]
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
         use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
         let launcher = root.path().join("systemd-run");
@@ -3657,6 +3725,10 @@ mod tests {
 
     #[test]
     fn systemd_scope_preserves_environment_arguments_and_isolates_cgroup() {
+        #[cfg(target_os = "linux")]
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
         use std::io::{Read, Seek};
 
         if !systemd_user_manager_available() {

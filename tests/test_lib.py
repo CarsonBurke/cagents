@@ -100,8 +100,10 @@ if phase == "prune":
     raise SystemExit(config.get("prune_exit", 0))
 
 if phase == "compiler":
-    artifact = dict(reason="compiler-artifact", manifest_path=str(root / "Cargo.toml"),
-                    target=dict(name="cagents", kind=["lib"]),
+    application = sys.argv[sys.argv.index("--package") + 1] == "cagents-ui"
+    manifest = root / "crates/cagents-ui/Cargo.toml" if application else root / "Cargo.toml"
+    artifact = dict(reason="compiler-artifact", manifest_path=str(manifest),
+                    target=dict(name="cagents_ui" if application else "cagents", kind=["lib"]),
                     profile=dict(test=True), executable=str(root / "libtest"))
     variant = config.get("artifact", "valid")
     if variant == "wrong-manifest":
@@ -165,7 +167,7 @@ class TestLib(unittest.TestCase):
         self.root = Path(temporary.name)
         scripts = self.root / "scripts"
         scripts.mkdir()
-        for name in ("test-lib", "cargo-gate", "cargo-gate-command.py"):
+        for name in ("test-lib", "cargo-gate", "cargo-gate-command.py", "build-host"):
             shutil.copy2(ROOT / "scripts" / name, scripts / name)
         for name in ("seed-build-dir", "build-disk-guard"):
             if (ROOT / "scripts" / name).exists():
@@ -187,6 +189,8 @@ class TestLib(unittest.TestCase):
             "CAGENTS_BUILD_SEED": "0", "CAGENTS_BUILD_FREE_FLOOR_GIB": "0",
             "CARGO_BUILD_JOBS": "1", "TEST_ROOT": str(self.root),
             "CAGENTS_BUILD_INSTALLED_GATE": "", "CAGENTS_BUILD_REMOTE": "local",
+            # Build in place: no systemd scope or shared jobserver.
+            "CAGENTS_BUILD_SCOPE": "0",
             "TMPDIR": str(self.root / "tmp"), "LC_ALL": "C",
         }
         self.configure()
@@ -279,14 +283,16 @@ class TestLib(unittest.TestCase):
     def test_the_test_binary_runs_under_a_memory_limit(self):
         ran = self.root / "limited"
         limit = self.root / "scripts/memory-capped"
-        limit.write_text(f'#!/bin/sh\necho "$1" >"{ran}"\nexec "$@"\n')
+        limit.write_text(f'#!/bin/sh\necho "$1 $2" >"{ran}"\nshift\nexec "$@"\n')
         limit.chmod(0o755)
         result = self.invoke("cli", "module::one")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(ran.read_text().strip(), str(self.root / "libtest"))
+        # What a test leaves running is stopped with it.
+        self.assertEqual(ran.read_text().strip(), f"--stop-leftovers {self.root / 'libtest'}")
 
     def test_isolated_lane_arguments_cwd_profile_and_admission_release(self):
-        for lane, profile in (("cli", None), ("host", "dev-runtime"), ("ui", "test")):
+        for lane, profile in (("cli", None), ("host", "dev-runtime"), ("shared-ui", "test"),
+                              ("ui", None)):
             with self.subTest(lane=lane):
                 self.clear()
                 extra = [] if profile is None else ["--profile", profile]
@@ -294,11 +300,12 @@ class TestLib(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 events = self.events()
                 compiler = self.events("compiler")[0]
+                package = "cagents-ui" if lane == "ui" else "cagents"
                 expected = ["test", "--locked", "--no-default-features", "--manifest-path",
-                            str(self.root / "Cargo.toml"), "--package", "cagents", "--lib",
+                            str(self.root / "Cargo.toml"), "--package", package, "--lib",
                             "--no-run", "--message-format=json-render-diagnostics"]
-                if lane != "cli":
-                    expected += ["--features", lane]
+                expected += {"host": ["--features", "host"],
+                             "shared-ui": ["--features", "ui"]}.get(lane, [])
                 self.assertEqual(compiler["arguments"], expected + extra)
                 self.assertTrue(compiler["held"], events)
                 metadata = self.events("metadata")[0]
@@ -431,7 +438,7 @@ class TestLib(unittest.TestCase):
 
     def test_interleaved_options_and_ignored_prefix_union_with_ordinary_exact(self):
         self.configure(available=["module::ignored", "other::three"])
-        result = self.invoke("ui", "--profile", "dev-runtime", "--prefix", "module::",
+        result = self.invoke("shared-ui", "--profile", "dev-runtime", "--prefix", "module::",
                              "other::three", "--test-threads", "3")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("skipping ignored module::ignored", result.stderr)
@@ -445,6 +452,8 @@ class TestLib(unittest.TestCase):
             (("module::ignored",), {}, "explicit ignored tests"),
             (("--prefix", "absent::"), {}, "selects no tests"),
             (("--prefix", "module::"), {"available": ["module::ignored"]}, "no ordinary tests"),
+            (("--prefix", "module::"), {"available": [], "ignored": []},
+             "lane compiled no library tests"),
         ):
             with self.subTest(names=names):
                 self.clear()
@@ -666,7 +675,9 @@ class TestLib(unittest.TestCase):
                     _stdout, stderr = process.communicate("", timeout=5)
                     self.assertEqual(process.returncode, 128 + number, stderr)
                     received = [event["signal"] for event in self.events(phase) if "signal" in event]
-                    self.assertIn(signal.SIGTERM if phase == "compiler" else number, received)
+                    # build-host interrupts the build as Ctrl-C would, whatever
+                    # signal cancelled it; test-lib forwards a listing's own.
+                    self.assertIn(signal.SIGINT if phase == "compiler" else number, received)
                     self.assertFalse(self.held())
                     self.assert_no_test()
 

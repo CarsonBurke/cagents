@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Supervise one owned command without passing build-slot descriptors on."""
+"""Supervise one owned command, and keep the gate's admission clock."""
 
 import sys
 import time
@@ -33,62 +33,6 @@ def admission_expired(deadline):
     if deadline is not None and time.monotonic_ns() >= deadline:
         print("cargo-gate: build admission timed out", file=sys.stderr)
         return 124
-    return 0
-
-
-def wait_lock(arguments):
-    """Acquire one shared lock description without outliving its gate."""
-    import ctypes
-    import errno
-    import fcntl
-    import os
-    import signal
-
-    if len(arguments) != 3:
-        raise ValueError("invalid lock waiter arguments")
-    parent = positive_integer(arguments[0])
-    descriptor = positive_integer(arguments[1])
-    deadline = positive_integer(arguments[2]) if arguments[2] else None
-    if descriptor <= 2:
-        raise ValueError("lock descriptor must be above standard streams")
-    libc = ctypes.CDLL(None, use_errno=True)
-    # Only admission waiters die with the gate. Successful build commands may
-    # intentionally leave background services, so their supervisor stays separate.
-    if libc.prctl(1, signal.SIGKILL, 0, 0, 0):  # PR_SET_PDEATHSIG
-        raise OSError(ctypes.get_errno(), "cannot bind lock waiter to gate")
-    # Covers death before prctl, including death while Python was starting.
-    if os.getppid() != parent:
-        return 125
-    # The gate retains the caller's descriptors for the admitted command. The
-    # waiter needs only this shared lock description; don't pin caller locks or
-    # pipes, including descriptors above the shell's single-digit range.
-    for value in os.listdir("/proc/self/fd"):
-        number = int(value)
-        if number > 2 and number != descriptor:
-            try:
-                os.close(number)
-            except OSError as error:
-                if error.errno != errno.EBADF:
-                    raise
-
-    def cancelled(number, _frame):
-        raise SystemExit(128 + number)
-
-    for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
-        signal.signal(number, cancelled)
-
-    def expired(_number, _frame):
-        print("cargo-gate: build admission timed out", file=sys.stderr)
-        raise SystemExit(124)
-
-    if deadline is not None:
-        if admission_expired(deadline):
-            return 124
-        signal.signal(signal.SIGALRM, expired)
-        signal.setitimer(signal.ITIMER_REAL, max(0.000001, (deadline - time.monotonic_ns()) / 1_000_000_000))
-    # Keep kernel FIFO ordering: a polling LOCK_NB request could lose every
-    # release to plain flock callers. The gate shares this open description.
-    fcntl.flock(descriptor, fcntl.LOCK_EX)
     return 0
 
 
@@ -155,6 +99,20 @@ def main():
         # the primary and allow its PID to be reused before cleanup ends.
         return os.waitid(os.P_PID, primary.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
 
+    def adopted_children():
+        return [pid for pid in map(int, children_path.read_text().split()) if pid != primary.pid]
+
+    def reap_exited_adoptees():
+        # Descendants whose parents exit are adopted by this subreaper, such
+        # as the intermediate process and then the master of an offload's
+        # ssh ControlPersist connection. Left unreaped, each that finishes
+        # stays a zombie for the rest of the build.
+        # Reap only listed PIDs that have already exited, never waitpid(-1):
+        # the primary stays unreaped to reserve its PID, and live adoptees
+        # keep theirs for drain().
+        for pid in adopted_children():
+            os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG)
+
     def send(pid, number):
         try:
             os.kill(pid, number)
@@ -174,9 +132,7 @@ def main():
             force = time.monotonic() >= deadline
             if force:
                 send(primary.pid, signal.SIGKILL)
-            children = [int(value) for value in children_path.read_text().split()]
-            others = [pid for pid in children if pid != primary.pid]
-            for pid in others:
+            for pid in adopted_children():
                 # These are this supervisor's actual unreaped children. With
                 # SIGCHLD at default and one waiter, their IDs cannot be reused
                 # before this loop reaps them. Adoption includes setsid children.
@@ -213,6 +169,7 @@ def main():
                 # may outlive successful commands; only cancellation drains.
                 status = primary.wait()
                 return status if status >= 0 else 128 - status
+            reap_exited_adoptees()
             time.sleep(0.02)
     except BaseException:
         # A supervisor failure after launch must not release a live build.
@@ -224,12 +181,6 @@ if __name__ == "__main__":
     try:
         if sys.argv[1:2] in (["--admission-deadline"], ["--admission-check"]):
             sys.exit(admission_clock(sys.argv[1:]))
-        if sys.argv[1:2] == ["--wait-lock"]:
-            try:
-                sys.exit(wait_lock(sys.argv[2:]))
-            except Exception as error:
-                print(f"cargo-gate: lock waiter failed: {error}", file=sys.stderr)
-                sys.exit(2)
         sys.exit(main())
     except Exception as error:
         print(f"cargo-gate: command supervision failed: {error}", file=sys.stderr)

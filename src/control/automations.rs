@@ -306,21 +306,11 @@ pub(super) fn execute_with_context(
             (json!({"audit": page}), human)
         }
         Response::Detail(detail) => {
-            let mut human = format!(
-                "{}\t{}\n{}",
-                detail.firing.id,
-                state_label(detail.firing.state),
-                detail
-                    .run
-                    .as_ref()
-                    .map(|run| run.result.text.as_str())
-                    .or(detail.firing.diagnostic.as_deref())
-                    .unwrap_or_default()
+            let human = detail_human(
+                &detail.firing,
+                detail.run.as_ref().map(|run| &run.result),
+                now_ms(),
             );
-            if let Some(skipped) = skipped_occurrences_human(&detail.firing, now_ms()) {
-                human.push('\n');
-                human.push_str(&skipped);
-            }
             (json!({"run": detail}), human)
         }
         Response::Removed => (
@@ -480,6 +470,30 @@ fn history_human(history: &crate::automations::HistoryPage, now_ms: u64) -> Stri
         );
     }
     human
+}
+
+/// One run's outcome, in the order the native run view shows it. A run that
+/// failed to start has no result text, and its agent diagnostic usually repeats
+/// the firing's; neither may hide the failure or print it twice.
+fn detail_human(
+    firing: &crate::automations::Firing,
+    result: Option<&crate::agent_execution::ResultSummary>,
+    now_ms: u64,
+) -> String {
+    let mut lines = vec![format!("{}\t{}", firing.id, state_label(firing.state))];
+    lines.extend(firing.diagnostic.clone());
+    if let Some(result) = result {
+        if !result.text.is_empty() {
+            lines.push(result.text.clone());
+        }
+        if let Some(diagnostic) = &result.diagnostic
+            && firing.diagnostic.as_ref() != Some(diagnostic)
+        {
+            lines.push(diagnostic.clone());
+        }
+    }
+    lines.extend(skipped_occurrences_human(firing, now_ms));
+    lines.join("\n")
 }
 
 fn skipped_occurrences_human(firing: &crate::automations::Firing, now_ms: u64) -> Option<String> {
@@ -695,6 +709,68 @@ mod tests {
         assert!(human.contains("Morning check"));
         assert!(human.contains("Blocked: Missing account repair required"));
         assert!(human.ends_with("/repo"));
+    }
+
+    #[test]
+    fn run_detail_keeps_a_failed_start_diagnostic_once_and_the_result_text() {
+        use crate::agent_execution::ResultSummary;
+        use crate::automations::{Firing, FiringState, Trigger};
+        let diagnostic = "Cannot start claude: No such file or directory (os error 2)";
+        let firing = Firing {
+            id: Uuid::from_u128(1),
+            automation: Uuid::from_u128(2),
+            name: "Nightly review".into(),
+            revision: 1,
+            trigger: Trigger::Manual {
+                request: Uuid::from_u128(3),
+            },
+            state: FiringState::Failed,
+            release_pending: false,
+            cancel_requested: false,
+            created_ms: 60_000,
+            started_ms: None,
+            finished_ms: Some(61_000),
+            agent: None,
+            run: None,
+            skip: None,
+            diagnostic: Some(diagnostic.into()),
+            skipped_occurrences: None,
+        };
+        let id = "00000000-0000-0000-0000-000000000001\tFailed";
+        let failed = ResultSummary {
+            diagnostic: Some(diagnostic.into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            detail_human(&firing, Some(&failed), 120_000),
+            format!("{id}\n{diagnostic}")
+        );
+        assert_eq!(
+            detail_human(&firing, None, 120_000),
+            format!("{id}\n{diagnostic}")
+        );
+        let distinct = ResultSummary {
+            text: "Partial result".into(),
+            diagnostic: Some("Provider exited with status 1".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            detail_human(&firing, Some(&distinct), 120_000),
+            format!("{id}\n{diagnostic}\nPartial result\nProvider exited with status 1")
+        );
+        let succeeded = Firing {
+            state: FiringState::Succeeded,
+            diagnostic: None,
+            ..firing
+        };
+        let result = ResultSummary {
+            text: "All checks passed".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            detail_human(&succeeded, Some(&result), 120_000),
+            "00000000-0000-0000-0000-000000000001\tSucceeded\nAll checks passed"
+        );
     }
 
     #[test]

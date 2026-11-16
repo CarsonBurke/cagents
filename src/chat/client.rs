@@ -30,10 +30,7 @@ mod append;
 
 const CHAT_ATTACH_TIMEOUT: Duration = Duration::from_secs(70);
 
-pub(crate) fn restore_intent(
-    intent: Intent,
-    policy: crate::instance::WindowRestorePolicy,
-) -> Intent {
+pub fn restore_intent(intent: Intent, policy: crate::instance::WindowRestorePolicy) -> Intent {
     if intent == Intent::Restore && policy == crate::instance::WindowRestorePolicy::ExistingOnly {
         Intent::RestoreExisting
     } else {
@@ -123,6 +120,28 @@ fn frame_read_error(error: ipc::FrameError, timeout: Option<Duration>) -> String
     }
 }
 
+/// A conversation's subagents by the address their provider gives them, each
+/// with the ID the snapshot lists it under. Shared, so a surface can keep a
+/// copy for every frame without copying the addresses.
+pub type AgentAddresses = Arc<BTreeMap<String, String>>;
+
+/// Adds the addresses not yet known, which keep the agent they first named,
+/// and says whether any was.
+fn learn_addresses(known: &mut AgentAddresses, addresses: Vec<super::AgentAddress>) -> bool {
+    let new = addresses
+        .into_iter()
+        .filter(|address| !known.contains_key(&address.address))
+        .collect::<Vec<_>>();
+    if new.is_empty() {
+        return false;
+    }
+    let known = Arc::make_mut(known);
+    for address in new {
+        known.entry(address.address).or_insert(address.subagent);
+    }
+    true
+}
+
 #[derive(Debug, Clone)]
 pub enum Wake {
     Changed,
@@ -134,6 +153,9 @@ pub enum Wake {
     /// The daemon's judgement of the usage limit stopping the conversation
     /// changed; read it with `limit`.
     Limit,
+    /// The daemon said how the provider addresses more of the conversation's
+    /// subagents; read them with `agent_addresses`.
+    AgentAddresses,
     Disconnected(String),
 }
 #[derive(Clone)]
@@ -168,7 +190,7 @@ const TEXT_COPY_TIMEOUT: Duration = Duration::from_secs(40);
 /// hydration and advances while the provider is quiet without relying on the
 /// display machine's wall clock.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct SourceClock {
+pub struct SourceClock {
     sampled_at: u64,
     received_at: Instant,
 }
@@ -192,7 +214,7 @@ impl SourceClock {
         }
     }
 
-    pub(crate) fn now(self) -> u64 {
+    pub fn now(self) -> u64 {
         self.at(Instant::now())
     }
 
@@ -208,7 +230,7 @@ impl SourceClock {
 /// grant-bound attachment. This is deliberately neither serializable nor
 /// constructible from descriptors outside the handshake.
 #[derive(Clone, Debug)]
-pub(crate) struct UpgradeRecovery {
+pub struct UpgradeRecovery {
     sessions: (Session, Session),
     kind: UpgradeRecoveryKind,
 }
@@ -223,7 +245,7 @@ enum UpgradeRecoveryKind {
 impl UpgradeRecovery {
     /// Shape alone authorizes only an exact lineage query, never activation or
     /// persistence. Only the authenticated handshake can produce a witness.
-    pub(crate) fn is_candidate(source: &Session, replacement: &Session) -> bool {
+    pub fn is_candidate(source: &Session, replacement: &Session) -> bool {
         Self::candidate(source, replacement).is_some()
     }
 
@@ -273,14 +295,14 @@ impl UpgradeRecovery {
         })
     }
 
-    pub(crate) fn source(&self) -> &Session {
+    pub fn source(&self) -> &Session {
         &self.sessions.0
     }
-    pub(crate) fn replacement(&self) -> &Session {
+    pub fn replacement(&self) -> &Session {
         &self.sessions.1
     }
 
-    pub(crate) fn validate(&self) -> bool {
+    pub fn validate(&self) -> bool {
         matches!(
             (
                 self.kind,
@@ -318,7 +340,7 @@ struct PublicationPayload {
     // Ready before installation: hide performs no body/metadata derivation.
     // Metadata nodes have no pair and own no body or append authority.
     hidden: Option<Arc<Publication>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     retirement_complete: Mutex<Option<std::sync::mpsc::Sender<std::thread::ThreadId>>>,
 }
 
@@ -362,7 +384,7 @@ struct RetiredPublication {
 impl RetiredPublication {
     fn finish(self: Box<Self>) {
         debug_assert!(self.next.is_none());
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let complete = self
             .payload
             .retirement_complete
@@ -372,7 +394,7 @@ impl RetiredPublication {
         // Snapshot/control vectors, weak lineage and ready metadata ownership
         // all belong to this same node, regardless of the last Arc's thread.
         drop(self);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(complete) = complete {
             let _ = complete.send(thread::current().id());
         }
@@ -400,7 +422,7 @@ impl Publication {
                     resident,
                     lineage,
                     hidden,
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-support"))]
                     retirement_complete: Mutex::new(None),
                 },
                 next: None,
@@ -441,10 +463,12 @@ impl Publication {
 
     fn next(
         base: &Self,
-        snapshot: Snapshot,
+        mut snapshot: Snapshot,
         resident: bool,
         lineage: append::Lineage,
     ) -> Arc<Self> {
+        snapshot.active_model = base.snapshot.active_model.clone();
+        snapshot.active_model_revision = base.snapshot.active_model_revision;
         let mut clock = base.clock;
         SourceClock::observe(&mut clock, snapshot.sampled_at, Instant::now());
         if resident {
@@ -501,6 +525,8 @@ impl Publications {
         final_body: bool,
     ) -> Option<bool> {
         let (base, revision) = self.capture();
+        snapshot.active_model = base.snapshot.active_model.clone();
+        snapshot.active_model_revision = base.snapshot.active_model_revision;
         let mut clock = base.clock;
         if sample_clock {
             SourceClock::observe(&mut clock, snapshot.sampled_at, Instant::now());
@@ -521,6 +547,48 @@ impl Publications {
         #[cfg(test)]
         tests::pause_before_replacement(self as *const Self as usize);
         self.publish(&base, revision, body, Some(full), metadata, final_body)
+    }
+
+    fn active_model(
+        &self,
+        revision: u64,
+        model: Option<super::ActiveModel>,
+        body: &AtomicBool,
+    ) -> bool {
+        loop {
+            let (base, policy_revision) = self.capture();
+            if revision <= base.snapshot.active_model_revision {
+                return false;
+            }
+            let mut snapshot = (*base.snapshot).clone();
+            snapshot.active_model = model.clone();
+            snapshot.active_model_revision = revision;
+            let next = if base.resident {
+                Publication::resident(
+                    snapshot,
+                    base.clock,
+                    base.lineage.clone(),
+                    base.source_thread.clone(),
+                )
+            } else {
+                Publication::owned(
+                    snapshot,
+                    base.clock,
+                    false,
+                    append::Lineage::default(),
+                    None,
+                    base.source_thread.clone(),
+                )
+            };
+            let metadata = next.hidden.as_ref().unwrap_or(&next).clone();
+            let full = base.resident.then_some(next);
+            if self
+                .publish(&base, policy_revision, body, full, metadata, false)
+                .is_some()
+            {
+                return true;
+            }
+        }
     }
 
     /// The connection reader is the only source writer; visibility is a second
@@ -590,6 +658,7 @@ struct InnerPayload {
     observed: Arc<Mutex<OutputObservation>>,
     account_usage: Arc<Mutex<AccountUsage>>,
     limit: Arc<Mutex<Option<crate::agent_execution::directory::UsageLimit>>>,
+    agent_addresses: Arc<Mutex<AgentAddresses>>,
     next: Arc<AtomicU64>,
     alive: Arc<AtomicBool>,
     visible: Arc<AtomicBool>,
@@ -601,7 +670,7 @@ struct InnerPayload {
     text_copies: AtomicUsize,
     visibility_tx: crossbeam_channel::Sender<()>,
     visibility_worker: Mutex<Option<JoinHandle<()>>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     retirement_complete: Option<std::sync::mpsc::Sender<std::thread::ThreadId>>,
 }
 
@@ -675,14 +744,14 @@ impl RetiredClient {
             let _ = worker.join();
         }
         let id = self.payload.id;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let completed = self.payload.retirement_complete.take();
         // Actual publication, codec scratch, pending replies, session metadata
         // and callback ownership all leave the event thread together.
         drop(self);
         tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "chat_client", chat_id = %id,
             released = true, resident_bytes = 0usize);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(completed) = completed {
             let _ = completed.send(std::thread::current().id());
         }
@@ -1178,10 +1247,7 @@ fn native_environment(session: &Session, standalone: bool) -> ipc::ChatExecution
     } else {
         BTreeMap::new()
     };
-    session
-        .launch
-        .recipe
-        .remove_unset_environment(&mut environment);
+    session.launch.recipe.withhold_environment(&mut environment);
     ipc::ChatExecutionEnvironment(environment)
 }
 
@@ -1512,8 +1578,9 @@ impl ClientHandle {
     ///
     /// The peer sockets are kept open for the process lifetime so dropping the
     /// handle does not look like a protocol failure to a test that only draws.
-    #[cfg(test)]
-    pub(crate) fn fixture(session: Session, snapshot: Snapshot) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn fixture(session: Session, snapshot: Snapshot) -> Self {
         let retirement = ClientRetirement::shared().expect("start fixture client retirement");
         let body_requested = Arc::new(AtomicBool::new(true));
         let user_item_seen = snapshot
@@ -1559,6 +1626,7 @@ impl ClientHandle {
                     observed: Arc::new(Mutex::new(OutputObservation::default())),
                     account_usage: Arc::default(),
                     limit: Arc::default(),
+                    agent_addresses: Arc::default(),
                     next: Arc::new(AtomicU64::new(1)),
                     alive: Arc::new(AtomicBool::new(true)),
                     visible: Arc::new(AtomicBool::new(true)),
@@ -1577,8 +1645,9 @@ impl ClientHandle {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn fixture_upgrade(source: Session, session: Session, snapshot: Snapshot) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn fixture_upgrade(source: Session, session: Session, snapshot: Snapshot) -> Self {
         assert!(super::is_upgrade_recovery(&source, &session));
         assert_eq!(snapshot.session_id, session.launch.session_id);
         let proof = session.proof.clone().unwrap();
@@ -1593,8 +1662,9 @@ impl ClientHandle {
     }
 
     /// A started resume successor of the stranded retained card `source`.
-    #[cfg(test)]
-    pub(crate) fn fixture_resumed(source: Session, session: Session, snapshot: Snapshot) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn fixture_resumed(source: Session, session: Session, snapshot: Snapshot) -> Self {
         assert!(super::is_retained_resume_commit(&source, &session));
         let proof = session.proof.clone().unwrap();
         let mut handle = Self::fixture(session, snapshot);
@@ -1605,13 +1675,14 @@ impl ClientHandle {
     }
 
     /// Drives the production connect/lineage/attach path for UI writer tests.
-    #[cfg(test)]
-    pub(crate) fn fixture_upgrade_handshake(
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn fixture_upgrade_handshake(
         source: Session,
         session: Session,
         snapshot: Snapshot,
     ) -> Result<Self, StartFailure> {
-        tests::restore_with_lineage(source, Some(session), move |request| {
+        fixture::restore_with_lineage(source, Some(session), move |request| {
             let ClientRequest::ChatAttach { session } = request else {
                 panic!("expected exact upgrade attach");
             };
@@ -1623,8 +1694,9 @@ impl ClientHandle {
 
     /// Test-only access to the real start handshake and reader on a private
     /// socket. It never discovers a daemon or launches a provider.
-    #[cfg(test)]
-    pub(crate) fn fixture_start_on(
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn fixture_start_on(
         stream: UnixStream,
         session: Session,
         wake: impl Fn(Wake) + Send + Sync + 'static,
@@ -1644,16 +1716,18 @@ impl ClientHandle {
 
     /// Publishes `snapshot` as the reader thread would on a presentation
     /// frame, so a test can stream a transcript into a surface.
-    #[cfg(test)]
-    pub(crate) fn publish_snapshot_for_test(&self, snapshot: Snapshot) {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn publish_snapshot_for_test(&self, snapshot: Snapshot) {
         self.install_snapshot_for_test(snapshot);
     }
 
     /// Apply a fixture publication through the production delta validator and
     /// append-lineage recorder. A full-snapshot fixture intentionally resets
     /// that lineage and cannot stand in for a streaming delta benchmark.
-    #[cfg(test)]
-    pub(crate) fn publish_presentation_for_test(&self, update: super::presentation::Presentation) {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn publish_presentation_for_test(&self, update: super::presentation::Presentation) {
         let (base, revision) = self.inner.publication.capture();
         let mut lineage = base.lineage.clone();
         let candidates = append::Lineage::candidates(&update, &base.snapshot);
@@ -1676,8 +1750,9 @@ impl ClientHandle {
     /// Build normal daemon-style deltas while retaining the production
     /// transaction validator and weak append authority. Full reset fixtures
     /// deliberately keep using publish_snapshot_for_test instead.
-    #[cfg(test)]
-    pub(crate) fn publish_delta_snapshot_for_test(&self, mut next: Snapshot) {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn publish_delta_snapshot_for_test(&self, mut next: Snapshot) {
         use super::presentation::{ChildUpdate, ItemChange, Presentation};
         let previous = self.snapshot();
         let changes = |old: &[Arc<super::Item>], items: &[Arc<super::Item>]| {
@@ -1726,8 +1801,9 @@ impl ClientHandle {
 
     /// Queues a report as the reader thread would on its arrival, and says
     /// whether it would have woken the surface.
-    #[cfg(test)]
-    pub(crate) fn push_account_usage_for_test(&self, report: LiveReport, observed_at: u64) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn push_account_usage_for_test(&self, report: LiveReport, observed_at: u64) -> bool {
         self.inner
             .account_usage
             .lock()
@@ -1735,10 +1811,26 @@ impl ClientHandle {
             .push(report, observed_at)
     }
 
+    /// Records the subagent addresses the daemon sent as the reader thread
+    /// would on their arrival.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn learn_agent_addresses_for_test(&self, addresses: Vec<super::AgentAddress>) {
+        learn_addresses(
+            &mut self
+                .inner
+                .agent_addresses
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
+            addresses,
+        );
+    }
+
     /// Records the daemon's judgement of a usage limit as the reader thread
     /// would on its arrival.
-    #[cfg(test)]
-    pub(crate) fn judge_limit_for_test(
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn judge_limit_for_test(
         &self,
         limit: Option<crate::agent_execution::directory::UsageLimit>,
     ) {
@@ -1747,8 +1839,9 @@ impl ClientHandle {
 
     /// Records an activity edge as the reader thread would, and says whether
     /// it would have woken the surface.
-    #[cfg(test)]
-    pub(crate) fn observe_activity_for_test(&self, state: ActivityState) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn observe_activity_for_test(&self, state: ActivityState) -> bool {
         let mut activity = self
             .inner
             .activity
@@ -1759,36 +1852,41 @@ impl ClientHandle {
     }
 
     /// Whether the handle has asked its daemon to keep the snapshot current.
-    #[cfg(test)]
-    pub(crate) fn is_visible_for_test(&self) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn is_visible_for_test(&self) -> bool {
         self.inner.visible.load(Ordering::Acquire)
     }
 
     /// Marks the connection lost, as the reader thread does when its daemon
     /// goes away.
-    #[cfg(test)]
-    pub(crate) fn disconnect_for_test(&self) {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn disconnect_for_test(&self) {
         self.inner.alive.store(false, Ordering::Release);
     }
 
     /// Deliver a full snapshot the way the reader thread takes a daemon's
     /// `ChatSnapshot` reply, sharing unchanged items with a kept body.
-    #[cfg(test)]
-    pub(crate) fn deliver_snapshot_for_test(&self, snapshot: Snapshot) {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn deliver_snapshot_for_test(&self, snapshot: Snapshot) {
         self.inner
             .publication
             .replace(snapshot, &self.inner.body_requested, false, false);
     }
 
-    #[cfg(test)]
-    pub(crate) fn replace_snapshot_for_test(&self, snapshot: Snapshot) {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn replace_snapshot_for_test(&self, snapshot: Snapshot) {
         self.install_snapshot_for_test(snapshot);
     }
 
     /// Observe disposal of this exact publication, independently of the UI's
     /// presentation reclaimer. The signal follows destruction of its payload.
-    #[cfg(test)]
-    pub(crate) fn observe_snapshot_retirement_for_test(
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn observe_snapshot_retirement_for_test(
         &self,
     ) -> std::sync::mpsc::Receiver<std::thread::ThreadId> {
         let (completed, observed) = std::sync::mpsc::channel();
@@ -1950,7 +2048,7 @@ impl ClientHandle {
         Self::connect_upgrade_with_intent(source, expected, Intent::Restore, wake)
     }
 
-    pub(crate) fn connect_upgrade_with_intent(
+    pub fn connect_upgrade_with_intent(
         source: Session,
         expected: Session,
         intent: Intent,
@@ -2300,7 +2398,9 @@ impl ClientHandle {
         let mut early_observed = OutputObservation::default();
         let mut early_usage = AccountUsage::default();
         let mut early_limit = None;
-        let (session, initial) = loop {
+        let mut early_addresses = AgentAddresses::default();
+        let mut early_model = None;
+        let (session, mut initial) = loop {
             #[cfg(feature = "ui")]
             let health_request = crate::daemon_health::begin();
             let frame = codec.read(&mut stream);
@@ -2338,6 +2438,18 @@ impl ClientHandle {
                 {
                     early_observed.observe(epoch);
                 }
+                ServerMessage::ChatActiveModel {
+                    chat_id,
+                    revision,
+                    model,
+                } if chat_id == id && envelope.request_id.is_none() => {
+                    if early_model
+                        .as_ref()
+                        .is_none_or(|(known, _)| *known < revision)
+                    {
+                        early_model = Some((revision, model));
+                    }
+                }
                 ServerMessage::ChatAccountUsage {
                     chat_id,
                     report,
@@ -2349,6 +2461,11 @@ impl ClientHandle {
                     if chat_id == id && envelope.request_id.is_none() =>
                 {
                     early_limit = limit;
+                }
+                ServerMessage::ChatAgentAddresses { chat_id, addresses }
+                    if chat_id == id && envelope.request_id.is_none() =>
+                {
+                    learn_addresses(&mut early_addresses, addresses);
                 }
                 ServerMessage::Response {
                     response: ServerResponse::ChatAttached { session, snapshot },
@@ -2373,6 +2490,10 @@ impl ClientHandle {
                 _ => return Err("Daemon did not attach the exact native chat".into()),
             }
         };
+        if let Some((revision, model)) = early_model {
+            initial.active_model_revision = revision;
+            initial.active_model = model;
+        }
         let upgrade_recovery = upgrade_recovery
             .map(|(source, resolved)| {
                 UpgradeRecovery::confirmed(source, resolved, &session, &initial)
@@ -2401,6 +2522,7 @@ impl ClientHandle {
         let observed = Arc::new(Mutex::new(early_observed));
         let account_usage = Arc::new(Mutex::new(early_usage));
         let limit = Arc::new(Mutex::new(early_limit));
+        let agent_addresses = Arc::new(Mutex::new(early_addresses));
         // Attachment also serves non-UI callers that inspect the initial
         // publication directly. The UI immediately sets its actual visibility;
         // an unvisited hidden pane releases this body without preparing it.
@@ -2437,6 +2559,7 @@ impl ClientHandle {
                 observed: observed.clone(),
                 account_usage: account_usage.clone(),
                 limit: limit.clone(),
+                agent_addresses: agent_addresses.clone(),
                 next: next.clone(),
                 alive: alive.clone(),
                 wake: wake.clone(),
@@ -2448,7 +2571,7 @@ impl ClientHandle {
                 text_copies: AtomicUsize::new(0),
                 visibility_tx,
                 visibility_worker: Mutex::new(None),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 retirement_complete: None,
             },
             retirement,
@@ -2604,6 +2727,9 @@ impl ClientHandle {
                             .observe(generation, state);
                         if changed { wake(Wake::Activity); }
                     },
+                    ServerMessage::ChatActiveModel { chat_id, revision, model } if chat_id == id => {
+                        if publication.active_model(revision, model, &body_requested) { wake(Wake::Changed); }
+                    },
                     ServerMessage::ChatAccountUsage { chat_id, report, observed_at } if chat_id == id => {
                         let first = account_usage.lock().unwrap_or_else(|p| p.into_inner())
                             .push(report, observed_at);
@@ -2617,6 +2743,13 @@ impl ClientHandle {
                             changed
                         };
                         if changed { wake(Wake::Limit); }
+                    },
+                    ServerMessage::ChatAgentAddresses { chat_id, addresses } if chat_id == id => {
+                        let learned = learn_addresses(
+                            &mut agent_addresses.lock().unwrap_or_else(|p| p.into_inner()),
+                            addresses,
+                        );
+                        if learned { wake(Wake::AgentAddresses); }
                     },
                     ServerMessage::Response { response: ServerResponse::ChatSnapshot { chat_id, snapshot: update } } if chat_id == id => {
                         read_pending = false;
@@ -2766,10 +2899,10 @@ impl ClientHandle {
     }
     /// The identity negotiated by ChatAttached, before snapshot projection.
     /// A read-only reader cannot move to another conversation after attachment.
-    pub(crate) fn attached_session_id(&self) -> Option<&str> {
+    pub fn attached_session_id(&self) -> Option<&str> {
         self.inner.session.launch.session_id.as_deref()
     }
-    pub(crate) fn upgrade_recovery(&self) -> Option<&(Session, Session)> {
+    pub fn upgrade_recovery(&self) -> Option<&(Session, Session)> {
         self.inner
             .upgrade_recovery
             .as_ref()
@@ -2777,13 +2910,13 @@ impl ClientHandle {
     }
     /// The saved card whose stranded retained owner this successor replaces,
     /// when the daemon proved that owner gone and prepared a resume.
-    pub(crate) fn resumed_from(&self) -> Option<&Session> {
+    pub fn resumed_from(&self) -> Option<&Session> {
         self.inner.resumed_from.as_ref()
     }
-    pub(crate) fn authenticated_upgrade_recovery(&self) -> Option<&UpgradeRecovery> {
+    pub fn authenticated_upgrade_recovery(&self) -> Option<&UpgradeRecovery> {
         self.inner.upgrade_recovery.as_ref()
     }
-    pub(crate) fn is_connected(&self) -> bool {
+    pub fn is_connected(&self) -> bool {
         self.inner.alive.load(Ordering::Acquire)
     }
 
@@ -2797,9 +2930,7 @@ impl ClientHandle {
 
     /// Control metadata for a hidden runtime, without borrowing its body.
     /// A disconnected client's final publication must remain readable instead.
-    pub(crate) fn hidden_snapshot_with_clock(
-        &self,
-    ) -> Option<(Arc<Snapshot>, Option<SourceClock>)> {
+    pub fn hidden_snapshot_with_clock(&self) -> Option<(Arc<Snapshot>, Option<SourceClock>)> {
         let (mut snapshot, clock) = self.snapshot_with_clock();
         if !self.inner.alive.load(Ordering::Acquire) {
             return None;
@@ -2808,29 +2939,27 @@ impl ClientHandle {
         Some((snapshot, clock))
     }
 
-    pub(crate) fn has_observed_user_item(&self) -> bool {
+    pub fn has_observed_user_item(&self) -> bool {
         self.inner.user_item_seen.load(Ordering::Acquire)
     }
 
     /// A prompt receipt can precede its first transcript publication. Either
     /// authenticated observation forbids offering that prompt as an unsent draft.
-    pub(crate) fn has_accepted_user_input(&self) -> bool {
+    pub fn has_accepted_user_input(&self) -> bool {
         self.has_observed_user_item() || self.inner.prompt_accepted.load(Ordering::Acquire)
     }
 
     /// A renderable publication, absent until a hidden client's full history
     /// has been rehydrated. Metadata-only generations must never clear a
     /// runtime's scroll/disclosure state as if they were empty conversations.
-    pub(crate) fn resident_snapshot_with_clock(
-        &self,
-    ) -> Option<(Arc<Snapshot>, Option<SourceClock>)> {
+    pub fn resident_snapshot_with_clock(&self) -> Option<(Arc<Snapshot>, Option<SourceClock>)> {
         let state = self.inner.publication.current.load();
         state
             .resident
             .then(|| (state.snapshot.clone(), state.clock))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn install_snapshot_for_test(&self, update: Snapshot) {
         self.inner.user_item_seen.fetch_or(
             update
@@ -2860,6 +2989,15 @@ impl ClientHandle {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         activity.take()
+    }
+    /// How the provider addresses this conversation's subagents, by address,
+    /// with the ID its snapshot lists each under.
+    pub fn agent_addresses(&self) -> AgentAddresses {
+        self.inner
+            .agent_addresses
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
     /// The usage limit that stops this conversation, as the daemon last
     /// judged it.
@@ -3078,11 +3216,7 @@ impl ClientHandle {
             command,
         })
     }
-    pub(crate) fn known_append(
-        &self,
-        previous: &Arc<super::Item>,
-        current: &Arc<super::Item>,
-    ) -> bool {
+    pub fn known_append(&self, previous: &Arc<super::Item>, current: &Arc<super::Item>) -> bool {
         self.inner
             .publication
             .current
@@ -3097,7 +3231,7 @@ impl ClientHandle {
 
     /// Keep control notifications flowing for queued commands without keeping
     /// renderable history resident in an offscreen UI card.
-    pub(crate) fn set_interest(&self, interested: bool, retain_body: bool) -> Result<(), String> {
+    pub fn set_interest(&self, interested: bool, retain_body: bool) -> Result<(), String> {
         if !self.inner.alive.load(Ordering::Acquire) {
             return Err("Chat is disconnected".into());
         }
@@ -3303,9 +3437,214 @@ impl Drop for Inner {
     }
 }
 
+/// Daemon handshakes for chat-client tests here and in the UI crate.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod fixture {
+    use super::*;
+
+    pub fn host_proof(incarnation: &str) -> HostSessionProof {
+        use crate::model::{BootId, HostIncarnation, HostSessionId};
+        HostSessionProof {
+            host_session_id: HostSessionId::new("session"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new(incarnation),
+        }
+    }
+
+    pub fn restore_with_lineage(
+        session: Session,
+        resolved: Option<Session>,
+        answer: impl FnOnce(ClientRequest) -> ServerMessage + Send + 'static,
+    ) -> Result<ClientHandle, StartFailure> {
+        use crate::terminal_ipc::{ProtocolError, ProtocolErrorCode};
+        let live = resolved
+            .as_ref()
+            .and_then(|session| session.proof.clone())
+            .unwrap_or_else(|| host_proof("live"));
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let proof = live.clone();
+        let worker = thread::spawn(move || {
+            server
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            server
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            let respond = |codec: &mut FrameCodec, server: &mut UnixStream, id, message| {
+                codec
+                    .write(
+                        server,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: Some(id),
+                            proof: proof.clone(),
+                            message,
+                        },
+                    )
+                    .unwrap();
+            };
+            let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            respond(
+                &mut codec,
+                &mut server,
+                connect.request_id,
+                ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: proof.clone(),
+                        resumed: Vec::new(),
+                    },
+                },
+            );
+            let lineage: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            respond(
+                &mut codec,
+                &mut server,
+                lineage.request_id,
+                resolved.map_or_else(
+                    || {
+                        ServerMessage::Error(ProtocolError::new(
+                            ProtocolErrorCode::TerminalUnavailable,
+                            "No durable upgrade replacement exists for this native chat",
+                            false,
+                        ))
+                    },
+                    |session| ServerMessage::Response {
+                        response: ServerResponse::UpgradeChatResolved { session },
+                    },
+                ),
+            );
+            let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            respond(
+                &mut codec,
+                &mut server,
+                start.request_id,
+                answer(start.request),
+            );
+        });
+        let result = ClientHandle::connect_on(
+            client,
+            session,
+            Intent::Restore,
+            None,
+            false,
+            None,
+            None,
+            None,
+            |_| {},
+        );
+        worker.join().unwrap();
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::fixture::{host_proof, restore_with_lineage};
     use super::*;
+
+    #[test]
+    fn active_model_sidechannel_survives_snapshots_patches_and_hidden_publications() {
+        let publications = Publications::new(Snapshot {
+            generation: 4,
+            ..Snapshot::default()
+        });
+        let body = AtomicBool::new(true);
+        let model = super::super::ActiveModel {
+            id: "actual".into(),
+            label: "Actual model".into(),
+            reasoning: Some("high".into()),
+            default_reasoning: Some("medium".into()),
+            aliases: Vec::new(),
+        };
+        assert!(publications.active_model(2, Some(model.clone()), &body));
+        assert!(
+            !publications.active_model(1, None, &body),
+            "late attach status cannot rewind a live update"
+        );
+        assert_eq!(
+            publications.replace(
+                Snapshot {
+                    generation: 5,
+                    ..Snapshot::default()
+                },
+                &body,
+                false,
+                false
+            ),
+            Some(true)
+        );
+        let base = publications.current.load_full();
+        assert_eq!(base.snapshot.active_model.as_ref(), Some(&model));
+        assert_eq!(base.snapshot.active_model_revision, 2);
+        let patch = Publication::next(
+            &base,
+            Snapshot {
+                generation: 6,
+                ..Snapshot::default()
+            },
+            true,
+            append::Lineage::default(),
+        );
+        assert_eq!(patch.snapshot.active_model.as_ref(), Some(&model));
+        body.store(false, Ordering::Release);
+        assert!(publications.active_model(3, None, &body));
+        assert!(!publications.current.load().resident);
+        assert!(publications.current.load().snapshot.active_model.is_none());
+        assert!(publications.active_model(4, Some(model.clone()), &body));
+        assert_eq!(
+            publications.current.load().snapshot.active_model.as_ref(),
+            Some(&model)
+        );
+        assert_eq!(
+            publications.replace(
+                Snapshot {
+                    generation: 7,
+                    ..Snapshot::default()
+                },
+                &body,
+                false,
+                false
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            publications.current.load().snapshot.active_model.as_ref(),
+            Some(&model)
+        );
+    }
+
+    /// The daemon tells a surface every address it knows, as it learns one
+    /// and once on attaching, in whichever order those arrive.
+    #[test]
+    fn agent_addresses_accumulate_in_any_order_they_arrive() {
+        let address = |address: &str, subagent: &str| super::super::AgentAddress {
+            address: address.into(),
+            subagent: subagent.into(),
+        };
+        let mut known = AgentAddresses::default();
+        let shared = known.clone();
+        assert!(learn_addresses(
+            &mut known,
+            vec![
+                address("a1892b93e88999a7d", "toolu_relocate"),
+                address("a77f00d1e2b3c4d5a", "toolu_review"),
+            ]
+        ));
+        // The copy a frame holds is not changed under it.
+        assert!(shared.is_empty());
+        let learned = known.clone();
+        // An older list, sent on attaching after a newer one, adds nothing,
+        // and an address keeps the agent it first named.
+        assert!(!learn_addresses(
+            &mut known,
+            vec![address("a1892b93e88999a7d", "toolu_other")]
+        ));
+        assert!(Arc::ptr_eq(&known, &learned), "nothing new is not a change");
+        assert_eq!(known["a1892b93e88999a7d"], "toolu_relocate");
+        assert_eq!(known.len(), 2);
+    }
 
     static REPLACEMENT_GATES: Mutex<
         BTreeMap<usize, (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
@@ -3905,15 +4244,6 @@ mod tests {
         assert!(!activity.observe(8, ActivityState::Idle));
         assert!(activity.observe(9, ActivityState::Working));
         assert_eq!(activity.take(), ActivityState::Working);
-    }
-
-    fn host_proof(incarnation: &str) -> HostSessionProof {
-        use crate::model::{BootId, HostIncarnation, HostSessionId};
-        HostSessionProof {
-            host_session_id: HostSessionId::new("session"),
-            boot_id: BootId::new("boot"),
-            host_incarnation: HostIncarnation::new(incarnation),
-        }
     }
 
     /// The live installation's own card: a native OMP conversation whose
@@ -5131,92 +5461,6 @@ mod tests {
         answer: impl FnOnce(ClientRequest) -> ServerMessage + Send + 'static,
     ) -> Result<ClientHandle, StartFailure> {
         restore_with_lineage(session, None, answer)
-    }
-
-    pub(super) fn restore_with_lineage(
-        session: Session,
-        resolved: Option<Session>,
-        answer: impl FnOnce(ClientRequest) -> ServerMessage + Send + 'static,
-    ) -> Result<ClientHandle, StartFailure> {
-        use crate::terminal_ipc::{ProtocolError, ProtocolErrorCode};
-        let live = resolved
-            .as_ref()
-            .and_then(|session| session.proof.clone())
-            .unwrap_or_else(|| host_proof("live"));
-        let (client, mut server) = UnixStream::pair().unwrap();
-        let proof = live.clone();
-        let worker = thread::spawn(move || {
-            server
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            server
-                .set_write_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
-            let respond = |codec: &mut FrameCodec, server: &mut UnixStream, id, message| {
-                codec
-                    .write(
-                        server,
-                        &ServerEnvelope {
-                            version: PROTOCOL_VERSION,
-                            request_id: Some(id),
-                            proof: proof.clone(),
-                            message,
-                        },
-                    )
-                    .unwrap();
-            };
-            let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
-            respond(
-                &mut codec,
-                &mut server,
-                connect.request_id,
-                ServerMessage::Response {
-                    response: ServerResponse::Connected {
-                        proof: proof.clone(),
-                        resumed: Vec::new(),
-                    },
-                },
-            );
-            let lineage: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
-            respond(
-                &mut codec,
-                &mut server,
-                lineage.request_id,
-                resolved.map_or_else(
-                    || {
-                        ServerMessage::Error(ProtocolError::new(
-                            ProtocolErrorCode::TerminalUnavailable,
-                            "No durable upgrade replacement exists for this native chat",
-                            false,
-                        ))
-                    },
-                    |session| ServerMessage::Response {
-                        response: ServerResponse::UpgradeChatResolved { session },
-                    },
-                ),
-            );
-            let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
-            respond(
-                &mut codec,
-                &mut server,
-                start.request_id,
-                answer(start.request),
-            );
-        });
-        let result = ClientHandle::connect_on(
-            client,
-            session,
-            Intent::Restore,
-            None,
-            false,
-            None,
-            None,
-            None,
-            |_| {},
-        );
-        worker.join().unwrap();
-        result
     }
 
     #[test]

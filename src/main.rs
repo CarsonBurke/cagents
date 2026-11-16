@@ -9,8 +9,11 @@ cagents::refuse_filtered_test_run!();
 // daemon install both (see `instance::install_panic_hook`) because their
 // spawners redirect those descriptors to /dev/null.
 fn main() -> std::process::ExitCode {
-    // SAFETY: first statement of main, before any thread exists. A daemon or
+    // SAFETY: first statements of main, before any thread exists. A daemon or
     // window this command starts inherits its environment.
-    unsafe { cagents::account::detach_inherited_selections() };
+    unsafe {
+        cagents::account::detach_inherited_selections();
+        cagents::agent::detach_session_environment();
+    }
     cagents::control::run_from(std::env::args_os())
 }

@@ -352,6 +352,11 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(handle.snapshot().scroll.total >= 101);
+        // Published rows do not mean the worker is settled: it can still hold
+        // a later change back for redraw credit, and the next viewport read
+        // would capture it as a new generation. A read is ordered after every
+        // queued command and replies only once nothing is withheld.
+        handle.viewport_snapshot(Some(0), None, true).unwrap();
         (
             Arc::new(crate::host::state::HostLock::new(state)),
             handle,
@@ -542,6 +547,9 @@ mod tests {
     }
     #[test]
     fn continuously_dirty_output_keeps_two_custom_viewports_responsive() {
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
         let (host, handle, id, _dir) = fixture_with(
             r#"i=1; while :; do printf 'ROW-%03d\n' "$i"; i=$((i+1)); sleep 0.005; done"#,
         );
@@ -571,7 +579,11 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(5));
         }
-        assert!(started.elapsed() < Duration::from_secs(3));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "60 viewport reads took {elapsed:?}"
+        );
         handle.shutdown().unwrap();
     }
 }

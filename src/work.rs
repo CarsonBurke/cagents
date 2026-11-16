@@ -467,6 +467,8 @@ pub struct Checks {
     pub passed: u32,
     pub failed: u32,
     pub pending: u32,
+    pub cancelled: u32,
+    pub skipped: u32,
 }
 
 impl Checks {
@@ -475,8 +477,12 @@ impl Checks {
             Some(CheckOutcome::Failing)
         } else if self.pending > 0 {
             Some(CheckOutcome::Pending)
+        } else if self.cancelled > 0 {
+            Some(CheckOutcome::Cancelled)
         } else if self.passed > 0 {
             Some(CheckOutcome::Passing)
+        } else if self.skipped > 0 {
+            Some(CheckOutcome::Skipped)
         } else {
             None
         }
@@ -489,6 +495,8 @@ pub enum CheckOutcome {
     Passing,
     Pending,
     Failing,
+    Cancelled,
+    Skipped,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -541,8 +549,8 @@ impl Relation {
 }
 
 /// The pull requests one conversation's agents and user worked on or
-/// mentioned, read from its transcript rather than declared, with what the
-/// forge last said about each.
+/// mentioned, and the worktrees they edited, read from its transcript rather
+/// than declared, with what the forge last said about each pull request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConversationPullRequests {
     pub generated_at_unix_ms: u64,
@@ -555,6 +563,63 @@ pub struct ConversationPullRequests {
     /// Why some pull requests could not be read from GitHub, which then
     /// show what was last read about them.
     pub forge_error: Option<String>,
+    /// The project's worktrees the conversation edited files in, most
+    /// recently edited first.
+    #[serde(default)]
+    pub worktrees: Vec<ConversationWorktree>,
+}
+
+/// A worktree of the conversation's project that its agents edited.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationWorktree {
+    pub path: std::path::PathBuf,
+    /// The branch checked out there when the list was built.
+    pub branch: Option<String>,
+    /// Every edit there came from a subagent the conversation started.
+    pub by_subagent: bool,
+    /// Uncommitted changed paths, untracked ones included; `None` until the
+    /// worktree's status has been read.
+    #[serde(default)]
+    pub changed_paths: Option<u32>,
+    /// Lines its uncommitted changes to tracked files add and remove.
+    #[serde(default)]
+    pub diff: Option<DiffStat>,
+    /// The number of the listed pull request, in the list's repository, that
+    /// its branch heads and the conversation worked on: the same work, which
+    /// the list shows once.
+    #[serde(default)]
+    pub pull_request: Option<u64>,
+}
+
+/// Lines a change adds and removes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffStat {
+    pub additions: u64,
+    pub deletions: u64,
+}
+
+/// One check on a pull request's head, as GitHub buckets it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Check {
+    pub name: String,
+    /// The workflow it belongs to, when GitHub names one.
+    pub workflow: String,
+    pub state: CheckState,
+    /// Its details page.
+    pub url: String,
+}
+
+/// Ordered from what most needs attention: a failure, then a check still
+/// running, then a cancelled one, which leaves its pull request unproven
+/// though nothing failed, then passes and skips.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckState {
+    Failed,
+    Pending,
+    Cancelled,
+    Passed,
+    Skipped,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -569,6 +634,12 @@ pub struct ConversationPullRequest {
     /// What GitHub last said; `None` until it has answered once.
     pub pull_request: Option<PullRequest>,
     pub observed_at_unix_ms: Option<u64>,
+    /// Lines the pull request adds and removes, when GitHub said.
+    #[serde(default)]
+    pub diff: Option<DiffStat>,
+    /// Its head's checks, failing first, when GitHub listed them.
+    #[serde(default)]
+    pub checks: Vec<Check>,
 }
 
 impl ConversationPullRequest {
@@ -851,6 +922,26 @@ mod tests {
             title: None,
             state,
         }
+    }
+
+    #[test]
+    fn checks_keep_cancelled_and_skipped_distinct_in_outcomes_and_on_the_wire() {
+        let mut checks = Checks {
+            skipped: 1,
+            ..Default::default()
+        };
+        assert_eq!(checks.outcome(), Some(CheckOutcome::Skipped));
+        checks.passed = 2;
+        assert_eq!(checks.outcome(), Some(CheckOutcome::Passing));
+        checks.cancelled = 3;
+        assert_eq!(checks.outcome(), Some(CheckOutcome::Cancelled));
+        checks.pending = 4;
+        assert_eq!(checks.outcome(), Some(CheckOutcome::Pending));
+        checks.failed = 5;
+        assert_eq!(checks.outcome(), Some(CheckOutcome::Failing));
+        let bytes = postcard::to_allocvec(&checks).unwrap();
+        assert_eq!(postcard::from_bytes::<Checks>(&bytes).unwrap(), checks);
+        assert_eq!(Checks::default().outcome(), None);
     }
 
     #[test]

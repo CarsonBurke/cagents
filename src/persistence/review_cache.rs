@@ -3,7 +3,7 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use super::{StateStore, ensure_open};
 use crate::{
     github::PullRequestKey,
-    pull_request_review::cache::{self, Snapshot, Store},
+    review_cache::{self as cache, Snapshot, Store},
 };
 
 impl Store for StateStore {
@@ -265,7 +265,7 @@ mod tests {
             let mut snapshot = cache::fixture();
             snapshot.key.number = number;
             snapshot.range.number = number;
-            snapshot.pull_request = crate::pull_request_review::tests::pull_request(number);
+            snapshot.pull_request = crate::github::fixture_pull_request(number);
             snapshot.saved_ms = 10_000 + number;
             snapshot
         };
@@ -344,7 +344,7 @@ mod tests {
         let mut other = original.clone();
         other.key.number = 2;
         other.range.number = 2;
-        other.pull_request = crate::pull_request_review::tests::pull_request(2);
+        other.pull_request = crate::github::fixture_pull_request(2);
         assert!(store.save(&other, &cache::WriteOrder::fixture(2)).is_err());
         assert_eq!(store.load(&original.key).unwrap(), Some(original.clone()));
         assert!(store.load(&other.key).unwrap().is_none());
@@ -401,7 +401,7 @@ mod tests {
             let mut snapshot = cache::fixture();
             snapshot.key.number = number;
             snapshot.range.number = number;
-            snapshot.pull_request = crate::pull_request_review::tests::pull_request(number);
+            snapshot.pull_request = crate::github::fixture_pull_request(number);
             snapshot.saved_ms = number;
             store
                 .save(&snapshot, &cache::WriteOrder::fixture(number))

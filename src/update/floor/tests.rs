@@ -497,6 +497,7 @@ fn job(directory: &Path) -> UpdateJob {
         message: String::new(),
         log_path: directory.join("worker.log"),
         confirmation: None,
+        refusal: None,
     };
     let file = private_create(&directory.join(format!("{}.request", job.id))).unwrap();
     serde_json::to_writer(
@@ -829,7 +830,8 @@ listener.bind(sys.argv[2]);listener.listen()
     let saved: UpdateJob =
         serde_json::from_slice(&fs::read(state.join("status.json")).unwrap()).unwrap();
     assert_eq!(saved.phase, UpdatePhase::Failed);
-    assert_eq!(saved.message, error);
+    // The original failure leads; the recovery instruction follows it.
+    assert_eq!(saved.message, format!("{original} {error}"));
     assert!(
         !marker.exists(),
         "Prepared must never reach ordinary daemon start"
@@ -1578,7 +1580,10 @@ fn changed_or_expired_shutdown_consent_is_reasked_before_any_record_or_action() 
         );
         submit(directory.path(), &renewed, UpdateChoice::Cancel);
         let (result, source) = finish(worker);
-        assert!(matches!(result, Err(UpdateError::Cancelled)));
+        assert!(
+            matches!(&result, Err(UpdateError::Refused(refusal)) if !refusal.blockers.is_empty()),
+            "declining the stop list records what held the update back: {result:?}"
+        );
         assert_eq!(source.close_attempts, 0);
         assert_eq!(source.retain_attempts, 0);
         assert!(
@@ -1662,8 +1667,8 @@ fn cancel_at_ordinary_review_wait_policy_review_or_stop_ends_nothing() {
         submit(directory.path(), &published, UpdateChoice::Cancel);
         let (result, source) = finish(worker);
         assert!(
-            matches!(result, Err(UpdateError::Cancelled)),
-            "{prompt}: {result:?}"
+            matches!(&result, Err(UpdateError::Refused(refusal)) if !refusal.sessions.is_empty()),
+            "closing a blocked {prompt} review records what held the update back: {result:?}"
         );
         assert_no_destructive_actions(&source);
     }

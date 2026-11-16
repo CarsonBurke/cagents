@@ -1,7 +1,6 @@
-//! Automatic retirement must exercise the production retained Claude owner.
+//! Private retained Claude fixtures and automatic retirement contracts.
 use super::*;
 
-const TEST: &str = "host::agent_execution::tests::retained_automation::completed_retained_automation_retires_only_after_exact_idle_close";
 const MODE: &str = "CAGENTS_RETAINED_AUTOMATION_TEST";
 const SCOPE: &str = "CAGENTS_RETAINED_AUTOMATION_AUTHORITY_PRESENCE";
 
@@ -13,10 +12,9 @@ fn wait_until(mut condition: impl FnMut() -> bool, reason: &str) {
     }
 }
 
-#[test]
-fn completed_retained_automation_retires_only_after_exact_idle_close() {
+pub(super) fn isolated_retained() -> bool {
     if crate::retained_fixture::run_isolated() {
-        return;
+        return true;
     }
     if std::env::var(MODE).as_deref() != Ok("fixture") {
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
@@ -50,7 +48,11 @@ fn completed_retained_automation_retires_only_after_exact_idle_close() {
             }
         }
         let output = command
-            .args(["--exact", TEST, "--nocapture"])
+            .args([
+                "--exact",
+                std::thread::current().name().unwrap(),
+                "--nocapture",
+            ])
             .envs(crate::retained_fixture::owner_env())
             .env(MODE, "fixture")
             .env(
@@ -82,7 +84,7 @@ fn completed_retained_automation_retires_only_after_exact_idle_close() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
-        return;
+        return true;
     }
 
     let inherited = match std::env::var(SCOPE).as_deref() {
@@ -95,6 +97,15 @@ fn completed_retained_automation_retires_only_after_exact_idle_close() {
         inherited,
         "retained automation child lost its inherited authority scope"
     );
+    false
+}
+
+#[test]
+fn completed_retained_automation_retires_only_after_exact_idle_close() {
+    if isolated_retained() {
+        return;
+    }
+    let inherited = Authority::from_environment() != Authority::default();
     let (host, request, path) = fixture();
     if inherited {
         assert!(

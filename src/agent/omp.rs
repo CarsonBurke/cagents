@@ -18,6 +18,21 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
     session_directory: "sessions",
     activity_from_title,
     identity_options: &["--resume", "-r"],
+    // What Omp exports to the commands a session runs: its tool bridge,
+    // evaluation and artifact scope, and the session and agent identity.
+    session_environment: |name| {
+        [
+            "PI_TOOL_BRIDGE_",
+            "PI_EVAL_",
+            "PI_SESSION_",
+            "PI_AGENT_",
+            "OMP_SESSION_",
+            "OMP_AGENT_",
+        ]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+            || name == "PI_ARTIFACTS_DIR"
+    },
     cwd_options: &["--cwd"],
     value_options: &[
         "--profile",
