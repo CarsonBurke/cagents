@@ -64,13 +64,13 @@ impl MemberState {
         }
     }
 
-    fn label(self) -> Option<&'static str> {
+    fn label(self) -> &'static str {
         match self {
-            Self::Working => Some("working"),
-            Self::Waiting => Some("waiting for input"),
-            Self::Limited => Some("stopped by a usage limit"),
-            Self::Idle => Some("idle"),
-            Self::Running => None,
+            Self::Working => "working",
+            Self::Waiting => "waiting for input",
+            Self::Limited => "stopped by a usage limit",
+            Self::Idle => "idle",
+            Self::Running => "running",
         }
     }
 }
@@ -143,7 +143,7 @@ impl Members {
         let mut parts = Vec::new();
         for (member, count) in self.groups() {
             let (name, state) = match member {
-                Member::Agent(provider, state) => (provider.label(), state.label()),
+                Member::Agent(provider, state) => (provider.label(), Some(state.label())),
                 Member::Terminal => ("Terminal", None),
             };
             let name = if count == 1 {
@@ -189,9 +189,11 @@ const BOX: f32 = super::ROW_ICON_WIDTH;
 const LEAD: f32 = 15.0;
 /// The terminal glyph is a symbolic glyph like the channel glyph it replaces.
 const TERMINAL: u16 = super::CHILD_ROW_ICON_SIZE;
-/// The lead's centre, left of the column's centre, which leaves the badge
-/// room before the title.
+/// The lead's centre when a badge or a peeking mark goes with it: left of
+/// the column's centre, which leaves the badge room before the title. A lone
+/// mark keeps the column's centre, in line with the glyphs above and below.
 const LEAD_CENTRE: Point = Point::new(8.0, BOX / 2.0);
+const LONE_CENTRE: Point = Point::new(BOX / 2.0, BOX / 2.0);
 /// The peeking provider's mark, and where its centre sits from the lead's.
 const PEEK: f32 = 11.0;
 const PEEK_OFFSET: (f32, f32) = (6.0, -3.0);
@@ -212,9 +214,10 @@ const BADGE_TEXT: f32 = 9.0;
 /// clearly a pill on a resting, hovered or selected row, still quieter than
 /// the title.
 const BADGE_WASH: f32 = 0.3;
-/// The lead's centre in a rail cell. The cell pins its news and activity
-/// badges to its right-hand corners; the lead sits far enough left that its
-/// count badge stops at their ring rather than under them.
+/// The lead's centre in a rail cell when a badge or a peeking mark goes with
+/// it. The cell pins its news and activity badges to its right-hand corners;
+/// the lead sits far enough left that its count badge stops at their ring
+/// rather than under them. A lone mark is centred like any other glyph.
 const RAIL_LEAD_X: f32 = 11.0;
 
 /// The badge's right edge, from the lead's centre.
@@ -268,12 +271,15 @@ pub fn view(
         .as_deref()
         .map(|label| BADGE_WIDTHS[usize::from(label.len() > 1)]);
     let opacity = if ink == RowInk::Muted { 0.55 } else { 1.0 };
+    let peek = members.peek();
+    let lone = badge.is_none() && peek.is_none();
+    let centre = if lone { LONE_CENTRE } else { LEAD_CENTRE };
     let mut layers: Vec<Element<'static, SidebarAction>> = Vec::with_capacity(3);
-    if let Some(provider) = members.peek() {
+    if let Some(provider) = peek {
         layers.push(at(
             mark(peek_handle(provider), PEEK, ink, opacity),
-            LEAD_CENTRE.x + PEEK_OFFSET.0 - PEEK / 2.0,
-            LEAD_CENTRE.y + PEEK_OFFSET.1 - PEEK / 2.0,
+            centre.x + PEEK_OFFSET.0 - PEEK / 2.0,
+            centre.y + PEEK_OFFSET.1 - PEEK / 2.0,
         ));
     }
     let (handle, size) = match lead {
@@ -284,14 +290,14 @@ pub fn view(
     };
     layers.push(at(
         mark(handle, size, ink, opacity),
-        LEAD_CENTRE.x - size / 2.0,
-        LEAD_CENTRE.y - size / 2.0,
+        centre.x - size / 2.0,
+        centre.y - size / 2.0,
     ));
     if let (Some(label), Some(width)) = (badge, width) {
         layers.push(at(
             count_badge(label, width, ground, opacity),
-            LEAD_CENTRE.x + BADGE_RIGHT - width,
-            LEAD_CENTRE.y + BADGE_OFFSET.1 - BADGE / 2.0,
+            centre.x + BADGE_RIGHT - width,
+            centre.y + BADGE_OFFSET.1 - BADGE / 2.0,
         ));
     }
     let stack = cosmic::iced::widget::Stack::with_children(layers)
@@ -299,6 +305,7 @@ pub fn view(
         .height(Length::Fixed(BOX));
     Some(match ground {
         Ground::Row => stack.into(),
+        Ground::Rail if lone => stack.into(),
         Ground::Rail => widget::container(stack)
             .padding([0.0, 0.0, 0.0, RAIL_LEAD_X - LEAD_CENTRE.x])
             .width(Length::Fixed(super::rail::CELL_WIDTH))
@@ -458,7 +465,8 @@ fn cut(svg: &str, size: f32, hole: Hole) -> Option<String> {
     let view_box = &view_box[view_box.find("viewBox=\"")? + "viewBox=\"".len()..];
     let view_box = &view_box[..view_box.find('"')?];
     let [min_x, min_y, width, height]: [f32; 4] = view_box
-        .split_whitespace()
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|part| !part.is_empty())
         .map(str::parse)
         .collect::<Result<Vec<f32>, _>>()
         .ok()?
@@ -583,7 +591,7 @@ mod tests {
                 0
             )
             .description(),
-            "2 Claude Code, working; Oh My Pi, stopped by a usage limit; Codex"
+            "2 Claude Code, working; Oh My Pi, stopped by a usage limit; Codex, running"
         );
         assert_eq!(members(&[], 2).description(), "2 Terminals");
         assert_eq!(Members::default().description(), "");
@@ -638,6 +646,21 @@ mod tests {
                 }
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn a_view_box_may_separate_its_numbers_with_commas() {
+        let svg = r#"<svg viewBox="0,0, 22,22"><path/></svg>"#;
+        let hole = Hole::Circle {
+            x: 1.0,
+            y: 2.0,
+            radius: 3.0,
+        };
+        assert!(
+            cut(svg, 11.0, hole)
+                .unwrap()
+                .contains(r#"<ellipse cx="2" cy="4" rx="6" ry="6" fill="black"/>"#)
         );
     }
 

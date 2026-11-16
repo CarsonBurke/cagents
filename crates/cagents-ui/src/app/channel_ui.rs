@@ -2401,7 +2401,15 @@ impl Cagents {
                             activity.provider,
                             sidebar::ChannelMemberState::of(activity.state, attention.limited != 0),
                         ),
-                        (None, CardKind::Terminal(session)) if !super::terminal_ended(session) => {
+                        // A shell that ended, or whose runtime failed, has
+                        // nobody in it.
+                        (None, CardKind::Terminal(session))
+                            if !super::terminal_ended(session)
+                                && !matches!(
+                                    session.continuity,
+                                    TerminalContinuity::Failed { .. }
+                                ) =>
+                        {
                             match crate::agent::Provider::recognize_launch(&session.launch) {
                                 // An agent launched in the terminal that has
                                 // yet to report what it is doing.
@@ -3332,6 +3340,26 @@ mod tests {
         assert!(
             row.accessible_name_for_test()
                 .contains("Claude Code, working; Codex, idle; Terminal")
+        );
+
+        let durable = Arc::make_mut(&mut app.durable);
+        let crate::model::CardKind::Terminal(session) = &mut durable.cards[0].kind else {
+            panic!("the fixture's first card is a shell");
+        };
+        // A shell whose runtime failed has nobody in it.
+        session.continuity = crate::model::TerminalContinuity::Failed {
+            typed_error: crate::model::RuntimeError {
+                code: "spawn".into(),
+                message: "fixture".into(),
+            },
+            retryable: true,
+        };
+        app.refresh_sidebar_channels();
+        assert_eq!(
+            app.sidebar_model.projects[0].channels[0]
+                .members
+                .description(),
+            "Claude Code, working; Codex, idle"
         );
 
         let durable = Arc::make_mut(&mut app.durable);
