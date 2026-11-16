@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import textwrap
 import time
+import tomllib
 import unittest
 
 
@@ -16,7 +17,10 @@ CARGO_TAG = (
     "# This file is a cache directory tag created by cargo.\n"
     "# For information about cache directory tags see https://bford.info/cachedir/\n"
 )
-SEED = Path(__file__).resolve().parents[1] / "scripts/seed-build-dir"
+REPOSITORY = Path(__file__).resolve().parents[1]
+SEED = REPOSITORY / "scripts/seed-build-dir"
+# The probes live outside the repository, beyond its rust-toolchain.toml.
+TOOLCHAIN = tomllib.loads((REPOSITORY / "rust-toolchain.toml").read_text())["toolchain"]["channel"]
 
 
 class CopiedFingerprints(unittest.TestCase):
@@ -30,7 +34,8 @@ class CopiedFingerprints(unittest.TestCase):
             self.skipTest("no cargo")
         temporary = tempfile.TemporaryDirectory(prefix="cagents-seed-", dir="/var/tmp")
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        # Resolved, as Cargo names the workspace root by its real path.
+        self.root = Path(temporary.name).resolve()
         self.main = self.root / "main"
         files = {
             "Cargo.toml": """
@@ -69,11 +74,14 @@ class CopiedFingerprints(unittest.TestCase):
             path = self.main / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(textwrap.dedent(text))
+        # The Cargo this repository builds with, at its defaults. Its build
+        # layout differs between versions, and a user's Cargo home can move
+        # intermediates out of target/ with `build-dir`, so the probe uses the
+        # pinned toolchain and a private Cargo home; it needs no registry.
         self.env = {key: value for key, value in os.environ.items()
                     if not key.startswith(("CAGENTS_BUILD_", "CARGO_"))}
-        for name in ("CARGO_HOME", "RUSTUP_HOME"):
-            if name in os.environ:
-                self.env[name] = os.environ[name]
+        self.env["CARGO_HOME"] = str(self.root / "cargo-home")
+        self.env["RUSTUP_TOOLCHAIN"] = TOOLCHAIN
         self.cargo(self.main)
 
     def cargo(self, checkout):
@@ -81,9 +89,13 @@ class CopiedFingerprints(unittest.TestCase):
                               text=True, timeout=240, check=True).stderr
 
     def worktree(self, name):
-        """A checkout with different sources, all older than main's build."""
+        """A copy of main with different sources."""
         checkout = self.root / name
         shutil.copytree(self.main, checkout, ignore=shutil.ignore_patterns("target"))
+        return self.diverge(checkout)
+
+    def diverge(self, checkout):
+        """Give `checkout` different sources, all older than main's build."""
         for edited, old, new in (
             ("src/main.rs", "own=main", "own=worktree"),
             ("vendor/vendored/src/lib.rs", '"main"', '"worktree"'),
@@ -124,6 +136,50 @@ class CopiedFingerprints(unittest.TestCase):
                        cwd=worktree, env=self.env, check=True, capture_output=True)
         self.assertTrue((worktree / "target/debug/.fingerprint").is_dir())
         self.cargo(worktree)
+        self.assertEqual(self.output(worktree), "own=worktree vendored=worktree generated=worktree")
+
+    def test_seeding_finds_a_configured_build_directory(self):
+        # A user-wide `build-dir` puts each workspace's intermediates outside
+        # its target/. With no paths given, the script must ask Cargo where
+        # both builds are; cargo-gate names only the destination.
+        if not reflinks(self.root):
+            self.skipTest("this file system cannot reflink")
+        builds = self.root / "builds"
+        home = Path(self.env["CARGO_HOME"])
+        home.mkdir(exist_ok=True)
+        (home / "config.toml").write_text(f'[build]\nbuild-dir = "{builds}{{workspace-root}}/target"\n')
+        git = {key: value for key, value in self.env.items() if not key.startswith("GIT_")}
+        git.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+        def run(*command, cwd=self.main):
+            subprocess.run(command, cwd=cwd, env=git, check=True, capture_output=True)
+        (self.main / ".gitignore").write_text("/target\n")
+        run("git", "init", "-q")
+        run("git", "add", "-A")
+        run("git", "-c", "user.name=probe", "-c", "user.email=probe@example.invalid",
+            "commit", "-q", "-m", "probe")
+        metadata = subprocess.run(["cargo", "metadata", "--format-version", "1", "--no-deps"],
+                                  cwd=self.main, env=self.env, capture_output=True, text=True,
+                                  check=True).stdout
+        if '"build_directory"' not in metadata:
+            self.skipTest("this Cargo has no build-dir")
+        shutil.rmtree(self.main / "target")
+        self.cargo(self.main)
+        main_build = builds / str(self.main).lstrip("/") / "target"
+        self.assertTrue((main_build / "debug/.fingerprint").is_dir())
+        self.assertFalse((self.main / "target/debug/.fingerprint").exists())
+
+        worktree = self.root / "worktree"
+        run("git", "worktree", "add", "-q", "--detach", str(worktree))
+        self.diverge(worktree)
+        result = subprocess.run([SEED], cwd=worktree, env=git, capture_output=True, text=True,
+                                timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"seeded {builds / str(worktree).lstrip('/') / 'target'} from {main_build}",
+                      result.stderr)
+        self.assertFalse((worktree / "target").exists())
+        built = self.cargo(worktree)
+        self.assertIn("Compiling vendored", built)
+        self.assertIn("Compiling probe", built)
         self.assertEqual(self.output(worktree), "own=worktree vendored=worktree generated=worktree")
 
     def test_forgetting_reaches_a_target_triples_build(self):
