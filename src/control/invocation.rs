@@ -53,7 +53,7 @@ pub(crate) fn coordination(argv: &[String], stdin: Text) -> Option<Kind> {
         }
         TopCommand::Inbox(inbox) => Kind::Act(Act::Inbox { waits: inbox.wait }),
         TopCommand::Sessions(_) => Kind::Act(Act::Sessions),
-        TopCommand::Whoami => Kind::Act(Act::Whoami),
+        TopCommand::Whoami(_) => Kind::Act(Act::Whoami),
         TopCommand::Linear(linear) => {
             let (verb, subject) = linear.describe();
             Kind::Act(Act::Linear { verb, subject })
@@ -102,7 +102,7 @@ pub(crate) fn coordination(argv: &[String], stdin: Text) -> Option<Kind> {
                 waits: wait.wait,
             }),
             AgentCommand::Status { agent, .. } => Kind::Act(Act::Status { agent }),
-            AgentCommand::List => Kind::Act(Act::Agents),
+            AgentCommand::List { .. } => Kind::Act(Act::Agents),
             AgentCommand::Wait { handles, .. } => Kind::Act(Act::Wait { agents: handles }),
             AgentCommand::Requests { agent } => Kind::Act(Act::Requests { agent }),
             AgentCommand::Answer {

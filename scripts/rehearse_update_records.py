@@ -915,7 +915,16 @@ def project(row: dict, name: str) -> dict:
         "projects": ("name", "repository", "state", "closed"),
         "panes": ("workspace_id", "ordinal", "position", "title", "kind_tag", "existence", "terminal_id", "session_id"),
     }[name]
-    return {field: row[field] for field in fields if field in row}
+    projected = {field: row[field] for field in fields if field in row}
+    if name == "sessions":
+        # Listings before the compact rows named provider, surface and state
+        # in PascalCase and always stated a chat's surface; compare the
+        # facts, not their spelling, across an update between the two.
+        projected.setdefault("surface", "chat")
+        for field in ("surface", "provider", "state"):
+            if isinstance(projected.get(field), str):
+                projected[field] = projected[field].lower()
+    return projected
 
 
 def panes(snapshot: dict) -> dict:

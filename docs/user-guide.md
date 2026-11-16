@@ -492,7 +492,8 @@ cagents work --project redact     # one project, by name or path
 cagents work --column in-review   # one column
 cagents work --limit 0            # every card
 cagents work --fresh              # rescan and poll GitHub first, up to 20 s
-cagents work --json               # every card of the board listed, with its scope
+cagents work --json               # the cards listed, as JSON, with their projects and scope
+cagents work --fields card,column # only these fields of each card, as JSON
 ```
 
 `cagents work` is short for `cagents work ls`. It covers the open Git project
@@ -503,9 +504,21 @@ is listed however far down its column it is. Worktrees are shown relative to
 the project's primary checkout, which the listing names. `rm`, `pin` and
 `unpin` take that path, a branch, or a path from the current directory, which
 is tried first: `.` names the worktree you are in. The last line suggests what to run next, such
-as how to list the rest of a column it cut short. `--json` reports the scope it
-covered as `data.scope`, and with `--limit` how many cards of each column it
-left out as `data.omitted`.
+as how to list the rest of a column it cut short. `--json` lists the same cards
+the text does, so `--limit 0` reports every one. It returns the scope it
+covered as `data.scope`, each project once in `data.projects` (its name,
+primary checkout, the default branch cards compare against, and whether its
+forge could be read), the cards in `data.cards`, and how many cards of each
+column it left out as `data.omitted`. A card is a compact row: `card` is the
+name `rm`, `pin` and `unpin` take, and a fact the card lacks, such as a pull
+request, no commits ahead or no changed paths, is left out rather than given
+as null or zero. Its pull request has its number, title, check outcome and
+review, `state` unless it is open, and `unpushed` when it does not contain
+the local head; `head` is the commit's first 12 hexadecimal digits.
+`--fields` names the fields of each card to keep and prints only the cards,
+each with every field named, even one the row would leave out, and
+`data.omitted`. It implies `--json`; an unknown field is refused with the list
+of valid ones.
 
 Every linked worktree has a card, and so does the primary checkout while it is
 dirty, ahead of the default branch or has an agent session. A branch without a
