@@ -3,8 +3,6 @@
 //! discovery may be authenticated through Resolve; no launch recipe is run.
 mod console;
 mod current;
-mod v68;
-mod v77;
 #[cfg(test)]
 pub(super) use current::Client as InspectionClient;
 
@@ -15,7 +13,8 @@ use crate::update::source_inspection::{
 use crate::{
     chat::Session,
     model::{CardKind, HostSessionProof},
-    update::source::{self, ClientFamily},
+    terminal::ipc::TerminalDescriptor,
+    update::source,
     upgrade::handoff,
 };
 use std::{
@@ -65,45 +64,10 @@ pub(super) fn entry() -> Option<Result<(), String>> {
     })())
 }
 
-enum Reader {
-    Current(current::Client),
-    Legacy(v77::Client),
-    Legacy68(v68::Client),
-}
-
-impl Reader {
-    fn list(&mut self) -> Result<Vec<Session>, String> {
-        match self {
-            Self::Current(client) => client.list(),
-            Self::Legacy(client) => client.list(),
-            Self::Legacy68(client) => client.list(),
-        }
+fn connect(request: &Request, deadline: Instant) -> Result<current::Client, InspectionFailure> {
+    if !source::is_qualified_source(request.protocol) {
+        return Err(InspectionFailure::UnsupportedProtocol);
     }
-    fn terminals(&mut self) -> Result<Vec<v77::Terminal>, String> {
-        match self {
-            Self::Current(client) => client.terminals(),
-            Self::Legacy(client) => client.terminals(),
-            Self::Legacy68(client) => client.terminals(),
-        }
-    }
-    fn resolve(&mut self, source: &Session) -> Result<Session, String> {
-        match self {
-            Self::Current(client) => client.resolve(source),
-            Self::Legacy(client) => client.resolve(source),
-            Self::Legacy68(client) => client.resolve(source),
-        }
-    }
-    fn inspect_saved_history(&mut self, source: &Session) -> Result<(), String> {
-        match self {
-            Self::Current(client) => client.inspect_saved_history(source),
-            _ => Err("Source has no qualified read-only history API".into()),
-        }
-    }
-}
-
-fn connect(request: &Request, deadline: Instant) -> Result<Reader, InspectionFailure> {
-    let family =
-        source::client_family(request.protocol).ok_or(InspectionFailure::UnsupportedProtocol)?;
     let proof = request
         .proof
         .as_ref()
@@ -111,15 +75,8 @@ fn connect(request: &Request, deadline: Instant) -> Result<Reader, InspectionFai
         .ok_or(InspectionFailure::UnverifiedService)?;
     let socket = crate::terminal::ipc::daemon_socket_path()
         .map_err(|_| InspectionFailure::ServiceUnavailable)?;
-    match family {
-        ClientFamily::Current => {
-            current::Client::connect(&socket, proof, deadline, request.protocol)
-                .map(Reader::Current)
-        }
-        ClientFamily::V68 => v68::Client::connect(&socket, proof, deadline).map(Reader::Legacy68),
-        ClientFamily::V77 => v77::Client::connect(&socket, proof, deadline).map(Reader::Legacy),
-    }
-    .map_err(InspectionFailure::Unchecked)
+    current::Client::connect(&socket, proof, deadline, request.protocol)
+        .map_err(InspectionFailure::Unchecked)
 }
 
 const UNCHECKED: &str = "could not be checked before the update";
@@ -564,7 +521,7 @@ fn record_ended_panes(
 fn record_live_panes(
     inspection: &mut SourceInspection,
     chats: &[Session],
-    terminals: &[v77::Terminal],
+    terminals: &[TerminalDescriptor],
     proof: &HostSessionProof,
     replaces_service: bool,
 ) {
@@ -1861,7 +1818,7 @@ fn check_deadline(deadline: Instant) -> Result<(), String> {
 /// pairs to Reconnects. Keeping the source needs no migration capability.
 fn record_live_console_outcomes(
     inspection: &mut SourceInspection,
-    terminals: &[v77::Terminal],
+    terminals: &[TerminalDescriptor],
     proof: &HostSessionProof,
     require_resumable: bool,
 ) {
@@ -1932,7 +1889,7 @@ fn issued_terminal_matches(
 
 fn qualify_terminal(
     saved: &crate::model::TerminalSession,
-    terminals: &[v77::Terminal],
+    terminals: &[TerminalDescriptor],
     proof: &HostSessionProof,
 ) -> Result<(), String> {
     let old = saved
@@ -1990,18 +1947,7 @@ mod tests {
                 source::is_qualified_source(protocol),
                 "protocol {protocol}: {error:?}"
             );
-            assert_eq!(
-                current::supports_protocol(protocol),
-                source::client_family(protocol) == Some(ClientFamily::Current),
-                "protocol {protocol}"
-            );
         }
-        assert!(current::supports_protocol(156));
-        assert!(current::supports_protocol(173));
-        assert!(current::supports_protocol(175));
-        assert!(current::supports_protocol(177));
-        assert!(current::supports_protocol(178));
-        assert!(current::supports_protocol(179));
         assert_eq!(
             source::protocols().collect::<Vec<_>>(),
             [
@@ -2117,7 +2063,7 @@ mod tests {
         record_live_panes(
             &mut inspection,
             &[source.clone()],
-            &[terminal.into()],
+            &[terminal],
             &proof,
             false,
         );
@@ -2311,7 +2257,7 @@ mod tests {
             chat.id = console.session.id;
             chat.terminal = Some(console.session.clone());
             let chats = if is_chat { vec![chat] } else { Vec::new() };
-            let roster = vec![v77::Terminal::from(console.clone())];
+            let roster = vec![console.clone()];
             for requires_migration in [false, true] {
                 let mut inspection = SourceInspection::default();
                 record_live_panes(&mut inspection, &chats, &roster, &proof, requires_migration);
@@ -2348,13 +2294,13 @@ mod tests {
         };
         for terminal in [inactive, foreign] {
             let mut inspection = SourceInspection::default();
-            record_live_console_outcomes(&mut inspection, &[terminal.into()], &proof, true);
+            record_live_console_outcomes(&mut inspection, &[terminal], &proof, true);
             assert!(inspection.details.console_capabilities.is_empty());
         }
         // Ordinary live shells do not require agent-console reconnection.
         console.session.launch.program = "bash".into();
         console.session.launch.arguments = vec!["--login".into()];
-        let roster = vec![v77::Terminal::from(console.clone())];
+        let roster = vec![console.clone()];
         let mut inspection = SourceInspection::default();
         record_live_panes(&mut inspection, &[], &roster, &proof, true);
         record_live_console_outcomes(&mut inspection, &roster, &proof, true);
@@ -3931,16 +3877,16 @@ mod tests {
             host_incarnation: proof.host_incarnation.clone(),
         };
         let saved = descriptor.session.clone();
-        qualify_terminal(&saved, &[descriptor.clone().into()], &proof).unwrap();
+        qualify_terminal(&saved, &[descriptor.clone()], &proof).unwrap();
         descriptor.session.resume_hint = Some("observed-agent-inside-original-shell".into());
-        qualify_terminal(&saved, &[descriptor.clone().into()], &proof).unwrap();
+        qualify_terminal(&saved, &[descriptor.clone()], &proof).unwrap();
         let mut detached = saved.clone();
         detached.continuity = crate::model::TerminalContinuity::DetachedSameBoot {
             host_session_id: proof.host_session_id.clone(),
             boot_id: proof.boot_id.clone(),
             host_incarnation: proof.host_incarnation.clone(),
         };
-        qualify_terminal(&detached, &[descriptor.clone().into()], &proof).unwrap();
+        qualify_terminal(&detached, &[descriptor.clone()], &proof).unwrap();
         for field in 0..5 {
             let mut changed = descriptor.clone();
             match field {
@@ -3962,7 +3908,7 @@ mod tests {
                 }
             }
             assert!(
-                qualify_terminal(&saved, &[changed.into()], &proof).is_err(),
+                qualify_terminal(&saved, &[changed], &proof).is_err(),
                 "immutable field {field}"
             );
         }
@@ -3971,7 +3917,7 @@ mod tests {
             .launch
             .environment
             .insert("ACCOUNT".into(), "different".into());
-        assert!(qualify_terminal(&saved, &[descriptor.clone().into()], &proof).is_err());
+        assert!(qualify_terminal(&saved, &[descriptor.clone()], &proof).is_err());
         descriptor.session.launch = saved.launch.clone();
         let mut replacement = proof.clone();
         replacement.host_incarnation = HostIncarnation::new("replacement");
@@ -3980,14 +3926,14 @@ mod tests {
             boot_id: replacement.boot_id.clone(),
             host_incarnation: replacement.host_incarnation.clone(),
         };
-        assert!(qualify_terminal(&saved, &[descriptor.clone().into()], &replacement).is_err());
+        assert!(qualify_terminal(&saved, &[descriptor.clone()], &replacement).is_err());
         descriptor.upgrade_sources.push(detached);
-        qualify_terminal(&saved, &[descriptor.clone().into()], &replacement).unwrap();
+        qualify_terminal(&saved, &[descriptor.clone()], &replacement).unwrap();
         descriptor.upgrade_sources[0]
             .launch
             .environment
             .insert("ACCOUNT".into(), "another".into());
-        assert!(qualify_terminal(&saved, &[descriptor.into()], &replacement).is_err());
+        assert!(qualify_terminal(&saved, &[descriptor], &replacement).is_err());
     }
 
     #[test]

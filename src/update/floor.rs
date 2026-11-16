@@ -323,21 +323,6 @@ struct NativeSource<'a, O> {
     original_census: Option<crate::upgrade::recovery::Census>,
 }
 
-/// Frozen lifecycle sources can prepare and prove Ready without exposing the
-/// current inventory/snapshot DTOs. They never acquire Prepared recovery power.
-fn preparation_census(
-    legacy: bool,
-    checkpoint_absent: impl FnOnce() -> Result<(), String>,
-    observe: impl FnOnce() -> Result<crate::upgrade::recovery::Census, UpdateError>,
-) -> Result<Option<crate::upgrade::recovery::Census>, UpdateError> {
-    if legacy {
-        checkpoint_absent().map_err(invalid)?;
-        Ok(None)
-    } else {
-        observe().map(Some)
-    }
-}
-
 impl<O: FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>> FloorSource
     for NativeSource<'_, O>
 {
@@ -392,54 +377,45 @@ impl<O: FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>> FloorSour
         daemon: &impact::DaemonImpact,
     ) -> Result<(), UpdateError> {
         let mut client = source_client_for(daemon)?;
-        self.original_census = preparation_census(
-            matches!(&client, source::Client::Legacy(_)),
-            crate::upgrade::recovery::require_checkpoint_absent,
-            || {
-                let chats = client.list_chats()?;
-                let mut snapshots = crate::upgrade::recovery::SnapshotCapture::default();
-                for chat in &chats {
-                    let snapshot = client.capture_chat_snapshot(chat.clone())?;
-                    snapshots.push(chat.clone(), snapshot).map_err(invalid)?;
-                }
-                let terminals: Vec<_> = client
-                    .list()?
-                    .into_iter()
-                    .map(|item| item.session)
-                    .collect();
-                let mut presentation = crate::upgrade::floor::Record::new(
-                    self.proof.clone(),
-                    chats.clone(),
-                    terminals.iter().map(|terminal| terminal.id).collect(),
-                );
-                presentation.protocol = client.protocol();
-                // Saved panes can predate ChatList's confirmed conversation ID.
-                // Capture their exact aliases before preparation changes ownership.
-                let presentation = capture_floor(self.guard, presentation)?;
-                let mut census = crate::upgrade::recovery::Census {
-                    terminals,
-                    chats,
-                    snapshots: snapshots.finish(),
-                    aliases: presentation.aliases,
-                    presentations: presentation.presentations,
-                };
-                census
-                    .fit_pages(&self.proof, daemon, self.guard.prepared_window_slots())
-                    .map_err(invalid)?;
-                Ok(census)
-            },
-        )?;
-        if let Some(census) = &self.original_census {
-            crate::upgrade::recovery::capture_before_floor(
-                &self.proof,
-                census,
-                self.guard,
-                state,
-                &job.id,
-            )
-            .map_err(invalid)?;
+        let chats = client.list_chats()?;
+        let mut snapshots = crate::upgrade::recovery::SnapshotCapture::default();
+        for chat in &chats {
+            let snapshot = client.capture_chat_snapshot(chat.clone())?;
+            snapshots.push(chat.clone(), snapshot).map_err(invalid)?;
         }
-        Ok(())
+        let terminals: Vec<_> = client
+            .list()?
+            .into_iter()
+            .map(|item| item.session)
+            .collect();
+        let mut presentation = crate::upgrade::floor::Record::new(
+            self.proof.clone(),
+            chats.clone(),
+            terminals.iter().map(|terminal| terminal.id).collect(),
+        );
+        presentation.protocol = client.protocol();
+        // Saved panes can predate ChatList's confirmed conversation ID.
+        // Capture their exact aliases before preparation changes ownership.
+        let presentation = capture_floor(self.guard, presentation)?;
+        let mut census = crate::upgrade::recovery::Census {
+            terminals,
+            chats,
+            snapshots: snapshots.finish(),
+            aliases: presentation.aliases,
+            presentations: presentation.presentations,
+        };
+        census
+            .fit_pages(&self.proof, daemon, self.guard.prepared_window_slots())
+            .map_err(invalid)?;
+        let census = self.original_census.insert(census);
+        crate::upgrade::recovery::capture_before_floor(
+            &self.proof,
+            census,
+            self.guard,
+            state,
+            &job.id,
+        )
+        .map_err(invalid)
     }
     fn begin_preparation(
         &mut self,
@@ -448,28 +424,23 @@ impl<O: FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>> FloorSour
         daemon: &impact::DaemonImpact,
     ) -> Result<(), UpdateError> {
         let client = source_client_for(daemon)?;
-        let census = self.original_census.clone();
-        self.survivors.prepared_source = Some(match census {
-            Some(census) => {
-                self.preparation = Some(
-                    crate::upgrade::recovery::Preparation::begin(
-                        state,
-                        &job.id,
-                        daemon,
-                        census.clone(),
-                        self.guard,
-                    )
-                    .map_err(invalid)?,
-                );
-                PreparationEvidence::Full {
-                    daemon: daemon.clone(),
-                    census,
-                }
-            }
-            None => {
-                self.preparation = None;
-                PreparationEvidence::ScopeOnly(daemon.clone())
-            }
+        let census = self
+            .original_census
+            .clone()
+            .ok_or_else(|| invalid("The update has not captured its source preparation census"))?;
+        self.preparation = Some(
+            crate::upgrade::recovery::Preparation::begin(
+                state,
+                &job.id,
+                daemon,
+                census.clone(),
+                self.guard,
+            )
+            .map_err(invalid)?,
+        );
+        self.survivors.prepared_source = Some(PreparationEvidence {
+            daemon: daemon.clone(),
+            census,
         });
         for item in &daemon.sessions {
             self.survivors.labels.insert(
@@ -590,9 +561,8 @@ impl<O: FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>> FloorSour
         if client.proof() != &self.proof {
             return Err(invalid("The source changed during its survivor census"));
         }
-        if let Some(pid) = client.peer_pid() {
-            self.survivors.exclude_ambient(Path::new("/proc"), pid);
-        }
+        self.survivors
+            .exclude_ambient(Path::new("/proc"), client.peer_pid());
         let ids: BTreeSet<_> = list.items.iter().map(|item| item.id).collect();
         for terminal in client.list()? {
             if ids.contains(&terminal.session.id) {
@@ -613,9 +583,8 @@ impl<O: FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>> FloorSour
         list: &StopList,
     ) -> Result<(), UpdateError> {
         let mut client = source_client_for(daemon)?;
-        if let Some(pid) = client.peer_pid() {
-            self.survivors.exclude_ambient(Path::new("/proc"), pid);
-        }
+        self.survivors
+            .exclude_ambient(Path::new("/proc"), client.peer_pid());
         let ids: BTreeSet<_> = list.items.iter().map(|item| item.id).collect();
         for terminal in client.list()? {
             if ids.contains(&terminal.session.id) {
@@ -628,9 +597,8 @@ impl<O: FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>> FloorSour
                 );
             }
         }
-        let root = client
-            .peer_pid()
-            .and_then(|pid| i32::try_from(pid).ok())
+        let root = i32::try_from(client.peer_pid())
+            .ok()
             .and_then(|pid| crate::daemon::holder_registry::Process::read(pid).ok());
         self.survivors.capture(list, root)
     }
@@ -1251,29 +1219,14 @@ pub(super) struct Survivors {
     markers: BTreeMap<Vec<u8>, (TerminalId, String)>,
 }
 
-enum PreparationEvidence {
-    Full {
-        daemon: impact::DaemonImpact,
-        census: crate::upgrade::recovery::Census,
-    },
-    ScopeOnly(impact::DaemonImpact),
+struct PreparationEvidence {
+    daemon: impact::DaemonImpact,
+    census: crate::upgrade::recovery::Census,
 }
 
 impl PreparationEvidence {
-    fn census(&self) -> Option<&crate::upgrade::recovery::Census> {
-        match self {
-            Self::Full { census, .. } => Some(census),
-            Self::ScopeOnly(_) => None,
-        }
-    }
-
     fn require_ready(&self) -> Result<(), String> {
-        match self {
-            Self::Full { daemon, census } => {
-                crate::upgrade::recovery::require_ready(daemon, census)
-            }
-            Self::ScopeOnly(daemon) => crate::upgrade::recovery::require_ready_scope(daemon),
-        }
+        crate::upgrade::recovery::require_ready(&self.daemon, &self.census)
     }
 }
 
@@ -1303,9 +1256,6 @@ impl Survivors {
         let handoff = handoff.ok_or_else(|| {
             invalid("The acknowledged source has not released its daemon lease for recovery")
         })?;
-        if matches!(evidence, PreparationEvidence::ScopeOnly(_)) {
-            return evidence.require_ready().map_err(invalid);
-        }
         if let Some(captured) = self.captured_preparation.take() {
             let receipt = match verified_digest {
                 Some(digest) => captured.receipt_with_digest(target_daemon, digest, handoff),
@@ -1345,13 +1295,8 @@ impl Survivors {
             ));
         }
         let socket = crate::terminal_ipc::daemon_socket_path()?;
-        let source =
+        let source::Client { mut client, peer } =
             source::Client::connect(&socket).map_err(|error| invalid(error.to_string()))?;
-        let source::Client::Current { mut client, peer } = source else {
-            return Err(invalid(
-                "The confirmed successor cannot verify its recovery inventory",
-            ));
-        };
         if client.protocol() != crate::terminal_ipc::PROTOCOL_VERSION {
             return Err(invalid(
                 "The confirmed successor does not serve this update's matched protocol",
@@ -1414,20 +1359,16 @@ impl Survivors {
                 .get(id)
                 .map(String::as_str)
                 .unwrap_or("Conversation");
-            let recorded = self
-                .prepared_source
-                .as_ref()
-                .and_then(PreparationEvidence::census)
-                .is_some_and(|census| {
-                    census.chats.iter().any(|chat| {
-                        chat.id == *id
-                            && chat
-                                .launch
-                                .session_id
-                                .as_ref()
-                                .is_some_and(|id| !id.trim().is_empty())
-                    })
-                });
+            let recorded = self.prepared_source.as_ref().is_some_and(|evidence| {
+                evidence.census.chats.iter().any(|chat| {
+                    chat.id == *id
+                        && chat
+                            .launch
+                            .session_id
+                            .as_ref()
+                            .is_some_and(|id| !id.trim().is_empty())
+                })
+            });
             let action = if recorded {
                 "choose Resume conversation in the new tab (+) menu to continue"
             } else {

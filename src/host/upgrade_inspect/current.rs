@@ -1,5 +1,4 @@
 //! Read-only inspection of the wire-proven source inventory subset.
-//! The frozen protocol-77 reader remains separate from this matched connection.
 use crate::{
     chat::Session,
     model::HostSessionProof,
@@ -31,7 +30,7 @@ impl Client {
         deadline: Instant,
         protocol: u16,
     ) -> Result<Self, String> {
-        if !supports_protocol(protocol) {
+        if !crate::update::source::is_qualified_source(protocol) {
             return Err("Source protocol has no qualified migration inspector".into());
         }
         if !expected.is_complete() {
@@ -185,11 +184,9 @@ impl Client {
         }
     }
 
-    pub(super) fn terminals(&mut self) -> Result<Vec<super::v77::Terminal>, String> {
+    pub(super) fn terminals(&mut self) -> Result<Vec<ipc::TerminalDescriptor>, String> {
         match self.request(ClientRequest::List, true)? {
-            ServerResponse::Listed { terminals } if terminals.len() <= 1024 => {
-                Ok(terminals.into_iter().map(Into::into).collect())
-            }
+            ServerResponse::Listed { terminals } if terminals.len() <= 1024 => Ok(terminals),
             _ => Err(
                 "Source terminal inventory is unsupported or exceeds the inspection limit".into(),
             ),
@@ -241,7 +238,7 @@ impl Client {
     /// descriptor or presented as evidence of an old provider's execution.
     /// The host's normal owner/managed-work fences remain. No resident data is evicted.
     pub(super) fn inspect_saved_history(&mut self, source: &Session) -> Result<(), String> {
-        if !supports_protocol(self.protocol) || !source.is_saved_claude_history() {
+        if !source.is_saved_claude_history() {
             return Err("Saved history has no qualified read-only inspection API".into());
         }
         let mut requested = source.clone();
@@ -326,12 +323,6 @@ impl Client {
         // Other attached history views remain attached; no cache is evicted.
         inspection
     }
-}
-
-/// Use the same current-wire qualification as lifecycle control, including
-/// the complete read-only history API rather than only inventory messages.
-pub(super) fn supports_protocol(protocol: u16) -> bool {
-    crate::update::source::current_client_supports(protocol)
 }
 
 fn read_payload_with_limit(reader: &mut impl Read, limit: usize) -> Result<Vec<u8>, String> {
@@ -502,7 +493,7 @@ mod tests {
     use super::*;
 
     fn source_protocols() -> std::collections::BTreeSet<u16> {
-        crate::update::source::current_client_protocols().collect()
+        crate::update::source::protocols().collect()
     }
 
     fn source_frame_version(frame: &[u8], protocol: u16) -> Vec<u8> {
@@ -707,8 +698,10 @@ mod tests {
 
     #[test]
     fn frozen_inventory_subset_accepts_qualified_current_wire_sources() {
-        assert!(!supports_protocol(98));
-        assert!(!supports_protocol(ipc::PROTOCOL_VERSION + 1));
+        assert!(!crate::update::source::is_qualified_source(98));
+        assert!(!crate::update::source::is_qualified_source(
+            ipc::PROTOCOL_VERSION + 1
+        ));
         assert_eq!(postcard::to_allocvec(&ClientRequest::List).unwrap(), [1]);
         assert_eq!(
             postcard::to_allocvec(&ClientRequest::ChatList).unwrap(),
@@ -731,7 +724,6 @@ mod tests {
             38
         );
         for protocol in source_protocols() {
-            assert!(supports_protocol(protocol));
             // Frozen postcard envelope with request 7, proof s/b/i and an empty
             // ChatListed response. Only the leading version varint varies; from
             // 128 it takes two bytes.

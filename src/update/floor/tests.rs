@@ -24,8 +24,7 @@ struct FakeSource {
     lose_prepare_ack: bool,
     predicted_service: bool,
     fail_inventory: bool,
-    foreign_preparation: bool,
-    preparation_checks: usize,
+    existing_checkpoint: bool,
     close_attempts: usize,
     fail_close_at: Option<usize>,
     change_on_first_close: bool,
@@ -97,7 +96,7 @@ impl FloorSource for FakeSource {
     }
     fn inventory(&mut self, _: &impact::DaemonImpact, _: bool) -> Result<Inventory, UpdateError> {
         if self.fail_inventory {
-            return Err(invalid("legacy lifecycle source has no pane inventory API"));
+            return Err(invalid("this source has no pane inventory API"));
         }
         Ok(self.inventory.clone())
     }
@@ -107,22 +106,12 @@ impl FloorSource for FakeSource {
         _: &UpdateJob,
         _: &impact::DaemonImpact,
     ) -> Result<(), UpdateError> {
-        if self.fail_inventory {
-            self.preparation_checks += 1;
-            preparation_census(
-                true,
-                || {
-                    if self.foreign_preparation {
-                        Err(
-                            "A checkpoint already exists; it was kept without preparing the source"
-                                .into(),
-                        )
-                    } else {
-                        Ok(())
-                    }
-                },
-                || Err(invalid("legacy lifecycle source has no pane inventory API")),
-            )?;
+        if self.existing_checkpoint {
+            // The real source refuses an earlier checkpoint in recovery::capture_before_floor
+            // and again in Preparation::begin; this fake models the begin refusal.
+            return Err(invalid(
+                "A checkpoint already exists; it was kept without preparing the source",
+            ));
         }
         Ok(())
     }
@@ -423,8 +412,7 @@ fn fixture() -> FakeSource {
         lose_prepare_ack: false,
         predicted_service: false,
         fail_inventory: false,
-        foreign_preparation: false,
-        preparation_checks: 0,
+        existing_checkpoint: false,
         close_attempts: 0,
         fail_close_at: None,
         change_on_first_close: false,
@@ -635,7 +623,7 @@ fn recovered_paused_conversations_name_the_manual_resume_action() {
     let unrecorded = add_chat(&mut source, impact::Disposition::Resumes, false);
     let mut survivors = Survivors::default();
     survivors.record_prepared(&source.preview, source.preview.daemon.as_ref().unwrap());
-    survivors.prepared_source = Some(PreparationEvidence::Full {
+    survivors.prepared_source = Some(PreparationEvidence {
         daemon: source.preview.daemon.clone().unwrap(),
         census: crate::upgrade::recovery::Census {
             chats: source.inventory.chats.clone(),
@@ -764,7 +752,7 @@ listener.bind(sys.argv[2]);listener.listen()
     let original_proof = daemon.capability.proof.clone();
     let mut survivors = Survivors {
         source_prepared: true,
-        prepared_source: Some(PreparationEvidence::Full {
+        prepared_source: Some(PreparationEvidence {
             daemon,
             census: crate::upgrade::recovery::Census::default(),
         }),
@@ -2007,7 +1995,7 @@ fn recovery_report_keeps_completed_floor_actions_for_failures_after_quiescence()
 }
 
 #[test]
-fn ordinary_prepare_preserves_legacy_sources_without_floor_inventory_operations() {
+fn ordinary_prepare_reads_no_floor_inventory() {
     let directory = tempfile::tempdir().unwrap();
     let mut source = fixture();
     source.prepare_refusals = 0;
@@ -2021,7 +2009,6 @@ fn ordinary_prepare_preserves_legacy_sources_without_floor_inventory_operations(
         &mut source,
     )
     .unwrap();
-    assert_eq!(source.preparation_checks, 1);
     assert_eq!(
         *source.events.lock().unwrap(),
         [
@@ -2033,51 +2020,18 @@ fn ordinary_prepare_preserves_legacy_sources_without_floor_inventory_operations(
 }
 
 #[test]
-fn legacy_preparation_checks_absence_without_reading_unqualified_inventory() {
-    use std::cell::Cell;
-    for absent in [true, false] {
-        let checked = Cell::new(false);
-        let observed = preparation_census(
-            true,
-            || {
-                checked.set(true);
-                if absent {
-                    Ok(())
-                } else {
-                    Err("Foreign Prepared was kept".into())
-                }
-            },
-            || panic!("legacy preparation must not request current inventory DTOs"),
-        );
-        assert!(checked.get());
-        if absent {
-            assert!(observed.unwrap().is_none());
-        } else {
-            assert!(
-                observed
-                    .unwrap_err()
-                    .to_string()
-                    .contains("Foreign Prepared was kept")
-            );
-        }
-    }
-}
-
-#[test]
-fn preexisting_legacy_checkpoint_refuses_before_prepare_or_destructive_fallback() {
+fn preexisting_checkpoint_refuses_before_prepare_or_destructive_fallback() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path();
     let mut source = fixture();
     source.prepare_refusals = 0;
-    source.fail_inventory = true;
-    source.foreign_preparation = true;
+    source.existing_checkpoint = true;
     let preview = source.preview.clone();
     let mut current = job(path);
     let error = quiesce_source(path, &mut current, &preview, true, &mut source)
         .unwrap_err()
         .to_string();
     assert!(error.contains("checkpoint already exists"), "{error}");
-    assert_eq!(source.preparation_checks, 1);
     assert!(source.events.lock().unwrap().is_empty());
     assert_no_destructive_actions(&source);
     assert!(

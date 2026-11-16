@@ -616,7 +616,7 @@ impl InventorySource for source::Client {
         source::Client::startup_state(self)
     }
     fn list_terminals(&mut self) -> Result<Vec<TerminalDescriptor>, UpdateError> {
-        source::Client::list_terminals(self)
+        source::Client::list(self)
     }
     fn list_chats(&mut self) -> Result<Vec<crate::chat::Session>, UpdateError> {
         source::Client::list_chats(self)

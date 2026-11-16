@@ -636,7 +636,7 @@ fn lifecycle_differences(
 fn every_current_client_update_source_preserves_the_frozen_lifecycle_and_inspector_wire_format() {
     let current = traced();
     let current_recording = recorded(PROTOCOL_VERSION);
-    for protocol in crate::update::source::current_client_protocols() {
+    for protocol in crate::update::source::protocols() {
         let older = recorded(protocol);
         let restated = restated_for(protocol);
         let selected = selected_for(protocol);
@@ -658,7 +658,7 @@ fn every_current_client_update_source_preserves_the_frozen_lifecycle_and_inspect
 fn inspector_proof_detects_each_request_response_and_reachable_history_change() {
     // Every admitted Current source must prove the inspector as well as
     // lifecycle control. These mutations catch narrowing the subset.
-    for protocol in crate::update::source::current_client_protocols() {
+    for protocol in crate::update::source::protocols() {
         let baseline = recorded(protocol);
         for (container, names) in [
             (
@@ -721,7 +721,7 @@ fn inspector_proof_detects_each_request_response_and_reachable_history_change() 
 
 #[test]
 fn readiness_proof_detects_startup_phase_variants_and_nested_payload_changes() {
-    for protocol in crate::update::source::current_client_protocols() {
+    for protocol in crate::update::source::protocols() {
         let baseline = recorded(protocol);
         let key = baseline
             .containers
@@ -855,7 +855,7 @@ fn agent_addresses_are_beyond_every_older_recording() {
     let older = OLDER_CLIENTS
         .iter()
         .map(|client| client.protocol)
-        .chain(crate::update::source::current_client_protocols())
+        .chain(crate::update::source::protocols())
         .filter(|&protocol| protocol < AGENT_ADDRESSES_SINCE);
     for protocol in older {
         assert!(
@@ -882,7 +882,7 @@ fn automation_request_changes_are_beyond_recordings_before_their_introduction() 
     let older = OLDER_CLIENTS
         .iter()
         .map(|client| client.protocol)
-        .chain(crate::update::source::current_client_protocols())
+        .chain(crate::update::source::protocols())
         .filter(|&protocol| protocol < AUTOMATION_REQUEST_CHANGES_SINCE);
     for protocol in older {
         assert!(
@@ -913,7 +913,7 @@ fn active_models_are_beyond_every_older_recording() {
     let older = OLDER_CLIENTS
         .iter()
         .map(|client| client.protocol)
-        .chain(crate::update::source::current_client_protocols())
+        .chain(crate::update::source::protocols())
         .filter(|&protocol| protocol < ACTIVE_MODELS_SINCE);
     for protocol in older {
         assert!(
@@ -939,9 +939,7 @@ fn attachment_worker_metadata_is_beyond_older_clients_and_sources() {
     for client in OLDER_CLIENTS {
         assert!(!client.admits_message(&marker));
     }
-    for protocol in
-        crate::update::source::current_client_protocols().filter(|protocol| *protocol < 183)
-    {
+    for protocol in crate::update::source::protocols().filter(|protocol| *protocol < 183) {
         assert!(variant_count(&recorded(protocol), "ServerMessage") <= index);
     }
 }

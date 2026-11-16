@@ -178,13 +178,8 @@ fn recovery_window_slots(pending: &[String], current: &[String]) -> Vec<String> 
 
 fn verify(pending: &PendingRecovery, daemon: &Path) -> Result<recovery::Receipt, UpdateError> {
     let socket = crate::terminal_ipc::daemon_socket_path()?;
-    let source::Client::Current { mut client, peer } =
-        source::Client::connect(&socket).map_err(|e| invalid(e.to_string()))?
-    else {
-        return Err(invalid(
-            "The serving daemon cannot verify this candidate's recovery outcome",
-        ));
-    };
+    let source::Client { mut client, peer } =
+        source::Client::connect(&socket).map_err(|e| invalid(e.to_string()))?;
     peer.verify(client.proof())?;
     if peer.executable()? != daemon
         || client.protocol() != crate::terminal_ipc::PROTOCOL_VERSION
