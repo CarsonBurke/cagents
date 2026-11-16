@@ -19,13 +19,61 @@ impl State {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Review {
     recovery: TerminalPaneAdoption,
     terminal: TerminalSession,
     source_existence: Existence,
     source_title: String,
     target_title: String,
+}
+
+impl std::fmt::Debug for Review {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Review")
+            .field("recovery", &self.recovery)
+            .field("terminal", &RedactedTerminalSession(&self.terminal))
+            .field("source_existence", &self.source_existence)
+            .field("source_title", &self.source_title)
+            .field("target_title", &self.target_title)
+            .finish()
+    }
+}
+
+struct RedactedTerminalSession<'a>(&'a TerminalSession);
+
+impl std::fmt::Debug for RedactedTerminalSession<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let terminal = self.0;
+        f.debug_struct("TerminalSession")
+            .field("id", &terminal.id)
+            .field("owned_codex_listener", &terminal.owned_codex_listener)
+            .field("recovery_origin", &terminal.recovery_origin)
+            .field("predecessor", &terminal.predecessor)
+            .field("launch", &RedactedLaunchRecipe(&terminal.launch))
+            .field("transcript_path", &terminal.transcript_path)
+            .field("resume_hint", &terminal.resume_hint)
+            .field("continuity", &terminal.continuity)
+            .finish()
+    }
+}
+
+struct RedactedLaunchRecipe<'a>(&'a LaunchRecipe);
+
+impl std::fmt::Debug for RedactedLaunchRecipe<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let recipe = self.0;
+        f.debug_struct("LaunchRecipe")
+            .field("program", &recipe.program)
+            .field("arguments", &recipe.arguments)
+            .field("working_directory", &recipe.working_directory)
+            .field(
+                "environment",
+                &format_args!("<{} variables>", recipe.environment.len()),
+            )
+            .field("unset_environment", &recipe.unset_environment)
+            .finish()
+    }
 }
 
 impl Review {
@@ -499,6 +547,46 @@ mod tests {
         let diagnostic = format!("{action:?}");
         assert!(diagnostic.contains("OpenIntent"));
         assert!(!diagnostic.contains("PRIVATE_RECOVERY"));
+        app.session.as_mut().unwrap().shutdown();
+    }
+
+    #[test]
+    fn recovery_review_debug_redacts_launch_environment_values() {
+        let (_directory, mut app, card) = fixture();
+        let mut state = (*app.durable).clone();
+        for pane in &mut state.cards {
+            let CardKind::Terminal(terminal) = &mut pane.kind else {
+                continue;
+            };
+            terminal.launch.environment.insert(
+                "PRIVATE_RECOVERY_ENVIRONMENT".into(),
+                "PRIVATE_RECOVERY_VALUE".into(),
+            );
+        }
+        let source = state.cards[0].id;
+        let terminal = match &state
+            .cards
+            .iter()
+            .find(|pane| pane.id == card)
+            .unwrap()
+            .kind
+        {
+            CardKind::Terminal(terminal) => terminal.id,
+            _ => unreachable!(),
+        };
+        let review = Review::from_snapshot(
+            &state,
+            TerminalPaneAdoption {
+                alias: source,
+                canonical: card,
+                terminal,
+            },
+        )
+        .unwrap();
+
+        let diagnostic = format!("{review:?}");
+        assert!(diagnostic.contains("<1 variables>"));
+        assert!(!diagnostic.contains("PRIVATE_RECOVERY_VALUE"));
         app.session.as_mut().unwrap().shutdown();
     }
 
