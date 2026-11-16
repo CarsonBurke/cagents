@@ -2393,6 +2393,10 @@ impl Cagents {
                     // agent as a terminal. A chat whose provider has not
                     // started, or has ended, has no one to show.
                     match (state.card_activity(*id), &card.kind) {
+                        // A native chat reports an unknown state once its
+                        // provider has exited, and before it has started.
+                        (Some(activity), CardKind::Chat(_))
+                            if activity.state == crate::agent::ActivityState::Unknown => {}
                         (Some(activity), _) => members.add_agent(
                             activity.provider,
                             sidebar::ChannelMemberState::of(activity.state, attention.limited != 0),
@@ -3303,6 +3307,15 @@ mod tests {
             Activity {
                 provider: Provider::Claude,
                 state: ActivityState::Working,
+            },
+        );
+        // What a native chat reports before its provider starts and after it
+        // exits.
+        app.sidebar_state.set_card_activity(
+            unstarted,
+            Activity {
+                provider: Provider::Claude,
+                state: ActivityState::Unknown,
             },
         );
 
