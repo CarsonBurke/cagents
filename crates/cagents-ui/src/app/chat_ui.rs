@@ -20730,6 +20730,7 @@ mod tests {
                 }
             }
             let window = cosmic::iced::window::Id::unique();
+            app.core.set_main_window_id(Some(window));
             drop(app.update(Message::WindowCloseRequested(window)));
             assert!(app.exit.is_none());
             assert_eq!(app.transient_work_close, Some(window));
@@ -27997,7 +27998,7 @@ mod tests {
             };
             // A confirmed canonical Home, rather than an unregistered local
             // channel: only its authoritative disappearance permits retirement.
-            let home = crate::channel_work::Home {
+            let home = crate::workspace_model::ChannelIncarnation {
                 registry: uuid::Uuid::new_v4(),
                 channel,
                 creation_ordinal: 4,

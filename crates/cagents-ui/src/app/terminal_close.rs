@@ -828,6 +828,14 @@ impl Cagents {
             }
             _ => Task::none(),
         };
+        // A project closed in another window waits for its open editors. Closing
+        // the last of them, or discarding its edits, releases the close here,
+        // once any replacement is in place for the census to see.
+        let projects = if self.project_ui.closing.is_empty() {
+            Task::none()
+        } else {
+            self.complete_closed_projects()
+        };
         let focus = if !replacing
             && handoff
                 .is_some_and(|handoff| handoff.target != crate::workspace::FocusTarget::Unchanged)
@@ -841,8 +849,16 @@ impl Cagents {
             Task::none()
         };
         Some(
-            Task::batch([closed, replacement, settings, emptied, reopen, focus])
-                .chain(self.next_queued_card_close()),
+            Task::batch([
+                closed,
+                projects,
+                replacement,
+                settings,
+                emptied,
+                reopen,
+                focus,
+            ])
+            .chain(self.next_queued_card_close()),
         )
     }
 
@@ -1319,14 +1335,14 @@ mod tests {
         ));
     }
 
-    fn channel_close_fixture() -> (Cagents, CardId, crate::channel_work::Home) {
+    fn channel_close_fixture() -> (Cagents, CardId, crate::workspace_model::ChannelIncarnation) {
         use crate::workspace_model::{
             ModelChannel,
             views::{Pane, Scope, View},
         };
         let mut app = super::super::tests::context_inspector_test_app(true);
         let card = app.workspace.focused().unwrap();
-        let home = crate::channel_work::Home {
+        let home = crate::workspace_model::ChannelIncarnation {
             registry: uuid::Uuid::new_v4(),
             channel: crate::model::ChannelId::new(),
             creation_ordinal: 4,
@@ -1390,7 +1406,7 @@ mod tests {
     fn assert_deferred_home_close(
         app: &mut Cagents,
         card: CardId,
-        home: crate::channel_work::Home,
+        home: crate::workspace_model::ChannelIncarnation,
     ) {
         use crate::workspace_model::ModelEdit;
         assert!(!app.card_state(card).unwrap().existence.is_open());

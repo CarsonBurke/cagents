@@ -31,6 +31,8 @@ mod device_request_tests;
 #[cfg(all(test, target_os = "linux"))]
 mod explicit_authority_server_tests;
 #[cfg(test)]
+mod retired_channel_work_tests;
+#[cfg(test)]
 mod workspace_progress_tests;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1396,15 +1398,11 @@ fn process_admitted_request(
             super::agent_execution::terminals::authenticate(host, client_id, &authority)?;
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
-        ClientRequest::ChannelWork { authority, request } => {
-            let response = if let crate::channel_work_api::Request::Refresh { home } = request {
-                drop(_shared);
-                super::channel_work::refresh(host, &authority, home)
-            } else {
-                super::channel_work::process(host, &authority, request)
-            };
-            Ok((ServerResponse::ChannelWork(response), Vec::new(), false))
-        }
+        ClientRequest::RetiredChannelWork => Err(ProtocolError::new(
+            ProtocolErrorCode::InvalidRequest,
+            crate::terminal_ipc::RETIRED_CHANNEL_WORK,
+            false,
+        )),
         ClientRequest::Work(request) => {
             // Admission was checked above. A board may wait on scans and
             // GitHub for its bound, which must not hold the fence that

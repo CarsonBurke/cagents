@@ -4,7 +4,7 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use super::menu_bar::MenuBarState;
+use super::menu_bar::{MenuBarState, MenuBarStateInner};
 use super::menu_tree::MenuTree;
 #[cfg(wayland_platform)]
 use crate::app::cosmic::{WINDOWING_SYSTEM, WindowingSystem};
@@ -1542,16 +1542,21 @@ fn process_keyboard_events<Message: Clone + 'static>(
         Key::Character(text) if text.as_str() == " " => &Named::Enter,
         _ => return None,
     };
-    if !matches!(
-        key,
-        Named::ArrowDown
-            | Named::ArrowUp
-            | Named::Home
-            | Named::End
-            | Named::ArrowRight
-            | Named::ArrowLeft
-            | Named::Enter
-    ) {
+    // An in-window menu leaves Escape to the widget that opened it. A popup
+    // menu owns the keyboard while it is open, so it closes itself.
+    let dismisses = *key == Named::Escape && !menu.is_overlay;
+    if !dismisses
+        && !matches!(
+            key,
+            Named::ArrowDown
+                | Named::ArrowUp
+                | Named::Home
+                | Named::End
+                | Named::ArrowRight
+                | Named::ArrowLeft
+                | Named::Enter
+        )
+    {
         return None;
     }
     let mut open_at = None;
@@ -1569,6 +1574,11 @@ fn process_keyboard_events<Message: Clone + 'static>(
             menu.depth
         };
         if depth >= state.menu_states.len() || depth >= state.active_root.len() {
+            return true;
+        }
+        if dismisses {
+            destroy_popup_chain(menu, state, shell);
+            state.reset();
             return true;
         }
         if *key == Named::ArrowLeft {
@@ -1642,21 +1652,7 @@ fn process_keyboard_events<Message: Clone + 'static>(
                 && let Some(message) = &item.keyboard_action
             {
                 shell.publish(message.with_data(Clone::clone));
-                #[cfg(wayland_platform)]
-                if matches!(WINDOWING_SYSTEM.get(), Some(WindowingSystem::Wayland))
-                    && let Some(handler) = &menu.on_surface_action
-                {
-                    let mut root = menu.window_id;
-                    let mut depth = menu.depth;
-                    while let Some(parent) = state.popup_id.iter().find(|(_, id)| **id == root) {
-                        if depth == 0 {
-                            break;
-                        }
-                        root = *parent.0;
-                        depth -= 1;
-                    }
-                    shell.publish(handler(crate::surface::Action::DestroyPopup(root)));
-                }
+                destroy_popup_chain(menu, state, shell);
                 state.reset();
             }
         }
@@ -1694,6 +1690,32 @@ fn process_keyboard_events<Message: Clone + 'static>(
         });
     }
     Some(submenu)
+}
+
+/// Asks the application to destroy this popup menu together with the popups
+/// of the menus it was opened from, down to the root popup.
+fn destroy_popup_chain<Message: Clone>(
+    menu: &Menu<'_, Message>,
+    state: &MenuBarStateInner,
+    shell: &mut Shell<'_, Message>,
+) {
+    #[cfg(wayland_platform)]
+    if matches!(WINDOWING_SYSTEM.get(), Some(WindowingSystem::Wayland))
+        && let Some(handler) = &menu.on_surface_action
+    {
+        let mut root = menu.window_id;
+        let mut depth = menu.depth;
+        while let Some(parent) = state.popup_id.iter().find(|(_, id)| **id == root) {
+            if depth == 0 {
+                break;
+            }
+            root = *parent.0;
+            depth -= 1;
+        }
+        shell.publish(handler(crate::surface::Action::DestroyPopup(root)));
+    }
+    #[cfg(not(wayland_platform))]
+    let _ = (menu, state, shell);
 }
 
 #[allow(clippy::too_many_arguments)]

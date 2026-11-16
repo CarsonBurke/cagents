@@ -16161,6 +16161,11 @@ impl Application for Cagents {
                         tasks.push(repository_task(runtime.reconcile_operation_recovery(*card)));
                     }
                 }
+                // Recovery can release a clean editor's last close barrier
+                // without producing another repository event.
+                if !self.project_ui.closing.is_empty() {
+                    tasks.push(self.complete_closed_projects());
+                }
                 Task::batch(tasks)
             }
             Message::Repository(action) => {
@@ -17315,6 +17320,11 @@ impl Application for Cagents {
                 Task::none()
             }
             Message::WindowCloseRequested(window) => {
+                // libcosmic also reports auxiliary surface teardown here.
+                // Closing a popup must not begin main-window shutdown.
+                if self.core.main_window_id() != Some(window) {
+                    return Task::none();
+                }
                 // libcosmic reports the closed window through this same
                 // request, and a second close must not reopen the exit.
                 if self.exit.is_some() || self.dirty_repository_close.is_some() {
@@ -18422,23 +18432,11 @@ impl Application for Cagents {
                     && self.terminal_find.get(&card).is_some_and(|find| find.open)
                     && let keyboard::Event::KeyPressed {
                         key: keyboard::Key::Named(key),
-                        modifiers,
                         ..
                     } = &event
                 {
                     if *key == keyboard::key::Named::Escape && !captured {
                         return self.handle_terminal_find(terminal_ui::Action::Close(card));
-                    }
-                    if *key == keyboard::key::Named::Enter
-                        && self
-                            .terminal_find
-                            .get(&card)
-                            .is_some_and(|find| find.focused)
-                    {
-                        return self.handle_terminal_find(terminal_ui::Action::Next(
-                            card,
-                            modifiers.shift(),
-                        ));
                     }
                 }
                 if let keyboard::Event::KeyPressed {
@@ -19629,19 +19627,19 @@ impl Application for Cagents {
                     .into(),
             );
         }
-        rows.push(dialog_ui::confirmation_actions(
+        let actions = dialog_ui::confirmation_actions(
             crate::ui_controls::button::secondary("Cancel").on_press(Message::CancelDialog),
             crate::ui_controls::button::primary("Create").on_press_maybe(
                 self.pull_request_submission_allowed()
                     .then_some(Message::SubmitPullRequest),
             ),
-        ));
+        );
         Some(dialog_ui::overlay(
-            dialog_ui::scrolling_surface(
+            dialog_ui::scrolling_surface_with_actions(
                 widget::column::with_children(rows).spacing(space::M),
+                actions,
                 620.0,
-                (self.window_height - 112.0).clamp(120.0, 620.0),
-                Length::Shrink,
+                620.0,
             ),
             Some(Message::CancelDialog),
             1.0,
@@ -21563,6 +21561,86 @@ mod tests {
         );
     }
 
+    #[test]
+    fn popup_close_callbacks_and_requests_preserve_the_main_window() {
+        let mut app = context_inspector_test_app(true);
+        let main = window::Id::unique();
+        let popup = window::Id::unique();
+        app.core.set_main_window_id(Some(main));
+        let order = app.workspace.order().collect::<Vec<_>>();
+        let focused = app.workspace.focused();
+        let activation_closed = app.activation_rx.is_closed();
+
+        // The real libcosmic SurfaceClosed path calls this callback for
+        // popups too; the raw event subscription can also report a close.
+        if let Some(message) = app.on_close_requested(popup) {
+            drop(app.update(message));
+        }
+        drop(app.update(Message::WindowCloseRequested(popup)));
+
+        assert!(app.exit.is_none());
+        assert!(app.dirty_repository_close.is_none());
+        assert!(app.transient_work_close.is_none());
+        assert_eq!(app.core.main_window_id(), Some(main));
+        assert_eq!(app.workspace.order().collect::<Vec<_>>(), order);
+        assert_eq!(app.workspace.focused(), focused);
+        assert_eq!(app.activation_rx.is_closed(), activation_closed);
+
+        let close = app
+            .on_close_requested(main)
+            .expect("main close is admitted");
+        drop(app.update(close));
+        assert_eq!(
+            app.exit,
+            Some(ApplicationExit {
+                closing: Some(main),
+                servers_reaped: false,
+            })
+        );
+        assert_eq!(app.core.main_window_id(), None);
+    }
+
+    #[test]
+    fn popup_close_preserves_unsaved_work_without_opening_application_confirmation() {
+        let mut app = context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let main = window::Id::unique();
+        let popup = window::Id::unique();
+        app.core.set_main_window_id(Some(main));
+        app.cards.insert(
+            card,
+            CardRuntime::Repository(Box::new(RepositoryRuntime::dirty_fixture(card))),
+        );
+
+        if let Some(message) = app.on_close_requested(popup) {
+            drop(app.update(message));
+        }
+        drop(app.update(Message::WindowCloseRequested(popup)));
+
+        assert!(app.exit.is_none());
+        assert!(app.dirty_repository_close.is_none());
+        assert!(app.transient_work_close.is_none());
+        assert_eq!(app.core.main_window_id(), Some(main));
+        assert!(
+            matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime))
+            if runtime.blocks_navigation())
+        );
+
+        let close = app
+            .on_close_requested(main)
+            .expect("main close is admitted");
+        drop(app.update(close));
+        assert!(app.exit.is_none());
+        assert_eq!(app.core.main_window_id(), Some(main));
+        let confirmation = app.dirty_repository_close.as_ref().unwrap();
+        assert_eq!(confirmation.card, card);
+        assert_eq!(confirmation.intent, DirtyCloseIntent::Application(main));
+        assert!(
+            matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime))
+            if runtime.blocks_navigation())
+        );
+    }
+
     /// The window is the only part of an exit anyone sees, so it closes as
     /// soon as the exit is committed; the language-server reap, the final
     /// session flush and the process teardown all happen after it has gone.
@@ -21962,6 +22040,7 @@ mod tests {
         let mut app = context_inspector_test_app(true);
         let card = app.workspace.focused().unwrap();
         let window = window::Id::unique();
+        app.core.set_main_window_id(Some(window));
         let runtime = RepositoryRuntime::post_persist_warning_fixture(card);
         assert!(runtime.is_dirty(), "the buffer has edited back from B to A");
         assert!(runtime.has_durability_warning());
@@ -24215,6 +24294,7 @@ mod tests {
             CardRuntime::Repository(Box::new(RepositoryRuntime::dirty_fixture(second))),
         );
         let window = window::Id::unique();
+        app.core.set_main_window_id(Some(window));
 
         let _ = app.update(Message::WindowCloseRequested(window));
         let _ = app.update(Message::DiscardAndCloseRepository(first));

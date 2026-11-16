@@ -17,7 +17,7 @@ struct Fixture {
     project: ProjectId,
     channel: ChannelId,
     card: CardId,
-    home: crate::channel_work::Home,
+    home: crate::workspace_model::ChannelIncarnation,
     /// A conversation opened beside it and never sent, which no shared view
     /// lists until its first send.
     unsent: Option<CardId>,
@@ -35,7 +35,7 @@ fn fixture_with(unsent: bool) -> Fixture {
     let mut app = super::super::tests::context_inspector_test_app(true);
     let project = ProjectId::new();
     let channel = ChannelId::new();
-    let home = crate::channel_work::Home {
+    let home = crate::workspace_model::ChannelIncarnation {
         registry: uuid::Uuid::new_v4(),
         channel,
         creation_ordinal: 4,
@@ -342,14 +342,14 @@ impl Fixture {
     }
 
     /// The registry incarnation of the channel the window has entered.
-    fn entered_home(&self) -> crate::channel_work::Home {
+    fn entered_home(&self) -> crate::workspace_model::ChannelIncarnation {
         let id = self
             .app
             .durable
             .active_channel
             .expect("a channel is entered");
         let channel = self.app.workspace_model.channel(id).unwrap();
-        crate::channel_work::Home {
+        crate::workspace_model::ChannelIncarnation {
             registry: self.app.workspace_model.identity,
             channel: channel.id,
             creation_ordinal: channel.ordinal,

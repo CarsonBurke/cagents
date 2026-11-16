@@ -30,8 +30,6 @@ pub mod account;
 pub mod agent;
 pub mod agent_execution;
 pub mod automations;
-pub mod channel_work;
-pub mod channel_work_api;
 pub mod chat;
 pub mod companion;
 pub mod control;
