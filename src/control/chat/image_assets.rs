@@ -3,9 +3,11 @@ use super::*;
 
 #[derive(Debug, clap::Subcommand)]
 pub enum ImageAssetCommand {
-    /// List private image receipts and quota usage; never prints image bytes or source paths.
+    /// List private image receipts and quota usage.
+    #[command(after_help = "Never prints image bytes or source paths.")]
     List,
-    /// Remove one exact image receipt. Drafts and saved history may lose that image.
+    /// Remove one exact image receipt.
+    #[command(after_help = "Drafts and saved history may lose that image.")]
     Remove {
         /// Exact image receipt UUID from image-assets list.
         id: uuid::Uuid,

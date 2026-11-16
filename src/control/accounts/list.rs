@@ -207,7 +207,7 @@ mod tests {
             "--json",
         ])
         .unwrap();
-        assert!(parsed.json);
+        assert!(parsed.global.json);
         let TopCommand::Account {
             command: AccountCommand::List { provider },
         } = parsed.command

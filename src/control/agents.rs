@@ -16,59 +16,59 @@ pub enum AgentCommand {
     /// The terminal presentation of an already hosted execution agent.
     #[command(hide = true)]
     Console {
-        #[arg(help = "The hosted agent ID.")]
+        #[arg(help = "The hosted agent ID")]
         agent_id: AgentId,
     },
     /// Start a provider session on one prompt, accepted durably.
-    ///
-    /// The provider defaults to the calling session's, the directory to the
-    /// current one, and the project to the open one containing it.
+    #[command(
+        after_help = "Without --channel or --worktree, the agent joins the calling session's \
+        view, or the channel its lineage last belonged to when that view is missing or \
+        ambiguous. An agent for another project, or for a caller that never belonged to a \
+        channel, gets a new channel."
+    )]
     Spawn {
         #[command(flatten)]
         prompt: PromptArgs,
         /// Unique lowercase handle among your open agents, such as reviewer.
         #[arg(long)]
         name: Option<String>,
-        /// claude, codex, or omp. Defaults to the calling session's provider.
+        /// claude, codex or omp; defaults to the calling session's.
         #[arg(long, value_parser = parse_provider)]
         provider: Option<Provider>,
-        /// The open project to work in, by any directory inside it.
-        /// Defaults to the one containing the agent's directory.
+        /// The open project to work in, by any directory inside it; defaults
+        /// to the one containing the agent's directory.
         #[arg(long, visible_alias = "project")]
         repository: Option<PathBuf>,
-        /// The agent's working directory. Defaults to the --project path when
-        /// given, and otherwise the current directory.
+        /// The agent's working directory; defaults to the --project path, or
+        /// else the current directory.
         #[arg(long)]
         directory: Option<PathBuf>,
-        /// Place the agent in this channel. By default it joins the calling
-        /// session's view, or the channel its lineage last belonged to when
-        /// that view is missing or ambiguous; an agent for another project, or
-        /// for a caller that never belonged to a channel, gets a new channel.
+        /// Place the agent in this channel; the default is below.
         #[arg(long)]
         channel: Option<ChannelId>,
-        /// Place the agent among the panes of this open checkout, the
-        /// project's own folder or one of its linked worktrees, instead of
-        /// in a channel. It is also the working directory unless --directory
-        /// names another.
+        /// Place the agent among this open checkout's panes, the project
+        /// folder or a linked worktree, instead of a channel; also the working
+        /// directory unless --directory names another.
         #[arg(long, conflicts_with = "channel")]
         worktree: Option<PathBuf>,
         #[arg(long)]
-        #[arg(help = "Stable account ID (provider/system or provider/UUID).")]
+        #[arg(help = "Stable account ID: provider/system or provider/UUID")]
         account: Option<AccountId>,
         #[arg(long, default_value = "chat", value_parser = ["chat", "terminal"])]
-        #[arg(help = "Presentation surface for the provider session.")]
+        #[arg(help = "How the session is presented")]
         surface: String,
         #[arg(long)]
         #[arg(
-            help = "Provider model ID (Claude: an alias such as fable, opus, sonnet or haiku, which the installed Claude Code resolves, or a full ID such as claude-fable-5-2; Codex: exact provider catalog ID; OMP: provider/model). Omit to use the provider default; the native chat model picker lists available IDs."
+            help = "Provider model ID; omit for the provider default. Claude: an alias the installed Claude Code resolves, such as fable, opus, sonnet or haiku, or a full ID such as claude-fable-5-2. Codex: an exact provider catalog ID. OMP: provider/model. The native chat model picker lists available IDs"
         )]
         model: Option<String>,
-        #[arg(long)]
-        #[arg(help = "Permission policy (Claude: default/manual/auto/acceptEdits/plan/dontAsk/bypassPermissions; Codex: untrusted/on-failure/on-request/never; OMP: always-ask/write/yolo).",
+        #[arg(long, value_name = "MODE")]
+        #[arg(help = "Permission policy. Claude: default, manual, auto, acceptEdits, plan, dontAsk or bypassPermissions. Codex: untrusted, on-failure, on-request or never. OMP: always-ask, write or yolo",
+            hide_possible_values = true,
             value_parser = ["default", "manual", "auto", "acceptEdits", "plan", "dontAsk", "bypassPermissions", "untrusted", "on-failure", "on-request", "never", "always-ask", "write", "yolo"])]
         permission_mode: Option<String>,
         /// The provider's effort name, such as low or high; omit for its default.
-        #[arg(long)]
+        #[arg(long, value_name = "EFFORT")]
         reasoning_effort: Option<String>,
         #[command(flatten)]
         retry: RetryArgs,
@@ -78,17 +78,18 @@ pub enum AgentCommand {
         show: ShowArgs,
     },
     /// Send a follow-up prompt to an owned agent.
-    ///
-    /// An idle agent starts a run with it now, reopening its conversation if
-    /// its process stopped. A busy one holds it, unsent, and runs it as soon
-    /// as its current work ends.
+    #[command(
+        after_help = "An idle agent starts a run with it now, reopening its conversation \
+        if its process stopped. A busy one holds it, unsent, and runs it as soon as its \
+        current work ends."
+    )]
     Send {
-        /// The agent, by ID or a unique prefix of it.
+        /// Agent handle, ID, or unique ID prefix.
         agent: String,
         #[command(flatten)]
         prompt: PromptArgs,
-        /// Interrupt the agent's current turn, so this prompt runs as soon as
-        /// that turn stops. Prompts already waiting still run first.
+        /// Interrupt the current turn so this prompt runs when it stops;
+        /// prompts already waiting still run first.
         #[arg(long)]
         interrupt: bool,
         #[command(flatten)]
@@ -100,7 +101,7 @@ pub enum AgentCommand {
     },
     /// Read an owned agent and its latest run.
     Status {
-        #[arg(help = "Agent handle, ID, or unique ID prefix.")]
+        #[arg(help = "Agent handle, ID, or unique ID prefix")]
         agent: String,
         #[command(flatten)]
         show: ShowArgs,
@@ -108,34 +109,34 @@ pub enum AgentCommand {
     /// List this caller's open agents without their results.
     List,
     /// Wait for runs to settle or ask for input.
-    ///
-    /// Each handle is an agent, standing for its latest run, or a run, by ID
-    /// or a unique prefix of it.
-    ///
-    /// Exit codes: 0 succeeded; 3 timed out; 4 failed, cancelled or interrupted;
-    /// 5 waiting for input, approval or an arrived message. With --any, use
-    /// the first ready run; otherwise failure outranks input, then timeout.
+    #[command(
+        after_help = "Exit codes: 0 succeeded; 3 timed out; 4 failed, cancelled or \
+        interrupted; 5 waiting for input, approval or an arrived message. With --any, the \
+        first ready run decides; otherwise failure outranks input, then timeout."
+    )]
     Wait {
         #[arg(required = true, value_name = "AGENT_OR_RUN")]
-        #[arg(help = "Agent or run handles to wait for.")]
+        #[arg(
+            help = "Agent handles or IDs, each standing for its latest run, or run IDs; unique ID prefixes work too"
+        )]
         handles: Vec<String>,
         /// Return as soon as any of them is ready, rather than all.
         #[arg(long)]
         any: bool,
         #[arg(long, default_value = "60", value_parser = parse_positive_seconds)]
-        #[arg(help = "Maximum time to wait, in seconds.")]
+        #[arg(help = "Maximum time to wait, in seconds")]
         timeout: f64,
         #[command(flatten)]
         show: ShowArgs,
     },
     /// List the questions and approvals an owned agent is waiting on.
     Requests {
-        #[arg(help = "Agent handle, ID, or unique ID prefix.")]
+        #[arg(help = "Agent handle, ID, or unique ID prefix")]
         agent: String,
     },
     /// Answer one of an owned agent's requests with one of its actions.
     Answer {
-        #[arg(help = "Agent handle, ID, or unique ID prefix.")]
+        #[arg(help = "Agent handle, ID, or unique ID prefix")]
         agent: String,
         /// The request ID `requests` lists.
         request: String,
@@ -147,7 +148,7 @@ pub enum AgentCommand {
     },
     /// Interrupt an owned agent's active run.
     Interrupt {
-        #[arg(help = "Agent handle, ID, or unique ID prefix.")]
+        #[arg(help = "Agent handle, ID, or unique ID prefix")]
         agent: String,
         /// Permit the interrupt to stop the provider's background subagents,
         /// including any waiting on their own background work.
@@ -156,7 +157,7 @@ pub enum AgentCommand {
     },
     /// Stop and close an agent, including its background subagents.
     Close {
-        #[arg(help = "Agent handle, ID, or unique ID prefix.")]
+        #[arg(help = "Agent handle, ID, or unique ID prefix")]
         agent: String,
     },
 }
@@ -164,8 +165,7 @@ pub enum AgentCommand {
 /// A prompt given as an argument, in a file, or on standard input.
 #[derive(Debug, clap::Args)]
 pub struct PromptArgs {
-    /// The prompt, which may begin with `-`; a lone `-` reads it from
-    /// standard input.
+    /// The prompt, which may begin with `-`; a lone `-` reads standard input.
     #[arg(value_name = "PROMPT", allow_hyphen_values = true)]
     pub(super) text: Option<String>,
     /// Read the prompt from this file.
@@ -178,9 +178,9 @@ pub struct PromptArgs {
 
 #[derive(Debug, clap::Args)]
 pub struct RetryArgs {
-    /// Retrying with the same key and request returns the original
-    /// acceptance instead of starting the work again. Generated when omitted.
-    #[arg(long)]
+    /// Retrying with this key and the same request returns the original
+    /// acceptance instead of starting again; generated when omitted.
+    #[arg(long, value_name = "KEY")]
     idempotency_key: Option<String>,
 }
 
@@ -190,7 +190,7 @@ pub struct WaitArgs {
     /// 5 input or approval needed.
     #[arg(long)]
     pub(super) wait: bool,
-    /// How long `--wait` waits.
+    /// How long `--wait` waits, in seconds.
     #[arg(long, default_value = "60", value_parser = parse_positive_seconds, requires = "wait")]
     timeout: f64,
 }
@@ -333,30 +333,152 @@ pub(super) fn state_label(state: crate::agent_execution::State) -> &'static str 
     }
 }
 
-fn list_human(summaries: &[Summary]) -> String {
-    super::format::table(
-        ["AGENT", "PROVIDER", "STATE", "RUN", "DIRECTORY", "NAME"],
-        summaries
+/// The caller's agents, one row each, named by the shortest prefixes that
+/// tell their agent and run IDs apart. A project every agent works in is
+/// named once, after the rows, and their directories are shown relative to
+/// it; agents across projects each name theirs and show directories whole.
+fn list_human(summaries: &[Summary], projects: &[ModelProject], program: &str) -> String {
+    use super::format;
+    // Handles name an agent or a run, so a prefix must tell both apart.
+    let handles = Handles::among(summaries, &[]);
+    let project_of = |summary: &Summary| {
+        let repository = &summary.agent.spec.target.repository;
+        let root = checkout(repository);
+        let name = projects
             .iter()
-            .map(|summary| {
-                [
-                    short(summary.agent.id),
-                    summary.agent.spec.provider.executable().into(),
-                    state_label(summary.state).into(),
-                    short(summary.run),
-                    summary.agent.spec.target.directory.display().to_string(),
-                    summary.agent.name.clone().unwrap_or_default(),
-                ]
+            .find(|project| project.repository == *repository)
+            .map(|project| project.name.clone())
+            .or_else(|| {
+                root.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
             })
-            .collect(),
+            .unwrap_or_else(|| root.display().to_string());
+        (name, root)
+    };
+    let single = match summaries {
+        [first, rest @ ..]
+            if rest.iter().all(|summary| {
+                summary.agent.spec.target.repository == first.agent.spec.target.repository
+            }) =>
+        {
+            Some(project_of(first))
+        }
+        _ => None,
+    };
+    let root = single.as_ref().map(|(_, root)| root.as_path());
+    let rows = summaries
+        .iter()
+        .map(|summary| {
+            let directory = &summary.agent.spec.target.directory;
+            [
+                handles.name(summary.agent.id),
+                summary.agent.name.clone().unwrap_or_default(),
+                summary.agent.spec.provider.executable().into(),
+                state_label(summary.state).into(),
+                handles.name(summary.run),
+                if single.is_some() {
+                    String::new()
+                } else {
+                    project_of(summary).0
+                },
+                match root {
+                    Some(root) if directory == root => String::new(),
+                    root => format::location(directory, root),
+                },
+            ]
+        })
+        .collect();
+    let mut out = format::sparse_table(
+        [
+            "AGENT",
+            "NAME",
+            "PROVIDER",
+            "STATE",
+            "RUN",
+            "PROJECT",
+            "DIRECTORY",
+        ],
+        rows,
         "No open agents",
-    )
+    );
+    if let Some((name, root)) = &single {
+        let location = format::location(root, None);
+        // A project named for its folder is named by the path alone.
+        if root
+            .file_name()
+            .is_some_and(|folder| folder == name.as_str())
+        {
+            out.push_str(&format!("\n(project at {location})"));
+        } else {
+            out.push_str(&format!(
+                "\n(project {} at {location})",
+                format::plain(name)
+            ));
+        }
+    }
+    // One agent is named in its hints; several leave the choice.
+    let handle = |wanted: &dyn Fn(&Summary) -> bool| {
+        let mut chosen = summaries.iter().filter(|summary| wanted(summary));
+        match (chosen.next(), chosen.next()) {
+            (Some(only), None) => Some(handles.name(only.agent.id)),
+            (Some(_), Some(_)) => Some("AGENT".to_owned()),
+            (None, _) => None,
+        }
+    };
+    use crate::agent_execution::State;
+    let mut steps = Vec::new();
+    if let Some(agent) = handle(&|_| true) {
+        steps.push((
+            format!("{program} agent status {agent}"),
+            "shows its latest result",
+        ));
+    }
+    if let Some(agent) =
+        handle(&|summary| matches!(summary.state, State::Accepted | State::Running))
+    {
+        steps.push((format!("{program} agent wait {agent}"), "waits for its run"));
+    }
+    if let Some(agent) = handle(&|summary| summary.state == State::Waiting) {
+        steps.push((
+            format!("{program} agent requests {agent}"),
+            "lists what it asks",
+        ));
+    }
+    if !steps.is_empty() {
+        out.push('\n');
+        out.push_str(&format::hint(&steps));
+    }
+    out
 }
 
-/// The part of an ID people type and read: unique among one caller's agents
-/// in practice, and accepted back as a handle.
-fn short(id: impl std::fmt::Display) -> String {
-    super::format::prefix(&id.to_string(), super::format::MIN_ABBREVIATION).to_owned()
+/// How long naming an accepted run may wait on the agent list.
+const HANDLES_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// How output names agents and runs: by the shortest prefix, eight
+/// characters or more, that tells apart every agent and run it knows of, as
+/// `agent list` shows them. Each is accepted back as a handle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Handles(usize);
+
+impl Handles {
+    fn among(summaries: &[Summary], also: &[String]) -> Self {
+        let listed = summaries
+            .iter()
+            .flat_map(|summary| [summary.agent.id.to_string(), summary.run.to_string()]);
+        let ids: Vec<String> = listed.chain(also.iter().cloned()).collect();
+        Self(super::format::abbreviation(ids.iter().map(String::as_str)))
+    }
+
+    fn name(self, id: impl std::fmt::Display) -> String {
+        super::format::prefix(&id.to_string(), self.0).to_owned()
+    }
+}
+
+#[cfg(test)]
+impl Default for Handles {
+    fn default() -> Self {
+        Self(super::format::MIN_ABBREVIATION)
+    }
 }
 
 impl ControlClient {
@@ -864,6 +986,27 @@ impl Session {
         Ok(self.summaries.as_deref().unwrap_or_default())
     }
 
+    /// How to name agents and runs, among the caller's open ones and `also`.
+    /// The list is read only for human text, and only briefly: without it,
+    /// as when the daemon is slow or refuses it, `also` alone decides.
+    fn handles(&mut self, also: &[String]) -> Handles {
+        if self.summaries.is_none() && super::human_output() {
+            let authority = self.context.authority.clone();
+            let deadline = Instant::now() + HANDLES_TIMEOUT;
+            let listed = self
+                .client()
+                .ok()
+                .map(|client| client.agent_before(authority, Operation::List, Some(deadline)));
+            match listed {
+                Some(Ok(Reply::Listed(summaries))) => self.summaries = Some(summaries),
+                // A late reply must not answer this session's next request.
+                Some(Err(_)) => self.connection = None,
+                _ => {}
+            }
+        }
+        Handles::among(self.summaries.as_deref().unwrap_or_default(), also)
+    }
+
     /// An agent handle, or the agent of a run handle. A whole ID outside the
     /// caller's open agents is taken as an agent, for the daemon to judge.
     fn agent(&mut self, handle: &str) -> Result<AgentId, AppError> {
@@ -1214,9 +1357,13 @@ pub(super) fn execute_with_context(
             let agent = session.agent(&agent)?;
             let reply = session.call(Operation::Status(agent))?;
             let (agent, run) = status_reply(reply)?;
+            let handles = session.handles(&[agent.id.to_string(), run.id.to_string()]);
             let members = session.members(&[agent.id]);
             let member = member_of(&members, agent.id);
-            let human = with_standing(status_lines(&agent, &run, false, show), member);
+            let human = with_standing(
+                status_lines(&agent, &run, false, show, handles, true),
+                member,
+            );
             let mut data = json!({"agent": agent, "run": run, "timed_out": false});
             standing_json(&mut data, member);
             Ok(CommandOutput {
@@ -1227,7 +1374,19 @@ pub(super) fn execute_with_context(
         }
         AgentCommand::List => {
             let summaries = session.summaries()?.to_vec();
-            let human = list_human(&summaries);
+            // Names make the listing readable; without them it names each
+            // project by its folder.
+            let projects = if summaries.is_empty() || !super::human_output() {
+                Vec::new()
+            } else {
+                session
+                    .client()
+                    .ok()
+                    .and_then(|client| client.read_workspace_projects().ok())
+                    .map(|(_, projects)| projects)
+                    .unwrap_or_default()
+            };
+            let human = list_human(&summaries, &projects, &super::format::program());
             Ok(CommandOutput {
                 command: "agent.list",
                 data: json!({"agents": summaries}),
@@ -1261,11 +1420,28 @@ pub(super) fn execute_with_context(
                     .map(|(agent, _)| agent.id)
                     .collect::<Vec<_>>(),
             );
+            let names = session.handles(
+                &statuses
+                    .iter()
+                    .flat_map(|(agent, run)| [agent.id.to_string(), run.id.to_string()])
+                    .collect::<Vec<_>>(),
+            );
+            let program = super::format::program();
+            // One run's hint goes with its status. Several runs share one
+            // hint, after them all, so a wait prints one however many.
+            let single = statuses.len() == 1;
             let mut human = statuses
                 .iter()
                 .map(|(agent, run)| {
                     with_standing(
-                        status_lines(agent, run, timed_out && !run.state.wait_ready(), show),
+                        status_lines(
+                            agent,
+                            run,
+                            timed_out && !run.state.wait_ready(),
+                            show,
+                            names,
+                            single,
+                        ),
                         member_of(&members, agent.id),
                     )
                 })
@@ -1274,7 +1450,34 @@ pub(super) fn execute_with_context(
             if statuses.is_empty() && timed_out {
                 human = "Wait timed out before any run status was available".into();
             }
+            let mut steps = if single {
+                Vec::new()
+            } else {
+                runs_steps(&program, &statuses, names)
+            };
+            if !messages.is_empty() {
+                // Waiting again on them all covers waiting on any one.
+                let wait = format!("{program} agent wait ");
+                steps.retain(|(command, _)| !command.starts_with(&wait));
+            }
+            steps.extend(arrived_steps(
+                &program,
+                &messages,
+                format!(
+                    "{program} agent wait {}{}",
+                    handles
+                        .iter()
+                        .map(|handle| super::format::shell_word(handle))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    if any { " --any" } else { "" }
+                ),
+            ));
             human.push_str(&arrived_lines(&messages));
+            if !steps.is_empty() {
+                human.push_str("\n\n");
+                human.push_str(&super::format::hint(&steps));
+            }
             let mut data = wait_data(&statuses, any, timed_out, ended_by);
             data["unresolved_runs"] = json!(
                 runs.iter()
@@ -1295,7 +1498,7 @@ pub(super) fn execute_with_context(
             let requests = requests_reply(session.call(Operation::Requests(agent))?)?;
             Ok(CommandOutput {
                 command: "agent.requests",
-                human: requests_lines(agent, &requests),
+                human: requests_lines(agent, &requests, session.handles(&[agent.to_string()])),
                 data: json!({"agent": agent, "requests": requests}),
             })
         }
@@ -1318,7 +1521,11 @@ pub(super) fn execute_with_context(
             let mut human = format!("Answered {request} with {action}");
             if !requests.is_empty() {
                 human.push_str("\n\n");
-                human.push_str(&requests_lines(agent, &requests));
+                human.push_str(&requests_lines(
+                    agent,
+                    &requests,
+                    session.handles(&[agent.to_string()]),
+                ));
             }
             Ok(CommandOutput {
                 command: "agent.answer",
@@ -1342,7 +1549,7 @@ pub(super) fn execute_with_context(
                 data: json!({"agent": agent, "requests": requests, "including_subagents": including_subagents}),
                 human: format!(
                     "Interrupted agent {}{}",
-                    short(agent),
+                    session.handles(&[agent.to_string()]).name(agent),
                     if including_subagents {
                         " including its background subagents"
                     } else {
@@ -1358,7 +1565,10 @@ pub(super) fn execute_with_context(
             };
             Ok(CommandOutput {
                 command: "agent.close",
-                human: format!("Closed agent {}", short(agent.id)),
+                human: format!(
+                    "Closed agent {}",
+                    session.handles(&[agent.id.to_string()]).name(agent.id)
+                ),
                 data: json!({"agent": agent}),
             })
         }
@@ -1423,7 +1633,11 @@ fn ended_run(error: &AppError) -> bool {
 
 /// How a follow-up's acceptance line ends: whether the prompt went to the
 /// agent now or waits, and for what.
-fn start_phrase(start: &crate::agent_execution::Start, interrupted: bool) -> String {
+fn start_phrase(
+    start: &crate::agent_execution::Start,
+    interrupted: bool,
+    handles: Handles,
+) -> String {
     use crate::agent_execution::Start;
     match start {
         Start::Sent { resumed: false } => "; sent it to the agent now".into(),
@@ -1433,7 +1647,7 @@ fn start_phrase(start: &crate::agent_execution::Start, interrupted: bool) -> Str
         }
         Start::Queued { behind } => {
             let ahead = match behind {
-                Some(run) => format!("run {}", short(*run)),
+                Some(run) => format!("run {}", handles.name(*run)),
                 None => "the agent's current turn".into(),
             };
             if interrupted {
@@ -1477,6 +1691,8 @@ fn submitted(
         Reply::Prompted { accepted, start } => (accepted, Some(start)),
         _ => return Err(AppError::new(command, "Unexpected submit response")),
     };
+    let handles = session.handles(&[accepted.agent.id.to_string(), accepted.run.id.to_string()]);
+    let program = super::format::program();
     let mut human = format!(
         "{} agent {} run {}",
         // The retry finds the work this invocation's lost attempt accepted.
@@ -1485,11 +1701,21 @@ fn submitted(
         } else {
             "Already accepted"
         },
-        short(accepted.agent.id),
-        short(accepted.run.id)
+        handles.name(accepted.agent.id),
+        handles.name(accepted.run.id)
     );
     if let Some(start) = &start {
-        human.push_str(&start_phrase(start, interrupt == Some(true)));
+        human.push_str(&start_phrase(start, interrupt == Some(true), handles));
+    }
+    let steps = run_steps(
+        &program,
+        &handles.name(accepted.agent.id),
+        accepted.agent.spec.provider,
+        accepted.run.state,
+    );
+    if !steps.is_empty() {
+        human.push('\n');
+        human.push_str(&super::format::hint(&steps));
     }
     let mut data = json!({
         "agent": accepted.agent,
@@ -1517,8 +1743,17 @@ fn submitted(
                 .map_err(|error| accepted_wait_error(error, &accepted, &key, device))?,
             None => (accepted.agent.clone(), accepted.run.clone()),
         };
-        human = status_lines(&agent, &run, timed_out, show);
+        human = status_lines(&agent, &run, timed_out, show, handles, true);
         human.push_str(&arrived_lines(&messages));
+        let steps = arrived_steps(
+            &program,
+            &messages,
+            format!("{program} agent wait {}", handles.name(agent.id)),
+        );
+        if !steps.is_empty() {
+            human.push_str("\n\n");
+            human.push_str(&super::format::hint(&steps));
+        }
         data["agent"] = json!(agent);
         data["run"] = json!(run);
         data["timed_out"] = json!(timed_out);
@@ -1692,39 +1927,69 @@ fn requests_reply(reply: Reply) -> Result<Vec<crate::chat::Request>, AppError> {
 /// The heading of the messages that ended a wait early.
 pub(super) const ARRIVED: &str = "Messages arrived while waiting:";
 
-/// The messages that ended a wait early, and how to go on.
+/// The messages that ended a wait early, and how to go on: answer them,
+/// then wait `again`.
+/// What follows messages that ended a wait: answering one, or `again`.
+fn arrived_steps(
+    program: &str,
+    messages: &[crate::agent_execution::mailbox::Message],
+    again: String,
+) -> Vec<(String, &'static str)> {
+    if messages.is_empty() {
+        return Vec::new();
+    }
+    vec![
+        super::messages::reply_step(program, messages),
+        (again, "waits again"),
+    ]
+}
+
 fn arrived_lines(messages: &[crate::agent_execution::mailbox::Message]) -> String {
     if messages.is_empty() {
         return String::new();
     }
     let mut lines = vec![format!("\n\n{ARRIVED}")];
     lines.extend(messages.iter().map(super::messages::message_lines));
-    lines.push(
-        "Answer one with: cagents reply <id> \"…\"; then wait again with cagents agent wait".into(),
-    );
     lines.join("\n\n")
 }
 
 /// An agent's latest run in a few lines: who and where, how the run stands,
 /// and the end of its result.
-fn status_lines(agent: &Agent, run: &Run, timed_out: bool, show: ShowArgs) -> String {
+/// With `hint`, the run's next steps come before the result.
+fn status_lines(
+    agent: &Agent,
+    run: &Run,
+    timed_out: bool,
+    show: ShowArgs,
+    handles: Handles,
+    hint: bool,
+) -> String {
     let mut lines = format!(
         "agent {} ({}) run {} {:?}{}",
-        short(agent.id),
+        handles.name(agent.id),
         agent.spec.provider.executable(),
-        short(run.id),
+        handles.name(run.id),
         run.state,
         if timed_out { " (wait timed out)" } else { "" }
     );
-    if run.state == crate::agent_execution::State::Waiting {
-        lines.push_str(&format!(
-            "\nWaiting for input: cagents agent requests {}",
-            short(agent.id)
-        ));
-    }
     if let Some(diagnostic) = &run.result.diagnostic {
         lines.push('\n');
         lines.push_str(diagnostic);
+    }
+    // Before the result, which readers of the output take to its end.
+    let steps = if hint {
+        run_steps(
+            &super::format::program(),
+            &handles.name(agent.id),
+            agent.spec.provider,
+            run.state,
+        )
+    } else {
+        Vec::new()
+    };
+    if !steps.is_empty() {
+        lines.push('\n');
+        lines.push_str(&super::format::hint(&steps));
     }
     if !run.result.text.trim().is_empty() {
         lines.push_str("\n\n");
@@ -1734,6 +1999,68 @@ fn status_lines(agent: &Agent, run: &Run, timed_out: bool, show: ShowArgs) -> St
         }
     }
     lines
+}
+
+/// What to run next for an agent whose latest run is in `state`, when that
+/// is not obvious: what it asks while it waits for input, and its
+/// conversation once it failed or stopped. A working run is waited on and a
+/// finished one followed up, as every caller knows, and these commands run in
+/// loops, so they print nothing for those.
+fn run_steps(
+    program: &str,
+    agent: &str,
+    provider: crate::agent::Provider,
+    state: crate::agent_execution::State,
+) -> Vec<(String, &'static str)> {
+    use crate::agent_execution::State;
+    match state {
+        State::Waiting => vec![(
+            format!("{program} agent requests {agent}"),
+            "lists what it asks",
+        )],
+        // Omp conversations cannot be read back yet.
+        State::Failed | State::Cancelled | State::Interrupted
+            if provider != crate::agent::Provider::Omp =>
+        {
+            vec![(
+                format!("{program} transcript {agent}"),
+                "reads its conversation",
+            )]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The steps for several runs, each once: naming its agent when only one
+/// run calls for it, and `AGENT` when several do.
+fn runs_steps(
+    program: &str,
+    statuses: &[(Agent, Run)],
+    handles: Handles,
+) -> Vec<(String, &'static str)> {
+    // A placeholder no handle contains marks where each step names its agent.
+    const MARK: &str = "\u{0}";
+    let mut steps: Vec<(String, &'static str, Vec<String>)> = Vec::new();
+    for (agent, run) in statuses {
+        let name = handles.name(agent.id);
+        for (template, does) in run_steps(program, MARK, agent.spec.provider, run.state) {
+            match steps.iter_mut().find(|(known, _, _)| *known == template) {
+                Some((_, _, agents)) if !agents.contains(&name) => agents.push(name.clone()),
+                Some(_) => {}
+                None => steps.push((template, does, vec![name.clone()])),
+            }
+        }
+    }
+    steps
+        .into_iter()
+        .map(|(template, does, agents)| {
+            let agent = match agents.as_slice() {
+                [only] => only.as_str(),
+                _ => "AGENT",
+            };
+            (template.replace(MARK, agent), does)
+        })
+        .collect()
 }
 
 /// The run in output [`submitted`] printed: the acceptance line, or the
@@ -1798,9 +2125,9 @@ pub(super) fn read_run(output: &str) -> Option<crate::chat::coordination::Run> {
     })
 }
 
-fn requests_lines(agent: AgentId, requests: &[crate::chat::Request]) -> String {
+fn requests_lines(agent: AgentId, requests: &[crate::chat::Request], handles: Handles) -> String {
     if requests.is_empty() {
-        return format!("Agent {} is not waiting on anything", short(agent));
+        return format!("Agent {} is not waiting on anything", handles.name(agent));
     }
     let mut lines = Vec::new();
     for request in requests {
@@ -1820,10 +2147,23 @@ fn requests_lines(agent: AgentId, requests: &[crate::chat::Request]) -> String {
             lines.push(line);
         }
     }
-    lines.push(format!(
-        "Answer with: cagents agent answer {} REQUEST ACTION [--field FIELD=VALUE]",
-        short(agent)
-    ));
+    let request = match requests {
+        [only] => super::format::shell_word(&only.id),
+        _ => "REQUEST".into(),
+    };
+    let fields = if requests.iter().any(|request| !request.fields.is_empty()) {
+        " --field FIELD=VALUE"
+    } else {
+        ""
+    };
+    lines.push(super::format::hint(&[(
+        format!(
+            "{} agent answer {} {request} ACTION{fields}",
+            super::format::program(),
+            handles.name(agent)
+        ),
+        "answers it",
+    )]));
     lines.join("\n")
 }
 
@@ -1997,7 +2337,7 @@ mod tests {
                 );
                 let cli =
                     Cli::try_parse_from(["cagents", &selection, "agent", "wait", &run]).unwrap();
-                assert_eq!(cli.device.as_deref(), Some(device));
+                assert_eq!(cli.global.device.as_deref(), Some(device));
                 assert!(
                     matches!(cli.command, TopCommand::Agent { command: AgentCommand::Wait { handles, .. } } if handles == [run])
                 );
@@ -2759,6 +3099,19 @@ mod tests {
             "{printed}"
         );
         assert!(printed.contains("  Use the staging database"), "{printed}");
+        assert_eq!(
+            super::super::format::hint(&arrived_steps(
+                "cagents",
+                &waited.messages,
+                "cagents agent wait 1a2b3c4d".into()
+            )),
+            format!(
+                "hint: `cagents reply {} MESSAGE` answers it; \
+                 `cagents agent wait 1a2b3c4d` waits again",
+                crate::agent_execution::mailbox::short(waited.messages[0].id)
+            )
+        );
+        assert!(arrived_steps("cagents", &[], "again".into()).is_empty());
     }
 
     /// Feeds the transcript through `frames` and returns what each one prints.
@@ -3479,20 +3832,27 @@ mod tests {
         assert!(interrupt);
 
         assert_eq!(
-            start_phrase(&Start::Sent { resumed: false }, false),
+            start_phrase(&Start::Sent { resumed: false }, false, Handles::default()),
             "; sent it to the agent now"
         );
-        assert!(start_phrase(&Start::Sent { resumed: true }, false).contains("reopened"));
+        assert!(
+            start_phrase(&Start::Sent { resumed: true }, false, Handles::default())
+                .contains("reopened")
+        );
         let run = crate::model::RunId::new();
         assert_eq!(
-            start_phrase(&Start::Queued { behind: Some(run) }, false),
+            start_phrase(
+                &Start::Queued { behind: Some(run) },
+                false,
+                Handles::default()
+            ),
             format!(
                 "; it waits, unsent, until run {} ends, then starts",
-                short(run)
+                Handles::default().name(run)
             )
         );
         assert_eq!(
-            start_phrase(&Start::Queued { behind: None }, true),
+            start_phrase(&Start::Queued { behind: None }, true, Handles::default()),
             "; interrupted the agent's current turn, and it starts once that has stopped"
         );
     }
@@ -3649,29 +4009,74 @@ mod tests {
 
     #[test]
     fn readable_agent_list_labels_waiting_and_uncertain_results_with_an_empty_state() {
-        assert_eq!(list_human(&[]), "No open agents");
+        assert_eq!(list_human(&[], &[], "cagents"), "No open agents");
         let mut entry = summary(
             "abcdef00-0000-4000-8000-000000000001",
             "12345678-0000-4000-8000-000000000001",
         );
         entry.agent.name = Some("reviewer\nnext".into());
         entry.state = crate::agent_execution::State::Waiting;
-        let human = list_human(&[entry.clone()]);
-        assert_eq!(human.lines().count(), 2);
+        let human = list_human(std::slice::from_ref(&entry), &[], "cagents");
         assert_eq!(
-            human
-                .lines()
-                .next()
-                .unwrap()
-                .split_whitespace()
-                .collect::<Vec<_>>(),
-            ["AGENT", "PROVIDER", "STATE", "RUN", "DIRECTORY", "NAME"]
+            human,
+            "AGENT     NAME           PROVIDER  STATE              RUN\n\
+             abcdef00  reviewer next  claude    Waiting for input  12345678\n\
+             (project at /repo)\n\
+             hint: `cagents agent status abcdef00` shows its latest result; \
+             `cagents agent requests abcdef00` lists what it asks"
         );
-        assert!(human.contains("abcdef00"));
-        assert!(human.contains("Waiting for input"));
-        assert!(human.ends_with("reviewer next"));
         entry.state = crate::agent_execution::State::Interrupted;
-        assert!(list_human(&[entry]).contains("Outcome uncertain"));
+        assert!(list_human(&[entry], &[], "cagents").contains("Outcome uncertain"));
+    }
+
+    /// Agents of one project are listed relative to it, under its name;
+    /// across projects each row names its project and shows its directory.
+    #[test]
+    fn agent_rows_are_placed_by_project() {
+        let mut first = summary(
+            "abcdef00-0000-4000-8000-000000000001",
+            "12345678-0000-4000-8000-000000000001",
+        );
+        first.agent.spec.target.repository = "/repo/.git".into();
+        first.agent.spec.target.directory = "/repo/.worktrees/fix".into();
+        let mut second = summary(
+            "abcdef00-1000-4000-8000-000000000001",
+            "99999999-0000-4000-8000-000000000001",
+        );
+        second.agent.spec.target.repository = "/repo/.git".into();
+        second.agent.spec.target.directory = "/repo".into();
+        second.state = crate::agent_execution::State::Succeeded;
+        let projects = [ModelProject {
+            repository: "/repo/.git".into(),
+            name: "Repo".into(),
+            kind: Default::default(),
+            ordinal: 0,
+        }];
+        let human = list_human(&[first.clone(), second.clone()], &projects, "cagents");
+        assert_eq!(
+            human,
+            "AGENT       PROVIDER  STATE      RUN         DIRECTORY\n\
+             abcdef00-0  claude    Running    12345678-0  .worktrees/fix\n\
+             abcdef00-1  claude    Succeeded  99999999-0\n\
+             (project Repo at /repo)\n\
+             hint: `cagents agent status AGENT` shows its latest result; \
+             `cagents agent wait abcdef00-0` waits for its run",
+            "prefixes never end at a hyphen, and the primary checkout needs no directory"
+        );
+        let mut elsewhere = second;
+        elsewhere.agent.spec.target.repository = "/other".into();
+        elsewhere.agent.spec.target.directory = "/other/sub".into();
+        let human = list_human(&[first, elsewhere], &projects, "cagents");
+        assert!(
+            human.starts_with("AGENT       PROVIDER  STATE      RUN         PROJECT  DIRECTORY\n"),
+            "{human}"
+        );
+        assert!(
+            human.contains("  Repo     /repo/.worktrees/fix\n"),
+            "{human}"
+        );
+        assert!(human.contains("  other    /other/sub\n"), "{human}");
+        assert!(!human.contains("(project"), "{human}");
     }
 
     #[test]
@@ -3773,6 +4178,130 @@ mod tests {
         standing_json(&mut data, found);
         assert_eq!(data["limit"]["reset"], "3pm");
         assert_eq!(data["account"]["id"], "claude/system");
+    }
+
+    /// Each state suggests what follows from it, on a line the native app
+    /// does not take for the agent's result.
+    #[test]
+    fn a_run_names_what_to_run_next() {
+        use crate::agent::Provider;
+        use crate::agent_execution::State;
+        let hint = |program: &str, provider, state| {
+            super::super::format::hint(&run_steps(program, "1a2b3c4d", provider, state))
+        };
+        // What follows a working or finished run goes without saying.
+        for state in [State::Accepted, State::Running, State::Succeeded] {
+            assert!(run_steps("cagents", "1a2b3c4d", Provider::Claude, state).is_empty());
+        }
+        assert_eq!(
+            hint("cagents --device fw16", Provider::Codex, State::Waiting),
+            "hint: `cagents --device fw16 agent requests 1a2b3c4d` lists what it asks"
+        );
+        for state in [State::Failed, State::Cancelled, State::Interrupted] {
+            assert_eq!(
+                hint("cagents", Provider::Claude, state),
+                "hint: `cagents transcript 1a2b3c4d` reads its conversation"
+            );
+        }
+        // An Omp conversation cannot be read back, so none is suggested.
+        assert!(run_steps("cagents", "1a2b3c4d", Provider::Omp, State::Failed).is_empty());
+        #[cfg(feature = "ui")]
+        {
+            let status = format!(
+                "agent 1a2b3c4d (claude) run 5e6f7a8b Failed\n{}\n\nDone.",
+                hint("cagents", Provider::Claude, State::Failed)
+            );
+            let run = read_run(&status).unwrap();
+            assert_eq!(run.state, Some(State::Failed));
+            assert_eq!(run.result, "Done.");
+            let accepted = format!(
+                "Accepted agent 1a2b3c4d run 5e6f7a8b\n{}",
+                hint("cagents", Provider::Claude, State::Waiting)
+            );
+            assert_eq!(read_run(&accepted).unwrap().agent, "1a2b3c4d");
+        }
+    }
+
+    /// A wait on several runs prints one hint for them all, naming an agent
+    /// only when it alone calls for a step.
+    #[test]
+    fn several_runs_share_one_hint() {
+        use crate::agent_execution::State;
+        let summaries: Vec<Summary> = [
+            ("1a2b3c4d", State::Failed),
+            ("5e6f7a8b", State::Cancelled),
+            ("9c0d1e2f", State::Waiting),
+            ("0f1e2d3c", State::Succeeded),
+        ]
+        .into_iter()
+        .map(|(agent, state)| {
+            let mut entry = summary(
+                &format!("{agent}-0000-4000-8000-000000000001"),
+                // Runs whose prefixes no agent shares.
+                &format!(
+                    "{}-1111-4000-8000-000000000001",
+                    agent.chars().rev().collect::<String>()
+                ),
+            );
+            entry.state = state;
+            entry
+        })
+        .collect();
+        let statuses: Vec<(Agent, crate::agent_execution::Run)> = summaries
+            .iter()
+            .map(|summary| {
+                let run = crate::agent_execution::Run {
+                    id: summary.run,
+                    agent: summary.agent.id,
+                    state: summary.state,
+                    revision: 1,
+                    accepted_ms: 0,
+                    started_ms: None,
+                    finished_ms: None,
+                    provider_key: None,
+                    result: Default::default(),
+                };
+                (summary.agent.clone(), run)
+            })
+            .collect();
+        let handles = Handles::among(&summaries, &[]);
+        assert_eq!(
+            super::super::format::hint(&runs_steps("cagents", &statuses, handles)),
+            "hint: `cagents transcript AGENT` reads its conversation; \
+             `cagents agent requests 9c0d1e2f` lists what it asks"
+        );
+        let status = status_lines(
+            &statuses[0].0,
+            &statuses[0].1,
+            false,
+            ShowArgs {
+                full: false,
+                tail: 20,
+            },
+            handles,
+            false,
+        );
+        assert!(!status.contains("hint:"), "{status}");
+    }
+
+    /// Every output names an agent as `agent list` does: long enough to
+    /// tell it from every other agent and run.
+    #[test]
+    fn handles_are_lengthened_until_they_are_unique() {
+        let summaries = vec![
+            summary(
+                "abcdef00-0000-4000-8000-000000000001",
+                "12345678-0000-4000-8000-000000000001",
+            ),
+            summary(
+                "abcdef00-1111-4000-8000-000000000002",
+                "99999999-0000-4000-8000-000000000001",
+            ),
+        ];
+        let handles = Handles::among(&summaries, &[]);
+        assert_eq!(handles.name(summaries[0].agent.id), "abcdef00-0");
+        let alone = Handles::among(&[], &["abcdef00-0000-4000-8000-000000000001".into()]);
+        assert_eq!(alone.name(summaries[0].agent.id), "abcdef00");
     }
 
     #[test]
