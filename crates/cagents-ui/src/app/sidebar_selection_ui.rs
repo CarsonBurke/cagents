@@ -299,6 +299,52 @@ mod tests {
         );
     }
 
+    /// At the minimum 900x600 window with 150% interface scale, a long group
+    /// scrolls, and both of its actions stay whole and inside the window
+    /// rather than being squeezed below their labels.
+    #[test]
+    fn group_actions_stay_in_reach_at_the_scaled_minimum_window() {
+        let (mut app, project, _) = fixture();
+        let more = (3..30).map(|_| ChannelId::new()).collect::<Vec<_>>();
+        let durable = Arc::make_mut(&mut app.durable);
+        for (index, id) in more.iter().enumerate() {
+            durable.channels.push(ProjectChannel {
+                title_source: Default::default(),
+                id: *id,
+                project_id: project,
+                title: format!("Channel {}", index + 3),
+                ordinal: index as u32 + 3,
+                shared: false,
+                cards: Vec::new(),
+                focused: None,
+            });
+        }
+        app.refresh_sidebar_channels();
+        select(&mut app, &more);
+        drop(app.begin_sidebar_group_delete());
+        // The dialog's own recovery message, after a member changed.
+        app.sidebar_selection_ui.dialog.as_mut().unwrap().error = Some(
+            "A selected channel changed while this was open. Review it and confirm again.".into(),
+        );
+        for id in [close_focus_id(), focus_id()] {
+            let geometry = |window| {
+                super::super::dialog_ui::tests::action_geometry(
+                    app.sidebar_selection_dialog().unwrap(),
+                    window,
+                    &id,
+                )
+            };
+            let (_, _, _, natural) = geometry(iced::Size::new(1200.0, 900.0));
+            let (window, _, _, control) = geometry(iced::Size::new(600.0, 400.0));
+            assert!(
+                control.height == natural.height
+                    && control.y >= 0.0
+                    && control.y + control.height <= window.height,
+                "{id:?} must stay whole and inside the window: {control:?}, not {natural:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_selection_of_one_uses_that_rows_own_confirmation() {
         let (mut app, project, _) = fixture();
@@ -870,7 +916,7 @@ impl Cagents {
         if let Some(error) = &dialog.error {
             rows.push(super::notice_body(error.as_str()));
         }
-        rows.push(super::dialog_ui::confirmation_actions(
+        let actions = super::dialog_ui::confirmation_actions(
             crate::ui_controls::button::secondary("Cancel")
                 .id(close_focus_id())
                 .on_press(Message::SidebarSelection(Action::Dismiss)),
@@ -879,10 +925,16 @@ impl Cagents {
                 .on_press_maybe(
                     (blocked == 0).then_some(Message::SidebarSelection(Action::Confirm)),
                 ),
-        ));
-        Some(dialog_ui::confirmation_surface(
-            widget::column::with_children(rows).spacing(space::M),
-            500.0,
+        );
+        // A short window scrolls the members and notes; Cancel and the
+        // deletion stay in reach.
+        Some(crate::interaction::focus_scope(
+            dialog_ui::scrolling_surface_with_actions(
+                widget::column::with_children(rows).spacing(space::M),
+                actions,
+                500.0,
+                640.0,
+            ),
         ))
     }
 }
