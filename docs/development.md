@@ -132,7 +132,7 @@ enabled. See [Daemon and upgrades](daemon.md#development-instance).
 
 The CLI, UI client, and terminal host have separate Cargo feature boundaries.
 The root `cagents` package is the shared library with the `cagents` and
-`cagentsd` binaries. The application (`src/app` and the other UI-only modules)
+`cagentsd` binaries. The application (`crates/cagents-ui/src/app` and the other UI-only modules)
 and the `cagents-ui` binary are the `cagents-ui` package in `crates/cagents-ui`,
 which depends on the shared library's `ui` feature. Editing the application
 recompiles only that package; editing the shared library recompiles both.
