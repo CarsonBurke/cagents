@@ -57,9 +57,6 @@ pub(super) struct Details {
     consequence: &'static str,
     /// Why the last Retry started nothing, in place of what Retry would do.
     retry_refusal: Option<String>,
-    /// Without a live proof, Retry launches under this terminal's own ID, so
-    /// its saved output stays with the pane rather than being pruned.
-    keeps_identity: bool,
 }
 /// The daemon answered and does not host this terminal, as after a restart.
 /// Reattaching cannot work, so the failure must not promise it.
@@ -212,7 +209,6 @@ pub(super) fn missing_terminal_warning(
         exit: None,
         consequence: missing_terminal_consequence(code, session),
         retry_refusal: None,
-        keeps_identity: session.continuity.live_proof().is_none(),
     }
     .output_warning()
 }
@@ -313,7 +309,7 @@ impl Details {
     /// between that and the output it saved. See #2142. A refusal or a blocked
     /// state doesn't remove the risk, because a later press can still replace it.
     fn output_warning(&self) -> Option<&'static str> {
-        if self.consequence == NATIVE_OWNER || self.keeps_identity {
+        if self.consequence == NATIVE_OWNER {
             return None;
         }
         match self.code {
@@ -374,7 +370,6 @@ impl Details {
             exit,
             consequence,
             retry_refusal: None,
-            keeps_identity: session.continuity.live_proof().is_none(),
         }
     }
     fn copy_text(&self) -> String {
@@ -1345,8 +1340,9 @@ mod tests {
         let details = app.terminal_details(card).unwrap();
         assert_eq!(details.code, "terminal_not_hosted");
         assert_eq!(details.consequence, RETRY_FRESH);
-        // That launch keeps this terminal's ID, so its saved output stays.
-        assert_eq!(details.output_warning(), None);
+        // That launch is a fresh relaunch under a new ID, so the saved
+        // output is pruned at the next start as for any replacement.
+        assert_eq!(details.output_warning(), Some(OUTPUT_GOES_WITH_RETRY));
     }
     #[test]
     fn each_missing_terminal_says_what_applies_to_it() {
@@ -1501,20 +1497,7 @@ mod tests {
     }
     #[test]
     fn the_output_warning_follows_what_a_press_could_do() {
-        let (_, _, mut session) = app_and_session();
-        // Only a terminal with a live proof is replaced under a new ID.
-        for message in [TERMINAL_NOT_HOSTED, TERMINAL_DAEMON_RESTARTED] {
-            assert_eq!(
-                missing_terminal_warning(message, &session),
-                None,
-                "{message}"
-            );
-        }
-        session.continuity = TerminalContinuity::Live {
-            host_session_id: "host".into(),
-            boot_id: "boot".into(),
-            host_incarnation: "earlier".into(),
-        };
+        let (_, _, session) = app_and_session();
         for (message, warning) in [
             (TERMINAL_NOT_HOSTED, Some(OUTPUT_GOES_WITH_RETRY)),
             (TERMINAL_DAEMON_RESTARTED, Some(OUTPUT_MAY_GO_WITH_RETRY)),
