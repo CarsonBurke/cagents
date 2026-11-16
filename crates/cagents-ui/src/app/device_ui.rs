@@ -1012,17 +1012,18 @@ impl Cagents {
     fn device_dialog_layout(&self, size: iced::Size) -> Element<'_, Message> {
         let state = &self.device_ui;
         if let Some(image) = &state.image {
-            return dialog_ui::surface(
+            // However long the path, Cancel stays in reach.
+            return dialog_ui::scrolling_surface_with_actions(
                 widget::column::with_children(vec![
                     design::heading("Opening image").into(),
                     design::body(image.path.display().to_string()).into(),
                     design::caption(image.device.as_deref().unwrap_or("This device")).into(),
-                    crate::ui_controls::button::secondary("Cancel")
-                        .on_press(Message::Device(Action::Close))
-                        .into(),
                 ])
                 .spacing(space::M),
+                crate::ui_controls::button::secondary("Cancel")
+                    .on_press(Message::Device(Action::Close)),
                 600.0,
+                dialog_ui::MAX_HEIGHT,
             );
         }
         let narrow = size.width < 900.0;

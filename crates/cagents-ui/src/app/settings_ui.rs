@@ -290,13 +290,13 @@ fn settings_category_controls<'a>(
                 "Test notification",
                 "Your desktop controls presentation and sound. Unavailable delivery keeps attention inside cagents; the result appears in notices.",
                 crate::ui_controls::button::secondary("Send test notification")
-                .instead("Sending test notification…", testing_notification)
-                .id(widget::Id::new("settings.notifications.test"))
-                .on_press_maybe(
-                    (!testing_notification)
-                        .then_some(Message::NotificationUi(notification_ui::Action::Test)),
-                )
-                .into(),
+                    .instead("Sending test notification…", testing_notification)
+                    .id(widget::Id::new("settings.notifications.test"))
+                    .on_press_maybe(
+                        (!testing_notification)
+                            .then_some(Message::NotificationUi(notification_ui::Action::Test)),
+                    )
+                    .into(),
             )
             .label_in_control());
             vec![settings_group(
@@ -1220,14 +1220,21 @@ fn settings_layout<'a>(
             iced::widget::Space::new().width(Length::Fill).into()
         };
         header.push(
-            widget::row::with_children(std::iter::once(title).chain(status))
-                .align_y(Alignment::Center)
-                .spacing(space::S)
-                .width(Length::Fill)
-                // The height of the search field beside it, so the page
-                // title and the field share one centre line.
-                .height(design::DENSE_ROW_HEIGHT)
-                .into(),
+            // The save report at the title's end stays clear of the
+            // inspector toggle; the description below keeps the body's
+            // measure.
+            widget::container(
+                widget::row::with_children(std::iter::once(title).chain(status))
+                    .align_y(Alignment::Center)
+                    .spacing(space::S)
+                    .width(Length::Fill)
+                    // The height of the search field beside it, so the page
+                    // title and the field share one centre line.
+                    .height(design::DENSE_ROW_HEIGHT),
+            )
+            .padding(iced::Padding::ZERO.right((context.trailing_clearance - gutter).max(0.0)))
+            .width(Length::Fill)
+            .into(),
         );
     }
     if let Some(description) = page_description {
@@ -1247,9 +1254,7 @@ fn settings_layout<'a>(
         )
         .padding(iced::Padding {
             top: space::M,
-            // The save report at the title's end stays clear of the
-            // inspector toggle.
-            right: gutter.max(context.trailing_clearance),
+            right: gutter,
             bottom: 0.0,
             left: gutter,
         })

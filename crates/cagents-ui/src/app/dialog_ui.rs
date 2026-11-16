@@ -708,7 +708,7 @@ pub(super) mod tests {
     }
 
     /// The window, the dialog body's scroll viewport, its content height and
-    /// the bounds of the control `id`, in a laid-out dialog.
+    /// the bounds of the control or container `id`, in a laid-out dialog.
     pub(in crate::app) fn action_geometry(
         mut element: Element<'_, Message>,
         window: iced::Size,
@@ -744,6 +744,11 @@ pub(super) mod tests {
                 bounds: iced::Rectangle,
                 _: &mut dyn operation::Focusable,
             ) {
+                if id == Some(self.0) {
+                    self.3 = bounds;
+                }
+            }
+            fn container(&mut self, id: Option<&widget::Id>, bounds: iced::Rectangle) {
                 if id == Some(self.0) {
                     self.3 = bounds;
                 }

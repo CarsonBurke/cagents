@@ -1804,31 +1804,30 @@ impl State {
             }
             rows.push(
                 widget::row::with_children(vec![
-                    crate::ui_controls::button::primary(
-                        if matches!(composer.destination, Destination::Edit(_)) {
-                            "Save comment"
-                        } else if has_pending_review {
-                            "Add to review"
-                        } else {
-                            "Comment"
-                        },
-                    )
-                    .on_press_maybe(
-                        (enabled
-                            && !stale
-                            && (editing || !pending_on_old_head)
-                            && !composer.content.text().trim().is_empty())
-                        .then_some(
-                            if matches!(composer.destination, Destination::Edit(_))
-                                || has_pending_review
-                            {
-                                Action::Save
-                            } else {
-                                Action::SaveNow
-                            },
-                        ),
-                    )
-                    .into(),
+                    // Starting a review relabels this button; the
+                    // controls beside it stay put.
+                    crate::ui_controls::button::primary("Comment")
+                        .instead(
+                            "Save comment",
+                            matches!(composer.destination, Destination::Edit(_)),
+                        )
+                        .instead("Add to review", has_pending_review)
+                        .on_press_maybe(
+                            (enabled
+                                && !stale
+                                && (editing || !pending_on_old_head)
+                                && !composer.content.text().trim().is_empty())
+                            .then_some(
+                                if matches!(composer.destination, Destination::Edit(_))
+                                    || has_pending_review
+                                {
+                                    Action::Save
+                                } else {
+                                    Action::SaveNow
+                                },
+                            ),
+                        )
+                        .into(),
                     crate::ui_controls::button::secondary("Add to review")
                         .instead("Comment now", has_pending_review)
                         .on_press_maybe(

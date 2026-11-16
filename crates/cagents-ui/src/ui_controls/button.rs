@@ -154,34 +154,36 @@ impl<'a, Message: Clone + 'a> From<Button<'a, Message>> for Element<'a, Message>
             width,
             id,
         } = button;
-        let mut content = widget::row::with_capacity(2)
-            .spacing(space::XS + space::XXS)
-            .align_y(Alignment::Center);
-        // A glyph and its label read as one: the label stays beside it, and
-        // the room kept for a longer label trails it.
-        let label_align = if icon.is_some() {
+        // The glyph and label move as one, so they never part. A quiet
+        // button led by a glyph reads as a line of text, such as a
+        // disclosure, so the room kept for a longer label trails it; any
+        // other keeps its content centered.
+        let align = if matches!(weight, Weight::Quiet) && icon.is_some() {
             iced::alignment::Horizontal::Left
         } else {
             iced::alignment::Horizontal::Center
         };
-        if let Some(icon) = icon {
-            content = content.push(widget::icon(icon).size(design::ROW_ICON_SIZE));
-        }
-        let heading = |label: Cow<'a, str>| -> Element<'a, Message> {
-            design::heading(label)
-                .wrapping(iced::widget::text::Wrapping::None)
+        let content = |label: Cow<'a, str>| -> Element<'a, Message> {
+            let mut content = widget::row::with_capacity(2)
+                .spacing(space::XS + space::XXS)
+                .align_y(Alignment::Center);
+            if let Some(icon) = &icon {
+                content = content.push(widget::icon(icon.clone()).size(design::ROW_ICON_SIZE));
+            }
+            content
+                .push(design::heading(label).wrapping(iced::widget::text::Wrapping::None))
                 .into()
         };
         let label = labels.swap_remove(shown);
-        content = content.push(if labels.is_empty() {
-            heading(label.clone())
+        let content = if labels.is_empty() {
+            content(label.clone())
         } else {
             super::reserved(
-                heading(label.clone()),
-                labels.into_iter().map(heading),
-                label_align,
+                content(label.clone()),
+                labels.into_iter().map(content),
+                align,
             )
-        });
+        };
         let mut button = widget::button::custom(
             widget::container(content)
                 // COSMIC's transparent container resets the inherited ink.
@@ -471,9 +473,10 @@ mod tests {
         );
     }
 
-    /// A glyph and its label stay together whichever label shows: the room
-    /// kept for a longer one trails the label rather than splitting them,
-    /// as it would for a disclosure such as "Hide options".
+    /// A glyph and its label stay together whichever label shows. A quiet
+    /// button, such as the "Hide options" disclosure, keeps them at its
+    /// start with the spare room trailing; one with a surface, such as
+    /// Commit sized for "Amend commit", keeps them centered on it.
     #[test]
     fn a_shorter_label_stays_beside_its_glyph() {
         use cosmic::iced::advanced::{layout, widget::Tree};
@@ -489,9 +492,9 @@ mod tests {
             }
         }
         let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
-        let gap = |advanced: bool| {
-            let mut element: Element<'_, ()> = quiet("Base branch & destination")
-                .instead("Hide options", advanced)
+        // The button, its glyph and its label.
+        let laid_out = |button: Button<'static, ()>| {
+            let mut element: Element<'_, ()> = button
                 .icon(widget::icon::from_name("pan-down-symbolic"))
                 .on_press(())
                 .into();
@@ -506,10 +509,26 @@ mod tests {
             let [glyph, label] = found[..] else {
                 panic!("expected a glyph and a label, found {found:?}");
             };
-            label.x - (glyph.x + glyph.width)
+            (node.bounds(), glyph, label)
         };
-        assert_eq!(gap(true), gap(false));
-        assert_eq!(gap(false), space::XS + space::XXS);
+        let gap = |glyph: Rectangle, label: Rectangle| label.x - (glyph.x + glyph.width);
+
+        for advanced in [false, true] {
+            let (button, glyph, label) =
+                laid_out(quiet("Base branch & destination").instead("Hide options", advanced));
+            assert_eq!(gap(glyph, label), space::XS + space::XXS);
+            assert_eq!(glyph.x - button.x, space::M, "the quiet glyph leads");
+        }
+        for amend in [false, true] {
+            let (button, glyph, label) = laid_out(primary("Commit").instead("Amend commit", amend));
+            assert_eq!(gap(glyph, label), space::XS + space::XXS);
+            let leading = glyph.x - button.x;
+            let trailing = button.x + button.width - (label.x + label.width);
+            assert!(
+                (leading - trailing).abs() < 1.0,
+                "centered while amend is {amend}: {leading} before, {trailing} after"
+            );
+        }
     }
 
     #[test]

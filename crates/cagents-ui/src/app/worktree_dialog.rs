@@ -552,13 +552,13 @@ impl Cagents {
             crate::ui_controls::button::quiet("Base branch & destination")
                 .instead("Hide options", dialog.advanced)
                 .icon(if dialog.advanced {
-                Icon::PanDown
-            } else {
-                Icon::PanEnd
-            })
-            .id(widget::Id::new("dialog.worktree.options"))
-            .on_press_maybe(editable.then_some(Message::ToggleWorktreeAdvanced))
-            .into(),
+                    Icon::PanDown
+                } else {
+                    Icon::PanEnd
+                })
+                .id(widget::Id::new("dialog.worktree.options"))
+                .on_press_maybe(editable.then_some(Message::ToggleWorktreeAdvanced))
+                .into(),
         ];
         if let Some(notice) = &dialog.checkout_notice {
             rows.insert(1, design::caption(notice).into());
@@ -594,14 +594,21 @@ impl Cagents {
                 )),
             ));
         }
+        // An error about the request as a whole leads the body, beside the
+        // Branch field that takes the cursor, so it is in view even when
+        // the open options fill the dialog.
         if let Some(error) = dialog.error.as_ref().filter(|error| error.field.is_none()) {
-            rows.push(
-                widget::selectable_text(error.message.as_str())
-                    .size(design::TEXT_BODY)
-                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
-                    .width(Length::Fill)
-                    .class(cosmic::theme::Text::Custom(design::warning_text))
-                    .into(),
+            rows.insert(
+                1,
+                widget::container(
+                    widget::selectable_text(error.message.as_str())
+                        .size(design::TEXT_BODY)
+                        .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                        .width(Length::Fill)
+                        .class(cosmic::theme::Text::Custom(design::warning_text)),
+                )
+                .id(widget::Id::new("dialog.worktree.error"))
+                .into(),
             );
         }
         let status: Element<'_, Message> = if dialog.resolving.is_some() {
@@ -1074,6 +1081,38 @@ mod tests {
         assert_actions_stay_in_reach(
             || super::super::dialog_ui::overlay(app.worktree_dialog_view().unwrap().0, None, 1.0),
             &["dialog.worktree.cancel", "dialog.worktree.create"].map(widget::Id::new),
+        );
+    }
+
+    /// An error about the request as a whole starts in view when the open
+    /// options already fill the dialog, beside the Branch field that takes
+    /// the cursor, rather than below the fold.
+    #[test]
+    fn a_request_error_starts_in_view_with_the_options_open() {
+        use super::super::dialog_ui::tests::{
+            SCALED_MINIMUM_WINDOW, action_geometry, long_message,
+        };
+        let Fixture {
+            mut app, _state, ..
+        } = fixture();
+        let dialog = app.worktree_dialog.as_mut().unwrap();
+        dialog.draft.branch = "feature/topic".into();
+        dialog.advanced = true;
+        dialog.error = Some(WorktreeInputError {
+            field: None,
+            message: long_message(),
+        });
+        let (_, viewport, content, error) = action_geometry(
+            super::super::dialog_ui::overlay(app.worktree_dialog_view().unwrap().0, None, 1.0),
+            SCALED_MINIMUM_WINDOW,
+            &widget::Id::new("dialog.worktree.error"),
+        );
+        assert!(content > viewport.height, "the body scrolls");
+        assert!(error.height > 0.0, "the error is shown");
+        assert!(
+            error.y >= viewport.y
+                && error.y + 2.0 * design::TEXT_BODY <= viewport.y + viewport.height,
+            "the error starts in view: {error:?} in {viewport:?}"
         );
     }
 
