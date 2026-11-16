@@ -1,0 +1,189 @@
+#!/usr/bin/python3
+"""Count the BPE tokens of a command's output, as an agent reading it pays for them.
+
+  scripts/output-tokens [--encoding NAME] [--json] [--show] -- COMMAND [ARGUMENT...]
+  COMMAND | scripts/output-tokens [--encoding NAME] [--json]
+
+Runs COMMAND with this script's standard input, captures its standard output and
+error, and prints one line such as
+
+  412 tokens, 1650 bytes (stdout 398/1580, stderr 14/70), exit 0
+
+Without a command, it counts its own standard input. Bytes alone mislead: a UUID,
+a hash or JSON punctuation costs about twice as many tokens per byte as prose.
+The count uses OpenAI's o200k_base encoding through tiktoken, a
+public proxy for the tokenizers agents run on; compare outputs with one encoding
+rather than reading the numbers as any provider's bill. Text is counted as
+ordinary text, so special-token spellings in it are not treated as control tokens.
+
+--show passes the command's output through unchanged and prints the count on
+standard error instead. --json prints the counts as one JSON object.
+
+tiktoken runs from the current Python when it is importable, or else through
+`uv run` pinned to TIKTOKEN_VERSION. uv is tried offline first, so once its
+package cache and the encoding's vocabulary (kept in TIKTOKEN_CACHE_DIR, by
+default ${XDG_CACHE_HOME:-~/.cache}/tiktoken, and checked against tiktoken's
+recorded hash) are present, counting needs no network.
+
+Exit status: the command's own; with no command 0. 2 usage, 125 the count failed.
+"""
+import argparse
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+TIKTOKEN_VERSION = "0.14.0"
+DEFAULT_ENCODING = "o200k_base"
+USAGE, FAILED = 2, 125
+
+# Reads {"encoding": NAME, "texts": [...]} and prints the token count of each text.
+COUNTER = r"""
+import json, sys, tiktoken
+request = json.load(sys.stdin)
+encoding = tiktoken.get_encoding(request["encoding"])
+print(json.dumps([len(encoding.encode_ordinary(text)) for text in request["texts"]]))
+"""
+
+
+class CountFailed(Exception):
+    pass
+
+
+def cache_environment():
+    environment = dict(os.environ)
+    if not environment.get("TIKTOKEN_CACHE_DIR"):
+        cache = environment.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+        environment["TIKTOKEN_CACHE_DIR"] = str(Path(cache) / "tiktoken")
+    return environment
+
+
+def count_in_process(encoding, texts):
+    try:
+        import tiktoken
+    except ImportError:
+        return None
+    os.environ.setdefault("TIKTOKEN_CACHE_DIR", cache_environment()["TIKTOKEN_CACHE_DIR"])
+    try:
+        coder = tiktoken.get_encoding(encoding)
+    except Exception as error:
+        raise CountFailed(f"tiktoken could not load {encoding}: {error}") from error
+    return [len(coder.encode_ordinary(text)) for text in texts]
+
+
+def count_with_uv(encoding, texts):
+    uv = shutil.which("uv")
+    if uv is None:
+        raise CountFailed("tiktoken is not importable and uv is not on PATH; install uv or tiktoken")
+    request = json.dumps({"encoding": encoding, "texts": texts})
+    base = [uv, "run", "--quiet", "--no-project", "--with", f"tiktoken=={TIKTOKEN_VERSION}",
+            "python3", "-I", "-c", COUNTER]
+    failure = ""
+    # Offline first, so a warm cache never touches the network; online once to fill it.
+    for command in ([*base[:2], "--offline", *base[2:]], base):
+        result = subprocess.run(command, input=request, capture_output=True, text=True,
+                                env=cache_environment(), check=False)
+        if result.returncode == 0:
+            try:
+                counts = json.loads(result.stdout)
+            except json.JSONDecodeError:
+                counts = None
+            if isinstance(counts, list) and len(counts) == len(texts):
+                return counts
+            failure = f"unexpected tokenizer output: {result.stdout.strip()[:200]!r}"
+        else:
+            failure = result.stderr.strip()
+    raise CountFailed(f"could not run tiktoken {TIKTOKEN_VERSION} through uv: {failure}")
+
+
+def count_tokens(encoding, texts):
+    counts = count_in_process(encoding, texts)
+    return counts if counts is not None else count_with_uv(encoding, texts)
+
+
+def decode(data):
+    # Tokenizers read text; an agent's harness shows undecodable bytes as replacements too.
+    return data.decode("utf-8", errors="replace")
+
+
+def measure(encoding, streams):
+    """Count each named stream of bytes, and the whole as one text."""
+    names = list(streams)
+    texts = [decode(streams[name]) for name in names]
+    counts = count_tokens(encoding, [*texts, "".join(texts)])
+    result = {"encoding": encoding, "tokens": counts[-1],
+              "bytes": sum(len(streams[name]) for name in names)}
+    if len(names) > 1:
+        result["streams"] = {name: {"tokens": count, "bytes": len(streams[name])}
+                             for name, count in zip(names, counts)}
+    return result
+
+
+def summary(result):
+    line = f"{result['tokens']} tokens, {result['bytes']} bytes"
+    streams = result.get("streams", {})
+    if any(stream["bytes"] for name, stream in streams.items() if name != "stdout"):
+        line += " (" + ", ".join(f"{name} {stream['tokens']}/{stream['bytes']}"
+                                 for name, stream in streams.items()) + ")"
+    if result["encoding"] != DEFAULT_ENCODING:
+        line += f" [{result['encoding']}]"
+    if "exit" in result:
+        line += f", exit {result['exit']}"
+    return line
+
+
+def parse(arguments):
+    parser = argparse.ArgumentParser(
+        prog="output-tokens", description="Count the BPE tokens of a command's output or of standard input.",
+        usage="%(prog)s [--encoding NAME] [--json] [--show] [-- COMMAND [ARGUMENT...]]")
+    parser.add_argument("--encoding", default=DEFAULT_ENCODING,
+                        help=f"tiktoken encoding (default {DEFAULT_ENCODING})")
+    parser.add_argument("--json", action="store_true", help="print the counts as one JSON object")
+    parser.add_argument("--show", action="store_true",
+                        help="pass the command's output through and print the count on standard error")
+    if "--" in arguments:
+        split = arguments.index("--")
+        options, command = parser.parse_args(arguments[:split]), arguments[split + 1:]
+        if not command:
+            parser.error("name a command after --")
+    else:
+        options, command = parser.parse_args(arguments), []
+        if options.show:
+            parser.error("--show needs a command after --")
+    return options, command
+
+
+def main(arguments=None):
+    options, command = parse(sys.argv[1:] if arguments is None else arguments)
+    status = None
+    if command:
+        try:
+            result = subprocess.run(command, capture_output=True, check=False)
+        except OSError as error:
+            print(f"output-tokens: cannot run {command[0]}: {error.strerror}", file=sys.stderr)
+            return 127 if isinstance(error, FileNotFoundError) else 126
+        streams, status = {"stdout": result.stdout, "stderr": result.stderr}, result.returncode
+        if options.show:
+            sys.stdout.buffer.write(result.stdout)
+            sys.stdout.flush()
+            sys.stderr.buffer.write(result.stderr)
+            sys.stderr.flush()
+    else:
+        streams = {"stdin": sys.stdin.buffer.read()}
+    try:
+        measured = measure(options.encoding, streams)
+    except CountFailed as error:
+        print(f"output-tokens: {error}", file=sys.stderr)
+        return FAILED
+    if status is not None:
+        # A signal-terminated command reports as the shell would, 128 + the signal.
+        measured["exit"] = status if status >= 0 else 128 - status
+    text = json.dumps(measured) if options.json else summary(measured)
+    print(text, file=sys.stderr if options.show else sys.stdout)
+    return measured.get("exit", 0)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

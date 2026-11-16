@@ -292,6 +292,18 @@ Launch also removes the retired `cagents-agents` bundle only when its directory 
 
 These locations follow the providers' documented skill discovery: [Claude skills](https://code.claude.com/docs/en/skills), [Codex skills](https://learn.chatgpt.com/docs/build-skills), and [OMP skills](https://github.com/can1357/oh-my-pi/blob/main/docs/skills.md). The same installed instructions appear in cagents' native filesystem skill catalog and provider terminal sessions.
 
+## Output size
+
+The CLI's main readers are agents, which pay for its output in context. Its
+human output therefore keeps to what the next step needs: shortest unique IDs,
+one project line rather than a path per row, and one `hint:` line naming the
+likely next command. Size is measured in BPE tokens rather than bytes, because
+IDs, hashes and JSON punctuation cost about twice as many tokens per byte as
+prose. To
+compare a change's output before and after, run it under
+`scripts/output-tokens` (see
+[Output agents read](development.md#output-agents-read)).
+
 ## CLI compatibility changes
 
 Agent waits now always return `data.results`, including a single handle; consumers
