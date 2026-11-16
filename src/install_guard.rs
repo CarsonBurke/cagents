@@ -319,13 +319,6 @@ pub(crate) fn run(
 }
 
 const STAGED_OWNER: &str = ".deferred-owner.json";
-/// Markers `install.sh` leaves in a version tree it extracted but did not
-/// publish: a worker's private prepared candidate, and one retained after its
-/// readiness could not be verified.
-const UNPUBLISHED_CANDIDATE_MARKERS: [&str; 2] = [
-    ".cagents-prepared-candidate-v1.json",
-    ".cagents-retained-candidate-v1.json",
-];
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -473,9 +466,11 @@ pub(crate) fn select_staged(
     let target = selectable_root(&prefix, version_root)?;
     // Obsolete routing may be ignored, but a present marker must be valid.
     let marker = read_staged_owner(&target)?;
-    let unpublished = UNPUBLISHED_CANDIDATE_MARKERS
-        .iter()
-        .any(|name| std::fs::symlink_metadata(target.join(name)).is_ok());
+    // A prepared candidate's marker survives its publication, and an
+    // unpublished one carries no routing marker for the owner check below.
+    // A retained one was never proven ready and is removed once it is.
+    let unpublished =
+        std::fs::symlink_metadata(target.join(crate::update::RETAINED_CANDIDATE_MARKER)).is_ok();
     let _jobs = crate::update::exclude_update_jobs(&prefix).map_err(|error| match error {
         crate::update::UpdateError::Busy => io::Error::other(
             "an application update is in progress; finish or cancel it, then retry; installation was not changed",
@@ -530,7 +525,7 @@ pub(crate) fn select_staged(
         && owner.as_deref() != Some(target.join("bin").as_path())
     {
         return Err(io::Error::other(format!(
-            "version {} is an unverified update candidate the installer retained; install it again to verify it; installation was not changed",
+            "version {} is an unverified update candidate the installer retained; install that release again to verify it; installation was not changed",
             target.file_name().unwrap().to_string_lossy()
         )));
     }

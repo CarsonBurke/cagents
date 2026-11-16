@@ -2714,27 +2714,33 @@ fn selection_withdraws_and_restores_a_staged_build_without_touching_live_owners(
     assert_eq!(fs::read(&marker).unwrap(), recorded);
     assert_eq!(fs::read(&obsolete).unwrap(), obsolete_recorded);
     fs::remove_file(&unstaged_marker).unwrap();
-    // Trees the installer extracted without publishing were never proven
-    // ready, even with nothing running to route by.
-    for (version, unpublished) in [
-        ("9.9.3", ".cagents-prepared-candidate-v1.json"),
-        ("9.9.2", ".cagents-retained-candidate-v1.json"),
+    // A tree retained after its readiness could not be verified was never
+    // proven ready, even with nothing running to route by. A prepared
+    // candidate's marker outlives its publication, so it does not refuse.
+    for (version, candidate, selectable) in [
+        ("9.9.2", ".cagents-retained-candidate-v1.json", false),
+        ("9.9.3", ".cagents-prepared-candidate-v1.json", true),
     ] {
         let bin = prefix.join("versions").join(version).join("bin");
         fs::create_dir_all(&bin).unwrap();
         for name in ["cagents", "cagents-ui", "cagentsd"] {
             executable(&bin.join(name), "#!/bin/sh\nexit 90\n");
         }
-        let marker = bin.parent().unwrap().join(unpublished);
+        let marker = bin.parent().unwrap().join(candidate);
         fs::write(&marker, r#"{"version":1}"#).unwrap();
         fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
         let output = select(version);
-        assert!(!output.status.success(), "{version}: {output:?}");
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains("unverified update candidate"),
-            "{version}: {output:?}"
-        );
-        assert_eq!(current(), Path::new("versions").join(staged));
+        if selectable {
+            assert!(output.status.success(), "{version}: {output:?}");
+            assert_eq!(current(), Path::new("versions").join(version));
+        } else {
+            assert!(!output.status.success(), "{version}: {output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("unverified update candidate"),
+                "{version}: {output:?}"
+            );
+            assert_eq!(current(), Path::new("versions").join(staged));
+        }
     }
     let output = select("9.9.7");
     assert!(output.status.success(), "{output:?}");
