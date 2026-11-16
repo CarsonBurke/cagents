@@ -20746,6 +20746,9 @@ mod tests {
         assert!(app.navigation_save.is_some());
         drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
         assert_eq!(persists(), saved + 1, "the navigation is saved once");
+        let written = app.persistent_workspace();
+        assert!(written.cards.iter().all(|card| card.id != automatic));
+        assert_ne!(written.focused, Some(automatic));
 
         drop(app.navigate_to_worktree("/workspace/elsewhere".into()));
         assert!(app.card_state(automatic).is_none());
