@@ -499,9 +499,10 @@ cagents work --json               # every card of the board listed, with its sco
 containing the current directory, the one a session there belongs to, and
 outside every one lists them all; `pin`, `unpin`, `rm` and `snapshots` look in
 the same project unless given `--project`. The card of the worktree you are in
-is listed however far down its column it is. Worktrees are shown relative to the project's primary
-checkout, which the listing names, and that path names the card to `rm`, `pin`
-and `unpin` from any directory. The last line suggests what to run next, such
+is listed however far down its column it is. Worktrees are shown relative to
+the project's primary checkout, which the listing names. `rm`, `pin` and
+`unpin` take that path, a branch, or a path from the current directory, which
+is tried first: `.` names the worktree you are in. The last line suggests what to run next, such
 as how to list the rest of a column it cut short. `--json` reports the scope it
 covered as `data.scope`, and with `--limit` how many cards of each column it
 left out as `data.omitted`.

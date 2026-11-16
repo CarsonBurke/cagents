@@ -665,10 +665,11 @@ fn list(
     if let Some(column) = arguments.column {
         board.items.retain(|item| item.column == column);
     }
-    // The cards of the worktree this shell is in are always listed.
-    let directory = (!context.remote)
+    // The card of the worktree this shell is in is always listed.
+    let current = (!context.remote)
         .then(|| std::env::current_dir().and_then(std::fs::canonicalize).ok())
-        .flatten();
+        .flatten()
+        .and_then(|directory| current_worktree(&board.items, &directory));
     let listing = Listing {
         column: arguments.column,
         limit: arguments.limit.unwrap_or(DEFAULT_LIMIT),
@@ -676,7 +677,7 @@ fn list(
         project: named.as_deref(),
         all: arguments.all,
         placed: placed.is_some(),
-        here: directory.as_deref(),
+        current: current.as_deref(),
     };
     let human = board_human(&board, &listing, crate::chat::now_ms().unwrap_or_default());
     let omitted = arguments
@@ -739,19 +740,20 @@ struct Listing<'a> {
     project: Option<&'a str>,
     all: bool,
     placed: bool,
-    here: Option<&'a Path>,
+    /// The worktree this shell is in, if the board has its card.
+    current: Option<&'a Path>,
 }
 
 impl Listing<'_> {
     /// Whether `item` is listed when it is the `index`th card of its column:
-    /// one of the newest `limit`, or one whose worktree holds this shell.
+    /// one of the newest `limit`, or the card of the worktree this shell is in.
     fn shows(&self, item: &Item, index: usize, limit: usize) -> bool {
         limit == 0
             || index < limit
-            || self.here.is_some_and(|here| {
+            || self.current.is_some_and(|current| {
                 item.worktree
                     .as_ref()
-                    .is_some_and(|worktree| here.starts_with(&worktree.path))
+                    .is_some_and(|worktree| worktree.path == current)
             })
     }
 
@@ -775,6 +777,18 @@ impl Listing<'_> {
         });
         omitted
     }
+}
+
+/// The worktree of `items` that holds `directory`: the innermost, since a
+/// project's linked worktrees usually sit inside its primary checkout.
+fn current_worktree(items: &[Item], directory: &Path) -> Option<PathBuf> {
+    items
+        .iter()
+        .filter_map(|item| item.worktree.as_ref())
+        .map(|worktree| &worktree.path)
+        .filter(|path| directory.starts_with(path))
+        .max_by_key(|path| path.components().count())
+        .cloned()
 }
 
 const HEADERS: [&str; 9] = [
@@ -1216,7 +1230,7 @@ mod tests {
             project: None,
             all: false,
             placed,
-            here: None,
+            current: None,
         }
     }
 
@@ -1418,7 +1432,7 @@ mod tests {
     /// an agent always finds its own branch.
     #[test]
     fn a_listing_keeps_the_card_of_the_current_worktree() {
-        let items: Vec<Item> = (0..12)
+        let mut items: Vec<Item> = (0..12)
             .map(|index| {
                 let mut card = card(&format!("work-{index}"), Column::InProgress);
                 card.worktree = Some(Worktree {
@@ -1430,13 +1444,25 @@ mod tests {
                 card
             })
             .collect();
+        let mut primary = card("main", Column::InProgress);
+        primary.worktree = Some(Worktree {
+            path: "/repo".into(),
+            primary: true,
+            locked: false,
+            created_at_unix_ms: None,
+        });
+        items.insert(3, primary);
         let board = board(vec![project("repo")], items);
+        // The innermost worktree holding the directory is the current one,
+        // not the primary checkout the linked worktrees sit inside.
+        let current = current_worktree(&board.items, Path::new("/repo/.worktrees/11/src"));
+        assert_eq!(current.as_deref(), Some(Path::new("/repo/.worktrees/11")));
         let inside = Listing {
-            here: Some(Path::new("/repo/.worktrees/11/src")),
+            current: current.as_deref(),
             ..listing(DEFAULT_LIMIT, true)
         };
         let human = board_human(&board, &inside, NOW);
-        assert!(human.contains("IN PROGRESS (11 of 12)\n"), "{human}");
+        assert!(human.contains("IN PROGRESS (11 of 13)\n"), "{human}");
         assert!(human.contains("\nwork-11 "), "{human}");
         assert!(!human.contains("work-10 "), "{human}");
         let mut items = board.items.clone();

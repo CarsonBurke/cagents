@@ -152,7 +152,9 @@ impl Cli {
             use clap::CommandFactory;
             return Err(Self::command().error(
                 ClapErrorKind::ArgumentConflict,
-                "the list options of `cagents work` cannot be used with a subcommand",
+                "the list options of `cagents work` cannot be used with a subcommand; \
+                 give a subcommand its own options after it, as in \
+                 `cagents work rm CARD --project PROJECT`",
             ));
         }
         Ok(self)
