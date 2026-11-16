@@ -558,6 +558,45 @@ fn typed_remediable_first_message_keeps_send_enabled() {
 }
 
 #[test]
+fn choosing_another_model_lifts_a_blocked_first_start() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    app.workspace.resize_viewport(1200.0);
+    let card = tests::draft_chat(&mut app);
+    let target = chat_runtime(&app, card).target;
+    let provider = chat_runtime(&app, card).session.launch.provider;
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    runtime.start_retry_blocked = true;
+    runtime.error = Some("permanent launch refusal".into());
+    runtime.replace_draft(text_editor::Content::with_text("Keep this unsent note."));
+    assert!(app.chat_retry_blocked(card));
+    let current = chat_runtime(&app, card).snapshot.selected_model.clone();
+    drop(app.handle_chat_ui(Action::DraftModel(target, provider, current)));
+    assert!(
+        app.chat_retry_blocked(card),
+        "re-picking the current model names the same refused launch"
+    );
+    assert_eq!(
+        chat_runtime(&app, card).error.as_deref(),
+        Some("permanent launch refusal")
+    );
+    drop(app.handle_chat_ui(Action::DraftModel(
+        target,
+        provider,
+        Some("another-model".into()),
+    )));
+    let runtime = chat_runtime(&app, card);
+    assert!(
+        !app.chat_retry_blocked(card),
+        "the refusal answered the previous launch, not the one now chosen"
+    );
+    assert!(
+        runtime.error.is_none(),
+        "the old diagnostic no longer applies"
+    );
+    assert_eq!(runtime.composer.text().trim_end(), "Keep this unsent note.");
+}
+
+#[test]
 fn blocked_attachment_only_draft_close_requires_discard_and_cancel_keeps_it() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
     app.workspace.resize_viewport(1200.0);

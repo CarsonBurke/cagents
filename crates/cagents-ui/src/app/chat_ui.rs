@@ -4740,6 +4740,13 @@ impl Runtime {
     fn is_draft(&self) -> bool {
         matches!(self.connection, Connection::Draft)
     }
+    /// Lift a permanent first-start refusal once the draft names a different
+    /// launch. That refusal and its diagnostic answered the previous one.
+    fn release_start_block(&mut self) {
+        if std::mem::take(&mut self.start_retry_blocked) {
+            self.error = None;
+        }
+    }
     /// Whether this draft's provider, model and account can still change: it
     /// has not started, and its first message is not on its way.
     fn choosing(&self) -> bool {
@@ -7425,6 +7432,9 @@ impl Cagents {
             return Task::none();
         }
         runtime.model_picker = None;
+        // Re-picking the current choice names the same refused launch.
+        let changed =
+            runtime.session.launch.provider != provider || runtime.snapshot.selected_model != model;
         let moved = if runtime.session.launch.provider == provider {
             None
         } else {
@@ -7463,9 +7473,11 @@ impl Cagents {
         runtime.completion.restart(true);
         if let Some(session) = &moved {
             runtime.session = session.clone();
-            if !runtime.start_retry_blocked {
-                runtime.error = None;
-            }
+            runtime.error = None;
+        }
+        if changed {
+            // The refusal answered the previous launch; this one was never tried.
+            runtime.release_start_block();
         }
         self.remember_chat_model(provider, model, reasoning);
         let skills = if let Some(session) = moved {
@@ -7570,6 +7582,7 @@ impl Cagents {
             return Task::none();
         }
         runtime.session = session.clone();
+        runtime.release_start_block();
         Arc::make_mut(&mut runtime.snapshot).skills.clear();
         Arc::make_mut(&mut runtime.snapshot).permission_mode =
             draft_permission_mode(&session.launch.recipe, account.provider);
@@ -14741,7 +14754,12 @@ impl Cagents {
                         return Task::none();
                     }
                     let provider = runtime.session.launch.provider;
+                    let before = runtime.session.launch.recipe.clone();
                     set_draft_permission_mode(&mut runtime.session.launch.recipe, provider, &mode);
+                    if runtime.session.launch.recipe != before {
+                        // A different launch recipe was never refused.
+                        runtime.release_start_block();
+                    }
                     Arc::make_mut(&mut runtime.snapshot).permission_mode = Some(mode);
                     let session = runtime.session.clone();
                     self.replace_chat_conversation(target.card, session);

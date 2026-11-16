@@ -11566,21 +11566,31 @@ impl Cagents {
                             // A conversation no retry can reach still has one
                             // thing left to do with it, and the reader has to
                             // be the one who asks for it.
+                            // Without Retry, the first remaining action is
+                            // the card's primary one, as on a stopped pane.
+                            let closing = self.terminal_close_in_progress(id);
+                            let button = |controls: &Vec<Element<'_, Message>>, label| {
+                                if controls.is_empty() {
+                                    crate::ui_controls::button::primary(label)
+                                } else {
+                                    crate::ui_controls::button::secondary(label)
+                                }
+                            };
                             if self.chat_offers_fresh_conversation(id) {
                                 controls.push(
-                                    crate::ui_controls::button::secondary(
-                                        "Start a new conversation",
-                                    )
-                                    .id(card_control_id(id, "chat.fresh"))
-                                    .name("Start a new conversation")
-                                    .on_press(Message::ChatUi(chat_ui::Action::StartFresh(id)))
-                                    .into(),
+                                    button(&controls, "Start a new conversation")
+                                        .id(card_control_id(id, "chat.fresh"))
+                                        .name("Start a new conversation")
+                                        // Close owns the card until it settles.
+                                        .on_press_maybe((!closing).then_some(Message::ChatUi(
+                                            chat_ui::Action::StartFresh(id),
+                                        )))
+                                        .into(),
                                 );
                             }
                             controls.push(
                                 {
-                                    let closing = self.terminal_close_in_progress(id);
-                                    crate::ui_controls::button::secondary(if closing {
+                                    button(&controls, if closing {
                                         "Checking…"
                                     } else {
                                         "Close"

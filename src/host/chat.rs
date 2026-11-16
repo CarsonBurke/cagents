@@ -2002,12 +2002,16 @@ fn start_with_execution(
     restart_launch: Option<&chat::Launch>,
     pane: Option<crate::terminal_ipc::PaneChatStart>,
 ) -> Result<ServerResponse, ProtocolError> {
+    // Reading the floor can fail transiently. The client routes an ordinary
+    // start of a fenced conversation through its update resume, so a start
+    // that still reaches the fence cannot pass it by repeating itself. Name no
+    // action here: the pane shows the recovery it actually offers.
     if crate::upgrade::floor::load()
-        .map_err(unavailable)?
+        .map_err(retryable_unavailable)?
         .blocks_id(session.id)
     {
         return Err(unavailable(
-            "This conversation was stopped for the update. Press Resume in its pane to continue the recorded conversation, or start a new conversation if none was recorded.",
+            "This conversation was stopped for the update, and this start cannot continue it. Its saved files are kept; nothing was restarted.",
         ));
     }
     // A helper may have committed installation before host publication failed.
@@ -2948,20 +2952,26 @@ fn start_with_execution(
         };
 
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-        if state.shutting_down
+        // Shutdown, a reserved terminal and a new daemon proof are transient,
+        // and a chat that gained a live owner can be attached instead, as at
+        // entry. Only a lost reservation means another action took this start
+        // over, which repeating it cannot undo.
+        let transient = state.shutting_down
             || require_unreserved_terminals(&state, &record.session).is_err()
             || state.proof() != &proof
-            || state.chat_spawning.get(&reservation_id) != Some(&reservation)
             || state
                 .chats
                 .get(&id)
-                .is_some_and(|current| current.handle.owns_work())
-        {
+                .is_some_and(|current| current.handle.owns_work());
+        if transient || state.chat_spawning.get(&reservation_id) != Some(&reservation) {
             drop(state);
             let _ = record.handle.close();
-            return Err(unavailable(
-                "Native startup ownership changed before attachment publication",
-            ));
+            let message = "Native startup ownership changed before attachment publication";
+            return Err(if transient {
+                retryable_unavailable(message)
+            } else {
+                unavailable(message)
+            });
         }
         let installed_handle = record.handle.clone();
         let retired = state.chats.insert(id, record);

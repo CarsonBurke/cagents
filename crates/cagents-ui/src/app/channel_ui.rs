@@ -4004,13 +4004,20 @@ mod close_tests {
         crate::terminal::ipc::ServerResponse::ChatListed { sessions }
     }
 
-    fn model(agents: Vec<Agent>) -> crate::terminal::ipc::ServerResponse {
-        crate::terminal::ipc::ServerResponse::WorkspaceModel {
-            model: crate::workspace_model::WorkspaceModel {
-                agents,
-                ..Default::default()
-            },
+    /// Close reads only the agent rows, not the whole workspace model.
+    fn read_agents() -> crate::terminal::ipc::ClientRequest {
+        crate::terminal::ipc::ClientRequest::ReadWorkspaceMetadata {
+            query: crate::workspace_model::metadata::Query::Agents,
         }
+    }
+
+    fn model(agents: Vec<Agent>) -> crate::terminal::ipc::ServerResponse {
+        crate::terminal::ipc::ServerResponse::WorkspaceMetadata(
+            crate::workspace_model::metadata::Reply::Agents {
+                identity: uuid::Uuid::nil(),
+                agents,
+            },
+        )
     }
 
     /// Actual control framing checks the entire request sequence, including
@@ -4154,7 +4161,7 @@ mod close_tests {
                     &source,
                     vec![
                         (ClientRequest::ChatList, listed(vec![])),
-                        (ClientRequest::ReadWorkspaceModel, model(vec![])),
+                        (read_agents(), model(vec![])),
                         (
                             ClientRequest::ChatCloseRetained {
                                 session: source.clone()
@@ -4170,7 +4177,7 @@ mod close_tests {
                     &source,
                     vec![
                         (ClientRequest::ChatList, listed(vec![])),
-                        (ClientRequest::ReadWorkspaceModel, model(vec![])),
+                        (read_agents(), model(vec![])),
                         (
                             ClientRequest::ChatCloseRetained {
                                 session: source.clone()
@@ -4232,7 +4239,7 @@ mod close_tests {
                 &source,
                 vec![
                     (ClientRequest::ChatList, listed(vec![source.clone()])),
-                    (ClientRequest::ReadWorkspaceModel, model(vec![])),
+                    (read_agents(), model(vec![])),
                     (
                         ClientRequest::ChatAttach {
                             session: source.clone()
@@ -4261,10 +4268,7 @@ mod close_tests {
                 &source,
                 vec![
                     (ClientRequest::ChatList, listed(vec![source.clone()])),
-                    (
-                        ClientRequest::ReadWorkspaceModel,
-                        model(vec![agent(&source)])
-                    ),
+                    (read_agents(), model(vec![agent(&source)])),
                     (
                         ClientRequest::ChatAttach {
                             session: source.clone()
@@ -4281,10 +4285,7 @@ mod close_tests {
                             snapshot: Default::default()
                         }
                     ),
-                    (
-                        ClientRequest::ReadWorkspaceModel,
-                        model(vec![agent(&source)])
-                    ),
+                    (read_agents(), model(vec![agent(&source)])),
                     (
                         ClientRequest::ChatCloseRetained {
                             session: source.clone()
@@ -4312,10 +4313,7 @@ mod close_tests {
                             ClientRequest::ChatList,
                             listed(if live { vec![source.clone()] } else { vec![] })
                         ),
-                        (
-                            ClientRequest::ReadWorkspaceModel,
-                            model(vec![agent(&replacement)])
-                        ),
+                        (read_agents(), model(vec![agent(&replacement)])),
                     ]
                 )
                 .is_err()
@@ -4326,7 +4324,7 @@ mod close_tests {
                 &source,
                 vec![
                     (ClientRequest::ChatList, listed(vec![source.clone()])),
-                    (ClientRequest::ReadWorkspaceModel, model(vec![])),
+                    (read_agents(), model(vec![])),
                     (
                         ClientRequest::ChatAttach {
                             session: source.clone()
@@ -4343,10 +4341,7 @@ mod close_tests {
                             snapshot: Default::default()
                         }
                     ),
-                    (
-                        ClientRequest::ReadWorkspaceModel,
-                        model(vec![agent(&replacement)])
-                    ),
+                    (read_agents(), model(vec![agent(&replacement)])),
                 ]
             )
             .is_err()
@@ -4362,10 +4357,7 @@ mod close_tests {
                 &source,
                 vec![
                     (ClientRequest::ChatList, listed(vec![])),
-                    (
-                        ClientRequest::ReadWorkspaceModel,
-                        model(vec![agent(&source)])
-                    ),
+                    (read_agents(), model(vec![agent(&source)])),
                     (
                         ClientRequest::ChatCloseRetained {
                             session: source.clone()
@@ -4381,10 +4373,7 @@ mod close_tests {
                 &source,
                 vec![
                     (ClientRequest::ChatList, listed(vec![])),
-                    (
-                        ClientRequest::ReadWorkspaceModel,
-                        model(vec![agent(&source)])
-                    ),
+                    (read_agents(), model(vec![agent(&source)])),
                     (
                         ClientRequest::ChatCloseRetained {
                             session: source.clone()
@@ -4400,7 +4389,7 @@ mod close_tests {
                 &source,
                 vec![
                     (ClientRequest::ChatList, listed(vec![])),
-                    (ClientRequest::ReadWorkspaceModel, model(vec![])),
+                    (read_agents(), model(vec![])),
                 ]
             )
             .is_ok()

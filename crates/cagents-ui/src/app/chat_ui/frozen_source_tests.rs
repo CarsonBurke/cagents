@@ -476,8 +476,25 @@ fn a_hidden_successor_clears_the_old_warm_stamp_before_reusing_ids_and_generatio
     let frozen = runtime(&app, card).snapshot.clone();
     drop(app.start_chat(card, session.clone(), chat::Intent::Resume, None, false));
     let attempt = tests::chat_runtime_attempt(&app, card);
-    // Hide the workspace as a covering surface does.
-    app.set_workspace_surfaces_visible(false);
+    // Scroll the card out of view behind other panes, so the successor is
+    // answered while the card is still hidden.
+    let mut other = card;
+    for _ in 0..3 {
+        other = tests::live_chat(&mut app, None);
+    }
+    let narrow = app.workspace.resize_viewport(600.0);
+    drop(app.apply_viewport(narrow, false, DurableChange::None));
+    let away = app.workspace.native_scroll(f32::MAX, 600.0);
+    drop(app.apply_viewport(away, false, DurableChange::None));
+    assert_ne!(
+        app.workspace.visibility(card),
+        Some(VisibilityClass::Visible)
+    );
+    assert_eq!(
+        app.workspace.visibility(other),
+        Some(VisibilityClass::Visible)
+    );
+    assert!(!runtime(&app, card).visible.load(Ordering::Relaxed));
     assert!(runtime(&app, card).warm_stamp().is_some());
     assert_no_source_read_owners(runtime(&app, card), &old);
 
@@ -517,7 +534,12 @@ fn a_hidden_successor_clears_the_old_warm_stamp_before_reusing_ids_and_generatio
 
     // An ordinary hidden successor needs hydration on reveal. Its lower
     // generation and reused IDs must not be mistaken for the frozen source.
-    app.set_workspace_surfaces_visible(true);
+    let back = app.workspace.native_scroll(0.0, 600.0);
+    drop(app.apply_viewport(back, false, DurableChange::None));
+    assert_eq!(
+        app.workspace.visibility(card),
+        Some(VisibilityClass::Visible)
+    );
     successor.deliver_snapshot_for_test(next);
     let state = app.chat_runtime_mut(successor_target).unwrap();
     state.refresh();

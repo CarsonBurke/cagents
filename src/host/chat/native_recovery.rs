@@ -274,8 +274,10 @@ fn restore_with_policy_for_start(
     mut admission: Option<capacity::Reservation>,
     previously_adopted: bool,
 ) -> Result<ServerResponse, ProtocolError> {
+    // Reading the floor can fail transiently. A source the floor fences
+    // cannot clear that fence by repeating the same request.
     if crate::upgrade::floor::load()
-        .map_err(unavailable)?
+        .map_err(retryable_unavailable)?
         .blocks_id(source.id)
         && !previously_adopted
     {

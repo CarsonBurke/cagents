@@ -2681,10 +2681,14 @@ impl ClientHandle {
                         continue;
                     }
                     let mut failure = start_failure(error);
-                    if intent == Intent::RestoreExisting {
+                    if intent == Intent::RestoreExisting
+                        && failure.recovery != super::Recovery::Blocked
+                    {
                         // An ordinary recovery attachment cannot enter the
                         // account-recovery path, whose callback starts a
                         // provider. Account changes remain explicit actions.
+                        // A typed permanent refusal stays blocked: repeating
+                        // the same attachment cannot succeed.
                         failure.recovery = super::Recovery::Retry;
                         failure.message.push_str(" This recovery pane only attaches existing conversations. Restore its account in Settings if needed, then choose Start or Resume explicitly; Retry only attempts attachment.");
                     }
