@@ -145,35 +145,36 @@ fn private_allocation(directory: &Path) -> bool {
 
 /// Refreshes every listener still served from the daemon's temporary
 /// directory, now and every [`REFRESH_INTERVAL`]. The thread ends at the first
-/// wake after the host is dropped.
+/// wake after the host is dropped; a pass that panics is retried, backing off
+/// from the same interval while it keeps panicking.
 ///
 /// It reads the directory rather than this daemon's records, so it also keeps
 /// the listener of a retained server that a restore left unattached, which
 /// has no record here but is still the endpoint its next start joins.
 pub(crate) fn keep_legacy_listeners_fresh(host: &crate::host::state::SharedHost) -> io::Result<()> {
+    use crate::host::service::{self, Next};
     let host = std::sync::Arc::downgrade(host);
-    std::thread::Builder::new()
-        .name("cagents-codex-listeners".into())
-        .spawn(move || {
-            while let Some(host) = host.upgrade() {
-                let root = host
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .codex_listeners
-                    .legacy
-                    .clone();
-                drop(host);
-                if let Err(error) = refresh_served(&root) {
-                    tracing::warn!(
-                        %error,
-                        root = %root.display(),
-                        "Codex listeners in the temporary directory could not be kept fresh"
-                    );
-                }
-                std::thread::sleep(REFRESH_INTERVAL);
-            }
-        })
-        .map(drop)
+    service::periodic("cagents-codex-listeners", REFRESH_INTERVAL, move || {
+        let Some(host) = host.upgrade() else {
+            return Next::Stop;
+        };
+        let root = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .codex_listeners
+            .legacy
+            .clone();
+        drop(host);
+        if let Err(error) = refresh_served(&root) {
+            tracing::warn!(
+                %error,
+                root = %root.display(),
+                "Codex listeners in the temporary directory could not be kept fresh"
+            );
+        }
+        Next::Continue
+    })
+    .map(drop)
 }
 
 /// Refreshes each listener allocation in `root` whose server still accepts

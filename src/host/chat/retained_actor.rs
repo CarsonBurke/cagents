@@ -5,7 +5,7 @@ use super::*;
 use crate::chat::runtime::{RetirementInspection, VerifiedRetirement};
 use crate::host::model::NativeActorEvent;
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     sync::{Condvar, Mutex},
 };
 
@@ -41,6 +41,16 @@ struct Inbox {
     worker_lifetime: Weak<()>,
 }
 
+impl Inbox {
+    fn push(&self, id: TerminalId) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(id);
+        self.wake.notify_one();
+    }
+}
+
 #[cfg(test)]
 pub(in crate::host) fn broker_running(host: &SharedHost) -> bool {
     host.lock()
@@ -66,16 +76,19 @@ pub(in crate::host) fn wake(host: &SharedHost, id: TerminalId) {
                 #[cfg(test)]
                 worker_lifetime: Arc::downgrade(&worker_lifetime),
             });
-            let weak = Arc::downgrade(host);
-            let worker = inbox.clone();
-            if let Err(error) = thread::Builder::new()
-                .name("cagents-actor-outcomes".into())
-                .spawn(move || {
+            let mut outcomes = Outcomes::new(Arc::downgrade(host), inbox.clone(), drain);
+            // The broker stops only once the daemon is gone or stopping, when
+            // `wake` no longer hands it work; a panicking step is contained,
+            // so a registered broker always has a live worker.
+            if let Err(error) = crate::host::service::spawn(
+                "cagents-actor-outcomes",
+                Duration::from_secs(1),
+                move || {
                     #[cfg(test)]
-                    let _lifetime = worker_lifetime;
-                    run(weak, worker)
-                })
-            {
+                    let _lifetime = &worker_lifetime;
+                    outcomes.step()
+                },
+            ) {
                 tracing::error!(%error, "cannot start retained actor outcome broker; helper outbox remains unacknowledged");
                 return;
             }
@@ -85,59 +98,214 @@ pub(in crate::host) fn wake(host: &SharedHost, id: TerminalId) {
         }
     };
     drop(state);
-    broker
-        .0
-        .pending
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(id);
-    broker.0.wake.notify_one();
+    broker.0.push(id);
 }
 
-fn run(host: Weak<HostLock>, inbox: Arc<Inbox>) {
-    let mut retry = BTreeSet::new();
-    let mut warned = BTreeSet::new();
-    loop {
-        let mut pending = inbox.pending.lock().unwrap_or_else(|p| p.into_inner());
+/// How soon an actor whose drain panicked is drained again, doubling while it
+/// keeps panicking. The helper retains every unacknowledged outcome, so a retry
+/// recommits from the helper's outbox rather than from anything the panic left.
+const PANIC_RETRY: Duration = Duration::from_secs(1);
+
+/// The broker worker's state between steps.
+struct Outcomes<D> {
+    host: Weak<HostLock>,
+    inbox: Arc<Inbox>,
+    drain: D,
+    /// Actors with another page, or whose last drain failed: revisited each
+    /// second.
+    retry: BTreeSet<TerminalId>,
+    warned: BTreeSet<TerminalId>,
+    /// Actors whose last drain panicked, held back until their backoff ends so
+    /// a deterministic panic neither spins nor floods diagnostics. They stay
+    /// here, rather than being dropped, until a drain returns.
+    panicked: BTreeMap<TerminalId, (Instant, crate::host::service::Backoff)>,
+    panic_retry: Duration,
+}
+
+impl<D: FnMut(&SharedHost, TerminalId) -> Result<bool, String>> Outcomes<D> {
+    fn new(host: Weak<HostLock>, inbox: Arc<Inbox>, drain: D) -> Self {
+        Self {
+            host,
+            inbox,
+            drain,
+            retry: BTreeSet::new(),
+            warned: BTreeSet::new(),
+            panicked: BTreeMap::new(),
+            panic_retry: PANIC_RETRY,
+        }
+    }
+
+    /// Waits for work, then drains each woken or retried actor once.
+    fn step(&mut self) -> crate::host::service::Next {
+        use crate::host::service::Next;
+        let work = self.next_work();
+        let Some(host) = self.host.upgrade() else {
+            return Next::Stop;
+        };
+        if host.lock().unwrap_or_else(|p| p.into_inner()).shutting_down {
+            return Next::Stop;
+        }
+        for id in work {
+            self.drain_one(&host, id);
+        }
+        Next::Continue
+    }
+
+    fn next_work(&mut self) -> BTreeSet<TerminalId> {
+        let mut pending = self.inbox.pending.lock().unwrap_or_else(|p| p.into_inner());
         if pending.is_empty() {
-            pending = inbox
+            let idle = if self.retry.is_empty() {
+                Duration::from_secs(5)
+            } else {
+                Duration::from_secs(1)
+            };
+            let now = Instant::now();
+            let timeout = self
+                .panicked
+                .values()
+                .map(|(due, _)| due.saturating_duration_since(now))
+                .fold(idle, Duration::min);
+            pending = self
+                .inbox
                 .wake
-                .wait_timeout(
-                    pending,
-                    if retry.is_empty() {
-                        Duration::from_secs(5)
-                    } else {
-                        Duration::from_secs(1)
-                    },
-                )
+                .wait_timeout(pending, timeout)
                 .unwrap_or_else(|p| p.into_inner())
                 .0;
         }
         let mut work = std::mem::take(&mut *pending);
         drop(pending);
-        work.append(&mut retry);
-        let Some(host) = host.upgrade() else {
-            return;
-        };
-        if host.lock().unwrap_or_else(|p| p.into_inner()).shutting_down {
-            return;
-        }
-        for id in work {
-            match drain(&host, id) {
-                Ok(more) => {
-                    warned.remove(&id);
-                    if more {
-                        retry.insert(id);
-                    }
-                }
-                Err(error) => {
-                    if warned.insert(id) {
-                        tracing::warn!(%id, %error, "retained actor outcome is not committed; helper retains it for retry");
-                    }
-                    retry.insert(id);
-                }
+        work.append(&mut self.retry);
+        let now = Instant::now();
+        for (&id, (due, _)) in &self.panicked {
+            if *due <= now {
+                work.insert(id);
+            } else {
+                work.remove(&id);
             }
         }
+        work
+    }
+
+    fn drain_one(&mut self, host: &SharedHost, id: TerminalId) {
+        let drained = crate::host::service::contain("retained actor outcome drain", || {
+            (self.drain)(host, id)
+        });
+        match drained {
+            Ok(Ok(more)) => {
+                self.warned.remove(&id);
+                self.panicked.remove(&id);
+                if more {
+                    self.retry.insert(id);
+                }
+            }
+            Ok(Err(error)) => {
+                self.panicked.remove(&id);
+                if self.warned.insert(id) {
+                    tracing::warn!(%id, %error, "retained actor outcome is not committed; helper retains it for retry");
+                }
+                self.retry.insert(id);
+            }
+            Err(panicked) => {
+                let (due, backoff) = self.panicked.entry(id).or_insert_with(|| {
+                    (
+                        Instant::now(),
+                        crate::host::service::Backoff::new(self.panic_retry),
+                    )
+                });
+                let wait = backoff.fail();
+                *due = Instant::now() + wait;
+                tracing::error!(%id, %panicked, retry_seconds = wait.as_secs_f64(),
+                    "retained actor outcome drain panicked; helper retains the outcome for retry");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod outcome_broker_tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    const PROMPT: Duration = Duration::from_secs(10);
+
+    fn inbox() -> Arc<Inbox> {
+        Arc::new(Inbox {
+            pending: Mutex::new(BTreeSet::new()),
+            wake: Condvar::new(),
+            worker_lifetime: Weak::new(),
+        })
+    }
+
+    /// A drain that panics while the same step still holds other actors must
+    /// not lose them, and the broker must keep acknowledging later outcomes.
+    #[test]
+    fn a_panicking_drain_does_not_end_acknowledgements() {
+        let host = crate::host::service::test_host();
+        let inbox = inbox();
+        let (acknowledged, acknowledgements) = mpsc::channel();
+        let (failing, batched, later) = (TerminalId::new(), TerminalId::new(), TerminalId::new());
+        let mut outcomes = Outcomes::new(Arc::downgrade(&host), inbox.clone(), {
+            let mut failures = 0;
+            move |_: &SharedHost, id: TerminalId| {
+                if id == failing && failures < 2 {
+                    failures += 1;
+                    panic!("drain fixture panics for {id}");
+                }
+                acknowledged.send(id).unwrap();
+                Ok(false)
+            }
+        });
+        outcomes.panic_retry = Duration::from_millis(20);
+        let broker = crate::host::service::spawn(
+            "outcome-broker-test",
+            Duration::from_millis(1),
+            move || outcomes.step(),
+        )
+        .unwrap();
+
+        // One step takes both, so the panic happens while it still holds the
+        // other actor.
+        inbox.pending.lock().unwrap().extend([failing, batched]);
+        inbox.wake.notify_one();
+        assert_eq!(acknowledgements.recv_timeout(PROMPT), Ok(batched));
+        inbox.push(later);
+        // The panicked actor is retried after its backoff, without another
+        // wake, until it drains.
+        let rest: BTreeSet<_> = (0..2)
+            .map(|_| acknowledgements.recv_timeout(PROMPT).unwrap())
+            .collect();
+        assert_eq!(rest, BTreeSet::from([failing, later]));
+        assert!(!broker.is_finished());
+
+        host.lock().unwrap().shutting_down = true;
+        inbox.wake.notify_one();
+        broker.join().expect("the broker stops only for shutdown");
+    }
+
+    #[test]
+    fn a_panicked_actor_waits_out_its_backoff_even_when_woken() {
+        let host = crate::host::service::test_host();
+        let inbox = inbox();
+        let drains = Arc::new(Mutex::new(Vec::new()));
+        let mut outcomes = Outcomes::new(Arc::downgrade(&host), inbox.clone(), {
+            let drains = drains.clone();
+            move |_: &SharedHost, id: TerminalId| -> Result<bool, String> {
+                drains.lock().unwrap().push(id);
+                panic!("drain fixture always panics")
+            }
+        });
+        outcomes.panic_retry = Duration::from_secs(60 * 60);
+        let id = TerminalId::new();
+        inbox.push(id);
+        assert_eq!(outcomes.step(), crate::host::service::Next::Continue);
+        assert!(outcomes.panicked.contains_key(&id));
+        inbox.push(id);
+        assert_eq!(outcomes.step(), crate::host::service::Next::Continue);
+        assert_eq!(*drains.lock().unwrap(), [id], "woken during its backoff");
+        assert!(
+            outcomes.panicked.contains_key(&id),
+            "the outcome is still owed"
+        );
     }
 }
 
