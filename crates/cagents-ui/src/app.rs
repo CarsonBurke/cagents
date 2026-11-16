@@ -6267,7 +6267,9 @@ impl Cagents {
                             },
                         )?;
                         let proof = client.proof().clone();
-                        Some(daemon_recovery::hosted_or_missing(&session, &proof, terminals)?)
+                        Some(daemon_recovery::hosted_or_missing(
+                            &session, &proof, terminals,
+                        )?)
                     };
                     let hosted = hosted.ok_or(SHARED_TERMINAL_DISCONNECTED)?;
                     shared_terminal_attachment(hosted.session, client.proof().clone())
