@@ -5786,7 +5786,7 @@ mod tests {
         app.workspace_model_tx = tx;
         drop(app.apply_workspace_model_update(ModelUpdate::Read(model.clone())));
         app.persist();
-        drop(std::iter::from_fn(|| rx.try_recv().ok()).count());
+        std::iter::from_fn(|| rx.try_recv().ok()).for_each(drop);
         let channels = app
             .durable
             .channels
