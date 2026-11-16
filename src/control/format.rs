@@ -102,9 +102,11 @@ fn render(headers: &[&str], rows: Vec<Vec<String>>, empty: &str) -> String {
         .join("\n")
 }
 
-/// The fewest characters a listed ID is shown by. Eight hexadecimal digits
-/// keep a prefix unique among the few hundred sessions and agents one
-/// daemon hosts, and every command that takes an ID accepts a prefix.
+/// The fewest characters a listed session or agent ID is shown by. Eight
+/// hexadecimal digits keep a prefix unique among the few hundred sessions
+/// and agents one daemon hosts, and the commands that name them, such as
+/// `send`, `transcript` and `agent`, accept a unique prefix. `terminal`
+/// commands take a full ID, so a plain shell's is listed whole.
 pub(super) const MIN_ABBREVIATION: usize = 8;
 
 /// The shortest prefix length, at least [`MIN_ABBREVIATION`], that tells
@@ -199,6 +201,43 @@ pub(super) fn hint<S: AsRef<str>>(steps: &[(S, &str)]) -> String {
     format!("hint: {}", steps.join("; "))
 }
 
+/// How a hint names this program: with the device this command ran
+/// against, so a suggested command reaches the same daemon.
+pub(super) fn program() -> String {
+    match crate::device::selected() {
+        Some(device) => format!("cagents --device {}", shell_word(&device.name)),
+        None => "cagents".into(),
+    }
+}
+
+/// `word` quoted for a POSIX shell when it needs to be.
+pub(super) fn shell_word(word: &str) -> String {
+    if !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./~:@%+=,".contains(c))
+    {
+        word.to_owned()
+    } else {
+        format!("'{}'", word.replace('\'', r"'\''"))
+    }
+}
+
+/// `text` with the home directory in any path it holds shortened to `~`,
+/// as [`location`] shows a path.
+pub(super) fn home_shortened(text: &str) -> String {
+    home_shortened_in(text, std::env::var("HOME").ok().as_deref())
+}
+
+fn home_shortened_in(text: &str, home: Option<&str>) -> String {
+    match home.map(|home| home.trim_end_matches('/')) {
+        Some(home) if home.starts_with('/') && home.len() > 1 => {
+            text.replace(&format!("{home}/"), "~/")
+        }
+        _ => text.to_owned(),
+    }
+}
+
 /// A byte count in the largest binary unit that keeps it at least one.
 pub(super) fn size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
@@ -241,6 +280,30 @@ pub(super) fn relative_time(at_ms: u64, now_ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notes_shorten_the_home_directory_in_the_paths_they_quote() {
+        let error = "fatal: cannot open /home/me/repo/.git: denied";
+        assert_eq!(
+            home_shortened_in(error, Some("/home/me/")),
+            "fatal: cannot open ~/repo/.git: denied"
+        );
+        assert_eq!(
+            home_shortened_in("/home/meg/x", Some("/home/me")),
+            "/home/meg/x"
+        );
+        assert_eq!(home_shortened_in("/x", Some("/")), "/x");
+        assert_eq!(home_shortened_in("/x", None), "/x");
+    }
+
+    #[test]
+    fn hinted_words_are_quoted_for_the_shell() {
+        assert_eq!(shell_word("redact"), "redact");
+        assert_eq!(shell_word("~/a/b-c"), "~/a/b-c");
+        assert_eq!(shell_word("Just Make Money"), "'Just Make Money'");
+        assert_eq!(shell_word("it's"), r"'it'\''s'");
+        assert_eq!(shell_word(""), "''");
+    }
 
     #[test]
     fn cli_relative_times_handle_clock_skew_without_raw_epoch_values() {
