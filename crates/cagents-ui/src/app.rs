@@ -6277,19 +6277,9 @@ impl Cagents {
                     } else {
                         // Name what the daemon shows about a terminal it no
                         // longer lists, rather than a reconnect it can't make.
-                        let terminals = daemon_recovery::inventory_proving_absence(
+                        Some(daemon_recovery::hosted_proving_absence(
                             &session,
                             &mut client,
-                            |client| client.list().map_err(|error| error.to_string()),
-                            |client| {
-                                daemon_recovery::admitted(
-                                    client.startup_state().map_err(|error| error.to_string())?,
-                                )
-                            },
-                        )?;
-                        let proof = client.proof().clone();
-                        Some(daemon_recovery::hosted_or_missing(
-                            &session, &proof, terminals,
                         )?)
                     };
                     let hosted = hosted.ok_or(SHARED_TERMINAL_DISCONNECTED)?;
@@ -20268,15 +20258,7 @@ fn attach_initial_terminal(
     let mut client =
         crate::control::ControlClient::connect(&socket).map_err(|error| error.to_string())?;
     let proof = client.proof().clone();
-    let session = initial_terminal_proving_absence(
-        &source,
-        &proof,
-        &mut client,
-        |client| client.list().map_err(|error| error.to_string()),
-        |client| {
-            daemon_recovery::admitted(client.startup_state().map_err(|error| error.to_string())?)
-        },
-    )?;
+    let session = initial_terminal_from_daemon(&source, &mut client)?;
     saved_terminal::attach_existing(
         card,
         daemon_recovery::RecoveredTerminal {
@@ -20288,6 +20270,21 @@ fn attach_initial_terminal(
         socket,
         proof,
         sender,
+    )
+}
+
+/// [`initial_terminal_proving_absence`], asked of a connected daemon.
+fn initial_terminal_from_daemon(
+    source: &TerminalSession,
+    client: &mut crate::control::ControlClient,
+) -> Result<TerminalSession, String> {
+    let proof = client.proof().clone();
+    initial_terminal_proving_absence(
+        source,
+        &proof,
+        client,
+        daemon_recovery::list_terminals,
+        daemon_recovery::ensure_admitted,
     )
 }
 

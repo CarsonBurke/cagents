@@ -54,7 +54,7 @@ pub(super) fn reconcile(
     explicit_retry: bool,
 ) -> Result<RecoveredTerminal, String> {
     if session.continuity.live_proof().is_none() {
-        return reconcile_without_proof(session, || {
+        return reconcile_without_proof(session, explicit_retry, || {
             ensure_daemon_ready().map_err(|error| error.to_string())
         });
     }
@@ -73,14 +73,22 @@ pub(super) fn reconcile(
 }
 
 /// Nothing else stops a second provider on a conversation a live terminal holds:
-/// the daemon starts whatever it is asked to. A pane with no conversation to
-/// protect has nothing to ask, so it doesn't start a daemon here.
+/// the daemon starts whatever it is asked to. A daemon still restoring can't
+/// show that no terminal holds it, and refuses the launch a Retry asks for, so
+/// both wait for it. A pane opened with no conversation to protect has nothing
+/// to ask, so it doesn't start a daemon here.
 fn reconcile_without_proof(
     session: TerminalSession,
+    explicit_retry: bool,
     daemon: impl FnOnce() -> Result<std::path::PathBuf, String>,
 ) -> Result<RecoveredTerminal, String> {
-    if session.agent_resume_recipe().is_some() {
-        refuse_conversation_held_elsewhere(&session, &daemon()?)?;
+    let agent = session.agent_resume_recipe().is_some();
+    if explicit_retry || agent {
+        let mut client = ControlClient::connect(&daemon()?).map_err(|error| error.to_string())?;
+        ensure_admitted(&mut client)?;
+        if agent {
+            refuse_conversation_held_elsewhere(&session, &mut client)?;
+        }
     }
     Ok(RecoveredTerminal {
         attach_completed: false,
@@ -103,9 +111,8 @@ const CONVERSATION_HELD: &str = "the saved agent conversation is already hosted 
 
 fn refuse_conversation_held_elsewhere(
     session: &TerminalSession,
-    socket: &Path,
+    client: &mut ControlClient,
 ) -> Result<(), String> {
-    let mut client = ControlClient::connect(socket).map_err(|error| error.to_string())?;
     let proof = client.proof().clone();
     let terminals = client.list().map_err(|error| error.to_string())?;
     if conversation_hosted_elsewhere(session, &proof, &terminals) {
@@ -146,6 +153,28 @@ pub(super) fn admitted(state: crate::terminal::ipc::StartupState) -> Result<(), 
             "Startup recovery retained original ownership: {detail}"
         )),
     }
+}
+
+/// [`admitted`], asked of a connected daemon.
+pub(super) fn ensure_admitted(client: &mut ControlClient) -> Result<(), String> {
+    admitted(client.startup_state().map_err(|error| error.to_string())?)
+}
+
+pub(super) fn list_terminals(
+    client: &mut ControlClient,
+) -> Result<Vec<TerminalDescriptor>, String> {
+    client.list().map_err(|error| error.to_string())
+}
+
+/// What a shared pane attaches to: its terminal if the daemon hosts it, and
+/// otherwise what Retry will find, once an absence can be shown.
+pub(super) fn hosted_proving_absence(
+    session: &TerminalSession,
+    client: &mut ControlClient,
+) -> Result<TerminalDescriptor, String> {
+    let terminals = inventory_proving_absence(session, client, list_terminals, ensure_admitted)?;
+    let proof = client.proof().clone();
+    Ok(hosted_or_missing(session, &proof, terminals)?)
 }
 
 /// A shared pane attaches only to what the daemon hosts. When it hosts nothing
@@ -273,6 +302,11 @@ fn reconcile_with(
             .map_err(|error| format!("cannot serialize terminal recovery: {error}"))?,
     );
     let mut client = ControlClient::connect(socket).map_err(|error| error.to_string())?;
+    // While the daemon restores, its inventory can miss this terminal and it
+    // refuses what Retry would ask of it, so a press says that instead.
+    if explicit_retry {
+        ensure_admitted(&mut client)?;
+    }
     let proof = client.proof().clone();
     let terminals = client.list().map_err(|error| error.to_string())?;
     let original = terminals.iter().find(|terminal| {
@@ -1089,7 +1123,25 @@ mod tests {
                 },
             )
             .unwrap();
-            let list: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+            let mut list: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+            // A press asks whether the daemon admits it before discovery.
+            if list.request == ClientRequest::StartupState {
+                write_frame(
+                    &mut stream,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(list.request_id),
+                        proof: proof.clone(),
+                        message: ServerMessage::Response {
+                            response: ServerResponse::StartupState(
+                                crate::terminal::ipc::StartupState::Ready,
+                            ),
+                        },
+                    },
+                )
+                .unwrap();
+                list = read_frame(&mut stream).unwrap().unwrap();
+            }
             assert_eq!(list.proof, Some(proof.clone()));
             assert_eq!(list.request, ClientRequest::List);
             write_frame(
@@ -2284,6 +2336,13 @@ mod tests {
                             ClientRequest::BuildInfo => ServerResponse::BuildInfo {
                                 version: "fixture".into(),
                             },
+                            ClientRequest::StartupState => {
+                                ServerResponse::StartupState(if inventory.recovery_only {
+                                    crate::terminal::ipc::StartupState::Restoring { awaiting: 1 }
+                                } else {
+                                    crate::terminal::ipc::StartupState::Ready
+                                })
+                            }
                             ClientRequest::List => ServerResponse::Listed {
                                 terminals: inventory.terminals.clone(),
                             },
@@ -2464,7 +2523,7 @@ mod tests {
                 live.launch = saved.launch.clone();
             }
             let server = discovery(&socket, daemon, vec![hosted(&live)], 0);
-            let result = reconcile_without_proof(saved, || Ok(socket.clone()));
+            let result = reconcile_without_proof(saved, false, || Ok(socket.clone()));
             server.join().unwrap();
             assert_eq!(result.is_err(), held);
         }
@@ -2475,7 +2534,81 @@ mod tests {
             recipe: saved.launch.clone(),
             last_exit: None,
         };
-        let result = reconcile_without_proof(saved, || panic!("no daemon is needed"));
+        let result = reconcile_without_proof(saved, false, || panic!("no daemon is needed"));
+        assert!(result.is_ok());
+    }
+
+    /// While the daemon restores, every path that would read its inventory or
+    /// ask it to start something says so, rather than relaying its refusal of
+    /// the request or concluding from a partial inventory. A daemon that
+    /// refuses build information, as this one does while restoring, fails
+    /// these if a path asks for that instead of its startup state.
+    #[test]
+    fn every_path_that_would_rely_on_a_restoring_daemon_says_it_is_restoring() {
+        use super::super::terminal_failure::{TERMINAL_NOT_HOSTED, TERMINALS_RESTORING};
+        let restoring = || Inventory {
+            recovery_only: true,
+            ..Default::default()
+        };
+        let ready = Inventory::default;
+        let served = |directory: &Path, served: Inventory| {
+            let socket = directory.join("daemon.sock");
+            (inventory(&socket, proof("current"), served), socket)
+        };
+        let saved_shell = |directory: &Path, live: bool| {
+            let mut saved = session(directory, &other_boot("old"));
+            if !live {
+                saved.continuity = TerminalContinuity::RelaunchAvailable {
+                    recipe: saved.launch.clone(),
+                    last_exit: None,
+                };
+            }
+            saved
+        };
+        for (daemon, expected) in [
+            (restoring(), TERMINALS_RESTORING),
+            (ready(), TERMINAL_NOT_HOSTED),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let saved = saved_shell(directory.path(), true);
+            let (server, socket) = served(directory.path(), daemon);
+            let mut client = ControlClient::connect(&socket).unwrap();
+            // A shared pane's open.
+            assert_eq!(
+                hosted_proving_absence(&saved, &mut client).map(|_| ()),
+                Err(expected.into())
+            );
+            // An initial pane's attach at startup.
+            assert_eq!(
+                super::super::initial_terminal_from_daemon(&saved, &mut client),
+                Err(expected.into())
+            );
+            drop(client);
+            server.join().unwrap();
+        }
+        // Retry on a pane with a live proof, and on one without.
+        for live in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let saved = saved_shell(directory.path(), live);
+            let (server, socket) = served(directory.path(), restoring());
+            let result = if live {
+                reconcile_at(saved, true, &socket, directory.path())
+            } else {
+                reconcile_without_proof(saved, true, || Ok(socket.clone()))
+            };
+            server.join().unwrap();
+            assert_eq!(
+                result.err(),
+                Some(TERMINALS_RESTORING.to_owned()),
+                "live {live}"
+            );
+        }
+        // Once restored, a Retry without a proof goes ahead.
+        let directory = tempfile::tempdir().unwrap();
+        let saved = saved_shell(directory.path(), false);
+        let (server, socket) = served(directory.path(), ready());
+        let result = reconcile_without_proof(saved, true, || Ok(socket.clone()));
+        server.join().unwrap();
         assert!(result.is_ok());
     }
 

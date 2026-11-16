@@ -122,6 +122,12 @@ pub(super) fn runtime_error_code(message: &str, default: &'static str) -> &'stat
 }
 const RECONNECT: &str = "Reconnect to the existing terminal.";
 const RETRY_AFTER_RESTORING: &str = "Once restoring has finished, Retry reconnects this terminal, or starts it again if it wasn't restored.";
+const RETRY_AFTER_RESTORING_RESUME: &str = "Once restoring has finished, Retry resumes the saved conversation in this pane, unless a restored terminal already holds it.";
+const RETRY_AFTER_RESTORING_SHELL: &str =
+    "Once restoring has finished, Retry starts a new shell in this pane.";
+const RETRY_AFTER_RESTORING_FRESH: &str = "Once restoring has finished, Retry runs the saved command again from the beginning in this pane.";
+const RETRY_REFUSED_RESTORING: &str =
+    "Retry didn't start anything because restoring hasn't finished. Press Retry again once it has.";
 const RETRY_REFUSED: &str = "Retry didn't start anything. Open a new terminal to keep working.";
 // A failure isn't re-evaluated, and either obstacle can go away, so these keep
 // the Retry button and say when it can work.
@@ -152,6 +158,18 @@ fn new_terminal_consequence(session: &TerminalSession) -> &'static str {
         RETRY_SHELL
     } else {
         RETRY_FRESH
+    }
+}
+/// What Retry will do once the daemon has restored its terminals. A pane with a
+/// live proof can find its terminal among them; one without starts a new one.
+fn restoring_consequence(session: &TerminalSession) -> &'static str {
+    if session.continuity.live_proof().is_some() {
+        return RETRY_AFTER_RESTORING;
+    }
+    match new_terminal_consequence(session) {
+        RETRY_RESUME => RETRY_AFTER_RESTORING_RESUME,
+        RETRY_SHELL => RETRY_AFTER_RESTORING_SHELL,
+        _ => RETRY_AFTER_RESTORING_FRESH,
     }
 }
 /// What Retry does for a terminal whose daemon is gone: the plan recovery will
@@ -196,6 +214,7 @@ fn refused_text(code: &str, consequence: &str) -> String {
             format!("Retry didn't start anything. {consequence}")
         }
         "terminal_daemon_restarted" => RETRY_REFUSED_AFTER_CHECK.to_owned(),
+        "terminals_restoring" => RETRY_REFUSED_RESTORING.to_owned(),
         _ => RETRY_REFUSED.to_owned(),
     }
 }
@@ -241,7 +260,7 @@ fn is_missing_terminal(code: &str) -> bool {
 }
 fn missing_terminal_consequence(code: &str, session: &TerminalSession) -> &'static str {
     match code {
-        "terminals_restoring" => RETRY_AFTER_RESTORING,
+        "terminals_restoring" => restoring_consequence(session),
         "terminal_moved" => RECONNECT,
         "terminal_retired" => RETRY_BLOCKED_RETIRED,
         "terminal_superseded" => blocked_consequence(session),
@@ -261,7 +280,7 @@ fn known_failure(code: &str) -> (&'static str, &'static str) {
         "terminal_moved" => ("terminal_moved", "This terminal needs to reconnect."),
         "terminals_restoring" => (
             "terminals_restoring",
-            "Terminals are still being restored after the restart.",
+            "Terminals are still being restored after Cagents restarted.",
         ),
         "terminal_superseded" => (
             "terminal_superseded",
@@ -308,14 +327,17 @@ impl Details {
             )
     }
     fn attempt_title(&self) -> &'static str {
-        if self.expects_no_launch() {
+        if self.expects_no_launch() || self.code == "terminals_restoring" {
             "Checking terminal…"
         } else {
             "Launching terminal…"
         }
     }
     fn attempt_caption(&self) -> &'static str {
-        if self.expects_no_launch() {
+        if self.code == "terminals_restoring" {
+            // What it will do once restoring has finished isn't known yet.
+            "Checking whether restoring has finished."
+        } else if self.expects_no_launch() {
             "Trying again."
         } else {
             self.consequence
@@ -333,7 +355,8 @@ impl Details {
             "terminal_not_hosted"
             | "terminal_daemon_restarted"
             | "terminal_retired"
-            | "terminal_superseded" => Some(OUTPUT_MAY_GO_WITH_RETRY),
+            | "terminal_superseded"
+            | "terminals_restoring" => Some(OUTPUT_MAY_GO_WITH_RETRY),
             _ => None,
         }
     }
@@ -1101,19 +1124,25 @@ impl Cagents {
                 // the process in the way. Any other error stays out of the pane.
                 let readable =
                     super::daemon_recovery::is_retry_refusal(&refusal).then(|| refusal.clone());
-                if is_missing_terminal(prior.code) {
-                    // The refusal doesn't change what the pane knew about this
-                    // terminal, so it keeps saying so, and adds what this press did.
-                    details.code = prior.code;
-                    details.message = prior.message;
-                    details.consequence = prior.consequence;
-                    details.retry_refusal = Some(
-                        readable.unwrap_or_else(|| refused_text(prior.code, prior.consequence)),
-                    );
+                // A daemon still restoring is what the pane now says, whatever
+                // it said before: the failure this press recorded already does.
+                let restoring = refusal == TERMINALS_RESTORING;
+                if restoring || is_missing_terminal(prior.code) {
+                    if !restoring {
+                        // The refusal doesn't change what the pane knew about
+                        // this terminal, so it keeps saying so.
+                        details.code = prior.code;
+                        details.message = prior.message;
+                        details.consequence = prior.consequence;
+                    }
+                    let (code, consequence, message) =
+                        (details.code, details.consequence, details.message);
+                    details.retry_refusal =
+                        Some(readable.unwrap_or_else(|| refused_text(code, consequence)));
                     self.status = Some(
                         TransientNotice::error(terminal_notice(
                             pane.as_deref(),
-                            &format!("Retry didn't start anything. {}", prior.message),
+                            &format!("Retry didn't start anything. {message}"),
                         ))
                         .with_details(refusal)
                         .with_key(NoticeKey::TerminalStart(card)),
@@ -1543,22 +1572,88 @@ mod tests {
     }
     #[test]
     fn a_pane_refused_while_its_daemon_restores_says_so_and_when_retry_helps() {
-        let (mut app, card, _) = app_and_session();
+        let (mut app, card, session) = app_and_session();
         app.fail_runtime(card, TERMINALS_RESTORING.into());
         let details = app.terminal_details(card).unwrap();
         assert_eq!(details.code, "terminals_restoring");
         assert_eq!(
             details.message,
-            "Terminals are still being restored after the restart."
+            "Terminals are still being restored after Cagents restarted."
         );
-        assert_eq!(details.consequence, RETRY_AFTER_RESTORING);
-        // Nothing is replaced while the daemon restores.
-        assert_eq!(details.output_warning(), None);
+        // Without a live proof Retry starts a new terminal; it has nothing
+        // to reconnect. This one runs a saved command.
+        assert_eq!(details.consequence, RETRY_AFTER_RESTORING_FRESH);
+        // A press once restoring has finished can replace it.
+        assert_eq!(details.output_warning(), Some(OUTPUT_MAY_GO_WITH_RETRY));
+        // Until then a press can't say what it will start.
+        assert_eq!(details.attempt_title(), "Checking terminal…");
+        assert_eq!(
+            details.attempt_caption(),
+            "Checking whether restoring has finished."
+        );
         let pane = app.notice_pane_name(card).unwrap();
         assert_eq!(
             app.missing_terminal_notice(card).as_deref(),
             Some(format!("{pane}: {}", details.message).as_str())
         );
+        let mut live = session.clone();
+        live.continuity = TerminalContinuity::Live {
+            host_session_id: crate::model::HostSessionId::new("old-host"),
+            boot_id: crate::model::BootId::new("old-boot"),
+            host_incarnation: crate::model::HostIncarnation::new("old"),
+        };
+        assert_eq!(restoring_consequence(&live), RETRY_AFTER_RESTORING);
+        let mut agent = session;
+        agent.launch.program = "/usr/bin/codex".into();
+        agent.launch.arguments = vec![
+            "resume".into(),
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
+        ];
+        assert_eq!(restoring_consequence(&agent), RETRY_AFTER_RESTORING_RESUME);
+    }
+    #[test]
+    fn a_retry_refused_because_terminals_are_still_restoring_says_so() {
+        let (mut app, card, _) = app_and_session();
+        let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+            unreachable!()
+        };
+        session.continuity = TerminalContinuity::Live {
+            host_session_id: crate::model::HostSessionId::new("old-host"),
+            boot_id: crate::model::BootId::new("old-boot"),
+            host_incarnation: crate::model::HostIncarnation::new("old"),
+        };
+        let terminal = session.id;
+        // Whatever the pane said before, and pressed again while restoring.
+        for prior in [
+            TERMINAL_NOT_HOSTED,
+            TERMINALS_RESTORING,
+            TERMINALS_RESTORING,
+        ] {
+            if prior == TERMINAL_NOT_HOSTED {
+                app.fail_runtime(card, prior.into());
+            }
+            drop(app.retry_card(card));
+            let operation = app.terminal_failure.attempts[&card].operation;
+            drop(app.update_terminal_failure(Action::RetryFinished {
+                card,
+                operation,
+                terminal,
+                result: Err(TERMINALS_RESTORING.into()),
+            }));
+            let details = app.terminal_details(card).unwrap();
+            assert_eq!(details.code, "terminals_restoring", "after {prior}");
+            assert_eq!(details.consequence, RETRY_AFTER_RESTORING);
+            assert_eq!(
+                details.retry_refusal.as_deref(),
+                Some(RETRY_REFUSED_RESTORING)
+            );
+            assert!(!details.copy_text().contains("new terminal"));
+            let pane = app.notice_pane_name(card).unwrap();
+            assert_eq!(
+                app.status.as_ref().unwrap().message,
+                format!("{pane}: Retry didn't start anything. {}", details.message)
+            );
+        }
     }
     #[test]
     fn a_refusal_recovery_wrote_for_the_reader_is_what_the_pane_shows() {
