@@ -16,6 +16,24 @@ set -euo pipefail
 self=$(readlink -f "$0")
 tool_root=${self%/scripts/*}
 
+# A signal sent to this wrapper alone, such as a tool timeout's TERM, would end
+# only this shell. Its SSH connections, Git's and rsync's among them, would run
+# on, and the host would go on building or comparing for nobody: Bash runs no
+# trap until the command it waits for ends, and command substitutions hold
+# most of them. So the wrapper runs under the supervisor of the gate's owned
+# commands. On TERM, HUP or INT it ends this shell, then every connection the
+# shell left, and reaps them before it dies by that signal; the host sees each
+# connection go and ends its work. A signal the caller ignores, as nohup
+# ignores HUP, stays ignored. Otherwise it passes the exit status on.
+if [ "${CAGENTS_EVIDENCE_REMOTE_SUPERVISOR:-}" = "$PPID" ]; then
+    unset CAGENTS_EVIDENCE_REMOTE_SUPERVISOR
+else
+    export CAGENTS_EVIDENCE_REMOTE_SUPERVISOR=$$
+    # It reads cancellation from a file too, which this never writes.
+    exec /usr/bin/python3 -I "$tool_root/scripts/cargo-gate-command.py" --wrapper native-evidence-remote \
+        /dev/null "$self" "$@"
+fi
+
 usage() {
     cat <<'USAGE'
 Usage: scripts/native-evidence --remote HOST --task DIR COMMAND
@@ -105,7 +123,11 @@ fi
 # tool and synthetic provider, as they do locally.
 tool_source=${CAGENTS_EVIDENCE_REMOTE_TOOL:-$tool_root}
 
-ssh_command=(ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30)
+# Its own connection, never a channel of a user's multiplexing master: the
+# host ends what a connection started when that connection's sshd goes, and a
+# master's outlives this command.
+ssh_command=(ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30
+    -o ControlMaster=no -o ControlPath=none)
 # Git's own SSH connection, the first contact in a build, gets the same
 # options, so an unreachable host fails in seconds rather than prompting.
 git_ssh="${ssh_command[*]}"

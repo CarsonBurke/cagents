@@ -1,11 +1,24 @@
 #!/usr/bin/python3
-"""Supervise one owned command, and keep the gate's admission clock."""
+"""Supervise one owned command, and keep the gate's admission clock.
+
+    cargo-gate-command.py [--wrapper NAME] [--admission-until DEADLINE] RECEIPT COMMAND...
+
+--wrapper NAME supervises a whole program on its caller's behalf, as
+native-evidence-remote does itself: messages are NAME's, a cancelled run
+dies by the signal that cancelled it, so a calling shell stops as it would
+for the program, and the program gets longer than the gate's own grace to
+clean up, as it may be waiting on a gate that is draining.
+"""
 
 import sys
 import time
 
 
 GRACE_SECONDS = 2.0
+# Longer than GRACE_SECONDS, so that a gate the wrapped program runs drains
+# and cleans up before this kills it.
+WRAPPER_GRACE_SECONDS = 5.0
+PROGRAM = "cargo-gate"
 
 
 def positive_integer(value):
@@ -45,8 +58,22 @@ def main():
     import signal
     import subprocess
 
-    signals = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
+    global PROGRAM
     arguments = sys.argv[1:]
+    wrapper = False
+    grace = GRACE_SECONDS
+    if arguments[:1] == ["--wrapper"]:
+        wrapper, PROGRAM, grace = True, arguments[1], WRAPPER_GRACE_SECONDS
+        arguments = arguments[2:]
+    signals = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
+    # A signal the caller ignores, as nohup ignores HUP, stays ignored here and
+    # in the command: it cancels nothing. The gate starts this as a background
+    # job, for which its shell, not its caller, ignores INT and QUIT; the gate
+    # traps those itself and writes them to the receipt, which any signal of
+    # these can still cancel through.
+    kept = signals if wrapper else (signal.SIGTERM, signal.SIGHUP)
+    handled = [number for number in signals
+               if number not in kept or signal.getsignal(number) != signal.SIG_IGN]
     admission_deadline = None
     if arguments[:1] == ["--admission-until"]:
         admission_deadline = positive_integer(arguments[1])
@@ -58,7 +85,7 @@ def main():
         if not cancellation:
             cancellation = number
 
-    for number in signals:
+    for number in handled:
         signal.signal(number, cancelled)
     # An inherited SIGCHLD=SIG_IGN must not auto-reap our owned children.
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)
@@ -81,8 +108,15 @@ def main():
                     cancellation = number
         return cancellation
 
-    if cancellation_requested():
+    def cancelled_status():
+        if wrapper:
+            # Dies as the program would have, once nothing of it is left.
+            signal.signal(cancellation, signal.SIG_DFL)
+            os.kill(os.getpid(), cancellation)
         return 128 + cancellation
+
+    if cancellation_requested():
+        return cancelled_status()
     if admission_expired(admission_deadline):
         return 124
     try:
@@ -91,7 +125,7 @@ def main():
         # actual unreaped children, never the caller's shared process group.
         primary = subprocess.Popen(arguments[1:], close_fds=False)
     except OSError as error:
-        print(f"cargo-gate: {error}", file=sys.stderr)
+        print(f"{PROGRAM}: {error}", file=sys.stderr)
         return 127 if error.errno == errno.ENOENT else 126
 
     def primary_exited():
@@ -120,7 +154,7 @@ def main():
             pass
 
     def drain():
-        deadline = time.monotonic() + GRACE_SECONDS
+        deadline = time.monotonic() + grace
         terminating = set()
         killing = set()
         # Retaining the primary reserves its PID until the last signal. Its
@@ -158,7 +192,7 @@ def main():
         while True:
             if cancellation_requested():
                 drain()
-                return 128 + cancellation
+                return cancelled_status()
             if admission_expired(admission_deadline):
                 drain()
                 return 124
@@ -183,5 +217,5 @@ if __name__ == "__main__":
             sys.exit(admission_clock(sys.argv[1:]))
         sys.exit(main())
     except Exception as error:
-        print(f"cargo-gate: command supervision failed: {error}", file=sys.stderr)
+        print(f"{PROGRAM}: command supervision failed: {error}", file=sys.stderr)
         sys.exit(2)
