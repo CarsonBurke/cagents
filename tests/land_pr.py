@@ -455,6 +455,13 @@ class LandTests(unittest.TestCase):
         self.assertEqual(self.run_land(), land.REFUSED)
         self.assertIn("HTTP 405", self.output)
 
+    def test_a_report_that_still_lists_passing_checks_lands(self):
+        # An older gh-pr-status's REST fallback lists every check, passed or not.
+        self.status({"passed": None, "checks": [
+            {"__typename": "CheckRun", "name": "contracts", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"__typename": "StatusContext", "context": "deploy", "state": "SUCCESS"}]})
+        self.assertEqual(self.run_land(), 0, self.output)
+
     def test_aggregate_success_lands_past_the_hundred_listed_checks(self):
         self.status({"complete": False})
         self.assertEqual(self.run_land(), 0, self.output)

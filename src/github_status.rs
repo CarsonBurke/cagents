@@ -402,6 +402,8 @@ impl ReportedSnapshot {
     }
 }
 
+/// Reads see the snapshot's fields, with `checks` already filtered; judge a
+/// whole snapshot, as [`Snapshot::is_rest_bootstrap`] does, before filtering.
 impl std::ops::Deref for ReportedSnapshot {
     type Target = Snapshot;
 
