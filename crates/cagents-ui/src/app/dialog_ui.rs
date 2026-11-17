@@ -193,6 +193,10 @@ pub(crate) enum Consequence {
     /// keeps everything as it is. The committing action is one Tab, Shift+Tab
     /// or arrow away, and the question is always asked.
     Irreversible,
+    /// Lets an agent act with the permissions shown: the person reads what
+    /// they agree to before agreeing, so the dismissal takes focus, and the
+    /// question is always asked.
+    Authorization,
     /// Nothing to answer: the dialog reports an outcome, and its one way out
     /// takes focus.
     Report,
@@ -203,7 +207,7 @@ impl Consequence {
     pub(crate) fn initial_focus(self, dismiss: widget::Id, confirm: widget::Id) -> widget::Id {
         match self {
             Self::Routine(_) => confirm,
-            Self::Irreversible | Self::Report => dismiss,
+            Self::Irreversible | Self::Authorization | Self::Report => dismiss,
         }
     }
 }
@@ -212,11 +216,12 @@ impl Consequence {
 /// so no question can be left off the list.
 macro_rules! questions {
     ($($(#[$doc:meta])* $question:ident,)*) => {
-        /// Every question the application asks in a [`confirmation_surface`]. Each
-        /// names what its committing action costs, so where the keyboard starts is
-        /// decided here, once, rather than by whichever code opens the dialog: a
-        /// dialog that loses work can't open with Enter on its destructive button
-        /// because its opener reused a routine question's focus.
+        /// Every question the application asks, in a [`confirmation_surface`] or
+        /// in place in an [`inline_question`]. Each names what its committing
+        /// action costs, so where the keyboard starts is decided here, once,
+        /// rather than by whichever code opens it: a question that loses work
+        /// can't open with Enter on its destructive button because its opener
+        /// reused a routine question's focus, or forgot to place focus at all.
         ///
         /// Only questions whose action is common and recoverable, and which the
         /// person may choose not to be asked again, are routine (#2711).
@@ -269,6 +274,38 @@ questions! {
     DiscardAutomationDraft,
     /// Pasting lines a program without bracketed paste may each run at once.
     PasteMultipleLines,
+    /// Removing an automation, asked in its pane.
+    RemoveAutomation,
+    /// Enabling an automation's schedule, which then launches an agent with
+    /// the permissions shown, asked in its pane.
+    EnableAutomation,
+    /// Running an automation now with the permissions shown, asked in its
+    /// pane.
+    RunAutomationNow,
+    /// Forgetting a linked account home, asked in the account's menu.
+    ForgetHome,
+    /// A chat Close the daemon refused, on the pane it was about, offering
+    /// to end the processes that hold it.
+    EndCloseHolders,
+    /// Deleting a pending pull request review and its draft comments from
+    /// GitHub, asked in the review popover.
+    DiscardPendingReview,
+    /// Publishing a pull request review, asked in the review popover.
+    SubmitReview,
+    /// Spending one of an account's usage resets, asked beside its usage.
+    UseUsageReset,
+}
+
+/// Where a question is asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Placement {
+    /// In a [`confirmation_surface`] over the window, which holds the
+    /// keyboard until it is answered.
+    Dialog,
+    /// In an [`inline_question`], in place of or beside what it is about.
+    /// Its opener focuses where [`Question::focus`] says all the same, and
+    /// Escape answers it with its dismissal while it is in front.
+    Inline,
 }
 
 impl Question {
@@ -290,7 +327,42 @@ impl Question {
             | Self::DeleteChannel
             | Self::CloseWithUnsavedWork
             | Self::DiscardAutomationDraft
-            | Self::PasteMultipleLines => Consequence::Irreversible,
+            | Self::PasteMultipleLines
+            | Self::RemoveAutomation
+            | Self::ForgetHome
+            | Self::EndCloseHolders
+            | Self::DiscardPendingReview
+            | Self::SubmitReview
+            | Self::UseUsageReset => Consequence::Irreversible,
+            Self::EnableAutomation | Self::RunAutomationNow => Consequence::Authorization,
+        }
+    }
+
+    pub(crate) const fn placement(self) -> Placement {
+        match self {
+            Self::RemoveAutomation
+            | Self::EnableAutomation
+            | Self::RunAutomationNow
+            | Self::ForgetHome
+            | Self::EndCloseHolders
+            | Self::DiscardPendingReview
+            | Self::SubmitReview
+            | Self::UseUsageReset => Placement::Inline,
+            Self::StopWorkingChat
+            | Self::StopSendingFirstMessage
+            | Self::DiscardUnsentMessage
+            | Self::CloseActiveTerminal
+            | Self::LeaveTerminalProcessesRunning
+            | Self::TerminalPaneKept
+            | Self::ResetSettings
+            | Self::DiscardChanges
+            | Self::DeleteSidebarSelection
+            | Self::RemoveProject
+            | Self::DeleteWorktree
+            | Self::DeleteChannel
+            | Self::CloseWithUnsavedWork
+            | Self::DiscardAutomationDraft
+            | Self::PasteMultipleLines => Placement::Dialog,
         }
     }
 
@@ -298,7 +370,7 @@ impl Question {
     pub(crate) const fn skippable(self) -> Option<settings::Confirmation> {
         match self.consequence() {
             Consequence::Routine(confirmation) => Some(confirmation),
-            Consequence::Irreversible | Consequence::Report => None,
+            Consequence::Irreversible | Consequence::Authorization | Consequence::Report => None,
         }
     }
 
@@ -309,8 +381,16 @@ impl Question {
 
     /// Moves keyboard focus to where this question opens.
     pub(crate) fn focus(self, dismiss: widget::Id, confirm: widget::Id) -> Task<Message> {
+        self.focus_task(dismiss, confirm).map(cosmic::Action::App)
+    }
+
+    /// [`Self::focus`] for a surface with messages of its own.
+    pub(crate) fn focus_task<T: Send + 'static>(
+        self,
+        dismiss: widget::Id,
+        confirm: widget::Id,
+    ) -> iced::Task<T> {
         iced::widget::operation::focus(self.initial_focus(dismiss, confirm))
-            .map(cosmic::Action::App)
     }
 
     /// The id of the surface asking it, by which a test finds which question
@@ -336,6 +416,7 @@ pub(crate) fn confirmation_surface<'a, M: 'a>(
     actions: impl Into<Element<'a, M>>,
     max_width: f32,
 ) -> Element<'a, M> {
+    debug_assert_eq!(question.placement(), Placement::Dialog);
     crate::interaction::focus_scope(surface_with_actions(
         content,
         actions,
@@ -345,11 +426,144 @@ pub(crate) fn confirmation_surface<'a, M: 'a>(
     ))
 }
 
+/// A question asked in place: `content`, its answers among it, marked as
+/// asking `question`. Unlike a [`confirmation_surface`] it doesn't hold the
+/// keyboard, so Tab can leave it for what it is about; its opener focuses
+/// where [`Question::focus`] says, and Escape answers it with its dismissal.
+pub(crate) fn inline_question<'a, M: 'a>(
+    question: Question,
+    content: impl Into<Element<'a, M>>,
+) -> Element<'a, M> {
+    debug_assert_eq!(question.placement(), Placement::Inline);
+    widget::container(content).id(question.surface_id()).into()
+}
+
 pub(crate) fn dont_ask_again_id(confirmation: settings::Confirmation) -> widget::Id {
     widget::Id::new(format!("dialog.dont-ask.{}", confirmation.key()))
 }
 
 impl Cagents {
+    /// The inline question in front of the person, and the message its
+    /// dismissal sends, in the order Escape reaches them. A dialog over the
+    /// window is in front of all of them; then an account menu's or the
+    /// account popover's; then the focused pane's; then a usage reset's
+    /// asked anywhere else, as Escape has always withdrawn one.
+    pub(super) fn inline_question(&self) -> Option<(Question, Message)> {
+        if self.modal_is_open() {
+            return None;
+        }
+        self.forget_home_question()
+            .or_else(|| self.usage_reset_question(true))
+            .or_else(|| self.pane_question())
+            .or_else(|| self.usage_reset_question(false))
+    }
+
+    fn forget_home_question(&self) -> Option<(Question, Message)> {
+        self.account_forget_asked().then(|| {
+            (
+                Question::ForgetHome,
+                Message::AccountUi(account_ui::Action::RemoveCancel),
+            )
+        })
+    }
+
+    fn usage_reset_question(&self, in_popover: bool) -> Option<(Question, Message)> {
+        self.usage_reset_asked(in_popover).map(|account| {
+            (
+                Question::UseUsageReset,
+                Message::AccountUi(account_ui::Action::ResetCancel(account)),
+            )
+        })
+    }
+
+    /// The question asked in the focused pane, unless something covers the
+    /// pane's content.
+    fn pane_question(&self) -> Option<(Question, Message)> {
+        let card = self.workspace.focused()?;
+        if self.pane_content_inputs_blocked(card) {
+            return None;
+        }
+        match self.cards.get(&card)? {
+            CardRuntime::PullRequests(pane) => {
+                let question = pane.review.review_question()?;
+                Some((
+                    question,
+                    Message::PullRequestReview {
+                        card,
+                        action: pane.review.review_escape()?,
+                    },
+                ))
+            }
+            CardRuntime::Chat(_) => self.focused_close_refusal().map(|target| {
+                (
+                    Question::EndCloseHolders,
+                    Message::ChatUi(chat_ui::Action::DismissCloseRefusal(target)),
+                )
+            }),
+            CardRuntime::Automations => self.automation_ui.question().map(|(_, question)| {
+                (
+                    question,
+                    Message::AutomationUi(crate::automation_ui::Action::CancelConfirmation),
+                )
+            }),
+            _ => None,
+        }
+    }
+
+    /// What Escape answers in an account's popups, ahead of the menu and
+    /// popover they sit in, which would otherwise close around them: a
+    /// Forget home question goes back to its menu, and a usage reset asked
+    /// in the account popover is withdrawn.
+    ///
+    /// Unlike a dialog, an inline question doesn't hold the keyboard, so a
+    /// key a focused control captured, such as a composer interrupting its
+    /// agent or a terminal taking Escape, was that control's and answers no
+    /// question. Forget home is the exception: it is asked inside an
+    /// account menu, which, like every popup, takes Escape however it
+    /// arrives, and backing out of the question is the menu's first step.
+    pub(super) fn account_question_escape(&self, captured: bool) -> Option<Message> {
+        if self.modal_is_open() {
+            return None;
+        }
+        self.forget_home_question()
+            .or_else(|| {
+                (!captured)
+                    .then(|| self.usage_reset_question(true))
+                    .flatten()
+            })
+            .map(|(_, dismiss)| dismiss)
+    }
+
+    /// What an Escape no control captured answers in the focused pane, once
+    /// every popup, picker and overlay in front of it has had the key: its
+    /// question's dismissal, or else the pull request review popover
+    /// closing; failing those, a usage reset asked elsewhere is withdrawn.
+    /// A captured key was the control's, as with
+    /// [`Self::account_question_escape`].
+    pub(super) fn pane_escape(&self) -> Option<Message> {
+        if self.modal_is_open() {
+            return None;
+        }
+        if let Some((_, dismiss)) = self.pane_question() {
+            return Some(dismiss);
+        }
+        self.review_popover_escape()
+            .or_else(|| self.usage_reset_question(false).map(|(_, dismiss)| dismiss))
+    }
+
+    fn review_popover_escape(&self) -> Option<Message> {
+        let card = self.workspace.focused()?;
+        if self.pane_content_inputs_blocked(card) {
+            return None;
+        }
+        let Some(CardRuntime::PullRequests(pane)) = self.cards.get(&card) else {
+            return None;
+        };
+        pane.review
+            .review_escape()
+            .map(|action| Message::PullRequestReview { card, action })
+    }
+
     /// Whether to ask before the routine action `confirmation` guards.
     pub(super) fn asks(&self, confirmation: settings::Confirmation) -> bool {
         self.settings.asks(confirmation)

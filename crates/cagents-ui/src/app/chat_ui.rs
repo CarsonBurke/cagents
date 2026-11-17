@@ -81,6 +81,8 @@ mod changes;
 mod child_navigation;
 mod clipboard_image;
 mod close_refusal;
+#[cfg(test)]
+pub(in crate::app) use close_refusal::{close_refusal_dismiss_id, close_refusal_end_id};
 mod closed_draft;
 mod completion;
 mod coordination;
@@ -537,6 +539,9 @@ pub enum Action {
     FreshCloseFinished(Target, chat::Session, chat::Session, Result<(), String>),
     ToggleBlockedDetails(CardId, chat::Session),
     CopyBlockedDetails(CardId, chat::Session),
+    /// Asks the daemon what still runs for a conversation whose Close it
+    /// refused.
+    AskCloseHolders(Target, chat::Session),
     /// What still runs for a conversation whose Close was refused.
     CloseHolders(
         Target,
@@ -886,6 +891,7 @@ impl Action {
             Self::HandoffFinished(..) => "HandoffFinished",
             Self::CloseFinished(..) => "CloseFinished",
             Self::RetainedCloseFinished(..) => "RetainedCloseFinished",
+            Self::AskCloseHolders(..) => "AskCloseHolders",
             Self::CloseHolders(..) => "CloseHolders",
             Self::EndCloseHolders(..) => "EndCloseHolders",
             Self::CloseHoldersEnded(..) => "CloseHoldersEnded",
@@ -15166,6 +15172,9 @@ impl Cagents {
                     .remove_chat_card(target.card, None)
                     .unwrap_or_else(Task::none);
             }
+            Action::AskCloseHolders(target, session) => {
+                return self.ask_close_holders(target, session);
+            }
             Action::CloseHolders(target, session, result) => {
                 return self.show_close_holders(target, session, result);
             }
@@ -23807,6 +23816,25 @@ pub(in crate::app) mod tests {
         let (card, _) = starting_chat(app);
         assert!(app.chat_first_message_on_its_way(card).is_some());
         card
+    }
+
+    /// A focused live chat being closed, and the daemon's refusal of that
+    /// Close, which keeps it.
+    pub(in crate::app) fn refusing_close(app: &mut Cagents) -> (CardId, Message) {
+        let card = live_chat(app, Some(KNOWN_THREAD));
+        drop(app.workspace.focus(card));
+        assert_eq!(app.workspace.focused(), Some(card));
+        let source = app.chat_return_session(card).unwrap();
+        drop(app.begin_chat_close(card));
+        let close = app.chat_ui.phases[&card].target();
+        (
+            card,
+            Message::ChatUi(Action::RetainedCloseFinished(
+                close,
+                source,
+                Err("Codex is still running for this conversation.".into()),
+            )),
+        )
     }
 
     /// A live Claude chat whose turn is still running.
