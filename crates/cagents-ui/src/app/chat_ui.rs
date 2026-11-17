@@ -76,7 +76,7 @@ mod artifacts;
 mod attachment_draft;
 mod auth_recovery;
 #[cfg(test)]
-mod blocked_recovery_tests;
+pub(in crate::app) mod blocked_recovery_tests;
 mod changes;
 mod child_navigation;
 mod clipboard_image;
@@ -15393,7 +15393,7 @@ pub(super) fn show_chat_snapshot_for_test(
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::app) mod tests {
     #[test]
     fn remote_resume_command_preserves_draft_without_opening_desktop_history() {
         const CHILD: &str = "CAGENTS_TEST_REMOTE_RESUME_COMMAND";
@@ -23328,7 +23328,7 @@ mod tests {
     pub(super) fn live_chat(app: &mut Cagents, session_id: Option<&str>) -> CardId {
         live_chat_for_provider(app, Provider::Codex, session_id)
     }
-    pub(super) fn live_chat_for_provider(
+    pub(in crate::app) fn live_chat_for_provider(
         app: &mut Cagents,
         provider: Provider,
         session_id: Option<&str>,
@@ -23342,6 +23342,23 @@ mod tests {
             preparation::drain_fixture(runtime);
         }
         assert!(chat_runtime(app, card).queued.is_none());
+        card
+    }
+
+    /// A chat still starting, with its first message on its way.
+    pub(in crate::app) fn chat_sending_its_first_message(app: &mut Cagents) -> CardId {
+        let (card, _) = starting_chat(app);
+        assert!(app.chat_first_message_on_its_way(card).is_some());
+        card
+    }
+
+    /// A live Claude chat whose turn is still running.
+    pub(in crate::app) fn working_chat(app: &mut Cagents, session_id: &str) -> CardId {
+        let card = live_chat_for_provider(app, Provider::Claude, Some(session_id));
+        let handle = chat_runtime(app, card).handle().unwrap();
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.busy = true;
+        handle.publish_snapshot_for_test(snapshot);
         card
     }
 

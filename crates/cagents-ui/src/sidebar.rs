@@ -12347,6 +12347,7 @@ pub fn discard_confirmation_dialog(pending: &DiscardConfirmation) -> Element<'_,
         ));
     }
     crate::app::dialog_ui::confirmation_surface(
+        crate::app::dialog_ui::Question::DiscardChanges,
         widget::column::with_children(vec![
             design::title("Discard changes?").into(),
             design::body(detail.join(". "))

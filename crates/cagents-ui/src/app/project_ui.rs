@@ -175,11 +175,17 @@ impl State {
     }
 
     pub(super) fn focus_target(&self) -> widget::Id {
-        widget::Id::new(if self.remove_dialog.is_some() {
-            "dialog.project.remove.cancel"
+        if self.remove_dialog.is_some() {
+            super::dialog_ui::Question::RemoveProject.initial_focus(
+                widget::Id::new("dialog.project.remove.cancel"),
+                widget::Id::new("dialog.project.remove.confirm"),
+            )
         } else {
-            "dialog.project.close"
-        })
+            super::dialog_ui::Question::DeleteWorktree.initial_focus(
+                widget::Id::new("dialog.project.close"),
+                widget::Id::new("dialog.project.confirm"),
+            )
+        }
     }
 }
 
@@ -2029,6 +2035,7 @@ impl Cagents {
                 )
             };
             return Some(super::dialog_ui::confirmation_surface(
+                super::dialog_ui::Question::RemoveProject,
                 widget::column::with_children(vec![
                     design::title("Remove project from cagents?").into(),
                     super::notice_body(&removal.name),
@@ -2091,6 +2098,7 @@ impl Cagents {
         // The warning, what else closes and why a delete failed can run
         // long; they scroll, and the answers stay in reach.
         Some(super::dialog_ui::confirmation_surface(
+            super::dialog_ui::Question::DeleteWorktree,
             widget::column::with_children(rows).spacing(space::M),
             actions,
             480.0,
@@ -2663,7 +2671,7 @@ fn worktree_removal_command(target: &Target) -> CommandSpec {
 mod close_edit_regression;
 
 #[cfg(test)]
-mod tests {
+pub(in crate::app) mod tests {
     use super::*;
     use crate::sidebar::RowDeletion;
 
@@ -3368,7 +3376,7 @@ mod tests {
 
     /// A window with session storage and one project at `repository` whose
     /// linked worktree is `linked`, both of them saved.
-    fn deletable_app(
+    pub(in crate::app) fn deletable_app(
         repository: &Path,
         linked: &SidebarWorktree,
         primary: &SidebarWorktree,

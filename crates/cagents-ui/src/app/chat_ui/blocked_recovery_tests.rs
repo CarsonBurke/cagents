@@ -102,7 +102,11 @@ fn labels(tree: &A11yTree) -> Vec<&str> {
         .collect()
 }
 
-fn blocked_app(named: bool, valid_recipe: bool, runtime: bool) -> (Cagents, CardId) {
+pub(in crate::app) fn blocked_app(
+    named: bool,
+    valid_recipe: bool,
+    runtime: bool,
+) -> (Cagents, CardId) {
     blocked_app_with(
         named,
         valid_recipe,

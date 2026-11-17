@@ -74,7 +74,7 @@ enum ObservedInput {
     Key(crate::terminal::KeyInput),
 }
 
-struct Peer {
+pub(super) struct Peer {
     _directory: tempfile::TempDir,
     handle: HostedTerminalHandle,
     send: crossbeam_channel::Sender<ServerMessage>,
@@ -276,7 +276,7 @@ impl Drop for Peer {
     }
 }
 
-fn fixture() -> (Cagents, CardId, Peer) {
+pub(super) fn fixture() -> (Cagents, CardId, Peer) {
     let mut app = super::tests::context_inspector_test_app(true);
     let card = app.workspace.focused().unwrap();
     let CardKind::Terminal(mut session) = app.card_state(card).unwrap().kind.clone() else {
