@@ -795,6 +795,33 @@ impl ControlError {
     }
 }
 
+/// Why a request a person is waiting on did not complete, separating the
+/// daemon's refusal to admit it while busy, after which nothing was done and
+/// the same request may be sent again, from every other failure.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RequestError {
+    #[error("{}", crate::terminal_ipc::DAEMON_BUSY)]
+    Busy,
+    #[error("{0}")]
+    Failed(String),
+}
+
+impl From<ControlError> for RequestError {
+    fn from(error: ControlError) -> Self {
+        if error.is_daemon_busy() {
+            Self::Busy
+        } else {
+            Self::Failed(error.to_string())
+        }
+    }
+}
+
+impl From<String> for RequestError {
+    fn from(error: String) -> Self {
+        Self::Failed(error)
+    }
+}
+
 /// Ends a [`ControlClient`]'s connection from another thread.
 pub struct Hangup(UnixStream);
 
@@ -5961,17 +5988,21 @@ mod tests {
         let busy = remote(DAEMON_BUSY, true);
         assert!(busy.is_daemon_busy());
         assert_eq!(busy.to_string(), DAEMON_BUSY);
+        assert_eq!(RequestError::from(busy), RequestError::Busy);
         for other in [
             remote(DAEMON_BUSY, false),
             remote("registry is unavailable", true),
         ] {
             assert!(!other.is_daemon_busy());
+
             assert!(
                 other
                     .to_string()
                     .starts_with("daemon rejected the request (Internal): "),
                 "{other}"
             );
+            let shown = other.to_string();
+            assert_eq!(RequestError::from(other), RequestError::Failed(shown));
         }
     }
 

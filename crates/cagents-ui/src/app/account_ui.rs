@@ -50,16 +50,20 @@ use crate::settings::AccountUsageDisplay;
 pub(super) mod resets;
 mod table;
 
+use crate::control::RequestError;
+
 fn remote_lifecycle<T: serde::de::DeserializeOwned>(
     operation: account::remote::Operation,
-) -> Result<T, String> {
-    match crate::device_service::request(crate::device_service::Operation::AccountLifecycle {
-        operation,
-    })? {
+) -> Result<T, RequestError> {
+    match crate::device_service::request_unless_busy(
+        crate::device_service::Operation::AccountLifecycle { operation },
+    )? {
         crate::device_service::Reply::AccountLifecycle(value) => {
-            serde_json::from_value(value).map_err(|error| error.to_string())
+            serde_json::from_value(value).map_err(|error| RequestError::Failed(error.to_string()))
         }
-        _ => Err("The device did not complete its account operation".into()),
+        _ => Err(RequestError::Failed(
+            "The device did not complete its account operation".into(),
+        )),
     }
 }
 
@@ -1190,8 +1194,10 @@ enum LoginPhase {
     Waiting,
     /// The terminal ended and the home is being asked who it signed in as.
     Verifying,
-    /// The answer is in; the home is being registered or its pending entry abandoned.
+    /// The answer is in; the home is being registered.
     Settling,
+    /// Nothing signed in; the home's pending entry is being abandoned.
+    Discarding,
     /// The callback could not be acquired; retain the row until dismissed.
     CallbackBlocked,
 }
@@ -1339,7 +1345,7 @@ pub enum Action {
     },
     LoginSettled {
         key: uuid::Uuid,
-        result: Result<Settled, String>,
+        result: Result<Settled, RequestError>,
     },
     CancelLogin(uuid::Uuid),
     SetDefault(AccountId),
@@ -1355,12 +1361,11 @@ pub enum Action {
     RemoveConfirm(AccountId),
     RemoveCancel,
     ArchiveDuplicate(AccountId),
-    /// A removal finished: the registry as it now stands, where it was
-    /// changed, and what went wrong, if anything.
+    /// A removal finished: the registry as it now stands and what was left
+    /// behind, or why it was not removed.
     Removed {
         id: AccountId,
-        registry: Option<Registry>,
-        error: Option<String>,
+        result: Result<(Registry, Option<String>), RequestError>,
     },
     /// Opens a row's menu, or closes it with `None`.
     Menu(Option<AccountId>),
@@ -3877,19 +3882,39 @@ impl Cagents {
                     }
                 })
             }
-            Action::Removed {
-                id,
-                registry,
-                error,
-            } => {
+            Action::Removed { id, result } => {
                 self.account_ui.removing.remove(&id);
-                if let Some(registry) = registry {
-                    self.account_ui.set_registry(registry);
-                }
-                if let Some(error) = error {
-                    self.status = Some(TransientNotice::error(format!(
-                        "The account could not be removed completely: {error}"
-                    )));
+                let name = || {
+                    self.account_ui
+                        .account(&id)
+                        .map(|state| self.account_ui.display_name(state))
+                        .unwrap_or_else(|| "The account".into())
+                };
+                let notice = match result {
+                    Ok((registry, left_behind)) => {
+                        self.account_ui.set_registry(registry);
+                        // It is forgotten; only what it left behind went wrong.
+                        left_behind.map(|error| {
+                            TransientNotice::error(format!(
+                                "The account could not be removed completely: {error}"
+                            ))
+                        })
+                    }
+                    // Refused before anything was admitted, so the account
+                    // is still listed and still works.
+                    Err(RequestError::Busy) => Some(TransientNotice::warning(format!(
+                        "The cagents daemon was busy finishing another operation, so {} was not removed. Try again in a moment.",
+                        name()
+                    ))),
+                    // Nothing came back to say what changed, so the account
+                    // stays as last listed.
+                    Err(RequestError::Failed(error)) => Some(TransientNotice::error(format!(
+                        "{} could not be removed: {error}",
+                        name()
+                    ))),
+                };
+                if notice.is_some() {
+                    self.status = notice;
                 }
                 Task::none()
             }
@@ -4533,6 +4558,7 @@ impl Cagents {
                         key,
                         path: raw_path,
                     })
+                    .map_err(|error| error.to_string())
                 })
                 .await
                 .map_err(|error| error.to_string())
@@ -4608,6 +4634,7 @@ impl Cagents {
                         provider,
                         copy_codex_config,
                     })
+                    .map_err(|error| error.to_string())
                 })
                 .await
                 .map_err(|error| error.to_string())
@@ -4739,14 +4766,16 @@ impl Cagents {
         &self,
         key: uuid::Uuid,
         provider: Provider,
-        request: impl FnOnce(account::remote::Operation) -> Result<Settled, String> + Send + 'static,
+        request: impl FnOnce(account::remote::Operation) -> Result<Settled, RequestError>
+        + Send
+        + 'static,
     ) -> Task<Message> {
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
                 abandon_home(provider, key, request).map(Settled::Abandoned)
             })
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| RequestError::Failed(error.to_string()))
             .and_then(|result| result);
             Message::AccountUi(Action::LoginSettled { key, result })
         })
@@ -5007,7 +5036,7 @@ impl Cagents {
                 self.resolve_notice(NoticeKey::SignIn(key));
                 return Task::none();
             }
-            login.phase = LoginPhase::Settling;
+            login.phase = LoginPhase::Discarding;
             return self.discard_home(key, provider);
         }
         login.phase = LoginPhase::Settling;
@@ -5017,7 +5046,7 @@ impl Cagents {
                     remote_lifecycle(account::remote::Operation::Register { provider, key })
                 })
                 .await
-                .map_err(|error| error.to_string())
+                .map_err(|error| RequestError::Failed(error.to_string()))
                 .and_then(|result| result);
                 Message::AccountUi(Action::LoginSettled { key, result })
             });
@@ -5065,23 +5094,27 @@ impl Cagents {
                     // The same login twice would count one allowance twice.
                     // Match the daemon's duplicate path: abandon only pending
                     // metadata, preserving this home's login and history.
-                    tokio::task::spawn_blocking(move || -> Result<Settled, String> {
+                    tokio::task::spawn_blocking(move || -> Result<Settled, RequestError> {
                         Ok(Settled::Duplicate {
                             existing,
                             registry: abandon_home(provider, key, remote_lifecycle::<Settled>)?,
                         })
                     })
                     .await
-                    .map_err(|error| error.to_string())
+                    .map_err(|error| RequestError::Failed(error.to_string()))
                     .and_then(|result| result)
                 }
-                Err(error) => Err(error),
+                Err(error) => Err(RequestError::Failed(error)),
             };
             Message::AccountUi(Action::LoginSettled { key, result })
         })
     }
 
-    fn login_settled(&mut self, key: uuid::Uuid, result: Result<Settled, String>) -> Task<Message> {
+    fn login_settled(
+        &mut self,
+        key: uuid::Uuid,
+        result: Result<Settled, RequestError>,
+    ) -> Task<Message> {
         let Some(index) = self
             .account_ui
             .logins
@@ -5092,22 +5125,39 @@ impl Cagents {
         };
         if let Err(error) = &result {
             let login = &mut self.account_ui.logins[index];
-            if login.attempts < LOGIN_ATTEMPTS {
+            let discarding = matches!(
+                login.phase,
+                LoginPhase::Discarding | LoginPhase::CallbackBlocked
+            );
+            let busy = *error == RequestError::Busy;
+            // A busy daemon refused before doing anything, so waiting for it
+            // costs none of the sign-in's attempts.
+            if busy || login.attempts < LOGIN_ATTEMPTS {
                 // Registration can race the auth terminal exiting or lose an
                 // RPC reply. Keep the pending login and retry verification;
                 // daemon registration is idempotent for this exact key.
                 login.phase = LoginPhase::Waiting;
                 login.next_check = now_ms() + LOGIN_RETRY * Millis::from(login.attempts.max(1));
+                let provider = login.provider.label();
                 // Each retry replaces the warning before it, and the save that
                 // lands replaces it with the outcome.
-                self.status = Some(
-                    TransientNotice::warning(format!(
-                        "The new {} account could not be saved yet. cagents will try again.",
-                        login.provider.label()
+                let notice = match (busy, discarding) {
+                    (true, false) => TransientNotice::warning(format!(
+                        "The cagents daemon was busy finishing another operation, so the new {provider} account was not saved yet. cagents will try again."
+                    )),
+                    (true, true) => TransientNotice::warning(format!(
+                        "The cagents daemon was busy finishing another operation, so the unfinished {provider} sign-in was not discarded yet. cagents will try again."
+                    )),
+                    (false, false) => TransientNotice::warning(format!(
+                        "The new {provider} account could not be saved yet. cagents will try again."
                     ))
-                    .with_details(error.clone())
-                    .with_key(NoticeKey::SignIn(key)),
-                );
+                    .with_details(error.to_string()),
+                    (false, true) => TransientNotice::warning(format!(
+                        "The unfinished {provider} sign-in could not be discarded yet. cagents will try again."
+                    ))
+                    .with_details(error.to_string()),
+                };
+                self.status = Some(notice.with_key(NoticeKey::SignIn(key)));
                 return Task::none();
             }
         }
@@ -5166,13 +5216,19 @@ impl Cagents {
                 self.close_settled_sign_in(login.provider, &login.home)
             }
             Err(error) => {
+                let provider = login.provider.label();
+                let message = if matches!(
+                    login.phase,
+                    LoginPhase::Discarding | LoginPhase::CallbackBlocked
+                ) {
+                    format!("The unfinished {provider} sign-in could not be discarded.")
+                } else {
+                    format!("The new {provider} account could not be saved.")
+                };
                 self.status = Some(
-                    TransientNotice::error(format!(
-                        "The new {} account could not be saved.",
-                        login.provider.label()
-                    ))
-                    .with_details(error)
-                    .with_key(NoticeKey::SignIn(key)),
+                    TransientNotice::error(message)
+                        .with_details(error.to_string())
+                        .with_key(NoticeKey::SignIn(key)),
                 );
                 Task::none()
             }
@@ -5189,7 +5245,9 @@ impl Cagents {
     fn remove_account_via(
         &mut self,
         id: AccountId,
-        request: impl FnOnce(account::remote::Operation) -> Result<(Registry, Option<String>), String>
+        request: impl FnOnce(
+            account::remote::Operation,
+        ) -> Result<(Registry, Option<String>), RequestError>
         + Send
         + 'static,
     ) -> Task<Message> {
@@ -5208,17 +5266,9 @@ impl Cagents {
                 request(account::remote::Operation::Remove { id: remove_id })
             })
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| RequestError::Failed(error.to_string()))
             .and_then(|result| result);
-            let (registry, error) = match result {
-                Ok((registry, error)) => (Some(registry), error),
-                Err(error) => (None, Some(error)),
-            };
-            Message::AccountUi(Action::Removed {
-                id,
-                registry,
-                error,
-            })
+            Message::AccountUi(Action::Removed { id, result })
         })
     }
 
@@ -6301,11 +6351,13 @@ fn stop_hosted(terminal: TerminalId, proof: &HostSessionProof) -> Result<(), Str
 fn abandon_home(
     provider: Provider,
     key: uuid::Uuid,
-    request: impl FnOnce(account::remote::Operation) -> Result<Settled, String>,
-) -> Result<Option<Registry>, String> {
+    request: impl FnOnce(account::remote::Operation) -> Result<Settled, RequestError>,
+) -> Result<Option<Registry>, RequestError> {
     match request(account::remote::Operation::Abandon { provider, key })? {
         Settled::Abandoned(Some(registry)) => Ok(Some(registry)),
-        _ => Err("The device did not confirm the pending sign-in was abandoned".into()),
+        _ => Err(RequestError::Failed(
+            "The device did not confirm the pending sign-in was abandoned".into(),
+        )),
     }
 }
 
@@ -11492,8 +11544,10 @@ mod app_tests {
         // table follows the registry, and the reader hears about the rest.
         let _ = app.update(Message::AccountUi(Action::Removed {
             id: managed.clone(),
-            registry: Some(remaining),
-            error: Some("its files could not be deleted: busy".into()),
+            result: Ok((
+                remaining,
+                Some("its files could not be deleted: busy".into()),
+            )),
         }));
         assert!(app.account_ui.account(&managed).is_none());
         assert!(app.account_ui.removing.is_empty());
@@ -11503,6 +11557,37 @@ mod app_tests {
                 .message
                 .contains("could not be removed completely")
         }));
+    }
+
+    /// A removal the busy daemon refused removed nothing: the account stays
+    /// listed and the notice says so, rather than that it was partly removed.
+    #[test]
+    fn a_busy_refusal_of_a_removal_keeps_the_account() {
+        let mut app = context_inspector_test_app(false);
+        let managed = app.account_ui.add_managed_fixture(Provider::Claude, 6);
+        let registry = app.account_ui.registry.clone();
+        let _ = app.update(Message::AccountUi(Action::Remove(managed.clone())));
+        let _ = app.update(Message::AccountUi(Action::RemoveConfirm(managed.clone())));
+        assert!(app.account_ui.removing.contains(&managed));
+        let name = app
+            .account_ui
+            .account(&managed)
+            .map(|state| app.account_ui.display_name(state))
+            .unwrap();
+        let _ = app.update(Message::AccountUi(Action::Removed {
+            id: managed.clone(),
+            result: Err(RequestError::Busy),
+        }));
+        assert!(app.account_ui.account(&managed).is_some());
+        assert_eq!(app.account_ui.registry, registry);
+        assert!(app.account_ui.removing.is_empty());
+        let entries = app.notices.recent().collect::<Vec<_>>();
+        assert!(
+            matches!(entries.as_slice(), [entry] if entry.notice.severity == NoticeSeverity::Warning
+                && entry.notice.message == format!("The cagents daemon was busy finishing another operation, so {name} was not removed. Try again in a moment.")),
+            "{:?}",
+            notice_messages(&app)
+        );
     }
 
     #[test]
@@ -11567,12 +11652,83 @@ mod app_tests {
         app.account_ui.logins[0].attempts = 1;
         let _ = app.update(Message::AccountUi(Action::LoginSettled {
             key,
-            result: Err("auth terminal is still closing".into()),
+            result: Err(RequestError::Failed(
+                "auth terminal is still closing".into(),
+            )),
         }));
         let login = &app.account_ui.logins[0];
         assert_eq!(login.key, key);
         assert_eq!(login.phase, LoginPhase::Waiting);
         assert!(login.next_check > now_ms());
+    }
+
+    fn notice_messages(app: &Cagents) -> Vec<String> {
+        app.notices
+            .recent()
+            .map(|entry| entry.notice.message.clone())
+            .collect()
+    }
+
+    /// A busy daemon refused before doing anything, so a sign-in that was
+    /// being saved or discarded is asked again, whatever its attempts, and
+    /// the notice says which of the two is waiting.
+    #[test]
+    fn a_busy_refusal_keeps_a_sign_in_waiting_and_names_what_it_was_doing() {
+        for (phase, expected) in [
+            (
+                LoginPhase::Settling,
+                "The cagents daemon was busy finishing another operation, so the new Claude Code account was not saved yet. cagents will try again.",
+            ),
+            (
+                LoginPhase::Discarding,
+                "The cagents daemon was busy finishing another operation, so the unfinished Claude Code sign-in was not discarded yet. cagents will try again.",
+            ),
+        ] {
+            let mut app = context_inspector_test_app(false);
+            let key = pending_login(&mut app, 105);
+            app.account_ui.logins[0].phase = phase;
+            app.account_ui.logins[0].attempts = LOGIN_ATTEMPTS;
+            let _ = app.update(Message::AccountUi(Action::LoginSettled {
+                key,
+                result: Err(RequestError::Busy),
+            }));
+            let login = &app.account_ui.logins[0];
+            assert_eq!(login.key, key);
+            assert_eq!(login.phase, LoginPhase::Waiting);
+            assert!(login.next_check > now_ms());
+            assert_eq!(notice_messages(&app), [expected]);
+        }
+    }
+
+    /// Discarding a sign-in that never signed in is not saving an account,
+    /// while it is retried or once it is given up.
+    #[test]
+    fn a_failed_discard_says_the_sign_in_was_not_discarded() {
+        let mut app = context_inspector_test_app(false);
+        let key = pending_login(&mut app, 106);
+        app.account_ui.logins[0].phase = LoginPhase::Discarding;
+        app.account_ui.logins[0].attempts = 1;
+        let _ = app.update(Message::AccountUi(Action::LoginSettled {
+            key,
+            result: Err(RequestError::Failed("reply lost".into())),
+        }));
+        assert_eq!(
+            notice_messages(&app),
+            [
+                "The unfinished Claude Code sign-in could not be discarded yet. cagents will try again."
+            ]
+        );
+        app.account_ui.logins[0].phase = LoginPhase::Discarding;
+        app.account_ui.logins[0].attempts = LOGIN_ATTEMPTS;
+        let _ = app.update(Message::AccountUi(Action::LoginSettled {
+            key,
+            result: Err(RequestError::Failed("reply lost".into())),
+        }));
+        assert!(app.account_ui.logins.is_empty());
+        assert_eq!(
+            notice_messages(&app),
+            ["The unfinished Claude Code sign-in could not be discarded."]
+        );
     }
 
     #[test]
@@ -11737,7 +11893,7 @@ mod app_tests {
                 snapshot: UsageSnapshot::state(UsageStatus::NeedsLogin, "signed out", NOW),
             },
         }));
-        assert_eq!(app.account_ui.logins[0].phase, LoginPhase::Settling);
+        assert_eq!(app.account_ui.logins[0].phase, LoginPhase::Discarding);
         let _ = app.update(Message::AccountUi(Action::LoginSettled {
             key,
             result: Ok(Settled::Abandoned(None)),
@@ -11874,7 +12030,7 @@ mod app_tests {
                 app.account_ui.logins[0].attempts = 1;
                 let _ = app.update(Message::AccountUi(Action::LoginSettled {
                     key,
-                    result: Err("reply lost".into()),
+                    result: Err(RequestError::Failed("reply lost".into())),
                 }));
                 assert_eq!(app.notices.len(), 1);
             }
@@ -11914,7 +12070,7 @@ mod app_tests {
             app.account_ui.logins[0].attempts = attempt;
             let _ = app.update(Message::AccountUi(Action::LoginSettled {
                 key,
-                result: Err(error.into()),
+                result: Err(RequestError::Failed(error.into())),
             }));
         }
         assert_eq!(
@@ -13105,7 +13261,7 @@ mod app_tests {
         let task = app.remove_account_via(managed.id(), move |operation| {
             assert_eq!(operation, account::remote::Operation::Remove { id: expected });
             seen.lock().unwrap().push(operation);
-            Err("File deletion is not available in this build. Your account and its files were kept.".into())
+            Err(RequestError::Failed("File deletion is not available in this build. Your account and its files were kept.".into()))
         });
         assert!(
             requests.lock().unwrap().is_empty(),
@@ -13115,7 +13271,7 @@ mod app_tests {
         app.account_ui.popover = Some(linked.id());
         let message = lifecycle_message(task).await;
         assert!(
-            matches!(&message, Message::AccountUi(Action::Removed { id, registry: None, error: Some(reason) }) if *id == managed.id() && reason.contains("files were kept"))
+            matches!(&message, Message::AccountUi(Action::Removed { id, result: Err(RequestError::Failed(reason)) }) if *id == managed.id() && reason.contains("files were kept"))
         );
         drop(app.update(message));
         assert_eq!(app.account_ui.registry, original);
@@ -13136,7 +13292,9 @@ mod app_tests {
         let seen = requests.clone();
         let task = app.remove_account_via(linked.id(), move |operation| {
             seen.lock().unwrap().push(operation);
-            Err("This home still belongs to a hosted process".into())
+            Err(RequestError::Failed(
+                "This home still belongs to a hosted process".into(),
+            ))
         });
         drop(app.update(lifecycle_message(task).await));
         assert_eq!(app.account_ui.registry, original);
@@ -13161,7 +13319,7 @@ mod app_tests {
         });
         let message = lifecycle_message(task).await;
         assert!(
-            matches!(&message, Message::AccountUi(Action::Removed { id, registry: Some(_), error: None }) if *id == linked.id())
+            matches!(&message, Message::AccountUi(Action::Removed { id, result: Ok((_, None)) }) if *id == linked.id())
         );
         drop(app.update(message));
         assert!(app.account_ui.account(&linked.id()).is_none());
@@ -13251,7 +13409,9 @@ mod app_tests {
         let seen = requests.clone();
         let task = app.discard_home_via(key, Provider::Codex, move |operation| {
             seen.lock().unwrap().push(operation);
-            Err("Synthetic lost reply; outcome unconfirmed".into())
+            Err(RequestError::Failed(
+                "Synthetic lost reply; outcome unconfirmed".into(),
+            ))
         });
         let message = lifecycle_message(task).await;
         assert!(
@@ -13332,9 +13492,9 @@ mod app_tests {
         );
         // Already-settled/unknown metadata is not a fresh operation or a cleanup permit.
         assert!(
-            abandon_home(Provider::Codex, key, |_| Err(
+            abandon_home(Provider::Codex, key, |_| Err(RequestError::Failed(
                 "The pending sign-in changed on the device".into()
-            ))
+            )))
             .is_err()
         );
         assert_eq!(

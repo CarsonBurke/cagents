@@ -1337,6 +1337,7 @@ fn login_caption(login: &Login) -> &'static str {
         LoginPhase::Waiting => "Finish signing in in the terminal. Closing it cancels.",
         LoginPhase::Verifying => "Checking which account signed in…",
         LoginPhase::Settling => "Saving…",
+        LoginPhase::Discarding => "Discarding…",
         LoginPhase::CallbackBlocked => account::login::PORT_BUSY,
     }
 }
