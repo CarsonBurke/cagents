@@ -710,12 +710,10 @@ class Probe:
                     raise Stale
         finally:
             # What it started, still running or left behind, ends with it.
-            leftovers = True
-            try:
+            with contextlib.suppress(ProcessLookupError):
                 os.killpg(child.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                leftovers = child.returncode is None
-            if self.scoped and leftovers:
+            # The scope also holds what left the group, as with setsid.
+            if self.scoped:
                 with contextlib.suppress(OSError, subprocess.SubprocessError):
                     systemctl("kill", "--signal=SIGKILL", unit)
             child.wait()
