@@ -522,6 +522,7 @@ fn navigation_save_timing() {
     super::projection_oracle::disable();
     let (mut app, channels, directory) = large_workspace(&Scale::LARGE);
     app.shared_views.skip_rediscovery_check();
+    settle_seeds(&mut app);
     let targets = &channels[..Scale::LARGE.chats];
     let click = |app: &mut Cagents, round: usize, index: usize| {
         let channel_id = targets[(index * 7 + round) % targets.len()];
@@ -535,7 +536,8 @@ fn navigation_save_timing() {
         assert!(app.navigation_save.is_none(), "the save ran");
         elapsed
     };
-    for index in 0..5 {
+    // From the second target: the first is already open.
+    for index in 1..6 {
         click(&mut app, 0, index);
         save_due(&mut app);
     }
@@ -556,6 +558,37 @@ fn navigation_save_timing() {
     report_phases(phases);
 }
 
+/// Saves, then acknowledges every seed that save published and lists its
+/// view, as the daemon does once the window's first save reaches it. A
+/// running window publishes into seeded scopes, so a save that still meets
+/// over a thousand unseeded ones measures a state the window is never in.
+fn settle_seeds(app: &mut Cagents) {
+    // The save that seeds every scope the window shows.
+    app.persist();
+    // With no daemon to deliver them, the seeds fail as they are published.
+    let seeds = app
+        .shared_views
+        .seeding_scopes()
+        .into_iter()
+        .chain(app.shared_views.seed_failures.keys().cloned())
+        .collect::<Vec<_>>();
+    assert!(!seeds.is_empty(), "the window seeds its unseeded scopes");
+    for scope in seeds {
+        app.acknowledge_view_edit(scope.clone(), None);
+        if !app
+            .workspace_model
+            .views
+            .iter()
+            .any(|view| view.scope == scope)
+        {
+            let mut view = View::empty(ChannelId::new());
+            view.scope = scope;
+            view.revision = 1;
+            app.workspace_model.views.push(view);
+        }
+    }
+}
+
 /// The save a terminal's start makes once its surface attaches: the start
 /// changes the terminal's saved session, and `persist()` publishes that
 /// change before the handoff is committed. Each round opens a channel with a
@@ -567,6 +600,7 @@ fn terminal_started_save_timing() {
     super::projection_oracle::disable();
     let (mut app, channels, directory) = large_workspace(&Scale::LARGE);
     app.shared_views.skip_rediscovery_check();
+    settle_seeds(&mut app);
     // The channels whose conversation came with a terminal.
     let targets = channels[..Scale::LARGE.chats]
         .iter()
@@ -641,10 +675,27 @@ fn save_phases(
             .map(|value| value.trim_matches('"').to_owned())
     };
     let mut phases = BTreeMap::<String, Vec<Duration>>::new();
+    let mut counts = BTreeMap::<String, usize>::new();
     for line in logged.lines() {
         let Some(stage) = field(line, "stage=") else {
             continue;
         };
+        if matches!(
+            stage.as_str(),
+            "local_scopes" | "local_settled" | "view_index"
+        ) {
+            // Counts, not durations: the shape of each pass.
+            *counts
+                .entry(
+                    line.split_once(stage.as_str())
+                        .map_or(line, |(_, rest)| rest)
+                        .trim_start_matches('"')
+                        .trim()
+                        .to_owned(),
+                )
+                .or_insert(0usize) += 1;
+            continue;
+        }
         let duration = if let Some(micros) = field(line, "phase_us=") {
             micros.parse().ok().map(Duration::from_micros)
         } else {
@@ -655,6 +706,9 @@ fn save_phases(
         if let Some(duration) = duration {
             phases.entry(stage).or_default().push(duration);
         }
+    }
+    for (shape, passes) in counts {
+        eprintln!("  {passes:>3} passes: {shape}");
     }
     phases
 }
@@ -674,21 +728,7 @@ fn new_worktree_save_timing() {
     super::projection_oracle::disable();
     let (mut app, _channels, _directory) = large_workspace(&Scale::LARGE);
     app.shared_views.skip_rediscovery_check();
-    // The daemon acknowledges each seed and lists its view.
-    for scope in app.shared_views.seeding_scopes() {
-        app.acknowledge_view_edit(scope.clone(), None);
-        if !app
-            .workspace_model
-            .views
-            .iter()
-            .any(|view| view.scope == scope)
-        {
-            let mut view = View::empty(ChannelId::new());
-            view.scope = scope;
-            view.revision = 1;
-            app.workspace_model.views.push(view);
-        }
-    }
+    settle_seeds(&mut app);
     let project = &app.sidebar_model.projects[0];
     // Past the worktrees where `large_workspace` puts a loose terminal or a
     // closed card.

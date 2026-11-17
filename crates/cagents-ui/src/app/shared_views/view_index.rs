@@ -36,6 +36,8 @@ impl ViewIndex {
         if common == self.scopes.len() && common == views.len() {
             return &self.first;
         }
+        tracing::debug!(target: "cagents::workspace_pipeline", stage = "view_index",
+            kept = common, views = views.len(), "Indexed the model's views");
         #[cfg(test)]
         {
             self.builds += 1;

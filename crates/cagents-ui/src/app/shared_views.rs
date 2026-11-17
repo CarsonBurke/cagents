@@ -1653,6 +1653,9 @@ impl Cagents {
                 );
             }
         }
+        tracing::debug!(target: "cagents::workspace_pipeline", stage = "local_settled",
+            settled = settled.len(), projected = panes.len(),
+            "Compared the projected scopes with their baselines");
         phase.mark("local_panes");
         LocalViews {
             scopes,
