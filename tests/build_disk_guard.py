@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Exercise scripts/build-disk-guard with private locks and a stand-in pruner."""
 
+import contextlib
 import ctypes
 import fcntl
 import os
 import select
 import shutil
+import signal
 from pathlib import Path
 import subprocess
 import tempfile
@@ -51,12 +53,16 @@ def children():
 
 
 class BuildDiskGuard(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # The guard leaves its pruner running in the background, where it
+        # writes into the test's directory; each test reaps what it left.
+        adopt_orphans()
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="cagents-disk-guard-")
         self.addCleanup(temporary.cleanup)
-        # Runs before the directory goes: a pruner started in the background
-        # writes into it, so none may outlive the test.
-        adopt_orphans()
+        # Runs before the directory goes.
         self.addCleanup(self.reap)
         self.root = Path(temporary.name)
         self.pruned = self.root / "pruned"
@@ -75,17 +81,26 @@ class BuildDiskGuard(unittest.TestCase):
         self.env["CAGENTS_BUILD_PRUNE_ROOTS"] = str(self.root / "roots")
 
     def reap(self):
-        """Waits for every process the guards started to end, and reaps it."""
+        """Waits for every process the guards started to end, and reaps it.
+        Those still running after the hang guard are killed, so that none
+        writes into the directory as it goes, and the test fails."""
         deadline = time.monotonic() + HANG_GUARD
+        killed = {}
         while True:
             try:
                 pid, _ = os.waitpid(-1, os.WNOHANG)
             except ChildProcessError:
-                return
+                break
             if pid:
                 continue
-            self.assertLess(time.monotonic(), deadline, f"still running: {children()}")
+            if time.monotonic() >= deadline:
+                # A killed shell's own children come to this process next.
+                for child, command in children().items():
+                    killed.setdefault(child, command)
+                    with contextlib.suppress(ProcessLookupError):
+                        os.kill(int(child), signal.SIGKILL)
             time.sleep(0.05)
+        self.assertEqual(killed, {}, "still running after the hang guard")
 
     def guard(self, floor, directory=None, guard=GUARD):
         return subprocess.run(
