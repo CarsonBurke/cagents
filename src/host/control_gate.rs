@@ -14,16 +14,17 @@
 //! - Ordinary requests yield to a queued exclusive request, so it is admitted
 //!   as soon as the requests already inside finish.
 //! - Terminal I/O, which launches nothing and holds the gate only for a
-//!   HostState update and a worker send that never waits, does not wait
-//!   behind the requests a queued exclusive request is waiting for. It waits
-//!   only while an exclusive holder is inside, and at the moment the gate
-//!   empties with one queued, so the queued request takes the first empty
-//!   gate instead of losing it to the next keystroke.
+//!   HostState update and a send to a terminal worker, does not wait behind
+//!   the requests a queued exclusive request is waiting for. It waits only
+//!   while an exclusive holder is inside, and at the moment the gate empties
+//!   with one queued, so the queued request takes the first empty gate
+//!   instead of losing it to the next keystroke. No client request reaches a
+//!   terminal worker while an exclusive request holds the gate.
 //!
 //! A connection's requests run one at a time, so a request that waits ahead of
-//! a keystroke on the same connection delays it just as surely. Requests that
-//! act only on one terminal's own screen and history, such as the snapshot a
-//! redraw asks for, take no admission at all; see `ungated_terminal_request`.
+//! a keystroke on the same connection delays it just as surely. The snapshot a
+//! redraw asks for is therefore admitted as terminal I/O only while its read is
+//! queued to the worker, and waits for the frame outside the gate.
 //!
 //! Exclusive requests choose how they wait:
 //!

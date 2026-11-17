@@ -1128,11 +1128,13 @@ fn exclusive_patience(request: &ClientRequest) -> Option<Duration> {
     }
 }
 
-/// Requests answered from HostState and a non-blocking send to the terminal
-/// worker, which refuses them at once while it archives, so each holds the
-/// gate only briefly. They launch nothing and change no ownership, so they are
-/// admitted beside a queued exclusive request instead of behind the requests
-/// it waits for. They still wait while an exclusive request holds the gate.
+/// Requests answered from HostState and a send to the terminal worker. They
+/// launch nothing and change no ownership, so they are admitted beside a
+/// queued exclusive request instead of behind the requests it waits for. They
+/// still wait while an exclusive request holds the gate, so no client request
+/// reaches a worker during an exclusive section. Most sends never wait; search, copy and
+/// clearing scrollback wait up to three seconds, and only while that
+/// terminal's worker is preparing its archive.
 fn terminal_io_request(request: &ClientRequest) -> bool {
     matches!(
         request,
@@ -1148,21 +1150,6 @@ fn terminal_io_request(request: &ClientRequest) -> bool {
             | ClientRequest::Hibernate { .. }
             | ClientRequest::AcknowledgeRedraw { .. }
             | ClientRequest::TerminalAcknowledge { .. }
-    )
-}
-
-/// Requests that act only on one terminal's screen and history through its
-/// worker, which orders them against archival under its own lock. PTY output
-/// changes that state, and redraw delivery writes the presentation records a
-/// snapshot writes, both without the gate; ordinary exit and startup recovery
-/// admit snapshots too. No exclusive section can rely on them pausing. They can wait seconds
-/// for the worker, so under the gate they would either hold back the input
-/// pipelined behind them on their connection or keep it shared long enough
-/// to starve an exclusive request. They take no admission.
-fn ungated_terminal_request(request: &ClientRequest) -> bool {
-    matches!(
-        request,
-        ClientRequest::Snapshot { .. }
             | ClientRequest::SearchTerminal { .. }
             | ClientRequest::CopyTerminalSelection { .. }
             | ClientRequest::ClearTerminalScrollback { .. }
@@ -1258,7 +1245,11 @@ fn process_wire_request(
             ),
             None,
         ),
-        None if ungated_terminal_request(&request) => (None, None),
+        // A snapshot waits for the worker's next frame, which can take
+        // seconds. It is admitted as terminal I/O only while its read is
+        // queued (`state::client_snapshot`), so it neither holds back the
+        // input behind it on its connection nor keeps the gate shared.
+        None if matches!(request, ClientRequest::Snapshot { .. }) => (None, None),
         None if terminal_io_request(&request) => (None, Some(gate.terminal_io())),
         None => (None, Some(gate.shared())),
     };
