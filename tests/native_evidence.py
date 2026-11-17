@@ -25,6 +25,16 @@ AUTHORITY_NAMES = ("CAGENTS_AGENT_AUTHORITY", "CAGENTS_AGENT_TOKEN", "CAGENTS_SE
 HANG_GUARD = 60
 # What the script's 30-second clear and harness-stop timeouts take, with their 5-second kill.
 WEDGED_STOP_SECONDS = 35
+# The script's default --startup-timeout, how long it waits for the harness to show a window.
+HARNESS_STARTUP_TIMEOUT = 180
+# How long a harness told to wait never shows one: past the startup timeout, so only the
+# script giving up on its own can end the wait sooner.
+STUB_HARNESS_WAIT_SECONDS = HARNESS_STARTUP_TIMEOUT + 20
+# A refusal is proven prompt by its run and the lock's release each returning within
+# HANG_GUARD, which together must fall short of the harness's own startup timeout.
+assert 2 * HANG_GUARD < HARNESS_STARTUP_TIMEOUT < STUB_HARNESS_WAIT_SECONDS
+# Past every wait a test makes, so a UI stub no cleanup ends still cannot outlive a run by much.
+STUB_UI_SECONDS = 10 * HANG_GUARD
 
 STUBS = {
     "dbus-run-session": """
@@ -95,7 +105,7 @@ STUBS = {
             [ -z "${portal:-}" ] || export DBUS_SESSION_BUS_ADDRESS=stub-portal-bus XDG_CONFIG_HOME=$root/xdg-config
             NIRI_SOCKET=stub-niri sh -c "$cmd" >>"$STUB_LOG/app-output" 2>&1 &
             # The real harness waits for a window that a failed runner never shows.
-            [ ! -e "$STUB_LOG/harness-waits" ] || exec sleep 200
+            [ ! -e "$STUB_LOG/harness-waits" ] || exec sleep STUB_HARNESS_WAIT_SECONDS
             # Nor does it report ready until the app is up, unless told not to wait.
             if [[ " $* " != *" --no-window-wait "* ]]; then
                 for _ in {1..600}; do
@@ -191,7 +201,7 @@ STUBS = {
             printf '%s\\n' "${CAGENTS_UI_TRACE:-unset}" > "$STUB_LOG/ui-trace"
             env > "$STUB_LOG/ui-env"
             printf '%s\\n' "${RUST_LOG:-unset}" > "$STUB_LOG/ui-rust-log"
-            exec sleep infinity
+            exec sleep STUB_UI_SECONDS
         fi
         printf '%s\\n' "$*" >> "$STUB_LOG/cli"
         if [ "$*" = 'daemon start' ]; then
@@ -202,6 +212,8 @@ STUBS = {
         if [ "${1:-}" = print-env ]; then env; fi
     """,
 }
+STUBS["niri-harness"] = STUBS["niri-harness"].replace("STUB_HARNESS_WAIT_SECONDS", str(STUB_HARNESS_WAIT_SECONDS))
+STUBS["fixture-cli"] = STUBS["fixture-cli"].replace("STUB_UI_SECONDS", str(STUB_UI_SECONDS))
 
 
 def write_executable(path: Path, body: str, logs: Path | None = None) -> None:
@@ -661,8 +673,8 @@ class Evidence(unittest.TestCase):
         self.assertFalse((self.logs / "kwin").exists())
 
     def assert_fails_promptly(self, message: str) -> None:
-        # Its run and the lock's release each return within HANG_GUARD, so
-        # together well under the 180 seconds the harness would wait for a window.
+        # Its run and the lock's release each return within HANG_GUARD, so together
+        # under the HARNESS_STARTUP_TIMEOUT the script would wait for a window.
         result = self.run_tool("start", "after", check=False)
         self.assertEqual(result.returncode, 1)
         self.assertIn(message, result.stderr)
@@ -713,14 +725,13 @@ class Evidence(unittest.TestCase):
         # Only its executables come back here, so a full disk here is no
         # reason to refuse it; the build host's own runs guard its disk.
         checkout = self.checkout()
-        started = time.monotonic()
+        # run_tool's HANG_GUARD bounds the wait for the unreachable host.
         result = self.run_tool("build", "after", str(checkout), check=False, extra={
             "CAGENTS_BUILD_REMOTE": "build-host.invalid",
             "CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS": "1",
             "CAGENTS_BUILD_FREE_FLOOR_GIB": "999999999", "CAGENTS_BUILD_PRUNE": "true"})
         self.assertNotIn("refusing to build", result.stderr)
         self.assertNotEqual(result.returncode, 0)
-        self.assertLess(time.monotonic() - started, 60)
 
     def test_its_builds_and_sessions_keep_their_target_from_the_pruner(self) -> None:
         self.built()
@@ -1401,7 +1412,8 @@ class Evidence(unittest.TestCase):
 
     def test_terminating_the_supervisor_ends_the_whole_session(self) -> None:
         self.killed_supervisor_processes(15)
-        self.assertEqual(self.fixture_process_count(), 0)
+        # Settling sends its KILL without waiting for the processes to go.
+        self.wait_for(lambda: self.fixture_process_count() == 0, 'self.fixture_process_count() == 0')
         self.assertIn("none", self.run_tool("status").stdout)
 
     def test_a_killed_supervisor_takes_the_session_with_it_without_stop(self) -> None:
