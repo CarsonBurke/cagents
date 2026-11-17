@@ -57,6 +57,34 @@ fn a_waiting_exclusive_request_holds_back_ordinary_requests_but_not_terminal_io(
 }
 
 #[test]
+fn terminal_io_nested_under_an_ordinary_admission_does_not_wait_for_a_queued_writer() {
+    // A request that answers with a snapshot takes terminal I/O while it
+    // already holds ordinary admission. Its own hold keeps the gate from
+    // emptying, so the queued writer cannot claim it in between.
+    let gate = Arc::new(ControlGate::default());
+    let (entered, outer_held) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let (sender, nested) = mpsc::channel();
+    let request = Arc::clone(&gate);
+    thread::spawn(move || {
+        let _ordinary = request.shared();
+        let _ = entered.send(());
+        released.recv().unwrap();
+        let _io = request.terminal_io();
+        let _ = sender.send(());
+    });
+    outer_held.recv_timeout(Duration::from_secs(5)).unwrap();
+    let exclusive = waiting_exclusive(&gate, Duration::from_secs(30));
+    assert!(gate.try_shared().is_none(), "ordinary requests yield");
+
+    release.send(()).unwrap();
+    nested
+        .recv_timeout(Duration::from_secs(5))
+        .expect("nested terminal I/O waited for the writer queued behind its own hold");
+    assert!(exclusive.recv_timeout(Duration::from_secs(5)).unwrap());
+}
+
+#[test]
 fn an_exclusive_holder_excludes_terminal_io_until_it_leaves() {
     // Exclusion itself is the predicate on the counts; the waiter below only
     // shows that releasing the holder wakes a typist that had to wait.

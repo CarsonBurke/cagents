@@ -43,8 +43,11 @@
 //! The gate sits first in the daemon's lock order: control gate, agent gate,
 //! registry, HostState. Its own mutex is held only to update the counts, never
 //! while acquiring anything else. A thread already holding a shared admission
-//! must not take another: an exclusive request waiting between the two would
-//! wait for the first while the second waits for it.
+//! must not take an ordinary one: a queued exclusive request arriving between
+//! the two would wait for the first while the second waits for it. It may take
+//! terminal I/O, as a request that answers with a snapshot does. Its own hold
+//! keeps the shared count above zero, so no exclusive holder can be inside and
+//! the gate cannot be empty, and terminal I/O is admitted without waiting.
 
 use std::{
     sync::{Condvar, Mutex, MutexGuard},
