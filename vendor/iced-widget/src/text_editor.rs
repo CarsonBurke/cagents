@@ -63,6 +63,48 @@ pub use text::editor::{
     Action, Cursor, Edit, Line, LineEnding, Motion, Position, Selection,
 };
 
+/// cagents: where a [`TextEditor`] with this `padding` and `overscan` draws
+/// text: `text_bounds` extended by the overscan, which is limited to the
+/// padding. An extended edge is moved inward onto a whole device pixel at
+/// `scale_factor`, so the band never shares a device row with what lies just
+/// outside it, such as an antialiased border. The renderer rounds clip
+/// rectangles to device pixels, so a fractional edge could otherwise take in
+/// part of that row and paint over it. An edge with no overscan is the text
+/// area's own, as upstream.
+pub fn overscan_bounds(
+    text_bounds: Rectangle,
+    padding: Padding,
+    overscan: (f32, f32),
+    scale_factor: f32,
+) -> Rectangle {
+    let scale = if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    };
+    let above = overscan.0.clamp(0.0, padding.top);
+    let below = overscan.1.clamp(0.0, padding.bottom);
+    let text_top = text_bounds.y;
+    let text_bottom = text_bounds.y + text_bounds.height;
+
+    let top = if above > 0.0 {
+        (((text_top - above) * scale).ceil() / scale).min(text_top)
+    } else {
+        text_top
+    };
+    let bottom = if below > 0.0 {
+        (((text_bottom + below) * scale).floor() / scale).max(text_bottom)
+    } else {
+        text_bottom
+    };
+
+    Rectangle {
+        y: top,
+        height: bottom - top,
+        ..text_bounds
+    }
+}
+
 /// The identifier of a [`TextEditor`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Id(widget::Id);
@@ -276,14 +318,8 @@ where
     }
 
     /// The text area extended by the overscan: where text is drawn.
-    fn drawn_bounds(&self, text_bounds: Rectangle) -> Rectangle {
-        let (above, below) = self.clamped_overscan();
-
-        Rectangle {
-            y: text_bounds.y - above,
-            height: text_bounds.height + above + below,
-            ..text_bounds
-        }
+    fn drawn_bounds(&self, text_bounds: Rectangle, scale_factor: f64) -> Rectangle {
+        overscan_bounds(text_bounds, self.padding, self.overscan, scale_factor as f32)
     }
 
     fn clamped_overscan(&self) -> (f32, f32) {
@@ -1056,7 +1092,7 @@ where
         tree: &widget::Tree,
         renderer: &mut Renderer,
         theme: &Theme,
-        _defaults: &renderer::Style,
+        defaults: &renderer::Style,
         layout: Layout<'_>,
         _cursor: mouse::Cursor,
         _viewport: &Rectangle,
@@ -1128,7 +1164,7 @@ where
                 &internal.editor,
                 text_bounds.position(),
                 style.value,
-                self.drawn_bounds(text_bounds),
+                self.drawn_bounds(text_bounds, defaults.scale_factor),
             );
         }
 
@@ -1151,7 +1187,8 @@ where
                         );
 
                     if let Some(clipped_cursor) =
-                        self.drawn_bounds(text_bounds).intersection(&cursor)
+                        self.drawn_bounds(text_bounds, defaults.scale_factor)
+                            .intersection(&cursor)
                     {
                         renderer.fill_quad(
                             renderer::Quad {
@@ -1163,7 +1200,8 @@ where
                     }
                 }
                 Selection::Range(ranges) => {
-                    let drawn_bounds = self.drawn_bounds(text_bounds);
+                    let drawn_bounds =
+                        self.drawn_bounds(text_bounds, defaults.scale_factor);
 
                     for range in ranges.into_iter().filter_map(|range| {
                         drawn_bounds.intersection(&(range + translation))

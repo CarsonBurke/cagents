@@ -4226,10 +4226,6 @@ mod tests {
         assert!(lines.last().unwrap().layout_opt().is_none());
     }
 
-    /// iced's own text editor, which the chat composer uses, lays its native
-    /// editor out the same way: construction, then `update` at its bounds.
-    /// A restored or recalled long draft must not shape lines it never shows
-    /// under the shared font lock (#2973).
     /// An overscan lets the native editor draw, and be clicked, past its
     /// viewport (#2824): the composer's draft runs on into its inset there.
     /// Scrolling and the visible runs still keep to the viewport.
@@ -4288,12 +4284,24 @@ mod tests {
         };
         assert!(regions.iter().any(|region| region.y < 0.0));
         assert!(regions.iter().any(|region| region.y >= 100.0));
-        // A click on the line drawn in the top margin lands on it.
+        // A click on a line drawn in a band lands on it: the one above the
+        // viewport, then the one below it.
         editor.perform(Action::Click(Point::new(5.0, -4.0)));
         assert_eq!(editor.cursor().position.line, 9);
+        let mut editor = NativeEditor::with_text(&text);
+        editor.set_overscan(8.0, 8.0);
+        lay_out(&mut editor);
+        editor.perform(Action::Scroll { lines: 10 });
+        lay_out(&mut editor);
+        editor.perform(Action::Click(Point::new(5.0, 104.0)));
+        assert_eq!(editor.cursor().position.line, 15);
+        // Below the band there is nothing drawn, and the click keeps to the
+        // last line drawn, as a click below the text always has.
+        editor.perform(Action::Click(Point::new(5.0, 140.0)));
+        assert_eq!(editor.cursor().position.line, 15);
 
-        // Jumping to the end lays out the line above the viewport as well,
-        // although it was never in view.
+        // At the end of the text, the line above the viewport is drawn and
+        // nothing is below it.
         let mut editor = NativeEditor::with_text(&text);
         editor.set_overscan(8.0, 8.0);
         lay_out(&mut editor);
@@ -4312,6 +4320,75 @@ mod tests {
         );
     }
 
+    /// An overscan only adds what is drawn: where the editor scrolls, where
+    /// its cursor goes, which runs are in view and how tall it measures are
+    /// the same with or without one (#2824). Long lines wrap, so a line can
+    /// straddle the viewport's edge.
+    #[test]
+    fn native_overscan_leaves_scrolling_and_measurement_alone() {
+        use cosmic::iced::advanced::text::Editor as _;
+        fn lay_out(editor: &mut NativeEditor) {
+            editor.update(
+                Size::new(240.0, 100.0),
+                cosmic::iced::Font::DEFAULT,
+                Pixels(14.0),
+                LineHeight::Relative(1.4),
+                Wrapping::Word,
+                &mut highlighter::PlainText::new(&()),
+            );
+        }
+        fn observe(editor: &NativeEditor) -> impl PartialEq + std::fmt::Debug {
+            let buffer = editor.buffer();
+            (
+                buffer.scroll(),
+                editor.cursor().position,
+                buffer
+                    .layout_runs()
+                    .map(|run| (run.line_i, run.line_top))
+                    .collect::<Vec<_>>(),
+                editor.min_bounds(),
+            )
+        }
+        let text = (0..60)
+            .map(|line| {
+                if line % 7 == 3 {
+                    format!("line {line} runs on long enough to wrap onto a second row and a third")
+                } else {
+                    format!("line {line}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut plain = NativeEditor::with_text(&text);
+        let mut overscanned = NativeEditor::with_text(&text);
+        overscanned.set_overscan(8.2, 8.2);
+        lay_out(&mut plain);
+        lay_out(&mut overscanned);
+        assert_eq!(observe(&plain), observe(&overscanned));
+        for action in [
+            Action::Scroll { lines: 9 },
+            Action::Move(Motion::PageDown),
+            Action::Move(Motion::Down),
+            Action::Move(Motion::PageDown),
+            Action::Click(Point::new(5.0, 50.0)),
+            Action::Move(Motion::PageUp),
+            Action::Scroll { lines: -3 },
+            Action::Move(Motion::DocumentEnd),
+            Action::Move(Motion::PageUp),
+            Action::Move(Motion::DocumentStart),
+        ] {
+            plain.perform(action.clone());
+            overscanned.perform(action.clone());
+            lay_out(&mut plain);
+            lay_out(&mut overscanned);
+            assert_eq!(observe(&plain), observe(&overscanned), "after {action:?}");
+        }
+    }
+
+    /// iced's own text editor, which the chat composer uses, lays its native
+    /// editor out the same way: construction, then `update` at its bounds.
+    /// A restored or recalled long draft must not shape lines it never shows
+    /// under the shared font lock (#2973).
     #[test]
     fn native_constructor_defers_shaping_to_the_viewport() {
         fn shaped(editor: &NativeEditor) -> usize {

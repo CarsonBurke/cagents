@@ -21,4 +21,4 @@ Cargo cannot run it with `-p iced_wgpu` from the parent workspace because this v
 
 # Editor overscan (#2824)
 
-The editor's text area iterates `Buffer::draw_runs` instead of `layout_runs`, so the lines in the overscan bands reach the glyph renderer. The clip still comes from the widget. iced_tiny_skia is not vendored, so the software fallback draws only the viewport.
+The editor's text area iterates `Buffer::draw_runs` instead of `layout_runs`, so the lines in the overscan bands reach the glyph renderer. The clip still comes from the widget. iced_tiny_skia is not vendored, and the pinned copy draws `layout_runs`, so the software fallback draws no text in the bands. The selection regions, caret and the app's fade come from iced-graphics and the widget, so they still extend into the bands there, and a click in a band lands on a line that renderer did not draw.

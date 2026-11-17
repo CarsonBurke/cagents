@@ -139,6 +139,35 @@ impl<'a, Message: Clone + 'static> TextEditor<'a, Message> {
         self
     }
 }
+/// Where an editor with `padding` and `overscan` draws its text, and how deep
+/// the fade at each end of that area is when the drawn text reaches
+/// `overflow` past the text area. The area spans the editor's whole width,
+/// and its bands are the native editor's own (`overscan_bounds`), so the
+/// fade covers exactly what the editor drew there. Each fade is as deep as
+/// the text reaches, but no deeper than its band.
+fn padding_fade_geometry(
+    bounds: Rectangle,
+    padding: Padding,
+    overscan: (f32, f32),
+    overflow: (f32, f32),
+    scale_factor: f32,
+) -> (Rectangle, (f32, f32)) {
+    let text = bounds.shrink(padding);
+    let drawn = text_editor::overscan_bounds(text, padding, overscan, scale_factor);
+    let band = (
+        text.y - drawn.y,
+        (drawn.y + drawn.height) - (text.y + text.height),
+    );
+    (
+        Rectangle {
+            y: drawn.y,
+            height: drawn.height,
+            ..bounds
+        },
+        (overflow.0.clamp(0.0, band.0), overflow.1.clamp(0.0, band.1)),
+    )
+}
+
 fn byte_to_character(text: &str, byte: usize) -> usize {
     let mut offset = 0;
     character_lengths(text)
@@ -228,27 +257,20 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for TextEditor<'
             viewport,
         );
         if let Some(fade) = &self.padding_fade {
-            let (above, below) = self.content.overflow();
-            if above > 0.0 || below > 0.0 {
+            let overflow = self.content.overflow();
+            if overflow.0 > 0.0 || overflow.1 > 0.0 {
                 let bounds = layout.bounds();
-                let text = bounds.shrink(self.padding);
-                let reach = (
-                    fade.above.clamp(0.0, self.padding.top),
-                    fade.below.clamp(0.0, self.padding.bottom),
+                let (drawn, depth) = padding_fade_geometry(
+                    bounds,
+                    self.padding,
+                    (fade.above, fade.below),
+                    overflow,
+                    style.scale_factor as f32,
                 );
-                let drawn = Rectangle {
-                    y: text.y - reach.0,
-                    height: text.height + reach.0 + reach.1,
-                    ..bounds
-                };
                 let color = (fade.fill)(theme);
                 cosmic::iced::advanced::Renderer::with_layer(renderer, drawn, |renderer| {
                     crate::interaction::fade_vertical_edges(
-                        renderer,
-                        drawn,
-                        above.min(reach.0),
-                        below.min(reach.1),
-                        color,
+                        renderer, drawn, depth.0, depth.1, color,
                     );
                 });
             }
@@ -452,6 +474,77 @@ mod tests {
     enum Message {
         Edit(text_editor::Action),
         Cursor(text_editor::Cursor),
+    }
+    /// The composer's text, fade and selection bands stop on a whole device
+    /// pixel inside its 1 px border, whatever fractional position and scale
+    /// it lands on, so the renderer's rounded clip never takes in a row the
+    /// antialiased border paints (#2824). Each fade is as deep as the text
+    /// reaches, within its band, and an overscan is limited to the padding.
+    #[test]
+    fn padding_fade_stops_on_a_device_pixel_inside_the_border() {
+        // The composer's geometry: a 19.6 px line, a 9.2 px inset and a 1 px
+        // border, with the overscan reaching to the border.
+        let border = 1.0;
+        let inset = 9.2;
+        let reach = inset - border;
+        let padding = Padding::from([inset, 8.0]);
+        let device = |logical: f32, scale: f32| logical * scale;
+        for scale in [0.8, 1.0, 1.25, 1.5, 1.75, 2.0, 3.0] {
+            for top in [0.0, 573.73, 580.4, 580.5, 611.15, 777.95] {
+                let bounds = Rectangle {
+                    x: 326.3,
+                    y: top,
+                    width: 720.0,
+                    height: 12.0 * 19.6 + 2.0 * inset,
+                };
+                let text = bounds.shrink(padding);
+                let (drawn, depth) =
+                    padding_fade_geometry(bounds, padding, (reach, reach), (reach, reach), scale);
+                let context = format!("scale {scale}, top {top}: {drawn:?}");
+                let drawn_top = device(drawn.y, scale);
+                let drawn_bottom = device(drawn.y + drawn.height, scale);
+                assert!((drawn_top - drawn_top.round()).abs() < 1e-3, "{context}");
+                assert!(
+                    (drawn_bottom - drawn_bottom.round()).abs() < 1e-3,
+                    "{context}"
+                );
+                // Clear of every device row the border touches.
+                let border_top = device(bounds.y + border, scale).ceil();
+                let border_bottom = device(bounds.y + bounds.height - border, scale).floor();
+                assert!(drawn_top.round() >= border_top, "{context}");
+                assert!(drawn_bottom.round() <= border_bottom, "{context}");
+                // And within a device pixel of it, so the band is not lost.
+                assert!(drawn_top.round() - border_top <= 1.0, "{context}");
+                assert!(border_bottom - drawn_bottom.round() <= 1.0, "{context}");
+                assert!(drawn.y <= text.y && drawn.y + drawn.height >= text.y + text.height);
+                assert_eq!((drawn.x, drawn.width), (bounds.x, bounds.width));
+                // The fades fill their bands exactly when the text reaches
+                // across them.
+                assert!((depth.0 - (text.y - drawn.y)).abs() < 1e-4, "{context}");
+                assert!(
+                    (depth.1 - (drawn.y + drawn.height - text.y - text.height)).abs() < 1e-4,
+                    "{context}"
+                );
+                // Text reaching only part of the way fades only that far,
+                // and none at an end with nothing past it.
+                let (_, depth) =
+                    padding_fade_geometry(bounds, padding, (reach, reach), (3.0, 0.0), scale);
+                assert_eq!(depth, (3.0, 0.0), "{context}");
+                // An overscan is limited to the padding.
+                let (drawn, _) =
+                    padding_fade_geometry(bounds, padding, (50.0, 50.0), (50.0, 50.0), scale);
+                assert!(drawn.y >= bounds.y - 1e-4, "{context}");
+                assert!(
+                    drawn.y + drawn.height <= bounds.y + bounds.height + 1e-4,
+                    "{context}"
+                );
+                // Without an overscan the text area is drawn as upstream.
+                let (drawn, depth) =
+                    padding_fade_geometry(bounds, padding, (0.0, 0.0), (0.0, 0.0), scale);
+                assert_eq!((drawn.y, drawn.height), (text.y, text.height), "{context}");
+                assert_eq!(depth, (0.0, 0.0));
+            }
+        }
     }
     #[test]
     fn multiline_selection_maps_unicode_bytes_and_replacement_uses_existing_edit_action() {

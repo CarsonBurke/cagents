@@ -230,8 +230,13 @@ impl<'b> LayoutRunIter<'b> {
         let (above, below) = buffer.overscan;
         let mut start = buffer.scroll.line;
         let mut scroll = buffer.scroll.vertical;
+        // `scroll.line` can be past the end of the lines for a moment after
+        // an edit removed them, so the lines are looked up rather than
+        // indexed, as `from_lines` does.
         while scroll < above && start > 0 {
-            let line = &buffer.lines[start - 1];
+            let Some(line) = buffer.lines.get(start - 1) else {
+                break;
+            };
             let (Some(_), Some(layout)) = (line.shape_opt(), line.layout_opt()) else {
                 break;
             };

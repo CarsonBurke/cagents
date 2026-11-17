@@ -135,7 +135,7 @@ change are the same as upstream's. The application test
 repository_widget::text_editor::tests::native_multiline_insert_and_delete_keep_lines_order_and_history
 checks them, including undoing both changes.
 
-## Overscan for edge fades (cagents #2824)
+Overscan for edge fades (cagents #2824)
 
 `Buffer::set_overscan(above, below)` adds bands above and below the viewport. The lines in those bands are shaped and laid out, and `Buffer::draw_runs` yields them along with the visible runs, with negative `line_top` above the viewport and values past the height below it. `hit` uses `draw_runs`, so a click in a band lands on the line drawn there. `layout_runs`, scrolling, cursor reveal, PageUp/Down and the measured content height still use only the viewport, so the overscan never changes where the editor scrolls or how large it measures. The default overscan is zero, which keeps upstream behavior.
 

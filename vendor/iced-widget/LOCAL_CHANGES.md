@@ -54,6 +54,8 @@ crates/cagents-ui/src/app/chat_ui/selectable_prose.rs and flow_layout.rs.
 
 ## Text editor overscan (cagents #2824)
 
-`TextEditor::overscan(above, below)` lets text draw into the editor's top and bottom padding, up to the padding itself. The widget sets the overscan on its editor during layout, and clips the text, caret and selection to the text area plus that band. The placeholder still uses the text area. `Content::overflow` reports how far drawn text reaches into each band, so the app can fade it out (`ui_controls::editable::editor`, `fade_into_padding`).
+`TextEditor::overscan(above, below)` lets text draw into the editor's top and bottom padding, up to the padding itself. The widget sets the overscan on its editor during layout, and clips the text, caret and selection to the text area plus that band. `overscan_bounds` computes that area: each extended edge moves inward onto a whole device pixel at the renderer style's scale factor. The renderer rounds clip rectangles to device pixels, so a fractional edge next to an antialiased border would otherwise take in a row of that border and paint over it. The placeholder still uses the text area. `Content::overflow` reports how far drawn text reaches into each band, so the app can fade it out (`ui_controls::editable::editor`, `fade_into_padding`).
 
 Why: a scrolled composer draft was sliced at the padding's inner edge (#2824). Remove this when upstream editors can draw into their padding.
+
+Dragging a selection into a band selects the line drawn there, and cursor reveal then scrolls it into view. The drag therefore scrolls one line for each pointer move inside the band, and stops while the pointer is still. iced still reports drags only within the widget's bounds.
