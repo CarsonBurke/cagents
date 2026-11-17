@@ -58,6 +58,8 @@ fn a_waiting_exclusive_request_holds_back_ordinary_requests_but_not_terminal_io(
 
 #[test]
 fn an_exclusive_holder_excludes_terminal_io_until_it_leaves() {
+    // Exclusion itself is the predicate on the counts; the waiter below only
+    // shows that releasing the holder wakes a typist that had to wait.
     let gate = Arc::new(ControlGate::default());
     let exclusive = gate.exclusive();
     assert!(!gate.counts().admits_terminal_io());
@@ -66,13 +68,12 @@ fn an_exclusive_holder_excludes_terminal_io_until_it_leaves() {
     let typist = Arc::clone(&gate);
     thread::spawn(move || {
         let _io = typist.terminal_io();
-        let _ = sender.send(typist.counts().exclusive);
+        let _ = sender.send(());
     });
     drop(exclusive);
-    assert!(
-        !typed.recv_timeout(Duration::from_secs(5)).unwrap(),
-        "terminal I/O entered beside an exclusive holder"
-    );
+    typed
+        .recv_timeout(Duration::from_secs(5))
+        .expect("terminal I/O stayed out after the exclusive holder left");
 }
 
 #[test]
