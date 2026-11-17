@@ -3365,25 +3365,29 @@ impl Runtime {
         } else {
             iced::widget::Space::new().height(0).into()
         };
-        let editor: Element<'_, Message> = if transitioning {
-            // The reservation belongs inside the scroll viewport. An inset on
-            // the outer container moves the viewport itself, and the thumb
-            // floats at that viewport's right edge either way, so the draft
-            // text would still run underneath it.
-            widget::container(
-                widget::scrollable(widget::container(body(self.composer.text())).padding(
-                    crate::design::with_vertical_rail(iced::Padding::from([
-                        COMPOSER_INSET_Y,
-                        space::XS,
-                    ])),
-                ))
-                .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
-                    crate::design::scrollbar(),
-                )),
-            )
+        // The editor grows with the draft up to the ceiling, then scrolls,
+        // and its thumb floats over the text's right edge, so the gutter is
+        // reserved inside it.
+        let editor = crate::ui_controls::field::editor("Message", &self.composer)
+            .id(card_control_id(target.card, "chat-composer"))
+            // Nothing can be typed while the conversation changes hands.
+            .placeholder(if transitioning { "" } else { placeholder })
+            .size(design::TEXT_PROSE)
+            .height(Length::Shrink)
             .max_height(composer_ceiling)
-            .width(Length::Fill)
-            .into()
+            .padding(design::with_vertical_rail(iced::Padding::from([
+                COMPOSER_INSET_Y,
+                space::XS,
+            ])))
+            .class(cosmic::theme::iced::TextEditor::Custom(Box::new(
+                composer_editor_style,
+            )));
+        let editor: Element<'_, Message> = if transitioning {
+            // While the conversation changes hands the draft stays in place,
+            // read-only: an editor without actions takes no input. It is the
+            // same editor rather than a text copy of the draft, which would
+            // shape all of a long draft at once on the UI thread (#2973).
+            editor.into()
         } else {
             // Up first asks the native editor to resolve its rendered rows.
             // While browsing, both arrows walk whole history entries so a
@@ -3395,22 +3399,7 @@ impl Runtime {
             // the queue, and is not left to fall through to that walk.
             let take_back =
                 !recall_newer && (self.newest_take_back().is_some() || !self.recalling.is_empty());
-            crate::ui_controls::field::editor("Message", &self.composer)
-                .id(card_control_id(target.card, "chat-composer"))
-                .placeholder(placeholder)
-                .size(design::TEXT_PROSE)
-                .height(Length::Shrink)
-                .max_height(composer_ceiling)
-                // The editor scrolls once the draft passes the ceiling, and
-                // its thumb floats over the text's right edge, so the gutter
-                // is reserved here as well as in the read-only branch.
-                .padding(design::with_vertical_rail(iced::Padding::from([
-                    COMPOSER_INSET_Y,
-                    space::XS,
-                ])))
-                .class(cosmic::theme::iced::TextEditor::Custom(Box::new(
-                    composer_editor_style,
-                )))
+            editor
                 .on_action(move |event| action(Action::Composer(target, event)))
                 .on_cursor(move |cursor| action(Action::ComposerCursor(target, cursor)))
                 .key_binding(move |press| {

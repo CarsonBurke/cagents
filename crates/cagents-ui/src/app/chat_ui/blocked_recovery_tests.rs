@@ -1227,3 +1227,48 @@ fn a_pending_paste_disables_fresh_in_place() {
         "nothing closes mid-paste"
     );
 }
+
+/// While a chat closes, its unsent draft stays in the composer, read-only.
+/// It is the composer's own editor, which shapes only the rows it shows, not
+/// a text copy of the draft that shaped all of it at once (#2973).
+#[test]
+fn a_closing_chat_keeps_its_draft_in_the_read_only_composer() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    app.workspace.resize_viewport(1200.0);
+    let card = live_chat(&mut app, Some(KNOWN_THREAD));
+    let target = chat_runtime(&app, card).target;
+    let draft = "A line of a long unsent draft.\n".repeat(2_000);
+    app.chat_runtime_mut(target)
+        .unwrap()
+        .replace_draft(text_editor::Content::with_text(&draft));
+    let composer = |tree: &A11yTree| {
+        tree.root()
+            .iter()
+            .chain(tree.children())
+            .filter(|node| {
+                node.node().role() == Role::MultilineTextInput
+                    && node.node().label() == Some("Message")
+            })
+            .map(|node| (node.node().is_read_only(), node.node().is_disabled()))
+            .collect::<Vec<_>>()
+    };
+    let (tree, _) = frame(app.card_view(card, true, false), 1200.0, None);
+    assert_eq!(composer(&tree), [(false, false)], "an editable draft");
+
+    app.chat_ui.phases.insert(
+        card,
+        Phase::Closing {
+            target,
+            restart: None,
+        },
+    );
+    let (tree, _) = frame(app.card_view(card, true, false), 1200.0, None);
+    assert_eq!(composer(&tree), [(true, true)], "the same draft, read-only");
+    assert!(
+        !labels(&tree)
+            .iter()
+            .any(|label| label.contains("A line of a long unsent draft.")),
+        "no text copy of the draft"
+    );
+    assert_eq!(chat_runtime(&app, card).composer.text(), draft);
+}
