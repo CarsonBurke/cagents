@@ -2547,7 +2547,7 @@ class RemoteEvidence(unittest.TestCase):
             signal.pause()
         """))
         # Each connection the wrapper makes, held open where it is made, the
-        # host's side of it left to the real sshd and its lifetime watcher.
+        # host's side of it left to the stand-in sshd and its lifetime watcher.
         intercept = """
         if { [ "${STUB_SSH_STAGE:-}" = transport ] && [[ $* = *git-receive-pack* ]]; } ||
             { [ "${STUB_SSH_STAGE:-}" = rsync ] && [[ $* = "rsync --server "* ]]; }; then
