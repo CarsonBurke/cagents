@@ -166,7 +166,16 @@ fn an_exclusive_request_refuses_retryably_at_its_deadline() {
     );
     assert_eq!(refusal.code, ProtocolErrorCode::Internal);
     assert!(refusal.retryable);
-    assert_eq!(refusal.message, super::control_gate::busy().message);
+    // Clients match this exact sentence; the update retries only on it.
+    assert_eq!(refusal.message, crate::terminal_ipc::DAEMON_BUSY);
+    assert!(
+        crate::control::ControlError::Remote {
+            code: refusal.code,
+            message: refusal.message.clone(),
+            retryable: refusal.retryable,
+        }
+        .is_daemon_busy()
+    );
 
     // Once it has given up, ordinary requests no longer wait for it.
     assert!(gate.try_shared().is_some());
