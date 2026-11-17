@@ -2,8 +2,9 @@
 //! loaded window starts after that prompt, as a long conversation's does.
 //!
 //! A snapshot only names a channel from history it shows from the start (see
-//! `snapshot_channel_name`). A channel whose automatic name was lost keeps
-//! "New channel" until its provider reports a title. Opening its chat reads
+//! `snapshot_channel_name`). A channel whose automatic name was lost, or one a
+//! long conversation was resumed into, keeps "New channel" until its provider
+//! reports a title. Opening its chat reads
 //! the head of the conversation's transcript once, off the window's thread,
 //! and offers the first prompt's name through the observation that snapshot
 //! names use, so it is published with the same shared-view proof and never
@@ -75,6 +76,7 @@ impl Cagents {
         {
             return Task::none();
         }
+        tracing::debug!(card = %target.card, provider = ?launch.provider, "reading a conversation's opening to name its channel");
         cosmic::task::future(async move {
             let title = match READS.acquire().await {
                 Ok(_permit) => tokio::task::spawn_blocking(move || read(&launch))
@@ -96,6 +98,7 @@ impl Cagents {
         conversation: String,
         title: Option<String>,
     ) {
+        tracing::debug!(card = %target.card, named = title.is_some(), "read a conversation's opening");
         let Some(title) = title else {
             return;
         };
@@ -296,8 +299,10 @@ mod tests {
         Arc::make_mut(&mut app.durable).channels = vec![ProjectChannel {
             id,
             project_id: ProjectId::new(),
+            // A new channel, and one whose automatic name was cleared, are
+            // both empty; a new one's source is manual.
             title: String::new(),
-            title_source: ChannelTitleSource::Prompt,
+            title_source: ChannelTitleSource::Manual,
             ordinal: 0,
             shared: true,
             cards: vec![card],

@@ -2342,13 +2342,12 @@ impl Cagents {
     }
 
     /// Whether `card` is the primary chat of a channel with no name, which
-    /// its conversation may fill: the automatic name is empty and the reader
-    /// has not named the channel.
+    /// its conversation may fill. An empty title is unnamed whatever its
+    /// source: a new channel starts empty and manual, and the reader names a
+    /// channel only with a title (see `channel_is_named`).
     pub(super) fn channel_lacks_name(&self, card: CardId) -> bool {
         self.durable.channels.iter().any(|channel| {
-            channel.title.is_empty()
-                && channel.title_source != crate::model::ChannelTitleSource::Manual
-                && self.channel_primary_chat(channel) == Some(card)
+            channel.title.is_empty() && self.channel_primary_chat(channel) == Some(card)
         })
     }
 
