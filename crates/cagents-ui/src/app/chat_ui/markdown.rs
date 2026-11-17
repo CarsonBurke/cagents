@@ -1525,7 +1525,8 @@ fn labelled(
                     shown.push(&text[from..range.start], run);
                 }
                 let copy = Uri::from(&text[range.clone()]);
-                shown.label(&labels.label(&key), address, run.attributes, copy);
+                let label = labels.reference_label(&key, &text[range.end..]);
+                shown.label(&label, address, run.attributes, copy);
                 from = range.end;
             }
             if from < run.end || from == start {

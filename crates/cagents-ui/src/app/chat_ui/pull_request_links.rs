@@ -117,6 +117,8 @@ pub(super) struct Labels {
 struct Known<'a> {
     title: &'a str,
     glyph: Glyph,
+    /// Where a reference by number opens.
+    address: &'a str,
 }
 
 /// What is known of pull requests, by repository and number.
@@ -411,11 +413,13 @@ impl Labels {
             return Some(Known {
                 title: &fact.title,
                 glyph: fact.glyph,
+                address: &fact.address,
             });
         }
         self.conversation.get(id).map(|fact| Known {
             title: &fact.title,
             glyph: fact.glyph.filter(|_| self.watched),
+            address: &fact.address,
         })
     }
 
@@ -425,6 +429,13 @@ impl Labels {
         match named {
             Named::Link(key) => self.id_reads_alike(other, &Id::of(key)),
             Named::Reference(reference) => {
+                // Labels of one chat almost always share its repository, so
+                // the reference means the same pull request under both.
+                if self.repository == other.repository {
+                    return self
+                        .id(reference)
+                        .is_none_or(|id| self.id_reads_alike(other, &id));
+                }
                 let (mine, theirs) = (self.id(reference), other.id(reference));
                 if mine != theirs {
                     // Another repository is meant: alike only while neither
@@ -469,6 +480,12 @@ impl Labels {
         true
     }
 
+    /// Whether no source lists any pull request, so no reference by number
+    /// can read as one.
+    pub(super) fn knows_none(&self) -> bool {
+        self.conversation.0.is_empty() && self.board.iter().all(|facts| facts.0.is_empty())
+    }
+
     /// The pull request `reference` means here: its number in the repository
     /// it names, on the chat's repository's host, or in the chat's own
     /// repository. `None` while a bare number has no repository to be in.
@@ -500,20 +517,30 @@ impl Labels {
     /// knows it; otherwise the reference stays as written.
     pub(super) fn resolve(&self, reference: &Reference) -> Option<(PullRequestKey, Arc<str>)> {
         let id = self.id(reference)?;
-        let address = self
-            .board
-            .iter()
-            .find_map(|facts| facts.get(&id))
-            .or_else(|| self.conversation.get(&id))
-            .map(|fact| fact.address.clone())?;
-        let key = pull_request(&address).filter(|key| Id::of(key) == id)?;
-        Some((key, address))
+        let address = self.fact(&id)?.address;
+        let key = pull_request(address).filter(|key| Id::of(key) == id)?;
+        Some((key, Arc::from(address)))
     }
 
     /// How a link to `key` reads: `#20 Retry stalled daemon handshakes`, or
     /// `acme/tools#20 …` from another repository, or the reference alone
     /// while its title is unknown.
     pub(super) fn label(&self, key: &PullRequestKey) -> Label {
+        self.label_titled(key, true)
+    }
+
+    /// How a reference to `key` by number reads, when `following` is what
+    /// the sentence says after it: the reference alone, without the title,
+    /// when the author already wrote the title there, as in `#20: Retry
+    /// stalled daemon handshakes`, so it does not read twice.
+    pub(super) fn reference_label(&self, key: &PullRequestKey, following: &str) -> Label {
+        let titled = self
+            .fact(&Id::of(key))
+            .is_none_or(|fact| !continues_with(following, fact.title));
+        self.label_titled(key, titled)
+    }
+
+    fn label_titled(&self, key: &PullRequestKey, titled: bool) -> Label {
         let id = Id::of(key);
         let mut text = if self.repository.as_ref() == Some(&id.repository) {
             format!("#{}", key.number)
@@ -533,6 +560,7 @@ impl Labels {
         }
         let mut rest = String::new();
         if let Some(title) = fact
+            .filter(|_| titled)
             .map(|fact| shortened(fact.title, TITLE_CHARACTERS))
             .filter(|title| !title.is_empty())
         {
@@ -550,6 +578,37 @@ impl Labels {
             summary,
         }
     }
+}
+
+/// Whether `following`, past the punctuation that sets a title apart, starts
+/// with `title`'s first words, compared without case: three of them, or all
+/// of a shorter title.
+fn continues_with(following: &str, title: &str) -> bool {
+    let words = |text: &str| {
+        text.split_whitespace()
+            .map(|word| {
+                word.trim_matches(|ch: char| !ch.is_alphanumeric())
+                    .to_lowercase()
+            })
+            .filter(|word| !word.is_empty())
+            .take(3)
+            .collect::<Vec<_>>()
+    };
+    let title = words(title);
+    if title.is_empty() {
+        return false;
+    }
+    // A title is set apart by a colon, a dash, brackets or quotes; a
+    // sentence that only continues does not repeat it.
+    let following = following.trim_start_matches(|ch: char| {
+        ch.is_whitespace()
+            || matches!(
+                ch,
+                ':' | '-' | '–' | '—' | '(' | '[' | '"' | '“' | '\'' | '‘' | '*' | '_'
+            )
+    });
+    let following = words(following);
+    following.len() >= title.len() && following[..title.len()] == title[..]
 }
 
 /// `text` with a [`WORD_JOINER`] wherever a line could otherwise break inside
@@ -600,7 +659,7 @@ pub(super) fn pull_request(destination: &str) -> Option<PullRequestKey> {
 /// a title or `#20` reaches a message whose source only holds the address or
 /// the number. `None` when nothing in `text` is relabelled.
 pub(super) fn rendition(text: &str, labels: &Labels) -> Option<String> {
-    if !text.contains("/pull/") && !text.contains('#') {
+    if !text.contains("/pull/") && (labels.knows_none() || !text.contains('#')) {
         return None;
     }
     let mut read = String::with_capacity(text.len());
@@ -612,14 +671,17 @@ pub(super) fn rendition(text: &str, labels: &Labels) -> Option<String> {
             // An `owner/repo` before the `#` may already be read as written,
             // as it is when it holds an `h`.
             let known = reference_at(text, found)
-                .filter(|(range, _)| range.start >= at || read.ends_with(&text[range.start..at]))
+                .filter(|(range, _)| {
+                    !in_link_text(text, found)
+                        && (range.start >= at || read.ends_with(&text[range.start..at]))
+                })
                 .and_then(|(range, reference)| Some((range, labels.resolve(&reference)?.0)));
             if let Some((range, key)) = known {
                 match at.checked_sub(range.start) {
                     Some(read_already) => read.truncate(read.len() - read_already),
                     None => read.push_str(&text[at..range.start]),
                 }
-                read.push_str(&labels.label(&key).text);
+                read.push_str(&labels.reference_label(&key, &text[range.end..]).text);
                 relabelled = true;
                 at = range.end;
             } else {
@@ -700,10 +762,29 @@ impl From<PullRequestKey> for Named {
 /// and a longer run of digits is something else.
 const NUMBER_DIGITS: usize = 12;
 
+/// The most of the text before a `#` that an `owner/repo` takes, with room
+/// for the character before it: an owner of up to 39 characters, a slash and
+/// a name of up to 100.
+const QUALIFIER_BYTES: usize = 39 + 1 + 100 + 4;
+
+/// Where, at most [`QUALIFIER_BYTES`] before `hash`, the `owner/repo` of a
+/// reference could start, so a long run of name characters before each `#`
+/// is never read whole.
+fn qualifier_floor(text: &str, hash: usize) -> usize {
+    let mut floor = hash.saturating_sub(QUALIFIER_BYTES);
+    while !text.is_char_boundary(floor) {
+        floor += 1;
+    }
+    floor
+}
+
 /// Whether `ch`, beside a reference, would make it part of a longer word,
-/// path, address or entity, as GitHub's autolinker reads one.
+/// path, address or entity, as GitHub's autolinker reads one. Scripts
+/// written without spaces between words, such as Chinese and Japanese, set a
+/// reference straight after a word.
 fn joins(ch: char) -> bool {
-    ch.is_alphanumeric()
+    (ch.is_alphanumeric()
+        && !matches!(ch, '\u{2e80}'..='\u{9fff}' | '\u{f900}'..='\u{faff}' | '\u{ff00}'..='\u{ffef}'))
         || matches!(
             ch,
             '_' | '#' | '/' | '&' | '@' | '\\' | '$' | '%' | '=' | '+'
@@ -750,24 +831,27 @@ fn references_within<'a>(
             let Ok(number) = text[hash + 1..end].parse() else {
                 continue;
             };
-            let begins = |start: usize| {
+            // An `owner/repo` never follows a hyphen: one before it would be
+            // its owner's, cut off where reading it began.
+            let begins = |start: usize, qualified: bool| {
                 text[..start]
                     .trim_end_matches(transparent)
                     .chars()
                     .next_back()
-                    .is_none_or(|ch| !joins(ch) && ch != '.' && ch != '-')
+                    .is_none_or(|ch| !joins(ch) && ch != '.' && !(qualified && ch == '-'))
             };
-            if let Some((start, owner, name)) = qualifier(&text[range.start..hash])
-                .map(|(at, owner, name)| (range.start + at, owner, name))
+            let floor = qualifier_floor(text, hash).max(range.start);
+            if let Some((start, owner, name)) =
+                qualifier(&text[floor..hash]).map(|(at, owner, name)| (floor + at, owner, name))
             {
-                if begins(start) {
+                if begins(start, true) {
                     let repository =
                         Some((owner.to_lowercase().into(), name.to_lowercase().into()));
                     return Some((start..end, Reference { repository, number }));
                 }
                 continue;
             }
-            if begins(hash) {
+            if begins(hash, false) {
                 return Some((
                     hash..end,
                     Reference {
@@ -811,19 +895,36 @@ pub(super) fn references(
     references_within(text, range, &[])
 }
 
+/// Whether `at` in a Markdown source is inside a link's own words, as in
+/// `[PR #20](https://example.com)`, which show as written.
+fn in_link_text(text: &str, at: usize) -> bool {
+    let line = text[..at].rfind('\n').map_or(0, |start| start + 1);
+    let end = text[at..].find('\n').map_or(text.len(), |end| at + end);
+    let opened = text[line..at]
+        .rfind('[')
+        .is_some_and(|open| !text[line + open..at].contains(']'));
+    opened
+        && text[at..end]
+            .find(']')
+            .is_some_and(|close| matches!(text.as_bytes().get(at + close + 1), Some(b'(' | b'[')))
+}
+
 /// The reference whose `#` is at `hash` in a Markdown source, where its
-/// emphasis delimiters do not join it to the words beside it.
+/// emphasis delimiters and an escape before the `#` do not join it to the
+/// words beside it.
 fn reference_at(text: &str, hash: usize) -> Option<(Range<usize>, Reference)> {
-    let token = text[..hash].rfind(char::is_whitespace).map_or(0, |at| {
-        at + text[at..].chars().next().map_or(1, char::len_utf8)
-    });
     let end = hash
         + 1
         + text[hash + 1..]
             .bytes()
             .take_while(u8::is_ascii_digit)
             .count();
-    references_within(text, token..end, &['*', '_', '~']).find(|(range, _)| range.end == end)
+    references_within(
+        text,
+        qualifier_floor(text, hash)..end,
+        &['*', '_', '~', '\\'],
+    )
+    .find(|(range, _)| range.end == end)
 }
 
 /// Every number a message's source might name a pull request by, whether
@@ -843,16 +944,25 @@ fn mentions(text: &str) -> impl Iterator<Item = Reference> + '_ {
                 continue;
             };
             from = hash + 1 + digits;
-            let qualified = qualifier(&text[..hash]).map(|(_, owner, name)| Reference {
-                repository: Some((owner.to_lowercase().into(), name.to_lowercase().into())),
-                number,
-            });
+            let qualified = |before: &str| {
+                qualifier(before).map(|(_, owner, name)| Reference {
+                    repository: Some((owner.to_lowercase().into(), name.to_lowercase().into())),
+                    number,
+                })
+            };
+            let before = &text[qualifier_floor(text, hash)..hash];
+            // Shown, `acme/my\_repo#4` reads as `acme/my_repo#4`.
+            let unescaped = before
+                .contains('\\')
+                .then(|| qualified(&before.replace('\\', "")))
+                .flatten();
             return Some(
                 std::iter::once(Reference {
                     repository: None,
                     number,
                 })
-                .chain(qualified),
+                .chain(qualified(before))
+                .chain(unescaped),
             );
         }
         None
@@ -1664,6 +1774,10 @@ mod tests {
             ("acme/tools#4, then #5", &["acme/tools#4", "#5"]),
             ("see Acme-Co/the.repo_v2#4", &["Acme-Co/the.repo_v2#4"]),
             ("—#12", &["#12"]),
+            ("#20-#21", &["#20", "#21"]),
+            ("修复#12。", &["#12"]),
+            ("（#12）", &["#12"]),
+            ("x-acme/tools#4", &["x-acme/tools#4"]),
         ] {
             assert_eq!(shown_references(text), found, "{text}");
         }
@@ -1687,9 +1801,14 @@ mod tests {
             "#",
             "# 12",
             "#1234567890123",
+            "v1.#12",
         ] {
             assert_eq!(shown_references(text), Vec::<&str>::new(), "{text}");
         }
+        // A long run of name characters is never read whole, nor taken for an
+        // owner cut short.
+        let long = format!("{}/b#1 {}-acme/b#2", "a".repeat(10_000), "o".repeat(200));
+        assert_eq!(shown_references(&long), Vec::<&str>::new());
         // The range bounds what is read; what is beside it still counts.
         let text = "abc#12 #13";
         assert_eq!(
@@ -1776,6 +1895,60 @@ mod tests {
     }
 
     #[test]
+    fn a_reference_followed_by_its_title_does_not_repeat_it() {
+        for (source, shown) in [
+            (
+                "#20: Retry stalled daemon handshakes, landed.",
+                "\u{2007}\u{2007}#20: Retry stalled daemon handshakes, landed.",
+            ),
+            (
+                "See #20 (retry stalled daemon handshakes).",
+                "See \u{2007}\u{2007}#20 (retry stalled daemon handshakes).",
+            ),
+            (
+                "#21 — Trim sidebar row padding",
+                "\u{2007}\u{2007}#21 — Trim sidebar row padding",
+            ),
+        ] {
+            let text = paragraph(source);
+            assert_eq!(&*text.plain(), shown, "{source}");
+            let inlines = text.inlines().unwrap();
+            // The tip still names it in full.
+            assert!(
+                inlines
+                    .tip(inlines.glyphs[0].0)
+                    .unwrap()
+                    .contains(" · https://")
+            );
+            assert_eq!(copied(&text, 0..text.plain().len()), source);
+            assert_eq!(rendition(source, &fixture()).as_deref(), Some(source));
+        }
+        // Words that only start like the title are the sentence's own.
+        let text = paragraph("#20 retries now.");
+        assert!(
+            text.plain().contains("#20\u{a0}Retry stalled"),
+            "{:?}",
+            text.plain()
+        );
+    }
+
+    #[test]
+    fn a_reference_in_a_heading_reads_as_a_link_in_one_does() {
+        let content = super::super::markdown::Content::parse_labelled(
+            "## Follow-up to #20",
+            Arc::new(fixture()),
+        );
+        let [super::super::markdown::Item::Heading(_, text)] = content.items() else {
+            panic!("one heading");
+        };
+        assert!(
+            text.plain().contains("#20\u{a0}Retry"),
+            "{:?}",
+            text.plain()
+        );
+    }
+
+    #[test]
     fn a_reference_in_a_table_cell_or_emphasis_reads_as_its_label() {
         let content = super::super::markdown::Content::parse_labelled(
             "| Area | Status |\n| --- | --- |\n| Brokers | #20, with 6 brokers in beta. |",
@@ -1854,6 +2027,27 @@ mod tests {
             ]
         );
         assert!(named("## Heading\n\nNo numbers, #only words.").is_empty());
+        // An escape the source holds and the text shown does not.
+        assert!(
+            named("Fixed in acme/my\\_repo#4.").contains(&Named::Reference(Reference {
+                repository: Some(("acme".into(), "my_repo".into())),
+                number: 4
+            }))
+        );
+    }
+
+    #[test]
+    fn a_reference_relabels_when_its_pull_requests_address_changes() {
+        let reference = Named::Reference(Reference {
+            repository: None,
+            number: 20,
+        });
+        let list = fixture_list();
+        let mut moved = fixture_list();
+        moved.pull_requests[0].pull_request.as_mut().unwrap().url =
+            "https://github.com/ACME/Widgets/pull/20".into();
+        assert!(!fixture::of(&list).reads_alike(&fixture::of(&moved), &reference));
+        assert!(fixture::of(&list).reads_alike(&fixture::of(&list), &reference));
     }
 
     #[test]
@@ -1920,6 +2114,15 @@ mod tests {
             assert_eq!(rendition(source, &labels), None, "{source}");
         }
         assert_eq!(rendition("Fixed by #20.", &Labels::default()), None);
+        // A link's own words show as written; an escaped `#` does not.
+        assert_eq!(
+            rendition("See [PR #20](https://example.com/notes).", &labels),
+            None
+        );
+        assert_eq!(
+            rendition("See \\#20.", &labels).as_deref(),
+            Some("See \\#20\u{a0}Retry stalled daemon handshakes.")
+        );
         // An `owner/repo` holding an `h`, which an address would start with.
         let mut list = fixture_list();
         list.pull_requests.push(row(
