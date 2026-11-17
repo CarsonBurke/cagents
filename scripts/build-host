@@ -18,13 +18,12 @@ with its jobserver, unless something between closed that jobserver's
 descriptors, when it joins the jobserver for itself.
 
 A build that would wait for its shares first asks Cargo whether there is
-anything to compile, in a probe: the build, one job at a time, under a
-compiler wrapper that ends it at its first compile. The probe holds one of a
-few slots that together set aside one share, and ends as well if what it runs,
-such as a build script rerunning without a compile, outgrows its slot. A
-probe that finds everything fresh, or fails, is the build: its output is
-shown and no shares are taken. Otherwise the build waits for its shares as
-any other.
+anything to compile, in a probe: the build, one job at a time, in the build
+slice, under a compiler wrapper that ends it at its first compile. At most
+four probes run at once, each ended as well if what it runs, such as a build
+script rerunning without a compile, outgrows 1 GiB. A probe that finds
+everything fresh, or fails, is the build: its output is shown and no shares
+are taken. Otherwise the build waits for its shares as any other.
 """
 import array
 import contextlib
@@ -94,10 +93,14 @@ ALIASES = {"t": "test", "r": "run"}
 # Marks a command run by a build that holds shares, for the gates it starts.
 HELD_MARK = "CAGENTS_BUILD_SLOT_HELD"
 SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
-# The memory a probe may use, and so how many run at once: together they set
-# aside one share. Cargo alone needs about 180 MiB to find this workspace fresh.
+# The memory a probe may use, and so how many run at once: no more than one
+# share between them. Cargo alone needs about 180 MiB to find this workspace
+# fresh.
 PROBE_MEMORY = 2**30
 PROBE_TICK = 0.1
+# How long a probe may hold its slot, its output held back, before the build
+# queues instead: Cargo finds this workspace fresh in a few seconds.
+PROBE_SECONDS = 60
 # What only builds, and so can be probed. `doc` runs rustdoc, which no
 # compiler wrapper sees.
 PROBED = ("build", "b", "check", "c", "clippy")
@@ -627,23 +630,32 @@ def tree_memory(root):
 class Probe:
     """Runs a build's commands to find whether they compile anything, one
     Cargo job at a time, keeping their output until the build is known not
-    to need its shares. Each runs in a process group of its own, which ends
-    as soon as it would compile or outgrows PROBE_MEMORY."""
+    to need its shares. Each runs in a process group of its own, and where
+    builds run in scopes, in a scope of the build slice, whose cap covers it
+    with the builds. It ends as soon as it would compile, outgrows
+    PROBE_MEMORY, runs PROBE_SECONDS or reaches the admission deadline."""
 
-    def __init__(self, directory):
-        self.directory = directory
+    def __init__(self, directory, deadline):
+        self.directory, self.deadline = directory, deadline
         self.compiled = os.path.join(directory, "compiles")
         self.output = []
+        self.scoped = prepare_slice()
 
     def environment(self, environment):
         environment = dict(environment)
         for name in ("MAKEFLAGS", "CARGO_MAKEFLAGS", "MFLAGS"):
             environment.pop(name, None)
         environment["CARGO_BUILD_JOBS"] = "1"
-        # The caller's own wrapper still answers the compiler's queries.
+        # The caller's own wrapper still answers the compiler's queries;
+        # a guard there, as under `cargo-gate exec`, stands for the one the
+        # caller had before it.
         wrapper = environment.get("RUSTC_WRAPPER", "")
-        if wrapper and os.path.realpath(shutil.which(wrapper) or wrapper) == os.path.realpath(PROBE_WRAPPER):
+        if wrapper and os.path.basename(wrapper) == os.path.basename(PROBE_WRAPPER):
             wrapper = environment.get("CAGENTS_BUILD_EXEC_RUSTC_WRAPPER", "")
+        # A gate the probe starts keeps the guard, rather than restoring an
+        # exec's wrapper in its place.
+        for name in ("CAGENTS_BUILD_EXEC_SHIMS", "CAGENTS_BUILD_EXEC_RUSTC_WRAPPER"):
+            environment.pop(name, None)
         environment["CAGENTS_BUILD_PROBE_RUSTC_WRAPPER"] = wrapper
         environment["RUSTC_WRAPPER"] = PROBE_WRAPPER
         environment["CAGENTS_BUILD_PROBE_DIRECTORY"] = self.directory
@@ -652,8 +664,22 @@ class Probe:
         return environment
 
     def run(self, command, environment, capture=False):
+        environment = self.environment(environment)
+        unit = f"cagents-probe-{os.getpid()}-{time.monotonic_ns()}.scope"
+        if self.scoped:
+            # Throttled a little past where the check below ends it, so
+            # nothing outgrows its slot by much between checks.
+            settings = [f"{name}={environment[name]}" if name in environment else f"--unset={name}"
+                        for name in MANAGER_VARIABLES]
+            command = ["systemd-run", "--user", "--scope", "--quiet", "--collect",
+                       f"--slice={BUILD_SLICE}", f"--unit={unit}",
+                       f"--property=MemoryHigh={PROBE_MEMORY * 3 // 2}", "--",
+                       "env", *sorted(settings, key=lambda setting: not setting.startswith("--")),
+                       *command]
+            environment = {key: value for key, value in environment.items()
+                           if key not in MANAGER_VARIABLES} | manager_environment_only()
         parent = os.getpid()
-        child = subprocess.Popen(command, env=self.environment(environment),
+        child = subprocess.Popen(command, env=environment,
                                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, process_group=0,
                                  preexec_fn=lambda: follow_parent(parent))
@@ -663,6 +689,9 @@ class Probe:
                    for name, stream in (("stdout", child.stdout), ("stderr", child.stderr))]
         for reader in readers:
             reader.start()
+        until = time.monotonic_ns() + PROBE_SECONDS * 10**9
+        if self.deadline is not None:
+            until = min(until, self.deadline)
         try:
             while True:
                 try:
@@ -670,23 +699,24 @@ class Probe:
                     break
                 except subprocess.TimeoutExpired:
                     pass
-                if os.path.exists(self.compiled) or tree_memory(child.pid) > PROBE_MEMORY:
+                if (os.path.exists(self.compiled) or time.monotonic_ns() >= until
+                        or tree_memory(child.pid) > PROBE_MEMORY):
                     raise Stale
         finally:
-            if child.returncode is None:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(child.pid, signal.SIGKILL)
-                child.wait()
-            else:
-                # What it left running in its group ends with it.
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(child.pid, signal.SIGKILL)
+            # What it started, still running or left behind, ends with it.
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(child.pid, signal.SIGKILL)
+            if self.scoped:
+                with contextlib.suppress(OSError, subprocess.SubprocessError):
+                    systemctl("kill", "--signal=SIGKILL", unit)
+            child.wait()
             for reader in readers:
                 reader.join()
             child.stdout.close()
             child.stderr.close()
-        # Killed by something else, such as the kernel out of memory, it
-        # says nothing of the build.
+        # The guard ends the probe's process group at a compile. Killed by
+        # something else, such as the kernel out of memory, a probe says
+        # nothing of the build either.
         if os.path.exists(self.compiled) or status < 0:
             raise Stale
         stdout, stderr = streams.get("stdout", b""), streams.get("stderr", b"")
@@ -698,11 +728,17 @@ class Probe:
 
     def show(self):
         """Shows what the probe's commands wrote, which was the build's."""
-        for stdout, stderr in self.output:
-            sys.stdout.buffer.write(stdout)
-            sys.stdout.flush()
-            sys.stderr.buffer.write(stderr)
-            sys.stderr.flush()
+        try:
+            for stdout, stderr in self.output:
+                sys.stdout.buffer.write(stdout)
+                sys.stdout.flush()
+                sys.stderr.buffer.write(stderr)
+                sys.stderr.flush()
+        except BrokenPipeError:
+            # A reader that stopped reading, such as `head`, wants no more.
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+            os.dup2(devnull, sys.stderr.fileno())
 
 
 def status_of(status):
@@ -755,7 +791,7 @@ class Build:
             with probe_slot() as slot:
                 if slot is not None:
                     with tempfile.TemporaryDirectory(prefix="cagents-probe-") as directory:
-                        self.probe = Probe(directory)
+                        self.probe = Probe(directory, self.deadline)
                         try:
                             result = steps()
                         except Stale:

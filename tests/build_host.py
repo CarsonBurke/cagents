@@ -649,29 +649,63 @@ class Probing(BuildHostFixture):
         self.assertIsNone(call["environment"]["CAGENTS_BUILD_PROBE_DIRECTORY"])
 
     def test_a_probe_outgrowing_its_slot_ends_with_what_it_started(self):
-        script = (r"import os, subprocess, sys, time; "
-                  r"child = subprocess.Popen([sys.executable, '-c', "
-                  r"'x = bytearray(64 << 20); import time; time.sleep(60)']); "
-                  r"print(child.pid, flush=True); time.sleep(60)")
+        script = ("import os, subprocess, sys, time\n"
+                  "child = subprocess.Popen([sys.executable, '-c', "
+                  "'x = b\"x\" * (64 << 20); import time; time.sleep(60)'])\n"
+                  "open(os.environ['FIXTURE_GRANDCHILD'], 'w').write(str(child.pid))\n"
+                  "time.sleep(60)\n")
+        recorded = self.root / "grandchild"
+        # In place, as every build here runs, never in a scope.
         with tempfile.TemporaryDirectory(dir=self.root) as directory, \
-                unittest.mock.patch.object(build_host, "PROBE_MEMORY", 32 << 20):
-            probe = build_host.Probe(directory)
+                unittest.mock.patch.object(build_host, "PROBE_MEMORY", 32 << 20), \
+                unittest.mock.patch.object(build_host, "prepare_slice", lambda: False):
+            probe = build_host.Probe(directory, None)
             started = time.monotonic()
             with self.assertRaises(build_host.Stale):
-                probe.run([sys.executable, "-c", script], dict(self.env))
+                probe.run([sys.executable, "-c", script], dict(self.env) | {"FIXTURE_GRANDCHILD": str(recorded)})
             self.assertLess(time.monotonic() - started, HANG_GUARD)
+        # What it started ended with it.
+        grandchild = int(recorded.read_text())
+        def ended():
+            with contextlib.suppress(FileNotFoundError, ProcessLookupError):
+                return Path(f"/proc/{grandchild}/stat").read_text().rsplit(") ", 1)[1][0] == "Z"
+            return True
+        self.wait_for(ended, "the probe's child to end")
+
+    def test_a_probe_ends_at_the_admission_deadline(self):
+        build = self.start("cargo", "--wait-seconds", "1", "--", str(self.cargo), "check",
+                           env=self.env | {"FIXTURE_HOLD": "never"})
+        status, _stdout, stderr = self.finish(build)
+        self.assertEqual(status, 124, stderr)
+        self.assertIn("build admission timed out", stderr)
+        [probe] = self.calls()
+        self.assertIsNotNone(probe["environment"]["CAGENTS_BUILD_PROBE_DIRECTORY"])
+
+    def test_a_signal_ends_a_probe_with_what_it_started(self):
+        build = self.start("cargo", "--", str(self.cargo), "check", env=self.env | {"FIXTURE_HOLD": "never"})
+        self.wait_for(lambda: self.started("never"), "the probe")
+        [probe] = self.calls()
+        build.send_signal(signal.SIGTERM)
+        status, _stdout, _stderr = self.finish(build)
+        self.assertEqual(status, -signal.SIGTERM)
+        self.wait_for(lambda: not Path(f"/proc/{probe['pid']}").exists(), "the probe to end")
+        # Its slot is free again.
+        self.assertFalse(self.is_locked(f"{self.lock}.probe.0"))
 
     def test_the_guard_ends_a_probe_at_its_first_compile_only(self):
         guard = self.root / "scripts/cargo-gate-rustc-guard"
         with tempfile.TemporaryDirectory(dir=self.root) as directory:
             env = self.env | {"CAGENTS_BUILD_PROBE_DIRECTORY": directory}
+            # Each in a process group of its own, as a probe is, which a
+            # compile ends.
             asked = subprocess.run([str(guard), "/bin/echo", "--print=cfg"], env=env,
-                                   capture_output=True, text=True)
+                                   capture_output=True, text=True, process_group=0)
             self.assertEqual((asked.returncode, asked.stdout), (0, "--print=cfg\n"))
             self.assertFalse((Path(directory) / "compiles").exists())
-            compiled = subprocess.run([str(guard), "/bin/echo", "src/lib.rs"], env=env,
-                                      capture_output=True, text=True)
-            self.assertEqual((compiled.returncode, compiled.stdout), (1, ""))
+            compiled = subprocess.run(["/bin/sh", "-c", '"$@"; echo "survived $?"', "compiler",
+                                       str(guard), "/bin/echo", "src/lib.rs"], env=env,
+                                      capture_output=True, text=True, process_group=0)
+            self.assertEqual((compiled.returncode, compiled.stdout), (-signal.SIGKILL, ""))
             self.assertTrue((Path(directory) / "compiles").exists())
 
 

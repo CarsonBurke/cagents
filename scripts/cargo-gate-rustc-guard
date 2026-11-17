@@ -19,7 +19,8 @@
 # scripts/build-host also makes it the RUSTC_WRAPPER of a build it probes
 # before admitting it, with CAGENTS_BUILD_PROBE_DIRECTORY naming the probe's directory.
 # There it passes queries to the wrapper the build had, if any, and ends the
-# probe at the first compile, which the build then waits for its shares to do.
+# probe's process group at the first compile, which the build then waits for
+# its shares to do.
 tool=${0##*/}
 refusal="would compile on this host, where Rust compiles only through the gate"
 
@@ -88,6 +89,10 @@ if [ -n "${CAGENTS_BUILD_PROBE_DIRECTORY-}" ]; then
         exec ${CAGENTS_BUILD_PROBE_RUSTC_WRAPPER:+"$CAGENTS_BUILD_PROBE_RUSTC_WRAPPER"} "$@"
     fi
     : >"$CAGENTS_BUILD_PROBE_DIRECTORY/compiles"
+    # The probe is a process group of its own. Ending it here, rather than
+    # failing this compile, keeps a build script that compiles to detect a
+    # feature from recording the failure as the feature's absence.
+    kill -KILL 0
     exit 1
 fi
 if asks "$@"; then

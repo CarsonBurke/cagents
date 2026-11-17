@@ -2011,7 +2011,8 @@ def incremental_session(slot, crate, *, age, size=64 * 1024, profile="debug"):
 
 
 # What a gate sends the build host to run each command with.
-TOOLS = {name: (ROOT / "scripts" / name).read_text() for name in ("build-host", "memory-capped")}
+TOOLS = {name: (ROOT / "scripts" / name).read_text()
+         for name in ("build-host", "memory-capped", "cargo-gate-rustc-guard")}
 
 
 def wait_until(condition, timeout=HANG_GUARD):

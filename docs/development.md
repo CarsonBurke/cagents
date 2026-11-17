@@ -657,13 +657,18 @@ its output held back, under a compiler wrapper (`scripts/cargo-gate-rustc-guard`
 that passes the compiler's queries and ends the probe at the first compile.
 If Cargo finds everything fresh, or fails, the probe was the build: its output
 is shown and no shares are taken. Otherwise it is discarded and the build waits
-for its shares as before, so every compile still runs within them. A probe
-takes one of four slots (`/var/tmp/cagents-cargo.lock.probe.0` to `.3`) that
-together set aside one share; with none free, the build queues without one.
-A probe is also stopped, and the build queued, if its processes outgrow
-1 GiB, as a build script rerunning without a compile might. Cargo alone needs
-about 180 MiB to find this workspace fresh. Doctests, `doc` and `exec` scripts
-are not probed. `CAGENTS_BUILD_PROBE=0` turns probing off.
+for its shares as before, so every compile still runs within them. At most
+four probes run at once, each holding one of the slots
+`/var/tmp/cagents-cargo.lock.probe.0` to `.3`; with none free, a build queues
+without one. A probe runs in the build slice described below, so the cap on
+builds' memory covers it too, and is ended, its build queued, if its
+processes outgrow 1 GiB (as a build script rerunning without a compile
+might), after 60 seconds, or at the admission deadline. Cargo alone needs
+about 180 MiB to find this workspace fresh. Doctests and `doc`, whose rustdoc
+no compiler wrapper sees, are not probed, nor is an `exec` on the host that
+compiles, which holds its shares throughout; each Cargo command of an `exec`
+offloaded from elsewhere is admitted, and probed, on its own.
+`CAGENTS_BUILD_PROBE=0` turns probing off.
 
 Once admitted, a build runs in its own systemd scope in
 `background-cagents.slice`, inside the user manager's `background.slice`.
