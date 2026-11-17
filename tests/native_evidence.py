@@ -2334,7 +2334,11 @@ REMOTE_STUBS = {
         host=$1
         shift
         [ "$host" = buildhost ] || { echo "ssh: unknown host $host" >&2; exit 255; }
-        login=(env -i HOME="$STUB_REMOTE_HOME" PATH="$PATH" STUB_LOG="$STUB_LOG" GIT_CONFIG_GLOBAL=/dev/null)
+        # The host runs each command under its own sshd, which the host's
+        # scripts find as their connection. Without one here they would look
+        # further up, and where this suite itself runs over SSH, find that.
+        login=("$(dirname -- "$0")/sshd-session" env -i HOME="$STUB_REMOTE_HOME" PATH="$PATH" STUB_LOG="$STUB_LOG"
+               GIT_CONFIG_GLOBAL=/dev/null)
         # An rsync server speaks its protocol over this connection until the
         # client hangs up, which it does only once ssh has exited.
         case $1 in
@@ -2342,6 +2346,14 @@ REMOTE_STUBS = {
         esac
         # What travels to the host: its arguments, above, and its input.
         tee -a "$STUB_LOG/ssh-input" | "${login[@]}" sh -c "$*"
+    """,
+    # The connection as the host sees it: alive while what it runs is, and the
+    # parent of that, never replaced by it.
+    "sshd-session": """
+        #!/bin/bash
+        status=0
+        "$@" || status=$?
+        exit "$status"
     """,
     # Only to say where a checkout's builds go, as Cargo would.
     "cargo": """
