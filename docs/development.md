@@ -1484,7 +1484,13 @@ mise run test:ui -- --test session_restore_contract
 For focused library tests, `scripts/test-lib` builds one lane's library test
 harness and runs exactly the tests you name, through one `scripts/cargo-gate test`
 command. The `ui` lane runs the application's tests (`-p cagents-ui`);
-`shared-ui` runs the shared library's tests under `--features ui`:
+`shared-ui` runs the shared library's tests under `--features ui`.
+`mise run test:ui -- --lib MODULE::` compiles both of those harnesses, whatever
+the filter matches. After an edit to the shared library, on fw16, rebuilding
+for `scripts/test-lib ui` took 44 CPU-seconds and for `test:ui -- --lib` 79.
+The two commands build the shared library with different dependency features,
+so alternating between them compiles it once for each; keep to one while
+iterating:
 
 ```sh
 scripts/test-lib cli search_match::tests::overlapping_occurrences_keep_the_best_boundary_rank
