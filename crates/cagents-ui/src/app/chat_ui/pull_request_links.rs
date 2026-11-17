@@ -18,10 +18,21 @@
 //! current, so a pull request only that list names keeps its title but shows
 //! no state, rather than one that may since have changed.
 //!
+//! An agent also names pull requests by number, as `#20` or
+//! `acme/tools#20`, the way GitHub's own text does. Such a reference, a whole
+//! token in a message's prose, reads as the same label once the window knows
+//! a pull request by that number in the chat's repository, or in the one it
+//! names, and opens it. Issues and pull requests share their numbers, so a
+//! known pull request is the only thing the reference can mean. One the
+//! window does not know stays as written, with no glyph and no link: it may
+//! be an issue. A reference in code, or in a link's own words, is the
+//! author's literal text. Copy gives back the reference as written.
+//!
 //! The labels are an input to a chat's Markdown, like the syntax theme. Each
-//! prepared message keeps the pull requests it links to, so a change to the
-//! labels prepares again only the messages naming one that now reads
-//! otherwise, without reading any message's text.
+//! prepared message keeps the pull requests it links to and the numbers it
+//! mentions, known or not, so a change to the labels prepares again only the
+//! messages naming one that now reads otherwise, including a number the
+//! window has only now come to know, without reading any message's text.
 
 use crate::github_identity::{GitHubRepoKey, PullRequestKey};
 use crate::model::ProjectId;
@@ -31,7 +42,7 @@ use crate::work::ConversationPullRequests;
 #[cfg(test)]
 use crate::work::PullRequestState;
 use cosmic::iced;
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, ops::Range, sync::Arc};
 use unicode_segmentation::UnicodeSegmentation;
 
 /// The most of a title a link shows, in characters. About a third of a
@@ -128,6 +139,7 @@ impl Facts {
                         Fact {
                             title: displayable(&pull_request.title),
                             glyph: Some(WorktreePullRequestState::from_work(pull_request)),
+                            address: Arc::from(pull_request.url.as_str()),
                         },
                     ))
                 })
@@ -148,6 +160,7 @@ impl Facts {
                         Fact {
                             title: displayable(&row.title),
                             glyph: row.state,
+                            address: Arc::from(row.url.as_str()),
                         },
                     ))
                 })
@@ -386,6 +399,8 @@ impl Id {
 struct Fact {
     title: String,
     glyph: Glyph,
+    /// Where the pull request is, which a reference by number opens.
+    address: Arc<str>,
 }
 
 impl Labels {
@@ -404,10 +419,29 @@ impl Labels {
         })
     }
 
-    /// Whether a link to `key` reads the same under `other` as under these
-    /// labels, without building either label.
-    pub(super) fn reads_alike(&self, other: &Self, key: &PullRequestKey) -> bool {
-        let id = Id::of(key);
+    /// Whether what a message names reads the same under `other` as under
+    /// these labels, without building either label.
+    pub(super) fn reads_alike(&self, other: &Self, named: &Named) -> bool {
+        match named {
+            Named::Link(key) => self.id_reads_alike(other, &Id::of(key)),
+            Named::Reference(reference) => {
+                let (mine, theirs) = (self.id(reference), other.id(reference));
+                if mine != theirs {
+                    // Another repository is meant: alike only while neither
+                    // knows the pull request, so both leave it as written.
+                    let known = |labels: &Self, id: Option<Id>| {
+                        id.is_some_and(|id| labels.fact(&id).is_some())
+                    };
+                    return !known(self, mine) && !known(other, theirs);
+                }
+                mine.is_none_or(|id| self.id_reads_alike(other, &id))
+            }
+        }
+    }
+
+    /// Whether the pull request `id` reads the same under `other` as under
+    /// these labels: the same reference, title, state and address.
+    fn id_reads_alike(&self, other: &Self, id: &Id) -> bool {
         if (self.repository.as_ref() == Some(&id.repository))
             != (other.repository.as_ref() == Some(&id.repository))
         {
@@ -433,6 +467,47 @@ impl Labels {
             }
         }
         true
+    }
+
+    /// The pull request `reference` means here: its number in the repository
+    /// it names, on the chat's repository's host, or in the chat's own
+    /// repository. `None` while a bare number has no repository to be in.
+    fn id(&self, reference: &Reference) -> Option<Id> {
+        let repository = match &reference.repository {
+            None => self.repository.clone()?,
+            Some((owner, name)) => {
+                let (host, port) = self
+                    .repository
+                    .as_ref()
+                    .map_or(("github.com".to_owned(), None), |repository| {
+                        (repository.host.clone(), repository.port)
+                    });
+                Repository {
+                    host,
+                    port,
+                    owner: owner.to_string(),
+                    name: name.to_string(),
+                }
+            }
+        };
+        Some(Id {
+            repository,
+            number: reference.number,
+        })
+    }
+
+    /// The pull request `reference` names and its address, when the window
+    /// knows it; otherwise the reference stays as written.
+    pub(super) fn resolve(&self, reference: &Reference) -> Option<(PullRequestKey, Arc<str>)> {
+        let id = self.id(reference)?;
+        let address = self
+            .board
+            .iter()
+            .find_map(|facts| facts.get(&id))
+            .or_else(|| self.conversation.get(&id))
+            .map(|fact| fact.address.clone())?;
+        let key = pull_request(&address).filter(|key| Id::of(key) == id)?;
+        Some((key, address))
     }
 
     /// How a link to `key` reads: `#20 Retry stalled daemon handshakes`, or
@@ -520,18 +595,39 @@ pub(super) fn pull_request(destination: &str) -> Option<PullRequestKey> {
     PullRequestKey::from_url(destination).ok()
 }
 
-/// `text` as Find should read it: each address of a pull request as the
-/// label it shows, so a search for a title or `#20` reaches a message whose
-/// source only holds the address. `None` when nothing in `text` is relabelled.
+/// `text` as Find should read it: each address of a pull request, and each
+/// reference to one the window knows, as the label it shows, so a search for
+/// a title or `#20` reaches a message whose source only holds the address or
+/// the number. `None` when nothing in `text` is relabelled.
 pub(super) fn rendition(text: &str, labels: &Labels) -> Option<String> {
-    if !text.contains("/pull/") {
+    if !text.contains("/pull/") && !text.contains('#') {
         return None;
     }
     let mut read = String::with_capacity(text.len());
     let mut relabelled = false;
     let mut at = 0;
-    while let Some(found) = text[at..].find(['`', 'h']).map(|index| at + index) {
+    while let Some(found) = text[at..].find(['`', 'h', '#']).map(|index| at + index) {
         let rest = &text[found..];
+        if rest.starts_with('#') {
+            // An `owner/repo` before the `#` may already be read as written,
+            // as it is when it holds an `h`.
+            let known = reference_at(text, found)
+                .filter(|(range, _)| range.start >= at || read.ends_with(&text[range.start..at]))
+                .and_then(|(range, reference)| Some((range, labels.resolve(&reference)?.0)));
+            if let Some((range, key)) = known {
+                match at.checked_sub(range.start) {
+                    Some(read_already) => read.truncate(read.len() - read_already),
+                    None => read.push_str(&text[at..range.start]),
+                }
+                read.push_str(&labels.label(&key).text);
+                relabelled = true;
+                at = range.end;
+            } else {
+                read.push_str(&text[at..=found]);
+                at = found + 1;
+            }
+            continue;
+        }
         if rest.starts_with('`') {
             // Code, in a span or a fence, shows its addresses as written.
             let fence = &rest[..rest.len() - rest.trim_start_matches('`').len()];
@@ -578,24 +674,228 @@ pub(super) fn rendition(text: &str, labels: &Labels) -> Option<String> {
     relabelled.then_some(read)
 }
 
-/// The pull requests a message's text links to, by address, in order and
-/// without repeats.
-pub(super) fn named(text: &str) -> Vec<PullRequestKey> {
-    if !text.contains("/pull/") {
-        return Vec::new();
-    }
-    let mut keys = crate::pull_request_signals::pull_request_urls(text);
-    deduplicate(&mut keys);
-    keys
+/// A pull request named by number, as `#20` or `acme/tools#20`: the
+/// repository it names, in lower case as GitHub compares them, if any.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct Reference {
+    repository: Option<(Box<str>, Box<str>)>,
+    number: u64,
 }
 
-/// `keys` without repeats of a pull request, in order.
-pub(super) fn deduplicate(keys: &mut Vec<PullRequestKey>) {
-    if keys.len() < 2 {
+/// What a message names that its labels can change: a pull request by its
+/// address, or by number.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Named {
+    Link(PullRequestKey),
+    Reference(Reference),
+}
+
+impl From<PullRequestKey> for Named {
+    fn from(key: PullRequestKey) -> Self {
+        Self::Link(key)
+    }
+}
+
+/// The longest number a reference is read with; GitHub's are far shorter,
+/// and a longer run of digits is something else.
+const NUMBER_DIGITS: usize = 12;
+
+/// Whether `ch`, beside a reference, would make it part of a longer word,
+/// path, address or entity, as GitHub's autolinker reads one.
+fn joins(ch: char) -> bool {
+    ch.is_alphanumeric()
+        || matches!(
+            ch,
+            '_' | '#' | '/' | '&' | '@' | '\\' | '$' | '%' | '=' | '+'
+        )
+}
+
+/// The whole-token references in `text[range]`: `#N` or `owner/repo#N`, not
+/// joined to the text around them, so `#20,` and `(#20)` are references and
+/// `#20abc`, `abc#20`, `##20`, `#20.5` and an address's `/#20` are not.
+/// Characters in `transparent`, such as Markdown's emphasis delimiters in a
+/// source, are skipped when looking at what is beside a reference.
+fn references_within<'a>(
+    text: &'a str,
+    range: Range<usize>,
+    transparent: &'a [char],
+) -> impl Iterator<Item = (Range<usize>, Reference)> + 'a {
+    let mut from = range.start;
+    std::iter::from_fn(move || {
+        while let Some(hash) = text[from..range.end].find('#').map(|at| from + at) {
+            from = hash + 1;
+            let digits = text[hash + 1..range.end]
+                .bytes()
+                .take_while(u8::is_ascii_digit)
+                .count();
+            if digits == 0 || digits > NUMBER_DIGITS || text.as_bytes()[hash + 1] == b'0' {
+                continue;
+            }
+            let end = hash + 1 + digits;
+            from = end;
+            let after = text[end..].trim_start_matches(transparent);
+            let mut following = after.chars();
+            let ended = match following.next() {
+                None => true,
+                // A sentence's punctuation ends it; a version's or a file's
+                // dot, or a range's dash, continues it.
+                Some('.' | ':' | '-') => following
+                    .next()
+                    .is_none_or(|ch| !ch.is_alphanumeric() && ch != '_'),
+                Some(ch) => !joins(ch),
+            };
+            if !ended {
+                continue;
+            }
+            let Ok(number) = text[hash + 1..end].parse() else {
+                continue;
+            };
+            let begins = |start: usize| {
+                text[..start]
+                    .trim_end_matches(transparent)
+                    .chars()
+                    .next_back()
+                    .is_none_or(|ch| !joins(ch) && ch != '.' && ch != '-')
+            };
+            if let Some((start, owner, name)) = qualifier(&text[range.start..hash])
+                .map(|(at, owner, name)| (range.start + at, owner, name))
+            {
+                if begins(start) {
+                    let repository =
+                        Some((owner.to_lowercase().into(), name.to_lowercase().into()));
+                    return Some((start..end, Reference { repository, number }));
+                }
+                continue;
+            }
+            if begins(hash) {
+                return Some((
+                    hash..end,
+                    Reference {
+                        repository: None,
+                        number,
+                    },
+                ));
+            }
+        }
+        None
+    })
+}
+
+/// The `owner/repo` that `before` ends with, where it starts in `before`,
+/// with the owner and name: a name of letters, digits, `.`, `-` and `_`, and
+/// an owner of letters, digits and inner hyphens, as GitHub allows them.
+fn qualifier(before: &str) -> Option<(usize, &str, &str)> {
+    let head = before
+        .trim_end_matches(|ch: char| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_'));
+    let name = &before[head.len()..];
+    let rest = head.strip_suffix('/')?;
+    let owner_start = rest
+        .trim_end_matches(|ch: char| ch.is_ascii_alphanumeric() || ch == '-')
+        .len();
+    let owner = &rest[owner_start..];
+    (!name.is_empty()
+        && name.len() <= 100
+        && !owner.is_empty()
+        && owner.len() <= 39
+        && !owner.starts_with('-')
+        && !owner.ends_with('-'))
+    .then_some((owner_start, owner, name))
+}
+
+/// The references that `text`, a paragraph as shown, makes in its
+/// `range`, as [`references_within`] reads them.
+pub(super) fn references(
+    text: &str,
+    range: Range<usize>,
+) -> impl Iterator<Item = (Range<usize>, Reference)> + '_ {
+    references_within(text, range, &[])
+}
+
+/// The reference whose `#` is at `hash` in a Markdown source, where its
+/// emphasis delimiters do not join it to the words beside it.
+fn reference_at(text: &str, hash: usize) -> Option<(Range<usize>, Reference)> {
+    let token = text[..hash].rfind(char::is_whitespace).map_or(0, |at| {
+        at + text[at..].chars().next().map_or(1, char::len_utf8)
+    });
+    let end = hash
+        + 1
+        + text[hash + 1..]
+            .bytes()
+            .take_while(u8::is_ascii_digit)
+            .count();
+    references_within(text, token..end, &['*', '_', '~']).find(|(range, _)| range.end == end)
+}
+
+/// Every number a message's source might name a pull request by, whether
+/// or not it shows as a reference: more than it shows, never less, since
+/// Markdown can join or part what sits beside a `#`. Each `#N` might be in
+/// the chat's repository, and in the `owner/repo` written before it.
+fn mentions(text: &str) -> impl Iterator<Item = Reference> + '_ {
+    let mut from = 0;
+    std::iter::from_fn(move || {
+        while let Some(hash) = text[from..].find('#').map(|at| from + at) {
+            from = hash + 1;
+            let digits = text[hash + 1..]
+                .bytes()
+                .take_while(u8::is_ascii_digit)
+                .count();
+            let Ok(number) = text[hash + 1..hash + 1 + digits].parse::<u64>() else {
+                continue;
+            };
+            from = hash + 1 + digits;
+            let qualified = qualifier(&text[..hash]).map(|(_, owner, name)| Reference {
+                repository: Some((owner.to_lowercase().into(), name.to_lowercase().into())),
+                number,
+            });
+            return Some(
+                std::iter::once(Reference {
+                    repository: None,
+                    number,
+                })
+                .chain(qualified),
+            );
+        }
+        None
+    })
+    .flatten()
+}
+
+/// What a message's text names that its labels can change: the pull
+/// requests it links to, by address, then the numbers it mentions, in order
+/// and without repeats.
+pub(super) fn named(text: &str) -> Vec<Named> {
+    let mut named = Vec::new();
+    if text.contains("/pull/") {
+        named.extend(
+            crate::pull_request_signals::pull_request_urls(text)
+                .into_iter()
+                .map(Named::Link),
+        );
+    }
+    if text.contains('#') {
+        named.extend(mentions(text).map(Named::Reference));
+    }
+    deduplicate(&mut named);
+    named
+}
+
+/// `named` without repeats, in order.
+pub(super) fn deduplicate(named: &mut Vec<Named>) {
+    if named.len() < 2 {
         return;
     }
+    #[derive(PartialEq, Eq, Hash)]
+    enum Seen {
+        Link(Id),
+        Reference(Reference),
+    }
     let mut seen = std::collections::HashSet::new();
-    keys.retain(|key| seen.insert(Id::of(key)));
+    named.retain(|named| {
+        seen.insert(match named {
+            Named::Link(key) => Seen::Link(Id::of(key)),
+            Named::Reference(reference) => Seen::Reference(reference.clone()),
+        })
+    });
 }
 
 /// `title`, whitespace collapsed into single spaces, cut at a word within
@@ -896,8 +1196,11 @@ mod tests {
              [again](https://github.com/acme/widgets/pull/20) and https://github.com/acme/tools/pull/4.",
         );
         assert_eq!(
-            keys.iter().map(|key| key.number).collect::<Vec<_>>(),
-            [20, 4]
+            keys,
+            [
+                Named::Link(key("https://github.com/acme/widgets/pull/20")),
+                Named::Link(key("https://github.com/acme/tools/pull/4")),
+            ]
         );
         assert!(named("no links here").is_empty());
     }
@@ -980,10 +1283,13 @@ mod tests {
         let after = board.labels(None, &Inspected::default(), false);
         assert!(Arc::ptr_eq(&before.board[1], &after.board[1]), "tools kept");
         let widgets = |number| key(&format!("https://github.com/acme/widgets/pull/{number}"));
-        assert!(before.reads_alike(&after, &widgets(20)));
-        assert!(!before.reads_alike(&after, &widgets(21)));
-        assert!(before.reads_alike(&after, &key("https://github.com/acme/tools/pull/5")));
-        assert!(before.reads_alike(&after, &widgets(99)), "known to neither");
+        assert!(before.reads_alike(&after, &widgets(20).into()));
+        assert!(!before.reads_alike(&after, &widgets(21).into()));
+        assert!(before.reads_alike(&after, &key("https://github.com/acme/tools/pull/5").into()));
+        assert!(
+            before.reads_alike(&after, &widgets(99).into()),
+            "known to neither"
+        );
 
         // A pull request both list reads as the first project says, so the
         // second's poll changes nothing it shows.
@@ -1000,7 +1306,7 @@ mod tests {
         );
         assert!(board.refresh(&projects, none));
         let shadowed = board.labels(None, &Inspected::default(), false);
-        assert!(after.reads_alike(&shadowed, &widgets(20)));
+        assert!(after.reads_alike(&shadowed, &widgets(20).into()));
         assert_eq!(
             shadowed.label(&widgets(20)).glyph,
             Some(WorktreePullRequestState::Open)
@@ -1108,11 +1414,11 @@ mod tests {
             "{}",
             label.tip(url)
         );
-        assert!(!watched.reads_alike(&unwatched, &key(url)));
-        assert!(watched.reads_alike(&board.labels(None, &inspected, true), &key(url)));
+        assert!(!watched.reads_alike(&unwatched, &key(url).into()));
+        assert!(watched.reads_alike(&board.labels(None, &inspected, true), &key(url).into()));
         // One no source names reads the same either way.
         let unknown = key("https://github.com/acme/widgets/pull/77");
-        assert!(watched.reads_alike(&unwatched, &unknown));
+        assert!(watched.reads_alike(&unwatched, &unknown.into()));
     }
 
     /// The one paragraph `markdown` parses to, with the fixture's labels.
@@ -1335,6 +1641,296 @@ mod tests {
         assert_eq!(
             &*inlines.tips[0].1,
             "#30\nState unknown · https://github.com/acme/widgets/pull/30"
+        );
+    }
+
+    /// The references `text` shows, as written.
+    fn shown_references(text: &str) -> Vec<&str> {
+        references(text, 0..text.len())
+            .map(|(range, _)| &text[range])
+            .collect()
+    }
+
+    #[test]
+    fn a_reference_is_a_whole_token_as_github_links_one() {
+        for (text, found) in [
+            ("#13076, with 6 brokers in beta.", ["#13076"].as_slice()),
+            ("(#12)", &["#12"]),
+            ("Fixed in #12.", &["#12"]),
+            ("#12: done", &["#12"]),
+            ("#12, #14's", &["#12", "#14"]),
+            ("#12.", &["#12"]),
+            ("\"#12\" and '#13'", &["#12", "#13"]),
+            ("acme/tools#4, then #5", &["acme/tools#4", "#5"]),
+            ("see Acme-Co/the.repo_v2#4", &["Acme-Co/the.repo_v2#4"]),
+            ("—#12", &["#12"]),
+        ] {
+            assert_eq!(shown_references(text), found, "{text}");
+        }
+        for text in [
+            "#13076abc",
+            "abc#12",
+            "é#12",
+            "##12",
+            "#0",
+            "#012",
+            "#12.5",
+            "#12/files",
+            "#12_x",
+            "&#12;",
+            "https://example.com/docs#12",
+            "example.com/#12",
+            "github.com/acme/tools#4",
+            "-acme/tools#4",
+            "acme-/tools#4",
+            "C#12",
+            "#",
+            "# 12",
+            "#1234567890123",
+        ] {
+            assert_eq!(shown_references(text), Vec::<&str>::new(), "{text}");
+        }
+        // The range bounds what is read; what is beside it still counts.
+        let text = "abc#12 #13";
+        assert_eq!(
+            references(text, 3..text.len())
+                .map(|(range, _)| &text[range])
+                .collect::<Vec<_>>(),
+            ["#13"]
+        );
+    }
+
+    const REFERENCES: &str = "Fixed by #20, see (#21) and acme/tools#4; #30 and #99 are issues.";
+
+    #[test]
+    fn a_known_reference_reads_and_opens_as_its_pull_request() {
+        let text = paragraph(REFERENCES);
+        let plain = text.plain();
+        assert_eq!(
+            &*plain,
+            "Fixed by \u{2007}\u{2007}#20\u{a0}Retry stalled daemon handshakes, \
+             see (\u{2007}\u{2007}#21\u{a0}Trim sidebar row padding) and \
+             \u{2007}\u{2007}Acme/\u{2060}Tools#4\u{a0}Old sidebar experiment; \
+             #30 and #99 are issues."
+        );
+        let style =
+            crate::design::markdown_settings(&cosmic::Theme::dark(), crate::design::TEXT_PROSE)
+                .style;
+        let spans = text.spans(style);
+        let linked = |address: &str| {
+            spans
+                .iter()
+                .filter(|span| span.link.as_deref() == Some(address))
+                .map(|span| span.text.as_ref())
+                .collect::<String>()
+        };
+        assert_eq!(
+            linked(OPEN),
+            "\u{2007}\u{2007}#20\u{a0}Retry stalled daemon handshakes"
+        );
+        assert_eq!(
+            linked("https://github.com/Acme/Tools/pull/4"),
+            "\u{2007}\u{2007}Acme/\u{2060}Tools#4\u{a0}Old sidebar experiment"
+        );
+        // Neither unknown number is a link: it may be an issue.
+        assert!(spans.iter().all(|span| {
+            span.link.is_none() || !(span.text.contains("#30") || span.text.contains("#99"))
+        }));
+        let inlines = text.inlines().expect("labelled references");
+        assert_eq!(
+            inlines
+                .glyphs
+                .iter()
+                .map(|(_, state)| *state)
+                .collect::<Vec<_>>(),
+            [
+                WorktreePullRequestState::Open,
+                WorktreePullRequestState::Merged,
+                WorktreePullRequestState::Closed
+            ]
+        );
+        assert_eq!(
+            &**inlines.tip(inlines.glyphs[0].0).unwrap(),
+            format!("#20 Retry stalled daemon handshakes\nOpen · {OPEN}")
+        );
+        // Copy gives back what the agent wrote, whole even when only part of
+        // a label is selected.
+        assert_eq!(copied(&text, 0..plain.len()), REFERENCES);
+        let within = plain.find("stalled").unwrap();
+        assert_eq!(copied(&text, within..within + 3), "#20");
+        let within = plain.find("sidebar experiment").unwrap();
+        assert_eq!(copied(&text, within..within + 3), "acme/tools#4");
+    }
+
+    #[test]
+    fn a_reference_to_the_chats_own_repository_reads_by_number() {
+        let text = paragraph("Landed as Acme/Widgets#21.");
+        assert_eq!(
+            &*text.plain(),
+            "Landed as \u{2007}\u{2007}#21\u{a0}Trim sidebar row padding."
+        );
+        assert_eq!(
+            copied(&text, 0..text.plain().len()),
+            "Landed as Acme/Widgets#21."
+        );
+    }
+
+    #[test]
+    fn a_reference_in_a_table_cell_or_emphasis_reads_as_its_label() {
+        let content = super::super::markdown::Content::parse_labelled(
+            "| Area | Status |\n| --- | --- |\n| Brokers | #20, with 6 brokers in beta. |",
+            Arc::new(fixture()),
+        );
+        let [super::super::markdown::Item::Table { rows, .. }] = content.items() else {
+            panic!("one table");
+        };
+        let [super::super::markdown::Item::Paragraph(cell)] = rows[0].cells[1].as_slice() else {
+            panic!("a paragraph cell");
+        };
+        assert_eq!(
+            &*cell.plain(),
+            "\u{2007}\u{2007}#20\u{a0}Retry stalled daemon handshakes, with 6 brokers in beta."
+        );
+        let text = paragraph("Merged in **#21**.");
+        assert!(text.plain().contains("#21\u{a0}Trim"), "{:?}", text.plain());
+    }
+
+    #[test]
+    fn a_reference_in_code_a_link_or_an_unknown_repository_stays_as_written() {
+        for source in [
+            "Run `git log --grep #20`.",
+            "[see #20](https://example.com/notes)",
+            "[#20](https://example.com/notes)",
+            "Not #20abc or abc#20.",
+            "See https://example.com/docs#20 there.",
+        ] {
+            let text = paragraph(source);
+            assert!(!text.plain().contains(GLYPH_SPACE), "{source}");
+            assert!(!text.plain().contains("Retry"), "{source}");
+        }
+        // Before the chat's repository is known, a bare number names nothing.
+        let content =
+            super::super::markdown::Content::parse_labelled("Fixed by #20.", Arc::default());
+        let [super::super::markdown::Item::Paragraph(text)] = content.items() else {
+            panic!("one paragraph");
+        };
+        assert_eq!(&*text.plain(), "Fixed by #20.");
+        assert!(text.inlines().is_none());
+        // A code block is the author's literal text.
+        let content = super::super::markdown::Content::parse_labelled(
+            "```\nFixed by #20\n```",
+            Arc::new(fixture()),
+        );
+        let [super::super::markdown::Item::CodeBlock { .. }] = content.items() else {
+            panic!("one code block: {:?}", content.items().len());
+        };
+    }
+
+    #[test]
+    fn a_message_names_every_number_it_might_mean() {
+        assert_eq!(
+            named("Fixed #20 and acme/tools#4 in `#7`; see #20 again, ##8 and #20abc."),
+            [
+                Named::Reference(Reference {
+                    repository: None,
+                    number: 20
+                }),
+                Named::Reference(Reference {
+                    repository: None,
+                    number: 4
+                }),
+                Named::Reference(Reference {
+                    repository: Some(("acme".into(), "tools".into())),
+                    number: 4
+                }),
+                Named::Reference(Reference {
+                    repository: None,
+                    number: 7
+                }),
+                Named::Reference(Reference {
+                    repository: None,
+                    number: 8
+                }),
+            ]
+        );
+        assert!(named("## Heading\n\nNo numbers, #only words.").is_empty());
+    }
+
+    #[test]
+    fn a_reference_relabels_when_its_pull_request_or_repository_becomes_known() {
+        let reference = |number| {
+            Named::Reference(Reference {
+                repository: None,
+                number,
+            })
+        };
+        let qualified = |number| {
+            Named::Reference(Reference {
+                repository: Some(("acme".into(), "tools".into())),
+                number,
+            })
+        };
+        let mut list = fixture_list();
+        let without = fixture::of(&list);
+        list.pull_requests.push(row(
+            "acme",
+            "widgets",
+            99,
+            Some(("Count brokers", PullRequestState::Open, false)),
+        ));
+        let with = fixture::of(&list);
+        assert!(!without.reads_alike(&with, &reference(99)), "now known");
+        assert!(without.reads_alike(&with, &reference(20)), "unchanged");
+        assert!(
+            without.reads_alike(&with, &reference(77)),
+            "known to neither"
+        );
+        assert!(without.reads_alike(&with, &qualified(4)), "unchanged");
+        // Without a repository a bare number means nothing, so learning the
+        // chat's repository relabels a known one and no other.
+        let unplaced = Labels::default();
+        assert!(!unplaced.reads_alike(&with, &reference(20)));
+        assert!(unplaced.reads_alike(&with, &reference(77)));
+        assert!(!unplaced.reads_alike(&with, &qualified(4)));
+        assert!(unplaced.reads_alike(&with, &qualified(5)));
+    }
+
+    #[test]
+    fn find_reads_a_known_reference_as_its_label() {
+        let labels = fixture();
+        assert_eq!(
+            rendition(REFERENCES, &labels).as_deref(),
+            Some(
+                "Fixed by #20\u{a0}Retry stalled daemon handshakes, see \
+                 (#21\u{a0}Trim sidebar row padding) and \
+                 Acme/\u{2060}Tools#4\u{a0}Old sidebar experiment; #30 and #99 are issues."
+            )
+        );
+        // Emphasis delimiters are not part of the words beside it.
+        assert_eq!(
+            rendition("Merged in **#21**.", &labels).as_deref(),
+            Some("Merged in **#21\u{a0}Trim sidebar row padding**.")
+        );
+        for source in [
+            "Run `git log --grep #20`.",
+            "Not #20abc or abc#20.",
+            "Unknown #30.",
+            "## Heading",
+        ] {
+            assert_eq!(rendition(source, &labels), None, "{source}");
+        }
+        assert_eq!(rendition("Fixed by #20.", &Labels::default()), None);
+        // An `owner/repo` holding an `h`, which an address would start with.
+        let mut list = fixture_list();
+        list.pull_requests.push(row(
+            "hashi",
+            "hub",
+            3,
+            Some(("Hub sync", PullRequestState::Open, false)),
+        ));
+        assert_eq!(
+            rendition("See hashi/hub#3.", &fixture::of(&list)).as_deref(),
+            Some("See hashi/\u{2060}hub#3\u{a0}Hub sync.")
         );
     }
 

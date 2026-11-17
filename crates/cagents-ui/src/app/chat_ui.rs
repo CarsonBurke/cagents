@@ -1835,9 +1835,10 @@ struct CachedItem {
     /// What a plain tool call's row says it did, read from its input once
     /// per change to the call rather than while drawing or regrouping.
     title: Option<tool_title::Title>,
-    /// The pull requests the prepared text links to, so a change of labels
-    /// finds what it relabels without reading any text.
-    pull_request_links: Box<[crate::github_identity::PullRequestKey]>,
+    /// The pull requests the prepared text links to or mentions by number,
+    /// so a change of labels finds what it relabels without reading any
+    /// text.
+    pull_request_links: Box<[pull_request_links::Named]>,
 }
 impl Drop for CachedItem {
     fn drop(&mut self) {

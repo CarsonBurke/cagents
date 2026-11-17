@@ -41,8 +41,8 @@ pub(super) struct Prepared {
     disposed: Option<std::sync::mpsc::Sender<std::thread::ThreadId>>,
 }
 impl Prepared {
-    /// The pull requests the texts this card parses link to.
-    pub(super) fn links(&self) -> Vec<crate::github_identity::PullRequestKey> {
+    /// The pull requests the texts this card parses link to or mention.
+    pub(super) fn links(&self) -> Vec<super::pull_request_links::Named> {
         let reading = &self.reading;
         let prompts: Vec<&str> = match &reading.kind {
             Kind::Message(message) => message.body.inline().into_iter().collect(),
