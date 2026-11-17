@@ -336,15 +336,17 @@ build_in_checkout() {
     evidence_arguments=$(build_arguments) && [ -n "$evidence_arguments" ] ||
         die "could not ask $tool_source what native-evidence builds"
     [ "$(tree_of "$checkout")" = "$tree" ] || die "$checkout changed while it was copied; build it again"
-    # One slot for the three, as scripts/run-development holds it.
+    # One slot for the three, as scripts/run-development holds it. This
+    # tool's scripts/cargo-lane runs the checkout's gate, so its vendored
+    # crates' warnings are counted, not shown, as the runner's are.
     # shellcheck disable=SC2016 # Expanded by the inner shell.
     (cd -- "$checkout" && scripts/cargo-gate exec --hold bash -ec '
-        gate=$1
+        lane=$1 gate=$2
         while IFS= read -r arguments; do
             # Deliberately one word per argument.
-            "$gate" build $arguments
-        done <<<"$2"
-    ' build-evidence "$checkout/scripts/cargo-gate" "$evidence_arguments") ||
+            "$lane" --allow-warnings --gate "$gate" build $arguments
+        done <<<"$3"
+    ' build-evidence "$tool_root/scripts/cargo-lane" "$checkout/scripts/cargo-gate" "$evidence_arguments") ||
         die "could not build $checkout; see the build's messages above"
     [ "$(tree_of "$checkout")" = "$tree" ] || die "$checkout changed during its build; build it again"
     # Where the gate brought them, which Cargo's configuration may move.
