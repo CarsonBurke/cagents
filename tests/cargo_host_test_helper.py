@@ -16,6 +16,8 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 HELPER = "CAGENTS_TEST_RETAINED_ACTOR_HELPER"
+# Bounds only a hang: every wait it guards returns as soon as what it waits for happens.
+HANG_GUARD = 60
 
 
 def compiled(events):
@@ -67,7 +69,9 @@ elif arguments[0] == "build":
     if mode == "blocking-build":
         import time
         (root / "build-pid").write_text(str(os.getpid()))
-        time.sleep(30)
+        # Ended by its gate's cancellation; longer than the test's hang guard,
+        # this bounds only a test that never cancels it.
+        time.sleep(600)
     if mode == "failure":
         # Malformed output must not hide Cargo's own failure status.
         print("[]")
@@ -104,7 +108,7 @@ elif arguments[0] in ("test", "t"):
             command = [sys.executable, "-I", str(ROOT / "scripts/cargo-host-test-helper.py"),
                        str(self.cargo), *arguments]
         result = subprocess.run(command, cwd=self.root, env=self.env | (extra or {}),
-                                capture_output=True, text=True, timeout=30)
+                                capture_output=True, text=True, timeout=HANG_GUARD)
         events = [json.loads(line) for line in self.events.read_text().splitlines()] \
             if self.events.exists() else []
         return result, events
@@ -132,7 +136,7 @@ elif arguments[0] in ("test", "t"):
                    "test", "--no-default-features", "--features", "host"]
         environment = self.env | {"MAKEFLAGS": f"-j --jobserver-auth={reader},{writer}"}
         result = subprocess.run(command, cwd=self.root, env=environment, pass_fds=(reader, writer),
-                                capture_output=True, text=True, timeout=30)
+                                capture_output=True, text=True, timeout=HANG_GUARD)
         self.assertEqual(result.returncode, 0, result.stderr)
         seen = [json.loads(line) for line in (self.root / "jobserver.jsonl").read_text().splitlines()]
         self.assertEqual(seen, [["metadata", True], ["build", True]])
@@ -225,7 +229,7 @@ elif arguments[0] in ("test", "t"):
                                  start_new_session=True)
         compiler = None
         try:
-            deadline = time.monotonic() + 10
+            deadline = time.monotonic() + HANG_GUARD
             while not build_pid.exists() or not build_pid.read_text():
                 self.assertIsNone(child.poll(), "gate exited before helper compilation")
                 self.assertLess(time.monotonic(), deadline, "helper build did not start")
@@ -233,7 +237,7 @@ elif arguments[0] in ("test", "t"):
             compiler = int(build_pid.read_text())
             child.send_signal(signal.SIGTERM)
             # The gate ends as the signal it was sent.
-            self.assertEqual(child.wait(timeout=15), -signal.SIGTERM)
+            self.assertEqual(child.wait(timeout=HANG_GUARD), -signal.SIGTERM)
             self.assertFalse(Path(f"/proc/{compiler}").exists(), "helper compiler outlived its gate")
             with open(self.root / "lock", "a") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -274,7 +278,7 @@ elif arguments[0] in ("test", "t"):
             child.stdin.flush()
             # The agent cancels when its connection's stdin closes. Keep that
             # pipe open until the fake Cargo finishes, as a real offload does.
-            status = child.wait(timeout=30)
+            status = child.wait(timeout=HANG_GUARD)
             output = child.stdout.read().decode()
             error = child.stderr.read().decode()
             self.assertEqual(status, 0, error)
@@ -295,11 +299,13 @@ elif arguments[0] in ("test", "t"):
         installed = self.root / "installed"
         installed.mkdir()
         result = subprocess.run([str(ROOT / "scripts/install-cargo-gate"), str(installed)],
-                                cwd=self.root, env=self.env, capture_output=True, text=True, timeout=30)
+                                cwd=self.root, env=self.env, capture_output=True, text=True,
+                                timeout=HANG_GUARD)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((installed / "cargo_artifacts.py").is_file())
         result = subprocess.run([str(installed / "cagents-cargo-gate"), "test", "--features=host"],
-                                cwd=self.root, env=self.env, capture_output=True, text=True, timeout=30)
+                                cwd=self.root, env=self.env, capture_output=True, text=True,
+                                timeout=HANG_GUARD)
         self.assertEqual(result.returncode, 0, result.stderr)
         events = [json.loads(line) for line in self.events.read_text().splitlines()]
         self.assertEqual([event["args"][0] for event in events if event["args"][0] != "metadata"],

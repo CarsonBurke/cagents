@@ -3,6 +3,7 @@
 
 import fcntl
 import os
+import select
 import shutil
 from pathlib import Path
 import subprocess
@@ -13,6 +14,16 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 GUARD = ROOT / "scripts/build-disk-guard"
+# Bounds only a hang: every wait it guards returns as soon as what it waits for happens.
+HANG_GUARD = 60
+
+
+def until(path):
+    """Shell that waits for `path` to exist. It gives up once the test's
+    directory has gone, or after twice the hang guard, so that a stand-in
+    started late or a failed test leaves nothing running for long."""
+    return (f'i=0; while [ ! -e "{path}" ] && [ -d "{path.parent}" ] && '
+            f'[ $i -lt {HANG_GUARD * 20} ]; do sleep 0.1; i=$((i + 1)); done\n')
 
 
 class BuildDiskGuard(unittest.TestCase):
@@ -39,7 +50,7 @@ class BuildDiskGuard(unittest.TestCase):
         return subprocess.run(
             [str(guard), str(directory or self.root / "absent/build/target")],
             env={**self.env, "CAGENTS_BUILD_FREE_FLOOR_GIB": str(floor)},
-            capture_output=True, text=True, timeout=60,
+            capture_output=True, text=True, timeout=HANG_GUARD,
         )
 
     def prunes(self):
@@ -134,7 +145,14 @@ class BuildDiskGuard(unittest.TestCase):
         del self.env["CAGENTS_BUILD_PRUNE"]
         return guard, calls
 
-    def calls(self, path, count, timeout=10):
+    def release(self):
+        """A file whose creation lets a stand-in waiting `until` it go on;
+        made at the latest when the test ends."""
+        go = self.root / "go"
+        self.addCleanup(go.touch)
+        return go
+
+    def calls(self, path, count, timeout=HANG_GUARD):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             lines = path.read_text().splitlines() if path.exists() else []
@@ -151,7 +169,7 @@ class BuildDiskGuard(unittest.TestCase):
         result = subprocess.run(
             [str(guard), str(self.root)], cwd=checkout,
             env={**self.env, "CAGENTS_BUILD_FREE_FLOOR_GIB": str(10**9)},
-            capture_output=True, text=True, timeout=60)
+            capture_output=True, text=True, timeout=HANG_GUARD)
         self.assertEqual(result.returncode, 2)
         self.assertIn("reclaiming unused build directories", result.stderr)
         # A complete run in the background, and the one the build waits for.
@@ -215,10 +233,12 @@ class BuildDiskGuard(unittest.TestCase):
         return free * 2 // 3
 
     def test_running_low_the_pruner_runs_in_the_background(self):
-        guard, calls = self.stand_in_pruner(then="sleep 3\n")
-        started = time.monotonic()
+        # Held until the guard has returned, which it could not do in time
+        # if it waited for the pruner.
+        go = self.release()
+        guard, calls = self.stand_in_pruner(then=until(go))
         result = self.guard(self.band(), guard=guard)
-        self.assertLess(time.monotonic() - started, 2)
+        go.touch()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("reclaiming unused build directories in the background", result.stderr)
         (call,) = self.calls(calls, 1)
@@ -267,7 +287,10 @@ class BuildDiskGuard(unittest.TestCase):
         guard, calls = self.stand_in_pruner()
         trims = self.root / "trims"
         offload = guard.with_name("cargo-offload")
-        offload.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> {trims}\nsleep 5\n')
+        # Held until the guard has returned, which it could not do in time
+        # if it waited for the trim.
+        go = self.release()
+        offload.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> {trims}\n{until(go)}')
         offload.chmod(0o755)
         # Every command the guard could find but timeout.
         tools = self.root / "tools"
@@ -284,14 +307,13 @@ class BuildDiskGuard(unittest.TestCase):
                     target.symlink_to(entry.path)
         self.assertTrue((tools / "dangling-command").is_symlink())
         self.assertFalse((tools / "dangling-command").exists())
-        started = time.monotonic()
         result = subprocess.run(
             [str(guard), str(self.root / "absent/build/target")],
             env={**self.env, "PATH": str(tools), "CAGENTS_BUILD_FREE_FLOOR_GIB": str(10**9)},
-            capture_output=True, text=True, timeout=60,
+            capture_output=True, text=True, timeout=HANG_GUARD,
         )
+        go.touch()
         self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertLess(time.monotonic() - started, 4)
         self.assertEqual(self.calls(trims, 2), [f"--trim-slots {10**9}"] * 2)
 
     def test_a_reclaim_command_of_its_own_leaves_offload_slots_alone(self):
@@ -307,39 +329,46 @@ class BuildDiskGuard(unittest.TestCase):
         # As the real trim closes what it inherited as it starts, and then
         # runs on; the shell that starts it must not hold them meanwhile.
         guard, calls = self.stand_in_pruner(then="exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&-\n")
+        # The trim runs on until the pipe has closed, which it would hold
+        # open if it kept the build's descriptors.
+        go = self.release()
         offload = guard.with_name("cargo-offload")
-        offload.write_text("#!/bin/sh\nexec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&-\nsleep 5\n")
+        offload.write_text(f"#!/bin/sh\nexec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&-\n{until(go)}")
         offload.chmod(0o755)
         read, write = os.pipe()
-        started = time.monotonic()
         with subprocess.Popen([str(guard), str(self.root)], pass_fds=(write,),
                               env={**self.env, "CAGENTS_BUILD_FREE_FLOOR_GIB": str(self.band())},
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as guarding:
             os.close(write)
-            self.assertEqual(guarding.wait(timeout=30), 0)
+            self.assertEqual(guarding.wait(timeout=HANG_GUARD), 0)
             self.calls(calls, 1)
             # The pipe closes once nothing of the build's holds it.
+            self.assertTrue(select.select([read], [], [], HANG_GUARD)[0], "the trim kept the pipe")
             self.assertEqual(os.read(read, 1), b"")
+        go.touch()
         os.close(read)
-        self.assertLess(time.monotonic() - started, 4)
 
     def test_the_background_run_keeps_none_of_the_builds_descriptors(self):
         # As the real pruner closes what it inherited, and then runs on.
+        # The pruner runs on until the pipe has closed, which it would hold
+        # open if it kept the build's descriptors.
+        go = self.release()
         guard, calls = self.stand_in_pruner(
-            then="exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&-\nsleep 5\n")
+            then=f"exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&-\n{until(go)}")
         self.env["CAGENTS_BUILD_PRUNE_INTERVAL_HOURS"] = "6"
         # Like `flock FILE command`, which passes its lock to the command.
         read, write = os.pipe()
-        started = time.monotonic()
         with os.fdopen(read, "rb") as reader:
             result = subprocess.run(
                 [str(guard), str(self.root / "absent/target")], pass_fds=(write,),
                 env={**self.env, "CAGENTS_BUILD_FREE_FLOOR_GIB": "1"},
-                capture_output=True, timeout=20)
+                capture_output=True, timeout=HANG_GUARD)
             os.close(write)
             self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(select.select([reader], [], [], HANG_GUARD)[0],
+                            "the pruner kept the pipe")
             self.assertEqual(reader.read(), b"")
-        self.assertLess(time.monotonic() - started, 4)
+        go.touch()
         self.calls(calls, 1)
 
     def test_a_build_directory_in_use_is_marked_so(self):
@@ -388,18 +417,18 @@ class BuildDiskGuard(unittest.TestCase):
         guard = self.alone()
         pruner = guard.with_name("prune-build-dirs")
         pidfile = self.root / "pruner.pid"
-        pruner.write_text(f'#!/bin/sh\necho $$ > {pidfile}\nexec sleep 30\n')
+        # Outlasting the hang guard, so that the guard returning at all shows
+        # it did not wait for the prune.
+        pruner.write_text(f'#!/bin/sh\necho $$ > {pidfile}\nexec sleep {2 * HANG_GUARD}\n')
         pruner.chmod(0o755)
         del self.env["CAGENTS_BUILD_PRUNE"]
         self.env["CAGENTS_BUILD_PRUNE_INTERVAL_HOURS"] = "6"
-        started = time.monotonic()
         result = subprocess.run(
             [str(guard), str(self.root)],
             env={**self.env, "CAGENTS_BUILD_FREE_FLOOR_GIB": "1"},
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=HANG_GUARD)
         self.assertEqual(result.returncode, 0)
-        self.assertLess(time.monotonic() - started, 10)
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + HANG_GUARD
         while not pidfile.exists() and time.monotonic() < deadline:
             time.sleep(0.05)
         os.kill(int(pidfile.read_text()), 9)
@@ -419,22 +448,48 @@ class BuildDiskGuard(unittest.TestCase):
                 del self.env[name]
 
     def test_a_build_waits_for_another_builds_reclaim(self):
-        self.env["CAGENTS_BUILD_PRUNE"] = f"sleep 2; echo pruned >> {self.pruned}"
-        first = subprocess.Popen(
-            [str(GUARD), str(self.root)],
-            env={**self.env, "CAGENTS_BUILD_FREE_FLOOR_GIB": str(10**9)},
-            stderr=subprocess.PIPE, text=True,
-        )
+        # The first build's reclaim holds until the second is seen waiting for it.
+        reclaiming, go = self.root / "reclaiming", self.release()
+        self.env["CAGENTS_BUILD_PRUNE"] = (f"touch {reclaiming}; {until(go)}"
+                                           f"echo pruned >> {self.pruned}")
+        environment = {**self.env, "CAGENTS_BUILD_FREE_FLOOR_GIB": str(10**9)}
+        first = subprocess.Popen([str(GUARD), str(self.root)], env=environment,
+                                 stderr=subprocess.PIPE, text=True)
         self.addCleanup(first.kill)
-        time.sleep(0.5)
-        started = time.monotonic()
-        result = self.guard(10**9)
-        self.assertGreaterEqual(time.monotonic() - started, 1)
-        self.assertIn("waiting for another build", result.stderr)
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(first.wait(timeout=30), 2)
+        self.wait_for(reclaiming.exists, "the first build's reclaim")
+        second = subprocess.Popen([str(GUARD), str(self.root)], env=environment,
+                                  stderr=subprocess.PIPE, text=True)
+        self.addCleanup(second.kill)
+        self.wait_for(lambda: self.waits_for_the_reclaim(second.pid), "the second build to wait")
+        go.touch()
+        _, stderr = second.communicate(timeout=HANG_GUARD)
+        self.assertIn("waiting for another build", stderr)
+        self.assertEqual(second.returncode, 2)
+        self.assertEqual(first.wait(timeout=HANG_GUARD), 2)
         first.stderr.close()
         self.assertEqual(self.prunes(), 1)
+
+    def wait_for(self, predicate, label):
+        deadline = time.monotonic() + HANG_GUARD
+        while not predicate():
+            self.assertLess(time.monotonic(), deadline, f"timed out waiting for {label}")
+            time.sleep(0.05)
+
+    @staticmethod
+    def waits_for_the_reclaim(guard):
+        """Whether the guard's flock on the reclaim lock is waiting."""
+        try:
+            children = Path(f"/proc/{guard}/task/{guard}/children").read_text().split()
+        except OSError:
+            return False
+        for child in children:
+            try:
+                arguments = Path(f"/proc/{child}/cmdline").read_bytes().split(b"\0")
+            except OSError:
+                continue
+            if arguments[:3] == [b"flock", b"-w", b"900"]:
+                return True
+        return False
 
     def test_the_gate_refuses_before_admitting(self):
         gate = self.root / "gate"
@@ -445,7 +500,7 @@ class BuildDiskGuard(unittest.TestCase):
             [str(gate / "cargo-gate"), "exec", "sh", "-c", "echo admitted"],
             cwd=ROOT, env={**self.env, "CAGENTS_BUILD_FREE_FLOOR_GIB": str(10**9),
                            "CAGENTS_BUILD_SLOT_HELD": ""},
-            capture_output=True, text=True, timeout=60,
+            capture_output=True, text=True, timeout=HANG_GUARD,
         )
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertNotIn("admitted", result.stdout)
@@ -468,7 +523,7 @@ class InstallCargoGate(unittest.TestCase):
     def test_installs_the_gate_with_every_helper(self):
         result = subprocess.run(
             [str(ROOT / "scripts/install-cargo-gate"), str(self.root)],
-            env=self.env, capture_output=True, text=True, timeout=60,
+            env=self.env, capture_output=True, text=True, timeout=HANG_GUARD,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         names = ["build-disk-guard", "build-host", "cagents-cargo-gate", "cargo-gate-command.py",
@@ -489,27 +544,27 @@ class InstallCargoGate(unittest.TestCase):
 
     def test_an_installation_leaves_the_running_one_whole(self):
         install = [str(ROOT / "scripts/install-cargo-gate"), str(self.root)]
-        subprocess.run(install, env=self.env, check=True, capture_output=True, timeout=60)
+        subprocess.run(install, env=self.env, check=True, capture_output=True, timeout=HANG_GUARD)
         (first,) = (self.root / "cagents-cargo-gate.d").iterdir()
         contents = {path.name: path.read_bytes() for path in first.iterdir()}
-        subprocess.run(install, env=self.env, check=True, capture_output=True, timeout=60)
+        subprocess.run(install, env=self.env, check=True, capture_output=True, timeout=HANG_GUARD)
         self.assertEqual({path.name: path.read_bytes() for path in first.iterdir()}, contents)
         self.assertNotEqual((self.root / "cagents-cargo-gate").resolve().parent, first)
 
     def test_an_installation_replaced_long_ago_is_removed_and_a_recent_one_kept(self):
         install = [str(ROOT / "scripts/install-cargo-gate"), str(self.root)]
         versions = self.root / "cagents-cargo-gate.d"
-        subprocess.run(install, env=self.env, check=True, capture_output=True, timeout=60)
+        subprocess.run(install, env=self.env, check=True, capture_output=True, timeout=HANG_GUARD)
         (old,) = versions.iterdir()
         ancient = time.time() - 30 * 86400
         os.utime(old, (ancient, ancient))
         # Made long ago, replaced just now: running builds may still use it.
-        subprocess.run(install, env=self.env, check=True, capture_output=True, timeout=60)
+        subprocess.run(install, env=self.env, check=True, capture_output=True, timeout=HANG_GUARD)
         self.assertTrue(old.is_dir())
         (replaced,) = set(versions.iterdir()) - {old}
         os.utime(old, (ancient, ancient))
         os.utime(replaced, (ancient, ancient))
-        subprocess.run(install, env=self.env, check=True, capture_output=True, timeout=60)
+        subprocess.run(install, env=self.env, check=True, capture_output=True, timeout=HANG_GUARD)
         self.assertFalse(old.exists())
         self.assertTrue(replaced.is_dir())
 
@@ -528,7 +583,7 @@ class InstallCargoGate(unittest.TestCase):
         (installed / "cagents-cargo-gate").write_text("previous\n")
         result = subprocess.run(
             [str(scripts / "install-cargo-gate"), str(installed)],
-            env=self.env, capture_output=True, text=True, timeout=60,
+            env=self.env, capture_output=True, text=True, timeout=HANG_GUARD,
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("did not run a command", result.stderr)

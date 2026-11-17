@@ -36,6 +36,9 @@ fixture_custody = importlib.util.module_from_spec(_custody_spec)
 _custody_spec.loader.exec_module(fixture_custody)
 FixtureDirectory = fixture_custody.FixtureDirectory
 
+# Bounds only a hang: every wait it guards returns as soon as what it waits for happens.
+HANG_GUARD = 60
+
 _loader = importlib.machinery.SourceFileLoader("build_host", str(ROOT / "scripts/build-host"))
 build_host = importlib.util.module_from_spec(importlib.util.spec_from_loader("build_host", _loader))
 _loader.exec_module(build_host)
@@ -133,7 +136,7 @@ class BuildHostFixture(unittest.TestCase):
                 return True
         return False
 
-    def wait_for(self, predicate, label, timeout=5):
+    def wait_for(self, predicate, label, timeout=HANG_GUARD):
         deadline = time.monotonic() + timeout
         while not predicate():
             if time.monotonic() >= deadline:
@@ -146,7 +149,7 @@ class BuildHostFixture(unittest.TestCase):
 
     def run_host(self, kind, *arguments, env=None):
         return self.scope.run([str(self.build_host), kind, *arguments], env=env or self.env,
-                              cwd=self.root, capture_output=True, text=True, timeout=20)
+                              cwd=self.root, capture_output=True, text=True, timeout=HANG_GUARD)
 
     def held_build(self, name, shares, *options):
         """A `build` holding `shares` until the file `name` exists."""
@@ -163,7 +166,7 @@ class BuildHostFixture(unittest.TestCase):
     def finish(self, process, name=None):
         if name:
             (self.root / name).touch()
-        stdout, stderr = process.communicate(timeout=10)
+        stdout, stderr = process.communicate(timeout=HANG_GUARD)
         return process.returncode, stdout, stderr
 
 
@@ -199,7 +202,7 @@ class Admission(BuildHostFixture):
         second.close()
 
     def test_the_head_of_the_queue_is_not_overtaken_by_a_smaller_build(self):
-        for options in ((), ("--wait-seconds", "30")):
+        for options in ((), ("--wait-seconds", str(10 * HANG_GUARD))):
             with self.subTest(waiting_with_a_deadline=bool(options)):
                 (self.root / "calls.jsonl").unlink(missing_ok=True)
                 first, second = self.hold(self.share(0)), self.hold(self.share(1))
@@ -227,7 +230,7 @@ class Admission(BuildHostFixture):
 
     def test_waiters_start_in_the_order_they_arrived(self):
         env = self.env | {"CAGENTS_BUILD_SLOTS": "1"}
-        for options in ((), ("--wait-seconds", "30")):
+        for options in ((), ("--wait-seconds", str(10 * HANG_GUARD))):
             with self.subTest(waiting_with_a_deadline=bool(options)):
                 (self.root / "calls.jsonl").unlink(missing_ok=True)
                 share = self.hold(self.lock)
@@ -549,7 +552,7 @@ while True:
     def test_what_ignores_the_interrupt_ends_with_the_command(self):
         # A shell's background job ignores Ctrl-C; once the shell has gone,
         # nothing would be left to end it.
-        build = self.start("build", "--", "/bin/sh", "-c", 'sleep 30 & echo $! >"$1"; wait', "script",
+        build = self.start("build", "--", "/bin/sh", "-c", 'sleep infinity & echo $! >"$1"; wait', "script",
                            str(self.root / "background"))
         self.wait_for((self.root / "background").exists, "the background job")
         self.wait_for(lambda: (self.root / "background").read_text().strip(), "its process ID")
@@ -558,7 +561,8 @@ while True:
         build.send_signal(signal.SIGTERM)
         status, _stdout, stderr = self.finish(build)
         self.assertEqual(status, -signal.SIGTERM, stderr)
-        self.assertTrue(select.select([background], [], [], 2)[0], "the background job outlived its build")
+        self.assertTrue(select.select([background], [], [], HANG_GUARD)[0],
+                        "the background job outlived its build")
 
     def test_a_signal_while_waiting_ends_the_wait_and_releases_only_its_own(self):
         other = self.hold(self.lock)
@@ -580,15 +584,23 @@ while True:
         # In this process, with build-host's clock fifty times as fast, so
         # its five-second grace passes in a tenth of one.
         ready = self.root / "ready"
-        command = ["/bin/sh", "-c", 'trap "" INT; touch "$1"; exec sleep 30', "ignoring", str(ready)]
-        clock = types.SimpleNamespace(monotonic=lambda: time.monotonic() * 50,
-                                      monotonic_ns=time.monotonic_ns, sleep=time.sleep)
+        # Outlasting the hang guard, so that returning within it shows the
+        # command was killed rather than left to finish.
+        command = ["/bin/sh", "-c", f'trap "" INT; touch "$1"; exec sleep {2 * HANG_GUARD}', "ignoring",
+                   str(ready)]
+        readings = []
+
+        def fast():
+            readings.append(True)
+            return time.monotonic() * 50
+
+        clock = types.SimpleNamespace(monotonic=fast, monotonic_ns=time.monotonic_ns, sleep=time.sleep)
         early = []
         previous = signal.signal(signal.SIGTERM, lambda *_: early.append(True))
         self.addCleanup(signal.signal, signal.SIGTERM, previous)
 
         def interrupt():
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + HANG_GUARD
             while not ready.exists() and time.monotonic() < deadline:
                 time.sleep(0.01)
             time.sleep(0.1)
@@ -603,7 +615,10 @@ while True:
         sender.join()
         self.assertEqual(early, [])
         self.assertEqual(raised.exception.number, signal.SIGTERM)
-        self.assertLess(time.monotonic() - started, 3)
+        self.assertLess(time.monotonic() - started, HANG_GUARD)
+        # The grace was measured on the module's clock: once when the
+        # interrupt came, and again when it ran out.
+        self.assertGreaterEqual(len(readings), 2)
         self.assertIs(signal.getsignal(signal.SIGTERM).__class__, types.FunctionType)
 
 
@@ -679,7 +694,7 @@ class Jobserver(unittest.TestCase):
 
     def take(self, jobserver, count):
         """Takes `count` tokens as the build's compilers would, waiting for each."""
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + HANG_GUARD
         while count:
             try:
                 got = len(os.read(jobserver.client.reader, count))
@@ -701,7 +716,7 @@ class Jobserver(unittest.TestCase):
             jobserver.stocker.join()
 
     def wait_for(self, predicate, label):
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + HANG_GUARD
         while not predicate():
             self.assertLess(time.monotonic(), deadline, f"timed out waiting for {label}")
             time.sleep(0.002)
