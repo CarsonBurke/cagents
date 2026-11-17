@@ -4768,8 +4768,12 @@ pub(in crate::app) mod tests {
         let _ = app.handle_project_action(Action::ConfirmDelete);
         loaded(&mut app, picked, picked_listing, true);
         assert_ne!(app.active_workspace.as_ref(), Some(&linked_path));
+        // The update that refused it reported why.
         assert_eq!(
-            app.status.as_ref().map(|notice| notice.message.as_str()),
+            app.notices
+                .recent()
+                .next()
+                .map(|entry| entry.notice.message.as_str()),
             Some("That worktree is being deleted.")
         );
         git(

@@ -564,8 +564,8 @@ mod tests {
             );
             let _ = app.update_chrome(Action::RenameChanged(" New name ".into()));
             let close = match dismissal {
-                0 => app
-                    .chrome_key_event(&keyboard::Event::KeyPressed {
+                0 => {
+                    app.chrome_key_event(&keyboard::Event::KeyPressed {
                         key: keyboard::Key::Named(keyboard::key::Named::Escape),
                         modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
                         physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
@@ -574,7 +574,9 @@ mod tests {
                         text: None,
                         repeat: false,
                     })
-                    .expect("rename handles Escape"),
+                    .expect("rename handles Escape")
+                    .0
+                }
                 1 => app.update_chrome(Action::RenameCancel),
                 _ => app.update_chrome(Action::RenameSubmit),
             };
@@ -2182,12 +2184,18 @@ impl Cagents {
     }
 
     /// Keep Tab traversal and global shortcuts inside the open popup.
-    pub(super) fn chrome_key_event(&mut self, event: &keyboard::Event) -> Option<Task<Message>> {
+    /// Answers a key a rename or an open popup owns, with the projection
+    /// the answer needs: typing into the rename and moving focus within a
+    /// popup project nothing. `None` when neither owns the key.
+    pub(super) fn chrome_key_event(
+        &mut self,
+        event: &keyboard::Event,
+    ) -> Option<(Task<Message>, Projection)> {
         if self.chrome_ui.rename.is_some() {
             if is_escape_press(event) {
-                return Some(self.update_chrome(Action::RenameCancel));
+                return Some((self.update_chrome(Action::RenameCancel), Projection::Full));
             }
-            return Some(Task::none());
+            return Some((Task::none(), Projection::Unchanged));
         }
         let popup = self.chrome_ui.popup?;
         if self.modal_is_open() {
@@ -2195,7 +2203,7 @@ impl Cagents {
             return None;
         }
         if is_escape_press(event) {
-            return Some(self.update_chrome(Action::Close));
+            return Some((self.update_chrome(Action::Close), Projection::Full));
         }
         let backwards = is_tab_press(event).or_else(|| match event {
             keyboard::Event::KeyPressed {
@@ -2217,9 +2225,9 @@ impl Cagents {
             } else {
                 (self.chrome_ui.focus_index + 1) % count
             };
-            return Some(self.focus_popup_control(ring));
+            return Some((self.focus_popup_control(ring), Projection::Unchanged));
         }
-        Some(Task::none())
+        Some((Task::none(), Projection::Unchanged))
     }
 
     /// Every control the open popup draws, in the order it draws them, so

@@ -500,7 +500,14 @@ impl Cagents {
         self.palette.recording.is_some() || self.palette.filtering_key
     }
 
-    pub(super) fn palette_key_event(&mut self, event: &keyboard::Event) -> Option<Task<Message>> {
+    /// Answers a key the palette or its shortcut recorder owns, with the
+    /// projection the answer needs: one that moves only the palette's own
+    /// selection or focus, or changes nothing, projects nothing. `None`
+    /// when the key is not the palette's.
+    pub(super) fn palette_key_event(
+        &mut self,
+        event: &keyboard::Event,
+    ) -> Option<(Task<Message>, Projection)> {
         if self.palette_records_keys() {
             // Recording is globally visible, but a real dialog owns its
             // key before the recording or settings draft can change.
@@ -512,7 +519,7 @@ impl Cagents {
                 self.palette.filtering_key = false;
                 self.palette.reassign = None;
                 self.palette.recording_error = None;
-                return Some(self.return_recorder_focus());
+                return Some((self.return_recorder_focus(), Projection::Full));
             }
             // A pending Reassign is reached with the keyboard: Tab and
             // Shift+Tab move focus to it rather than being recorded, which
@@ -522,10 +529,11 @@ impl Cagents {
                 && is_tab_press(event).is_some()
             {
                 self.palette.focus_return = Some(*field);
-                return Some(
+                return Some((
                     iced::widget::operation::focus(widget::Id::new(REASSIGN_BUTTON))
                         .map(cosmic::Action::App),
-                );
+                    Projection::Unchanged,
+                ));
             }
             if let keyboard::Event::KeyPressed {
                 key,
@@ -589,14 +597,15 @@ impl Cagents {
                         // Match the event, rather than one spelling: a shifted
                         // number key can trigger both digit and symbol chords.
                         self.palette.pressed_key_filter = Some(event.clone());
-                        return Some(task);
+                        return Some((task, Projection::Full));
                     }
-                    return Some(
+                    return Some((
                         self.record_shortcut(
                             self.palette.recording.expect("recording field"),
                             chord,
                         ),
-                    );
+                        Projection::Full,
+                    ));
                 }
                 if matches!(key, keyboard::Key::Character(_)) {
                     self.palette.recording_error = Some(
@@ -605,11 +614,11 @@ impl Cagents {
                     );
                 }
             }
-            return Some(Task::none());
+            return Some((Task::none(), Projection::Unchanged));
         }
         self.palette.query.as_ref()?;
         if is_escape_press(event) {
-            return Some(self.update_palette(Action::Close));
+            return Some((self.update_palette(Action::Close), Projection::Full));
         }
         if let keyboard::Event::KeyPressed {
             key: keyboard::Key::Named(key),
@@ -625,18 +634,20 @@ impl Cagents {
                 keyboard::key::Named::ArrowDown if count > 0 => {
                     let next = selected.map_or(0, |index| (index + 1) % count);
                     self.palette.selected = EntryIdentity::capture(&entries[next].2);
-                    return Some(self.reveal_palette_selection());
+                    return Some((self.reveal_palette_selection(), Projection::Unchanged));
                 }
                 keyboard::key::Named::ArrowUp if count > 0 => {
                     let next = selected.map_or(count - 1, |index| (index + count - 1) % count);
                     self.palette.selected = EntryIdentity::capture(&entries[next].2);
-                    return Some(self.reveal_palette_selection());
+                    return Some((self.reveal_palette_selection(), Projection::Unchanged));
                 }
-                keyboard::key::Named::Enter => return Some(self.update_palette(Action::Submit)),
+                keyboard::key::Named::Enter => {
+                    return Some((self.update_palette(Action::Submit), Projection::Full));
+                }
                 _ => {}
             }
         }
-        Some(Task::none())
+        Some((Task::none(), Projection::Unchanged))
     }
 
     fn record_shortcut(&mut self, field: SettingsField, chord: String) -> Task<Message> {
@@ -3026,7 +3037,8 @@ mod settings_recorder_tests {
             drop(app.update_palette(Action::Record(field)));
             drop(
                 app.palette_key_event(&pressed)
-                    .expect("recorder owns the key"),
+                    .expect("recorder owns the key")
+                    .0,
             );
             assert!(app.palette.recording_error.is_none());
             assert!(
@@ -3039,7 +3051,8 @@ mod settings_recorder_tests {
             drop(app.update_palette(Action::FilterKey));
             drop(
                 app.palette_key_event(&pressed)
-                    .expect("pressed-key filter owns the key"),
+                    .expect("pressed-key filter owns the key")
+                    .0,
             );
             assert_eq!(app.settings_search, chord);
             assert!(!app.palette.filtering_key);
@@ -3061,7 +3074,8 @@ mod settings_recorder_tests {
         let interrupt = event("с", keyboard::key::Code::KeyC, keyboard::Modifiers::CTRL);
         drop(
             app.palette_key_event(&interrupt)
-                .expect("recorder owns the key"),
+                .expect("recorder owns the key")
+                .0,
         );
         assert!(
             app.palette
@@ -3195,7 +3209,7 @@ mod settings_recorder_tests {
                 keyboard::key::Code::Tab,
                 modifiers,
             );
-            let task = app.palette_key_event(&tab).expect("the recorder owns Tab");
+            let (task, _) = app.palette_key_event(&tab).expect("the recorder owns Tab");
             assert!(
                 app.palette.reassign.is_some(),
                 "Tab moves toward Reassign instead of being recorded"
@@ -3307,7 +3321,7 @@ mod settings_recorder_tests {
             repeat: false,
         };
         drop(app.palette_key_event(&key(keyboard::key::Named::Tab, keyboard::key::Code::Tab)));
-        let task = app
+        let (task, _) = app
             .palette_key_event(&key(
                 keyboard::key::Named::Escape,
                 keyboard::key::Code::Escape,

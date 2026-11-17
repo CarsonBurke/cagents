@@ -3254,6 +3254,12 @@ impl SidebarState {
         self.attention_projection_rebuilds = 0;
     }
 
+    /// The pane the Attention list draws as current.
+    #[cfg(test)]
+    pub(crate) fn focused_card(&self) -> Option<CardId> {
+        self.focused_card
+    }
+
     pub fn reveal_worktree(
         &mut self,
         project: &SidebarProject,

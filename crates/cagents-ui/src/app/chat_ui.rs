@@ -19293,6 +19293,36 @@ pub(in crate::app) mod tests {
     pub(super) fn draft_chat(app: &mut Cagents) -> CardId {
         draft_chat_for_provider(app, Provider::Codex)
     }
+    /// A key nothing took, typed while a conversation is focused, goes into
+    /// its message input, and that update projects everything: only a key
+    /// nothing answered projects nothing, so declaring this one narrower
+    /// fails here.
+    #[test]
+    fn a_key_typed_into_an_unfocused_composer_projects_everything() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        let composer = |app: &Cagents| chat_runtime(app, card).composer.text();
+        let before = composer(&app);
+        let projections = super::super::terminal_output_tests::projections();
+        drop(app.update(Message::KeyEvent {
+            event: keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character("x".into()),
+                modified_key: keyboard::Key::Character("x".into()),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyX),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: Some("x".into()),
+                repeat: false,
+            },
+            captured: false,
+        }));
+        assert_eq!(composer(&app).trim_end(), format!("{}x", before.trim_end()));
+        assert_eq!(
+            super::super::terminal_output_tests::projections(),
+            projections + 1
+        );
+    }
+
     #[test]
     fn a_pane_inspector_overlay_keeps_typing_out_of_the_covered_chat() {
         let mut app = super::super::tests::context_inspector_test_app(false);

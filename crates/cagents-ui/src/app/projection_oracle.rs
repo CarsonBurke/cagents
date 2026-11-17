@@ -5,15 +5,23 @@
 //! the derived state is still current. After such an update this check
 //! captures that state, runs the full projection over it, captures it again
 //! and reports any part that changed: that part was stale, so the narrower
-//! projection's claim was wrong for the message.
+//! projection's claim was wrong for the message. A handler that returns
+//! before the projection makes the same claim, and is checked the same way.
+//!
+//! What it compares is the state the full projection writes, listed in
+//! [`Snapshot`]. The tasks the projection returns are not compared: those it
+//! returns for a change, such as a source control read, follow from state
+//! it also writes.
 //!
 //! Every unit test built with debug assertions runs it, and fails on a
 //! difference. A development build runs it when `CAGENTS_PROJECTION_ORACLE`
 //! is set and logs each difference under the `cagents::projection_oracle`
-//! target instead, keeping what the full projection repaired. It adds a full
-//! projection to every narrower update, so optimized timing workloads run
-//! without it, and the measurements that run with debug assertions turn it
-//! off with [`disable`].
+//! target instead. Such a session keeps what each check's full projection
+//! repaired and runs the tasks it returned, so it behaves as though every
+//! update projected everything, and shows no stale state a wrong
+//! declaration leaves: the log is the evidence. It adds full projections to
+//! narrower updates, so optimized timing workloads run without it, and the
+//! measurements that run with debug assertions turn it off with [`disable`].
 
 use super::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -30,8 +38,17 @@ thread_local! {
     /// Whether the outermost update running brought the derived state up to
     /// date before its message.
     static SETTLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether the outermost update running has reached its projection,
+    /// rather than returning from its handler before it.
+    static PROJECTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The last outermost update, when it returned before its projection
+    /// from state that was not brought up to date first, so that only the
+    /// next one settled can tell whether it left the derived state stale.
+    static SKIPPED: std::cell::RefCell<Option<Box<str>>> = const { std::cell::RefCell::new(None) };
     #[cfg(test)]
     static DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    #[cfg(test)]
+    static UNSETTLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The last outermost update's message, which a development build names
     /// when the next one finds the derived state stale.
     #[cfg(not(test))]
@@ -76,6 +93,14 @@ pub(super) fn disable() {
     DISABLED.set(true);
 }
 
+/// Stops bringing the derived state up to date before updates on this
+/// thread, so a test sees only what the updates themselves project. Each
+/// narrower projection is still checked.
+#[cfg(test)]
+pub(super) fn disable_settling() {
+    UNSETTLED.set(true);
+}
+
 /// Whether the check's own full projection is running.
 #[cfg(test)]
 pub(super) fn verifying() -> bool {
@@ -103,6 +128,30 @@ pub(super) fn sorted_items<T: Debug>(set: impl IntoIterator<Item = T>) -> String
     format!("{{{}}}", items.join(", "))
 }
 
+/// Fails unless the derived state is what a full projection makes it: the
+/// updates so far have left nothing stale.
+#[cfg(test)]
+pub(super) fn assert_projected(app: &mut Cagents) {
+    let current = Snapshot::capture(app);
+    VERIFYING.set(true);
+    drop(app.project_workspace(false));
+    VERIFYING.set(false);
+    let differences = current.differences(&Snapshot::capture(app));
+    assert!(
+        differences.is_empty(),
+        "derived state is stale:\n{}",
+        differences.join("\n")
+    );
+}
+
+/// Fails the test, or logs the report in a development build.
+fn report(report: &str) {
+    #[cfg(test)]
+    panic!("{report}");
+    #[cfg(not(test))]
+    tracing::error!(target: "cagents::projection_oracle", "{report}");
+}
+
 /// Everything the full projection writes, as comparable values.
 #[derive(Debug, PartialEq)]
 pub(super) struct Snapshot {
@@ -121,6 +170,13 @@ pub(super) struct Snapshot {
     automation_reads: String,
     worktree_owners: BTreeMap<CardId, PathBuf>,
     protections: BTreeSet<PathBuf>,
+    /// The panes whose working directory and find bar are remembered:
+    /// the chrome forgets closed ones.
+    terminal_directories: BTreeSet<CardId>,
+    terminal_finds: BTreeSet<CardId>,
+    /// The source control, branch comparison and history reads that are
+    /// current: binding the source control to other work cancels them.
+    source_reads: String,
 }
 
 impl Snapshot {
@@ -171,6 +227,15 @@ impl Snapshot {
                 .map(|(card, owner)| (*card, owner.clone()))
                 .collect(),
             protections: app.projected_protections.clone(),
+            terminal_directories: app.terminal_working_directories.keys().copied().collect(),
+            terminal_finds: app.terminal_find.keys().copied().collect(),
+            source_reads: format!(
+                "source {} running {}; {}; {}",
+                app.refresh_ui.source_generation,
+                app.refresh_ui.source_cancel.is_some(),
+                app.branch_ui.projection_view(),
+                app.history_ui.projection_view(),
+            ),
         }
     }
 
@@ -209,6 +274,9 @@ impl Snapshot {
             automation_reads,
             worktree_owners,
             protections,
+            terminal_directories,
+            terminal_finds,
+            source_reads,
         );
         differences
     }
@@ -258,39 +326,68 @@ impl Cagents {
     ///
     /// Tests often arrange state directly rather than through updates, and
     /// leave its projection to the next one: that is no claim of the next
-    /// message's. A message that always projects everything is left alone,
-    /// so what its handler does is tested as it stands. A development build
-    /// has no such arrangements, so it logs what it settles: the update
-    /// before it changed what the projection reads and declared, or
-    /// returned, as though it had not.
+    /// message's. Whatever settling finds stale is put down to such an
+    /// arrangement only when the update before it projected: that update
+    /// left the derived state current, so only something outside an update
+    /// changed it since. When the update before it instead returned from its
+    /// handler before projecting, from state that was not settled first, the
+    /// stale state is reported against that update. It cannot be told apart
+    /// from state a test then arranged directly without projecting it, so
+    /// such a test projects what it arranged with `project_workspace`. An
+    /// update that was settled first and returns before projecting is
+    /// checked as it returns, by [`Self::check_skipped_projection`], and
+    /// never blamed here.
+    ///
+    /// A message that always projects everything is not settled, so what
+    /// its handler does is tested as it stands. A development build has no
+    /// arrangements, so it also logs whatever it settles after an update that
+    /// projected: something outside the updates changed what the projection
+    /// reads.
     pub(super) fn settle_projection(&mut self, message: &Message) -> (Running, Task<Message>) {
         let outermost = DEPTH.replace(DEPTH.get() + 1) == 0;
         let running = Running(());
         if !outermost {
             return (running, Task::none());
         }
-        let settle = enabled() && self.may_project_narrowly(message);
+        PROJECTED.set(false);
+        let skipped = SKIPPED.take();
+        #[cfg(test)]
+        let settling = !UNSETTLED.get();
+        #[cfg(not(test))]
+        let settling = true;
+        let settle = settling && enabled() && self.may_project_narrowly(message);
         SETTLED.set(settle);
         if !settle {
             return (running, Task::none());
         }
-        #[cfg(not(test))]
-        let before = Snapshot::capture(self);
+        // A test's own arrangements are settled without a comparison.
+        let before = (cfg!(not(test)) || skipped.is_some()).then(|| Snapshot::capture(self));
         VERIFYING.set(true);
         let task = self.project_workspace(false);
         VERIFYING.set(false);
-        #[cfg(not(test))]
-        {
-            let message = crate::performance::ui_trace::label(message);
-            let previous = PREVIOUS.replace(message.clone());
-            let differences = before.differences(&Snapshot::capture(self));
-            if !differences.is_empty() {
-                tracing::error!(
-                    target: "cagents::projection_oracle",
-                    "derived state was stale before {message}, after {previous}:\n{}",
-                    differences.join("\n")
-                );
+        let Some(before) = before else {
+            return (running, task);
+        };
+        let differences = before.differences(&Snapshot::capture(self));
+        if differences.is_empty() {
+            return (running, task);
+        }
+        let message = crate::performance::ui_trace::label(message);
+        let differences = differences.join("\n");
+        match skipped {
+            Some(skipped) => report(&format!(
+                "{skipped} returned before its projection, and derived state was stale at the \
+                 next update, {message}:\n{differences}"
+            )),
+            #[cfg(not(test))]
+            None => {
+                let previous = PREVIOUS.with_borrow(|previous| previous.clone());
+                report(&format!(
+                    "derived state was stale before {message}, after {previous}:\n{differences}"
+                ));
             }
+            #[cfg(test)]
+            None => {}
         }
         (running, task)
     }
@@ -311,7 +408,7 @@ impl Cagents {
                     | Message::TerminalWake { .. }
                     | Message::WorkspaceModelObserved(_)
                     | Message::KeyEvent { .. }
-                    | Message::ChromeUi(_)
+                    | Message::ChromeUi(chrome_ui::Action::HoverTab(_))
                     | Message::Frame(_)
                     | Message::Viewport { .. }
             )
@@ -333,6 +430,9 @@ impl Cagents {
         camera_only: bool,
         reconcile_row_selection: bool,
     ) -> Task<Message> {
+        if DEPTH.get() == 1 {
+            PROJECTED.set(true);
+        }
         let Some(message) = message else {
             return Task::none();
         };
@@ -355,14 +455,45 @@ impl Cagents {
             } else {
                 " (its state was not brought up to date before it: see `may_project_narrowly`)"
             };
-            let report = format!(
+            report(&format!(
                 "the {projection} projection of {message} left derived state stale{unsettled}:\n{}",
                 differences.join("\n")
-            );
-            #[cfg(test)]
-            panic!("{report}");
-            #[cfg(not(test))]
-            tracing::error!(target: "cagents::projection_oracle", "{report}");
+            ));
+        }
+        task
+    }
+
+    /// After an outermost update whose handler returned before projecting,
+    /// as though nothing derived had changed, runs the full projection and
+    /// reports what it changed, when the update's state was brought up to
+    /// date before it. Otherwise leaves the update for the next settled one
+    /// to judge. Returns the full projection's tasks.
+    pub(super) fn check_skipped_projection(&mut self, message: Option<&str>) -> Task<Message> {
+        let Some(message) = message else {
+            return Task::none();
+        };
+        if DEPTH.get() != 1 {
+            return Task::none();
+        }
+        #[cfg(not(test))]
+        PREVIOUS.set(message.into());
+        if PROJECTED.get() {
+            return Task::none();
+        }
+        if !SETTLED.get() {
+            SKIPPED.set(Some(message.into()));
+            return Task::none();
+        }
+        let returned = Snapshot::capture(self);
+        VERIFYING.set(true);
+        let task = self.project_workspace(false);
+        VERIFYING.set(false);
+        let differences = returned.differences(&Snapshot::capture(self));
+        if !differences.is_empty() {
+            report(&format!(
+                "{message} returned before its projection and left derived state stale:\n{}",
+                differences.join("\n")
+            ));
         }
         task
     }
@@ -393,6 +524,214 @@ mod tests {
             location: keyboard::Location::Standard,
             modifiers: keyboard::Modifiers::empty(),
         }
+    }
+
+    fn named(key: keyboard::key::Named, modifiers: keyboard::Modifiers, pressed: bool) -> Message {
+        let physical_key = keyboard::key::Physical::Code(match key {
+            keyboard::key::Named::Tab => keyboard::key::Code::Tab,
+            keyboard::key::Named::Escape => keyboard::key::Code::Escape,
+            _ => keyboard::key::Code::ControlLeft,
+        });
+        let key = keyboard::Key::Named(key);
+        let event = if pressed {
+            keyboard::Event::KeyPressed {
+                modified_key: key.clone(),
+                key,
+                physical_key,
+                location: keyboard::Location::Standard,
+                modifiers,
+                text: None,
+                repeat: false,
+            }
+        } else {
+            keyboard::Event::KeyReleased {
+                modified_key: key.clone(),
+                key,
+                physical_key,
+                location: keyboard::Location::Standard,
+                modifiers,
+            }
+        };
+        Message::KeyEvent {
+            event,
+            captured: false,
+        }
+    }
+
+    /// Two panes in different worktrees, the first focused, with everything
+    /// they derive projected.
+    fn two_worktree_app() -> (Cagents, CardId, CardId, crate::model::ChannelId) {
+        let (mut app, channel) = crate::app::tests::alt_tab_test_app();
+        let first = app.durable.cards[0].id;
+        let second = app.durable.cards[1].id;
+        Arc::make_mut(&mut app.durable).focused = Some(first);
+        // Named apart: unnamed, both would be the first terminal of their
+        // worktree.
+        app.chrome_ui.user_titles.insert(first, "Main build".into());
+        app.chrome_ui
+            .user_titles
+            .insert(second, "Feature tests".into());
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.cards = app
+            .durable
+            .cards
+            .iter()
+            .map(|card| (card.id, CardRuntime::Loading))
+            .collect();
+        drop(app.project_workspace(true));
+        assert_eq!(app.workspace.focused(), Some(first));
+        (app, first, second, channel)
+    }
+
+    /// Ctrl+Tab moves the focus as it is pressed, and everything that shows
+    /// the focused pane follows at once, not when the keys are released or
+    /// a later update projects. Settling is off, so nothing but the keys'
+    /// own updates projects.
+    #[test]
+    fn cycling_panes_by_keyboard_shows_the_new_focus_at_once() {
+        use keyboard::key::Named;
+        disable_settling();
+        let (mut app, first, second, _) = two_worktree_app();
+        let title = app.core.window.header_title.clone();
+        let worktree = app.sidebar_state.active_worktree().cloned();
+        assert_eq!(app.sidebar_state.focused_card(), Some(first));
+        let ctrl = keyboard::Modifiers::CTRL;
+        drop(app.update(Message::KeyEvent {
+            event: keyboard::Event::ModifiersChanged(ctrl),
+            captured: false,
+        }));
+        drop(app.update(named(Named::Tab, ctrl, true)));
+        assert_eq!(app.workspace.focused(), Some(second));
+        let shown = |app: &Cagents| {
+            (
+                app.core.window.header_title.clone(),
+                app.sidebar_state.focused_card(),
+                app.sidebar_state.active_worktree().cloned(),
+            )
+        };
+        let after_press = shown(&app);
+        assert_ne!(after_press.0, title, "the window title names the new pane");
+        assert_eq!(after_press.1, Some(second), "Attention marks the new pane");
+        assert_ne!(
+            after_press.2, worktree,
+            "source control follows its worktree"
+        );
+        drop(app.update(named(Named::Tab, ctrl, false)));
+        drop(app.update(named(Named::Control, keyboard::Modifiers::empty(), false)));
+        drop(app.update(Message::KeyEvent {
+            event: keyboard::Event::ModifiersChanged(keyboard::Modifiers::empty()),
+            captured: false,
+        }));
+        assert_eq!(shown(&app), after_press);
+        assert_projected(&mut app);
+    }
+
+    /// Escape closing a dialog leaves nothing derived behind it, without a
+    /// later update projecting it.
+    #[test]
+    fn dismissing_a_dialog_by_keyboard_projects_at_once() {
+        use keyboard::key::Named;
+        disable_settling();
+        let (mut app, _, _, channel) = two_worktree_app();
+        drop(
+            app.update(Message::ChannelUi(channel_ui::Action::RequestDelete(
+                channel,
+            ))),
+        );
+        assert!(app.channel_ui.modal_open());
+        drop(app.update(named(Named::Escape, keyboard::Modifiers::empty(), true)));
+        assert!(!app.channel_ui.modal_open());
+        assert_projected(&mut app);
+    }
+
+    /// Escape closing an inspector that covers a narrow pane updates what
+    /// the inspector drew, such as the source control it bound, at once.
+    #[test]
+    fn closing_an_overlaid_inspector_by_keyboard_projects_at_once() {
+        use keyboard::key::Named;
+        disable_settling();
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        drop(app.project_workspace(true));
+        drop(app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::Resized(500.0),
+        }));
+        drop(app.update(Message::TogglePaneInspector(card)));
+        app.settle_pane_inspectors();
+        assert_eq!(
+            app.pane_inspector_layout(card),
+            Some(InspectorLayout::Overlay)
+        );
+        drop(app.update(named(Named::Escape, keyboard::Modifiers::empty(), true)));
+        assert!(!app.pane_inspectors.is_open(card));
+        assert_projected(&mut app);
+    }
+
+    /// A handler that returns before projecting, from settled state, and
+    /// leaves something derived stale is reported as it returns rather than
+    /// repaired by the next update.
+    #[test]
+    fn a_handler_returning_before_its_projection_is_reported() {
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        // As the outermost update would be, settled and returning early.
+        let (running, settled) = app.settle_projection(&Message::KeyEvent {
+            event: released("a"),
+            captured: false,
+        });
+        drop(settled);
+        let state = Arc::make_mut(&mut app.durable)
+            .cards
+            .iter_mut()
+            .find(|state| state.id == card)
+            .unwrap();
+        state.title = "Renamed behind the projection".into();
+        let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(app.check_skipped_projection(Some("KeyEvent")));
+        }));
+        drop(running);
+        let report = report.expect_err("the stale chrome is reported");
+        let report = report
+            .downcast_ref::<String>()
+            .expect("the report is formatted");
+        assert!(
+            report.contains("KeyEvent returned before its projection"),
+            "{report}"
+        );
+        assert!(report.contains("card_chrome:"), "{report}");
+    }
+
+    /// An update that returned before projecting from state that was not
+    /// settled is named when the next settled update finds stale state.
+    #[test]
+    fn stale_state_after_an_unsettled_early_return_names_that_update() {
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        drop(app.project_workspace(false));
+        SKIPPED.set(Some("Earlier".into()));
+        let state = Arc::make_mut(&mut app.durable)
+            .cards
+            .iter_mut()
+            .find(|state| state.id == card)
+            .unwrap();
+        state.title = "Renamed behind the projection".into();
+        let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(app.update(Message::KeyEvent {
+                event: released("a"),
+                captured: false,
+            }));
+        }));
+        DEPTH.set(0);
+        let report = report.expect_err("the stale chrome is reported");
+        let report = report
+            .downcast_ref::<String>()
+            .expect("the report is formatted");
+        assert!(
+            report.contains("Earlier returned before its projection"),
+            "{report}"
+        );
+        assert!(report.contains("card_chrome:"), "{report}");
     }
 
     /// Typing into a field reaches the update as keys the field took and
