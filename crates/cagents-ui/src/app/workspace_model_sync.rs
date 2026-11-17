@@ -1282,7 +1282,7 @@ impl Cagents {
         // changes, just as they do after a complete reconciliation.
         let mut phase = WorkspaceProjectionTiming::new(true);
         let naming_source = Arc::downgrade(&self.durable);
-        self.refresh_channel_title_suggestions();
+        let openings = self.refresh_channel_title_suggestions();
         self.restore_channel_names();
         phase.mark("selected_naming");
         let names_unchanged = naming_source.as_ptr() == Arc::as_ptr(&self.durable);
@@ -1311,7 +1311,7 @@ impl Cagents {
         {
             self.materialize_replica_snapshot();
         }
-        (Task::batch([installed, projected]), projection)
+        (Task::batch([installed, projected, openings]), projection)
     }
 
     /// Only stale complete snapshots skip projection. Even an equal model can
@@ -2067,7 +2067,7 @@ impl Cagents {
         }
         // A manual name ends a pending suggestion, and a name arriving can
         // release one this window was holding back.
-        self.refresh_channel_title_suggestions();
+        tasks.push(self.refresh_channel_title_suggestions());
         self.restore_channel_names();
         Some(Task::batch(tasks))
     }
@@ -2301,7 +2301,7 @@ impl Cagents {
             self.refresh_sidebar_channels();
             tasks.push(self.sync_chrome());
         }
-        self.refresh_channel_title_suggestions();
+        tasks.push(self.refresh_channel_title_suggestions());
         self.restore_channel_names();
         Task::batch(tasks)
     }

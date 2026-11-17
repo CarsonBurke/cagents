@@ -46,10 +46,13 @@ pub(super) fn read(launch: &chat::Launch) -> Option<String> {
 }
 
 impl Cagents {
-    /// Reads the opening of the conversation `target` shows, once per pane
-    /// and conversation, when it is the primary chat of a channel with no
-    /// name and nothing it has shown names it.
-    pub(super) fn request_opening_name(&mut self, target: Target) -> Task<Message> {
+    /// Names the channel `target` is the primary chat of from its
+    /// conversation's opening, when the channel has no name and nothing the
+    /// chat has shown names it. Each pane's conversation is read at most once
+    /// while the window runs; a later attach of the same conversation, after a
+    /// reconnect or when the pane becomes primary, offers what that read found.
+    /// The task is the read, when one starts.
+    pub(super) fn request_opening_name(&mut self, target: Target) -> Option<Task<Message>> {
         // The transcript is on the device, which a remote window cannot read.
         if crate::device::is_remote()
             || self
@@ -59,25 +62,33 @@ impl Cagents {
                 .is_none_or(|observation| observation.title.is_some())
             || !self.channel_lacks_name(target.card)
         {
-            return Task::none();
+            return None;
         }
         let Some(runtime) = self.chat_runtime_mut(target) else {
-            return Task::none();
+            return None;
         };
         let launch = runtime.session.launch.clone();
         let Some(conversation) = launch.session_id.clone() else {
-            return Task::none();
+            return None;
         };
-        if launch.provider == Provider::Omp
-            || !self
-                .chat_ui
-                .opening_names
-                .insert((target.card, conversation.clone()))
-        {
-            return Task::none();
+        if launch.provider == Provider::Omp {
+            return None;
         }
+        let key = (target.card, conversation);
+        match self.chat_ui.opening_names.get(&key) {
+            Some(Some(Some(title))) => {
+                let title = title.clone();
+                self.offer_opening_name(target, title);
+                return None;
+            }
+            // Read already, or being read.
+            Some(_) => return None,
+            None => {}
+        }
+        self.chat_ui.opening_names.insert(key.clone(), None);
         tracing::debug!(card = %target.card, provider = ?launch.provider, "reading a conversation's opening to name its channel");
-        cosmic::task::future(async move {
+        let (card, conversation) = key;
+        Some(cosmic::task::future(async move {
             let title = match READS.acquire().await {
                 Ok(_permit) => tokio::task::spawn_blocking(move || read(&launch))
                     .await
@@ -85,27 +96,43 @@ impl Cagents {
                     .flatten(),
                 Err(_) => None,
             };
-            Message::ChatUi(Action::OpeningName(target, conversation, title))
-        })
+            Message::ChatUi(Action::OpeningName(card, conversation, title))
+        }))
     }
 
-    /// Offers the name read from a conversation's opening, unless the pane
-    /// has moved on to another conversation, its chat named the channel in
-    /// the meantime, or the channel has a name.
+    /// Keeps what the opening of `card`'s conversation named, and offers it
+    /// through the pane's current runtime if it still shows that conversation.
     pub(super) fn opening_name_read(
         &mut self,
-        target: Target,
+        card: CardId,
         conversation: String,
         title: Option<String>,
     ) {
-        tracing::debug!(card = %target.card, named = title.is_some(), "read a conversation's opening");
+        tracing::debug!(%card, named = title.is_some(), "read a conversation's opening");
+        self.chat_ui
+            .opening_names
+            .insert((card, conversation.clone()), Some(title.clone()));
         let Some(title) = title else {
             return;
         };
-        if self.chat_runtime_mut(target).is_none_or(|runtime| {
-            runtime.session.launch.session_id.as_deref() != Some(conversation.as_str())
-        }) || !self.channel_lacks_name(target.card)
+        let runtime = match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => Some(runtime.as_ref()),
+            _ => self.chat_ui.parked.get(&card).map(Box::as_ref),
+        };
+        if let Some(target) = runtime
+            .filter(|runtime| {
+                runtime.session.launch.session_id.as_deref() == Some(conversation.as_str())
+            })
+            .map(|runtime| runtime.target)
         {
+            self.offer_opening_name(target, title);
+        }
+    }
+
+    /// Offers `title` as the name of the channel `target` is the primary chat
+    /// of, unless the channel has a name or the chat has named it meanwhile.
+    fn offer_opening_name(&mut self, target: Target, title: String) {
+        if !self.channel_lacks_name(target.card) {
             return;
         }
         let Some(observation) = self.chat_ui.channel_names.get_mut(&target) else {
@@ -266,6 +293,15 @@ mod tests {
             read(&codex).as_deref(),
             Some("Add retries to the webhook sender")
         );
+        // Newer Codex versions report a prompt as a completed item.
+        write(
+            &path,
+            &[
+                meta(json!("cli")),
+                json!({"type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","content":[{"type":"input_text","text":"Cache the pricing lookups"}]}}}),
+            ],
+        );
+        assert_eq!(read(&codex).as_deref(), Some("Cache the pricing lookups"));
         write(
             &path,
             &[
@@ -326,7 +362,7 @@ mod tests {
             session: Some(ID.into()),
             ..Default::default()
         };
-        let reads = |task: Task<Message>| cosmic::iced::runtime::task::into_stream(task).is_some();
+        let reads = |task: Option<Task<Message>>| task.is_some();
 
         // A window whose chat already named the channel reads nothing.
         app.chat_ui.channel_names.insert(
@@ -344,37 +380,80 @@ mod tests {
             !reads(app.request_opening_name(target)),
             "the same conversation is read once"
         );
-        // An opening with no task in it leaves the channel as it was.
-        drop(app.update(Message::ChatUi(Action::OpeningName(
-            target,
-            ID.into(),
-            None,
-        ))));
+        // An opening with no task in it leaves the channel as it was, and is
+        // not read again.
+        drop(app.update(Message::ChatUi(Action::OpeningName(card, ID.into(), None))));
         assert_eq!(app.durable.channels[0].title, "");
-        // A read for a conversation the pane no longer shows is dropped.
-        app.opening_name_read(target, "another".into(), Some("Stale task".into()));
+        assert!(!reads(app.request_opening_name(target)));
+        // A read for a conversation the pane no longer shows names nothing.
+        app.opening_name_read(card, "another".into(), Some("Stale task".into()));
         assert_eq!(app.durable.channels[0].title, "");
 
-        app.opening_name_read(target, ID.into(), Some("Fix the token refresh race".into()));
-        assert_eq!(
+        app.chat_ui.opening_names.clear();
+        assert!(reads(app.request_opening_name(target)));
+        app.opening_name_read(card, ID.into(), Some("Fix the token refresh race".into()));
+        let named = |app: &Cagents| {
             (
-                app.durable.channels[0].title.as_str(),
-                app.durable.channels[0].title_source
-            ),
-            ("Fix the token refresh race", ChannelTitleSource::Prompt)
+                app.durable.channels[0].title.clone(),
+                app.durable.channels[0].title_source,
+            )
+        };
+        let found = (
+            "Fix the token refresh race".to_owned(),
+            ChannelTitleSource::Prompt,
         );
-        assert!(std::iter::from_fn(|| requests.try_recv().ok()).any(|edit| matches!(
-            edit,
-            ModelEdit::SuggestConversationTitle { id: channel, card: pane, expected_revision: 3, title, source: ChannelTitleSource::Prompt }
-                if channel == id && pane == card && title == "Fix the token refresh race"
-        )));
+        assert_eq!(named(&app), found);
+        let suggested =
+            |requests: &super::super::super::workspace_model_sync::TestModelRequests| {
+                std::iter::from_fn(|| requests.try_recv().ok()).any(|edit| matches!(
+                edit,
+                ModelEdit::SuggestConversationTitle { id: channel, card: pane, expected_revision: 3, title, source: ChannelTitleSource::Prompt }
+                    if channel == id && pane == card && title == "Fix the token refresh race"
+            ))
+            };
+        assert!(suggested(&requests));
+
+        // The pane attaching again, as after a reconnect, offers what the
+        // read found without reading again.
+        let channel = &mut Arc::make_mut(&mut app.durable).channels[0];
+        channel.title = String::new();
+        app.chat_ui.channel_names.insert(target, unnamed());
+        assert!(!reads(app.request_opening_name(target)));
+        assert_eq!(named(&app), found);
+        assert!(suggested(&requests));
+
+        // So does a new view of the channel, as when the pane becomes its
+        // primary chat or its name is cleared elsewhere.
+        Arc::make_mut(&mut app.durable).channels[0].title = String::new();
+        app.chat_ui.channel_names.insert(
+            target,
+            ChannelNameObservation {
+                last_view: Some((id, 3)),
+                ..unnamed()
+            },
+        );
+        app.workspace_model.views[0].revision = 4;
+        assert!(
+            cosmic::iced::runtime::task::into_stream(app.refresh_channel_title_suggestions())
+                .is_none()
+        );
+        assert_eq!(named(&app), found);
+        assert!(
+            std::iter::from_fn(|| requests.try_recv().ok()).any(|edit| matches!(
+                edit,
+                ModelEdit::SuggestConversationTitle {
+                    expected_revision: 4,
+                    ..
+                }
+            ))
+        );
 
         // A name the reader gave while the read ran is never replaced.
         let channel = &mut Arc::make_mut(&mut app.durable).channels[0];
         channel.title = "Auth work".into();
         channel.title_source = ChannelTitleSource::Manual;
         app.chat_ui.channel_names.insert(target, unnamed());
-        app.opening_name_read(target, ID.into(), Some("Fix the token refresh race".into()));
+        app.opening_name_read(card, ID.into(), Some("Fix the token refresh race".into()));
         assert_eq!(app.durable.channels[0].title, "Auth work");
         assert!(app.chat_ui.channel_names[&target].title.is_none());
         app.chat_ui.opening_names.clear();
