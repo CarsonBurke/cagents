@@ -107,9 +107,16 @@ like CSS inline padding. ShapeLine::build widens the span's first and last
 glyph advances by it and shifts the visually leftmost one's x_offset, so the
 room is laid out, wraps with the edge glyphs and lies inside their boxes,
 where highlight bounds computed from glyph boxes cover it. cagents uses it for
-the room around inline code inside its chip (cagents#3002).
-tests/richtext_layout.rs inline_padding_lays_out_room_at_both_edges_of_a_span
-covers it. Monospace width matching rounds advances to the cell width, so the
+the room around inline code inside its chip (cagents#3002). Shaping runs
+break at a padded span's edges even when its font matches its neighbours', so
+no ligature or cluster crosses them and the edges are always glyph
+boundaries. One pass over a line's glyphs looks each glyph's edges up among
+the sorted padded ranges. A padded span that crosses a hard line break is
+padded at both ends of each line, like CSS's `box-decoration-break: clone`.
+Room on a space that hangs at a wrap is not laid out, as that space is not.
+tests/richtext_layout.rs inline_padding_lays_out_room_at_both_edges_of_a_span,
+inline_padding_survives_a_same_font_ligature_edge and
+inline_padding_of_ltr_code_in_an_rtl_paragraph cover it. Monospace width matching rounds advances to the cell width, so the
 room is not meant for monospace-matched editors.
 
 All upstream targets and reference images still pass.

@@ -683,6 +683,17 @@ impl ShapeGlyph {
     }
 }
 
+/// Whether text in `other` can be shaped in one run with text in `attrs`.
+///
+/// Beyond [`Attrs::compatible`], a run breaks at the edges of a span with inline
+/// padding, so no ligature or cluster crosses them and the room lands on the span's
+/// own edge glyphs.
+fn shapes_with(attrs: &Attrs, other: &Attrs) -> bool {
+    attrs.compatible(other)
+        && (attrs == other
+            || (attrs.inline_padding_opt.is_none() && other.inline_padding_opt.is_none()))
+}
+
 fn decoration_metrics(font: &Font) -> (DecorationMetrics, DecorationMetrics, f32) {
     let metrics = font.metrics();
     let upem = metrics.units_per_em as f32;
@@ -826,7 +837,7 @@ impl ShapeWord {
             attrs_list.spans_iter().all(|(other_range, other_attrs)| {
                 word_range.end <= other_range.start
                     || other_range.end <= word_range.start
-                    || attrs_start.compatible(&other_attrs.as_attrs())
+                    || shapes_with(&attrs_start, &other_attrs.as_attrs())
             })
         } {
             shaping.run(
@@ -845,7 +856,7 @@ impl ShapeWord {
             for (egc_i, _egc) in word.grapheme_indices(true) {
                 let start_egc = word_range.start + egc_i;
                 let attrs_egc = attrs_list.get_span(start_egc);
-                if !attrs.compatible(&attrs_egc) {
+                if !shapes_with(&attrs, &attrs_egc) {
                     shaping.run(
                         &mut glyphs,
                         font_system,
@@ -1297,35 +1308,60 @@ impl VisualLine {
 }
 
 impl ShapeLine {
-    /// Widen the glyphs at the logical start and end of `range` by `padding` EM, like
-    /// CSS inline padding: the room is laid out, wraps with the span's edge glyphs and
-    /// lies inside their boxes. The glyph on the visual left draws past its room.
-    fn pad_span_edges(spans: &mut [ShapeSpan], range: &Range<usize>, padding: f32) {
-        let mut padded_start = false;
-        let mut end = None;
-        for span in spans.iter_mut() {
+    /// Widen the glyphs at the logical start and end of each padded attrs span by its
+    /// inline padding in EM, like CSS inline padding: the room is laid out, wraps with
+    /// the span's edge glyphs and lies inside their boxes. The glyph on the visual left
+    /// draws past its room. Runs break at padded spans' edges (see [`shapes_with`]),
+    /// so their edges are glyph boundaries. One pass over the glyphs; each glyph looks
+    /// its edges up among the sorted padded ranges.
+    fn pad_span_edges(spans: &mut [ShapeSpan], attrs_list: &AttrsList) {
+        let padded = attrs_list
+            .spans_iter()
+            .filter_map(|(range, attrs)| {
+                attrs
+                    .inline_padding_opt
+                    .map(|InlinePadding(padding)| (range.clone(), padding))
+            })
+            .collect::<Vec<_>>();
+        if padded.is_empty() {
+            return;
+        }
+        let find = |at: usize, edge: fn(&Range<usize>) -> usize| {
+            padded
+                .binary_search_by_key(&at, |(range, _)| edge(range))
+                .ok()
+        };
+        let mut started = vec![false; padded.len()];
+        // The last glyph seen ending each padded range: (span, word, glyph).
+        let mut ends = vec![None; padded.len()];
+        for (span_index, span) in spans.iter_mut().enumerate() {
             let rtl = span.level.is_rtl();
             for (word_index, word) in span.words.iter_mut().enumerate() {
                 for (glyph_index, glyph) in word.glyphs.iter_mut().enumerate() {
-                    if !padded_start && glyph.start == range.start {
-                        padded_start = true;
-                        glyph.x_advance += padding;
-                        if !rtl {
-                            glyph.x_offset += padding;
+                    if let Some(index) = find(glyph.start, |range| range.start) {
+                        if !started[index] {
+                            started[index] = true;
+                            glyph.x_advance += padded[index].1;
+                            if !rtl {
+                                glyph.x_offset += padded[index].1;
+                            }
                         }
                     }
-                    if glyph.end == range.end {
-                        end = Some((rtl, word_index, glyph_index));
+                    if let Some(index) = find(glyph.end, |range| range.end) {
+                        ends[index] = Some((span_index, word_index, glyph_index));
                     }
                 }
             }
-            if let Some((rtl, word_index, glyph_index)) = end.take() {
+        }
+        for (end, (_, padding)) in ends.into_iter().zip(&padded) {
+            if let Some((span_index, word_index, glyph_index)) = end {
+                let span = &mut spans[span_index];
+                let rtl = span.level.is_rtl();
                 let glyph = &mut span.words[word_index].glyphs[glyph_index];
                 glyph.x_advance += padding;
                 if rtl {
                     glyph.x_offset += padding;
                 }
-                return;
             }
         }
     }
@@ -1446,11 +1482,7 @@ impl ShapeLine {
             spans.push(span);
         }
 
-        for (range, attrs) in attrs_list.spans_iter() {
-            if let Some(InlinePadding(padding)) = attrs.inline_padding_opt {
-                Self::pad_span_edges(&mut spans, range, padding);
-            }
-        }
+        Self::pad_span_edges(&mut spans, attrs_list);
 
         // Adjust for tabs
         let mut x = 0.0;

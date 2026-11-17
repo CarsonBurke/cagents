@@ -204,3 +204,60 @@ fn inline_padding_lays_out_room_at_both_edges_of_a_span() {
     };
     assert!((period(&padded) - period(&plain) - 2.0 * room).abs() < 0.01);
 }
+
+fn padded_layout(
+    font_system: &mut FontSystem,
+    parts: [(&str, bool); 3],
+    padding: f32,
+) -> (Vec<(usize, usize, f32, f32, f32)>, f32) {
+    let mut buffer = Buffer::new(font_system, Metrics::new(20.0, 28.0));
+    let attrs = Attrs::new();
+    let spans = parts.map(|(text, padded)| {
+        let span = attrs.clone().metadata(usize::from(padded));
+        (text, if padded { span.inline_padding(padding) } else { span })
+    });
+    buffer.set_rich_text(spans, &attrs, Shaping::Advanced, None);
+    buffer.set_size(Some(1000.0), None);
+    buffer.shape_until_scroll(font_system, false);
+    let run = buffer.layout_runs().next().expect("one line");
+    let glyphs = run
+        .glyphs
+        .iter()
+        .map(|glyph| (glyph.start, glyph.end, glyph.x, glyph.w, glyph.x_offset))
+        .collect();
+    (glyphs, run.line_w)
+}
+
+// A padded span in the same font as its neighbours is shaped in a run of its
+// own, so a ligature cannot cross its edge and swallow the room.
+#[test]
+fn inline_padding_survives_a_same_font_ligature_edge() {
+    let mut font_system = FontSystem::new();
+    let parts = [("of", false), ("fice", true), (" b", false)];
+    let (plain, plain_w) = padded_layout(&mut font_system, parts, 0.0);
+    let (padded, padded_w) = padded_layout(&mut font_system, parts, 0.25);
+    let room = 0.25 * 20.0;
+    let first = padded.iter().find(|glyph| glyph.0 == 2).expect("a glyph at the edge");
+    assert!((first.4 * 20.0 - room).abs() < 0.01, "{padded:?}");
+    assert!(padded.iter().any(|glyph| glyph.1 == 6), "{padded:?}");
+    // Zero padding still breaks the run, so the widths compare like for like.
+    assert!((padded_w - plain_w - 2.0 * room).abs() < 0.01, "{plain:?} {padded:?}");
+}
+
+// In a right-to-left paragraph, left-to-right code keeps its room on its own
+// edges: its logical first glyph draws past the room on its left.
+#[test]
+fn inline_padding_of_ltr_code_in_an_rtl_paragraph() {
+    let mut font_system = FontSystem::new();
+    let parts = [("שלום ", false), ("code", true), (" עולם", false)];
+    let start = "שלום ".len();
+    let (_, plain_w) = padded_layout(&mut font_system, parts, 0.0);
+    let (padded, padded_w) = padded_layout(&mut font_system, parts, 0.25);
+    let room = 0.25 * 20.0;
+    let first = padded
+        .iter()
+        .find(|glyph| glyph.0 == start)
+        .expect("the code's first glyph");
+    assert!((first.4 * 20.0 - room).abs() < 0.01, "{padded:?}");
+    assert!((padded_w - plain_w - 2.0 * room).abs() < 0.01);
+}
