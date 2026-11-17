@@ -205,7 +205,7 @@ impl CompatiblePlacement {
         }
     }
 }
-fn placement_from_legacy<'de, D: serde::Deserializer<'de>>(
+pub(crate) fn placement_from_legacy<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Placement, D::Error> {
     if deserializer.is_human_readable() {

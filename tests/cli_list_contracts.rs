@@ -166,7 +166,25 @@ impl Listing {
                             },
                             placement: Placement::Channel(ChannelId::new()),
                             session: None,
-                            console: None,
+                            // The daemon's record holds the console's whole
+                            // recipe, environment included.
+                            console: Some(
+                                cagents::terminal::ipc::TerminalDescriptor::relaunchable(
+                                    "00000000-0000-4000-8000-000000000002".parse().unwrap(),
+                                    cagents::model::LaunchRecipe {
+                                        program: "/fixture/cagents".into(),
+                                        arguments: vec!["agent".into(), "console".into()],
+                                        working_directory: "/fixture".into(),
+                                        environment: std::collections::BTreeMap::from([(
+                                            "PROVIDER_TOKEN".into(),
+                                            ENVIRONMENT_SENTINEL.into(),
+                                        )]),
+                                        unset_environment: Default::default(),
+                                    },
+                                    None,
+                                )
+                                .session,
+                            ),
                             created_ms: 0,
                             closed: false,
                         },
@@ -1100,6 +1118,22 @@ fn standalone_account_list_json_is_metadata_only_and_lowercase() {
     }
 }
 
+/// A launch environment value in the fixture daemon's agent records.
+const ENVIRONMENT_SENTINEL: &str = "ENVIRONMENT_CREDENTIAL_SENTINEL";
+
+#[test]
+fn agent_list_json_keeps_records_without_launch_environments() {
+    let rendered = output(Listing::Agents, true, true);
+    assert!(!rendered.contains(ENVIRONMENT_SENTINEL), "{rendered}");
+    let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+    let console = &value["data"]["agents"][0]["agent"]["console"];
+    assert_eq!(console["launch"]["program"], "/fixture/cagents");
+    assert!(console["launch"].get("environment").is_none(), "{console}");
+    let relaunch = &console["continuity"]["relaunch_available"]["recipe"];
+    assert_eq!(relaunch["program"], "/fixture/cagents");
+    assert!(relaunch.get("environment").is_none(), "{relaunch}");
+}
+
 #[test]
 fn standalone_terminal_list_omits_recipes_and_show_preserves_them() {
     let listed: serde_json::Value =
@@ -1110,12 +1144,13 @@ fn standalone_terminal_list_omits_recipes_and_show_preserves_them() {
     for field in ["session", "launch", "environment", "recipe", "resume_hint"] {
         assert!(row.get(field).is_none());
     }
-    let shown: serde_json::Value =
-        serde_json::from_str(&output(Listing::TerminalShow, true, true)).unwrap();
-    assert_eq!(
-        shown["data"]["terminal"]["session"]["launch"]["environment"]["FIXTURE_VALUE"],
-        "show only"
-    );
+    let rendered = output(Listing::TerminalShow, true, true);
+    // Show keeps the recipe but never its environment's values.
+    assert!(!rendered.contains("show only"), "{rendered}");
+    let shown: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+    let launch = &shown["data"]["terminal"]["session"]["launch"];
+    assert_eq!(launch["program"], "/bin/sh");
+    assert!(launch.get("environment").is_none(), "{launch}");
     assert_eq!(
         shown["data"]["terminal"]["session"]["resume_hint"],
         "fixture recovery metadata"

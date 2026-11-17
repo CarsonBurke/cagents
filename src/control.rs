@@ -5640,8 +5640,37 @@ fn absolute_working_directory(cwd: Option<PathBuf>) -> io::Result<PathBuf> {
     })
 }
 
-fn emit_success(json_output: bool, output: CommandOutput) {
+/// Leaves out the environment of every launch recipe in `value`, for output
+/// that leaves this process.
+///
+/// The daemon's replies carry each recipe whole, because it relaunches and
+/// identifies processes from them. A launch environment can hold provider
+/// credentials, and callers copy `--json` output into transcripts, logs and
+/// pull requests, so no command prints its values. A recipe is an object with
+/// the fields [`LaunchRecipe`] serializes; its `unset_environment` names stay.
+fn withhold_launch_environments(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            if LAUNCH_RECIPE_FIELDS
+                .iter()
+                .all(|field| object.contains_key(*field))
+            {
+                object.remove("environment");
+            }
+            object.values_mut().for_each(withhold_launch_environments);
+        }
+        Value::Array(values) => values.iter_mut().for_each(withhold_launch_environments),
+        _ => {}
+    }
+}
+
+/// The fields that make a serialized object a [`LaunchRecipe`].
+const LAUNCH_RECIPE_FIELDS: [&str; 4] =
+    ["program", "arguments", "working_directory", "environment"];
+
+fn emit_success(json_output: bool, mut output: CommandOutput) {
     if json_output {
+        withhold_launch_environments(&mut output.data);
         println!(
             "{}",
             json!({ "ok": true, "command": output.command, "data": output.data })
@@ -5653,6 +5682,10 @@ fn emit_success(json_output: bool, output: CommandOutput) {
 
 fn emit_error(json_output: bool, error: &AppError) {
     if json_output {
+        let mut details = error.details.clone();
+        if let Some(details) = &mut details {
+            withhold_launch_environments(details);
+        }
         eprintln!(
             "{}",
             json!({
@@ -5660,7 +5693,7 @@ fn emit_error(json_output: bool, error: &AppError) {
                 "error": {
                     "kind": error.kind,
                     "message": error.message,
-                    "details": error.details,
+                    "details": details,
                 }
             })
         );
@@ -10330,5 +10363,89 @@ mod tests {
         )
         .unwrap_err();
         assert!(handshake_reports_already_running(&already_running));
+    }
+
+    /// A launch recipe carrying a credential in its environment.
+    fn credential_recipe(program: &str) -> crate::model::LaunchRecipe {
+        crate::model::LaunchRecipe {
+            program: program.into(),
+            arguments: vec!["--model".into(), "haiku".into()],
+            working_directory: "/repo".into(),
+            environment: [("PROVIDER_TOKEN".into(), "ENVIRONMENT_SECRET_VALUE".into())].into(),
+            unset_environment: ["CLAUDE_CONFIG_DIR".into()].into(),
+        }
+    }
+
+    /// An open agent whose chat, its terminal and its console each carry a
+    /// recipe with a credential, as the daemon's replies hold them.
+    pub(super) fn agent_with_credentials() -> crate::agent_execution::Agent {
+        use crate::model::{TerminalContinuity, TerminalId, TerminalSession};
+        let terminal = |program: &str| TerminalSession {
+            id: TerminalId::new(),
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+            launch: credential_recipe(program),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe: credential_recipe(program),
+                last_exit: None,
+            },
+        };
+        let mut agent =
+            crate::agent_execution::Agent::fixture_placed_in(crate::model::ChannelId::new());
+        agent.session = Some(crate::agent_execution::HostedSession::Chat(
+            crate::chat::Session {
+                id: TerminalId::new(),
+                launch: crate::chat::Launch {
+                    provider: crate::agent::Provider::Claude,
+                    recipe: credential_recipe("claude"),
+                    session_id: None,
+                },
+                proof: None,
+                terminal: Some(terminal("claude")),
+                owned_codex_listener: None,
+                native_continuity: Default::default(),
+            },
+        ));
+        agent.console = Some(terminal("cagents"));
+        agent
+    }
+
+    #[test]
+    fn json_output_names_no_launch_environment_values() {
+        let agent = agent_with_credentials();
+        let mut data = serde_json::json!({
+            "agent": agent,
+            "agents": [{"agent": agent, "state": "Running"}],
+        });
+        assert!(data.to_string().contains("ENVIRONMENT_SECRET_VALUE"));
+        super::withhold_launch_environments(&mut data);
+        let printed = data.to_string();
+        assert!(!printed.contains("ENVIRONMENT_SECRET_VALUE"), "{printed}");
+        assert!(!printed.contains("\"environment\""), "{printed}");
+        // Everything else about each launch is still stated.
+        assert!(printed.contains("CLAUDE_CONFIG_DIR"), "{printed}");
+        let chat = &data["agent"]["session"]["Chat"];
+        assert_eq!(chat["launch"]["recipe"]["program"], "claude");
+        assert_eq!(chat["terminal"]["launch"]["arguments"][1], "haiku");
+        assert_eq!(
+            data["agents"][0]["agent"]["console"]["launch"]["program"],
+            "cagents"
+        );
+    }
+
+    /// The filter recognizes a recipe by the fields `LaunchRecipe`
+    /// serializes, so a renamed field must be renamed there too.
+    #[test]
+    fn launch_recipe_fields_identify_a_serialized_recipe() {
+        let recipe = serde_json::to_value(credential_recipe("claude")).unwrap();
+        let mut fields = recipe.as_object().unwrap().keys().collect::<Vec<_>>();
+        fields.retain(|field| *field != "unset_environment");
+        fields.sort_unstable();
+        let mut expected = super::LAUNCH_RECIPE_FIELDS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(fields, expected.iter().collect::<Vec<_>>());
     }
 }

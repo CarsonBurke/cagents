@@ -900,6 +900,26 @@ def load_snapshot(path: Path) -> dict:
     return value
 
 
+LAUNCH_RECIPE_FIELDS = ("program", "arguments", "working_directory", "environment")
+
+
+def without_launch_environments(value: Any) -> Any:
+    """`value` without the environment of any launch recipe it holds.
+
+    The CLI's `--json` stopped printing launch environments, whose values can
+    be credentials, while stores, censuses and older CLIs still hold them. A
+    recipe is compared by everything else it states, as the CLI recognizes
+    one: an object with every field in LAUNCH_RECIPE_FIELDS.
+    """
+    if isinstance(value, dict):
+        recipe = all(field in value for field in LAUNCH_RECIPE_FIELDS)
+        return {key: without_launch_environments(item) for key, item in value.items()
+                if not (recipe and key == "environment")}
+    if isinstance(value, list):
+        return [without_launch_environments(item) for item in value]
+    return value
+
+
 def project(row: dict, name: str) -> dict:
     if name == "agents":
         agent = row.get("agent", {})
@@ -1053,7 +1073,8 @@ def console_relaunch(before: dict, after: dict, terminal_id: str) -> bool:
             continue
         current = after["agents"].get(key, {})
         replacement = current.get("agent", {}).get("console") or {}
-        old_recipe, new_recipe = console.get("launch", {}), replacement.get("launch", {})
+        old_recipe, new_recipe = (without_launch_environments(console.get("launch", {})),
+                                  without_launch_environments(replacement.get("launch", {})))
         if (not row.get("run") or current.get("run") != row["run"]
                 or row.get("state") != "Running" or current.get("state") != "Running"
                 or replacement.get("id") != terminal_id or new_recipe.get("program") != program
