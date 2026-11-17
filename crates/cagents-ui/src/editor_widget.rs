@@ -1191,23 +1191,12 @@ where
 
     /// Creates a [`Content`] with the given text.
     pub fn with_text(text: &str) -> Self {
-        // The native constructor shapes all text before it has a viewport.
-        // Insert native line fragments instead: Paste does not shape, and
-        // appending one fragment avoids its quadratic interior Vec insertions
-        // for a large multiline paste. Use the same parser as Buffer::set_text
-        // so mixed and paired line endings retain their exact native identity.
-        let mut editor = R::Editor::with_text("");
-        for fragment in paste_fragments(text, None) {
-            append_fragment(&mut editor, fragment, "");
-        }
-        editor.perform(Action::ClearSelection);
-        editor.move_to(Cursor {
-            position: Position { line: 0, column: 0 },
-            selection: None,
-        });
+        // The vendored native constructor leaves every line unshaped until the
+        // first viewport is laid out (vendor/iced-graphics/README.cagents.md).
+        let mut editor = R::Editor::with_text(text);
         // Native edits remember the latest changed line for highlighting.
-        // Renew that marker at the start after the append-only load, without
-        // changing text, so the first viewport highlights from line zero.
+        // Mark the start, without changing text, so the first viewport
+        // highlights from line zero.
         mark_changed_from(&mut editor, Position { line: 0, column: 0 });
         let count = editor.line_count();
         let snapshot = TextSnapshot::from_lines((0..count).map(|index| {
@@ -4169,6 +4158,56 @@ mod tests {
         assert!(lines.last().unwrap().layout_opt().is_none());
     }
 
+    /// iced's own text editor, which the chat composer uses, lays its native
+    /// editor out the same way: construction, then `update` at its bounds.
+    /// A restored or recalled long draft must not shape lines it never shows
+    /// under the shared font lock (#2973).
+    #[test]
+    fn native_constructor_defers_shaping_to_the_viewport() {
+        fn shaped(editor: &NativeEditor) -> usize {
+            let lines = &editor.buffer().lines;
+            lines
+                .iter()
+                .filter(|line| line.shape_opt().is_some())
+                .count()
+        }
+        fn lay_out(editor: &mut NativeEditor) {
+            editor.update(
+                Size::new(700.0, 240.0),
+                cosmic::iced::Font::DEFAULT,
+                Pixels(14.0),
+                LineHeight::Relative(1.4),
+                Wrapping::Word,
+                &mut highlighter::PlainText::new(&()),
+            );
+        }
+        let draft = "A long draft line that the composer wraps at its width.\n".repeat(10_000);
+        let mut editor = NativeEditor::with_text(&draft);
+        assert_eq!(editor.line_count(), 10_001);
+        assert_eq!(shaped(&editor), 0, "construction must not shape");
+
+        lay_out(&mut editor);
+        let visible = shaped(&editor);
+        assert!((1..100).contains(&visible), "only the viewport: {visible}");
+        assert!(editor.buffer().lines[10_000].shape_opt().is_none());
+
+        // Moving the caret to the end shapes what the viewport scrolls to,
+        // not the lines between.
+        editor.perform(Action::Move(Motion::DocumentEnd));
+        lay_out(&mut editor);
+        assert_eq!(
+            editor.cursor().position,
+            Position {
+                line: 10_000,
+                column: 0
+            }
+        );
+        let lines = &editor.buffer().lines;
+        assert!(lines[10_000].shape_opt().is_some());
+        assert!(lines[5_000].shape_opt().is_none());
+        assert!(shaped(&editor) < 200, "{}", shaped(&editor));
+    }
+
     #[test]
     fn replacement_output_budget_counts_prefix_tail_and_sparse_aggregate() {
         let original = "λa🦀aZ";
@@ -4379,39 +4418,6 @@ mod tests {
         );
         assert_eq!(result.unwrap_err(), "Replacement cancelled.");
         assert_eq!(snapshot.source.text().as_ref(), text);
-    }
-
-    #[test]
-    #[ignore = "explicit constructor benchmark retains the old full-file glyph caches"]
-    fn native_constructor_large_file_microbenchmark() {
-        let source = "let token = 123; // native fixture\n".repeat(100_000);
-        let started = Instant::now();
-        let content: Content = Content::with_text(&source);
-        let current_elapsed = started.elapsed();
-        let current_shaped = content
-            .0
-            .borrow()
-            .editor
-            .buffer()
-            .lines
-            .iter()
-            .filter(|line| line.shape_opt().is_some())
-            .count();
-        let started = Instant::now();
-        let original = NativeEditor::with_text(&source);
-        let original_elapsed = started.elapsed();
-        let original_shaped = original
-            .buffer()
-            .lines
-            .iter()
-            .filter(|line| line.shape_opt().is_some())
-            .count();
-        eprintln!(
-            "100k lines / {} bytes: original {original_elapsed:?}, {original_shaped} shaped; current {current_elapsed:?}, {current_shaped} shaped (unoptimized test profile)",
-            source.len()
-        );
-        assert_eq!(original_shaped, 100_001);
-        assert_eq!(current_shaped, 0);
     }
 
     #[test]
