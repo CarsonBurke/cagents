@@ -1973,10 +1973,14 @@ mod tests {
                         "account" => {
                             chat.id = crate::model::TerminalId::new();
                             chat.proof = Some(started);
-                            chat.launch
-                                .recipe
-                                .environment
-                                .insert("CLAUDE_CONFIG_DIR".into(), "/other-account".into());
+                            chat.launch.recipe.environment.insert(
+                                crate::account::home_variable(provider).unwrap().into(),
+                                "/other-account".into(),
+                            );
+                            let CardKind::Chat(source) = &original.kind else {
+                                unreachable!()
+                            };
+                            assert!(crate::chat::is_account_recovery(source, chat));
                         }
                         // The same chat proved by a new host session.
                         "reconnected" => chat.proof = Some(started),
