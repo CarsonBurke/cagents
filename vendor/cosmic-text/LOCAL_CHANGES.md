@@ -87,7 +87,29 @@ Layout raises each visual line's maximum ascent and descent to that font's at
 the line's font size. A line that contains the default font's glyphs is
 unchanged, because they already reach those maxima. The strut is skipped on
 a line whose own spans set a line height shorter than the default font's
-glyphs, since it could not hold them without pushing its glyphs out of it.
-Such a line still centres on its own glyphs. tests/richtext_layout.rs
+glyphs. Such a line is sized by its spans rather than by the default, as when
+every span of a rich text sets a smaller size, and a strut would push its
+glyphs out of the box, so it still centres on its own glyphs. A line sized
+by the buffer's metrics is set in the default font and takes the strut.
+tests/richtext_layout.rs
 a_line_of_only_smaller_text_keeps_the_paragraph_baseline fails without the
-strut. All upstream targets and reference images still pass.
+strut, and a_line_sized_shorter_than_the_default_font_keeps_its_own_centre
+covers the skipped case.
+
+Lines that hold only fallback glyphs move onto the default font's baseline
+too. That also applies outside chat, for example a terminal or editor row of
+only emoji or CJK, which now lines up with rows that hold the default font.
+
+Inline padding
+
+Attrs::inline_padding reserves room in EM at a span's logical start and end,
+like CSS inline padding. ShapeLine::build widens the span's first and last
+glyph advances by it and shifts the visually leftmost one's x_offset, so the
+room is laid out, wraps with the edge glyphs and lies inside their boxes,
+where highlight bounds computed from glyph boxes cover it. cagents uses it for
+the room around inline code inside its chip (cagents#3002).
+tests/richtext_layout.rs inline_padding_lays_out_room_at_both_edges_of_a_span
+covers it. Monospace width matching rounds advances to the cell width, so the
+room is not meant for monospace-matched editors.
+
+All upstream targets and reference images still pass.

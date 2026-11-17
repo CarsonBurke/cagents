@@ -6,7 +6,7 @@ use crate::fallback::FontFallbackIter;
 use crate::{
     math, Align, Attrs, AttrsList, CacheKeyFlags, Color, DecorationMetrics, DecorationSpan,
     Ellipsize, EllipsizeHeightLimit, Family, Font, FontSystem, GlyphDecorationData, Hinting,
-    LayoutGlyph, LayoutLine, Metrics, Wrap,
+    InlinePadding, LayoutGlyph, LayoutLine, Metrics, Wrap,
 };
 #[cfg(not(feature = "std"))]
 use alloc::{format, vec, vec::Vec};
@@ -1297,6 +1297,39 @@ impl VisualLine {
 }
 
 impl ShapeLine {
+    /// Widen the glyphs at the logical start and end of `range` by `padding` EM, like
+    /// CSS inline padding: the room is laid out, wraps with the span's edge glyphs and
+    /// lies inside their boxes. The glyph on the visual left draws past its room.
+    fn pad_span_edges(spans: &mut [ShapeSpan], range: &Range<usize>, padding: f32) {
+        let mut padded_start = false;
+        let mut end = None;
+        for span in spans.iter_mut() {
+            let rtl = span.level.is_rtl();
+            for (word_index, word) in span.words.iter_mut().enumerate() {
+                for (glyph_index, glyph) in word.glyphs.iter_mut().enumerate() {
+                    if !padded_start && glyph.start == range.start {
+                        padded_start = true;
+                        glyph.x_advance += padding;
+                        if !rtl {
+                            glyph.x_offset += padding;
+                        }
+                    }
+                    if glyph.end == range.end {
+                        end = Some((rtl, word_index, glyph_index));
+                    }
+                }
+            }
+            if let Some((rtl, word_index, glyph_index)) = end.take() {
+                let glyph = &mut span.words[word_index].glyphs[glyph_index];
+                glyph.x_advance += padding;
+                if rtl {
+                    glyph.x_offset += padding;
+                }
+                return;
+            }
+        }
+    }
+
     /// Creates an empty line.
     ///
     /// The returned line is in an invalid state until [`Self::build_in_buffer`] is called.
@@ -1411,6 +1444,12 @@ impl ShapeLine {
                 shaping,
             );
             spans.push(span);
+        }
+
+        for (range, attrs) in attrs_list.spans_iter() {
+            if let Some(InlinePadding(padding)) = attrs.inline_padding_opt {
+                Self::pad_span_edges(&mut spans, range, padding);
+            }
         }
 
         // Adjust for tabs
@@ -3043,9 +3082,13 @@ impl ShapeLine {
             if let Some((ascent, descent)) = self.strut {
                 let size = self.metrics_opt.map_or(font_size, |m| m.font_size);
                 let (ascent, descent) = (size * ascent, size * descent);
-                // A line whose own spans set it shorter than the default
-                // font's glyphs could not hold the strut without pushing its
-                // glyphs out of it, so it keeps centring on its own.
+                // A line whose spans set it shorter than the default font's
+                // glyphs is sized by those spans rather than by the default,
+                // as when every span of a rich text sets a smaller size; a
+                // strut would push its glyphs out of the box, so it keeps
+                // centring on its own. A line sized by the buffer's metrics
+                // is set in the default font, so it takes the strut like
+                // every other line.
                 if line_height_opt.is_none_or(|height| ascent + descent <= height) {
                     max_ascent = max_ascent.max(ascent);
                     max_descent = max_descent.max(descent);
