@@ -359,11 +359,6 @@ impl PendingVisibility {
         Self::decode(self.0.swap(Self::NONE, Ordering::AcqRel))
     }
 
-    #[cfg(test)]
-    fn peek(&self) -> Option<Visibility> {
-        Self::decode(self.0.load(Ordering::Acquire))
-    }
-
     fn decode(encoded: u8) -> Option<Visibility> {
         match encoded {
             1 => Some(Visibility::Visible),
@@ -1132,15 +1127,19 @@ impl RenderStreamFixture {
             .or(queued)
     }
 
-    /// The host's visibility request the worker has not applied yet, as
-    /// whether it shows the terminal.
-    pub(crate) fn pending_visibility(&self) -> Option<bool> {
+    /// Takes the host's visibility request the worker has not applied yet.
+    pub(crate) fn take_host_visibility(&self) -> Option<super::ipc::TerminalVisibility> {
+        use super::ipc::TerminalVisibility;
         self.handle
             .inner
             .published
             .host_visibility
-            .peek()
-            .map(|pending| pending == Visibility::Visible)
+            .take()
+            .map(|pending| match pending {
+                Visibility::Visible => TerminalVisibility::Visible,
+                Visibility::Hidden => TerminalVisibility::Hidden,
+                Visibility::Hibernated => TerminalVisibility::Hibernated,
+            })
     }
 }
 

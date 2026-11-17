@@ -661,6 +661,7 @@ fn publishing_a_spawn_reveals_a_worker_hidden_while_it_started() {
 /// refuses none of them, and the newest replaces a redraw's Hide.
 #[test]
 fn a_full_command_queue_refuses_no_visibility_change() {
+    use TerminalVisibility::{Hibernated, Hidden, Visible};
     let fixture = Fixture::new();
     let set = |visibility| {
         fixture
@@ -669,7 +670,7 @@ fn a_full_command_queue_refuses_no_visibility_change() {
             .unwrap()
             .set_visibility(1, fixture.id, visibility)
     };
-    set(TerminalVisibility::Hidden).unwrap();
+    set(Hidden).unwrap();
     // The worker published before it applied the hide; the redraw re-asks.
     broadcast_redraw(
         &Arc::downgrade(&fixture.shared),
@@ -677,22 +678,54 @@ fn a_full_command_queue_refuses_no_visibility_change() {
         1,
         &fixture.stream.handle,
     );
-    assert_eq!(fixture.stream.pending_visibility(), Some(false));
+    assert_eq!(fixture.stream.take_host_visibility(), Some(Hidden));
+    // Every request below is made while the queue stays full.
     fill_commands(&fixture.stream);
-    set(TerminalVisibility::Visible).unwrap();
-    assert_eq!(fixture.stream.drain_visibility(), Some(true));
-
-    fill_commands(&fixture.stream);
-    set(TerminalVisibility::Hibernated).unwrap();
-    assert_eq!(fixture.stream.drain_visibility(), Some(false));
-    fill_commands(&fixture.stream);
+    set(Visible).unwrap();
+    assert_eq!(fixture.stream.take_host_visibility(), Some(Visible));
+    set(Hibernated).unwrap();
+    assert_eq!(fixture.stream.take_host_visibility(), Some(Hibernated));
     let mut state = fixture.shared.lock().unwrap();
     state.register_client(2);
     state.attach(2, fixture.id).unwrap();
-    assert_eq!(fixture.stream.drain_visibility(), Some(false), "attach");
-    fill_commands(&fixture.stream);
+    assert_eq!(
+        fixture.stream.take_host_visibility(),
+        Some(Hidden),
+        "attach"
+    );
     state.detach(2, fixture.id).unwrap();
-    assert_eq!(fixture.stream.drain_visibility(), Some(false), "detach");
+    assert_eq!(
+        fixture.stream.take_host_visibility(),
+        Some(Hibernated),
+        "detach"
+    );
+    drop(state);
+    fill_commands(&fixture.stream);
+}
+
+/// A worker reveals once per transition to Visible: each reveal forces a
+/// full capture and resets the subscriber's capture credit. A client leaving
+/// while another still shows the terminal changes nothing.
+#[test]
+fn a_client_leaving_a_terminal_another_shows_does_not_reveal_it_again() {
+    use TerminalVisibility::{Hidden, Visible};
+    let fixture = Fixture::new();
+    // Whatever installing the terminal asked of its worker.
+    fixture.stream.take_host_visibility();
+    let mut state = fixture.shared.lock().unwrap();
+    state.register_client(2);
+    state.attach(2, fixture.id).unwrap();
+    state.set_visibility(2, fixture.id, Visible).unwrap();
+    assert_eq!(fixture.stream.take_host_visibility(), None);
+    drop(state.unregister_client(2));
+    assert_eq!(
+        fixture.stream.take_host_visibility(),
+        None,
+        "the remaining viewer's terminal was revealed again"
+    );
+    // Control: the last viewer leaving does change it.
+    drop(state.unregister_client(1));
+    assert_eq!(fixture.stream.take_host_visibility(), Some(Hidden));
 }
 
 /// A redraw pushes its frames under the host lock. When that overflows a slow

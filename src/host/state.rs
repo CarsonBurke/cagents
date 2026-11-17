@@ -1026,26 +1026,36 @@ impl HostState {
                 .handle
                 .set_visible(record.subscribers.values().any(|visible| *visible));
         }
-        let terminal_ids = self
+        // With each terminal's visibility before the disconnect: only a change
+        // is sent, as every other writer does. Re-sending Visible while
+        // another client still shows the terminal would force a full capture.
+        let terminals = self
             .subscriptions
             .by_client
             .get(&client_id)
-            .map(|terminals| terminals.keys().copied().collect::<Vec<_>>())
+            .map(|terminals| {
+                terminals
+                    .keys()
+                    .map(|terminal_id| (*terminal_id, self.subscriptions.visibility(*terminal_id)))
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
-        let handles = terminal_ids
+        let handles = terminals
             .iter()
-            .filter_map(|terminal_id| {
+            .filter_map(|(terminal_id, _)| {
                 self.terminals
                     .get(terminal_id)
                     .map(|record| record.handle.clone())
             })
             .collect::<Vec<_>>();
         self.subscriptions.disconnect(client_id);
-        for terminal_id in terminal_ids {
+        for (terminal_id, old_visibility) in terminals {
             self.refresh_presentation_owner(terminal_id);
-            let visibility = self.subscriptions.visibility(terminal_id);
-            if let Some(record) = self.terminals.get(&terminal_id) {
-                record.handle.set_host_visibility(visibility);
+            let new_visibility = self.subscriptions.visibility(terminal_id);
+            if old_visibility != new_visibility
+                && let Some(record) = self.terminals.get(&terminal_id)
+            {
+                record.handle.set_host_visibility(new_visibility);
             }
             self.disarm_output_if_observed(terminal_id);
         }
