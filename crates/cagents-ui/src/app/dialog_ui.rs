@@ -196,7 +196,7 @@ pub(crate) enum Consequence {
     /// Lets an agent act with the permissions shown: the person reads what
     /// they agree to before agreeing, so the dismissal takes focus, and the
     /// question is always asked.
-    Consent,
+    Authorization,
     /// Nothing to answer: the dialog reports an outcome, and its one way out
     /// takes focus.
     Report,
@@ -207,7 +207,7 @@ impl Consequence {
     pub(crate) fn initial_focus(self, dismiss: widget::Id, confirm: widget::Id) -> widget::Id {
         match self {
             Self::Routine(_) => confirm,
-            Self::Irreversible | Self::Consent | Self::Report => dismiss,
+            Self::Irreversible | Self::Authorization | Self::Report => dismiss,
         }
     }
 }
@@ -334,7 +334,7 @@ impl Question {
             | Self::DiscardPendingReview
             | Self::SubmitReview
             | Self::UseUsageReset => Consequence::Irreversible,
-            Self::EnableAutomation | Self::RunAutomationNow => Consequence::Consent,
+            Self::EnableAutomation | Self::RunAutomationNow => Consequence::Authorization,
         }
     }
 
@@ -370,7 +370,7 @@ impl Question {
     pub(crate) const fn skippable(self) -> Option<settings::Confirmation> {
         match self.consequence() {
             Consequence::Routine(confirmation) => Some(confirmation),
-            Consequence::Irreversible | Consequence::Consent | Consequence::Report => None,
+            Consequence::Irreversible | Consequence::Authorization | Consequence::Report => None,
         }
     }
 
@@ -444,53 +444,28 @@ pub(crate) fn dont_ask_again_id(confirmation: settings::Confirmation) -> widget:
 
 impl Cagents {
     /// The inline question in front of the person, and the message its
-    /// dismissal sends, which is how Escape answers it. A dialog over the
-    /// window is in front of all of them; then a popover; then the focused
-    /// pane's.
+    /// dismissal sends. A dialog over the window is in front of all of them;
+    /// then an account menu's; then the focused pane's; then a usage reset's,
+    /// which is asked beside an account's usage wherever that is shown.
     pub(super) fn inline_question(&self) -> Option<(Question, Message)> {
         if self.modal_is_open() {
             return None;
         }
-        if self.account_forget_asked() {
-            return Some((
+        self.forget_home_question()
+            .or_else(|| self.pane_question())
+            .or_else(|| self.usage_reset_question())
+    }
+
+    fn forget_home_question(&self) -> Option<(Question, Message)> {
+        self.account_forget_asked().then(|| {
+            (
                 Question::ForgetHome,
                 Message::AccountUi(account_ui::Action::RemoveCancel),
-            ));
-        }
-        if let Some(card) = self.workspace.focused() {
-            match self.cards.get(&card) {
-                Some(CardRuntime::PullRequests(pane)) => {
-                    if let Some(question) = pane.review.review_question() {
-                        return Some((
-                            question,
-                            Message::PullRequestReview {
-                                card,
-                                action: pane.review.review_escape()?,
-                            },
-                        ));
-                    }
-                }
-                Some(CardRuntime::Chat(_)) => {
-                    if let Some(target) = self.focused_close_refusal() {
-                        return Some((
-                            Question::EndCloseHolders,
-                            Message::ChatUi(chat_ui::Action::DismissCloseRefusal(target)),
-                        ));
-                    }
-                }
-                Some(CardRuntime::Automations) => {
-                    if let Some((_, question)) = self.automation_ui.question() {
-                        return Some((
-                            question,
-                            Message::AutomationUi(crate::automation_ui::Action::CancelConfirmation),
-                        ));
-                    }
-                }
-                _ => {}
-            }
-        }
-        // Usage resets are asked beside an account's usage wherever it is
-        // shown, the focused pane's or not.
+            )
+        })
+    }
+
+    fn usage_reset_question(&self) -> Option<(Question, Message)> {
         self.usage_reset_asked().map(|account| {
             (
                 Question::UseUsageReset,
@@ -499,21 +474,80 @@ impl Cagents {
         })
     }
 
-    /// What Escape answers before anything behind it, if it is an inline
-    /// question's or popover's to answer: the question's dismissal, or the
-    /// review popover closing. Like a dialog, the question answers it even
-    /// when the control under it captured the key.
-    pub(super) fn inline_escape(&self) -> Option<Message> {
-        if let Some((_, dismiss)) = self.inline_question() {
+    /// The question asked in the focused pane, unless something covers the
+    /// pane's content.
+    fn pane_question(&self) -> Option<(Question, Message)> {
+        let card = self.workspace.focused()?;
+        if self.pane_content_inputs_blocked(card) {
+            return None;
+        }
+        match self.cards.get(&card)? {
+            CardRuntime::PullRequests(pane) => {
+                let question = pane.review.review_question()?;
+                Some((
+                    question,
+                    Message::PullRequestReview {
+                        card,
+                        action: pane.review.review_escape()?,
+                    },
+                ))
+            }
+            CardRuntime::Chat(_) => self.focused_close_refusal().map(|target| {
+                (
+                    Question::EndCloseHolders,
+                    Message::ChatUi(chat_ui::Action::DismissCloseRefusal(target)),
+                )
+            }),
+            CardRuntime::Automations => self.automation_ui.question().map(|(_, question)| {
+                (
+                    question,
+                    Message::AutomationUi(crate::automation_ui::Action::CancelConfirmation),
+                )
+            }),
+            _ => None,
+        }
+    }
+
+    /// What Escape answers in an account's own surfaces, ahead of the menus
+    /// and popover they sit in: a Forget home question goes back to its
+    /// menu, and a usage reset question is withdrawn.
+    ///
+    /// Unlike a dialog, an inline question doesn't hold the keyboard, so a
+    /// key a focused control captured, such as a composer interrupting its
+    /// agent or a terminal taking Escape, was that control's and answers no
+    /// question. Forget home is the exception: it is asked inside an
+    /// account menu, which, like every popup, takes Escape however it
+    /// arrives, and backing out of the question is the menu's first step.
+    pub(super) fn account_question_escape(&self, captured: bool) -> Option<Message> {
+        if self.modal_is_open() {
+            return None;
+        }
+        self.forget_home_question()
+            .or_else(|| (!captured).then(|| self.usage_reset_question()).flatten())
+            .map(|(_, dismiss)| dismiss)
+    }
+
+    /// What an Escape no control captured answers in the focused pane, once
+    /// every popup, picker and overlay in front of it has had the key: its
+    /// question's dismissal, or else the pull request review popover
+    /// closing. A captured key was the control's, as with
+    /// [`Self::account_question_escape`].
+    pub(super) fn pane_escape(&self) -> Option<Message> {
+        if self.modal_is_open() {
+            return None;
+        }
+        if let Some((_, dismiss)) = self.pane_question() {
             return Some(dismiss);
         }
         let card = self.workspace.focused()?;
+        if self.pane_content_inputs_blocked(card) {
+            return None;
+        }
         let Some(CardRuntime::PullRequests(pane)) = self.cards.get(&card) else {
             return None;
         };
-        (!self.modal_is_open())
-            .then(|| pane.review.review_escape())
-            .flatten()
+        pane.review
+            .review_escape()
             .map(|action| Message::PullRequestReview { card, action })
     }
 

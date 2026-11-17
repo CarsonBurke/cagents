@@ -10155,7 +10155,7 @@ impl Cagents {
             return answer;
         }
         if is_escape_press(&event)
-            && let Some(dismiss) = self.inline_escape()
+            && let Some(dismiss) = self.account_question_escape(captured)
         {
             return (self.update(dismiss), Projection::Full);
         }
@@ -10316,6 +10316,10 @@ impl Cagents {
                 && self.pane_inspector_layout(card) == Some(InspectorLayout::Overlay)
             {
                 return (self.close_pane_inspector_overlay(card), Projection::Full);
+            }
+            // Last, behind everything drawn in front of the pane.
+            if let Some(dismiss) = self.pane_escape() {
+                return (self.update(dismiss), Projection::Full);
             }
         }
         if let Some(backwards) = is_tab_press(&event)

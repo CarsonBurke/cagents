@@ -544,7 +544,7 @@ fn every_question_opens_on_its_safe_answer_unless_routine_and_escape_dismisses_i
         }
         let expected = match question.consequence() {
             Consequence::Routine(_) => confirm.clone(),
-            Consequence::Irreversible | Consequence::Consent | Consequence::Report => {
+            Consequence::Irreversible | Consequence::Authorization | Consequence::Report => {
                 dismiss.clone()
             }
         };
@@ -643,6 +643,105 @@ fn escape_on_an_inline_question_returns_focus_to_what_asked_it() {
             "Escape on {question:?} returns focus to what asked it"
         );
     }
+}
+
+/// An inline question doesn't hold the keyboard, so Escape a focused
+/// control captured, such as a composer interrupting its agent, was that
+/// control's alone and leaves the question asked. Forget home's account
+/// menu is a popup, which takes Escape however it arrives; the question
+/// answers it there, back to the menu.
+#[test]
+fn a_captured_escape_answers_no_inline_question_outside_a_popup() {
+    for &question in Question::ALL {
+        if question.placement() != Placement::Inline {
+            continue;
+        }
+        let in_popup = question == Question::ForgetHome;
+        let Opened {
+            mut app,
+            view,
+            _keep,
+            ..
+        } = open(question);
+        let task = app.update(Message::KeyEvent {
+            event: dialog_ui::tests::key_press(keyboard::key::Named::Escape),
+            captured: true,
+        });
+        deliver(&mut app, task);
+        if in_popup {
+            assert_eq!(asked(view(&app)), None, "its menu answers {question:?}");
+            assert!(
+                account_ui::table_tests::open_menu(&app).is_some(),
+                "and stays open"
+            );
+        } else {
+            assert_eq!(
+                asked(view(&app)),
+                Some(question),
+                "a captured Escape leaves {question:?} asked"
+            );
+        }
+    }
+}
+
+/// A pane's question is the focused pane's to answer: Escape in another
+/// pane leaves it asked.
+#[test]
+fn escape_in_another_pane_leaves_a_pane_question_asked() {
+    let Opened { mut app, _keep, .. } = open(Question::RemoveAutomation);
+    let automations = app.workspace.focused().expect("the automations pane");
+    let chat = chat_ui::tests::working_chat(&mut app, "elsewhere");
+    drop(app.workspace.focus(chat));
+    let task = app.update(escape());
+    deliver(&mut app, task);
+    drop(app.workspace.focus(automations));
+    assert_eq!(
+        asked(automation_pane(&app)),
+        Some(Question::RemoveAutomation),
+        "Escape in the chat leaves the automation's question asked"
+    );
+}
+
+/// A popup drawn in front of the pane takes Escape before the question
+/// behind it: the first press closes the device menu, the second answers.
+#[test]
+fn a_popup_in_front_takes_escape_before_the_pane_question() {
+    let Opened { mut app, _keep, .. } = open(Question::RemoveAutomation);
+    app.device_ui.menu_open = true;
+    let task = app.update(escape());
+    deliver(&mut app, task);
+    assert!(!app.device_ui.menu_open, "the first Escape closes the menu");
+    assert_eq!(
+        asked(automation_pane(&app)),
+        Some(Question::RemoveAutomation),
+        "and leaves the question behind it asked"
+    );
+    let task = app.update(escape());
+    deliver(&mut app, task);
+    assert_eq!(asked(automation_pane(&app)), None, "the second answers it");
+}
+
+/// With no question asked, Escape closes the review popover, as its
+/// Cancel does.
+#[test]
+fn escape_closes_a_review_popover_that_asks_nothing() {
+    let Opened { mut app, _keep, .. } = open(Question::SubmitReview);
+    let task = app.update(escape());
+    deliver(&mut app, task);
+    let Some((_, CardRuntime::PullRequests(pane))) = focused_card(&app) else {
+        panic!("a pull request pane");
+    };
+    assert_eq!(pane.review.review_question(), None, "the first answers");
+    assert!(pane.review.review_escape().is_some(), "the popover is open");
+    let task = app.update(escape());
+    deliver(&mut app, task);
+    let Some((_, CardRuntime::PullRequests(pane))) = focused_card(&app) else {
+        panic!("a pull request pane");
+    };
+    assert!(
+        pane.review.review_escape().is_none(),
+        "the second closes the popover"
+    );
 }
 
 fn focused_in(
