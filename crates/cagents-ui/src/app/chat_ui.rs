@@ -1118,11 +1118,6 @@ fn account_switch_hold(snapshot: &chat::Snapshot) -> Option<String> {
     })
 }
 
-/// An automatic account switch the daemon refused while it finished another
-/// operation. The send that asked for it was never made, so its message is
-/// still in the composer and sending again is the retry.
-const ACCOUNT_SWITCH_BUSY: &str = "Sending would move this conversation to another account, but cagents was busy finishing another operation, so it stayed on its current account and your message wasn't sent. Send again in a moment.";
-
 /// The account home `session` launches its provider in, as its launch names it.
 fn chat_account_home(session: &chat::Session) -> Option<&str> {
     let variable = account::home_variable(session.launch.provider)?;
@@ -12311,7 +12306,8 @@ impl Cagents {
                             && !runtime.disconnected
                             && !runtime.snapshot.exited
                         {
-                            runtime.error = Some(ACCOUNT_SWITCH_BUSY.to_owned());
+                            runtime.error =
+                                Some(chat::failure::delivery::ACCOUNT_SWITCH_BUSY.to_owned());
                         }
                         return Task::none();
                     }
@@ -12623,6 +12619,16 @@ impl Cagents {
                         let previous_limit = runtime.failure_ui.limit_occurrence;
                         let rehydrating = runtime.presentation_evicted;
                         runtime.refresh();
+                        // The daemon reports an exit that happened while it
+                        // was busy only once it is free, after its refusal.
+                        // Sending again no longer applies: the provider's own
+                        // report and the way back to it stand instead.
+                        if runtime.snapshot.exited
+                            && runtime.error.as_deref()
+                                == Some(chat::failure::delivery::ACCOUNT_SWITCH_BUSY)
+                        {
+                            runtime.error = None;
+                        }
                         let settled = runtime.settle_streaming_answer();
                         // First hydration can load historical provider errors
                         // never classified in this window. Current Snapshot/
@@ -19367,7 +19373,10 @@ pub(in crate::app) mod tests {
         assert!(Arc::ptr_eq(runtime.handle().unwrap(), &handle));
         assert!(!runtime.disconnected);
         assert_eq!(runtime.session, source);
-        assert_eq!(runtime.error.as_deref(), Some(ACCOUNT_SWITCH_BUSY));
+        assert_eq!(
+            runtime.error.as_deref(),
+            Some(chat::failure::delivery::ACCOUNT_SWITCH_BUSY)
+        );
         assert_eq!(runtime.composer.text().trim(), "Keep this message");
 
         drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send))));
@@ -19404,6 +19413,41 @@ pub(in crate::app) mod tests {
         let runtime = chat_runtime(&app, card);
         assert!(runtime.disconnected);
         assert_eq!(runtime.error.as_deref(), Some("The daemon stopped"));
+    }
+
+    /// The conversation's provider exited while the daemon was busy, which
+    /// the reader learns only after the refusal. Its exit and recovery then
+    /// replace the advice to send again; the message stays in the composer.
+    #[test]
+    fn a_busy_refusal_gives_way_to_an_exit_reported_after_it() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target) = limited_automatic_chat(&mut app, "Keep this message");
+        let handle = chat_runtime(&app, card).handle().unwrap().clone();
+        drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send))));
+        let attempt = chat_runtime_attempt(&app, card);
+        answer_start(
+            &mut app,
+            attempt,
+            Err(chat::StartFailure {
+                message: crate::terminal_ipc::DAEMON_BUSY.into(),
+                recovery: chat::Recovery::Busy,
+            }),
+        );
+        assert_eq!(
+            chat_runtime(&app, card).error.as_deref(),
+            Some(chat::failure::delivery::ACCOUNT_SWITCH_BUSY)
+        );
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.exited = true;
+        handle.publish_snapshot_for_test(snapshot);
+        drop(app.update(Message::ChatUi(Action::Wake(target, Wake::Changed))));
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.snapshot.exited);
+        assert_eq!(runtime.error, None);
+        assert_eq!(runtime.composer.text().trim(), "Keep this message");
+        assert!(!app.chat_ui.removed_accounts.contains(&card));
+        assert!(!app.chat_ui.restorable_accounts.contains_key(&card));
     }
 
     /// Any other failed switch still leaves the removed-account recovery in

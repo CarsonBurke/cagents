@@ -503,8 +503,9 @@ fn is_zone(text: &str) -> bool {
         })
 }
 
-/// What became of a request Claude's retained conversation process could not
-/// confirm or take, as the daemon reports it, and what the person can do.
+/// What became of a request cagents could not deliver, such as one Claude's
+/// retained conversation process could not confirm or take, as the daemon
+/// reports it, and what the person can do.
 /// Each text is one sentence of outcome and one of next step, so a notice can
 /// show the step as its guidance instead of a generic one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -593,6 +594,11 @@ delivery_outcomes! {
     /// Any input once the proxy has stopped.
     refused UNAVAILABLE_INPUT: "Claude's conversation process is no longer reachable, so this was not sent.",
         "Close and reopen the conversation to continue.";
+    /// A send that needed an automatic account switch the daemon refused
+    /// while it finished another operation. The message is still in the
+    /// composer, so sending again is the retry.
+    refused ACCOUNT_SWITCH_BUSY: "Sending would move this conversation to another account, but cagents was busy finishing another operation, so it stayed on its current account and your message wasn't sent.",
+        "Send again in a moment.";
 }
 
 impl DeliveryOutcome {
