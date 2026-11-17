@@ -371,6 +371,10 @@ impl Cagents {
                 paths.push(runtime.descriptor.worktree.clone());
             }
         }
+        #[cfg(any(test, feature = "development"))]
+        if super::projection_oracle::enabled() {
+            self.projected_protections = paths.iter().cloned().collect();
+        }
         if let Err(error) = self.worktree_protections.sync(paths) {
             tracing::debug!(%error, "automatic worktree cleanup unavailable until window scopes are protected");
         }
@@ -4764,8 +4768,12 @@ pub(in crate::app) mod tests {
         let _ = app.handle_project_action(Action::ConfirmDelete);
         loaded(&mut app, picked, picked_listing, true);
         assert_ne!(app.active_workspace.as_ref(), Some(&linked_path));
+        // The update that refused it reported why.
         assert_eq!(
-            app.status.as_ref().map(|notice| notice.message.as_str()),
+            app.notices
+                .recent()
+                .next()
+                .map(|entry| entry.notice.message.as_str()),
             Some("That worktree is being deleted.")
         );
         git(

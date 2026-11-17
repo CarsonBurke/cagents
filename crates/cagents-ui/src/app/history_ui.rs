@@ -11,6 +11,18 @@ pub(super) struct State {
 }
 
 impl State {
+    /// Which requests are current and whether one is under way, for the
+    /// projection check: rebinding the source control cancels them.
+    #[cfg(any(test, feature = "development"))]
+    pub(super) fn projection_view(&self) -> String {
+        format!(
+            "history {} page {} running {}",
+            self.generation,
+            self.page_generation,
+            self.cancellation.is_some()
+        )
+    }
+
     pub(super) fn next_page_request(&mut self) -> u64 {
         self.page_generation = self.page_generation.wrapping_add(1);
         self.page_generation

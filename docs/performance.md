@@ -162,6 +162,13 @@ A nested `update` counts toward the outermost one. Overlays' own layout and
 drawing, the libcosmic chrome around the application view, and the renderer's
 presentation run outside the measured root, so the thread's CPU time exceeds
 the traced total.
+The `Projection` phase breaks out the share of `update` spent on its
+projection tail, without adding to any total. A label such as
+`Full Sidebar(OpenChannel` or `Unchanged ChatUi(Wake` names the projection an
+update took and its message; `Camera` is the full projection's panning path,
+and `Postlude` the work every update ends with. `stage chrome`,
+`stage sidebar_channels` and the other `stage` labels time the tail's stages
+across all updates.
 Each five-second report also covers the frames the shell presented, on any of
 its surfaces: how many, the p50/p95/p99/max **work** of each, and the same
 quantiles of the **interval** between consecutive presentations, as
@@ -429,6 +436,67 @@ change is a reported terminal title (OSC 0/2) runs only chrome, which includes
 the window title. Reported titles on their own cause at most one save, and
 one publication to shared views, every three seconds. The unit tests in `crates/cagents-ui/src/app/terminal_output_tests.rs`
 count the tail passes, chrome syncs and saves each message causes.
+
+The full projection is the default. An update projects less only where the
+handler for its message declares what it changed, by returning a narrower
+`Projection` beside its task, so a new handler is correct before it is fast.
+A handler that returns before the projection makes the same claim. Typing is
+the busiest case: a key that a text field took, a key release and a
+modifier change answer nothing in the workspace and project nothing, and the
+pointer crossing the tab strip changes only which tab is drawn hovered. A key
+that does something, such as Ctrl+Tab moving the focus or Escape closing a
+dialog, projects everything in its own update rather than leaving the
+projection to whatever message comes next.
+
+`app/projection_oracle.rs` checks each narrower declaration. After an update
+whose projection was narrower than `Full`, it runs the full projection and
+compares what the workspace derives: the sidebar model and state, card chrome
+and indices, terminal ordinals, pane and window titles, inspectors, transcript
+probes, worktree owners and protections, the panes whose working directory
+and find bar are kept, and which source control, branch comparison and
+history reads are current. It does not compare the tasks the projection
+returns. Every unit test built with debug assertions runs it and fails,
+naming the message and the stale part. Before an outermost update whose
+message can project narrowly it first brings that state up to date, because
+tests often arrange state directly and leave its projection to the next
+update. An update whose handler returned before projecting is checked when
+it returns if its state was brought up to date first. Otherwise the next
+update that brings the state up to date reports what it found stale against
+that earlier update, rather than repairing it silently; stale state found
+after an update that did project is put down to a test's own arrangement.
+
+Set `CAGENTS_PROJECTION_ORACLE` for a development build to run the same
+check natively. It logs to the `cagents::projection_oracle` target, both a
+stale declaration and state found stale before an update, with the update
+before it. Each check keeps what its full projection repaired and runs the
+tasks it returned, so such a session behaves as though every update
+projected everything: it cannot show a stale title or sidebar, and only its
+log shows whether a declaration was wrong. The check adds full projections
+to narrower updates, so the timing tests turn it off and native measurements
+run without the variable.
+
+The workload for these declarations is the `realistic` native evidence seed
+(18 projects, 76 channels, 1769 cards) at 1600x1000 under `--ui-trace`, with
+three fixture Claude agents streaming long replies, one shown. The run
+records idle streaming for 15 s, then types four 77-character sentences into
+the shown conversation's composer with `drive type`. It then hovers 14
+sidebar rows and 4 tabs twice, scrolls the sidebar, and switches channels 8
+times. One run per side on fw16 (`dev-runtime`) compares `a831f307a`, which
+traces the stages and projects everything for every key, with the change for
+issue #2954:
+
+| Phase | Before | After |
+| --- | --- | --- |
+| Typing, full projections | 336 `KeyEvent`, 2304 ms | none from keys (2 `RefreshUi` ticks) |
+| Typing, worst window's frame work p95 / p99 | 557 / 877 ms | 24 / 57 ms |
+| Typing, busy per second of trace | 643 ms | 302 ms |
+| Hover, `ChromeUi(HoverTab)` updates | 16, 165 ms | 12, 1.6 ms |
+| Whole run, traced busy time | 30.5 s over 146 s | 15.7 s over 136 s |
+
+Before, about two thirds of each key's projection was `stage chrome`, which
+rebuilds every card's chrome. A visible streaming conversation's
+`ChatUi(Wake)` costs about 2 ms of update each, outside the projection, and is
+the largest remaining cost while typing.
 
 The native workload has no script. In the browserless development runner,
 inside a nested niri session with fresh private HOME and XDG directories, open

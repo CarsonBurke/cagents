@@ -525,6 +525,14 @@ pub(super) struct State {
     attempts: HashMap<CardId, Attempt>,
     outstanding: HashMap<uuid::Uuid, CardId>,
 }
+
+impl State {
+    /// The terminals' transcript probes, for the projection check.
+    #[cfg(any(test, feature = "development"))]
+    pub(super) fn projection_view(&self) -> String {
+        super::projection_oracle::sorted_entries(&self.probes)
+    }
+}
 #[derive(Clone)]
 pub struct Permit(Arc<Mutex<Option<transcript_location::ValidatedTranscript>>>);
 impl std::fmt::Debug for Permit {

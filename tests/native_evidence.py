@@ -933,6 +933,16 @@ class Evidence(unittest.TestCase):
                 self.assertEqual((self.logs / "ui-trace").read_text(), f"{expected}\n")
                 self.run_tool("stop")
 
+    def test_projection_oracle_reaches_only_the_session_that_asked_for_it(self) -> None:
+        self.built()
+        for options, expected in (([], False), (["--projection-oracle"], True), ([], False)):
+            with self.subTest(options=options):
+                (self.logs / "ui-ran").unlink(missing_ok=True)
+                self.run_tool("start", "after", *options)
+                environment = (self.logs / "ui-env").read_text().splitlines()
+                self.assertEqual("CAGENTS_PROJECTION_ORACLE=1" in environment, expected)
+                self.run_tool("stop")
+
     def test_scoped_ui_fixture_leaves_daemon_env_and_cli_as_user_and_resets_on_next_start(self) -> None:
         self.built()
         token = "native-evidence-invalid-session"

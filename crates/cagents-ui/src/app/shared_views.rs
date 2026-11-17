@@ -6459,6 +6459,7 @@ mod tests {
     #[test]
     #[ignore = "manual paired measurement of observed metadata edits"]
     fn measure_observed_channel_renames_at_desktop_inventory_scale() {
+        crate::app::projection_oracle::disable();
         use super::super::workspace_model_sync::ModelUpdate;
         fn thread_cpu() -> Duration {
             let mut value = libc::timespec {
@@ -6525,6 +6526,7 @@ mod tests {
     #[test]
     #[ignore = "manual paired measurement of complete saves"]
     fn measure_complete_saves_at_desktop_inventory_scale() {
+        crate::app::projection_oracle::disable();
         use super::super::workspace_model_sync::ModelUpdate;
         fn thread_cpu() -> Duration {
             let mut value = libc::timespec {
@@ -6894,6 +6896,7 @@ mod tests {
     #[test]
     #[ignore = "manual paired fw16 performance measurement"]
     fn measure_desktop_startup_reconciliation() {
+        crate::app::projection_oracle::disable();
         use super::super::workspace_model_sync::ModelUpdate;
         fn cpu_ns() -> u64 {
             let mut value = libc::timespec {

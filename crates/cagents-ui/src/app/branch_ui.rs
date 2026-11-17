@@ -28,6 +28,19 @@ pub(super) struct State {
 }
 
 impl State {
+    /// Which comparison is under way, for the projection check: rebinding
+    /// the source control cancels it.
+    #[cfg(any(test, feature = "development"))]
+    pub(super) fn projection_view(&self) -> String {
+        format!(
+            "branch {} pending {:?}",
+            self.generation,
+            self.pending
+                .as_ref()
+                .map(|pending| (pending.generation, &pending.identity))
+        )
+    }
+
     fn cancel(&mut self) {
         if let Some(pending) = self.pending.take() {
             pending.cancellation.cancel();

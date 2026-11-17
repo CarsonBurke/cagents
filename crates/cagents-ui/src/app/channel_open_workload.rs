@@ -406,6 +406,7 @@ fn opening_a_channel_while_a_save_is_in_flight_copies_no_card() {
 #[test]
 #[ignore = "timing workload; run optimized with --ignored --nocapture"]
 fn channel_open_timing() {
+    super::projection_oracle::disable();
     let (mut app, channels, _directory) = large_workspace(&Scale::LARGE);
     let mut renderer = super::tests::headless_renderer();
     let mut cache = frame(&app, Default::default(), &mut renderer);
@@ -473,6 +474,7 @@ fn channel_open_timing() {
 #[test]
 #[ignore = "timing workload; run optimized with --ignored --nocapture"]
 fn worktree_open_timing() {
+    super::projection_oracle::disable();
     let (mut app, _channels, _directory) = large_workspace(&Scale::LARGE);
     let project = &app.sidebar_model.projects[0];
     let rows = &project.worktrees;
@@ -517,6 +519,7 @@ fn worktree_open_timing() {
 #[test]
 #[ignore = "timing workload; run optimized with --ignored --nocapture"]
 fn navigation_save_timing() {
+    super::projection_oracle::disable();
     let (mut app, channels, directory) = large_workspace(&Scale::LARGE);
     app.shared_views.skip_rediscovery_check();
     let targets = &channels[..Scale::LARGE.chats];
@@ -597,6 +600,7 @@ fn navigation_save_timing() {
 #[test]
 #[ignore = "timing workload; run optimized with --ignored --nocapture"]
 fn new_worktree_save_timing() {
+    super::projection_oracle::disable();
     let (mut app, _channels, _directory) = large_workspace(&Scale::LARGE);
     app.shared_views.skip_rediscovery_check();
     // The daemon acknowledges each seed and lists its view.
@@ -663,6 +667,7 @@ fn new_worktree_save_timing() {
 #[test]
 #[ignore = "timing workload; run optimized with --ignored --nocapture"]
 fn steady_frame_phases() {
+    super::projection_oracle::disable();
     use iced::advanced::widget::{Tree, tree::NAMED};
 
     fn nodes(tree: &Tree) -> usize {
@@ -731,6 +736,7 @@ fn steady_frame_phases() {
 #[test]
 #[ignore = "timing workload; run optimized with --ignored --nocapture"]
 fn pull_request_label_upkeep_timing() {
+    super::projection_oracle::disable();
     const LISTED: u64 = 100;
     const TURNS: usize = 16;
     const SHOWN: usize = 4;
@@ -822,4 +828,103 @@ fn pull_request_label_upkeep_timing() {
     );
     summary("update, nothing changed", &mut steady);
     summary("update after a poll", &mut polled);
+}
+
+/// What the projection that ends an update costs in the large workspace,
+/// stage by stage, and the whole update for messages that change nothing the
+/// projection reads: a modifier key's event, which every keystroke delivers
+/// beside the text it types, and an animation frame.
+#[test]
+#[ignore = "timing workload; run optimized with --ignored --nocapture"]
+fn projection_tail_timing() {
+    super::projection_oracle::disable();
+    const ROUNDS: usize = 64;
+    let (mut app, channels, _directory) = large_workspace(&Scale::LARGE);
+    drop(app.update(Message::Sidebar(SidebarAction::OpenChannel {
+        channel_id: channels[1],
+    })));
+    let modifiers = || Message::KeyEvent {
+        event: keyboard::Event::ModifiersChanged(keyboard::Modifiers::empty()),
+        captured: true,
+    };
+    let timed = |label: &str, app: &mut Cagents, stage: &mut dyn FnMut(&mut Cagents)| {
+        let mut durations = Vec::with_capacity(ROUNDS);
+        for round in 0..ROUNDS + 8 {
+            let started = Instant::now();
+            stage(app);
+            if round >= 8 {
+                durations.push(started.elapsed());
+            }
+        }
+        summary(label, &mut durations);
+    };
+    eprintln!(
+        "projection tail workload: {} cards, {} channels, {} views, {} worktrees",
+        app.durable.cards.len(),
+        app.durable.channels.len(),
+        app.workspace_model.views.len(),
+        app.known_worktree_roots.len(),
+    );
+    timed("update(KeyEvent modifiers)", &mut app, &mut |app| {
+        drop(app.update(modifiers()))
+    });
+    timed("update(Frame)", &mut app, &mut |app| {
+        drop(app.update(Message::Frame(Instant::now())))
+    });
+    timed("update(ChatUi Tick)", &mut app, &mut |app| {
+        drop(app.update(Message::ChatUi(chat_ui::Action::Tick)))
+    });
+    timed("  worktree_protections", &mut app, &mut |app| {
+        app.sync_worktree_protections()
+    });
+    timed("  notice_popup", &mut app, &mut |app| {
+        drop(app.reconcile_notice_popup())
+    });
+    timed("  sidebar_selection", &mut app, &mut |app| {
+        app.synchronize_sidebar_selection()
+    });
+    timed("  sidebar_channels", &mut app, &mut |app| {
+        app.refresh_sidebar_channels()
+    });
+    timed("  retained_attention", &mut app, &mut |app| {
+        app.sidebar_state
+            .prune_retained_attention(&app.sidebar_model)
+    });
+    timed("  row_selection", &mut app, &mut |app| {
+        app.prune_sidebar_row_selection()
+    });
+    timed("  worktree_panes", &mut app, &mut |app| {
+        app.refresh_sidebar_worktree_panes()
+    });
+    timed("  pane_inspectors", &mut app, &mut |app| {
+        app.sync_pane_inspectors()
+    });
+    timed("  pull_request_inspector", &mut app, &mut |app| {
+        app.sync_pull_request_inspector()
+    });
+    timed("  source_control", &mut app, &mut |app| {
+        drop(app.rebind_source_control())
+    });
+    timed("  chrome", &mut app, &mut |app| drop(app.sync_chrome()));
+    timed("  transcript_probes", &mut app, &mut |app| {
+        drop(app.terminal_transcript_probes())
+    });
+    timed("  automation_requests", &mut app, &mut |app| {
+        drop(app.read_owed_automation_requests())
+    });
+    timed("  postlude chat_failures", &mut app, &mut |app| {
+        app.reconcile_chat_failure_presentations()
+    });
+    timed("  postlude pull_request_labels", &mut app, &mut |app| {
+        app.sync_pull_request_labels()
+    });
+    timed("  postlude visible_attention", &mut app, &mut |app| {
+        drop(app.sync_visible_attention())
+    });
+    timed("  postlude notification_presence", &mut app, &mut |app| {
+        app.sync_notification_presence()
+    });
+    timed("  postlude chat_limit_accounts", &mut app, &mut |app| {
+        drop(app.refresh_chat_limit_accounts())
+    });
 }

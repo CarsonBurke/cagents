@@ -44,6 +44,10 @@ pub enum Phase {
     A11y,
     /// Collecting the overlays, such as menus, that widgets have open.
     Overlay,
+    /// The derived-state projection that ends an `update`, named by the
+    /// projection it ran and the update's message, and each of its stages.
+    /// These are shares of the update's time, so they add to no total.
+    Projection,
 }
 
 pub fn enabled() -> bool {
@@ -110,7 +114,32 @@ pub fn update(message: &dyn Debug) -> Scope {
     if depth > 0 {
         return Scope(None);
     }
-    Scope(Some(Entry::new(Phase::Update, label(message), true)))
+    let label = label(message);
+    UPDATE_LABEL.with_borrow_mut(|current| current.clone_from(&label));
+    Scope(Some(Entry::new(Phase::Update, label, true)))
+}
+
+/// Times the projection an update ends with, named by its kind and the
+/// outermost update's message, such as `Full KeyEvent`.
+pub fn projection(kind: &'static str) -> Scope {
+    if !enabled() {
+        return Scope(None);
+    }
+    let label = UPDATE_LABEL.with_borrow(|message| format!("{kind} {message}"));
+    Scope(Some(Entry::new(Phase::Projection, label.into(), false)))
+}
+
+/// Times one stage of the projection an update ends with, such as
+/// `stage sidebar_channels`, summed over every update.
+pub fn projection_stage(stage: &'static str) -> Scope {
+    if !enabled() {
+        return Scope(None);
+    }
+    Scope(Some(Entry::new(
+        Phase::Projection,
+        format!("stage {stage}").into(),
+        false,
+    )))
 }
 
 impl Drop for Scope {
@@ -135,6 +164,8 @@ impl Drop for Scope {
 
 thread_local! {
     static UPDATE_DEPTH: Cell<usize> = const { Cell::new(0) };
+    /// The outermost update's message, which names its projection.
+    static UPDATE_LABEL: RefCell<Box<str>> = RefCell::new(Box::from(""));
     static RECORDER: RefCell<Recorder> = RefCell::new(Recorder::new());
 }
 
@@ -272,13 +303,17 @@ impl Recorder {
         }
         let mut labels: Vec<_> = self.labels.iter().collect();
         labels.sort_by_key(|((phase, _), stat)| (*phase, std::cmp::Reverse(stat.total)));
-        let mut updates = 0;
+        let mut shown = HashMap::<Phase, usize>::new();
         for ((phase, label), stat) in labels {
-            if *phase == Phase::Update {
-                updates += 1;
-                if updates > 8 {
-                    continue;
-                }
+            let limit = match phase {
+                Phase::Update => Some(8),
+                Phase::Projection => Some(24),
+                _ => None,
+            };
+            let count = shown.entry(*phase).or_default();
+            *count += 1;
+            if limit.is_some_and(|limit| *count > limit) {
+                continue;
             }
             eprintln!("ui-trace   {phase:?} {label} {stat}");
         }
@@ -286,7 +321,9 @@ impl Recorder {
 }
 
 /// The message's outer two variant names, from its bounded `Debug` output.
-fn label(message: &dyn Debug) -> Box<str> {
+/// Payloads, which may hold what someone typed, are formatted only up to
+/// the bound and never kept: the label ends with the second variant's name.
+pub fn label(message: &dyn Debug) -> Box<str> {
     let mut bounded = Bounded(String::with_capacity(LABEL_BYTES));
     // Stopping early is the point; the error only reports it.
     let _ = write!(bounded, "{message:?}");

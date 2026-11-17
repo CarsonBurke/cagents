@@ -1834,6 +1834,9 @@ mod tests {
             let created = worktree.id;
             assert_eq!(worktree.path, destination);
             drop(fixture.app.update(publication));
+            // The new row and the selection moving to it are projected
+            // without waiting for the project's reload.
+            crate::app::projection_oracle::assert_projected(&mut fixture.app);
             assert!(
                 fixture
                     .app
