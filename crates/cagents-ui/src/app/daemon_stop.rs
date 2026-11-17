@@ -36,6 +36,9 @@ pub struct DaemonStop {
     pending: bool,
     settled: bool,
     detail: String,
+    /// What the dialog said before the refresh in flight, which it says
+    /// again if a busy daemon refuses that refresh.
+    before_refresh: Option<String>,
     /// What the tray that opened this dialog is told once it closes.
     report: Option<StopReport>,
     failed: Arc<AtomicBool>,
@@ -54,6 +57,7 @@ impl Application for DaemonStop {
                 pending: false,
                 settled: false,
                 detail: CONSEQUENCE.into(),
+                before_refresh: None,
                 report: None,
                 failed,
             },
@@ -97,7 +101,10 @@ impl Application for DaemonStop {
             }
             StopMessage::Refresh if !self.pending => {
                 self.pending = true;
-                self.detail = "Refreshing daemon inventory; no shutdown is being requested.".into();
+                self.before_refresh = Some(std::mem::replace(
+                    &mut self.detail,
+                    "Refreshing daemon inventory; no shutdown is being requested.".into(),
+                ));
                 cosmic::task::future(async {
                     StopMessage::Refreshed(
                         tokio::task::spawn_blocking(|| {
@@ -146,6 +153,7 @@ impl Application for DaemonStop {
             }
             StopMessage::Refreshed(result) if self.pending => {
                 self.pending = false;
+                let before = self.before_refresh.take().unwrap_or_default();
                 match result {
                     Ok(capability) => {
                         self.capability = capability;
@@ -154,8 +162,13 @@ impl Application for DaemonStop {
                         self.detail = "Fresh inventory loaded. Confirm the count below; no shutdown has been requested by this refresh.".into();
                     }
                     // The refresh issued nothing, so the dialog stays as it
-                    // was, Refresh included.
-                    Err(RequestError::Busy) => self.detail = REFRESH_REFUSED_BUSY.into(),
+                    // was, Refresh and the earlier result's text included;
+                    // the busy sentence follows that text once.
+                    Err(RequestError::Busy) => {
+                        let busy = format!("\n\n{REFRESH_REFUSED_BUSY}");
+                        let earlier = before.strip_suffix(&busy).unwrap_or(&before);
+                        self.detail = format!("{earlier}{busy}");
+                    }
                     Err(RequestError::Failed(error)) => {
                         self.settled = true;
                         self.failed.store(true, Ordering::Release);
@@ -392,12 +405,18 @@ mod tests {
         let _unpolled = app.update(StopMessage::Confirm);
         let _ = app.update(StopMessage::Finished(Ok(ShutdownOutcome::Expired)));
         let report = app.report.clone();
-        let _unpolled = app.update(StopMessage::Refresh);
-        let _ = app.update(StopMessage::Refreshed(Err(RequestError::Busy)));
-        assert!(!app.pending && app.settled);
-        assert_eq!(app.report, report);
-        assert_eq!(app.capability, capability);
-        assert_eq!(app.detail, REFRESH_REFUSED_BUSY);
+        let failure = app.detail.clone();
+        let refused = format!("{failure}\n\n{REFRESH_REFUSED_BUSY}");
+        for _ in 0..2 {
+            let _unpolled = app.update(StopMessage::Refresh);
+            let _ = app.update(StopMessage::Refreshed(Err(RequestError::Busy)));
+            assert!(!app.pending && app.settled);
+            assert_eq!(app.report, report);
+            assert_eq!(app.capability, capability);
+            // Why Stop daemon is unavailable stays said, and repeated
+            // refusals do not stack.
+            assert_eq!(app.detail, refused);
+        }
         let _unpolled = app.update(StopMessage::Refresh);
         assert!(app.pending, "Refresh can be asked again");
     }
