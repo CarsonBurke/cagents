@@ -2174,8 +2174,9 @@ tool timeout drops the SSH connection, and that ends the work on the host too.
 TERM, HUP or INT sent to the wrapper alone also ends and reaps its SSH
 connections, Git's and rsync's included, and then the wrapper dies by that
 signal; the host ends the build or comparison they started. A signal its
-caller ignores stays ignored, so `nohup` keeps a run through a closed terminal. A session detached by an explicit
-`start` keeps running until `stop`.
+caller ignores stays ignored, so `nohup` keeps a run through a closed
+terminal. A session detached by an explicit `start` keeps running until
+`stop`.
 
 `pair` builds both sides, then for each starts a session, runs the steps file
 on the host with `SIDE` set and `evidence` standing for `native-evidence` there,
