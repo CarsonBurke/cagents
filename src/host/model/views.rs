@@ -1187,7 +1187,8 @@ impl<'a> PrimaryConversation<'a> {
             (None, _) => {
                 chat.id == next_chat.id
                     || chat.has_unnamed_retained_claude_actor()
-                        && crate::chat::is_retained_resume_successor(chat, next_chat)
+                        && (crate::chat::is_retained_resume_commit(chat, next_chat)
+                            || crate::chat::is_retained_resume_successor(chat, next_chat))
             }
         }
     }
@@ -1921,7 +1922,7 @@ mod tests {
             crate::agent::Provider::Codex,
         ] {
             for source in [Prompt, Provider] {
-                for successor in ["resumed", "reconnected"] {
+                for successor in ["resumed", "account", "reconnected"] {
                     let (mut registry, _directory, _, _) = setup();
                     let channel = ChannelId::new();
                     registry
@@ -1956,21 +1957,29 @@ mod tests {
                     let CardKind::Chat(chat) = &mut next.kind else {
                         unreachable!()
                     };
+                    let started = crate::model::HostSessionProof {
+                        host_session_id: "next-host".into(),
+                        boot_id: "next-boot".into(),
+                        host_incarnation: "next-owner".into(),
+                    };
                     match successor {
                         // After a restart the same provider conversation
-                        // resumes as a new chat, still unproved by a host.
+                        // resumes as a new chat, started by the new host.
                         "resumed" => {
                             chat.id = crate::model::TerminalId::new();
-                            chat.proof = None;
+                            chat.proof = Some(started);
+                        }
+                        // The same conversation continued on another account.
+                        "account" => {
+                            chat.id = crate::model::TerminalId::new();
+                            chat.proof = Some(started);
+                            chat.launch
+                                .recipe
+                                .environment
+                                .insert("CLAUDE_CONFIG_DIR".into(), "/other-account".into());
                         }
                         // The same chat proved by a new host session.
-                        "reconnected" => {
-                            chat.proof = Some(crate::model::HostSessionProof {
-                                host_session_id: "next-host".into(),
-                                boot_id: "next-boot".into(),
-                                host_incarnation: "next-owner".into(),
-                            });
-                        }
+                        "reconnected" => chat.proof = Some(started),
                         _ => unreachable!(),
                     }
                     let update = edit(
@@ -1991,7 +2000,14 @@ mod tests {
     #[test]
     fn resuming_an_unnamed_retained_claude_chat_keeps_its_channel_title() {
         let conversation = uuid::Uuid::new_v4().to_string();
-        for successor in ["confirmed", "unconfirmed", "different-launch"] {
+        for (successor, started) in [
+            ("confirmed", false),
+            ("confirmed", true),
+            ("unconfirmed", false),
+            ("unconfirmed", true),
+            ("different-launch", false),
+            ("different-launch", true),
+        ] {
             let (mut registry, _directory, _, _) = setup();
             let channel = ChannelId::new();
             registry
@@ -2011,6 +2027,7 @@ mod tests {
             chat.native_continuity =
                 crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
             assert!(chat.has_unnamed_retained_claude_actor());
+            let original_chat = chat.clone();
             seed(&mut registry, channel, vec![original.clone()]);
             let mut next = original.clone();
             let CardKind::Chat(chat) = &mut next.kind else {
@@ -2027,6 +2044,21 @@ mod tests {
                 "unconfirmed" => {}
                 "different-launch" => chat.launch.recipe.arguments.push("--other".into()),
                 _ => unreachable!(),
+            }
+            // The UI publishes the pane once the new host has started it:
+            // under its complete proof, as a retained actor again.
+            if started {
+                chat.proof = Some(crate::model::HostSessionProof {
+                    host_session_id: "next-host".into(),
+                    boot_id: "next-boot".into(),
+                    host_incarnation: "next-owner".into(),
+                });
+                chat.native_continuity =
+                    crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+                assert_eq!(
+                    crate::chat::is_retained_resume_commit(&original_chat, chat),
+                    successor != "different-launch"
+                );
             }
             let update = edit(
                 &mut registry,
