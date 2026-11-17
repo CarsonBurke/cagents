@@ -1337,7 +1337,7 @@ fn login_caption(login: &Login) -> &'static str {
         LoginPhase::Waiting => "Finish signing in in the terminal. Closing it cancels.",
         LoginPhase::Verifying => "Checking which account signed in…",
         LoginPhase::Settling => "Saving…",
-        LoginPhase::Discarding => "Discarding…",
+        LoginPhase::Discarding | LoginPhase::DiscardWaiting => "Discarding…",
         LoginPhase::CallbackBlocked => account::login::PORT_BUSY,
     }
 }
@@ -1406,6 +1406,7 @@ mod tests {
             next_check: 0,
             started_at: 0,
             recovered: false,
+            after_busy: false,
         };
         assert!(login_caption(&login).starts_with("Finish signing in in the terminal"));
         // Between asks the phase is `Waiting` again, with the terminal ended.
