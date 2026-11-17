@@ -9357,11 +9357,11 @@ os._exit(0)
         worker.run();
     }
 
-    #[test]
-    fn a_viewport_read_waiting_for_a_synchronized_frame_does_not_hold_back_a_handoff() {
-        // A snapshot is admitted only while its read is queued, so the read a
-        // redraw asked for can still be waiting when upgrade preparation
-        // reaches this worker.
+    /// A snapshot is admitted only while its read is queued, so the read a
+    /// redraw asked for can still be waiting inside a synchronized update when
+    /// a handoff reaches this worker. `handoff` sends the handoff command and
+    /// returns its error, if any.
+    fn assert_waiting_read_settled_by(handoff: impl FnOnce(&mut Worker) -> Option<String>) {
         let (mut worker, _) = capture_worker();
         worker.process_output(b"old frame".to_vec());
         worker.publish_snapshot(true);
@@ -9375,8 +9375,7 @@ os._exit(0)
         });
         assert!(answer.try_recv().is_err(), "the read did not wait");
 
-        let (reply, prepared) = crossbeam_channel::bounded(1);
-        worker.handle_command(Command::PrepareUpgrade(reply));
+        let error = handoff(&mut worker);
         let capture = answer
             .recv_timeout(Duration::from_secs(1))
             .expect("the waiting read was left unanswered")
@@ -9387,13 +9386,36 @@ os._exit(0)
             .map(|cell| cell.text.as_str())
             .collect::<String>();
         assert!(text.starts_with("partial"), "{text:?}");
-        if let Err(error) = prepared.recv_timeout(Duration::from_secs(5)).unwrap() {
+        if let Some(error) = error {
             assert!(
                 !error.contains("still pending"),
                 "a viewport read held back the handoff: {error}"
             );
         }
         worker.run();
+    }
+
+    #[test]
+    fn a_viewport_read_waiting_for_a_synchronized_frame_does_not_hold_back_upgrade_preparation() {
+        assert_waiting_read_settled_by(|worker| {
+            let (reply, prepared) = crossbeam_channel::bounded(1);
+            worker.handle_command(Command::PrepareUpgrade(reply));
+            prepared.recv_timeout(Duration::from_secs(5)).unwrap().err()
+        });
+    }
+
+    #[test]
+    fn a_viewport_read_waiting_for_a_synchronized_frame_does_not_hold_back_a_carry() {
+        // This worker has no holder to detach into, so the carry still fails,
+        // but only after its drain checks have passed.
+        assert_waiting_read_settled_by(|worker| {
+            let (reply, carried) = crossbeam_channel::bounded(1);
+            worker.handle_command(Command::Carry {
+                socket: PathBuf::from("/nonexistent/carry.sock"),
+                reply,
+            });
+            carried.recv_timeout(Duration::from_secs(5)).unwrap().err()
+        });
     }
 
     #[test]
