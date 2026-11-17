@@ -13,6 +13,7 @@
 
 use super::dialog_ui::{Consequence, Placement, Question};
 use super::*;
+use crate::repository::test_fixture::isolated_fixture_case;
 use cosmic::iced::advanced::widget::{Operation, Tree};
 use cosmic::iced::advanced::{Layout, layout};
 use iced::futures::StreamExt;
@@ -63,6 +64,17 @@ fn review_popover(app: &Cagents) -> Option<Element<'_, Message>> {
                 .review_popup_for_test()
                 .map(move |action| Message::PullRequestReview { card, action }),
         ),
+        _ => None,
+    }
+}
+
+/// The focused pull request pane, wide enough to show its review beside
+/// the files.
+fn pull_request_pane(app: &Cagents) -> Option<Element<'_, Message>> {
+    match focused_card(app)? {
+        (card, CardRuntime::PullRequests(pane)) => {
+            Some(app.pull_request_card_layout(card, pane, 1200.0))
+        }
         _ => None,
     }
 }
@@ -270,6 +282,49 @@ fn use_usage_reset() -> Opened {
     }
 }
 
+fn install_update() -> Opened {
+    let mut app = tests::context_inspector_test_app(false);
+    let poll = update_ui::tests::review_ready(&mut app, update_ui::tests::awaiting_confirmation());
+    let opening = app.update(poll);
+    opened(app, opening, id("update.cancel"), id("update.confirm"))
+}
+
+/// A focused pull request pane whose Check out pull request found a
+/// worktree already holding the branch, offered once preparing finishes.
+fn use_existing_checkout() -> Opened {
+    use crate::pull_request_review::checkout_ui::tests::ExistingCheckout;
+    let fixture = ExistingCheckout::new();
+    let (mut app, project) = tests::pull_request_test_app(&[1]);
+    let (card, _) = app.add_pull_requests_card("/repo".into());
+    drop(app.workspace.focus(card));
+    let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&card) else {
+        panic!("a pull request pane");
+    };
+    fixture.open_review(&mut pane.review);
+    let generation = pane.review.selection_generation();
+    let opening = app.update(Message::PullRequestCheckoutReady {
+        card,
+        project,
+        generation,
+        target: fixture.target(),
+        result: Ok(
+            crate::pull_request_review::checkout::PreparedCheckout::reconciling(
+                fixture.plan(),
+                "feature",
+            ),
+        ),
+    });
+    let Some(CardRuntime::PullRequests(pane)) = app.cards.get(&card) else {
+        panic!("a pull request pane");
+    };
+    let (dismiss, confirm, _) = pane.review.existing_checkout_ids();
+    Opened {
+        view: pull_request_pane,
+        _keep: Box::new(fixture),
+        ..opened(app, opening, dismiss, confirm)
+    }
+}
+
 /// Opens `question` the way its user does.
 fn open(question: Question) -> Opened {
     match question {
@@ -436,6 +491,8 @@ fn open(question: Question) -> Opened {
             crate::pull_request_review::discussion_ui::Action::PrepareSubmit,
         ),
         Question::UseUsageReset => use_usage_reset(),
+        Question::InstallUpdate => install_update(),
+        Question::UseExistingCheckout => use_existing_checkout(),
     }
 }
 
@@ -500,6 +557,14 @@ fn escape() -> Message {
 /// dismisses every one of them.
 #[test]
 fn every_question_opens_on_its_safe_answer_unless_routine_and_escape_dismisses_it() {
+    // The existing-checkout offer's plan runs Git, which runs outside the
+    // parallel test process.
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::every_question_opens_on_its_safe_answer_unless_routine_and_escape_dismisses_it"
+    )) {
+        return;
+    }
     for &question in Question::ALL {
         let Opened {
             mut app,
@@ -588,6 +653,14 @@ fn every_question_opens_on_its_safe_answer_unless_routine_and_escape_dismisses_i
 /// conversation's composer, so the next key lands somewhere.
 #[test]
 fn escape_on_an_inline_question_returns_focus_to_what_asked_it() {
+    // The existing-checkout offer's plan runs Git, which runs outside the
+    // parallel test process.
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::escape_on_an_inline_question_returns_focus_to_what_asked_it"
+    )) {
+        return;
+    }
     for &question in Question::ALL {
         if question.placement() != Placement::Inline {
             continue;
@@ -638,6 +711,13 @@ fn escape_on_an_inline_question_returns_focus_to_what_asked_it() {
                     account_ui::resets::reset_control_id(&account, "accounts", "start"),
                 )
             }
+            Question::UseExistingCheckout => {
+                let Some((_, CardRuntime::PullRequests(pane))) = focused_card(&app) else {
+                    panic!("a pull request pane");
+                };
+                let (_, _, check_out) = pane.review.existing_checkout_ids();
+                focused_in(pull_request_pane(&app), task, check_out)
+            }
             _ => unreachable!("{question:?} is not asked in place"),
         };
         assert_eq!(
@@ -654,6 +734,14 @@ fn escape_on_an_inline_question_returns_focus_to_what_asked_it() {
 /// answers it there, back to the menu.
 #[test]
 fn a_captured_escape_answers_no_inline_question_outside_a_popup() {
+    // The existing-checkout offer's plan runs Git, which runs outside the
+    // parallel test process.
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::a_captured_escape_answers_no_inline_question_outside_a_popup"
+    )) {
+        return;
+    }
     for &question in Question::ALL {
         if question.placement() != Placement::Inline {
             continue;

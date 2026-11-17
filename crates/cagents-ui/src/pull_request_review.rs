@@ -53,6 +53,12 @@ struct QuestionIds {
     discard_in_review: widget::Id,
     discard_in_composer: widget::Id,
     submit: widget::Id,
+    /// The existing-checkout offer's answers, asked beneath the summary
+    /// while the review popover may ask its own, and Check out pull
+    /// request, which asks it.
+    offer_dismiss: widget::Id,
+    offer_confirm: widget::Id,
+    checkout: widget::Id,
 }
 
 impl Default for QuestionIds {
@@ -63,6 +69,9 @@ impl Default for QuestionIds {
             discard_in_review: widget::Id::unique(),
             discard_in_composer: widget::Id::unique(),
             submit: widget::Id::unique(),
+            offer_dismiss: widget::Id::unique(),
+            offer_confirm: widget::Id::unique(),
+            checkout: widget::Id::unique(),
         }
     }
 }
@@ -2244,6 +2253,7 @@ impl State {
         .into();
         let mut controls: Vec<Element<'_, Action>> = vec![
             icon_button(Icon::Branch, "Check out pull request")
+                .id(self.question_ids.checkout.clone())
                 .on_press_maybe(
                     (!modal_open
                         && !busy

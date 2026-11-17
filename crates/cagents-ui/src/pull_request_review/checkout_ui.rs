@@ -90,26 +90,66 @@ impl State {
                 .is_some_and(|source| source.same_repository(&plan.request().head_repository))
     }
 
+    /// Offers to reconcile the existing checkout `plan` describes, and
+    /// returns the task moving the keyboard to where its question opens, for
+    /// the pane to run if the person is still in it. An offer it can't make
+    /// returns none.
     pub fn offer_existing_checkout(
         &mut self,
         target: CheckoutTarget,
         plan: ExistingPrCheckoutPlan,
         notice: String,
-    ) {
+    ) -> ActionTask {
         if self.existing_checkout.busy() {
-            return;
+            return ActionTask::none();
         }
         if !self.existing_checkout_plan_is_current(&target, &plan) {
             self.notice = Some(
                 "The PR branch, source or head changed. Refresh the review before checking it out."
                     .into(),
             );
-            return;
+            return ActionTask::none();
         }
         self.existing_checkout.reset();
         self.existing_checkout.target = Some(target);
         self.existing_checkout.plan = Some(plan);
         self.existing_checkout.notice = Some(notice);
+        Question::UseExistingCheckout.focus_task(
+            self.question_ids.offer_dismiss.clone(),
+            self.question_ids.offer_confirm.clone(),
+        )
+    }
+
+    /// The question the pane asks where Escape answers it, and its
+    /// dismissal: the review popover's while the popover is open in front of
+    /// the pane, asking or not, or else the existing-checkout offer's.
+    pub(crate) fn pane_question(&self) -> Option<(Question, super::Action)> {
+        if let Some(dismiss) = self.review_escape() {
+            return self.review_question().map(|question| (question, dismiss));
+        }
+        let question = self.existing_checkout_question()?;
+        Some((
+            question,
+            self.fenced(super::Action::ExistingCheckout(Action::Cancel)),
+        ))
+    }
+
+    /// The existing-checkout offer's dismissal and committing action, and
+    /// Check out pull request, which asks it.
+    #[cfg(test)]
+    pub(crate) fn existing_checkout_ids(&self) -> (widget::Id, widget::Id, widget::Id) {
+        (
+            self.question_ids.offer_dismiss.clone(),
+            self.question_ids.offer_confirm.clone(),
+            self.question_ids.checkout.clone(),
+        )
+    }
+
+    /// The question the existing-checkout offer asks, until it is answered:
+    /// once accepted, it reports the reconciliation and its outcome instead.
+    fn existing_checkout_question(&self) -> Option<Question> {
+        (self.existing_checkout.plan.is_some() && !self.existing_checkout.accepted)
+            .then_some(Question::UseExistingCheckout)
     }
 
     pub(super) fn update_existing_checkout(&mut self, action: Action) -> ActionTask {
@@ -121,6 +161,9 @@ impl State {
                         Some("Cancellation requested; waiting for the checkout outcome.".into());
                 } else {
                     self.existing_checkout.reset();
+                    // Back to Check out pull request, which asked, so the next
+                    // key lands somewhere rather than on a control now gone.
+                    return iced::widget::operation::focus(self.question_ids.checkout.clone());
                 }
             }
             Action::Confirm => {
@@ -269,6 +312,7 @@ impl State {
         // One control from the offer to the outcome, so Dismiss beside it
         // stays put while the checkout reconciles and once it is done.
         let primary = crate::ui_controls::button::secondary(label)
+            .id(self.question_ids.offer_confirm.clone())
             .instead("Open existing worktree", completed)
             .instead("Reconciling checkout…", busy)
             .on_press_maybe(if completed {
@@ -285,6 +329,7 @@ impl State {
             widget::row::with_children(vec![
                 primary.into(),
                 crate::ui_controls::button::quiet("Dismiss")
+                    .id(self.question_ids.offer_dismiss.clone())
                     .instead("Cancel reconciliation", busy)
                     .on_press_maybe((!modal_open).then(|| action(Action::Cancel)))
                     .into(),
@@ -292,12 +337,16 @@ impl State {
             .spacing(space::S)
             .into(),
         );
-        Some(widget::column::with_children(rows).spacing(space::S).into())
+        let rows = widget::column::with_children(rows).spacing(space::S);
+        Some(match self.existing_checkout_question() {
+            Some(question) => crate::app::dialog_ui::inline_question(question, rows),
+            None => rows.into(),
+        })
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::repository::test_fixture::isolated_fixture_case;
     use crate::repository::{ExistingPrCheckoutRequest, PrCheckoutTracking, ValidatedRefName};
@@ -330,6 +379,161 @@ mod tests {
         String::from_utf8(output.stdout).unwrap().trim().to_owned()
     }
 
+    /// A repository whose `existing` worktree already holds pull request
+    /// #7's branch, `feature`, at the reviewed head but tracks nothing: the
+    /// checkout a review of #7 offers to reconcile by setting its upstream.
+    /// Its plan runs Git, so its test runs under [`isolated_fixture_case`].
+    pub(crate) struct ExistingCheckout {
+        /// Holds the repositories until the fixture is dropped.
+        _directory: tempfile::TempDir,
+        repository: PathBuf,
+        remote: PathBuf,
+        worktree: PathBuf,
+        head: Oid,
+        key: GitHubRepoKey,
+    }
+
+    impl ExistingCheckout {
+        pub(crate) fn new() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let repository = directory.path().join("repository");
+            let remote = directory.path().join("remote.git");
+            let worktree = directory.path().join("existing");
+            git(
+                directory.path(),
+                &["init", "--bare", remote.to_str().unwrap()],
+            );
+            git(
+                directory.path(),
+                &[
+                    "init",
+                    "--initial-branch=main",
+                    repository.to_str().unwrap(),
+                ],
+            );
+            git(&repository, &["config", "user.name", "Fixture"]);
+            git(
+                &repository,
+                &["config", "user.email", "fixture@example.invalid"],
+            );
+            std::fs::write(repository.join("README"), "Reviewed content\n").unwrap();
+            git(&repository, &["add", "README"]);
+            git(&repository, &["commit", "-m", "Initial fixture"]);
+            git(
+                &repository,
+                &["push", remote.to_str().unwrap(), "HEAD:refs/heads/feature"],
+            );
+            git(
+                &repository,
+                &[
+                    "worktree",
+                    "add",
+                    "--no-track",
+                    "-b",
+                    "feature",
+                    worktree.to_str().unwrap(),
+                    "HEAD",
+                ],
+            );
+            let url = "https://fixture.invalid/owner/repo.git";
+            git(&repository, &["remote", "add", "origin", url]);
+            git(
+                &repository,
+                &[
+                    "config",
+                    &format!("url.{}.insteadOf", remote.display()),
+                    url,
+                ],
+            );
+            git(
+                &repository,
+                &["config", "fixture.keep", "unrelated configuration"],
+            );
+            let head = Oid::parse(&git(&repository, &["rev-parse", "HEAD"])).unwrap();
+            let key = GitHubRepoKey::new("fixture.invalid", None, "owner", "repo").unwrap();
+            Self {
+                _directory: directory,
+                repository,
+                remote,
+                worktree,
+                head,
+                key,
+            }
+        }
+
+        /// The plan preparing #7's checkout finds: set the upstream.
+        pub(crate) fn plan(&self) -> ExistingPrCheckoutPlan {
+            let request = ExistingPrCheckoutRequest {
+                repository: self.repository.clone(),
+                worktree: self.worktree.clone(),
+                branch: ValidatedBranchName::parse("feature").unwrap(),
+                head_repository: self.key.clone(),
+                head_branch: ValidatedBranchName::parse("feature").unwrap(),
+                expected_head: self.head.clone(),
+                remote: "origin".into(),
+                tracking: PrCheckoutTracking::RemoteBranch,
+            };
+            RepositoryService::system("git")
+                .prepare_existing_pr_checkout(&request, &CancellationToken::new())
+                .unwrap()
+        }
+
+        /// What Check out pull request asks to check out.
+        pub(crate) fn target(&self) -> CheckoutTarget {
+            CheckoutTarget {
+                repository: self.repository.clone(),
+                number: 7,
+                head: self.head.clone(),
+                pull_request: Some(PullRequestKey::new(self.key.clone(), 7).unwrap()),
+                head_ref_name: "feature".into(),
+                head_repository: Some(self.key.clone()),
+            }
+        }
+
+        fn pull_request(&self) -> PullRequest {
+            serde_json::from_value(serde_json::json!({
+                "number": 7,
+                "title": "Fixture",
+                "state": "OPEN",
+                "headRefName": "feature",
+                "headRefOid": self.head.as_str(),
+                "headRepository": {"name": "repo"},
+                "headRepositoryOwner": {"login": "owner"},
+                "baseRefName": "main",
+                "updatedAt": "2026-10-15T00:00:00Z",
+                "url": "https://fixture.invalid/owner/repo/pull/7"
+            }))
+            .unwrap()
+        }
+
+        fn range(&self) -> crate::repository::PullRequestRange {
+            crate::repository::PullRequestRange {
+                number: 7,
+                base_branch: ValidatedBranchName::parse("main").unwrap(),
+                head_mirror: ValidatedRefName::parse("refs/cagents/fixture/head").unwrap(),
+                base_mirror: ValidatedRefName::parse("refs/cagents/fixture/base").unwrap(),
+                head: self.head.clone(),
+                base_tip: self.head.clone(),
+                merge_base: self.head.clone(),
+            }
+        }
+
+        /// Shows the review of #7 in `state`, loaded as the pane loads it,
+        /// so Check out pull request can ask for this checkout.
+        pub(crate) fn open_review(&self, state: &mut State) {
+            drop(state.update(super::super::Action::Open(ReviewTarget {
+                repository: self.key.clone(),
+                worktree: self.repository.clone(),
+                pull_request: Arc::new(self.pull_request()),
+            })));
+            let mut loaded = super::super::tests::loaded(Vec::new(), Vec::new());
+            loaded.pull_request = self.pull_request();
+            loaded.context.head_oid = self.head.as_str().to_owned();
+            loaded.range = self.range();
+            super::super::tests::finish_load(state, loaded);
+        }
+    }
+
     #[test]
     fn existing_checkout_tracking_changes_only_after_confirmation_and_opens_only_after_verified_receipt()
      {
@@ -340,109 +544,32 @@ mod tests {
         )) {
             return;
         }
-        let directory = tempfile::tempdir().unwrap();
-        let repository = directory.path().join("repository");
-        let remote = directory.path().join("remote.git");
-        let worktree = directory.path().join("existing");
-        git(
-            directory.path(),
-            &["init", "--bare", remote.to_str().unwrap()],
+        let fixture = ExistingCheckout::new();
+        let (repository, remote, worktree, head) = (
+            &fixture.repository,
+            &fixture.remote,
+            &fixture.worktree,
+            fixture.head.clone(),
         );
-        git(
-            directory.path(),
-            &[
-                "init",
-                "--initial-branch=main",
-                repository.to_str().unwrap(),
-            ],
-        );
-        git(&repository, &["config", "user.name", "Fixture"]);
-        git(
-            &repository,
-            &["config", "user.email", "fixture@example.invalid"],
-        );
-        std::fs::write(repository.join("README"), "Reviewed content\n").unwrap();
-        git(&repository, &["add", "README"]);
-        git(&repository, &["commit", "-m", "Initial fixture"]);
-        git(
-            &repository,
-            &["push", remote.to_str().unwrap(), "HEAD:refs/heads/feature"],
-        );
-        git(
-            &repository,
-            &[
-                "worktree",
-                "add",
-                "--no-track",
-                "-b",
-                "feature",
-                worktree.to_str().unwrap(),
-                "HEAD",
-            ],
-        );
-        let url = "https://fixture.invalid/owner/repo.git";
-        git(&repository, &["remote", "add", "origin", url]);
-        git(
-            &repository,
-            &[
-                "config",
-                &format!("url.{}.insteadOf", remote.display()),
-                url,
-            ],
-        );
-        git(
-            &repository,
-            &["config", "fixture.keep", "unrelated configuration"],
-        );
-        let head = Oid::parse(&git(&repository, &["rev-parse", "HEAD"])).unwrap();
-        let key = GitHubRepoKey::new("fixture.invalid", None, "owner", "repo").unwrap();
-        let request = ExistingPrCheckoutRequest {
-            repository: repository.clone(),
-            worktree: worktree.clone(),
-            branch: ValidatedBranchName::parse("feature").unwrap(),
-            head_repository: key.clone(),
-            head_branch: ValidatedBranchName::parse("feature").unwrap(),
-            expected_head: head.clone(),
-            remote: "origin".into(),
-            tracking: PrCheckoutTracking::RemoteBranch,
-        };
         let config = std::fs::read(repository.join(".git/config")).unwrap();
-        let plan = RepositoryService::system("git")
-            .prepare_existing_pr_checkout(&request, &CancellationToken::new())
-            .unwrap();
+        let plan = fixture.plan();
         assert_eq!(plan.disposition(), PrCheckoutDisposition::RepairTracking);
-        let target = CheckoutTarget {
-            repository: repository.clone(),
-            number: 7,
-            head: head.clone(),
-            pull_request: Some(PullRequestKey::new(key.clone(), 7).unwrap()),
-            head_ref_name: "feature".into(),
-            head_repository: Some(key.clone()),
-        };
-        let pr:PullRequest=serde_json::from_value(serde_json::json!({
-            "number":7,"title":"Fixture","state":"OPEN","headRefName":"feature","headRefOid":head.as_str(),
-            "headRepository":{"name":"repo"},"headRepositoryOwner":{"login":"owner"},"baseRefName":"main","updatedAt":"2026-10-15T00:00:00Z","url":"https://fixture.invalid/owner/repo/pull/7"
-        })).unwrap();
         let mut state = State::new(
             Arc::new(crate::github::GitHubService::system("gh")),
             RepositoryService::system("git"),
         );
         state.target = Some(ReviewTarget {
-            repository: key,
+            repository: fixture.key.clone(),
             worktree: repository.clone(),
-            pull_request: Arc::new(pr),
+            pull_request: Arc::new(fixture.pull_request()),
         });
-        state.range = Some(crate::repository::PullRequestRange {
-            number: 7,
-            base_branch: ValidatedBranchName::parse("main").unwrap(),
-            head_mirror: ValidatedRefName::parse("refs/cagents/fixture/head").unwrap(),
-            base_mirror: ValidatedRefName::parse("refs/cagents/fixture/base").unwrap(),
-            head: head.clone(),
-            base_tip: head.clone(),
-            merge_base: head.clone(),
-        });
+        state.range = Some(fixture.range());
         state.load = LoadState::Ready;
-        state.offer_existing_checkout(target, plan, "Set the existing PR branch upstream.".into());
+        drop(state.offer_existing_checkout(
+            fixture.target(),
+            plan,
+            "Set the existing PR branch upstream.".into(),
+        ));
         assert_eq!(
             std::fs::read(repository.join(".git/config")).unwrap(),
             config
@@ -659,7 +786,7 @@ mod tests {
             merge_base: reviewed,
         });
         state.load = LoadState::Ready;
-        state.offer_existing_checkout(target.clone(), plan.clone(), plan.notice().into());
+        drop(state.offer_existing_checkout(target.clone(), plan.clone(), plan.notice().into()));
         assert_eq!(
             std::fs::read(repository.join(".git/config")).unwrap(),
             config,
