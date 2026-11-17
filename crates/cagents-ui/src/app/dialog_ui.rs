@@ -444,16 +444,18 @@ pub(crate) fn dont_ask_again_id(confirmation: settings::Confirmation) -> widget:
 
 impl Cagents {
     /// The inline question in front of the person, and the message its
-    /// dismissal sends. A dialog over the window is in front of all of them;
-    /// then an account menu's; then the focused pane's; then a usage reset's,
-    /// which is asked beside an account's usage wherever that is shown.
+    /// dismissal sends, in the order Escape reaches them. A dialog over the
+    /// window is in front of all of them; then an account menu's or the
+    /// account popover's; then the focused pane's; then a usage reset's
+    /// asked anywhere else, as Escape has always withdrawn one.
     pub(super) fn inline_question(&self) -> Option<(Question, Message)> {
         if self.modal_is_open() {
             return None;
         }
         self.forget_home_question()
+            .or_else(|| self.usage_reset_question(true))
             .or_else(|| self.pane_question())
-            .or_else(|| self.usage_reset_question())
+            .or_else(|| self.usage_reset_question(false))
     }
 
     fn forget_home_question(&self) -> Option<(Question, Message)> {
@@ -465,8 +467,8 @@ impl Cagents {
         })
     }
 
-    fn usage_reset_question(&self) -> Option<(Question, Message)> {
-        self.usage_reset_asked().map(|account| {
+    fn usage_reset_question(&self, in_popover: bool) -> Option<(Question, Message)> {
+        self.usage_reset_asked(in_popover).map(|account| {
             (
                 Question::UseUsageReset,
                 Message::AccountUi(account_ui::Action::ResetCancel(account)),
@@ -508,9 +510,10 @@ impl Cagents {
         }
     }
 
-    /// What Escape answers in an account's own surfaces, ahead of the menus
-    /// and popover they sit in: a Forget home question goes back to its
-    /// menu, and a usage reset question is withdrawn.
+    /// What Escape answers in an account's popups, ahead of the menu and
+    /// popover they sit in, which would otherwise close around them: a
+    /// Forget home question goes back to its menu, and a usage reset asked
+    /// in the account popover is withdrawn.
     ///
     /// Unlike a dialog, an inline question doesn't hold the keyboard, so a
     /// key a focused control captured, such as a composer interrupting its
@@ -523,14 +526,19 @@ impl Cagents {
             return None;
         }
         self.forget_home_question()
-            .or_else(|| (!captured).then(|| self.usage_reset_question()).flatten())
+            .or_else(|| {
+                (!captured)
+                    .then(|| self.usage_reset_question(true))
+                    .flatten()
+            })
             .map(|(_, dismiss)| dismiss)
     }
 
     /// What an Escape no control captured answers in the focused pane, once
     /// every popup, picker and overlay in front of it has had the key: its
     /// question's dismissal, or else the pull request review popover
-    /// closing. A captured key was the control's, as with
+    /// closing; failing those, a usage reset asked elsewhere is withdrawn.
+    /// A captured key was the control's, as with
     /// [`Self::account_question_escape`].
     pub(super) fn pane_escape(&self) -> Option<Message> {
         if self.modal_is_open() {
@@ -539,6 +547,11 @@ impl Cagents {
         if let Some((_, dismiss)) = self.pane_question() {
             return Some(dismiss);
         }
+        self.review_popover_escape()
+            .or_else(|| self.usage_reset_question(false).map(|(_, dismiss)| dismiss))
+    }
+
+    fn review_popover_escape(&self) -> Option<Message> {
         let card = self.workspace.focused()?;
         if self.pane_content_inputs_blocked(card) {
             return None;

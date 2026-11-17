@@ -110,6 +110,13 @@ impl State {
         });
     }
 
+    /// Where its question is asked, while it is.
+    pub(super) fn asked_on(&self) -> Option<&str> {
+        self.confirmation
+            .as_ref()
+            .map(|asked| asked.surface.as_str())
+    }
+
     /// Withdraws the question, returning where it was asked.
     pub(super) fn cancel(&mut self) -> Option<String> {
         self.confirmation.take().map(|asked| asked.surface)

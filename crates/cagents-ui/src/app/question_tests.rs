@@ -254,6 +254,8 @@ fn end_close_holders() -> Opened {
 
 fn use_usage_reset() -> Opened {
     let mut app = tests::context_inspector_test_app(false);
+    // Asked on the accounts page, in the pane in front.
+    drop(app.update(Message::AccountUi(account_ui::Action::OpenPane)));
     let start = account_ui::resets::tests::spendable_reset(&mut app);
     let opening = app.update(start);
     let account = crate::account::Account::system(crate::agent::Provider::Claude).id();
@@ -741,6 +743,26 @@ fn escape_closes_a_review_popover_that_asks_nothing() {
     assert!(
         pane.review.review_escape().is_none(),
         "the second closes the popover"
+    );
+}
+
+/// A usage reset asked in a pane behind the focused one is still
+/// withdrawn by Escape, as it always was, but the keyboard stays where the
+/// person is rather than jumping into that pane.
+#[test]
+fn a_usage_reset_withdrawn_behind_the_focused_pane_leaves_focus_alone() {
+    let Opened { mut app, _keep, .. } = open(Question::UseUsageReset);
+    let chat = chat_ui::tests::working_chat(&mut app, "in-front");
+    drop(app.workspace.focus(chat));
+    let task = app.update(escape());
+    let account = crate::account::Account::system(crate::agent::Provider::Claude).id();
+    assert!(app.inline_question().is_none(), "Escape withdrew the reset");
+    assert_ne!(
+        tests::focused(&app, task),
+        Some(account_ui::resets::reset_control_id(
+            &account, "accounts", "start"
+        )),
+        "and left the keyboard out of the accounts pane"
     );
 }
 

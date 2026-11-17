@@ -2494,12 +2494,42 @@ impl Cagents {
     }
 
     /// The account asked whether to spend one of its usage resets.
-    pub(super) fn usage_reset_asked(&self) -> Option<AccountId> {
+    ///
+    /// With `in_popover`, only one asked in the open account popover, which
+    /// is in front of every pane; otherwise only one asked anywhere else.
+    pub(super) fn usage_reset_asked(&self, in_popover: bool) -> Option<AccountId> {
         self.account_ui
             .accounts
             .iter()
-            .find(|state| state.reset.confirmation.is_some())
+            .find(|state| {
+                state
+                    .reset
+                    .asked_on()
+                    .is_some_and(|surface| self.reset_in_popover(surface) == in_popover)
+            })
             .map(|state| state.id.clone())
+    }
+
+    fn reset_in_popover(&self, surface: &str) -> bool {
+        surface == "popover" && self.account_ui.popover.is_some()
+    }
+
+    /// Whether a usage reset asked on `surface` is in front of the person:
+    /// in the open account popover, or in the focused pane.
+    fn reset_in_front(&self, surface: &str) -> bool {
+        if self.reset_in_popover(surface) {
+            return true;
+        }
+        let Some(card) = self.workspace.focused() else {
+            return false;
+        };
+        match surface {
+            "accounts" => matches!(self.cards.get(&card), Some(CardRuntime::Accounts)),
+            _ => surface
+                .strip_prefix("chat/")
+                .and_then(|rest| rest.split('/').next())
+                .is_some_and(|asked| asked == card.to_string()),
+        }
     }
 
     /// The account popups' share of a key event, like the chrome's popups:
@@ -3121,13 +3151,17 @@ impl Cagents {
                     .account_ui
                     .account_mut(&id)
                     .and_then(|state| state.reset.cancel());
-                // Back on the control that offered the reset, not nowhere.
+                // Back on the control that offered the reset, not nowhere;
+                // but a question withdrawn from a pane behind the one in
+                // front leaves the keyboard where it is.
                 match asked {
-                    Some(surface) => iced::widget::operation::focus(resets::reset_control_id(
-                        &id, &surface, "start",
-                    ))
-                    .map(cosmic::Action::App),
-                    None => Task::none(),
+                    Some(surface) if self.reset_in_front(&surface) => {
+                        iced::widget::operation::focus(resets::reset_control_id(
+                            &id, &surface, "start",
+                        ))
+                        .map(cosmic::Action::App)
+                    }
+                    _ => Task::none(),
                 }
             }
             Action::ResetFinished {
