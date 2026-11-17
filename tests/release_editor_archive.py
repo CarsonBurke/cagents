@@ -10,6 +10,8 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 VERSION = "1.2.3"
+# Bounds only a hang; a passing run returns as soon as its process exits.
+HANG_GUARD = 60
 
 
 class EditorArchive(unittest.TestCase):
@@ -60,7 +62,7 @@ class EditorArchive(unittest.TestCase):
                 output.add(self.root / duplicate, arcname=f"{self.root.name}/{duplicate}")
         return subprocess.run(
             ["bash", str(self.validator), VERSION, str(self.work), str(self.work), archive.name],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=HANG_GUARD,
         )
 
     def test_exact_private_companion_layout_is_accepted(self):

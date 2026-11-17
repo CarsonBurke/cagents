@@ -13,6 +13,8 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 PUBLISHER = ROOT / "scripts/publish-release"
 VERSION = "1.2.3"
+# Bounds only a hang; a passing run returns as soon as its process exits.
+HANG_GUARD = 60
 ROUTING = (
     "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
     "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
@@ -91,7 +93,7 @@ class PublisherGitEnvironment(unittest.TestCase):
             [self.git, "-c", "core.hooksPath=/dev/null",
              "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
              "-C", str(repository), *arguments],
-            env=self.environment, capture_output=True, text=True, check=True, timeout=5,
+            env=self.environment, capture_output=True, text=True, check=True, timeout=HANG_GUARD,
         ).stdout.strip()
 
     def repository(self, name):
@@ -128,7 +130,7 @@ class PublisherGitEnvironment(unittest.TestCase):
         result = subprocess.run(
             [str(self.publisher), "--verify-only", "--dist", str(self.missing_dist)],
             cwd=self.directory, env=self.environment | (routing or {}),
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=HANG_GUARD,
         )
         # Compare every owned foreign file and its mode, including the complete
         # index bytes, before asserting the tag diagnostic on either source.

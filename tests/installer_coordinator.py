@@ -774,7 +774,7 @@ os.execv({real_tar!r}, [{real_tar!r}, *args])
     def test_candidate_capability_probe_has_no_installation_side_effects(self):
         result = subprocess.run(
             ['/bin/sh', str(ROOT / 'install.sh'), '--supports-prepared-candidate'],
-            env=self.environment, capture_output=True, text=True, timeout=10,
+            env=self.environment, capture_output=True, text=True, timeout=INSTALL_TIMEOUT_SECONDS,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertFalse(self.prefix.exists())

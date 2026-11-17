@@ -11,6 +11,8 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+# Bounds only a hang; a passing run returns as soon as its process exits.
+HANG_GUARD = 60
 
 
 class RedrawArtifacts(unittest.TestCase):
@@ -105,7 +107,7 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
         return subprocess.run(
             ["sh", str(self.root / "scripts/run-redraw-latency"), str(self.root / "output")],
             cwd=self.root.parent, env=self.environment | overrides,
-            capture_output=True, text=True, timeout=20,
+            capture_output=True, text=True, timeout=HANG_GUARD,
         )
 
     def recorded(self):

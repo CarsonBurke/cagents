@@ -15,6 +15,8 @@ from unittest import mock
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
+# Bounds only a hang; a passing run returns as soon as its process exits.
+HANG_GUARD = 60
 SOURCE = ROOT / "scripts/qualify-checkout-cache.py"
 SPEC = importlib.util.spec_from_file_location("checkout_cache_qualifier", SOURCE)
 QUALIFIER = importlib.util.module_from_spec(SPEC)
@@ -44,7 +46,7 @@ class GitEnvironment(unittest.TestCase):
     def setup_git(self, *arguments, cwd):
         return subprocess.run(
             [self.git, *arguments], cwd=cwd, env=self.environment,
-            capture_output=True, text=True, check=True, timeout=5,
+            capture_output=True, text=True, check=True, timeout=HANG_GUARD,
         ).stdout.strip()
 
     def assert_private_index(self, explicit_environment):

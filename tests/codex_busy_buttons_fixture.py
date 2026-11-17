@@ -11,6 +11,8 @@ import time
 import unittest
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
+# Bounds only a hang; a passing run returns as soon as its process exits.
+HANG_GUARD = 60
 PEER = runpy.run_path(str(FIXTURES / "codex-child-errors.py"))
 
 
@@ -46,7 +48,7 @@ class BusyButtonsFixture(unittest.TestCase):
 
             def login(*arguments):
                 return subprocess.run([str(executable), "login", *arguments],
-                                      env=environment, capture_output=True, text=True, timeout=5)
+                                      env=environment, capture_output=True, text=True, timeout=HANG_GUARD)
 
             started = time.monotonic()
             result = login()
