@@ -26,6 +26,12 @@ CODEX_HOME/fixture-row-diagnostics instead emits a failed root turn with a
 short, synthetic original diagnostic for the native Details/Copy controls.
 An existing CODEX_HOME/fixture-turn-audit.json opts into a bounded record of
 accepted turn model/effort fields, without recording the prompt or other input.
+CODEX_HOME/fixture-account-email names the login that home's account check
+reports, so two linked homes read as two accounts. With
+CODEX_HOME/fixture-rollouts present, starting the thread writes a minimal
+rollout for it under CODEX_HOME/sessions, as Codex keeps one; a peer asked to
+resume a thread it doesn't know adopts it when its own home has that rollout,
+as after an account switch copied it there.
 With CODEX_HOME/fixture-plan present, the ordinary turn also publishes a plan
 with one step done, one in progress and one pending, and finishes it before
 completing. The file may hold whole seconds for the turn to stay working,
@@ -132,6 +138,29 @@ def web_items():
          "url": "https://example.test/fixture/receipts/schema",
          "snippet": "Synthetic schema: the receipt records probe creation, removal and the final permission."},
     ]})]
+
+
+def rollout(codex_home, thread):
+    """The rollout Codex keeps for `thread` under this home, if any."""
+    return next(iter(sorted((Path(codex_home) / "sessions").glob(f"*/*/*/rollout-*-{thread}.jsonl"))), None)
+
+
+def write_rollout(codex_home, thread, cwd):
+    """A minimal rollout naming `thread`, where Codex keeps one, so an account
+    switch has history to carry to the other account's home."""
+    if rollout(codex_home, thread) is not None:
+        return
+    started = time.localtime()  # Codex dates its rollouts locally.
+    directory = Path(codex_home) / "sessions" / time.strftime("%Y/%m/%d", started)
+    directory.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%S", started)
+    meta = {"timestamp": stamp, "type": "session_meta", "payload": {
+        "id": thread, "timestamp": stamp, "cwd": cwd or str(Path(codex_home).parent),
+        "originator": "codex_cli_rs", "cli_version": "0.162.0", "source": "cli",
+        "model_provider": "openai"}}
+    path = directory / f"rollout-{stamp.replace(':', '-')}-{thread}.jsonl"
+    path.write_text(json.dumps(meta, separators=(",", ":")) + "\n")
+    path.chmod(0o600)
 
 
 class Scenario:
@@ -376,6 +405,11 @@ class Scenario:
             result = {"userAgent": "cagents-offline-tool-rows", "codexHome": codex_home}
         elif method in ("thread/start", "thread/resume"):
             thread = params.get("threadId", self.thread)
+            if method == "thread/resume" and thread not in (self.thread, self.child) \
+                    and rollout(codex_home, thread) is not None:
+                # An account switch copied this thread's rollout into this
+                # account's home before resuming it here.
+                self.thread, self.latest = thread, None
             if thread not in (self.thread, self.child):
                 return [{"id": identifier, "error": {"code": -32602, "message": "Unknown fixture thread"}}]
             latest = self.latest if thread == self.thread else self.child_latest
@@ -390,6 +424,8 @@ class Scenario:
                       "initialTurnsPage": {"data": [latest] if latest else [], "nextCursor": None}}
             if (Path(codex_home) / "fixture-unconfirmed-model").is_file():
                 del result["model"]
+            if method == "thread/start" and (Path(codex_home) / "fixture-rollouts").is_file():
+                write_rollout(codex_home, self.thread, params.get("cwd"))
         elif method == "thread/read":
             result = {"thread": self.metadata(params["threadId"])}
         elif method == "model/list":
@@ -411,7 +447,11 @@ class Scenario:
         elif method in ("skills/list", "thread/queue/list"):
             result = {"data": [], "nextCursor": None}
         elif method == "account/read":
-            result = {"account": {"type": "chatgpt", "email": "fixture@invalid", "planType": "free"}}
+            # CODEX_HOME/fixture-account-email gives an account home its own
+            # login, so a second linked home is a different account.
+            email = Path(codex_home) / "fixture-account-email"
+            result = {"account": {"type": "chatgpt", "planType": "free",
+                                  "email": email.read_text().strip() if email.is_file() else "fixture@invalid"}}
         elif method == "account/rateLimits/read":
             # Optional usage: CODEX_HOME/fixture-rate-limits.json holds the
             # result, such as fixtures/accounts/codex-rate-limits-read.json's.

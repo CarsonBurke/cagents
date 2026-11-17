@@ -219,6 +219,9 @@ pub(super) struct Incident {
     pub summary: String,
     pub guidance: &'static str,
     pub kind: Option<FailureKind>,
+    /// Whether the summary and guidance are the whole original, as with a
+    /// [`DeliveryOutcome`], so technical details would only repeat them.
+    pub explained: bool,
     sources: Vec<Source>,
     reset_sources: std::collections::BTreeSet<u64>,
     /// The chronological first transcript source owns the visible notice.
@@ -234,6 +237,7 @@ struct Metadata {
     summary: String,
     guidance: &'static str,
     kind: Option<FailureKind>,
+    explained: bool,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -448,36 +452,42 @@ impl State {
         if text.trim().is_empty() {
             return None;
         }
-        let (key, summary, guidance, kind) = if let Some(failure) = Failure::parse(provider, text) {
-            (
-                diagnostic_key(failure.key.as_ref()),
-                failure.summary,
-                failure.action,
-                Some(failure.kind),
-            )
-        } else if let Some(outcome) = DeliveryOutcome::parse(text) {
-            // The daemon's report already says what to do next.
-            (
-                diagnostic_key(text),
-                outcome.summary.to_owned(),
-                outcome.action,
-                None,
-            )
-        } else if known_only {
-            return None;
-        } else {
-            (
-                diagnostic_key(text),
-                fallback_summary(text),
-                "Review the details before trying again.",
-                None,
-            )
-        };
+        let (key, summary, guidance, kind, explained) =
+            if let Some(failure) = Failure::parse(provider, text) {
+                (
+                    diagnostic_key(failure.key.as_ref()),
+                    failure.summary,
+                    failure.action,
+                    Some(failure.kind),
+                    false,
+                )
+            } else if let Some(outcome) = DeliveryOutcome::parse(text) {
+                // The report already says what to do next, and is nothing
+                // more than what the notice shows.
+                (
+                    diagnostic_key(text),
+                    outcome.summary.to_owned(),
+                    outcome.action,
+                    None,
+                    true,
+                )
+            } else if known_only {
+                return None;
+            } else {
+                (
+                    diagnostic_key(text),
+                    fallback_summary(text),
+                    "Review the details before trying again.",
+                    None,
+                    false,
+                )
+            };
         let meta = Metadata {
             key: diagnostic_key(&format!("{context}\0{key}")),
             summary,
             guidance,
             kind,
+            explained,
         };
         Some(meta)
     }
@@ -514,6 +524,7 @@ impl State {
                 summary: meta.summary,
                 guidance: meta.guidance,
                 kind: meta.kind,
+                explained: meta.explained,
                 sources: vec![source],
                 reset_sources: Default::default(),
                 first_item,
@@ -1531,7 +1542,9 @@ impl Runtime {
                     .view(),
             );
         }
-        rows.push(self.failure_diagnostics(incident, design::sunken));
+        if !incident.explained {
+            rows.push(self.failure_diagnostics(incident, design::sunken));
+        }
         widget::container(
             widget::column::with_children(rows)
                 .spacing(space::S)
@@ -1693,10 +1706,36 @@ mod tests {
             outcome.guidance,
             "It may still go through, so check the conversation before trying again."
         );
-        // Other unrecognised failures keep the general guidance, and a
-        // filter for known failures still drops them.
+        // An outcome is recognised only by its whole text, so the notice's
+        // summary and next step are everything its details would show: they
+        // are not offered again, for Claude's own outcomes as for a refused
+        // account switch.
+        for text in [
+            chat::failure::delivery::UNACKNOWLEDGED_INPUT,
+            chat::failure::delivery::UNSETTLED_INPUT,
+            chat::failure::delivery::ACCOUNT_SWITCH_BUSY,
+        ] {
+            let outcome = State::metadata(Provider::Claude, text, false, "").unwrap();
+            assert!(outcome.explained, "{text}");
+            assert_eq!(
+                format!("{} {}", outcome.summary, outcome.guidance),
+                text,
+                "the notice shows the whole original"
+            );
+        }
+        // Other unrecognised failures keep the general guidance and their
+        // details, and a filter for known failures still drops them.
         let other = State::metadata(Provider::Claude, "Something else broke", false, "").unwrap();
         assert_eq!(other.guidance, "Review the details before trying again.");
+        assert!(!other.explained);
+        // An outcome quoted inside a longer report is not the outcome, so the
+        // report keeps its details.
+        let quoted = format!("Proxy said: {}", chat::failure::delivery::UNSETTLED_INPUT);
+        assert!(
+            !State::metadata(Provider::Claude, &quoted, false, "")
+                .unwrap()
+                .explained
+        );
         assert!(State::metadata(Provider::Claude, "Something else broke", true, "").is_none());
     }
 
@@ -1900,6 +1939,7 @@ mod tests {
             summary: "The command failed".into(),
             guidance: "Review the details before trying again.",
             kind: None,
+            explained: false,
             sources: Vec::new(),
             reset_sources: Default::default(),
             first_item: None,

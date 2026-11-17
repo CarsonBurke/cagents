@@ -1352,6 +1352,19 @@ impl ProtocolError {
             retryable,
         }
     }
+
+    /// Whether this is the daemon's [`DAEMON_BUSY`] refusal of an exclusive
+    /// request it could not admit before its deadline. Nothing was admitted,
+    /// so the same request may be sent again once the other operation ends.
+    pub fn is_daemon_busy(&self) -> bool {
+        is_daemon_busy(&self.message, self.retryable)
+    }
+}
+
+/// The one recognition of [`DAEMON_BUSY`] for every client type that carries
+/// a daemon refusal's sentence and retryability.
+pub(crate) fn is_daemon_busy(message: &str, retryable: bool) -> bool {
+    retryable && message == DAEMON_BUSY
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

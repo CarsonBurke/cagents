@@ -47,6 +47,26 @@ fn chat_socket(intent: Intent) -> Result<std::path::PathBuf, StartFailure> {
     }
 }
 
+/// An account switch that failed before asking the daemon for anything, so
+/// the original conversation is untouched whatever the cause. An update in
+/// progress is the daemon busy with another operation. A daemon that took
+/// the connection but did not finish the handshake in time may be held by a
+/// long operation or hung, which the client cannot tell apart.
+fn switch_unadmitted(error: crate::terminal::HostedTerminalStartError) -> StartFailure {
+    use crate::terminal::HostedTerminalStartError;
+    let recovery = match &error {
+        HostedTerminalStartError::UpdateInProgress(_) => super::Recovery::Busy,
+        HostedTerminalStartError::HostProtocol(crate::control::ControlError::ReplyTimeout {
+            ..
+        }) => super::Recovery::Unresponsive,
+        _ => super::Recovery::Unreached,
+    };
+    StartFailure {
+        message: error.to_string(),
+        recovery,
+    }
+}
+
 /// [`super::UNPROVEN_OWNER_REFUSAL`] as an earlier daemon worded it. A
 /// daemon outlives the client upgrades it serves, so a client still meets
 /// this sentence until that daemon is replaced.
@@ -56,6 +76,7 @@ fn start_failure(error: ipc::ProtocolError) -> StartFailure {
     let recovery = match error.code {
         ipc::ProtocolErrorCode::AccountRemoved => super::Recovery::Account,
         ipc::ProtocolErrorCode::ChatCapacity => super::Recovery::Capacity,
+        _ if error.is_daemon_busy() => super::Recovery::Busy,
         _ if error.retryable => super::Recovery::Retry,
         // Only the daemon's own whole sentence, never text that quotes it.
         _ if [
@@ -2251,7 +2272,8 @@ impl ClientHandle {
         if !super::is_account_recovery(&source, &replacement) {
             return Err("Account switch changed the saved conversation".into());
         }
-        let socket = chat_socket(Intent::Start)?;
+        let socket = crate::terminal::ensure_daemon_ready_for_explicit_action()
+            .map_err(switch_unadmitted)?;
         let stream = connect_daemon(&socket).map_err(|error| error.to_string())?;
         Self::connect_on(
             stream,
@@ -4015,6 +4037,79 @@ mod tests {
                 assert_eq!(failure.message, "the daemon's exact reason");
             }
         }
+    }
+
+    /// The daemon's busy refusal of an exclusive start, such as an account
+    /// switch, is typed apart from other retryable failures, because it alone
+    /// proves nothing was admitted. Only its own whole retryable sentence.
+    #[test]
+    fn only_the_daemons_busy_refusal_is_typed_busy() {
+        use super::super::Recovery;
+        use ipc::ProtocolErrorCode;
+
+        let recovery = |message: &str, retryable| {
+            start_failure(ipc::ProtocolError::new(
+                ProtocolErrorCode::Internal,
+                message,
+                retryable,
+            ))
+            .recovery
+        };
+        // As `host::control_gate::busy` refuses; its own tests pin that.
+        let busy = start_failure(ipc::ProtocolError::new(
+            ProtocolErrorCode::Internal,
+            ipc::DAEMON_BUSY,
+            true,
+        ));
+        assert_eq!(busy.recovery, Recovery::Busy);
+        assert_eq!(busy.message, ipc::DAEMON_BUSY);
+        assert!(!Recovery::Busy.is_blocked());
+        assert_eq!(recovery(ipc::DAEMON_BUSY, false), Recovery::Blocked);
+        assert_eq!(
+            recovery(&format!("Provider said: {}", ipc::DAEMON_BUSY), true),
+            Recovery::Retry
+        );
+    }
+
+    /// A daemon too busy to finish a switch's handshake refuses it as busy;
+    /// one that can't be reached at all does not claim to be busy, and an
+    /// update in progress is.
+    #[test]
+    fn a_switch_whose_handshake_timed_out_is_unanswered_not_busy() {
+        use super::super::Recovery;
+        use crate::terminal::HostedTerminalStartError;
+
+        let timed_out = switch_unadmitted(HostedTerminalStartError::HostProtocol(
+            crate::control::ControlError::ReplyTimeout {
+                timeout: Duration::from_secs(30),
+                error: ipc::FrameError::Io(io::ErrorKind::WouldBlock.into()),
+            },
+        ));
+        // Nothing says another operation holds the daemon; it may be hung.
+        assert_eq!(timed_out.recovery, Recovery::Unresponsive);
+        assert!(!Recovery::Unresponsive.is_blocked());
+        assert!(timed_out.message.contains("did not answer within 30 s"));
+        for unreachable in [
+            HostedTerminalStartError::HostProtocol(crate::control::ControlError::ConnectionClosed),
+            HostedTerminalStartError::HostSocket {
+                path: "/run/cagents.sock".into(),
+                source: io::ErrorKind::ConnectionRefused.into(),
+            },
+            HostedTerminalStartError::SocketPath(io::ErrorKind::NotFound.into()),
+            HostedTerminalStartError::HostIncompatible { actual: 1 },
+        ] {
+            // Nothing was asked of a daemon, so nothing marks the account
+            // removed.
+            assert_eq!(switch_unadmitted(unreachable).recovery, Recovery::Unreached);
+        }
+        assert!(!Recovery::Unreached.is_blocked());
+        assert_eq!(
+            switch_unadmitted(HostedTerminalStartError::UpdateInProgress(
+                crate::instance::UpdateInProgress
+            ))
+            .recovery,
+            Recovery::Busy
+        );
     }
 
     #[test]
