@@ -401,6 +401,12 @@ class Comparison(unittest.TestCase):
         without_environment = copy.deepcopy(after)
         del without_environment['agents']['agent']['agent']['console']['launch']['environment']
         self.assertTrue(records.console_relaunch(with_environment,without_environment,'terminal'))
+        # And a rollback to a CLI that prints it again.
+        rollback_before = copy.deepcopy(before)
+        del rollback_before['agents']['agent']['agent']['console']['launch']['environment']
+        rollback_after = copy.deepcopy(after)
+        rollback_after['agents']['agent']['agent']['console']['launch']['environment'] = {'TOKEN':'value'}
+        self.assertTrue(records.console_relaunch(rollback_before,rollback_after,'terminal'))
         mutations = {
             'wrong-target':lambda a:a['target'].update(version='other'),
             'failed-update':lambda a:a['update_status'].update(phase='Failed'),

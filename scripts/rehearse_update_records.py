@@ -1082,8 +1082,9 @@ def console_relaunch(before: dict, after: dict, terminal_id: str) -> bool:
             continue
         current = after["agents"].get(key, {})
         replacement = current.get("agent", {}).get("console") or {}
-        new_recipe = replacement.get("launch", {})
-        old_recipe = as_printed(console.get("launch", {}), new_recipe)
+        # Either side may come from a CLI that leaves environments out.
+        old_recipe, new_recipe = console.get("launch", {}), replacement.get("launch", {})
+        old_recipe, new_recipe = as_printed(old_recipe, new_recipe), as_printed(new_recipe, old_recipe)
         if (not row.get("run") or current.get("run") != row["run"]
                 or row.get("state") != "Running" or current.get("state") != "Running"
                 or replacement.get("id") != terminal_id or new_recipe.get("program") != program
