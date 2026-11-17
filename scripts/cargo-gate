@@ -32,7 +32,7 @@ fi
 # checkout whose gate is older than the installed one runs the installed one,
 # so a worktree that has fallen behind main does not keep main's fixes from its
 # builds.
-gate_version=32
+gate_version=33
 installed=${CAGENTS_BUILD_INSTALLED_GATE-/var/tmp/cagents-cargo-gate}
 # The helpers this gate runs are the ones beside the file it is, so an
 # installed gate keeps its own while a newer installation takes its name.
@@ -460,9 +460,13 @@ if [ "$where" -eq 0 ]; then
     # Each Cargo command in COMMAND goes through this gate, with its own
     # admission budget: nothing here holds a slot while they build there.
     # With --hold, the offload holds one slot there for all of them.
-    # Cargo reached some other way would compile here; see the guard.
+    # Cargo reached some other way, or a compiler run directly, would
+    # compile here; see the guard, which answers for both.
     CAGENTS_BUILD_EXEC_RUSTC_WRAPPER=${RUSTC_WRAPPER-}
     cargo_shim
+    for tool in rustc rustdoc clippy-driver; do
+        ln -s -- "$here/cargo-gate-rustc-guard" "$shims/$tool"
+    done
     RUSTC_WRAPPER=$here/cargo-gate-rustc-guard
     export CAGENTS_BUILD_EXEC_RUSTC_WRAPPER RUSTC_WRAPPER
     status=0
