@@ -106,8 +106,10 @@ struct Ledger {
 pub struct Instance {
     directories: Directories,
     /// The data directory, locked exclusively: the ledger is read, checked and
-    /// rewritten under this lock.
-    _lock: File,
+    /// rewritten under this lock. It is released when the instance is dropped,
+    /// even if a concurrent fork inherited the descriptor and has not reached
+    /// exec yet.
+    _lock: crate::instance::OwnedLock,
 }
 
 impl Instance {
@@ -121,24 +123,18 @@ impl Instance {
             .map_err(|error| format!("Cannot create {}: {error}", directories.data.display()))?;
         let lock = File::open(&directories.data)
             .map_err(|error| format!("Cannot open {}: {error}", directories.data.display()))?;
-        // SAFETY: flock receives a live descriptor and scalar flags.
-        if unsafe {
-            libc::flock(
-                std::os::fd::AsRawFd::as_raw_fd(&lock),
-                libc::LOCK_EX | libc::LOCK_NB,
-            )
-        } != 0
-        {
-            let error = io::Error::last_os_error();
-            return Err(if error.kind() == io::ErrorKind::WouldBlock {
-                format!(
-                    "Another seed is writing this instance ({}). Let it finish first.",
-                    directories.data.display()
-                )
-            } else {
-                format!("Cannot lock {}: {error}", directories.data.display())
-            });
-        }
+        let lock = crate::instance::owned_file_lock(lock, libc::LOCK_EX | libc::LOCK_NB).map_err(
+            |error| {
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    format!(
+                        "Another seed is writing this instance ({}). Let it finish first.",
+                        directories.data.display()
+                    )
+                } else {
+                    format!("Cannot lock {}: {error}", directories.data.display())
+                }
+            },
+        )?;
         Ok(Self {
             directories,
             _lock: lock,
@@ -706,6 +702,47 @@ mod tests {
         assert!(error.contains("Another seed is writing"), "{error}");
         drop(first);
         Instance::admit(&plan, dirs).unwrap();
+    }
+
+    /// Another thread's child, forked but not yet at exec, holds a copy of
+    /// the instance's locked descriptor. The seed that took the lock still
+    /// releases it when it finishes, so the next seed of the instance is
+    /// admitted rather than told another seed is writing.
+    #[test]
+    fn a_finished_seed_releases_the_instance_despite_a_concurrent_fork() {
+        use std::os::{
+            fd::AsRawFd as _,
+            unix::{net::UnixStream, process::CommandExt as _},
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let plan = test_support::small(directory.path());
+        let dirs = directories(&plan.root, None);
+        let first = Instance::admit(&plan, dirs.clone()).unwrap();
+        let (ready_write, mut ready_read) = UnixStream::pair().unwrap();
+        let (gate_read, mut gate_write) = UnixStream::pair().unwrap();
+        let mut unrelated = std::process::Command::new("/bin/true");
+        // SAFETY: only async-signal-safe read and write on live inherited fds.
+        unsafe {
+            unrelated.pre_exec(move || {
+                let byte = [1_u8];
+                if libc::write(ready_write.as_raw_fd(), byte.as_ptr().cast(), 1) != 1 {
+                    return Err(io::Error::last_os_error());
+                }
+                let mut released = [0_u8];
+                if libc::read(gate_read.as_raw_fd(), released.as_mut_ptr().cast(), 1) != 1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = std::thread::spawn(move || unrelated.status().unwrap());
+        // The child has forked and holds the locked description until exec.
+        io::Read::read_exact(&mut ready_read, &mut [0_u8]).unwrap();
+        drop(first);
+        let admitted = Instance::admit(&plan, dirs);
+        gate_write.write_all(&[1]).unwrap();
+        assert!(child.join().unwrap().success());
+        admitted.unwrap();
     }
 
     /// The unnamed instance is the login daemon's: only directories inside the
