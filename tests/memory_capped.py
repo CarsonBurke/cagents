@@ -177,6 +177,22 @@ class InARealScope(unittest.TestCase):
                       result.stderr)
         self.assertGreater(len(reads.read_text().splitlines()), 3)
 
+    def test_a_descendant_over_the_limit_is_reported_while_the_scope_still_runs(self):
+        # What the command left running keeps the scope from settling; the
+        # kernel's own count says what happened.
+        runaway = 'chunks = [bytearray(b"x") * (16 * 2**20) for _ in range(64)]'
+        result = self.run_tool("sh", "-c", f"sleep 3 & {shlex.quote(sys.executable)} -I -c '{runaway}'; exit 101")
+        self.assertEqual(result.returncode, 137, result.stderr)
+        self.assertIn("went over the limit", result.stderr)
+
+    def test_a_failure_that_leaves_work_running_is_not_held_up(self):
+        # Nothing went over the limit, which the kernel's count shows at once,
+        # so the command's failure is not held for the manager to settle.
+        started = time.monotonic()
+        result = self.run_tool("sh", "-c", "sleep 3 >/dev/null 2>&1 & exit 3")
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertLess(time.monotonic() - started, 1.5)
+
     def test_memory_under_the_limit_is_undisturbed(self):
         script = "data = bytearray(b'x') * (64 * 2**20); print(len(data))"
         result = self.run_tool(sys.executable, "-I", "-c", script)
