@@ -47,6 +47,29 @@ fn chat_socket(intent: Intent) -> Result<std::path::PathBuf, StartFailure> {
     }
 }
 
+/// An account switch that could not reach the daemon before asking for
+/// anything. A daemon that took the connection but did not finish the
+/// handshake in time is busy, as when an operation holds it beyond the
+/// switch's own wait; nothing was requested of it, so the switch is
+/// refused as busy rather than as a failure that may have closed the
+/// original.
+fn switch_unadmitted(error: crate::terminal::HostedTerminalStartError) -> StartFailure {
+    let busy = matches!(
+        error,
+        crate::terminal::HostedTerminalStartError::HostProtocol(
+            crate::control::ControlError::ReplyTimeout { .. }
+        )
+    );
+    StartFailure {
+        message: error.to_string(),
+        recovery: if busy {
+            super::Recovery::Busy
+        } else {
+            super::Recovery::Retry
+        },
+    }
+}
+
 /// [`super::UNPROVEN_OWNER_REFUSAL`] as an earlier daemon worded it. A
 /// daemon outlives the client upgrades it serves, so a client still meets
 /// this sentence until that daemon is replaced.
@@ -2252,7 +2275,8 @@ impl ClientHandle {
         if !super::is_account_recovery(&source, &replacement) {
             return Err("Account switch changed the saved conversation".into());
         }
-        let socket = chat_socket(Intent::Start)?;
+        let socket = crate::terminal::ensure_daemon_ready_for_explicit_action()
+            .map_err(switch_unadmitted)?;
         let stream = connect_daemon(&socket).map_err(|error| error.to_string())?;
         Self::connect_on(
             stream,
@@ -4048,6 +4072,32 @@ mod tests {
             recovery(&format!("Provider said: {}", ipc::DAEMON_BUSY), true),
             Recovery::Retry
         );
+    }
+
+    /// A daemon too busy to finish a switch's handshake refuses it as busy;
+    /// one that can't be reached at all does not claim to be busy.
+    #[test]
+    fn a_switch_whose_handshake_timed_out_is_refused_as_busy() {
+        use super::super::Recovery;
+        use crate::terminal::HostedTerminalStartError;
+
+        let timed_out = switch_unadmitted(HostedTerminalStartError::HostProtocol(
+            crate::control::ControlError::ReplyTimeout {
+                timeout: Duration::from_secs(30),
+                error: ipc::FrameError::Io(io::ErrorKind::WouldBlock.into()),
+            },
+        ));
+        assert_eq!(timed_out.recovery, Recovery::Busy);
+        assert!(timed_out.message.contains("did not answer within 30 s"));
+        for unreachable in [
+            HostedTerminalStartError::HostProtocol(crate::control::ControlError::ConnectionClosed),
+            HostedTerminalStartError::HostSocket {
+                path: "/run/cagents.sock".into(),
+                source: io::ErrorKind::ConnectionRefused.into(),
+            },
+        ] {
+            assert_eq!(switch_unadmitted(unreachable).recovery, Recovery::Retry);
+        }
     }
 
     #[test]
