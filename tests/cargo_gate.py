@@ -523,6 +523,98 @@ class OwnedCommandSupervisor(unittest.TestCase):
         self.assertTrue(failed.stderr.startswith("some-wrapper: "), failed.stderr)
 
 
+class CompilerGuard(unittest.TestCase):
+    """scripts/cargo-gate-rustc-guard on its own, with stand-in compilers that
+    record what reaches them: what only asks the compiler something passes,
+    and anything that would compile here is refused."""
+
+    QUERIES = ([], ["-vV"], ["-V"], ["--version"], ["-h"], ["--help"], ["--explain", "E0382"],
+               ["--explain=E0382"], ["-Chelp"], ["-C", "help"], ["-Zhelp"], ["-Whelp"],
+               ["--print", "sysroot"], ["--print=cfg"], ["--print=file-names=names.txt"],
+               # Cargo's query of the target: it prints and stops.
+               ["-", "--crate-name", "___", "--print=file-names", "--crate-type", "bin"],
+               # Any print but those made while linking stops before compiling.
+               ["--print=native-static-libs", "--print=cfg", "main.rs"])
+    COMPILES = (["main.rs"], ["-v", "main.rs"], ["-C", "opt-level=3", "main.rs"],
+                ["--crate-name", "probe", "--edition=2021", "src/main.rs"],
+                # Printed while linking, after compiling.
+                ["--crate-name", "probe", "--print=native-static-libs", "src/lib.rs"],
+                ["--print", "native-static-libs", "main.rs"], ["--print=link-args", "main.rs"],
+                ["--print=link-args=args.txt", "main.rs"])
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory(prefix="cagents-compiler-guard-", dir="/var/tmp")
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.log = self.root / "log"
+        guard = ROOT / "scripts/cargo-gate-rustc-guard"
+        self.real = self.root / "real"
+        # Two directories of the guard, as nested `exec` commands leave on
+        # PATH: the next compiler is never the guard again.
+        self.shims = [self.root / "shims", self.root / "outer-shims"]
+        for directory in (self.real, *self.shims):
+            directory.mkdir()
+        for tool in ("rustc", "rustdoc"):
+            (self.real / tool).write_text(
+                f'#!/bin/sh\nprintf "{tool} %s\\n" "$*" >>"{self.log}"\n')
+            (self.real / tool).chmod(0o755)
+            for shims in self.shims:
+                (shims / tool).symlink_to(guard)
+        self.env = {"PATH": os.pathsep.join([*map(str, self.shims), str(self.real), "/usr/bin", "/bin"])}
+
+    def run_guard(self, command, **env):
+        self.log.unlink(missing_ok=True)
+        result = subprocess.run(command, env=self.env | env, cwd=self.root, capture_output=True,
+                                text=True, timeout=HANG_GUARD)
+        ran = [line.rstrip() for line in self.log.read_text().splitlines()] if self.log.exists() else []
+        return result, ran
+
+    def test_a_compiler_run_directly_only_answers_queries(self):
+        for tool in ("rustc", "rustdoc"):
+            for arguments in self.QUERIES:
+                with self.subTest(tool=tool, arguments=arguments):
+                    result, ran = self.run_guard([str(self.shims[0] / tool), *arguments])
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(ran, [" ".join([tool, *arguments])])
+            for arguments in self.COMPILES:
+                with self.subTest(tool=tool, arguments=arguments):
+                    result, ran = self.run_guard([str(self.shims[0] / tool), *arguments])
+                    self.assertEqual(result.returncode, 1)
+                    self.assertEqual(ran, [])
+                    self.assertIn(f"`{tool}` run directly inside `cargo-gate exec` would compile on this host",
+                                  result.stderr)
+
+    def test_as_cargos_wrapper_it_only_passes_queries_to_the_callers_wrapper(self):
+        wrapper = self.root / "callers-wrapper"
+        wrapper.write_text(f'#!/bin/sh\nprintf "wrapper %s\\n" "$*" >>"{self.log}"\nexec "$@"\n')
+        wrapper.chmod(0o755)
+        rustc = str(self.real / "rustc")
+        for given in ({}, {"CAGENTS_BUILD_EXEC_RUSTC_WRAPPER": str(wrapper)}):
+            for arguments in self.QUERIES[1:]:
+                with self.subTest(given=given, arguments=arguments):
+                    result, ran = self.run_guard(
+                        [str(ROOT / "scripts/cargo-gate-rustc-guard"), rustc, *arguments], **given)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    expected = [" ".join(["rustc", *arguments])]
+                    if given:
+                        expected.insert(0, " ".join(["wrapper", rustc, *arguments]))
+                    self.assertEqual(ran, expected)
+            for arguments in self.COMPILES:
+                with self.subTest(given=given, arguments=arguments):
+                    result, ran = self.run_guard(
+                        [str(ROOT / "scripts/cargo-gate-rustc-guard"), rustc, *arguments], **given)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertEqual(ran, [])
+                    self.assertIn("would compile on this host", result.stderr)
+                    self.assertIn("CAGENTS_BUILD_REMOTE=local", result.stderr)
+
+    def test_a_compiler_missing_beyond_the_guard_is_named(self):
+        self.env["PATH"] = os.pathsep.join([str(self.shims[0]), "/nonexistent"])
+        result, ran = self.run_guard([str(self.shims[0] / "rustc"), "-vV"])
+        self.assertEqual(result.returncode, 127)
+        self.assertIn("no rustc on PATH besides cargo-gate's guard", result.stderr)
+
+
 class HeldCommand(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

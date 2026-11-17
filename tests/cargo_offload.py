@@ -1435,7 +1435,9 @@ fn bounded_allocation() {
 
     def test_cargo_in_an_exec_command_reached_by_path_does_not_compile_here(self):
         cargo = str(self.cargo_bin / "cargo")
-        for command in (f"'{cargo}' build --bin probe", '"$CARGO_PATH" build --bin probe'):
+        for command in (f"'{cargo}' build --bin probe", '"$CARGO_PATH" build --bin probe',
+                        # A print rustc makes while linking does not stop it compiling.
+                        f"RUSTFLAGS=--print=native-static-libs '{cargo}' build --bin probe"):
             with self.subTest(command=command):
                 result = self.gate_run("exec", "sh", "-ec", command,
                                        env=self.remote_env() | {"CARGO_PATH": cargo}, timeout=60)
@@ -1448,6 +1450,26 @@ fn bounded_allocation() {
         result = self.gate_run("exec", "sh", "-ec", f"'{cargo}' metadata --format-version 1 "
                                ">/dev/null && printf ok", env=self.remote_env(), timeout=60)
         self.assertEqual((result.returncode, result.stdout), (0, "ok"), result.stderr)
+
+    def test_a_compiler_run_directly_in_an_exec_command_does_not_compile_here(self):
+        env = self.remote_env()
+        env["PATH"] = os.pathsep.join([str(self.cargo_bin), env["PATH"]])
+        before = sorted(self.crate.iterdir())
+        for command in ("rustc src/main.rs", "rustc --crate-name probe --edition=2021 src/main.rs",
+                        "rustdoc src/main.rs"):
+            with self.subTest(command=command):
+                result = self.gate_run("exec", "sh", "-ec", command, env=env, timeout=60)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("would compile on this host", result.stderr)
+                # Neither `main` nor `doc` was made.
+                self.assertEqual(sorted(self.crate.iterdir()), before)
+        # What only asks the compiler something still answers, from the
+        # compiler that would have run.
+        result = self.gate_run("exec", "sh", "-ec", "rustc -vV; rustdoc --version; rustc --print sysroot",
+                               env=env, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("host: ", result.stdout)
+        self.assertIn("rustdoc ", result.stdout)
 
     def shell_program(self):
         # Exercise Offload.launch with a real Cargo-built program, which runs
@@ -1499,6 +1521,17 @@ fn bounded_allocation() {
         queries = (self.root / "wrapper-log").read_text()
         self.assertIn("-vV", queries)
         self.assertNotIn("--crate-name probe ", queries)
+
+    def test_a_program_run_inside_exec_cannot_run_a_compiler_directly(self):
+        self.shell_program()
+        env = self.remote_env()
+        env["PATH"] = os.pathsep.join([str(self.cargo_bin), env["PATH"]])
+        result = self.gate_run("exec", "cargo", "run", "--quiet", "--", "-ec",
+                               "rustc -vV >/dev/null; rustc src/main.rs -o built-here", env=env)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("`rustc` run directly inside `cargo-gate exec` would compile on this host",
+                      result.stderr)
+        self.assertFalse((self.crate / "built-here").exists())
 
     def test_a_program_run_outside_exec_keeps_the_callers_environment(self):
         self.shell_program()

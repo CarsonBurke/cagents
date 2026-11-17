@@ -837,11 +837,16 @@ between its builds would keep the slot leased while it ran, so leave `--hold`
 off for such a script. A Cargo
 reached any other way inside COMMAND, by path, through `$CARGO`, `rustup run`
 or `mise exec`, would compile here, so `exec` also sets `RUSTC_WRAPPER` to
-`scripts/cargo-gate-rustc-guard`, which refuses to compile a crate and says
-why; Cargo's queries of rustc pass, and a wrapper the caller set still runs.
-Programs launched by `cargo run` inside that `exec` inherit the same Cargo
-shim and guard. Their named `cargo` reenters the gate after the program's
-build releases its slot; their absolute `$CARGO` cannot compile here.
+`scripts/cargo-gate-rustc-guard`, which refuses to compile and says why;
+Cargo's queries of rustc pass, and a wrapper the caller set still runs. The
+same guard is the `rustc` and `rustdoc` beside the shim's `cargo` on `PATH`,
+so a compiler run by name passes only what asks it something (its version,
+help, or a print it makes without compiling) to the next one on `PATH`.
+Programs launched by `cargo run` inside that `exec` inherit the same shims and
+guard. Their named `cargo` reenters the gate after the program's build
+releases its slot; their absolute `$CARGO` cannot compile here. A compiler run
+by its absolute path, or by anything the command leaves running after the
+shims are removed, is outside the guard's reach.
 On the build host itself, or with
 `CAGENTS_BUILD_REMOTE=local`, commands build here through the local slots
 above. With `CAGENTS_BUILD_REMOTE_LOOPBACK=1`, the build host's own commands
