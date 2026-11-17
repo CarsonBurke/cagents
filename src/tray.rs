@@ -242,35 +242,41 @@ mod service {
         Ok(stdout.trim().into())
     }
 
+    fn stop_failed(error: impl std::fmt::Display) -> String {
+        format!("Could not stop the cagents daemon: {error}")
+    }
+
+    /// What the tray says when the daemon refused a stop or its count. A busy
+    /// daemon refused before doing anything, so asking again is all that is
+    /// needed; anything else failed.
+    fn stop_refused(error: ControlError) -> String {
+        if error.is_daemon_busy() {
+            STOP_REFUSED_BUSY.to_owned()
+        } else {
+            stop_failed(error)
+        }
+    }
+
     fn stop_from_tray() -> ActionResult {
-        let failed = |error: String| format!("Could not stop the cagents daemon: {error}");
-        // A busy daemon refused before doing anything; asking again is all
-        // that is needed.
-        let refused = |error: ControlError| {
-            if error.is_daemon_busy() {
-                STOP_REFUSED_BUSY.to_owned()
-            } else {
-                failed(error.to_string())
-            }
-        };
-        let socket = daemon_socket_path().map_err(|error| failed(error.to_string()))?;
-        let mut client =
-            ControlClient::connect(&socket).map_err(|error| failed(error.to_string()))?;
-        match client.shutdown_with_policy(true, None).map_err(refused)? {
+        let socket = daemon_socket_path().map_err(stop_failed)?;
+        let mut client = ControlClient::connect(&socket).map_err(stop_failed)?;
+        match client
+            .shutdown_with_policy(true, None)
+            .map_err(stop_refused)?
+        {
             // Stopping would close terminals or interrupt agents, which only
             // the counted confirmation may do.
             ShutdownOutcome::EmptyRequired { .. }
             | ShutdownOutcome::ConfirmationRequired { .. } => {}
             outcome => return stop_result(&outcome),
         }
-        let preflight = client.shutdown_preflight().map_err(refused)?;
-        let capability = serde_json::to_string(&preflight.capability)
-            .map_err(|error| failed(error.to_string()))?;
+        let preflight = client.shutdown_preflight().map_err(stop_refused)?;
+        let capability = serde_json::to_string(&preflight.capability).map_err(stop_failed)?;
         let output = spawn_child(
             "cagents-ui",
             &[crate::instance::CONFIRM_DAEMON_STOP_MODE.into(), capability],
         )
-        .map_err(failed)?;
+        .map_err(stop_failed)?;
         confirmation_outcome(output.status.success(), &output.stdout, &output.stderr)
     }
 
@@ -284,7 +290,7 @@ mod service {
             let detail = child_outcome(false, stdout, stderr)
                 .err()
                 .unwrap_or_default();
-            return Err(format!("Could not stop the cagents daemon: {detail}"));
+            return Err(stop_failed(detail));
         }
         confirmation_result(&report)
     }
@@ -312,9 +318,7 @@ mod service {
         match stop_report(stdout) {
             Some(StopReport::Cancelled) => Ok("Stop cancelled; nothing was closed".into()),
             Some(StopReport::Finished { outcome }) => stop_result(&outcome),
-            Some(StopReport::Failed { error }) => {
-                Err(format!("Could not stop the cagents daemon: {error}"))
-            }
+            Some(StopReport::Failed { error }) => Err(stop_failed(error)),
             // A crashed or mismatched dialog must not read as a stop.
             None => Err("The stop confirmation closed without reporting a result".into()),
         }
@@ -323,6 +327,23 @@ mod service {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn a_busy_refusal_reads_as_nothing_stopped_and_others_as_failures() {
+            use crate::terminal_ipc::{DAEMON_BUSY, ProtocolErrorCode};
+            let remote = |message: &str, retryable| ControlError::Remote {
+                code: ProtocolErrorCode::Internal,
+                message: message.into(),
+                retryable,
+            };
+            assert_eq!(stop_refused(remote(DAEMON_BUSY, true)), STOP_REFUSED_BUSY);
+            let other = remote("registry is unavailable", true);
+            let shown = other.to_string();
+            assert_eq!(
+                stop_refused(other),
+                format!("Could not stop the cagents daemon: {shown}")
+            );
+        }
 
         #[test]
         fn asynchronous_command_failure_is_visible_and_not_acceptance() {
