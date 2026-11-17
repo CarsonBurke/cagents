@@ -85,8 +85,8 @@ class RetryAdmission(unittest.TestCase):
                     'agents': {'agent': {'agent': {'id': 'agent', 'console': {'id': 'terminal',
                         'launch': {'program': program, 'arguments': ['agent', 'console', 'agent']}}},
                         'run': 'original-run', 'state': 'Running'}},
-                    'stores': {'sessions': {'rows': {'cards': [{'card_id': 'console', 'kind_tag': 'terminal',
-                        'existence': 'open'}], 'terminal_recipes': [{'card_id': 'console', 'terminal_id': 'terminal'}]}}}}
+                    'stores': {'sessions': {'rows': {'cards': [{'card_id': 'console', 'workspace_id': 'workspace',
+                        'ordinal': 0, 'kind_tag': 'terminal', 'existence': 'open'}], 'terminal_recipes': [{'card_id': 'console', 'terminal_id': 'terminal'}]}}}}
         def bind_receipt(source, target, transaction):
             census = {'version': 1, 'transaction': transaction, 'source': source['serving']}
             receipt = {'version': 1, 'transaction': transaction, 'census_digest': transaction,
