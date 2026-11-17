@@ -32,11 +32,25 @@ cargo_fixture = importlib.util.module_from_spec(_cargo_spec)
 _cargo_spec.loader.exec_module(cargo_fixture)
 
 
+def compiled(profile: Path) -> bool:
+    """Whether Cargo has compiled in `profile`, in either of its layouts."""
+    return (profile / ".fingerprint").is_dir() or any(profile.glob("build/*/*/fingerprint"))
+
+
+def units(build: Path, package: str) -> list[Path]:
+    """The fingerprints of `package` anywhere in `build`. Cargo up to 1.99 keeps
+    them in <profile>/.fingerprint/<package>-<hash>, and from 1.100 in
+    <profile>/build/<package>/<hash>/fingerprint."""
+    return [*build.rglob(f".fingerprint/{package}-*"), *build.rglob(f"build/{package}/*/fingerprint")]
+
+
 class CopiedFingerprints(unittest.TestCase):
     """Real Cargo: a copied build must not pass for this checkout's sources.
 
     Only the copying differs from seeding, so this runs where reflinks do not.
     """
+
+    toolchain = TOOLCHAIN
 
     def setUp(self):
         if shutil.which("cargo") is None:
@@ -89,8 +103,11 @@ class CopiedFingerprints(unittest.TestCase):
         # pinned toolchain and a private Cargo home; it needs no registry.
         self.env = cargo_fixture.private_cargo_environment(self.root / "cargo-home", {
             key: value for key, value in os.environ.items() if not key.startswith("CAGENTS_BUILD_")})
-        self.env["RUSTUP_TOOLCHAIN"] = TOOLCHAIN
+        self.env["RUSTUP_TOOLCHAIN"] = self.toolchain
         self.cargo(self.main)
+        # Where this Cargo keeps the fingerprints of a profile, to copy them about.
+        debug = self.main / "target/debug"
+        self.fingerprint_tree = ".fingerprint" if (debug / ".fingerprint").is_dir() else "build"
 
     def cargo(self, checkout):
         return subprocess.run(["cargo", "build"], cwd=checkout, env=self.env, capture_output=True,
@@ -140,9 +157,11 @@ class CopiedFingerprints(unittest.TestCase):
         if not reflinks(self.root):
             self.skipTest("this file system cannot reflink")
         worktree = self.worktree("worktree")
-        subprocess.run([SEED, "--from", self.main / "target", "--to", worktree / "target"],
-                       cwd=worktree, env=self.env, check=True, capture_output=True)
-        self.assertTrue((worktree / "target/debug/.fingerprint").is_dir())
+        seeded = subprocess.run([SEED, "--from", self.main / "target", "--to", worktree / "target"],
+                                cwd=worktree, env=self.env, check=True, capture_output=True, text=True)
+        # Every crate here is the checkout's own, so only their artifacts remain.
+        self.assertIn("seeded", seeded.stderr)
+        self.assertTrue((worktree / "target/debug").is_dir())
         self.cargo(worktree)
         self.assertEqual(self.output(worktree), "own=worktree vendored=worktree generated=worktree")
 
@@ -173,8 +192,8 @@ class CopiedFingerprints(unittest.TestCase):
         shutil.rmtree(self.main / "target")
         self.cargo(self.main)
         main_build = builds / str(self.main).lstrip("/") / "target"
-        self.assertTrue((main_build / "debug/.fingerprint").is_dir())
-        self.assertFalse((self.main / "target/debug/.fingerprint").exists())
+        self.assertTrue(compiled(main_build / "debug"))
+        self.assertFalse(compiled(self.main / "target/debug"))
 
         worktree = self.root / "worktree"
         run("git", "worktree", "add", "-q", "--detach", str(worktree))
@@ -213,7 +232,7 @@ class CopiedFingerprints(unittest.TestCase):
         subprocess.run(["cp", "-a", "--reflink=auto", self.main / "target", worktree / "copied"], check=True)
         (worktree / "target").symlink_to("copied")
         subprocess.run([SEED, "--forget-local", "target"], cwd=worktree, env=self.env, check=True)
-        self.assertEqual(list((worktree / "copied/debug/.fingerprint").glob("probe-*")), [])
+        self.assertEqual(units(worktree / "copied", "probe"), [])
 
     def test_forgetting_refuses_what_it_cannot_do(self):
         worktree = self.worktree("worktree")
@@ -226,12 +245,15 @@ class CopiedFingerprints(unittest.TestCase):
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 1)
         self.assertIn("names no crate", result.stderr)
-        self.assertNotEqual(list((self.main / "target/debug/.fingerprint").glob("probe-*")), [])
+        self.assertNotEqual(units(self.main / "target", "probe"), [])
 
     def test_a_directory_without_fingerprints_has_nothing_to_forget(self):
         worktree = self.worktree("worktree")
         (worktree / "executables/debug").mkdir(parents=True)
         (worktree / "executables/debug/probe").write_text("program")
+        # As Cargo copies a library up into a target whose intermediates are
+        # in a separate build directory.
+        (worktree / "executables/debug/libprobe.rlib").write_text("library")
         result = subprocess.run([SEED, "--forget-local", "executables"], cwd=worktree, env=self.env,
                                 check=True, capture_output=True, text=True)
         # It says so, as this may be the wrong path.
@@ -264,22 +286,22 @@ class CopiedFingerprints(unittest.TestCase):
                                 env={**self.env, "PATH": f"{tools}:{self.env['PATH']}"},
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertNotEqual(list((worktree / "target/debug/.fingerprint").glob("vendored-*")), [])
+        self.assertNotEqual(units(worktree / "target", "vendored"), [])
 
     def test_forgetting_reaches_a_profile_of_any_name_at_any_depth(self):
         worktree = self.worktree("worktree")
-        fingerprints = self.main / "target/debug/.fingerprint"
+        fingerprints = self.main / "target/debug" / self.fingerprint_tree
         for profile in ("deps", "examples", "incremental", "a/b/c/d/release"):
-            copy = worktree / "target" / profile / ".fingerprint"
+            copy = worktree / "target" / profile / self.fingerprint_tree
             shutil.copytree(fingerprints, copy, symlinks=True)
         subprocess.run([SEED, "--forget-local", "target"], cwd=worktree, env=self.env, check=True)
-        self.assertEqual(list((worktree / "target").rglob(".fingerprint/probe-*")), [])
+        self.assertEqual(units(worktree / "target", "probe"), [])
 
     def test_a_fingerprint_that_could_not_be_removed_fails_in_any_profile(self):
         worktree = self.worktree("worktree")
         for profile in ("debug", "release"):
-            shutil.copytree(self.main / "target/debug/.fingerprint",
-                            worktree / "target" / profile / ".fingerprint", symlinks=True)
+            shutil.copytree(self.main / "target/debug" / self.fingerprint_tree,
+                            worktree / "target" / profile / self.fingerprint_tree, symlinks=True)
         tools = self.root / "tools"
         tools.mkdir()
         rm = tools / "rm"
@@ -297,8 +319,8 @@ class CopiedFingerprints(unittest.TestCase):
         if os.geteuid() == 0:
             self.skipTest("root reads the unreadable directory")
         worktree = self.worktree("worktree")
-        shutil.copytree(self.main / "target/debug/.fingerprint",
-                        worktree / "target/debug/.fingerprint", symlinks=True)
+        shutil.copytree(self.main / "target/debug" / self.fingerprint_tree,
+                        worktree / "target/debug" / self.fingerprint_tree, symlinks=True)
         hidden = worktree / "target/release"
         hidden.mkdir()
         hidden.chmod(0)
@@ -316,7 +338,7 @@ class CopiedFingerprints(unittest.TestCase):
         subprocess.run(["cp", "-a", "--reflink=auto", self.main / "target", worktree / "target"], check=True)
         subprocess.run([SEED, "--forget-local", worktree / "target"], cwd=worktree / "vendor/vendored",
                        env=self.env, check=True)
-        self.assertEqual(list((worktree / "target/debug/.fingerprint").glob("vendored-*")), [])
+        self.assertEqual(units(worktree / "target", "vendored"), [])
 
     def test_forgetting_needs_a_lock_file(self):
         empty = self.root / "empty"
@@ -325,6 +347,25 @@ class CopiedFingerprints(unittest.TestCase):
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 1)
         self.assertIn("no Cargo.lock", result.stderr)
+
+
+class CopiedFingerprintsInEachUnit(CopiedFingerprints):
+    """The same under Cargo 1.100, the first to keep each unit in its own
+    <profile>/build/<package>/<hash>, while the pinned toolchain is older.
+    Runs where that toolchain is installed; it is never installed for this."""
+
+    toolchain = "1.100.0"
+
+    def setUp(self):
+        if TOOLCHAIN == self.toolchain:
+            self.skipTest("the pinned toolchain is this one")
+        listed = subprocess.run(["rustup", "toolchain", "list"], capture_output=True, text=True) \
+            if shutil.which("rustup") else None
+        if listed is None or not any(line.startswith(f"{self.toolchain}-")
+                                     for line in listed.stdout.splitlines()):
+            self.skipTest(f"Rust {self.toolchain} is not installed")
+        super().setUp()
+        self.assertEqual(self.fingerprint_tree, "build", "this Cargo keeps the older layout")
 
 
 def reflinks(directory: Path) -> bool:
@@ -413,6 +454,40 @@ class SeedBuildDir(unittest.TestCase):
         # The source keeps its own, and its artifacts remain for reuse.
         self.assertTrue((self.source / "debug/.fingerprint/cagents-0a1b").is_dir())
         self.assertTrue((self.destination / "debug/deps/libzstd-1.rlib").is_file())
+
+    def test_cargos_newer_layout_is_seeded_without_this_checkouts_crates(self):
+        # From Cargo 1.100 each unit has its own build/<package>/<hash>.
+        if not reflinks(self.root):
+            self.skipTest("this file system cannot reflink")
+        shutil.rmtree(self.source)
+        for package in ("zstd-sys", "cagents", "cagents-browser", "vendored-crate"):
+            unit = self.source / "debug/build" / package / "0a1b2c3d4e5f6a7b"
+            (unit / "fingerprint").mkdir(parents=True)
+            (unit / "fingerprint" / f"lib-{package}").write_text("fingerprint")
+            (unit / "out").mkdir()
+            (unit / "out" / f"lib{package}.rlib").write_bytes(b"rlib")
+        (self.source / "debug/incremental/cagents-1").mkdir(parents=True)
+        result = self.seed()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("seeded", result.stderr)
+        self.assertEqual(sorted(path.name for path in (self.destination / "debug/build").iterdir()),
+                         ["cagents-browser", "zstd-sys"])
+        self.assertEqual((self.destination / "debug/build/zstd-sys/0a1b2c3d4e5f6a7b/out/libzstd-sys.rlib")
+                         .read_bytes(), b"rlib")
+        self.assertFalse((self.destination / "debug/incremental").exists())
+        # Seeded once, it is a build directory like any other.
+        shutil.rmtree(self.destination / "debug/build/cagents-browser")
+        self.assertEqual(self.seed().returncode, 0)
+        self.assertFalse((self.destination / "debug/build/cagents-browser").exists())
+
+    def test_compiled_crates_in_a_layout_it_does_not_know_are_not_called_forgotten(self):
+        build = self.checkout / "copied/debug/units/zstd-sys"
+        build.mkdir(parents=True)
+        (build / "libzstd_sys-0a1b2c3d4e5f6a7b.rlib").write_bytes(b"rlib")
+        result = subprocess.run([str(SEED), "--forget-local", "copied"], cwd=self.checkout, env=self.env,
+                                capture_output=True, text=True, timeout=HANG_GUARD)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("no fingerprints this understands", result.stderr)
 
     def test_every_way_of_writing_a_lock_file_names_its_own_crates(self):
         if not reflinks(self.root):
