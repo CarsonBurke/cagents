@@ -1045,12 +1045,35 @@ impl RenderStreamFixture {
         self.handle.inner.published.publish(Arc::new(snapshot));
     }
 
+    /// Publishes a caller-built grid, so row identity can be controlled.
+    pub(crate) fn publish_snapshot(&self, snapshot: RenderSnapshot) {
+        self.handle.inner.published.publish(Arc::new(snapshot));
+    }
+
     pub(crate) fn emit(&self, event: TerminalEvent) {
         self.handle.inner.published.emit_event(&self.events, event);
     }
 
     pub(crate) fn queued_commands(&self) -> usize {
         self.commands.len()
+    }
+
+    /// Drains the queued commands, returning whether the last one that sets
+    /// visibility leaves the worker visible.
+    pub(crate) fn drain_visibility(&self) -> Option<bool> {
+        fn visibility(command: &Command) -> Option<bool> {
+            match command {
+                Command::Admitted { command, .. } => visibility(command),
+                Command::HostVisibility(visibility) => Some(*visibility == Visibility::Visible),
+                Command::Hide | Command::Hibernate => Some(false),
+                Command::Reveal => Some(true),
+                Command::Restore { visible } => Some(*visible),
+                _ => None,
+            }
+        }
+        self.commands
+            .try_iter()
+            .fold(None, |visible, command| visibility(&command).or(visible))
     }
 }
 

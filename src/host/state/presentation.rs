@@ -12,7 +12,8 @@ pub(super) struct Viewport {
     pub acknowledged_source: u64,
 }
 impl Viewport {
-    fn advance(&mut self, source: u64) {
+    /// Numbers a new presentation of `source`, always above the last one.
+    pub(super) fn advance(&mut self, source: u64) {
         self.source_generation = source;
         self.revision = source.max(self.revision.saturating_add(1));
     }
@@ -288,7 +289,8 @@ pub(in crate::host) fn snapshot(
             .get_mut(&(client, id))
             .expect("attached viewport")
             .acknowledged_source = source;
-        state.subscriptions.record_sent(client, id, capture);
+        // The connection queues this reply after the lock is released.
+        state.subscriptions.record_sent(client, id, capture, false);
         return Ok(Some(wire));
     }
     Err(ProtocolError::new(

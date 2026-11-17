@@ -118,6 +118,17 @@ struct OutputObservation {
     notified: bool,
 }
 
+/// The frame last recorded as sent to one subscription.
+struct SentFrame {
+    snapshot: Arc<RenderSnapshot>,
+    /// Whether the frame was queued in the same hold that recorded it, as a
+    /// redraw broadcast's are. A `ClientRequest::Snapshot` reply is recorded
+    /// under the lock but queued by its connection after the lock is
+    /// released, so a broadcast can reach the queue first: it must not be a
+    /// delta against a frame the subscriber may not hold yet.
+    queued: bool,
+}
+
 #[derive(Default)]
 struct Subscriptions {
     viewports: BTreeMap<(ClientId, TerminalId), presentation::Viewport>,
@@ -131,7 +142,7 @@ struct Subscriptions {
     /// lets the next repaint be diffed by pointer identity and sent as a row
     /// delta. Dropped on detach and disconnect so a stale base can never be
     /// used as a delta base, and so a departing client frees its rows.
-    sent: BTreeMap<(ClientId, TerminalId), Arc<RenderSnapshot>>,
+    sent: BTreeMap<(ClientId, TerminalId), SentFrame>,
     output: BTreeMap<(ClientId, TerminalId), OutputObservation>,
 }
 
@@ -172,14 +183,17 @@ impl Subscriptions {
     }
 
     /// Remembers the capture just sent to `client_id`, so the next repaint for
-    /// that subscription can be a delta against it.
+    /// that subscription can be a delta against it. `queued` says whether it
+    /// was queued under this same hold; see [`SentFrame::queued`].
     fn record_sent(
         &mut self,
         client_id: ClientId,
         terminal_id: TerminalId,
         snapshot: Arc<RenderSnapshot>,
+        queued: bool,
     ) {
-        self.sent.insert((client_id, terminal_id), snapshot);
+        self.sent
+            .insert((client_id, terminal_id), SentFrame { snapshot, queued });
     }
 
     fn last_sent(
@@ -187,7 +201,9 @@ impl Subscriptions {
         client_id: ClientId,
         terminal_id: TerminalId,
     ) -> Option<&Arc<RenderSnapshot>> {
-        self.sent.get(&(client_id, terminal_id))
+        self.sent
+            .get(&(client_id, terminal_id))
+            .map(|sent| &sent.snapshot)
     }
 
     fn disconnect(&mut self, client_id: ClientId) {
@@ -5116,6 +5132,12 @@ fn publish_installed_terminal(
         .published_terminal_workers
         .observe(id, expected.execution_instance());
     if let Some(client) = client {
+        // Until now the spawning client was attached hidden, so a redraw or
+        // another client may have hidden the worker meanwhile. Apply the
+        // published visibility as `attach` does, or a hidden worker captures
+        // nothing more until it exits. The publication above has committed,
+        // so a refused command cannot undo it.
+        let old_visibility = state.subscriptions.visibility(id);
         state.subscriptions.attach(
             client,
             id,
@@ -5125,6 +5147,12 @@ fn publish_installed_terminal(
                 TerminalVisibility::Hidden
             },
         );
+        let new_visibility = state.subscriptions.visibility(id);
+        if old_visibility != new_visibility
+            && let Err(error) = apply_visibility(expected, new_visibility)
+        {
+            tracing::warn!(terminal_id = %id, %error, "a published terminal kept its startup visibility");
+        }
         state.rearm_output(client, id);
         state.publish_worker(client, id);
     }
@@ -5276,6 +5304,46 @@ impl TerminalRedraw {
     }
 }
 
+/// How long one redraw broadcast holds the host lock, for the opt-in
+/// `cagents::terminal_pipeline` trace. Disabled, it reads no clock.
+struct HostHold {
+    enabled: bool,
+    since: Option<Instant>,
+    held: Duration,
+}
+
+impl HostHold {
+    fn new() -> Self {
+        Self {
+            enabled: tracing::enabled!(target: "cagents::terminal_pipeline", tracing::Level::TRACE),
+            since: None,
+            held: Duration::ZERO,
+        }
+    }
+
+    fn acquired(&mut self) {
+        if self.enabled {
+            self.since = Some(Instant::now());
+        }
+    }
+
+    fn released(&mut self) {
+        if let Some(since) = self.since.take() {
+            self.held += since.elapsed();
+        }
+    }
+
+    /// Records one sample, the total hold, per broadcast that queued at least
+    /// one frame. Broadcasts that queued only notifications or a Hide are not
+    /// sampled.
+    fn report(&self, queued_frames: usize) {
+        if self.enabled && queued_frames > 0 {
+            tracing::trace!(target: "cagents::terminal_pipeline", stage = "redraw_host_lock",
+                elapsed_ns = self.held.as_nanos() as u64, frames = queued_frames);
+        }
+    }
+}
+
 /// Publishes a repaint to every visible subscriber of this exact worker.
 ///
 /// A subscriber for which the daemon already recorded the exact capture it last
@@ -5289,10 +5357,17 @@ impl TerminalRedraw {
 ///
 /// The acknowledge/credit protocol is untouched: the worker still withholds the
 /// next capture until the client acknowledges this generation, so the daemon
-/// cannot run ahead of the UI. `last_sent` advances at push time, which keeps
-/// every delta chained to the previous delivery; an unapplicable delta is
-/// detected by `base_generation` and answered with a full repaint, so a client
-/// that misses a push still recovers.
+/// cannot run ahead of the UI.
+///
+/// Building wire rows copies every changed cell, and every cell of a full
+/// repaint, once per subscriber. That work happens outside the host lock,
+/// which every client request, chat actor and scheduler shares. The lock is
+/// taken twice: [`plan_redraw`] validates the worker, reads visibility and
+/// each subscriber's base, and [`commit_redraw`] queues each frame only if
+/// nothing presented that subscriber in between. Recording a frame as sent
+/// and queuing it happen under one hold, so the queue holds frames in the
+/// order they were recorded and every delta is relative to the frame queued
+/// before it.
 fn broadcast_redraw(
     host: &Weak<HostLock>,
     terminal_id: TerminalId,
@@ -5302,92 +5377,262 @@ fn broadcast_redraw(
     let Some(host) = host.upgrade() else {
         return;
     };
-    let mut pending = Vec::new();
-    {
+    let mut hold = HostHold::new();
+    let planned = {
         let mut state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        // Retirement does not drain queued callbacks. Validate the original
-        // worker under the same lock as visibility, viewport and capture work;
-        // an earlier identity check could race a same-ID replacement.
-        if !state
-            .terminals
-            .get(&terminal_id)
-            .is_some_and(|record| record.handle.same_worker(worker))
-        {
-            return;
+        hold.acquired();
+        let planned = plan_redraw(&mut state, terminal_id, generation, worker);
+        hold.released();
+        planned
+    };
+    if planned.is_empty() {
+        return;
+    }
+    let encoded = planned
+        .into_iter()
+        .map(PlannedFrame::encode)
+        .collect::<Vec<_>>();
+    let committed = {
+        let mut state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        hold.acquired();
+        let committed = commit_redraw(&mut state, terminal_id, worker, encoded);
+        hold.released();
+        committed
+    };
+    hold.report(committed.queued);
+    // Dropped here, outside the lock: the replaced bases free the rows only
+    // they still referenced, and refused frames free their wire rows.
+    drop(committed);
+}
+
+/// A repaint whose subscriber state was read under the host lock, to be
+/// encoded outside it.
+struct PlannedFrame {
+    client_id: ClientId,
+    delivery: Arc<DeliveryQueue>,
+    /// The subscriber's presentation revision when planned. Every resize,
+    /// scroll, snapshot reply and frame that presents the view advances it,
+    /// so a commit that finds it changed knows the frame is stale.
+    revision: u64,
+    /// The worker generation `projected` was captured at.
+    source: u64,
+    /// The capture, numbered with the subscriber's presentation revision.
+    projected: Arc<RenderSnapshot>,
+    /// The frame this subscriber was last recorded as sent.
+    recorded: Option<Arc<RenderSnapshot>>,
+    /// Whether `recorded` is known to be queued ahead of this frame, and so
+    /// can be its delta base.
+    delta: bool,
+}
+
+struct EncodedFrame {
+    planned: PlannedFrame,
+    wire: TerminalSnapshot,
+}
+
+impl PlannedFrame {
+    /// Builds the wire frame. Pure: both snapshots are immutable.
+    fn encode(self) -> EncodedFrame {
+        let wire = match &self.recorded {
+            Some(base) if self.delta => TerminalSnapshot::diff(&self.projected, base),
+            _ => TerminalSnapshot::full(&self.projected),
+        };
+        EncodedFrame {
+            planned: self,
+            wire,
         }
-        let visible = state
-            .subscriptions
+    }
+}
+
+/// The first hold of a redraw broadcast. Returns the frames to encode; every
+/// other outcome is settled here.
+fn plan_redraw(
+    state: &mut HostState,
+    terminal_id: TerminalId,
+    generation: u64,
+    worker: &TerminalHandle,
+) -> Vec<PlannedFrame> {
+    // Retirement does not drain queued callbacks. Validate the original
+    // worker under the same lock as visibility and viewport work; an earlier
+    // identity check could race a same-ID replacement.
+    if !state
+        .terminals
+        .get(&terminal_id)
+        .is_some_and(|record| record.handle.same_worker(worker))
+    {
+        return Vec::new();
+    }
+    let visible = state
+        .subscriptions
+        .by_terminal
+        .get(&terminal_id)
+        .into_iter()
+        .flat_map(|clients| clients.iter())
+        .filter(|(_, visibility)| **visibility == TerminalVisibility::Visible)
+        .map(|(client_id, _)| *client_id)
+        .collect::<Vec<_>>();
+    if visible.is_empty() {
+        // Serialize visibility commands with attachment/reveal changes.
+        // Otherwise this Hide could overtake a newly attached UI's Reveal.
+        if state.subscriptions.visibility(terminal_id) == TerminalVisibility::Hidden {
+            let _ = worker.hide();
+        }
+        return Vec::new();
+    }
+    let proof = state.proof_handle();
+    // The identity check above makes this the record's own published capture.
+    let capture = worker.snapshot();
+    let mut planned = Vec::new();
+    for client_id in visible {
+        let Some(delivery) = state.clients.get(&client_id).cloned() else {
+            continue;
+        };
+        let key = (client_id, terminal_id);
+        let mut revision = state.presentation_observed(client_id, terminal_id, generation);
+        let Subscriptions {
+            viewports, sent, ..
+        } = &mut state.subscriptions;
+        let Some(view) = viewports.get_mut(&key) else {
+            continue;
+        };
+        let direct = !capture.detached
+            && capture.scroll.offset == capture.scroll.max_offset()
+            && view.offset.is_none()
+            && view.size.is_none_or(|size| size.rows == capture.rows);
+        if !direct {
+            let _ = delivery.push(Outbound::broadcast(
+                &proof,
+                ServerMessage::Redraw {
+                    terminal_id,
+                    generation: revision,
+                },
+            ));
+            continue;
+        }
+        let recorded = sent.get(&key);
+        if recorded.is_some_and(|sent| sent.snapshot.generation >= revision) {
+            // The subscriber was already sent a frame with this number; it
+            // drops another. A stale wake carries nothing newer. A newer
+            // capture under an old wake needs a number of its own, or it
+            // would be recorded as sent while the subscriber discards it.
+            if view.acknowledged_source == capture.generation {
+                continue;
+            }
+            view.advance(capture.generation);
+            revision = view.revision;
+        }
+        let mut projected = (*capture).clone();
+        projected.generation = revision;
+        planned.push(PlannedFrame {
+            client_id,
+            delivery,
+            revision,
+            source: capture.generation,
+            projected: Arc::new(projected),
+            recorded: recorded.map(|sent| Arc::clone(&sent.snapshot)),
+            delta: recorded.is_some_and(|sent| sent.queued),
+        });
+    }
+    planned
+}
+
+/// What a commit queued, and what it no longer needs. The caller drops it
+/// after releasing the lock.
+struct Committed {
+    queued: usize,
+    /// Each planned frame's recorded base, now replaced or abandoned.
+    bases: Vec<Option<Arc<RenderSnapshot>>>,
+    /// Frames refused because their subscriber changed or left.
+    refused: Vec<EncodedFrame>,
+}
+
+/// The second hold of a redraw broadcast: queues each encoded frame whose
+/// subscriber is still exactly as planned, and records it as sent.
+///
+/// A subscriber presented in between — a resize, scroll, snapshot reply,
+/// reveal, or a concurrent broadcast's frame — gets a `Redraw` at its current
+/// revision instead. The frame would be numbered or based on a presentation
+/// the subscriber no longer has; the notification lets it fetch the current
+/// one through the request path.
+fn commit_redraw(
+    state: &mut HostState,
+    terminal_id: TerminalId,
+    worker: &TerminalHandle,
+    frames: Vec<EncodedFrame>,
+) -> Committed {
+    let mut committed = Committed {
+        queued: 0,
+        bases: Vec::with_capacity(frames.len()),
+        refused: Vec::new(),
+    };
+    // A same-ID replacement may have been installed while encoding. Nothing
+    // from the retired worker may reach its subscribers.
+    if !state
+        .terminals
+        .get(&terminal_id)
+        .is_some_and(|record| record.handle.same_worker(worker))
+    {
+        committed.refused = frames;
+        return committed;
+    }
+    let proof = state.proof_handle();
+    let HostState {
+        subscriptions,
+        clients,
+        ..
+    } = state;
+    for frame in frames {
+        let planned = &frame.planned;
+        let key = (planned.client_id, terminal_id);
+        let still_visible = subscriptions
             .by_terminal
             .get(&terminal_id)
-            .into_iter()
-            .flat_map(|clients| clients.iter())
-            .filter(|(_, visibility)| **visibility == TerminalVisibility::Visible)
-            .map(|(client_id, _)| *client_id)
-            .collect::<Vec<_>>();
-        if visible.is_empty() {
-            // Serialize visibility commands with attachment/reveal changes.
-            // Otherwise this Hide could overtake a newly attached UI's Reveal.
-            if state.subscriptions.visibility(terminal_id) == TerminalVisibility::Hidden
-                && let Some(record) = state.terminals.get(&terminal_id)
-            {
-                let _ = record.handle.hide();
-            }
-            return;
-        }
-        let proof = state.proof_handle();
-        for client_id in visible {
-            if let Some(delivery) = state.clients.get(&client_id).cloned() {
-                let revision = state.presentation_observed(client_id, terminal_id, generation);
-                let capture = state
-                    .terminals
-                    .get(&terminal_id)
-                    .map(|record| record.handle.snapshot());
-                let direct = capture.filter(|capture| {
-                    !capture.detached
-                        && capture.scroll.offset == capture.scroll.max_offset()
-                        && state
-                            .subscriptions
-                            .viewports
-                            .get(&(client_id, terminal_id))
-                            .is_some_and(|view| {
-                                view.offset.is_none()
-                                    && view.size.is_none_or(|size| size.rows == capture.rows)
-                            })
-                });
-                let message = if let Some(capture) = direct {
-                    let mut projected = (*capture).clone();
-                    projected.generation = revision;
-                    let projected = Arc::new(projected);
-                    let wire = match state.subscriptions.last_sent(client_id, terminal_id) {
-                        Some(base) => TerminalSnapshot::diff(&projected, base),
-                        None => TerminalSnapshot::full(&projected),
-                    };
-                    state
-                        .subscriptions
-                        .viewports
-                        .get_mut(&(client_id, terminal_id))
-                        .expect("observed viewport")
-                        .acknowledged_source = capture.generation;
-                    state
-                        .subscriptions
-                        .record_sent(client_id, terminal_id, projected);
+            .and_then(|subscribers| subscribers.get(&planned.client_id))
+            == Some(&TerminalVisibility::Visible);
+        let same_connection = clients
+            .get(&planned.client_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &planned.delivery));
+        let unchanged_base = match (subscriptions.sent.get(&key), &planned.recorded) {
+            (Some(sent), Some(recorded)) => Arc::ptr_eq(&sent.snapshot, recorded),
+            (None, None) => true,
+            _ => false,
+        };
+        let current_revision = subscriptions
+            .viewports
+            .get(&key)
+            .filter(|_| still_visible && same_connection)
+            .map(|view| view.revision);
+        match current_revision {
+            Some(revision) if revision == planned.revision && unchanged_base => {
+                let EncodedFrame { planned, wire } = frame;
+                if let Some(view) = subscriptions.viewports.get_mut(&key) {
+                    view.acknowledged_source = planned.source;
+                }
+                subscriptions.record_sent(planned.client_id, terminal_id, planned.projected, true);
+                let _ = planned.delivery.push(Outbound::broadcast(
+                    &proof,
                     ServerMessage::Snapshot {
                         terminal_id,
                         snapshot: wire,
-                    }
-                } else {
+                    },
+                ));
+                committed.queued += 1;
+                committed.bases.push(planned.recorded);
+            }
+            Some(revision) => {
+                let _ = planned.delivery.push(Outbound::broadcast(
+                    &proof,
                     ServerMessage::Redraw {
                         terminal_id,
                         generation: revision,
-                    }
-                };
-                pending.push((delivery, Outbound::broadcast(&proof, message)));
+                    },
+                ));
+                committed.refused.push(frame);
             }
+            None => committed.refused.push(frame),
         }
     }
-    for (delivery, message) in pending {
-        let _ = delivery.push(message);
-    }
+    committed
 }
 
 #[cfg(test)]
@@ -5534,6 +5779,8 @@ mod bounded_input_upgrade_tests;
 mod native_upgrade_tests;
 #[cfg(test)]
 mod redraw_identity_tests;
+#[cfg(test)]
+mod redraw_ordering_tests;
 #[cfg(test)]
 mod relaunch_lineage_tests;
 #[cfg(test)]
@@ -7991,7 +8238,9 @@ for line in sys.stdin:
                 .unwrap();
             // Stand in for the request path that delivered this capture.
             let base = handle.snapshot();
-            state.subscriptions.record_sent(1, id, Arc::clone(&base));
+            state
+                .subscriptions
+                .record_sent(1, id, Arc::clone(&base), true);
             (delivery, handle, base)
         };
         let deadline = Instant::now() + Duration::from_secs(5);

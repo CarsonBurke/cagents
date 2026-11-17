@@ -31,6 +31,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         b"01234567890123456789012345678901234567890123456789012345678901234567890123456789\r\n";
     const BLOCK_LINES: usize = 512;
     const STANDARD_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+    /// How the worker words the notice for completed output beyond its
+    /// retained history.
+    const RETAINED_HISTORY_NOTICE: &str = "The completed terminal retains its newest rows";
 
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let socket = if let Some(index) = args.iter().position(|arg| arg == "--socket") {
@@ -298,6 +301,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut complete = vec![false; count];
         let mut generations = vec![0; count];
         let mut observations = 0u64;
+        // Completed output that outgrew the retained history is reported as
+        // an error, though the final screen is still published. Record that
+        // notice; any other error still ends the run.
+        let mut terminal_errors = Vec::new();
         let mut resized = false;
         let mut latencies = Vec::new();
         let mut probe = 0;
@@ -337,6 +344,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .unwrap()
                         .1;
                     match operation.recv(&events[index]) {
+                        Ok(TerminalEvent::Error { operation, message })
+                            if message.starts_with(RETAINED_HISTORY_NOTICE) =>
+                        {
+                            terminal_errors.push(format!("{operation}: {message}"));
+                        }
                         Ok(TerminalEvent::Error { operation, message }) => {
                             return Err(format!("{operation}: {message}").into());
                         }
@@ -440,6 +452,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "consumer_process_cpu_ns": cpu_ns().saturating_sub(cpu_start), "output_batches": batches, "resize_exercised": resized,
                 "snapshot_generations": generations, "observed_snapshots": observations, "wake_callbacks": wakes.load(Ordering::Relaxed),
                 "terminal_ids": handles.iter().filter_map(BenchTerminal::id).map(|id| id.to_string()).collect::<Vec<_>>(),
+                "terminal_errors": terminal_errors,
                 "input_samples": latencies.len(), "input_to_snapshot_p50_ns": percentile(50), "input_to_snapshot_p95_ns": percentile(95), "input_to_snapshot_p99_ns": percentile(99),
                 "sustained_output_bytes": sustained_bytes,
                 "sustained_mib_per_second": sustained_bytes.map(|bytes| bytes as f64 * 1e9 / wall_ns as f64 / (1024.0 * 1024.0)),
