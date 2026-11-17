@@ -1,12 +1,13 @@
 //! Closing a pane closes it in every window and stops what it runs, so a chat
 //! that is still working asks first, as a terminal running a process does. The
 //! window may not be the one that started it, or know how far it has got.
-//! The conversation stays in history, so this is a routine question: Enter
-//! answers it, and the person may choose not to be asked again. Closing a
-//! chat whose first message hasn't arrived discards that message, which
-//! nothing brings back, so those questions are always asked and open on
-//! their dismissal: one whose message is still on its way, and one whose
-//! message couldn't start and is kept unsent in the composer.
+//! The conversation stays in history, and this window keeps anything it had
+//! not sent for when it reopens (see `chat_ui::kept_draft`), so this is a
+//! routine question: Enter answers it, and the person may choose not to be
+//! asked again. Closing a chat whose first message hasn't arrived discards
+//! that message, which nothing brings back, so those questions are always
+//! asked and open on their dismissal: one whose message is still on its way,
+//! and one whose message couldn't start and is kept unsent in the composer.
 
 use super::*;
 
@@ -29,6 +30,9 @@ pub(super) struct ChatCloseConfirm {
     /// Decided when the question opens, so the answer it starts on doesn't
     /// change under the person reading it.
     question: dialog_ui::Question,
+    /// Whether closing keeps anything unsent for a reopened conversation,
+    /// which the question then says.
+    keeps_unsent: bool,
     restore_card: Option<CardId>,
     restore_keyboard_nav: bool,
 }
@@ -37,6 +41,9 @@ impl Cagents {
     /// A close the reader asked for, from anywhere a chat pane can be closed.
     pub(super) fn request_chat_close(&mut self, card: CardId) -> Task<Message> {
         self.reset_shared_removal_for_new_close(card);
+        // A discard confirmed for an earlier close that didn't go ahead
+        // answers nothing about this one.
+        self.forget_close_loss(card);
         self.continue_chat_close(card)
     }
 
@@ -99,11 +106,13 @@ impl Cagents {
             return Some(Task::none());
         }
         let restore_keyboard_nav = self.core.keyboard_nav();
+        let keeps_unsent = self.close_keeps_unsent(card, question);
         self.chat_close_confirm = Some(ChatCloseConfirm {
             card,
             session,
             certain,
             question,
+            keeps_unsent,
             restore_card: self.workspace.focused(),
             restore_keyboard_nav,
         });
@@ -192,6 +201,9 @@ impl Cagents {
                 self.dismiss_confirmation(QUESTION);
                 Task::none()
             };
+            // A message the reader chose to discard is not kept for a
+            // reopened conversation; the rest of what it had not sent is.
+            self.confirm_close_loss(intent.card, intent.session, intent.question);
             Task::batch([remember, self.begin_chat_close(intent.card)])
         } else {
             self.dismiss_confirmation(QUESTION);
@@ -241,17 +253,35 @@ impl Cagents {
         } else {
             "It may still be working. Closing it stops it and closes it in every window."
         };
+        // What isn't lost, the reader should know where to find.
+        let kept = intent
+            .filter(|intent| intent.keeps_unsent)
+            .and_then(|_| match question {
+                dialog_ui::Question::StopWorkingChat => {
+                    Some("Unsent and queued messages come back when you reopen this chat in this window.")
+                }
+                dialog_ui::Question::StopSendingFirstMessage => Some(
+                    "Anything else unsent comes back when you reopen this chat in this window.",
+                ),
+                _ => None,
+            });
         dialog_ui::overlay(
             dialog_ui::confirmation_surface(
                 question,
-                widget::column::with_children(vec![
-                    crate::design::title(title).into(),
-                    crate::design::body(body).into(),
-                    match question.skippable() {
-                        Some(confirmation) => self.dont_ask_again_control(confirmation, true),
-                        None => iced::widget::Space::new().into(),
-                    },
-                ])
+                widget::column::with_children(
+                    [
+                        Some(crate::design::title(title).into()),
+                        Some(crate::design::body(body).into()),
+                        kept.map(|kept| crate::design::body(kept).into()),
+                        Some(match question.skippable() {
+                            Some(confirmation) => self.dont_ask_again_control(confirmation, true),
+                            None => iced::widget::Space::new().into(),
+                        }),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>(),
+                )
                 .spacing(space::M),
                 dialog_ui::confirmation_actions(
                     crate::ui_controls::button::secondary(if discard_draft {
