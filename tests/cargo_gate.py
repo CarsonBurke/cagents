@@ -542,25 +542,46 @@ class CompilerGuard(unittest.TestCase):
                 ["--print", "native-static-libs", "main.rs"], ["--print=link-args", "main.rs"],
                 ["--print=link-args=args.txt", "main.rs"])
 
+    TOOLS = ("rustc", "rustdoc", "clippy-driver")
+
     def setUp(self):
         directory = tempfile.TemporaryDirectory(prefix="cagents-compiler-guard-", dir="/var/tmp")
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
         self.log = self.root / "log"
-        guard = ROOT / "scripts/cargo-gate-rustc-guard"
+        self.guard = ROOT / "scripts/cargo-gate-rustc-guard"
+        # An outer `exec` command's gate can be another copy of the guard.
+        copy = self.root / "copy"
+        copy.mkdir()
+        shutil.copy2(self.guard, copy / self.guard.name)
         self.real = self.root / "real"
-        # Two directories of the guard, as nested `exec` commands leave on
-        # PATH: the next compiler is never the guard again.
         self.shims = [self.root / "shims", self.root / "outer-shims"]
-        for directory in (self.real, *self.shims):
+        # Like mise's shim for a tool it does not manage here: it runs the
+        # first one on PATH outside its own directory, and gives up when that
+        # keeps coming back to it.
+        mise = self.root / "mise"
+        for directory in (self.real, *self.shims, mise):
             directory.mkdir()
-        for tool in ("rustc", "rustdoc"):
+        for tool in (*self.TOOLS, "rustup"):
             (self.real / tool).write_text(
                 f'#!/bin/sh\nprintf "{tool} %s\\n" "$*" >>"{self.log}"\n')
             (self.real / tool).chmod(0o755)
-            for shims in self.shims:
-                (shims / tool).symlink_to(guard)
-        self.env = {"PATH": os.pathsep.join([*map(str, self.shims), str(self.real), "/usr/bin", "/bin"])}
+            (self.shims[0] / tool).symlink_to(self.guard)
+            (self.shims[1] / tool).symlink_to(copy / self.guard.name)
+            (mise / tool).write_text(textwrap.dedent(f"""\
+                #!/bin/sh
+                [ "${{MISE_DEPTH:-0}}" -lt 3 ] || {{ echo "mise: shim fallback recursion detected" >&2; exit 1; }}
+                export MISE_DEPTH=$((${{MISE_DEPTH:-0}} + 1))
+                here=$(dirname "$0")
+                IFS=:
+                for entry in $PATH; do
+                    [ "$entry" != "$here" ] && [ -x "$entry/{tool}" ] && exec "$entry/{tool}" "$@"
+                done
+                exit 127
+            """))
+            (mise / tool).chmod(0o755)
+        self.env = {"PATH": os.pathsep.join([*map(str, self.shims), str(mise), str(self.real),
+                                             "/usr/bin", "/bin"])}
 
     def run_guard(self, command, **env):
         self.log.unlink(missing_ok=True)
@@ -570,7 +591,7 @@ class CompilerGuard(unittest.TestCase):
         return result, ran
 
     def test_a_compiler_run_directly_only_answers_queries(self):
-        for tool in ("rustc", "rustdoc"):
+        for tool in self.TOOLS:
             for arguments in self.QUERIES:
                 with self.subTest(tool=tool, arguments=arguments):
                     result, ran = self.run_guard([str(self.shims[0] / tool), *arguments])
@@ -593,7 +614,7 @@ class CompilerGuard(unittest.TestCase):
             for arguments in self.QUERIES[1:]:
                 with self.subTest(given=given, arguments=arguments):
                     result, ran = self.run_guard(
-                        [str(ROOT / "scripts/cargo-gate-rustc-guard"), rustc, *arguments], **given)
+                        [str(self.guard), rustc, *arguments], **given)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     expected = [" ".join(["rustc", *arguments])]
                     if given:
@@ -602,11 +623,31 @@ class CompilerGuard(unittest.TestCase):
             for arguments in self.COMPILES:
                 with self.subTest(given=given, arguments=arguments):
                     result, ran = self.run_guard(
-                        [str(ROOT / "scripts/cargo-gate-rustc-guard"), rustc, *arguments], **given)
+                        [str(self.guard), rustc, *arguments], **given)
                     self.assertEqual(result.returncode, 1)
                     self.assertEqual(ran, [])
                     self.assertIn("would compile on this host", result.stderr)
                     self.assertIn("CAGENTS_BUILD_REMOTE=local", result.stderr)
+
+    def test_rustup_runs_a_toolchains_compiler_only_for_queries(self):
+        rustup = str(self.shims[0] / "rustup")
+        for arguments in (["show"], ["run", "stable", "cargo", "build"], ["run", "stable", "sh", "-c", "true"],
+                          ["run", "stable"], *(["run", "stable", "rustc", *query] for query in self.QUERIES),
+                          ["run", "--install", "1.93.0", "rustdoc", "--version"]):
+            with self.subTest(arguments=arguments):
+                result, ran = self.run_guard([rustup, *arguments])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(ran, [" ".join(["rustup", *arguments])])
+        for tool in self.TOOLS:
+            for arguments in (["run", "stable", tool, "main.rs"],
+                              ["run", "--install", "nightly", f"/toolchain/bin/{tool}", "--crate-name", "probe",
+                               "--print=native-static-libs", "src/lib.rs"]):
+                with self.subTest(arguments=arguments):
+                    result, ran = self.run_guard([rustup, *arguments])
+                    self.assertEqual(result.returncode, 1)
+                    self.assertEqual(ran, [])
+                    self.assertIn(f"`rustup run … {tool}` inside `cargo-gate exec` would compile on this host",
+                                  result.stderr)
 
     def test_a_compiler_missing_beyond_the_guard_is_named(self):
         self.env["PATH"] = os.pathsep.join([str(self.shims[0]), "/nonexistent"])

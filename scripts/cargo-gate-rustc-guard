@@ -6,12 +6,15 @@
 # - RUSTC_WRAPPER, for a Cargo reached other than by that name (by path,
 #   $CARGO, `rustup run` or `mise exec`). The wrapper the caller had, if any,
 #   still runs.
-# - `rustc` and `rustdoc` beside the gate's `cargo` on PATH, for a compiler run
-#   directly. It runs the next one on PATH.
+# - `rustc`, `rustdoc`, `clippy-driver` and `rustup` beside the gate's `cargo`
+#   on PATH, for a compiler run by name, or by `rustup run`. Each runs the
+#   next one on PATH.
 #
 # Either way, it passes what only asks the compiler something, which Cargo's
-# queries and `rustc -vV` do, and refuses anything else.
+# queries and `rustc -vV` do, and refuses anything else. A compiler run by
+# its path, or found on PATH ahead of the gate's `cargo`, is beyond its reach.
 tool=${0##*/}
+refusal="would compile on this host, where Rust compiles only through the gate"
 
 # Whether the compiler stops before compiling, as it does for its version,
 # help, an explanation, or any print but those it prints while linking.
@@ -38,26 +41,63 @@ asks_to_print() {
     esac
 }
 
-if [ "$tool" = rustc ] || [ "$tool" = rustdoc ]; then
-    if asks "$@"; then
-        # The next one on PATH: not this guard under another directory.
-        self=$(readlink -f -- "$0")
-        rest=$PATH:
-        while [ -n "$rest" ]; do
-            entry=${rest%%:*}
-            rest=${rest#*:}
-            [ -n "$entry" ] || entry=.
-            if [ -x "$entry/$tool" ] && [ ! -d "$entry/$tool" ] &&
-                [ "$(readlink -f -- "$entry/$tool")" != "$self" ]; then
-                exec "$entry/$tool" "$@"
-            fi
-        done
+# Runs the next $tool on PATH. Every directory holding this guard comes off
+# PATH first: a shim such as mise's that looks $tool up on PATH again would
+# otherwise find the guard, which would find the shim, without end.
+next() {
+    rest=$PATH:
+    kept=
+    separator=
+    while [ -n "$rest" ]; do
+        entry=${rest%%:*}
+        rest=${rest#*:}
+        # By the system's PATH: the one being rebuilt may have no readlink.
+        resolved=$(command -p readlink -f -- "${entry:-.}/$tool" 2>/dev/null) || resolved=
+        if [ "${resolved##*/}" != cargo-gate-rustc-guard ]; then
+            kept=$kept$separator$entry
+            separator=:
+        fi
+    done
+    PATH=$kept
+    export PATH
+    if ! command -v "$tool" >/dev/null 2>&1; then
         printf '%s\n' "cargo-gate: no $tool on PATH besides cargo-gate's guard" >&2
         exit 127
     fi
-    printf '%s\n' "cargo-gate: \`$tool\` run directly inside \`cargo-gate exec\` would compile on this host, where Rust compiles only through the gate; build with \`cargo\` by name, which builds on the build host" >&2
-    exit 1
-fi
+    exec "$tool" "$@"
+}
+
+# Whether a `rustup` command line may go ahead: anything but `rustup run`
+# of a compiler that would compile.
+runs_compiler() {
+    [ "${1-}" = run ] || return 0
+    shift
+    [ "${1-}" != --install ] || shift
+    [ "$#" -ge 2 ] || return 0
+    compiler=${2##*/}
+    case $compiler in
+        rustc|rustdoc|clippy-driver) ;;
+        *) return 0 ;;
+    esac
+    shift 2
+    asks "$@" && return 0
+    printf '%s\n' "cargo-gate: \`rustup run … $compiler\` inside \`cargo-gate exec\` $refusal; build with \`cargo\` by name, which builds on the build host" >&2
+    return 1
+}
+
+case $tool in
+    rustc|rustdoc|clippy-driver)
+        asks "$@" && next "$@"
+        printf '%s\n' "cargo-gate: \`$tool\` run directly inside \`cargo-gate exec\` $refusal; build with \`cargo\` by name, which builds on the build host" >&2
+        exit 1
+        ;;
+    rustup)
+        # `rustup run [--install] TOOLCHAIN COMMAND...` runs the toolchain's
+        # own compiler, not the one on PATH.
+        runs_compiler "$@" && next "$@"
+        exit 1
+        ;;
+esac
 
 # As RUSTC_WRAPPER: "$1" is the compiler, or a workspace wrapper before it.
 if asks "$@"; then
@@ -66,5 +106,5 @@ if asks "$@"; then
     fi
     exec "$@"
 fi
-printf '%s\n' "cargo-gate: Cargo inside \`cargo-gate exec\` was reached other than by the name \`cargo\` (by path, \$CARGO, rustup run or mise exec) and would compile on this host; run \`cargo\` by name, which builds on the build host, or here through the gate with CAGENTS_BUILD_REMOTE=local" >&2
+printf '%s\n' "cargo-gate: Cargo inside \`cargo-gate exec\` was reached other than by the name \`cargo\` (by path, \$CARGO, rustup run or mise exec) and $refusal; run \`cargo\` by name, which builds on the build host, or here through the gate with CAGENTS_BUILD_REMOTE=local" >&2
 exit 1
