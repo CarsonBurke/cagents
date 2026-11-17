@@ -67,7 +67,7 @@ if [ "${CAGENTS_DAEMON_LEASE_FD:-}" = 3 ] \
     if (set -o posix) 2>/dev/null; then set -o posix; fi
     # Preserve command -v detection for optional and missing tools. Aliases
     # apply inside functions and command substitutions too.
-    for installer_utility in awk cat chmod cp curl find getconf gh \
+    for installer_utility in awk cat chmod cp curl find flock getconf gh \
         gtk-update-icon-cache id ln mkdir mktemp mv readlink rm rmdir sed \
         sha256sum shasum sleep sync tar uname update-desktop-database; do
         if command -v "$installer_utility" >/dev/null 2>&1; then
@@ -351,6 +351,29 @@ classify_daemon_status() {
     esac
 }
 
+# An in-app update keeps its job lock and logs in .update and holds the lock for
+# the job's lifetime. Take it, creating it as the updater would if no update has
+# run yet, and keep it until this process exits: an update cannot then start
+# while the installation is removed. Brief status checks also take it, so wait
+# a few seconds before calling it busy.
+claim_updater_state() {
+    update_state=$PREFIX/.update
+    command -v flock >/dev/null 2>&1 \
+        || fail 'flock is required to confirm that no application update is running; cagents was not removed'
+    # The updater refuses state that others can read or write.
+    uninstall_umask=$(umask)
+    umask 077
+    mkdir "$update_state" 2>/dev/null || :
+    if [ -L "$update_state" ] || [ ! -d "$update_state" ] || [ -L "$update_state/lock" ]; then
+        fail "unsafe updater state at $update_state; cagents was not removed"
+    fi
+    { command exec 9>>"$update_state/lock"; } 2>/dev/null \
+        || fail "cannot open the updater lock at $update_state; cagents was not removed"
+    umask "$uninstall_umask"
+    flock -w 5 9 \
+        || fail 'an application update is in progress; let it finish, then retry; cagents was not removed'
+}
+
 uninstall_installation() {
     if [ ! -e "$PREFIX/.cagents-install-root" ]; then
         printf '%s: no install.sh installation found at %s\n' "$PROGRAM" "$PREFIX" >&2
@@ -361,6 +384,7 @@ uninstall_installation() {
     [ "$(cat "$PREFIX/.cagents-install-root")" = 'cagents install root' ] \
         || fail "unrecognized installation marker at $PREFIX"
 
+    claim_updater_state
     if [ -L "$PREFIX/current" ]; then
         stop_daemon_and_wait "$PREFIX/current/bin/cagents"
     elif [ -e "$PREFIX/current" ]; then
@@ -376,8 +400,23 @@ uninstall_installation() {
 
     rm -f "$PREFIX/current"
     rm -rf "$PREFIX/versions"
-    rm -f "$PREFIX/.cagents-install-root"
-    rmdir "$PREFIX" 2>/dev/null || :
+    # Remove the held lock last: an updater that opens it meanwhile finds it
+    # held rather than creating another.
+    find "$update_state" -mindepth 1 -maxdepth 1 ! -name lock -exec rm -rf -- {} +
+    # A later install refuses a non-empty root without this marker, so keep it
+    # while anything else remains.
+    uninstall_remaining=$(find "$PREFIX" -mindepth 1 -maxdepth 1 \
+        ! -name .cagents-install-root ! -name .update -print)
+    rm -f "$update_state/lock"
+    if [ -z "$uninstall_remaining" ] && rmdir "$update_state" 2>/dev/null; then
+        rm -f "$PREFIX/.cagents-install-root"
+        rmdir "$PREFIX" 2>/dev/null || :
+    else
+        rmdir "$update_state" 2>/dev/null || :
+        uninstall_remaining=$(find "$PREFIX" -mindepth 1 -maxdepth 1 ! -name .cagents-install-root -print)
+        printf '%s: kept %s and its installation marker because it also contains:\n%s\n' \
+            "$PROGRAM" "$PREFIX" "$uninstall_remaining" >&2
+    fi
     if command -v gtk-update-icon-cache >/dev/null 2>&1; then
         gtk-update-icon-cache --force --ignore-theme-index "$DATA_HOME/icons/hicolor" >/dev/null 2>&1 || :
     fi
@@ -389,7 +428,7 @@ uninstall_installation() {
 
 read_daemon_status() {
     daemon_cli=$1
-    if daemon_output=$(installer_tool "$daemon_cli" --json daemon status 2>/dev/null); then
+    if daemon_output=$(installer_tool "$daemon_cli" --json daemon status 2>/dev/null 9>&-); then
         classify_daemon_status "$daemon_output"
     else
         DAEMON_STATUS=unknown
@@ -407,7 +446,7 @@ stop_daemon_and_wait() {
     esac
 
     DAEMON_SHUTDOWN_REQUESTED=1
-    installer_tool "$daemon_cli" daemon stop --require-empty >/dev/null \
+    installer_tool "$daemon_cli" daemon stop --require-empty >/dev/null 9>&- \
         || fail 'daemon was not stopped: finish terminals or explicitly confirm their termination with cagents daemon stop --confirm, then retry; installation was not changed'
 
     wait_for_daemon_shutdown "$daemon_cli"

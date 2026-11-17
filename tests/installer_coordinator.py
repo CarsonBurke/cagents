@@ -5,6 +5,7 @@ The fixtures exercise archive extraction, coordinator selection, re-entry and
 publication without compiling Rust, opening windows or starting a real daemon.
 They do not replace the Rust source-inspection or install-guard contracts.
 """
+import fcntl
 import hashlib
 import json
 import os
@@ -145,6 +146,20 @@ elif args == ['--json', 'daemon', 'status']:
 elif args == ['daemon', 'stop', '--require-empty']:
     record('daemon-stop')
     pathlib.Path(os.environ['FIXTURE_DAEMON_STATE']).unlink()
+    if os.environ.get('FIXTURE_UPDATE_DURING_STOP'):
+        # An in-app update starting now takes its job lock as update.rs does.
+        import fcntl
+        state = pathlib.Path(os.environ['FIXTURE_UPDATE_DURING_STOP']) / '.update'
+        try:
+            state.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        lock = os.open(state / 'lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            record('update-started')
+        except BlockingIOError:
+            record('update-busy')
 elif args == ['daemon', 'start']:
     record('daemon-start-fixture', executable=str(pathlib.Path(sys.argv[0]).resolve()))
     starts = sum(json.loads(line)['event'] == 'daemon-start-fixture' for line in log.read_text().splitlines())
@@ -925,13 +940,23 @@ os.execv({real_tar!r}, [{real_tar!r}, *args])
         else:
             command = ["/bin/sh", str(ROOT / "install.sh"), "--prefix", str(self.prefix),
                        *(() if "--purge" in options else ("--uninstall",))]
+        # A typical login umask, which would expose files the uninstaller creates.
         return subprocess.run([*command, *options], env=environment or self.environment, cwd=self.directory,
-                              capture_output=True, text=True, timeout=INSTALL_TIMEOUT_SECONDS)
+                              capture_output=True, text=True, timeout=INSTALL_TIMEOUT_SECONDS, umask=0o022)
 
     def install_serving(self):
         self.assert_installed(self.install(), 'candidate')
         self.assertTrue(Path(self.environment["FIXTURE_DAEMON_STATE"]).exists())
         self.calls.unlink()
+
+    def record_update(self):
+        """Leave the updater state an in-app update job leaves in its prefix."""
+        state = self.prefix / ".update"
+        state.mkdir(mode=0o700, exist_ok=True)
+        for name, text in (("lock", ""), ("status.json", '{"phase":"Succeeded"}\n'), (f"{JOB}.log", "updated\n")):
+            (state / name).write_text(text)
+            (state / name).chmod(0o600)
+        return state
 
     def assert_still_installed(self):
         self.assertEqual(os.readlink(self.prefix / "current"), f"versions/{VERSION}")
@@ -957,6 +982,74 @@ os.execv({real_tar!r}, [{real_tar!r}, *args])
                     self.assertIn("the daemon is starting or stopping; retry once it has settled", result.stderr)
                     self.assert_still_installed()
                     self.assertNotIn("daemon-stop", [e["event"] for e in self.events()])
+
+    def test_uninstall_after_an_update_lets_the_same_prefix_be_reinstalled(self):
+        for uninstaller in self.UNINSTALLERS:
+            with self.subTest(uninstaller=uninstaller):
+                self.install_serving()
+                self.record_update()
+                result = self.uninstall(uninstaller)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual([e["event"] for e in self.events()].count("daemon-stop"), 1)
+                self.assertFalse(self.prefix.exists(), result.stderr)
+                self.assertFalse(self.managed_link("bin/cagents").is_symlink())
+                self.calls.unlink()
+        self.assert_installed(self.install(), 'candidate')
+
+    def test_uninstall_refuses_while_an_update_holds_the_updater_lock(self):
+        self.install_serving()
+        state = self.record_update()
+        with (state / "lock").open("r+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            for uninstaller in self.UNINSTALLERS:
+                with self.subTest(uninstaller=uninstaller):
+                    result = self.uninstall(uninstaller)
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("an application update is in progress", result.stderr)
+                    self.assert_still_installed()
+                    self.assertEqual(sorted(p.name for p in state.iterdir()), sorted(["lock", "status.json", f"{JOB}.log"]))
+                    # The daemon is checked only after the update is excluded.
+                    self.assertFalse(self.calls.exists())
+
+    def test_an_update_cannot_start_while_an_installation_without_updater_state_is_removed(self):
+        for uninstaller in self.UNINSTALLERS:
+            with self.subTest(uninstaller=uninstaller):
+                self.install_serving()
+                self.assertFalse((self.prefix / ".update").exists())
+                result = self.uninstall(uninstaller, environment=dict(
+                    self.environment, FIXTURE_UPDATE_DURING_STOP=str(self.prefix)))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                events = [e["event"] for e in self.events()]
+                self.assertIn("update-busy", events)
+                self.assertNotIn("update-started", events)
+                self.assertFalse(self.prefix.exists(), result.stderr)
+                self.calls.unlink()
+
+    def test_a_refused_uninstall_leaves_updater_state_the_updater_accepts(self):
+        self.install_serving()
+        self.environment["FIXTURE_STATUS_REPLY"] = self.TRANSITIONING_STATUS[0]
+        for uninstaller in self.UNINSTALLERS:
+            with self.subTest(uninstaller=uninstaller):
+                result = self.uninstall(uninstaller)
+                self.assertNotEqual(result.returncode, 0)
+                # update.rs refuses state that others can read or write.
+                self.assertEqual((self.prefix / ".update").stat().st_mode & 0o777, 0o700)
+                self.assertEqual((self.prefix / ".update/lock").stat().st_mode & 0o777, 0o600)
+                self.assert_still_installed()
+
+    def test_uninstall_keeps_the_marker_while_unrecognized_files_remain(self):
+        for uninstaller in self.UNINSTALLERS:
+            with self.subTest(uninstaller=uninstaller):
+                self.install_serving()
+                self.record_update()
+                self.write(self.prefix / "notes.txt", "kept\n")
+                result = self.uninstall(uninstaller)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(f"kept {self.prefix} and its installation marker because it also contains:\n"
+                              f"{self.prefix / 'notes.txt'}\n", result.stderr)
+                self.assertEqual(sorted(p.name for p in self.prefix.iterdir()), [".cagents-install-root", "notes.txt"])
+                self.calls.unlink()
+        self.assert_installed(self.install(), 'candidate')
 
 
 if __name__ == "__main__":
