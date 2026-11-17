@@ -75,19 +75,50 @@ local_packages() {
     printf '%s\n' "$packages" | paste -s -d '|' -
 }
 
+# Cargo has kept a profile's fingerprints in two layouts. Up to 1.99 they are in
+# <profile>/.fingerprint/<package>-<hash>, beside deps/ and build/. From 1.100
+# each unit has its own <profile>/build/<package>/<hash>, holding its
+# fingerprint/, its out/ and what its build script ran.
+
+# Whether $1 is a profile Cargo has compiled in, in either layout.
+compiled() {
+    [ -d "$1/.fingerprint" ] && return 0
+    for unit in "$1"/build/*/*/fingerprint; do
+        [ -d "$unit" ] && return 0
+    done
+    return 1
+}
+
 # Removes the fingerprints of the packages matching $1 from build directory $2,
 # in every profile however deep: Cargo adds a directory for a target triple.
 # Without a fingerprint Cargo rebuilds a package, and then whatever depends on
-# it. A directory holding none has nothing stale; one that can't be searched or
-# cleaned fails.
+# it; in the newer layout the package's units go whole. A directory holding no
+# fingerprints but compiled crates is in a layout this does not know, and fails,
+# as does one that can't be searched or cleaned. One holding neither has
+# nothing stale.
 forget_local() {
-    fingerprints=$(find "$2/" -type d -name .fingerprint -prune -print) || return 1
-    [ -n "$fingerprints" ] || { note "no fingerprints in $2, so nothing to forget"; return 0; }
-    printf '%s\n' "$fingerprints" | while IFS= read -r directory; do
-        # Each is named <package>-<hash>; a package can begin with another's name.
-        find "$directory" -mindepth 1 -maxdepth 1 -type d -regextype posix-extended \
-            -regex ".*/($1)-[0-9a-f]+" -exec rm -rf -- {} + || exit 1
-    done
+    found=$(find "$2/" -regextype posix-extended -type d \( -name .fingerprint -prune -print -o \
+        -regex '.*/build/[^/]+/[^/]+/fingerprint' -prune -print \)) || return 1
+    if [ -z "$found" ]; then
+        compiled=$(find "$2/" -type f \( -name '*.rlib' -o -name '*.rmeta' \) -print -quit) || return 1
+        if [ -n "$compiled" ]; then
+            note "$2 holds compiled crates but no fingerprints this understands"
+            return 1
+        fi
+        note "no fingerprints in $2, so nothing to forget"
+        return 0
+    fi
+    # Each .fingerprint holds <package>-<hash>, and each build/ <package>/<hash>.
+    printf '%s\n' "$found" | sed 's|/[^/]*/[^/]*/fingerprint$||' | sort -u |
+        while IFS= read -r directory; do
+            # A package can begin with another's name.
+            case $directory in
+                */.fingerprint) named="($1)-[0-9a-f]+" ;;
+                *) named="($1)" ;;
+            esac
+            find "$directory" -mindepth 1 -maxdepth 1 -type d -regextype posix-extended \
+                -regex ".*/$named" -exec rm -rf -- {} + || exit 1
+        done
 }
 
 from=
@@ -123,8 +154,8 @@ build_dir_of() {
 
 # A build directory with any compiled profile has been built in or seeded.
 built() {
-    for fingerprints in "$1"/*/.fingerprint; do
-        [ -d "$fingerprints" ] && return 0
+    for profile in "$1"/*/; do
+        compiled "${profile%/}" && return 0
     done
     return 1
 }
@@ -188,7 +219,7 @@ case $(lsattr -d -- "$from" 2>/dev/null | cut -d' ' -f1) in
 esac
 
 # Each failed clone costs a pass over every file, so try one first.
-probe=$(find "$from" -path '*/deps/*' -type f -print -quit)
+probe=$(find "$from" \( -path '*/deps/*' -o -path '*/build/*/out/*' \) -type f -print -quit)
 [ -n "$probe" ] || exit 0
 if ! cp --reflink=always -- "$probe" "$stage/.probe" 2>/dev/null; then
     note "not seeding $to: this file system cannot reflink from $from"
@@ -217,9 +248,9 @@ holding_cargo_locks() {
 }
 
 profiles=
-for fingerprints in "$from"/*/.fingerprint; do
-    [ -d "$fingerprints" ] || continue
-    source=${fingerprints%/.fingerprint}
+for source in "$from"/*/; do
+    source=${source%/}
+    compiled "$source" || continue
     profile=${source##*/}
     mkdir -- "$stage/$profile"
     set --
