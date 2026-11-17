@@ -1051,7 +1051,10 @@ build_identity_inputs() {
     # compile time through env! or option_env!.
     watched=$({
         build_script_watches env-changed
-        sed -n 's/^# env-dep:\([^=]*\).*/\1/p' "$build_dir"/dev-runtime/deps/*.d 2>/dev/null
+        # Cargo up to 1.99 keeps rustc's dependency lists in deps/, and from
+        # 1.100 in each unit's build/<package>/<hash>/out/.
+        sed -n 's/^# env-dep:\([^=]*\).*/\1/p' "$build_dir"/dev-runtime/deps/*.d \
+            "$build_dir"/dev-runtime/build/*/*/out/*.d 2>/dev/null
     } | LC_ALL=C sort -u)
     env | awk -v watched="$watched" '
         BEGIN { count = split(watched, names, "\n"); for (i = 1; i <= count; i++) seen[names[i]] }
@@ -1070,9 +1073,12 @@ build_identity() {
 }
 # What the dev-runtime build scripts asked Cargo to watch: env-changed for
 # variable names, or changed for paths. Outputs of earlier builds count too,
-# which only makes the check stricter.
+# which only makes the check stricter. Cargo up to 1.99 keeps what a build
+# script printed in build/<package>-<hash>/output, and from 1.100 in
+# build/<package>/<hash>/run/stdout.
 build_script_watches() {
-    sed -n "s/^cargo::\{0,1\}rerun-if-$1=//p" "$build_dir"/dev-runtime/build/*/output 2>/dev/null |
+    sed -n "s/^cargo::\{0,1\}rerun-if-$1=//p" "$build_dir"/dev-runtime/build/*/output \
+        "$build_dir"/dev-runtime/build/*/*/run/stdout 2>/dev/null |
         LC_ALL=C sort -u
 }
 # Files the build read outside the checkout scan: the executables' dependency

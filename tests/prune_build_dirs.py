@@ -51,13 +51,22 @@ class PruneBuildDirs(unittest.TestCase):
         return result.stdout
 
     def target(self, path, marker="rustc"):
-        """A Cargo target directory, idle once settled."""
+        """A Cargo target directory, idle once settled. A separate build
+        directory, marked by its fingerprints, is laid out as Cargo up to 1.99
+        does with marker="fingerprint", and as 1.100 does with marker="unit"."""
         path.mkdir(parents=True)
         if marker == "rustc":
             (path / ".rustc_info.json").write_text("{}")
         else:
             # A separate build directory: Cargo tags it.
             (path / "CACHEDIR.TAG").write_text("Signature: 8a477f597d28d172789f06886806bc55\n")
+        if marker == "unit":
+            unit = path / "debug/build/crate/0123456789abcdef"
+            (unit / "fingerprint").mkdir(parents=True)
+            (unit / "out").mkdir()
+            (unit / "out/libcrate-0123456789abcdef.rlib").write_bytes(b"x" * 8192)
+            (path / "debug/.cargo-build-lock").write_text("")
+            return path
         (path / "debug/.fingerprint/crate-0123").mkdir(parents=True)
         (path / "debug/.cargo-lock").write_text("")
         (path / "debug/deps").mkdir()
@@ -71,14 +80,15 @@ class PruneBuildDirs(unittest.TestCase):
         worktree = self.target(self.roots / "repo/.worktrees/old/target")
         lane = self.target(self.roots / "lane/target-after")
         separate = self.target(self.roots / "build/target", marker="fingerprint")
+        units = self.target(self.roots / "build-1.100/target", marker="unit")
         self.settle()
         output = self.prune()
-        for path in (worktree, lane, separate):
+        for path in (worktree, lane, separate, units):
             self.assertFalse(path.exists(), path)
             self.assertIn(f"removed {path}", output)
         # The worktree that held it stays.
         self.assertTrue((self.roots / "repo/.worktrees/old").is_dir())
-        self.assertEqual(len(self.log.read_text().splitlines()), 3)
+        self.assertEqual(len(self.log.read_text().splitlines()), 4)
 
     def test_a_recent_write_anywhere_inside_keeps_it(self):
         path = self.target(self.roots / "lane/target")
@@ -149,10 +159,15 @@ class PruneBuildDirs(unittest.TestCase):
         evidence = self.roots / "evidence"
         evidence.mkdir()
         (evidence / "handoff.md").write_text("notes")
+        # Tagged, with a fingerprint where no Cargo unit's directory is.
+        cache = self.roots / "state/cache"
+        (cache / "data/build/package/not-a-unit-hash/fingerprint").mkdir(parents=True)
+        (cache / "CACHEDIR.TAG").write_text("Signature: 8a477f597d28d172789f06886806bc55\n")
         self.settle()
         self.prune()
         self.assertTrue(venv.exists())
         self.assertTrue(evidence.exists())
+        self.assertTrue(cache.exists())
 
     def evidence_task(self, path):
         """A native-evidence task whose after side was built in a shared slot:

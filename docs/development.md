@@ -933,12 +933,14 @@ included, and moves the rest out of the target; with `0` it keeps none. Every
 6 hours it also moves out compiled units no build has looked at for 3 days,
 such as old versions after a dependency update. Cargo reads the fingerprint
 of every unit in a build's graph, even one it doesn't compile, so a unit is
-dated by its `.fingerprint/<package>-<hash>` directory and its outputs: a
-build dependency's rlib or a compiled build script is read only when it is
-rebuilt, so judged alone it would look unused in a lane that builds daily.
-A stale unit's fingerprint goes first, then its `deps/<crate>-<hash>` files
-and `build/<package>-<hash>` directory, so a unit moved out only in part is
-rebuilt. It skips this where the file system keeps no access times. Below twice the host's floor, the larger of
+dated by its fingerprint and its outputs: a build dependency's rlib or a
+compiled build script is read only when it is rebuilt, so judged alone it
+would look unused in a lane that builds daily. In Cargo's layout up to 1.99,
+a stale unit's `.fingerprint/<package>-<hash>` goes first, then its
+`deps/<crate>-<hash>` files and `build/<package>-<hash>` directory, so a unit
+moved out only in part is rebuilt. From 1.100, a unit is one
+`build/<package>/<hash>/` directory holding its fingerprint and outputs, and
+goes in one rename. It skips this where the file system keeps no access times. Below twice the host's floor, the larger of
 `CAGENTS_BUILD_REMOTE_FREE_FLOOR_GIB` and the [guard's](#compilation-jobs-and-shared-build-directories)
 default, a slot keeps a quarter of the budget, its dependencies are looked
 through at once, and the lease does the same to every other slot no lease
@@ -1075,7 +1077,7 @@ local build, removes them with `scripts/prune-build-dirs` in two ways:
 
 The pruner searches the repository's main checkout first, then the mirrored `/var/tmp/cargo-build`, then `~/.cache`, `~/.local/state` and `/var/tmp`, six levels deep. `CAGENTS_BUILD_PRUNE_ROOTS` replaces the last three. `~` is the account's home from the password database, because a test fixture's builds run under a private `HOME` that holds none of the account's build output, and a search of only that would find nothing yet count as a complete run. When `HOME` differs, its `~/.cache` and `~/.local/state` are searched as well, for a user who keeps builds under a `HOME` of their own. `~/.local/share` and the offload slots are never touched under either: their leases bound them, as [described above](#building-on-another-host), and before each of the guard's background runs and its run below the floor, `scripts/cargo-offload --trim-slots` beside it bounds the slots under the account's `~/.cache/cagents-offload` (`CAGENTS_BUILD_OFFLOAD_SLOTS`; empty for none) that no lease holds, under their leases' locks, as a lease would. A background run's account of it is in `/var/tmp/cagents-prune-build-dirs-UID.slots.log`. Below the floor the build waits for that trim and its removals beside the pruner, within the same budget. A `CAGENTS_BUILD_PRUNE` command replaces both. It skips a checkout's committed directories, which hold only sources.
 
-It recognizes build output by Cargo's own markers, not by name or place: a root `.rustc_info.json`, or a `CACHEDIR.TAG` beside a profile's `.fingerprint`. A [native-evidence](#native-evidence) task's `target-before` and `target-after`, beside the task's `.native-evidence` marker, are build output too. It removes a build directory only when all of these hold:
+It recognizes build output by Cargo's own markers, not by name or place: a root `.rustc_info.json`, or a `CACHEDIR.TAG` beside a profile's fingerprints, in `.fingerprint/` up to Cargo 1.99 or in `build/<package>/<hash>/fingerprint/` from 1.100. A [native-evidence](#native-evidence) task's `target-before` and `target-after`, beside the task's `.native-evidence` marker, are build output too. It removes a build directory only when all of these hold:
 
 - nothing inside it has been written or changed for `CAGENTS_BUILD_PRUNE_IDLE_DAYS` (default 7), or four times that for another main checkout's own build, which seeds that checkout's worktrees, or 12 hours for a native-evidence task's, 1 hour while running low;
 - every Cargo lock in it is free;

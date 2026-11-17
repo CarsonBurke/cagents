@@ -6,8 +6,9 @@ Agents build in many places: worktree `target/`s, `CARGO_TARGET_DIR`s under
 `/var/tmp/cargo-build/<workspace>/target` layout. Cargo never removes any of
 them, and together they fill the disk that every build shares. This finds
 build output by what it holds rather than by where it is: Cargo writes
-`.rustc_info.json` at the root of every target directory and a `.fingerprint`
-directory in each profile, which nothing else does. scripts/native-evidence
+`.rustc_info.json` at the root of every target directory and fingerprints in
+each profile, `.fingerprint/` up to 1.99 and `build/<package>/<hash>/fingerprint/`
+from 1.100, which nothing else does. scripts/native-evidence
 marks its task directories with `.native-evidence`, and their `target-before`
 and `target-after` hold only what its builds made.
 
@@ -73,6 +74,8 @@ PRUNED = re.compile(r"^\.(?P<name>.+)\.cagents-pruned-(?P<pid>\d+)$")
 # What scripts/native-evidence names a task's builds, beside this marker.
 EVIDENCE_TARGET = re.compile(r"^target-(before|after)$")
 EVIDENCE_TASK = ".native-evidence"
+# The hash naming a unit's directory in Cargo's build layout from 1.100.
+UNIT_HASH = re.compile(r"[0-9a-f]{16}")
 
 
 def default_roots() -> list[Path]:
@@ -90,7 +93,7 @@ def within(path: Path, parents: list[Path]) -> bool:
 
 def is_build_output(path: Path, names: set[str]) -> bool:
     """Cargo's own markers: `.rustc_info.json` at a target directory's root,
-    or, beside the CACHEDIR.TAG Cargo writes, a profile's `.fingerprint` in a
+    or, beside the CACHEDIR.TAG Cargo writes, a profile's fingerprints in a
     separate build directory. Never a checkout, whatever it holds: a target
     directory configured as one would take its sources with it."""
     if {".git", "Cargo.toml"} & names:
@@ -98,7 +101,28 @@ def is_build_output(path: Path, names: set[str]) -> bool:
     if ".rustc_info.json" in names:
         return True
     return "CACHEDIR.TAG" in names and any(
-        directory(path / name / ".fingerprint") for name in names if not name.startswith("."))
+        fingerprinted(path / name) for name in names if not name.startswith("."))
+
+
+def fingerprinted(profile: Path) -> bool:
+    """Whether Cargo has fingerprinted units in `profile`: up to Cargo 1.99 in
+    its `.fingerprint`, and from 1.100 in `build/<package>/<hash>/fingerprint`."""
+    if directory(profile / ".fingerprint"):
+        return True
+    if not directory(profile / "build"):
+        return False
+    try:
+        packages = list(os.scandir(profile / "build"))
+    except OSError:
+        return False
+    for package in packages:
+        if not package.is_dir(follow_symlinks=False):
+            continue
+        with contextlib.suppress(OSError), os.scandir(package.path) as units:
+            if any(UNIT_HASH.fullmatch(unit.name) and directory(Path(unit.path) / "fingerprint")
+                   for unit in units):
+                return True
+    return False
 
 
 def evidence_target(path: Path, names: set[str] | None = None) -> bool:
