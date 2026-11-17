@@ -47,24 +47,23 @@ fn chat_socket(intent: Intent) -> Result<std::path::PathBuf, StartFailure> {
     }
 }
 
-/// An account switch that could not reach the daemon before asking for
-/// anything. A daemon that took the connection but did not finish the
-/// handshake in time was asked nothing, so the original is untouched; it may
-/// be held by a long operation or hung, which the client cannot tell apart.
+/// An account switch that failed before asking the daemon for anything, so
+/// the original conversation is untouched whatever the cause. An update in
+/// progress is the daemon busy with another operation. A daemon that took
+/// the connection but did not finish the handshake in time may be held by a
+/// long operation or hung, which the client cannot tell apart.
 fn switch_unadmitted(error: crate::terminal::HostedTerminalStartError) -> StartFailure {
-    let unanswered = matches!(
-        error,
-        crate::terminal::HostedTerminalStartError::HostProtocol(
-            crate::control::ControlError::ReplyTimeout { .. }
-        )
-    );
+    use crate::terminal::HostedTerminalStartError;
+    let recovery = match &error {
+        HostedTerminalStartError::UpdateInProgress(_) => super::Recovery::Busy,
+        HostedTerminalStartError::HostProtocol(crate::control::ControlError::ReplyTimeout {
+            ..
+        }) => super::Recovery::Unresponsive,
+        _ => super::Recovery::Unreached,
+    };
     StartFailure {
         message: error.to_string(),
-        recovery: if unanswered {
-            super::Recovery::Unresponsive
-        } else {
-            super::Recovery::Retry
-        },
+        recovery,
     }
 }
 
@@ -4073,7 +4072,8 @@ mod tests {
     }
 
     /// A daemon too busy to finish a switch's handshake refuses it as busy;
-    /// one that can't be reached at all does not claim to be busy.
+    /// one that can't be reached at all does not claim to be busy, and an
+    /// update in progress is.
     #[test]
     fn a_switch_whose_handshake_timed_out_is_unanswered_not_busy() {
         use super::super::Recovery;
@@ -4095,9 +4095,21 @@ mod tests {
                 path: "/run/cagents.sock".into(),
                 source: io::ErrorKind::ConnectionRefused.into(),
             },
+            HostedTerminalStartError::SocketPath(io::ErrorKind::NotFound.into()),
+            HostedTerminalStartError::HostIncompatible { actual: 1 },
         ] {
-            assert_eq!(switch_unadmitted(unreachable).recovery, Recovery::Retry);
+            // Nothing was asked of a daemon, so nothing marks the account
+            // removed.
+            assert_eq!(switch_unadmitted(unreachable).recovery, Recovery::Unreached);
         }
+        assert!(!Recovery::Unreached.is_blocked());
+        assert_eq!(
+            switch_unadmitted(HostedTerminalStartError::UpdateInProgress(
+                crate::instance::UpdateInProgress
+            ))
+            .recovery,
+            Recovery::Busy
+        );
     }
 
     #[test]

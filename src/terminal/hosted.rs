@@ -1591,7 +1591,11 @@ fn verify_startup_stream(
     // an update's bound-but-unready listener gets the normal handshake budget;
     // only an admitted/inherited launch may need checkpoint restoration time.
     let client = if launch_is_updating(socket)? {
-        crate::control::ControlClient::from_stream(stream)
+        // An update's listener that doesn't answer yet is still restoring
+        // the daemon the update is installing, as one that isn't listening
+        // yet would be, so the caller hears that cagents is updating.
+        return verify_daemon_protocol(crate::control::ControlClient::from_stream(stream))
+            .map_err(updating_listener_error);
     } else {
         #[cfg(feature = "ui")]
         let health_request = crate::daemon_health::begin();
@@ -1605,6 +1609,17 @@ fn verify_startup_stream(
         client
     };
     verify_daemon_protocol(client)
+}
+
+/// An update's listener that took the connection and did not answer it is
+/// the update still in progress, not a hung daemon to restart.
+fn updating_listener_error(error: HostedTerminalStartError) -> HostedTerminalStartError {
+    match error {
+        HostedTerminalStartError::HostProtocol(crate::control::ControlError::ReplyTimeout {
+            ..
+        }) => HostedTerminalStartError::UpdateInProgress(crate::instance::UpdateInProgress),
+        error => error,
+    }
 }
 
 fn verify_daemon_protocol(
@@ -3400,6 +3415,33 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    /// An update's listener that hasn't answered is the update in progress;
+    /// any other failure is reported as it was.
+    #[test]
+    fn an_unanswered_update_listener_reports_the_update_in_progress() {
+        let timed_out = updating_listener_error(HostedTerminalStartError::HostProtocol(
+            crate::control::ControlError::ReplyTimeout {
+                timeout: Duration::from_secs(5),
+                error: crate::terminal::ipc::FrameError::Io(io::ErrorKind::WouldBlock.into()),
+            },
+        ));
+        assert!(matches!(
+            timed_out,
+            HostedTerminalStartError::UpdateInProgress(_)
+        ));
+        assert!(crate::instance::is_update_in_progress(&timed_out));
+        assert!(matches!(
+            updating_listener_error(HostedTerminalStartError::HostProtocol(
+                crate::control::ControlError::ConnectionClosed
+            )),
+            HostedTerminalStartError::HostProtocol(crate::control::ControlError::ConnectionClosed)
+        ));
+        assert!(matches!(
+            updating_listener_error(HostedTerminalStartError::HostIncompatible { actual: 1 }),
+            HostedTerminalStartError::HostIncompatible { actual: 1 }
+        ));
     }
 
     /// A serving daemon that takes the connection and never answers it is

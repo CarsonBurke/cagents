@@ -36,6 +36,7 @@ impl Reopen {
             | chat::Recovery::Retry
             | chat::Recovery::Busy
             | chat::Recovery::Unresponsive
+            | chat::Recovery::Unreached
             | chat::Recovery::Capacity
             | chat::Recovery::Fresh => None,
         }

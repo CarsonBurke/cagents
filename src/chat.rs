@@ -364,6 +364,11 @@ pub enum Recovery {
     /// changed nothing and may be sent again, but nothing says the daemon is
     /// finishing another operation: it may be hung.
     Unresponsive,
+    /// An account switch could not reach a daemon to ask anything of it: the
+    /// socket could not be found or connected, the connection closed before
+    /// its handshake, or the daemon speaks another protocol. Nothing was
+    /// requested, so the conversation it would have moved is untouched.
+    Unreached,
     /// The daemon refused this start and reported that repeating it cannot help.
     /// Keep the saved conversation and diagnostic without offering a retry.
     Blocked,

@@ -1706,10 +1706,36 @@ mod tests {
             outcome.guidance,
             "It may still go through, so check the conversation before trying again."
         );
-        // Other unrecognised failures keep the general guidance, and a
-        // filter for known failures still drops them.
+        // An outcome is recognised only by its whole text, so the notice's
+        // summary and next step are everything its details would show: they
+        // are not offered again, for Claude's own outcomes as for a refused
+        // account switch.
+        for text in [
+            chat::failure::delivery::UNACKNOWLEDGED_INPUT,
+            chat::failure::delivery::UNSETTLED_INPUT,
+            chat::failure::delivery::ACCOUNT_SWITCH_BUSY,
+        ] {
+            let outcome = State::metadata(Provider::Claude, text, false, "").unwrap();
+            assert!(outcome.explained, "{text}");
+            assert_eq!(
+                format!("{} {}", outcome.summary, outcome.guidance),
+                text,
+                "the notice shows the whole original"
+            );
+        }
+        // Other unrecognised failures keep the general guidance and their
+        // details, and a filter for known failures still drops them.
         let other = State::metadata(Provider::Claude, "Something else broke", false, "").unwrap();
         assert_eq!(other.guidance, "Review the details before trying again.");
+        assert!(!other.explained);
+        // An outcome quoted inside a longer report is not the outcome, so the
+        // report keeps its details.
+        let quoted = format!("Proxy said: {}", chat::failure::delivery::UNSETTLED_INPUT);
+        assert!(
+            !State::metadata(Provider::Claude, &quoted, false, "")
+                .unwrap()
+                .explained
+        );
         assert!(State::metadata(Provider::Claude, "Something else broke", true, "").is_none());
     }
 

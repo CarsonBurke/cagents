@@ -120,6 +120,7 @@ pub fn is_account_switch_refusal(message: &str) -> bool {
     [
         delivery::ACCOUNT_SWITCH_BUSY,
         delivery::ACCOUNT_SWITCH_UNANSWERED,
+        delivery::ACCOUNT_SWITCH_UNREACHED,
     ]
     .contains(&message.trim())
 }
@@ -610,13 +611,20 @@ delivery_outcomes! {
     /// while it finished another operation. The conversation stayed on its
     /// account, and the message is still in the composer, so sending again
     /// is the retry.
-    refused ACCOUNT_SWITCH_BUSY: "Your message wasn't sent. This conversation's account can't be used right now, and cagents was busy finishing something else, so it couldn't move the conversation to another account.",
+    refused ACCOUNT_SWITCH_BUSY: "Your message wasn't sent. This conversation's account can't be used right now, and the cagents daemon was busy finishing something else, so it couldn't move the conversation to another account.",
         "Send again in a moment.";
     /// A send that needed an automatic account switch, when the daemon took
     /// the connection but never answered it. Nothing was asked of it, so the
     /// conversation stayed on its account; the daemon may be hung, which the
     /// daemon health banner reports with its own restart.
-    refused ACCOUNT_SWITCH_UNANSWERED: "Your message wasn't sent. This conversation's account can't be used right now, and cagents didn't respond in time to move the conversation to another account.",
+    refused ACCOUNT_SWITCH_UNANSWERED: "Your message wasn't sent. This conversation's account can't be used right now, and the cagents daemon didn't respond in time to move the conversation to another account.",
+        "Send again, or restart the daemon if this keeps happening.";
+    /// A send that needed an automatic account switch, when no daemon could
+    /// be reached to ask: its socket was missing or refused the connection,
+    /// the connection closed before its handshake, or it speaks another
+    /// protocol. Nothing was asked, so the conversation stayed on its
+    /// account; a daemon that is gone or mismatched has its own banner.
+    refused ACCOUNT_SWITCH_UNREACHED: "Your message wasn't sent. This conversation's account can't be used right now, and the cagents daemon couldn't be reached to move the conversation to another account.",
         "Send again, or restart the daemon if this keeps happening.";
 }
 
