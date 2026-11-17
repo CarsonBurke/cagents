@@ -258,10 +258,10 @@ impl Cagents {
             .filter(|intent| intent.keeps_unsent)
             .and_then(|_| match question {
                 dialog_ui::Question::StopWorkingChat => {
-                    Some("What you haven't sent yet comes back when you reopen it in this window.")
+                    Some("Unsent and queued messages come back when you reopen this chat in this window.")
                 }
                 dialog_ui::Question::StopSendingFirstMessage => Some(
-                    "Anything else you haven't sent comes back when you reopen it in this window.",
+                    "Anything else unsent comes back when you reopen this chat in this window.",
                 ),
                 _ => None,
             });

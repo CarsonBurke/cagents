@@ -128,6 +128,9 @@ impl Cagents {
         else {
             return false;
         };
+        if unix_millis().saturating_sub(draft.closed_at_unix_ms) > KeptChatDraft::RETENTION_MS {
+            return false;
+        }
         if !draft.text.is_empty() {
             self.chat_ui.drafts.insert(closed, draft.text);
             if draft.sending {
@@ -398,7 +401,7 @@ mod tests {
         assert!(text.contains("It is still working"), "{text}");
         assert!(
             text.contains(
-                "What you haven't sent yet comes back when you reopen it in this window."
+                "Unsent and queued messages come back when you reopen this chat in this window."
             ),
             "{text}"
         );
@@ -578,7 +581,7 @@ mod tests {
             assert!(text.contains("first message is still on its way"), "{text}");
             assert_eq!(
                 text.contains(
-                    "Anything else you haven't sent comes back when you reopen it in this window."
+                    "Anything else unsent comes back when you reopen this chat in this window."
                 ),
                 written.is_some(),
                 "{text}"
