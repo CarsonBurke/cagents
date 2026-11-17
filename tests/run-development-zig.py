@@ -252,6 +252,12 @@ case $1 in
     build)
         printf '%s\\n' "$*" >> "$CARGO_CALLS"
         sleep "${FAKE_BUILD_SECONDS:-0}"
+        # Until the test releases it, bounded so a failing test leaks nothing.
+        waited=0
+        while [ -n "${FAKE_BUILD_RELEASE:-}" ] && [ ! -e "$FAKE_BUILD_RELEASE" ] &&
+            [ "$waited" -lt "$FAKE_BUILD_BOUND" ]; do
+            sleep 0.05; waited=$((waited + 1))
+        done
         for argument do binary=$argument; done
         if [ "$binary" = "${FAKE_FAIL_BINARY:-}" ]; then exit 101; fi
         mkdir -p "$FAKE_TARGET/dev-runtime" "$FAKE_BUILD/dev-runtime/build/script-1" \\
@@ -286,8 +292,9 @@ exit 83
             FAKE_SOURCE=str(self.source), FAKE_VENDORED=str(self.vendored),
             FAKE_GIT_INDEX=str(self.git_index),
             FAKE_WATCHED_DIRECTORY=str(self.root / "shared/assets"),
+            FAKE_BUILD_BOUND=str(2 * HANG_GUARD * 20),
         )
-        for name in ("FAKE_WATCHED", "FAKE_COMPILED", "FAKE_BUILD_SECONDS"):
+        for name in ("FAKE_WATCHED", "FAKE_COMPILED", "FAKE_BUILD_SECONDS", "FAKE_BUILD_RELEASE"):
             self.env.pop(name, None)
 
     def launch(self, *arguments, **changes):
@@ -537,6 +544,8 @@ exit 83
         )
         self.assertEqual(result.returncode, 124, result.stderr)
         self.assertIn("refusing to keep waiting while holding the native lock", result.stderr)
+        # The configured bound, not some other, ended it.
+        self.assertIn("took over 1 seconds", result.stderr)
 
     def test_ending_a_guarded_launch_ends_its_build_and_frees_a_plain_flocks_lock(self):
         lock = self.root / "native-lock"
@@ -554,7 +563,8 @@ exit 83
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
                 )
                 self.addCleanup(holder.wait)
-                self.addCleanup(lambda process=holder: process.poll() is None and process.kill())
+                # The whole session: a runner orphaned by a failing test, and its build.
+                self.addCleanup(os.killpg, holder.pid, signal.SIGKILL)
                 wait_until(self.cargo_calls.exists, "the build never started")
                 runner = int(subprocess.run(
                     ["pgrep", "-P", str(holder.pid)], capture_output=True, text=True,
@@ -582,7 +592,7 @@ exit 83
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
         )
         self.addCleanup(holder.wait)
-        self.addCleanup(lambda: holder.poll() is None and holder.kill())
+        self.addCleanup(os.killpg, holder.pid, signal.SIGKILL)
         wait_until(arming.exists, "the build never began")
         runner = int(subprocess.run(
             ["pgrep", "-P", str(holder.pid)], capture_output=True, text=True,
@@ -812,24 +822,37 @@ exit 83
         launch that started later."""
         self.assert_built("--browserless")
         self.source.write_text("fn main() { first }\n")
-        slow = dict(self.env, FAKE_BUILD_SECONDS="1")
+        # Each build waits for its release, so the edit lands during the first
+        # and the second has recorded nothing when the third decides.
+        first_release, second_release = self.root / "release-first", self.root / "release-second"
+        self.addCleanup(second_release.touch)
+        self.addCleanup(first_release.touch)
         first = subprocess.Popen(
-            [str(self.runner), "--browserless"], cwd=self.root, env=slow,
+            [str(self.runner), "--browserless"], cwd=self.root,
+            env=self.env | {"FAKE_BUILD_RELEASE": str(first_release)},
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
         )
         wait_until(self.cargo_calls.exists, "the first launch never built")
         self.source.write_text("fn main() { edited }\n")
         second = subprocess.Popen(
-            [str(self.runner), "--browserless"], cwd=self.root, env=slow,
+            [str(self.runner), "--browserless"], cwd=self.root,
+            env=self.env | {"FAKE_BUILD_RELEASE": str(second_release)},
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
         )
+        first_release.touch()
         self.assertEqual(first.wait(timeout=HANG_GUARD), 0, first.stderr.read())
-        third = subprocess.run(
+        third = subprocess.Popen(
             [str(self.runner), "--browserless"], cwd=self.root, env=self.env,
-            capture_output=True, text=True, timeout=HANG_GUARD,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
         )
-        self.assertEqual(third.returncode, 0, third.stderr)
-        self.assertNotIn("skipping the build", third.stderr,
+        # The third queues behind the held second build once it has decided to
+        # build: its start stamp beside the second's. Skipping would end it.
+        started = lambda: len(list((self.target / "dev-runtime").glob(".run-development-started.??????")))
+        wait_until(lambda: started() == 2 or third.poll() is not None, "the third launch never decided")
+        second_release.touch()
+        _, third_stderr = third.communicate(timeout=HANG_GUARD)
+        self.assertEqual(third.returncode, 0, third_stderr)
+        self.assertNotIn("skipping the build", third_stderr,
                          "a launch skipped the build after an edit made during one")
         self.assertEqual(second.wait(timeout=HANG_GUARD), 0, second.stderr.read())
         self.cargo_calls.unlink()
@@ -1081,14 +1104,19 @@ exit 1
         self.assert_built("--browserless", **guarded)
 
     def test_a_terminated_launch_leaves_no_stamps(self):
+        # The build waits for its release, so the signal always arrives during it.
+        release = self.root / "release-build"
+        self.addCleanup(release.touch)
         launch = subprocess.Popen(
             [str(self.runner), "--browserless"], cwd=self.root,
-            env=dict(self.env, FAKE_BUILD_SECONDS="1"),
+            env=dict(self.env, FAKE_BUILD_RELEASE=str(release)),
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         wait_until(self.cargo_calls.exists, "the launch never built")
         # The runner alone, as a supervisor stopping it would.
         launch.send_signal(signal.SIGTERM)
+        # Its trap runs once the foreground build returns.
+        release.touch()
         self.assertEqual(launch.wait(timeout=HANG_GUARD), 143)
         leftovers = [path.name for path in (self.target / "dev-runtime").iterdir()
                      if path.name.startswith((".run-development-started", ".run-development-record"))]
