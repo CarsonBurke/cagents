@@ -557,6 +557,8 @@ def sidebar_labels(text):
     OCR reads a row's provider icon as punctuation, such as `@` or `©`, or
     as a letter or two, such as `S` for Codex's knot or `é` for Claude's
     star, depending on how it rasterizes. The row is named by the rest.
+    So a title that is another one plus a word of one or two characters
+    reads as that title; callers confirm the selected card by identity.
     """
     text = re.sub(r'^\W+','',text).strip().casefold()
     return {text, re.sub(r'^\S{1,2}\s+','',text)}
