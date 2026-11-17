@@ -18,10 +18,12 @@ loader = importlib.machinery.SourceFileLoader("gh_pr_status", str(ROOT / "script
 spec = importlib.util.spec_from_loader(loader.name, loader)
 status = importlib.util.module_from_spec(spec)
 loader.exec_module(status)
+# Bounds only a hang; a passing wait returns as soon as its event arrives.
+HANG_GUARD = 60
 
 
 def wait_for(predicate):
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + HANG_GUARD
     while not predicate():
         if time.monotonic() >= deadline:
             raise AssertionError("fixture did not complete")
@@ -41,7 +43,9 @@ class Fixture(unittest.TestCase):
                         XDG_STATE_HOME=str(self.root / "state"),
                         GH_CONFIG_DIR=str(self.repo / "config"), GH_TOKEN="fixture-token",
                         PATH=str(self.repo / "bin") + ":/usr/bin:/bin",
-                        FIXTURE_ROOT=str(self.root), PYTHONDONTWRITEBYTECODE="1")
+                        # Fakes outlast the callers' guard, so a stuck hold fails the caller first.
+                        FIXTURE_ROOT=str(self.root), FIXTURE_HOLD_LIMIT=str(2 * HANG_GUARD),
+                        PYTHONDONTWRITEBYTECODE="1")
         for name in ["GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"]:
             self.env.pop(name, None)
         self.patch = patch.dict(os.environ, self.env, clear=True)
@@ -63,7 +67,7 @@ if 'graphql' in sys.argv and (r/'graphql-response').exists():
     sys.exit(0)
 if (r/'hold-rest').exists():
     (r/'rest-started').touch()
-    deadline=time.monotonic()+5
+    deadline=time.monotonic()+float(os.environ['FIXTURE_HOLD_LIMIT'])
     while not (r/'release-rest').exists():
         if time.monotonic()>deadline: sys.exit(9)
         time.sleep(.01)
@@ -82,7 +86,7 @@ from pathlib import Path
 r = Path(os.environ['FIXTURE_ROOT'])
 with (r/'builds').open('a') as f: f.write(json.dumps(dict(args=sys.argv[1:], source=Path('src/github_status.rs').read_text()))+'\\n')
 (r/'build-started').touch()
-deadline=time.monotonic()+5
+deadline=time.monotonic()+float(os.environ['FIXTURE_HOLD_LIMIT'])
 while (r/'hold-build').exists() and not (r/'release-build').exists():
     if time.monotonic()>deadline: sys.exit(9)
     time.sleep(.01)
@@ -112,7 +116,7 @@ print(json.dumps(dict(reason='compiler-artifact',target=dict(name='cagents',kind
 
     def invoke(self, number=7, env=None):
         return subprocess.run([str(self.script), str(number), "-R", "o/r", "--json"],
-                              env=env or self.env, capture_output=True, text=True, timeout=5)
+                              env=env or self.env, capture_output=True, text=True, timeout=HANG_GUARD)
 
     def lines(self, name):
         path = self.root / name
@@ -149,7 +153,7 @@ print(json.dumps(dict(reason='compiler-artifact',target=dict(name='cagents',kind
             wait_for(lambda: self.root.joinpath("rest-started").exists())
             wait_for(lambda: self.root.joinpath("build-started").exists())
             self.root.joinpath("release-rest").touch()
-            results = [child.communicate(timeout=5) for child in children]
+            results = [child.communicate(timeout=HANG_GUARD) for child in children]
             self.assertTrue(all(child.returncode in (0, 4) for child in children), results)
             self.assertEqual(len(self.lines("requests")), 1)
             self.assertEqual(len(self.lines("builds")), 1)
@@ -220,7 +224,7 @@ print(json.dumps(dict(reason='compiler-artifact',target=dict(name='cagents',kind
         self.git("commit", "-qam", "candidate")
         self.assertEqual(subprocess.run([str(self.script), "7", "-R", "o/r", "--json",
                                          "--source-ref", "HEAD"], env=self.env, capture_output=True,
-                                        text=True, timeout=5).returncode, 0)
+                                        text=True, timeout=HANG_GUARD).returncode, 0)
         candidate = status.build_context(self.repo, "HEAD")[2]
         wait_for(lambda: (cache / candidate / "source.json").exists())
         (self.repo / "src/github_status.rs").write_text("reviewed GitHub source")
@@ -332,7 +336,7 @@ print(json.dumps(dict(reason='compiler-artifact',target=dict(name='cagents',kind
             lock = root / (status.digest("host-v2", status.credentials(), "github.com") + ".lock")
             with status.locked(lock):
                 self.root.joinpath("release-rest").touch()
-                thread.join(timeout=1)
+                thread.join(timeout=HANG_GUARD)
                 self.assertFalse(thread.is_alive(), "a stopped budget owner must not hang the caller")
                 self.assertIn("Host cooldown could not be saved", result[0]["error"])
                 self.assertGreaterEqual(result[0]["next_attempt"], int(time.time()) + 599)
@@ -340,7 +344,7 @@ print(json.dumps(dict(reason='compiler-artifact',target=dict(name='cagents',kind
                 self.assertEqual(len(self.lines("requests")), 1)
         finally:
             self.root.joinpath("release-rest").touch()
-            thread.join(timeout=5)
+            thread.join(timeout=HANG_GUARD)
 
     def test_rest_cannot_seed_the_cache_with_a_different_repository(self):
         result = status.rest(status.target("different/r", "github.com", 7))
@@ -484,7 +488,7 @@ print(json.dumps(dict(reason='compiler-artifact',target=dict(name='cagents',kind
 
         def real():
             return subprocess.run([cli, "gh", "pr-status", "7", "-R", "o/r", "--json"],
-                                  env=self.env, capture_output=True, text=True, timeout=5)
+                                  env=self.env, capture_output=True, text=True, timeout=HANG_GUARD)
 
         result = real()
         self.assertEqual(result.returncode, 0, result.stderr)

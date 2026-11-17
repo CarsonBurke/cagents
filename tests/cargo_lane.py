@@ -20,6 +20,8 @@ import cargo_warnings
 OWN_LIB = "path+file:///src#cagents@0.1.3"
 OWN_UI = "path+file:///src/crates/cagents-ui#0.1.3"
 VENDORED = "path+file:///src/vendor/libcosmic#1.0.0"
+# Bounds only a hang: every wait it guards returns as soon as what it waits for happens.
+HANG_GUARD = 60
 
 
 def diagnostic(package_id, level, text, file_name="src/lib.rs", line=3):
@@ -49,7 +51,9 @@ if os.environ.get("LANE_WAIT"):
     for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
         signal.signal(number, cancel)
     open(os.environ["LANE_WAIT"], "w").close()
-    time.sleep(30)
+    # Ended by the signal; longer than the test's hang guard, this bounds
+    # only a test that never sends it.
+    time.sleep(300)
 sys.exit(int(os.environ.get("LANE_STATUS", "0")))
 """
 
@@ -157,7 +161,7 @@ class Lane(unittest.TestCase):
         env |= {"LANE_MESSAGES": str(self.messages), "LANE_CALLS": str(self.calls),
                 "LANE_STATUS": str(status), **environment}
         return subprocess.run([str(self.root / "scripts/cargo-lane"), *arguments], cwd=self.root, env=env,
-                              stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+                              stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=HANG_GUARD)
 
     def recorded(self):
         return [json.loads(line) for line in self.calls.read_text().splitlines()]
@@ -235,7 +239,7 @@ class Lane(unittest.TestCase):
                 try:
                     subprocess.run([str(self.root / "scripts/cargo-lane"), "check", *arguments],
                                    cwd=self.root, env=env, stdin=subprocess.DEVNULL,
-                                   stdout=subprocess.DEVNULL, stderr=terminal, timeout=60, check=True)
+                                   stdout=subprocess.DEVNULL, stderr=terminal, timeout=HANG_GUARD, check=True)
                 finally:
                     os.close(terminal)
                     os.close(controller)
@@ -246,7 +250,7 @@ class Lane(unittest.TestCase):
         self.messages.write_bytes(output)
         env = os.environ | {"LANE_MESSAGES": str(self.messages), "LANE_CALLS": str(self.calls)}
         result = subprocess.run([str(self.root / "scripts/cargo-lane"), "test"], cwd=self.root, env=env,
-                                stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
+                                stdin=subprocess.DEVNULL, capture_output=True, timeout=HANG_GUARD)
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout, output)
 
@@ -267,15 +271,21 @@ class Lane(unittest.TestCase):
                 self.messages.write_text(diagnostic(OWN_LIB, "warning", "unused"))
                 env = os.environ | {"LANE_MESSAGES": str(self.messages), "LANE_CALLS": str(self.calls),
                                     "LANE_WAIT": str(ready)}
+                # Its own group, so a lane that never forwards the signal can be ended with its gate.
                 with subprocess.Popen([str(self.root / "scripts/cargo-lane"), "check"], cwd=self.root,
                                       env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                      stderr=subprocess.PIPE, text=True) as lane:
-                    deadline = time.monotonic() + 30
-                    while not ready.exists() and time.monotonic() < deadline:
+                                      stderr=subprocess.PIPE, text=True, start_new_session=True) as lane:
+                    deadline = time.monotonic() + HANG_GUARD
+                    while not ready.exists():
+                        self.assertLess(time.monotonic(), deadline, "the gate never got ready")
                         time.sleep(0.05)
                     # Only the lane: the gate must hear it from the lane.
                     lane.send_signal(number)
-                    _, stderr = lane.communicate(timeout=30)
+                    try:
+                        _, stderr = lane.communicate(timeout=HANG_GUARD)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(lane.pid, signal.SIGKILL)
+                        self.fail("the signal never ended the lane")
                 self.assertEqual(lane.returncode, 128 + number, stderr)
                 self.assertIn(f"error: cancelled by {int(number)}\n", stderr)
                 self.assertIn("1 warning from the workspace's crates", stderr)

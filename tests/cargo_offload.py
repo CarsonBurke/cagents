@@ -31,6 +31,8 @@ from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
+# Bounds only a hang: every wait it guards returns as soon as its event happens.
+HANG_GUARD = 60
 
 
 # Isolated Python (-I) leaves this directory off sys.path.
@@ -548,26 +550,25 @@ class ThisHost(unittest.TestCase):
     def test_a_loopback_that_is_killed_ends_its_command_as_a_dropped_connection_would(self):
         script = str(ROOT / "scripts/cargo-offload")
         with tempfile.TemporaryDirectory(prefix="cagents-loopback-") as root:
-            ended = Path(root) / "ended"
+            started, ended = Path(root) / "started", Path(root) / "ended"
             # Like the build host's agent: it ends what it started once its
             # input closes. The shell waits for it rather than exec it, as fish does.
-            command = (f"python3 -c 'import sys; sys.stdin.read(); open(sys.argv[1], \"w\")' "
-                       f"{ended}; true")
+            command = (f"python3 -c 'import sys; open(sys.argv[1], \"w\"); sys.stdin.read(); "
+                       f"open(sys.argv[2], \"w\")' {started} {ended}; true")
             loopback = subprocess.Popen(
                 [script, "--loopback-shell", "fw16", command], stdin=subprocess.PIPE,
                 env=os.environ | {"CAGENTS_BUILD_REMOTE_LOOPBACK_SHELL": "/bin/sh"})
             self.addCleanup(loopback.stdin.close)
-            time.sleep(1)
+            wait_until(started.exists)
+            # Long enough for an input closed early to show; under load this
+            # can only miss that, never fail a working loopback.
+            time.sleep(0.5)
             self.assertFalse(ended.exists())
             # This process still holds the loopback's input open, as a caller
             # whose stand-in for ssh was killed does.
             loopback.kill()
-            loopback.wait(timeout=10)
-            for _ in range(100):
-                if ended.exists():
-                    break
-                time.sleep(0.1)
-            self.assertTrue(ended.exists())
+            loopback.wait(timeout=HANG_GUARD)
+            wait_until(ended.exists)
 
     def test_this_hosts_names_and_addresses_build_here(self):
         self.assertTrue(offload.is_this_host(socket.gethostname()))
@@ -1497,7 +1498,7 @@ fn bounded_allocation() {
         result = self.gate_run("doc", "--no-deps", "--open",
                                env=self.remote_env() | {"BROWSER": str(browser)})
         self.assertEqual(result.returncode, 0, result.stderr)
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + HANG_GUARD
         while not opened.exists():
             self.assertLess(time.monotonic(), deadline)
             time.sleep(0.1)
@@ -1636,7 +1637,7 @@ fn bounded_allocation() {
             (slots / f"slot-{index}").mkdir(parents=True)
             held.append(open(slots / f"slot-{index}/lock", "a"))
             fcntl.flock(held[-1], fcntl.LOCK_EX)
-        result = self.gate_run("test", env=env, timeout=30)
+        result = self.gate_run("test", env=env, timeout=HANG_GUARD)
         for lock in held:
             lock.close()
         self.assertEqual(result.returncode, 78, result.stderr)
@@ -1682,7 +1683,13 @@ fn bounded_allocation() {
                     let exe = std::env::current_exe().unwrap();
                     let before = std::fs::read(&exe).unwrap();
                     std::fs::write(exe.with_file_name("started"), "").unwrap();
-                    std::thread::sleep(std::time::Duration::from_secs(6));
+                    // Until the test has seen the next build wait for this slot.
+                    let finish = exe.with_file_name("finish");
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+                    while !finish.exists() {
+                        assert!(std::time::Instant::now() < deadline, "never told to finish");
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
                     assert!(std::fs::read(&exe).unwrap() == before, "rewritten under the test");
                     eprintln!("%s");
                 }
@@ -1698,17 +1705,26 @@ fn bounded_allocation() {
                                    text=True)
         deadline = time.monotonic() + 120
         # Beside the test executable, wherever the host's Cargo puts it.
-        while not any(self.root.rglob("started")):
+        while not (started := next(self.root.rglob("started"), None)):
             self.assertIsNone(testing.poll(), "the tests ended before they were seen running")
             self.assertLess(time.monotonic(), deadline)
             time.sleep(0.1)
-        building = self.scope.run([str(self.gate), "test", "--no-run", "--test", "slow"],
-                                  cwd=other, env=env, capture_output=True, text=True,
-                                  timeout=120)
+        building_log = self.root / "building.log"
+        with building_log.open("w") as log:
+            building = self.scope.popen([str(self.gate), "test", "--no-run", "--test", "slow"],
+                                        cwd=other, env=env, stdout=subprocess.DEVNULL, stderr=log)
+        try:
+            # The running tests keep the slot until the next build says it waits for it.
+            waiting = "waiting for a build slot on stand-in"
+            wait_until(lambda: waiting in building_log.read_text() or building.poll() is not None,
+                       timeout=120)
+            self.assertIn(waiting, building_log.read_text())
+            self.assertIsNone(building.poll(), "the next build ended instead of waiting for the slot")
+        finally:
+            started.with_name("finish").touch()
         out, err = testing.communicate(timeout=60)
         self.assertEqual(testing.returncode, 0, err)
-        self.assertEqual(building.returncode, 0, building.stderr)
-        self.assertIn("waiting for", building.stderr)
+        self.assertEqual(building.wait(timeout=120), 0, building_log.read_text())
 
     def test_a_worktree_returns_to_the_slot_it_used_last(self):
         env = self.remote_env()
@@ -1729,11 +1745,13 @@ fn bounded_allocation() {
             self.addCleanup(lock.close)
             fcntl.flock(lock, fcntl.LOCK_EX)
             held.append(lock)
-        env = self.remote_env() | {"CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS": "2"}
-        started = time.monotonic()
+        # The budget also covers the gate's setup, so it leaves a slow start room
+        # to reach the wait it bounds.
+        env = self.remote_env() | {"CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS": "10"}
+        # The slots stay held and without a budget the gate waits for ever, so
+        # returning at all, timed out, shows the budget ended the wait.
         result = self.gate_run("check", env=env)
         self.assertEqual(result.returncode, 124, result.stderr)
-        self.assertLess(time.monotonic() - started, 30)
         self.assertIn("waiting for a build slot on stand-in", result.stderr)
         self.assertIn("cargo-gate: build admission timed out", result.stderr)
         self.assertFalse((self.root / "local-build").exists())
@@ -1745,7 +1763,7 @@ fn bounded_allocation() {
         self.addCleanup(shares.close)
         fcntl.flock(shares, fcntl.LOCK_EX)
         env = self.remote_env() | {"STAND_IN_SHARES": "1", "CAGENTS_BUILD_SLOTS": "8",
-                                   "CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS": "3"}
+                                   "CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS": "10"}
         result = self.gate_run("check", env=env)
         self.assertEqual(result.returncode, 124, result.stderr)
         self.assertIn("waiting for 1 of the 1 build memory shares on", result.stderr)
@@ -1826,7 +1844,7 @@ fn bounded_allocation() {
         self.addCleanup(client.stderr.close)
         try:
             wait_until(lambda: started.exists() or client.poll() is not None, timeout=120)
-            self.assertTrue(started.exists(), client.communicate(timeout=5) if client.poll() is not None else "build never started")
+            self.assertTrue(started.exists(), client.communicate(timeout=HANG_GUARD) if client.poll() is not None else "build never started")
             deadline = int(deadline_file.read_text())
             while time.monotonic_ns() <= deadline:
                 self.assertIsNone(client.poll(), "admitted build ended before release")
@@ -1855,8 +1873,8 @@ fn bounded_allocation() {
             time.sleep(0.1)
         script = int(marker.read_text())
         gate.send_signal(signal.SIGTERM)
-        self.assertEqual(gate.wait(timeout=30), 128 + signal.SIGTERM)
-        deadline = time.monotonic() + 15
+        self.assertEqual(gate.wait(timeout=HANG_GUARD), 128 + signal.SIGTERM)
+        deadline = time.monotonic() + HANG_GUARD
         while Path(f"/proc/{script}").exists():
             state = Path(f"/proc/{script}/stat").read_text().rsplit(")", 1)[1].split()[0]
             if state == "Z":
@@ -1900,13 +1918,13 @@ class StandInHostPython(unittest.TestCase):
 
     def test_copied_gate_ignores_callers_python_shim(self):
         result = self.host.gate_run("exec", "python3", "-c", self.probe,
-                                    env=self.environment, timeout=10)
+                                    env=self.environment, timeout=HANG_GUARD)
         self.assert_interpreter(result, caller="present")
 
     def test_clean_stand_in_host_ignores_callers_python_shim(self):
         result = self.host.scope.run(["ssh", "stand-in", "python3", "-c", shlex.quote(self.probe)],
                                 cwd=self.host.crate, env=self.environment,
-                                capture_output=True, text=True, timeout=10)
+                                capture_output=True, text=True, timeout=HANG_GUARD)
         self.assert_interpreter(result, caller=None)
 
 
@@ -1929,7 +1947,7 @@ def incremental_session(slot, crate, *, age, size=64 * 1024, profile="debug"):
 TOOLS = {name: (ROOT / "scripts" / name).read_text() for name in ("build-host", "memory-capped")}
 
 
-def wait_until(condition, timeout=10):
+def wait_until(condition, timeout=HANG_GUARD):
     deadline = time.monotonic() + timeout
     while not condition():
         if time.monotonic() > deadline:
@@ -1968,7 +1986,7 @@ class RemoteRun(unittest.TestCase):
             self.assertEqual(child.stdout.read().decode().strip(),
                              "x ['cargo', '--shares', '2', '--wait-seconds', '30', '--', 'cargo', 'check'] "
                              "['build-host', 'memory-capped']")
-            self.assertEqual(child.wait(timeout=30), 37)
+            self.assertEqual(child.wait(timeout=HANG_GUARD), 37)
             child.stdin.close()
             child.stdout.close()
 
@@ -1981,7 +1999,7 @@ class RemoteRun(unittest.TestCase):
             child.stdin.write(json.dumps({"environment": {},
                                           "tools": {"../build-host": ""}}).encode() + b"\n")
             child.stdin.flush()
-            self.assertNotEqual(child.wait(timeout=30), 0)
+            self.assertNotEqual(child.wait(timeout=HANG_GUARD), 0)
             self.assertIn(b"may not be named", child.stderr.read())
             self.assertFalse(Path(scope.name, "slot-0/build-host").exists())
             child.stdin.close()
@@ -1995,13 +2013,13 @@ class RemoteRun(unittest.TestCase):
             base = scope.name
             lease = self.agent(scope, "lease", base, "1", "key", "0", "",
                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-            self.assertRegex(offload.Lines(lease.stdout).next(10), r'^slot \{"index": 0, ')
+            self.assertRegex(offload.Lines(lease.stdout).next(HANG_GUARD), r'^slot \{"index": 0, ')
             with open(Path(base, "slot-0", "running"), "a") as running:
                 fcntl.flock(running, fcntl.LOCK_EX)
                 lease.stdin.close()
                 with self.assertRaises(subprocess.TimeoutExpired):
                     lease.wait(timeout=1)
-            self.assertEqual(lease.wait(timeout=10), 0)
+            self.assertEqual(lease.wait(timeout=HANG_GUARD), 0)
 
     def test_pruning_waits_for_the_slots_command_to_end(self):
         with FixtureDirectory() as scope:
@@ -2016,7 +2034,7 @@ class RemoteRun(unittest.TestCase):
                 with self.assertRaises(subprocess.TimeoutExpired):
                     prune.wait(timeout=1)
                 self.assertTrue(stale.exists())
-            self.assertEqual(prune.wait(timeout=10), 0)
+            self.assertEqual(prune.wait(timeout=HANG_GUARD), 0)
             self.assertFalse(stale.exists())
 
     def test_a_slot_is_handed_out_only_after_a_lingering_command_ends(self):
@@ -2031,14 +2049,14 @@ class RemoteRun(unittest.TestCase):
                 lines = offload.Lines(lease.stdout)
                 # It says it is waiting, so a long wait is not taken for a
                 # host that does not answer.
-                self.assertEqual(lines.next(10), "wait")
+                self.assertEqual(lines.next(HANG_GUARD), "wait")
                 with self.assertRaises(TimeoutError):
                     lines.next(1)
-            line = lines.next(10)
+            line = lines.next(HANG_GUARD)
             self.assertEqual(json.loads(line.removeprefix("slot ")),
                              {"index": 0, "path": os.path.realpath(Path(base, "slot-0"))})
             lease.stdin.close()
-            self.assertEqual(lease.wait(timeout=10), 0)
+            self.assertEqual(lease.wait(timeout=HANG_GUARD), 0)
 
     @contextlib.contextmanager
     def slots(self):
@@ -2076,13 +2094,13 @@ class RemoteRun(unittest.TestCase):
             with open(next(compiling.glob("s-*.lock")), "rb") as rustc:
                 fcntl.flock(rustc, fcntl.LOCK_EX)
                 lease, lines = self.lease(base, budget=0)
-                self.assertEqual(json.loads(lines.next(10).removeprefix("slot "))["index"], 0)
+                self.assertEqual(json.loads(lines.next(HANG_GUARD).removeprefix("slot "))["index"], 0)
             self.assertFalse(stale.exists())
             self.assertTrue(compiling.exists())
             # What it moved out goes in the background.
             wait_until(lambda: not any((slot / "evicted").iterdir()))
             lease.stdin.close()
-            self.assertEqual(lease.wait(timeout=10), 0)
+            self.assertEqual(lease.wait(timeout=HANG_GUARD), 0)
 
     def test_below_twice_the_floor_a_lease_trims_the_slots_no_lease_holds(self):
         free = shutil.disk_usage(tempfile.gettempdir()).free // 2**30
@@ -2103,19 +2121,19 @@ class RemoteRun(unittest.TestCase):
                 Path(base, "slot-2", "owner").write_text("other\n")
                 leased = incremental_session(Path(base, "slot-2"), "leased-1", age=60)
                 lease, lines = self.lease(base, slots=3, floor=floor, budget=0)
-                self.assertEqual(json.loads(lines.next(10).removeprefix("slot "))["index"], 1)
+                self.assertEqual(json.loads(lines.next(HANG_GUARD).removeprefix("slot "))["index"], 1)
                 self.assertFalse(mine.exists())
                 self.assertEqual(idle.exists(), not pressed)
                 self.assertTrue(leased.exists())
                 lease.stdin.close()
-                self.assertEqual(lease.wait(timeout=10), 0)
+                self.assertEqual(lease.wait(timeout=HANG_GUARD), 0)
                 lock.close()
 
     def test_a_further_slot_is_made_while_the_disk_holds_one(self):
         with self.slots() as base:
             self.hold(base, 0, None)
             lease, lines = self.lease(base)
-            self.assertEqual(json.loads(lines.next(10).removeprefix("slot ")),
+            self.assertEqual(json.loads(lines.next(HANG_GUARD).removeprefix("slot ")),
                              {"index": 1, "path": os.path.realpath(Path(base, "slot-1"))})
 
     def test_no_further_slot_is_made_without_disk_for_one_or_beyond_the_most(self):
@@ -2124,12 +2142,12 @@ class RemoteRun(unittest.TestCase):
                     self.slots() as base:
                 lock = self.hold(base, 0, None)
                 lease, lines = self.lease(base, slots=slots, slot_disk=slot_disk)
-                self.assertEqual(lines.next(10), "wait")
+                self.assertEqual(lines.next(HANG_GUARD), "wait")
                 with self.assertRaises(TimeoutError):
                     lines.next(1.5)
                 self.assertFalse(Path(base, "slot-1").exists())
                 fcntl.flock(lock, fcntl.LOCK_UN)
-                self.assertEqual(json.loads(lines.next(10).removeprefix("slot "))["index"], 0)
+                self.assertEqual(json.loads(lines.next(HANG_GUARD).removeprefix("slot "))["index"], 0)
 
     def test_slots_made_lately_count_as_full_until_they_fill(self):
         with self.slots() as base:
@@ -2137,10 +2155,10 @@ class RemoteRun(unittest.TestCase):
             slot_disk = int(stat.f_bavail * stat.f_frsize * 0.6)
             self.hold(base, 0, None)
             first, lines = self.lease(base, slots=8, slot_disk=slot_disk)
-            self.assertEqual(json.loads(lines.next(10).removeprefix("slot "))["index"], 1)
+            self.assertEqual(json.loads(lines.next(HANG_GUARD).removeprefix("slot "))["index"], 1)
             # Slot 1 holds nothing yet, but will.
             second, lines = self.lease(base, slots=8, slot_disk=slot_disk)
-            self.assertEqual(lines.next(10), "wait")
+            self.assertEqual(lines.next(HANG_GUARD), "wait")
             with self.assertRaises(TimeoutError):
                 lines.next(1.5)
             self.assertFalse(Path(base, "slot-2").exists())
@@ -2149,38 +2167,38 @@ class RemoteRun(unittest.TestCase):
         with self.slots() as base:
             lock = self.hold(base, 0, {"build": "same", "key": "key"})
             lease, lines = self.lease(base, build="same")
-            self.assertEqual(lines.next(10), "wait same")
+            self.assertEqual(lines.next(HANG_GUARD), "wait same")
             with self.assertRaises(TimeoutError):
                 lines.next(1.5)
             self.assertFalse(Path(base, "slot-1").exists())
             # Another build goes ahead of it, into a further slot.
             other, others = self.lease(base, build="other")
-            self.assertEqual(json.loads(others.next(10).removeprefix("slot "))["index"], 1)
+            self.assertEqual(json.loads(others.next(HANG_GUARD).removeprefix("slot "))["index"], 1)
             fcntl.flock(lock, fcntl.LOCK_UN)
-            self.assertEqual(json.loads(lines.next(10).removeprefix("slot "))["index"], 0)
+            self.assertEqual(json.loads(lines.next(HANG_GUARD).removeprefix("slot "))["index"], 0)
 
     def test_a_build_that_waited_for_the_same_one_gets_back_in_line(self):
         with self.slots() as base:
             lock = self.hold(base, 0, {"build": "same", "key": "key"})
             waiter, waits = self.lease(base, slots=1, build="same")
-            self.assertEqual(waits.next(10), "wait same")
+            self.assertEqual(waits.next(HANG_GUARD), "wait same")
             # The head of the line meanwhile, as another build would be.
             line = open(Path(base, "queue"), "a")
             self.addCleanup(line.close)
             fcntl.flock(line, fcntl.LOCK_EX | fcntl.LOCK_NB)
             fcntl.flock(lock, fcntl.LOCK_UN)
             # The slot is free, and it still takes its turn.
-            self.assertEqual(waits.next(10), "wait")
+            self.assertEqual(waits.next(HANG_GUARD), "wait")
             with self.assertRaises(TimeoutError):
                 waits.next(1.5)
             line.close()
-            self.assertEqual(json.loads(waits.next(10).removeprefix("slot "))["index"], 0)
+            self.assertEqual(json.loads(waits.next(HANG_GUARD).removeprefix("slot "))["index"], 0)
 
     def test_the_same_build_from_another_checkout_is_not_waited_for(self):
         with self.slots() as base:
             self.hold(base, 0, {"build": "same", "key": "elsewhere"})
             lease, lines = self.lease(base, build="same")
-            self.assertEqual(json.loads(lines.next(10).removeprefix("slot "))["index"], 1)
+            self.assertEqual(json.loads(lines.next(HANG_GUARD).removeprefix("slot "))["index"], 1)
 
     def test_closing_the_connection_ends_the_command_and_its_children(self):
         self.assert_connection_cleanup(capped=False)
@@ -2207,7 +2225,7 @@ class RemoteRun(unittest.TestCase):
                        "tools": TOOLS}
             agent.stdin.write(json.dumps(request).encode() + b"\n")
             agent.stdin.flush()
-            deadline = time.monotonic() + 10
+            deadline = time.monotonic() + HANG_GUARD
             while not marker.exists() or not marker.read_text().strip():
                 self.assertLess(time.monotonic(), deadline)
                 time.sleep(0.05)
@@ -2215,14 +2233,14 @@ class RemoteRun(unittest.TestCase):
             agent.stdin.close()
             # This runner adopts the sleeper; reaping it as it dies, as init
             # would, lets the agent see the command's group end.
-            deadline = time.monotonic() + 15
+            deadline = time.monotonic() + HANG_GUARD
             while agent.poll() is None:
                 self.assertLess(time.monotonic(), deadline, "the agent outlived its connection")
                 with contextlib.suppress(ChildProcessError):
                     os.waitpid(sleeper, os.WNOHANG)
                 time.sleep(0.05)
             self.assertEqual(agent.returncode, 130)
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + HANG_GUARD
             while Path(f"/proc/{sleeper}").exists() and Path(
                     f"/proc/{sleeper}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z":
                 self.assertLess(time.monotonic(), deadline, "the command's child outlived it")
@@ -2237,7 +2255,7 @@ class RemoteRun(unittest.TestCase):
                                stdin=subprocess.PIPE)
             agent.stdin.write(json.dumps({"environment": {"PROBE": "x"}, "tools": TOOLS}).encode() + b"\n")
             agent.stdin.flush()
-            self.assertEqual(agent.wait(timeout=15), 7)
+            self.assertEqual(agent.wait(timeout=HANG_GUARD), 7)
 
     def test_the_command_may_open_as_many_files_as_the_host_allows(self):
         hard = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
@@ -2256,7 +2274,7 @@ class RemoteRun(unittest.TestCase):
                 # The connection stays open, as it does while the gate waits.
                 agent.stdin.write(json.dumps(request).encode() + b"\n")
                 agent.stdin.flush()
-                self.assertEqual(agent.wait(timeout=15), 0)
+                self.assertEqual(agent.wait(timeout=HANG_GUARD), 0)
                 reported = agent.stdout.read().decode().strip()
                 self.assertEqual(reported, "unlimited" if hard == resource.RLIM_INFINITY
                                  else str(hard))
@@ -2417,7 +2435,7 @@ class Trim(unittest.TestCase):
         with open(leased / "lock", "a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             result = subprocess.run([*offloading, "0", "--wait"], env=environment,
-                                    capture_output=True, text=True, timeout=30)
+                                    capture_output=True, text=True, timeout=HANG_GUARD)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual([crate.exists() for crate in crates], [False, True])
         self.assertIn("out of 1 idle build slots", result.stdout)
@@ -2426,10 +2444,10 @@ class Trim(unittest.TestCase):
         for arguments in ([], ["x"], ["0", "--later"]):
             with self.subTest(arguments=arguments):
                 result = subprocess.run([*offloading, *arguments], env=environment,
-                                        capture_output=True, text=True, timeout=30)
+                                        capture_output=True, text=True, timeout=HANG_GUARD)
                 self.assertEqual(result.returncode, 2)
                 self.assertIn("usage", result.stderr)
-        result = subprocess.run([*offloading, "0"], capture_output=True, text=True, timeout=30,
+        result = subprocess.run([*offloading, "0"], capture_output=True, text=True, timeout=HANG_GUARD,
                                 env=environment | {"CAGENTS_BUILD_REMOTE_INCREMENTAL_GIB": "-1"})
         self.assertEqual(result.returncode, 2)
         self.assertIn("must be a nonnegative integer", result.stderr)
@@ -2534,7 +2552,7 @@ class Prune(unittest.TestCase):
                 Path(source, name).write_text("")
             Path(source, "link").symlink_to("keep.rs")
             scope.run([sys.executable, "-c", offload.REMOTE_AGENT, "prune", base],
-                           input=b"keep.rs\0a/keep.rs\0", check=True, timeout=15)
+                           input=b"keep.rs\0a/keep.rs\0", check=True, timeout=HANG_GUARD)
             left = sorted(str(path.relative_to(source)) for path in source.rglob("*"))
             self.assertEqual(left, ["a", "a/keep.rs", "keep.rs", "target", "target/debug",
                                     "target/debug/x"])

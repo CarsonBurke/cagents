@@ -16,6 +16,8 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 VERSION = "9.9.9"
+# Bounds only a hang; a passing run returns as soon as its process exits.
+HANG_GUARD = 60
 
 
 def provisioned_runtime_packages():
@@ -57,7 +59,7 @@ def native_package_host_supported():
     try:
         result = subprocess.run(
             ["getconf", "GNU_LIBC_VERSION"], stdin=subprocess.DEVNULL,
-            capture_output=True, text=True, check=False, timeout=5,
+            capture_output=True, text=True, check=False, timeout=HANG_GUARD,
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -103,7 +105,7 @@ class HostRequirements(unittest.TestCase):
                 else:
                     run.assert_called_once_with(
                         query, stdin=subprocess.DEVNULL, capture_output=True,
-                        text=True, check=False, timeout=5,
+                        text=True, check=False, timeout=HANG_GUARD,
                     )
 
         with mock.patch(f"{__name__}.native_package_host_supported", return_value=False):
@@ -223,7 +225,7 @@ class PackageDependencies(unittest.TestCase):
         result = subprocess.run(
             ["/bin/sh", str(ROOT / "scripts/package-linux.sh"), "--variant", variant],
             env=self.environment | {"CAGENTS_DIST_DIR": str(dist)},
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=HANG_GUARD,
         )
         return result, dist
 
@@ -303,7 +305,7 @@ class PackageDependencies(unittest.TestCase):
                     archive = dist / f"{name}-{VERSION}-x86_64-unknown-linux-gnu.tar.gz"
                     deb = dist / f"{name}_{VERSION}_amd64.deb"
                     deb_payload = subprocess.check_output(
-                        ["dpkg-deb", "--fsys-tarfile", str(deb)], timeout=10,
+                        ["dpkg-deb", "--fsys-tarfile", str(deb)], timeout=HANG_GUARD,
                     )
                     with tarfile.open(archive, "r:gz") as portable, \
                             tarfile.open(fileobj=io.BytesIO(deb_payload), mode="r:") as debian:

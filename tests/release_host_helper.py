@@ -12,6 +12,8 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 HELPER_ENV = "CAGENTS_TEST_RETAINED_ACTOR_HELPER"
+# Bounds only a hang; a passing run returns as soon as its process exits.
+HANG_GUARD = 60
 
 
 class ReleaseHostHelper(unittest.TestCase):
@@ -73,7 +75,7 @@ with open(os.environ["FIXTURE_EVENTS"], "a") as output:
                        FIXTURE_HELPER=str(helper))
             result = subprocess.run(
                 ["/bin/bash", "-euo", "pipefail", "-c", source[start:end]],
-                cwd=fixture, env=env, capture_output=True, text=True, timeout=10,
+                cwd=fixture, env=env, capture_output=True, text=True, timeout=HANG_GUARD,
             )
             recorded = [json.loads(line) for line in events.read_text().splitlines()]
             return result, recorded, str(helper)

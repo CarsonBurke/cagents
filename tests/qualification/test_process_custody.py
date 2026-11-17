@@ -10,6 +10,7 @@ is selected. The injected metadata errors exercise an observation boundary;
 the child's exit and original pidfd readability are real kernel observations.
 """
 
+import contextlib
 import errno
 import importlib.util
 import os
@@ -27,7 +28,8 @@ from unittest import mock
 
 
 MODULE_PATH = Path(__file__).resolve().parents[2] / "scripts/qualification/process_custody.py"
-HANDSHAKE_SECONDS = 5
+# Bounds only a hang: every handshake and wait returns as soon as its event happens.
+HANG_GUARD = 60
 
 # The parent deliberately leaves its own exited child unreaped until requested.
 # That makes positive death and outstanding non-child reaping independently
@@ -35,6 +37,7 @@ HANDSHAKE_SECONDS = 5
 # Custody rather than donating the worker's known exit status to the inventory.
 WORKER = r"""
 import os, select, sys
+guard_ms = int(sys.argv[1]) * 1000
 reader, writer = os.pipe()
 child = os.fork()
 if child == 0:
@@ -53,7 +56,7 @@ try:
             writer = None
             poller = select.poll()
             poller.register(pidfd, select.POLLIN)
-            if not any(flags & select.POLLIN for _, flags in poller.poll(5000)):
+            if not any(flags & select.POLLIN for _, flags in poller.poll(guard_ms)):
                 raise RuntimeError('Owned fixture child did not exit within its handshake bound')
             os.write(1, b'dead\n')
         elif command == b'reap\n':
@@ -86,7 +89,7 @@ class OwnedFamily:
         try:
             self.owner = self.module.Custody(lambda: False)
             self.worker = self.owner.launch(
-                [sys.executable, "-I", "-B", "-c", WORKER],
+                [sys.executable, "-I", "-B", "-c", WORKER, str(HANG_GUARD)],
                 self.directory.name,
                 "fixture-owned-parent",
                 stdin=subprocess.PIPE,
@@ -109,7 +112,7 @@ class OwnedFamily:
             raise
 
     def line(self):
-        deadline = time.monotonic() + HANDSHAKE_SECONDS
+        deadline = time.monotonic() + HANG_GUARD
         while b"\n" not in self.buffer:
             remaining = deadline - time.monotonic()
             self.case.assertGreater(remaining, 0, "Fixed owned-child handshake timed out")
@@ -157,6 +160,15 @@ class OwnedFamily:
         self.close()
 
 
+def exit_before_the_bounded_wait(pidfd):
+    """Waits until the released child has exited, so a slow exit cannot outlast the product's short wait.
+
+    select, unlike the observed poll, reaches the kernel directly.
+    """
+    if not select.select([pidfd], [], [], HANG_GUARD)[0]:
+        raise AssertionError("The released fixture child did not exit")
+
+
 def observe_real_polls(before_wait, after_wait=None):
     """Observe requested waits; every readiness result comes from kernel poll."""
     real_poll = select.poll
@@ -187,6 +199,19 @@ def observe_real_polls(before_wait, after_wait=None):
 
 
 class ProcessCustodyExitTests(unittest.TestCase):
+    def end_at_cleanup(self, pid):
+        """Kills and reaps PID when the test ends, if settlement has not; a pidfd reaches only this process."""
+        pidfd = os.pidfd_open(pid)
+
+        def end():
+            with contextlib.suppress(ProcessLookupError):
+                signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+            with contextlib.suppress(ChildProcessError):
+                os.waitid(os.P_PIDFD, pidfd, os.WEXITED)
+            os.close(pidfd)
+
+        self.addCleanup(end)
+
     @classmethod
     def setUpClass(cls):
         # Import occurs only during a separately admitted test execution, never
@@ -328,36 +353,39 @@ class ProcessCustodyExitTests(unittest.TestCase):
                 node["signals"].clear()
 
     def test_a_process_whose_main_thread_exited_is_settled_without_a_report(self):
-        program = ("import ctypes, threading, time\n"
-                   "threading.Thread(target=time.sleep, args=(30,)).start()\n"
+        program = ("import ctypes, sys, threading\n"
+                   # Bounded, so a regression in settlement ends the test instead of hanging it.
+                   "threading.Thread(target=threading.Event().wait, args=(float(sys.argv[1]),)).start()\n"
                    "ctypes.CDLL(None).pthread_exit(None)\n")
         with tempfile.TemporaryDirectory() as directory:
             owner = self.module.Custody(lambda: False)
-            child = owner.launch([sys.executable, "-I", "-c", program], directory, "fixture-owned-parent")
+            child = owner.launch([sys.executable, "-I", "-c", program, str(HANG_GUARD)], directory, "fixture-owned-parent")
+            self.end_at_cleanup(child.pid)
             node = owner.nodes[child.pid]
-            deadline = time.monotonic() + HANDSHAKE_SECONDS
+            deadline = time.monotonic() + HANG_GUARD
             while owner.current(node)["state"] != "Z":
                 self.assertLess(time.monotonic(), deadline, "The main thread did not exit")
                 time.sleep(0.01)
             self.assertFalse(owner.exited(node))
             reports = []
-            started = time.monotonic()
             owner.settle_all(lambda: None, lambda stage, error: reports.append(error))
-            self.assertLess(time.monotonic() - started, 4, "It needed no more than the first signal")
             self.assertEqual(reports, [])
-            self.assertEqual(node["exit_code"], -signal.SIGTERM)
+            # Its other thread never ends by itself: the first signal ended it.
+            self.assertEqual(node["exit_code"], -signal.SIGTERM, "It needed no more than the first signal")
             owner.close_pidfds()
 
     def test_a_process_whose_main_thread_exited_still_gets_sigkill(self):
-        program = ("import ctypes, signal, threading, time\n"
+        program = ("import ctypes, signal, sys, threading\n"
                    "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
-                   "threading.Thread(target=time.sleep, args=(30,)).start()\n"
+                   # Bounded, so a regression in settlement ends the test instead of hanging it.
+                   "threading.Thread(target=threading.Event().wait, args=(float(sys.argv[1]),)).start()\n"
                    "ctypes.CDLL(None).pthread_exit(None)\n")
         with tempfile.TemporaryDirectory() as directory:
             owner = self.module.Custody(lambda: False)
-            child = owner.launch([sys.executable, "-I", "-c", program], directory, "fixture-owned-parent")
+            child = owner.launch([sys.executable, "-I", "-c", program, str(HANG_GUARD)], directory, "fixture-owned-parent")
+            self.end_at_cleanup(child.pid)
             node = owner.nodes[child.pid]
-            deadline = time.monotonic() + HANDSHAKE_SECONDS
+            deadline = time.monotonic() + HANG_GUARD
             while owner.current(node)["state"] != "Z":
                 self.assertLess(time.monotonic(), deadline, "The main thread did not exit")
                 time.sleep(0.01)
@@ -390,7 +418,7 @@ class ProcessCustodyExitTests(unittest.TestCase):
             with mock.patch.object(owner, "current", side_effect=denied_once):
                 owner.settle_all(lambda: None, lambda stage, error: reports.append((stage, error)))
             self.assertEqual(reports, [("owned-child-settlement-blocked", denied)])
-            family.worker.wait(timeout=HANDSHAKE_SECONDS)
+            family.worker.wait(timeout=HANG_GUARD)
 
     def test_an_identity_that_can_be_read_is_still_checked_before_signalling(self):
         with OwnedFamily(self, self.module) as family:
@@ -478,11 +506,11 @@ class ProcessCustodyExitTests(unittest.TestCase):
             # The kernel cuts the name to 15 bytes, in the middle of a character.
             named = Path(directory) / ("\u00e9" * 8)
             named.symlink_to(shutil.which("sleep"))
-            child = subprocess.Popen([named, "30"])
+            child = subprocess.Popen([named, "infinity"])
             self.addCleanup(child.wait)
             self.addCleanup(child.kill)
             comm = Path("/proc") / str(child.pid) / "comm"
-            deadline = time.monotonic() + HANDSHAKE_SECONDS
+            deadline = time.monotonic() + HANG_GUARD
             while not comm.read_bytes().startswith(b"\xc3"):
                 self.assertLess(time.monotonic(), deadline, "The child did not exec")
                 time.sleep(0.01)
@@ -493,7 +521,8 @@ class ProcessCustodyExitTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             owner = self.module.Custody(lambda: False)
             for error in (vanished, ProcessLookupError(errno.ESRCH, "Injected released process")):
-                with self.subTest(error=error), mock.patch.object(owner, "pin", side_effect=error):
+                with self.subTest(error=error), mock.patch.object(owner, "pin", side_effect=error), \
+                        mock.patch.object(self.module, "NEW_CHILD_EXIT_SECONDS", HANG_GUARD):
                     child = owner.launch(["sh", "-c", "sleep 0.3; exit 7"], directory, "fixture-owned-parent")
                 self.assertEqual(owner.nodes[child.pid]["exit_code"], 7)
                 self.assertTrue(owner.nodes[child.pid]["settled"])
@@ -560,6 +589,7 @@ class ProcessCustodyExitTests(unittest.TestCase):
                     self.assertFalse(owner.exited(node), "Real child is still pipe-held")
                     family.worker.stdin.write(b"exit\n")
                     family.worker.stdin.flush()
+                    exit_before_the_bounded_wait(descriptor)
                     released.append(descriptor)
 
                 poll_proxy, observations = observe_real_polls(release_at_bounded_poll)
@@ -607,6 +637,7 @@ class ProcessCustodyExitTests(unittest.TestCase):
                     self.assertFalse(released)
                     family.worker.stdin.write(b"exit\n")
                     family.worker.stdin.flush()
+                    exit_before_the_bounded_wait(descriptor)
                     released.append(descriptor)
                 else:
                     self.assertEqual(descriptors, (worker_descriptor,))

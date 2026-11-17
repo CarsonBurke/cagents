@@ -18,6 +18,8 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
 PROTECTED = ("HOME", "CODEX_HOME", "CAGENTS_AGENT_AUTHORITY")
+# Bounds only a hang: every wait it guards returns as soon as its event happens.
+HANG_GUARD = 60
 
 # This program is both fake Cargo and its executable artifact. It never launches
 # a compiler, provider or service, and observes only its synthetic environment.
@@ -62,7 +64,8 @@ def record(**extra):
 def interrupted(number, _frame):
     record(signal=number)
     (root / (phase + ".signalled")).touch()
-    deadline = time.monotonic() + 4
+    # Until released, or for `linger` seconds when a test wants it to end by itself.
+    deadline = time.monotonic() + config.get("linger", config["hang_guard"])
     while not (root / "release").exists() and time.monotonic() < deadline:
         time.sleep(0.01)
     raise SystemExit(128 + number)
@@ -73,7 +76,7 @@ if phase != "cargo-run":
     record()
     (root / (phase + ".ready")).touch()
 if config.get("hold") == phase:
-    deadline = time.monotonic() + 6
+    deadline = time.monotonic() + config["hang_guard"]
     while not (root / "release").exists() and time.monotonic() < deadline:
         time.sleep(0.01)
     if not (root / "release").exists():
@@ -209,7 +212,7 @@ class TestLib(unittest.TestCase):
         self.addCleanup(self.cleanup_processes)
 
     def configure(self, **config):
-        (self.root / "control.json").write_text(json.dumps(config))
+        (self.root / "control.json").write_text(json.dumps({"hang_guard": HANG_GUARD, **config}))
 
     def cleanup_processes(self):
         (self.root / "release").touch()
@@ -218,7 +221,7 @@ class TestLib(unittest.TestCase):
                 # Each wrapper owns a fresh session containing fixture children
                 # only. Retaining its unreaped Popen protects this group ID.
                 os.killpg(process.pid, signal.SIGKILL)
-            process.communicate(timeout=5)
+            process.communicate(timeout=HANG_GUARD)
 
     def start(self, *arguments, env=None, pass_fds=()):
         process = subprocess.Popen(
@@ -232,7 +235,7 @@ class TestLib(unittest.TestCase):
 
     def invoke(self, *arguments, stdin="", env=None, pass_fds=()):
         process = self.start(*arguments, env=env, pass_fds=pass_fds)
-        stdout, stderr = process.communicate(stdin, timeout=10)
+        stdout, stderr = process.communicate(stdin, timeout=HANG_GUARD)
         return subprocess.CompletedProcess(arguments, process.returncode, stdout, stderr)
 
     def events(self, phase=None):
@@ -248,7 +251,7 @@ class TestLib(unittest.TestCase):
         for path in self.root.glob("*.signalled"):
             path.unlink()
 
-    def wait_for(self, condition, label, timeout=5):
+    def wait_for(self, condition, label, timeout=HANG_GUARD):
         deadline = time.monotonic() + timeout
         while not condition():
             if time.monotonic() >= deadline:
@@ -573,7 +576,7 @@ class TestLib(unittest.TestCase):
     def test_protected_environment_stdin_and_final_exec_exit_are_preserved(self):
         self.configure(test_exit=43)
         process = self.start("cli", "module::one")
-        stdout, stderr = process.communicate("private synthetic stdin\n", timeout=10)
+        stdout, stderr = process.communicate("private synthetic stdin\n", timeout=HANG_GUARD)
         self.assertEqual(process.returncode, 43, stderr)
         self.assertEqual(stdout, "")
         final = self.events("test")
@@ -610,7 +613,7 @@ class TestLib(unittest.TestCase):
             ["flock", "--close", str(self.lock), sys.executable, "-I", "-B",
              str(self.root / "scripts/test-lib"), "cli", "module::one"],
             cwd=self.root / "caller", env=self.env, stdin=subprocess.DEVNULL,
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=HANG_GUARD,
         )
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("a parent flock holds build admission", result.stderr)
@@ -621,7 +624,7 @@ class TestLib(unittest.TestCase):
             ["flock", "--close", str(slot), *inner, sys.executable, "-I", "-B",
              str(self.root / "scripts/test-lib"), "cli", "module::one"],
             cwd=self.root / "caller", env=self.env, stdin=subprocess.DEVNULL,
-            capture_output=True, text=True, timeout=10, pass_fds=pass_fds,
+            capture_output=True, text=True, timeout=HANG_GUARD, pass_fds=pass_fds,
         )
 
     def test_a_flock_further_up_is_refused_too(self):
@@ -629,7 +632,7 @@ class TestLib(unittest.TestCase):
         result = subprocess.run(
             ["flock", "--close", str(self.lock), "sh", "-c", f"sh -c '{command}'; exit $?"],
             cwd=self.root / "caller", env=self.env, stdin=subprocess.DEVNULL,
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=HANG_GUARD,
         )
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("a parent flock holds build admission", result.stderr)
@@ -708,7 +711,7 @@ class TestLib(unittest.TestCase):
             self.assertEqual([event["phase"] for event in self.events()], ["metadata"])
             self.assertTrue(self.events("metadata")[0]["held"], "the independent owner still holds admission")
             fcntl.flock(holder, fcntl.LOCK_UN)
-            _stdout, stderr = process.communicate("", timeout=10)
+            _stdout, stderr = process.communicate("", timeout=HANG_GUARD)
         self.assertEqual(process.returncode, 0, stderr)
         self.assertTrue(self.events("compiler")[0]["held"])
 
@@ -721,7 +724,7 @@ class TestLib(unittest.TestCase):
             self.assertEqual([event["phase"] for event in self.events()], ["metadata"])
             self.assertTrue(self.events("metadata")[0]["held"], "the independent owner still holds admission")
             fcntl.flock(holder, fcntl.LOCK_UN)
-            _stdout, stderr = process.communicate("", timeout=10)
+            _stdout, stderr = process.communicate("", timeout=HANG_GUARD)
         self.assertEqual(process.returncode, 0, stderr)
         self.assertTrue(self.events("compiler")[0]["held"])
         self.assertFalse(self.events("test")[0]["held"])
@@ -749,7 +752,7 @@ class TestLib(unittest.TestCase):
                 self.assertIsNone(process.poll(), "wrapper released a live owned child")
                 self.assertTrue(self.held())
                 (self.root / "release").touch()
-                _stdout, stderr = process.communicate("", timeout=5)
+                _stdout, stderr = process.communicate("", timeout=HANG_GUARD)
                 # The gate ends as the signal it was sent, once its build has.
                 self.assertEqual(process.returncode, -number, stderr)
                 # The build host interrupts the build, whatever it was sent.
@@ -771,7 +774,7 @@ class TestLib(unittest.TestCase):
                     process.send_signal(number)
                     self.wait_for(lambda: (self.root / (phase + ".signalled")).exists(), "the signal")
                     (self.root / "release").touch()
-                    _stdout, stderr = process.communicate("", timeout=5)
+                    _stdout, stderr = process.communicate("", timeout=HANG_GUARD)
                     self.assertEqual(process.returncode,
                                      128 + number if number == signal.SIGINT else -number, stderr)
                     self.assertIn(number, [event["signal"] for event in self.events(phase)
@@ -788,21 +791,23 @@ class TestLib(unittest.TestCase):
                 process.send_signal(number)
                 self.wait_for(lambda: (self.root / "test.signalled").exists(), "the signal")
                 (self.root / "release").touch()
-                _stdout, stderr = process.communicate("", timeout=5)
+                _stdout, stderr = process.communicate("", timeout=HANG_GUARD)
                 self.assertEqual(process.returncode,
                                  128 + number if number == signal.SIGINT else -number, stderr)
                 self.assertIn(number, [event["signal"] for event in self.events("test")
                                        if "signal" in event])
 
     def test_test_lib_outlives_what_a_signal_left_running(self):
-        # Cargo ends at once on SIGTERM while the harness still handles it.
-        self.configure(hold="test")
+        # Cargo ends at once on SIGTERM while the harness still handles it,
+        # then ends by itself, unreleased, well within the 5 seconds test-lib
+        # waits for its group; returning sooner would leave it running.
+        self.configure(hold="test", linger=1)
         process = self.start("cli", "module::one")
         self.wait_for(lambda: (self.root / "test.ready").exists(), "the harness")
         harness = self.events("test")[0]["pid"]
         process.send_signal(signal.SIGTERM)
         self.wait_for(lambda: (self.root / "test.signalled").exists(), "the signal")
-        _stdout, stderr = process.communicate("", timeout=10)
+        _stdout, stderr = process.communicate("", timeout=HANG_GUARD)
         self.assertEqual(process.returncode, -signal.SIGTERM, stderr)
         with self.assertRaises(ProcessLookupError):
             os.kill(harness, 0)
@@ -841,7 +846,7 @@ class TestLib(unittest.TestCase):
                 self.wait_for(lambda: (self.root / "test.signalled").exists(), "the interrupt")
                 time.sleep(0.2)
                 (self.root / "release").touch()
-                _stdout, stderr = process.communicate(timeout=10)
+                _stdout, stderr = process.communicate(timeout=HANG_GUARD)
                 self.assertEqual(process.returncode, 128 + signal.SIGINT, stderr)
                 self.assertEqual([event["signal"] for event in self.events("test")
                                   if "signal" in event], [signal.SIGINT])
@@ -860,7 +865,7 @@ class TestLib(unittest.TestCase):
         (self.root / "release").touch()
         # The harness reads the terminal, which it has again: end its input.
         os.write(controller, b"\x04")
-        _stdout, stderr = process.communicate(timeout=10)
+        _stdout, stderr = process.communicate(timeout=HANG_GUARD)
         self.assertEqual(process.returncode, 0, stderr)
 
     def test_a_job_continued_in_the_background_leaves_the_shell_its_terminal(self):
@@ -871,7 +876,7 @@ class TestLib(unittest.TestCase):
 import fcntl, json, os, signal, subprocess, sys, termios, time
 fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 signal.signal(signal.SIGTTOU, signal.SIG_IGN)
-mode, report, *command = sys.argv[1:]
+mode, report, guard, *command = sys.argv[1:]
 job = subprocess.Popen(command, process_group=0)
 os.tcsetpgrp(0, job.pid)
 _pid, status = os.waitpid(job.pid, os.WUNTRACED)
@@ -880,7 +885,16 @@ os.tcsetpgrp(0, os.getpgrp())
 if mode == "fg":
     os.tcsetpgrp(0, job.pid)
 os.killpg(job.pid, signal.SIGCONT)
-time.sleep(0.5)
+if mode == "fg":
+    # Continued in the foreground, test-lib hands the terminal on to its command.
+    # The guard is shorter than the test's, so a handover that never happens
+    # is reported by the `resumed` assertion rather than a wait timing out.
+    deadline = time.monotonic() + float(guard)
+    while os.tcgetpgrp(0) == job.pid and time.monotonic() < deadline:
+        time.sleep(0.01)
+else:
+    # In the background it must leave the terminal alone; give it a chance not to.
+    time.sleep(0.5)
 resumed = os.tcgetpgrp(0)
 open(sys.argv[2] + ".resumed", "w").close()
 _pid, status = os.waitpid(job.pid, 0)
@@ -897,7 +911,7 @@ json.dump(dict(stopped=stopped, shell=os.getpgrp(), job=job.pid, resumed=resumed
                 self.addCleanup(os.close, controller)
                 try:
                     process = subprocess.Popen(
-                        [sys.executable, "-I", "-B", str(shell), mode, str(report),
+                        [sys.executable, "-I", "-B", str(shell), mode, str(report), str(HANG_GUARD / 2),
                          sys.executable, "-I", "-B", str(self.root / "scripts/test-lib"), "cli",
                          "module::one"],
                         cwd=self.root / "caller", env=self.env, stdin=terminal,
@@ -910,7 +924,7 @@ json.dump(dict(stopped=stopped, shell=os.getpgrp(), job=job.pid, resumed=resumed
                 os.write(controller, b"\x1a")
                 self.wait_for(lambda: Path(str(report) + ".resumed").exists(), "the job to continue")
                 (self.root / "release").touch()
-                _stdout, stderr = process.communicate(timeout=10)
+                _stdout, stderr = process.communicate(timeout=HANG_GUARD)
                 self.assertEqual(process.returncode, 0, stderr)
                 result = json.loads(report.read_text())
                 self.assertTrue(result["stopped"], result)
@@ -936,7 +950,7 @@ json.dump(dict(stopped=stopped, shell=os.getpgrp(), job=job.pid, resumed=resumed
                 time.sleep(0.2)
                 self.assertIsNone(process.poll(), "runner left before its listing ended")
                 (self.root / "release").touch()
-                _stdout, stderr = process.communicate("", timeout=5)
+                _stdout, stderr = process.communicate("", timeout=HANG_GUARD)
                 self.assertEqual(process.returncode, 128 + signal.SIGINT, stderr)
                 self.assertIn(signal.SIGINT, [event["signal"] for event in self.events(phase)
                                               if "signal" in event])
@@ -954,7 +968,7 @@ json.dump(dict(stopped=stopped, shell=os.getpgrp(), job=job.pid, resumed=resumed
                 self.wait_for(lambda: (self.root / "test.signalled").exists(), "the signal")
                 self.assertFalse(self.held())
                 (self.root / "release").touch()
-                _stdout, stderr = process.communicate("", timeout=5)
+                _stdout, stderr = process.communicate("", timeout=HANG_GUARD)
                 # Cargo exits with the harness's status after an interrupt;
                 # another signal ends Cargo itself, as it would end real Cargo.
                 self.assertEqual(process.returncode,

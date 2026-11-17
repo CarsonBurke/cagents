@@ -10,6 +10,8 @@ import time
 import unittest
 
 PEER = runpy.run_path(str(Path(__file__).resolve().parent / "fixtures/terminal-escape-codex.py"))
+# Bounds only a hang; a passing wait returns as soon as its event arrives.
+HANG_GUARD = 60
 
 
 class TerminalEscapeFixture(unittest.TestCase):
@@ -28,7 +30,7 @@ class TerminalEscapeFixture(unittest.TestCase):
             thread = threading.Thread(target=run_stream)
             thread.start()
             try:
-                deadline = time.monotonic() + 3
+                deadline = time.monotonic() + HANG_GUARD
                 while not (root / "stream-paused.json").exists():
                     if worker_errors:
                         raise worker_errors[0]
@@ -60,7 +62,7 @@ class TerminalEscapeFixture(unittest.TestCase):
                 self.assertTrue(thread.is_alive(), "completion must wait for independent UI proof")
             finally:
                 (root / "complete-stream").touch()
-                thread.join(timeout=3)
+                thread.join(timeout=HANG_GUARD)
             self.assertFalse(thread.is_alive())
             # Thread exceptions are otherwise only printed, even if the peer
             # already emitted item/completed and its aggregate looks correct.

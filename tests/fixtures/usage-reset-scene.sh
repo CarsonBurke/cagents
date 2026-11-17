@@ -23,7 +23,8 @@ case $command in
             rm -f -- "$root/home/.claude/fixture-reset-api.json"
             /usr/bin/python3 "$1" serve "$root" >"$root/usage-reset-server.json" 2>"$root/usage-reset-server.log" &
             echo $! >"$root/usage-reset-server.pid"
-            for attempt in $(seq 100); do
+            # Bounds only a hang (60 s); a started server ends the wait at once.
+            for attempt in $(seq 1200); do
                 [ -f "$root/home/.claude/fixture-reset-api.json" ] && exit 0
                 kill -0 "$!" 2>/dev/null || break
                 sleep 0.05
