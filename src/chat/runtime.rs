@@ -6655,6 +6655,229 @@ mod tests {
         );
     }
 
+    /// A Codex parser attached to `parent-exact` with `latest` as its latest
+    /// history page, older history and its child listing still outstanding,
+    /// and the snapshot it has built. The value is the listing request's ID.
+    fn codex_child_name_session(
+        directory: &std::path::Path,
+        latest: Vec<Value>,
+    ) -> (Box<dyn Adapter>, Snapshot, BTreeMap<String, usize>, Value) {
+        let mut adapter = codex_child_name_adapter(directory);
+        let mut state = Snapshot::default();
+        let mut indices = BTreeMap::new();
+        let hello = adapter.initialize().unwrap();
+        let initialized = adapter
+            .receive(json!({"id":hello.writes[0]["id"],"result":{
+                "codexHome":directory.to_str().unwrap(),"userAgent":"codex-child-name-fixture"
+            }}))
+            .unwrap();
+        let attach = initialized
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "thread/resume")
+            .unwrap();
+        let attached = adapter
+            .receive(json!({"id":attach["id"],"result":{
+                "thread":{"id":"parent-exact","status":{"type":"idle"}},
+                "initialTurnsPage":{"data":latest,"nextCursor":"older"}
+            }}))
+            .unwrap();
+        let list = attached
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "thread/list")
+            .unwrap()["id"]
+            .clone();
+        let skills = initialized
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "skills/list")
+            .unwrap();
+        let ready = adapter
+            .receive(json!({"id":skills["id"],"result":{"data":[]}}))
+            .unwrap();
+        assert!(ready.events.contains(&Event::Ready(true)));
+        for event in attached.events.into_iter().chain(ready.events) {
+            apply_event(&mut state, &mut indices, event);
+        }
+        (adapter, state, indices, list)
+    }
+
+    /// A completed parent turn that spawned children, as Codex records it in
+    /// history, with each child's nickname at the time.
+    fn codex_spawn_turn(turn: &str, children: &[(&str, &str)]) -> Value {
+        let ids = children.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+        let states = children
+            .iter()
+            .map(|(id, name)| ((*id).to_owned(), json!({"agentNickname":name})))
+            .collect::<serde_json::Map<_, _>>();
+        json!({"id":turn,"status":"completed","itemsView":"full","items":[{
+            "id":format!("spawn-{turn}"),"type":"collabAgentToolCall","tool":"spawnAgent",
+            "status":"completed","senderThreadId":"parent-exact","receiverThreadIds":ids,
+            "agentsStates":states
+        }]})
+    }
+
+    fn codex_child_names(state: &Snapshot) -> Vec<(String, String)> {
+        state
+            .subagents
+            .iter()
+            .map(|agent| (agent.id.clone(), agent.kind.clone()))
+            .collect()
+    }
+
+    fn codex_child_read(step: &Step, child: &str) -> Value {
+        step.writes
+            .iter()
+            .find(|frame| {
+                frame["method"] == "thread/resume" && frame["params"]["threadId"] == child
+            })
+            .unwrap()["id"]
+            .clone()
+    }
+
+    #[test]
+    fn codex_history_and_listing_replies_cannot_rewind_a_live_child_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut adapter, mut state, mut indices, list) = codex_child_name_session(
+            directory.path(),
+            vec![codex_spawn_turn("latest", &[("other", "Mapper")])],
+        );
+        let mut apply = |step: Step, state: &mut Snapshot| {
+            for event in step.events {
+                apply_event(state, &mut indices, event);
+            }
+        };
+        let names = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(id, name)| (id.to_string(), name.to_string()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(codex_child_names(&state), names(&[("other", "Mapper")]));
+        // Older history and the child listing are requested before Codex
+        // reports the child live under its current name.
+        let earlier = adapter.command(Command::LoadEarlier).unwrap().writes[0]["id"].clone();
+        let started = adapter
+            .receive(json!({"method":"thread/started","params":{"thread":{
+                "id":"child","parentThreadId":"parent-exact","agentNickname":"Navigator",
+                "status":{"type":"active"}
+            }}}))
+            .unwrap();
+        let read = codex_child_read(&started, "child");
+        apply(started, &mut state);
+        // The listing is newer than any recorded call, older than live news.
+        let listed = adapter
+            .receive(json!({"id":list,"result":{"data":[
+                {"id":"child","parentThreadId":"parent-exact","agentNickname":"Scout"},
+                {"id":"other","parentThreadId":"parent-exact","agentNickname":"Cartographer"}
+            ]}}))
+            .unwrap();
+        apply(listed, &mut state);
+        assert_eq!(
+            codex_child_names(&state),
+            names(&[("other", "Cartographer"), ("child", "Navigator")]),
+        );
+        let page = adapter
+            .receive(json!({"id":earlier,"result":{
+                "data":[
+                    codex_spawn_turn("newer", &[("child", "Scout"), ("other", "Old mapper"), ("third", "Second")]),
+                    codex_spawn_turn("older", &[("third", "First")]),
+                ],
+                "nextCursor":null
+            }}))
+            .unwrap();
+        apply(page, &mut state);
+        assert_eq!(
+            codex_child_names(&state),
+            names(&[
+                ("other", "Cartographer"),
+                ("child", "Navigator"),
+                ("third", "Second")
+            ]),
+            "a page names an unknown child by its latest call, and no other"
+        );
+        // A thread read answered before the live name cannot replace it.
+        let resumed = adapter
+            .receive(json!({"id":read,"result":{
+                "thread":{"id":"child","agentNickname":"Scout","status":{"type":"active"}},
+                "initialTurnsPage":{"data":[],"nextCursor":null}
+            }}))
+            .unwrap();
+        apply(resumed, &mut state);
+        assert_eq!(state.subagents[1].kind, "Navigator");
+        let renamed = adapter
+            .receive(json!({"method":"thread/started","params":{"thread":{
+                "id":"child","parentThreadId":"parent-exact","agentNickname":"Pilot"
+            }}}))
+            .unwrap();
+        apply(renamed, &mut state);
+        assert_eq!(
+            state.subagents[1].kind, "Pilot",
+            "a live rename still applies"
+        );
+    }
+
+    #[test]
+    fn codex_child_thread_read_names_a_child_discovered_without_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut adapter, mut state, mut indices, _) =
+            codex_child_name_session(directory.path(), Vec::new());
+        let mut apply = |step: Step, state: &mut Snapshot| {
+            for event in step.events {
+                apply_event(state, &mut indices, event);
+            }
+        };
+        let started = adapter
+            .receive(json!({"method":"thread/started","params":{"thread":{
+                "id":"unnamed","parentThreadId":"parent-exact","agentRole":"worker",
+                "status":{"type":"active"}
+            }}}))
+            .unwrap();
+        let unnamed = codex_child_read(&started, "unnamed");
+        apply(started, &mut state);
+        let earlier = adapter.command(Command::LoadEarlier).unwrap().writes[0]["id"].clone();
+        let page = adapter
+            .receive(json!({"id":earlier,"result":{
+                "data":[codex_spawn_turn("spawn", &[("recorded", "Scout")])],
+                "nextCursor":"oldest"
+            }}))
+            .unwrap();
+        let recorded = codex_child_read(&page, "recorded");
+        apply(page, &mut state);
+        assert_eq!(
+            codex_child_names(&state),
+            [("unnamed", ""), ("recorded", "Scout")].map(|(id, name)| (id.into(), name.into())),
+        );
+        for (read, id, name) in [
+            (unnamed, "unnamed", " Quinn "),
+            (recorded, "recorded", "Navigator"),
+        ] {
+            let resumed = adapter
+                .receive(json!({"id":read,"result":{
+                    "thread":{"id":id,"agentNickname":name,"status":{"type":"idle"}},
+                    "initialTurnsPage":{"data":[],"nextCursor":null}
+                }}))
+                .unwrap();
+            apply(resumed, &mut state);
+        }
+        assert_eq!(
+            codex_child_names(&state),
+            [("unnamed", "Quinn"), ("recorded", "Navigator")]
+                .map(|(id, name)| (id.into(), name.into())),
+            "the child's own thread read reports its current name"
+        );
+        let earlier = adapter.command(Command::LoadEarlier).unwrap().writes[0]["id"].clone();
+        let page = adapter
+            .receive(json!({"id":earlier,"result":{
+                "data":[codex_spawn_turn("first", &[("recorded", "Even older")])],
+                "nextCursor":null
+            }}))
+            .unwrap();
+        apply(page, &mut state);
+        assert_eq!(state.subagents[1].kind, "Navigator");
+    }
+
     #[test]
     fn child_metadata_survives_sparse_updates_and_completion_clears_waiting() {
         let mut state = Snapshot::default();

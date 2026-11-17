@@ -546,6 +546,7 @@ fn create_inner(
             materialized: launch.session_id.is_some(),
             execution: None,
             children: BTreeMap::new(),
+            child_names: BTreeMap::new(),
             branch_points: Vec::new(),
             is_child: false,
             child_failure: None,
@@ -717,6 +718,10 @@ struct Codex {
     materialized: bool,
     execution: Option<Execution>,
     children: BTreeMap<String, Box<Codex>>,
+    /// Where the nickname shown for each child was learned, by child ID. It
+    /// outlives a child's parser, which a crowded conversation can evict and
+    /// readmit, and covers children never admitted.
+    child_names: BTreeMap<String, ChildName>,
     branch_points: Vec<chat::BranchPoint>,
     is_child: bool,
     /// The turn and message of the last final error a child reported, which
@@ -731,6 +736,24 @@ struct Codex {
     /// paths are relative to, once looked up.
     repo_root: Option<Option<PathBuf>>,
 }
+
+/// Where the nickname shown for a child was learned, from oldest to newest.
+/// Codex reports a child's nickname live, in its thread listing and in the
+/// records of earlier calls, and the replies to listing and history requests
+/// can arrive after a newer live notification.
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+enum ChildName {
+    /// From a call a history page records, as the child was then.
+    Recorded,
+    /// From the thread listing, as the child was when it was requested.
+    Listed,
+    /// From a live notification or the child's own thread read.
+    Current,
+}
+
+/// The most children whose nickname origin is remembered; beyond it, a new
+/// child's historical name is published as if nothing were known of it.
+const MAX_CHILD_NAMES: usize = 1024;
 
 #[derive(Default)]
 struct TurnDiff {
@@ -882,14 +905,33 @@ impl Codex {
         }));
     }
 
+    /// Discover or refresh a child from live metadata, whose nickname is
+    /// the child's current one.
     fn discover_child(
         &mut self,
         id: &str,
         metadata: &Value,
         step: &mut Step,
     ) -> Result<(), String> {
+        self.discover_child_named(id, metadata, ChildName::Current, false, step)
+            .map(drop)
+    }
+
+    /// Discover or refresh a child, publishing the nickname in `metadata`
+    /// only where its `origin` may replace what is already known: a newer
+    /// source replaces an older one, and a recorded call replaces another
+    /// only when `advance` says the same history page set it. Returns
+    /// whether a nickname was published.
+    fn discover_child_named(
+        &mut self,
+        id: &str,
+        metadata: &Value,
+        origin: ChildName,
+        advance: bool,
+        step: &mut Step,
+    ) -> Result<bool, String> {
         if self.is_child || id.is_empty() || id.len() > 256 || self.thread.as_deref() == Some(id) {
-            return Ok(());
+            return Ok(false);
         }
         let discovered = !self.children.contains_key(id);
         if discovered {
@@ -918,7 +960,7 @@ impl Codex {
                 }
             }
             if self.children.len() >= 32 || self.pending.len() >= MAX_PENDING {
-                return Ok(());
+                return Ok(false);
             }
             let mut child = Codex::default();
             child.thread = Some(id.into());
@@ -950,16 +992,24 @@ impl Codex {
             // Sparse collab metadata must not reset a known terminal outcome.
             child.subagent_status = Some(status);
         }
+        let nickname = agent_nickname(metadata).filter(|_| {
+            self.child_names.get(id).is_none_or(|known| {
+                origin > *known || origin == *known && (advance || origin != ChildName::Recorded)
+            })
+        });
+        if nickname.is_some() {
+            self.note_child_name(id, origin);
+        }
         step.events.push(Event::Subagent {
             model,
             waiting: None,
             detail: None,
             id: id.into(),
-            // A role says what an agent can do, not who it is. Sparse or
-            // role-only metadata publishes no name, so the runtime keeps the
-            // nickname it already has; an unnamed child is left to the tab's
-            // own fallback.
-            kind: agent_nickname(metadata).unwrap_or_default().into(),
+            // A role says what an agent can do, not who it is. Sparse,
+            // role-only or superseded metadata publishes no name, so the
+            // runtime keeps the nickname it already has; an unnamed child is
+            // left to the tab's own fallback.
+            kind: nickname.unwrap_or_default().into(),
             description: metadata["message"]
                 .as_str()
                 .or_else(|| metadata["preview"].as_str())
@@ -969,7 +1019,34 @@ impl Codex {
             // A child is a thread of its own, not work inside the parent's turn.
             background: Some(true),
         });
-        Ok(())
+        Ok(nickname.is_some())
+    }
+    /// Publish the nickname a child's own thread read reports, which can name
+    /// a child discovered without one. It is the child's current name unless
+    /// a live notification has reported one since the read was requested.
+    fn read_child_name(&mut self, id: &str, thread: &Value, step: &mut Step) {
+        let Some(nickname) = agent_nickname(thread) else {
+            return;
+        };
+        if self.child_names.get(id) == Some(&ChildName::Current) {
+            return;
+        }
+        self.note_child_name(id, ChildName::Current);
+        step.events.push(Event::Subagent {
+            id: id.into(),
+            kind: nickname.into(),
+            description: String::new(),
+            status: None,
+            background: None,
+            model: None,
+            waiting: None,
+            detail: None,
+        });
+    }
+    fn note_child_name(&mut self, id: &str, origin: ChildName) {
+        if self.child_names.len() < MAX_CHILD_NAMES || self.child_names.contains_key(id) {
+            self.child_names.insert(id.into(), origin);
+        }
     }
     // Child parsers share a server connection, so their local RPC IDs must
     // never escape into the parent's ID space. Keep the original correlation
@@ -1495,6 +1572,10 @@ impl Codex {
 
     fn page(&mut self, page: &Value, step: &mut Step, earlier: bool) -> Result<(), String> {
         let mut items = Vec::new();
+        // Children whose nickname this page set. The page is read oldest
+        // first, so a later call on it may advance that name; a name known
+        // before the page is newer than any it records.
+        let mut named = std::collections::BTreeSet::new();
         for turn in array(page, "data")?.iter().rev() {
             let turn_id = string(turn, "id")?;
             let active = turn["status"] == "inProgress";
@@ -1544,7 +1625,15 @@ impl Codex {
                             metadata.remove("status");
                             metadata.remove("model");
                         }
-                        self.discover_child(id, &metadata, step)?;
+                        if self.discover_child_named(
+                            id,
+                            &metadata,
+                            ChildName::Recorded,
+                            named.contains(id),
+                            step,
+                        )? {
+                            named.insert(id.to_owned());
+                        }
                     }
                 }
                 if active {
@@ -2851,7 +2940,15 @@ impl Adapter for Codex {
                                 continue;
                             }
                             if let Some(id) = thread["id"].as_str() {
-                                self.discover_child(id, thread, &mut step)?;
+                                // The listing may have been taken before a
+                                // live notification that renamed the child.
+                                self.discover_child_named(
+                                    id,
+                                    thread,
+                                    ChildName::Listed,
+                                    false,
+                                    &mut step,
+                                )?;
                             }
                         }
                         if deferred.len() == before {
@@ -2861,11 +2958,15 @@ impl Adapter for Codex {
                     }
                 }
                 Pending::ChildResume(id) => {
+                    let exact = result["thread"]["id"].as_str() == Some(id.as_str());
+                    if exact {
+                        self.read_child_name(&id, &result["thread"], &mut step);
+                    }
                     // Overflow abandons only hydration, retaining live content.
                     if !self.child_buffer.contains_key(&id) {
                         return Ok(step);
                     }
-                    if result["thread"]["id"].as_str() != Some(id.as_str()) {
+                    if !exact {
                         return Err("Codex returned a different child thread".into());
                     }
                     if let Some(child) = self.children.get_mut(&id) {
@@ -6712,6 +6813,7 @@ print(json.dumps({'frames': frames, 'replies': {
             materialized: true,
             execution: None,
             children: BTreeMap::new(),
+            child_names: BTreeMap::new(),
             branch_points: Vec::new(),
             is_child: false,
             child_failure: None,
@@ -7999,6 +8101,39 @@ print(json.dumps({'frames': frames, 'replies': {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn older_history_cannot_rename_a_child_evicted_after_its_live_name() {
+        let mut parent = adapter();
+        let mut live = Step::default();
+        for index in 0..32 {
+            parent
+                .discover_child(
+                    &format!("child-{index:02}"),
+                    &json!({"agentNickname":format!("Live {index}")}),
+                    &mut live,
+                )
+                .unwrap();
+        }
+        for child in parent.children.values_mut() {
+            child.ready = true;
+        }
+        parent.child_buffer.clear();
+        // A crowded conversation evicts a finished child to admit another.
+        parent
+            .discover_child("newest", &json!({}), &mut live)
+            .unwrap();
+        assert!(!parent.children.contains_key("child-00"));
+        let mut paged = Step::default();
+        parent.page(&json!({"data":[{"id":"older","status":"completed","items":[{"id":"spawn","type":"collabAgentToolCall","tool":"spawnAgent","status":"completed","senderThreadId":"thread-exact","receiverThreadIds":["child-00"],"agentsStates":{"child-00":{"agentNickname":"Stale"}}}]}],"nextCursor":null}), &mut paged, true).unwrap();
+        assert!(paged.events.iter().any(|event| matches!(event, Event::Subagent { id, kind, .. } if id == "child-00" && kind.is_empty())), "{:?}", paged.events);
+        assert!(
+            !paged
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Subagent { kind, .. } if kind == "Stale"))
+        );
     }
 
     #[test]
