@@ -353,6 +353,22 @@ pub enum Recovery {
     /// it - a stopped daemon, a busy writer, a provider that failed to launch -
     /// can succeed on the next attempt.
     Retry,
+    /// The daemon was finishing another operation and refused this start
+    /// before admitting it ([`crate::terminal_ipc::DAEMON_BUSY`]). Unlike
+    /// [`Self::Retry`], this proves the request changed nothing: the card
+    /// keeps whatever it held, including a live conversation an account
+    /// switch was about to move, and the same request may be sent again.
+    Busy,
+    /// The daemon took the connection but did not answer its handshake in
+    /// time, so nothing was asked of it. As with [`Self::Busy`], the request
+    /// changed nothing and may be sent again, but nothing says the daemon is
+    /// finishing another operation: it may be hung.
+    Unresponsive,
+    /// An account switch could not reach a daemon to ask anything of it: the
+    /// socket could not be found or connected, the connection closed before
+    /// its handshake, or the daemon speaks another protocol. Nothing was
+    /// requested, so the conversation it would have moved is untouched.
+    Unreached,
     /// The daemon refused this start and reported that repeating it cannot help.
     /// Keep the saved conversation and diagnostic without offering a retry.
     Blocked,
@@ -770,8 +786,10 @@ pub fn is_upgrade_recovery(source: &Session, replacement: &Session) -> bool {
 /// no authority by itself; only an authenticated `ChatPrepareResume` answer on
 /// the same daemon stream may produce one.
 pub fn is_retained_resume_successor(source: &Session, successor: &Session) -> bool {
-    if crate::upgrade::floor::load().is_ok_and(|ledger| ledger.resume_source(source).is_some())
-        && source.launch.session_id.is_some()
+    // Only a named source can be an upgrade's resume source; check that
+    // before reading the ledger from disk.
+    if source.launch.session_id.is_some()
+        && crate::upgrade::floor::load().is_ok_and(|ledger| ledger.resume_source(source).is_some())
     {
         let mut expected = source.clone();
         expected.reset_owned_codex_listener();

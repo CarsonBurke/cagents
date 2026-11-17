@@ -203,6 +203,42 @@ class CodexToolRowsFixture(unittest.TestCase):
             Path(home, "fixture-rate-limits.json").write_text(json.dumps(limits))
             self.assertEqual(scenario.request(request, home), [{"id": 3, "result": limits}])
 
+    def test_each_account_home_has_its_own_login_and_takes_over_a_switched_thread(self):
+        import json
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as directory:
+            first, second = Path(directory, "first"), Path(directory, "second")
+            for home in (first, second):
+                home.mkdir()
+            read = {"id": 1, "method": "account/read"}
+            [shared] = PEER["Scenario"]().request(read, str(first))
+            self.assertEqual(shared["result"]["account"]["email"], "fixture@invalid")
+            Path(second, "fixture-account-email").write_text("second@invalid\n")
+            [own] = PEER["Scenario"]().request(read, str(second))
+            self.assertEqual(own["result"]["account"]["email"], "second@invalid")
+
+            original = PEER["Scenario"]()
+            original.request({"id": 2, "method": "thread/start", "params": {}}, str(first))
+            self.assertEqual(list(first.glob("sessions/*/*/*")), [], "rollouts are opt-in")
+            Path(first, "fixture-rollouts").touch()
+            original = PEER["Scenario"]()
+            original.request({"id": 2, "method": "thread/start", "params": {"cwd": directory}},
+                             str(first))
+            [written] = first.glob(f"sessions/*/*/*/rollout-*-{original.thread}.jsonl")
+            meta = json.loads(written.read_text())
+            self.assertEqual((meta["type"], meta["payload"]["id"], meta["payload"]["cwd"]),
+                             ("session_meta", original.thread, directory))
+
+            resume = {"id": 3, "method": "thread/resume", "params": {"threadId": original.thread}}
+            replacement = PEER["Scenario"]()
+            [unknown] = replacement.request(resume, str(second))
+            self.assertEqual(unknown["error"]["message"], "Unknown fixture thread")
+            copy = second / written.relative_to(first)
+            copy.parent.mkdir(parents=True)
+            copy.write_bytes(written.read_bytes())
+            [resumed] = replacement.request(resume, str(second))
+            self.assertEqual(resumed["result"]["thread"]["id"], original.thread)
+            self.assertEqual(replacement.thread, original.thread)
+
     def test_model_catalog_and_resolved_selection_come_from_the_fixture_home(self):
         import json
         import tempfile

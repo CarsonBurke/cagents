@@ -82,8 +82,16 @@ class Bounded(unittest.TestCase):
         return process
 
     def records(self):
-        found = sorted((self.directory / "state/cagents-bounded").glob("*.json"))
-        return [json.loads(path.read_text()) for path in found]
+        """The records of running wrappers. One ending removes its record,
+        which can go between listing and reading it, as bounded itself
+        allows for; a record is written whole, by rename."""
+        found = []
+        for path in sorted((self.directory / "state/cagents-bounded").glob("*.json")):
+            try:
+                found.append(json.loads(path.read_text()))
+            except FileNotFoundError:
+                continue
+        return found
 
     def assert_all_stopped(self):
         self.assertTrue(self.recorded_pids(), "the workload never started")

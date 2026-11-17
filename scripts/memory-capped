@@ -128,24 +128,53 @@ def follow_parent(parent):
         os._exit(143)
 
 
-def went_over(unit, killed):
+def killed_in(group):
+    """Whether the kernel has killed a process in cgroup GROUP for its memory
+    limit, which it counts before the kill, or None once the group has gone."""
+    try:
+        with open(f"/sys/fs/cgroup{group}/memory.events") as file:
+            events = dict(line.split() for line in file if line.strip())
+    except (OSError, ValueError):
+        return None
+    return int(events.get("oom_kill", 0)) > 0
+
+
+def went_over(unit, failed):
     """Whether the unit was stopped for going over its limit. A failed unit is
-    left for no one to read. The manager can hear of a kill after the command's
-    parent does, so a killed command gets a moment."""
-    deadline = time.monotonic() + (2 if killed else 0)
+    left for no one to read. The process killed can be any in the scope, such
+    as the tests a `cargo test` ran, whose parent then fails on its own, and
+    the manager can hear of the kill after the command's parent does. So a
+    command that failed asks the kernel while the scope's group remains, and
+    otherwise waits, for a moment at most, until the manager has settled the
+    unit: it records a kill before it finds the scope empty. Once a kill is
+    known, the wait is for the manager to record it, so the failed unit it
+    leaves can be reset."""
+    deadline = time.monotonic() + (2 if failed else 0)
+    over = False
     try:
         while True:
-            result = subprocess.run(["systemctl", "--user", "show", unit, "--property=Result", "--value"],
-                                    stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30,
-                                    env=manager_environment())
-            if result.stdout.strip() == "oom-kill" or time.monotonic() >= deadline:
+            shown = subprocess.run(["systemctl", "--user", "show", unit,
+                                    "--property=Result,ActiveState,LoadState,ControlGroup"],
+                                   stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30,
+                                   env=manager_environment())
+            state = dict(line.partition("=")[::2] for line in shown.stdout.splitlines())
+            recorded = state.get("Result") == "oom-kill"
+            settled = (state.get("LoadState") == "not-found"
+                       or state.get("ActiveState") in ("inactive", "failed"))
+            if failed and not over and state.get("ControlGroup"):
+                killed = killed_in(state["ControlGroup"])
+                if killed is False:
+                    break  # The kernel killed nothing here: no need to wait.
+                over = bool(killed)
+            over = over or recorded
+            if recorded or settled or time.monotonic() >= deadline:
                 break
-            time.sleep(0.1)
+            time.sleep(0.05)
         subprocess.run(["systemctl", "--user", "reset-failed", unit], stdin=subprocess.DEVNULL,
                        capture_output=True, timeout=30, env=manager_environment())
     except (OSError, subprocess.SubprocessError):
-        return False
-    return result.stdout.strip() == "oom-kill"
+        return over
+    return over
 
 
 def leftovers(unit):
@@ -285,7 +314,7 @@ def main():
                            capture_output=True, timeout=30, env=manager_environment())
         except (OSError, subprocess.SubprocessError):
             pass
-    if went_over(unit, status == -signal.SIGKILL):
+    if went_over(unit, status != 0):
         print(over_limit_notice(name or os.path.basename(command[0]), limit, swap), file=sys.stderr)
         return 137
     if stop_left and not interrupted:

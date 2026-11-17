@@ -704,7 +704,8 @@ pub(super) struct Inlines {
     /// The span each glyph is drawn over, in span order.
     pub(super) glyphs: Box<[(usize, WorktreePullRequestState)]>,
     /// Shown text that copies as something else, in text order: a label
-    /// copies as its address, and a glyph's room as nothing.
+    /// copies as what the source wrote, its address or its reference, and a
+    /// glyph's room as nothing.
     pub(super) copies: Box<[(Range<usize>, Uri)]>,
     /// The spans of each link and what hovering it says, in span order.
     pub(super) tips: Box<[(Range<usize>, Arc<str>)]>,
@@ -1462,7 +1463,8 @@ impl SpanBuffer {
     }
 }
 
-/// A paragraph's pull request links as their labels show them.
+/// A paragraph's pull request links, and its references to known pull
+/// requests, as their labels show them.
 ///
 /// A link whose text is its own address, which is how a bare address, an
 /// autolink and `[address](address)` all arrive, is shown by its pull
@@ -1470,32 +1472,70 @@ impl SpanBuffer {
 /// them and gains the glyph before them, which says what it opens and in
 /// what state without rewording the author's sentence. A pull request
 /// address set in code is the author's literal text and stays as written.
+///
+/// A reference such as `#20` in plain text, outside code and links, is shown
+/// by the same glyph and label, linked to the pull request, once the labels
+/// know it, and copies as the reference the author wrote.
 fn labelled(
     text: String,
     runs: Vec<Run>,
     labels: &pull_request_links::Labels,
 ) -> (String, Vec<Run>, Option<Arc<Inlines>>) {
+    let plain = |run: &Run| run.link.is_none() && !run.attributes.code;
+    // A reference is only ever to a pull request the labels know, so a
+    // paragraph with a `#` but no known number is left as it is.
+    let known_reference = |start: usize, run: &Run| {
+        pull_request_links::references(&text, start..run.end)
+            .any(|(_, reference)| labels.resolve(&reference).is_some())
+    };
+    let mut start = 0;
     // A link's own words need not name the pull request it opens, so its
     // destination is what is looked at.
-    if !runs.iter().any(|run| {
-        !run.attributes.code
+    let relabels = runs.iter().any(|run| {
+        let from = mem::replace(&mut start, run.end);
+        (!run.attributes.code
             && run
                 .link
                 .as_deref()
                 .and_then(pull_request_links::pull_request)
-                .is_some()
-    }) {
+                .is_some())
+            || (plain(run) && text[from..run.end].contains('#') && known_reference(from, run))
+    });
+    if !relabels {
         return (text, runs, None);
     }
-    let mut shown = String::with_capacity(text.len());
-    let mut out: Vec<Run> = Vec::with_capacity(runs.len() + 2);
-    let mut glyphs = Vec::new();
-    let mut copies = Vec::new();
-    let mut tips = Vec::new();
+    let mut shown = Relabelled {
+        text: String::with_capacity(text.len()),
+        runs: Vec::with_capacity(runs.len() + 2),
+        glyphs: Vec::new(),
+        copies: Vec::new(),
+        tips: Vec::new(),
+    };
     let mut start = 0;
     let mut index = 0;
     while index < runs.len() {
         let run = &runs[index];
+        if plain(run) {
+            let mut from = start;
+            for (range, reference) in pull_request_links::references(&text, start..run.end) {
+                let Some((key, address)) = labels.resolve(&reference) else {
+                    continue;
+                };
+                if from < range.start {
+                    shown.push(&text[from..range.start], run);
+                }
+                let copy = Uri::from(&text[range.clone()]);
+                let label = labels.reference_label(&key, &text[range.end..]);
+                shown.label(&label, address, run.attributes, copy);
+                from = range.end;
+            }
+            if from < run.end || from == start {
+                shown.push(&text[from..run.end], run);
+            }
+            start = run.end;
+            index += 1;
+            continue;
+        }
         // The link's runs: one per style its words change through.
         let last = index
             + runs[index + 1..]
@@ -1509,11 +1549,7 @@ fn labelled(
             .filter(|_| runs[index..=last].iter().any(|run| !run.attributes.code))
             .and_then(pull_request_links::pull_request);
         let Some(key) = key else {
-            shown.push_str(&text[start..run.end]);
-            out.push(Run {
-                end: shown.len(),
-                ..run.clone()
-            });
+            shown.push(&text[start..run.end], run);
             start = run.end;
             index += 1;
             continue;
@@ -1521,55 +1557,104 @@ fn labelled(
         let end = runs[last].end;
         let destination = run.link.clone().expect("a pull request link");
         let label = labels.label(&key);
-        let first = out.len();
-        let glyph_start = shown.len();
-        // A pull request whose state is unknown has no glyph: a neutral one
-        // would look like a state of its own.
-        if let Some(state) = label.glyph {
-            shown.push_str(pull_request_links::GLYPH_SPACE);
-            glyphs.push((out.len(), state));
-            out.push(Run {
-                end: shown.len(),
-                link: Some(destination.clone()),
-                // The glyph takes the link's color, not its words' decoration.
-                attributes: Attributes {
-                    strikethrough: false,
-                    code: false,
-                    ..run.attributes
-                },
-                inline: Some(Inline::Glyph(state)),
-            });
-        }
         if text[start..end].trim_end_matches('/') == destination.trim_end_matches('/') {
-            shown.push_str(&label.text);
-            out.push(Run {
-                end: shown.len(),
-                link: Some(destination.clone()),
-                attributes: run.attributes,
-                inline: Some(Inline::Label),
-            });
-            copies.push((glyph_start..shown.len(), destination.clone()));
+            shown.label(&label, destination.clone(), run.attributes, destination);
         } else {
-            copies.push((glyph_start..shown.len(), Uri::from("")));
+            let first = shown.runs.len();
+            let glyph_start = shown.text.len();
+            shown.glyph(&label, &destination, run.attributes);
+            shown
+                .copies
+                .push((glyph_start..shown.text.len(), Uri::from("")));
             for run in &runs[index..=last] {
-                shown.push_str(&text[start..run.end]);
-                out.push(Run {
-                    end: shown.len(),
-                    ..run.clone()
-                });
+                shown.push(&text[start..run.end], run);
                 start = run.end;
             }
+            shown
+                .tips
+                .push((first..shown.runs.len(), Arc::from(label.tip(&destination))));
         }
-        tips.push((first..out.len(), Arc::from(label.tip(&destination))));
         start = end;
         index = last + 1;
     }
     let inlines = Inlines {
-        glyphs: glyphs.into_boxed_slice(),
-        copies: copies.into_boxed_slice(),
-        tips: tips.into_boxed_slice(),
+        glyphs: shown.glyphs.into_boxed_slice(),
+        copies: shown.copies.into_boxed_slice(),
+        tips: shown.tips.into_boxed_slice(),
     };
-    (shown, out, Some(Arc::new(inlines)))
+    (shown.text, shown.runs, Some(Arc::new(inlines)))
+}
+
+/// A paragraph's text and runs as [`labelled`] shows them, with where its
+/// glyphs go, what its labels copy as and what hovering them says.
+struct Relabelled {
+    text: String,
+    runs: Vec<Run>,
+    glyphs: Vec<(usize, WorktreePullRequestState)>,
+    copies: Vec<(Range<usize>, Uri)>,
+    tips: Vec<(Range<usize>, Arc<str>)>,
+}
+
+impl Relabelled {
+    /// `text` as written, in `run`'s style and link.
+    fn push(&mut self, text: &str, run: &Run) {
+        self.text.push_str(text);
+        self.runs.push(Run {
+            end: self.text.len(),
+            ..run.clone()
+        });
+    }
+
+    /// The room for `label`'s state glyph, linked to `destination`. A pull
+    /// request whose state is unknown has no glyph: a neutral one would look
+    /// like a state of its own.
+    fn glyph(
+        &mut self,
+        label: &pull_request_links::Label,
+        destination: &Uri,
+        attributes: Attributes,
+    ) {
+        let Some(state) = label.glyph else {
+            return;
+        };
+        self.text.push_str(pull_request_links::GLYPH_SPACE);
+        self.glyphs.push((self.runs.len(), state));
+        self.runs.push(Run {
+            end: self.text.len(),
+            link: Some(destination.clone()),
+            // The glyph takes the link's color, not its words' decoration.
+            attributes: Attributes {
+                strikethrough: false,
+                code: false,
+                ..attributes
+            },
+            inline: Some(Inline::Glyph(state)),
+        });
+    }
+
+    /// `label`'s glyph and text in place of what the source wrote, linked to
+    /// `destination`, copying as `copy`.
+    fn label(
+        &mut self,
+        label: &pull_request_links::Label,
+        destination: Uri,
+        attributes: Attributes,
+        copy: Uri,
+    ) {
+        let first = self.runs.len();
+        let start = self.text.len();
+        self.glyph(label, &destination, attributes);
+        self.text.push_str(&label.text);
+        self.runs.push(Run {
+            end: self.text.len(),
+            link: Some(destination.clone()),
+            attributes,
+            inline: Some(Inline::Label),
+        });
+        self.copies.push((start..self.text.len(), copy));
+        self.tips
+            .push((first..self.runs.len(), Arc::from(label.tip(&destination))));
+    }
 }
 
 fn parse_with<'a>(

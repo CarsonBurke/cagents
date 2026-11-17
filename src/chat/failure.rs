@@ -109,7 +109,20 @@ pub const PROVIDER_EXITED: &str = "Provider exited with ";
 /// rather than a failure of the conversation. It still gets its notice in
 /// the transcript, but the conversation's state does not become an error.
 pub fn is_notice(message: &str) -> bool {
-    message.trim_start().starts_with(COMMAND_OUT_OF_MEMORY)
+    message.trim_start().starts_with(COMMAND_OUT_OF_MEMORY) || is_account_switch_refusal(message)
+}
+
+/// Whether `message` reports a send whose automatic account switch the daemon
+/// never admitted. The conversation itself is untouched, so this answers the
+/// send rather than describing the conversation, and the next switch attempt
+/// replaces it.
+pub fn is_account_switch_refusal(message: &str) -> bool {
+    [
+        delivery::ACCOUNT_SWITCH_BUSY,
+        delivery::ACCOUNT_SWITCH_UNANSWERED,
+        delivery::ACCOUNT_SWITCH_UNREACHED,
+    ]
+    .contains(&message.trim())
 }
 
 /// What a runtime exit report says happened to the provider, in words: the
@@ -503,8 +516,9 @@ fn is_zone(text: &str) -> bool {
         })
 }
 
-/// What became of a request Claude's retained conversation process could not
-/// confirm or take, as the daemon reports it, and what the person can do.
+/// What became of a request cagents could not deliver, such as one Claude's
+/// retained conversation process could not confirm or take, as the daemon
+/// reports it, and what the person can do.
 /// Each text is one sentence of outcome and one of next step, so a notice can
 /// show the step as its guidance instead of a generic one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -593,6 +607,25 @@ delivery_outcomes! {
     /// Any input once the proxy has stopped.
     refused UNAVAILABLE_INPUT: "Claude's conversation process is no longer reachable, so this was not sent.",
         "Close and reopen the conversation to continue.";
+    /// A send that needed an automatic account switch the daemon refused
+    /// while it finished another operation. The conversation stayed on its
+    /// account, and the message is still in the composer, so sending again
+    /// is the retry.
+    refused ACCOUNT_SWITCH_BUSY: "Your message wasn't sent. This conversation's account can't be used right now, and the cagents daemon was busy finishing something else, so it couldn't move the conversation to another account.",
+        "Send again in a moment.";
+    /// A send that needed an automatic account switch, when the daemon took
+    /// the connection but never answered it. Nothing was asked of it, so the
+    /// conversation stayed on its account; the daemon may be hung, which the
+    /// daemon health banner reports with its own restart.
+    refused ACCOUNT_SWITCH_UNANSWERED: "Your message wasn't sent. This conversation's account can't be used right now, and the cagents daemon didn't respond in time to move the conversation to another account.",
+        "Send again, or restart the daemon if this keeps happening.";
+    /// A send that needed an automatic account switch, when no daemon could
+    /// be reached to ask: its socket was missing or refused the connection,
+    /// the connection closed before its handshake, or it speaks another
+    /// protocol. Nothing was asked, so the conversation stayed on its
+    /// account; a daemon that is gone or mismatched has its own banner.
+    refused ACCOUNT_SWITCH_UNREACHED: "Your message wasn't sent. This conversation's account can't be used right now, and the cagents daemon couldn't be reached to move the conversation to another account.",
+        "Send again, or restart the daemon if this keeps happening.";
 }
 
 impl DeliveryOutcome {

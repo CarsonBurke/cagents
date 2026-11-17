@@ -1235,6 +1235,18 @@ fn process_wire_request(
             false,
         ));
     }
+    // Compiled only into debug builds, and inert outside a native-evidence
+    // fixture that asks for it.
+    #[cfg(debug_assertions)]
+    if matches!(
+        &request,
+        ClientRequest::ShutdownV1 {
+            operation: ShutdownOperation::Preflight,
+            ..
+        }
+    ) {
+        super::fixture_hold::hold_preflight(&gate);
+    }
     // Inventory decisions and commit must wait for all previously admitted
     // effects, including provider closes that finish outside HostState.
     let (_exclusive, _shared) = match exclusive_patience(&request) {

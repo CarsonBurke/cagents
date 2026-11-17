@@ -283,23 +283,8 @@ impl Cagents {
         Some(Task::none())
     }
     pub(super) fn daemon_health_banner(&self) -> Element<'_, Message> {
-        let detail = match &self.daemon_health_ui.health {
-            daemon_health::State::Responsive => {
-                return iced::widget::Space::new().height(Length::Shrink).into();
-            }
-            daemon_health::State::Unresponsive { since, timeout } => format!(
-                "The daemon has not answered since {}. A reply timed out after {} s.",
-                timestamp(*since),
-                timeout.as_secs_f64(),
-            ),
-            daemon_health::State::Incompatible { actual, .. } => format!(
-                "This window requires daemon protocol {}, but the last daemon reply used protocol {actual}. The window and daemon cannot communicate.",
-                crate::terminal_ipc::PROTOCOL_VERSION,
-            ),
-            daemon_health::State::Unreachable { since } => format!(
-                "The daemon has been unreachable since {}. Reconnecting…",
-                timestamp(*since),
-            ),
+        let Some(detail) = health_detail(&self.daemon_health_ui.health) else {
+            return iced::widget::Space::new().height(Length::Shrink).into();
         };
         let mut row =
             widget::row::with_children(vec![design::body(detail).width(Length::Fill).into()])
@@ -400,6 +385,38 @@ impl Cagents {
     }
 }
 
+/// What the banner says about an unavailable daemon, or nothing while it
+/// answers.
+fn health_detail(health: &daemon_health::State) -> Option<String> {
+    Some(match health {
+        daemon_health::State::Responsive => return None,
+        daemon_health::State::Unresponsive { since, timeout } => format!(
+            "The daemon has not answered since {}. A reply timed out after {}.",
+            timestamp(*since),
+            reply_wait(*timeout),
+        ),
+        daemon_health::State::Incompatible { actual, .. } => format!(
+            "This window requires daemon protocol {}, but the last daemon reply used protocol {actual}. The window and daemon cannot communicate.",
+            crate::terminal_ipc::PROTOCOL_VERSION,
+        ),
+        daemon_health::State::Unreachable { since } => format!(
+            "The daemon has been unreachable since {}. Reconnecting…",
+            timestamp(*since),
+        ),
+    })
+}
+
+/// How long a timed-out reply was awaited. A wait bounded by a deadline ends
+/// a hair short of it, so whole seconds say it as it was set.
+fn reply_wait(timeout: std::time::Duration) -> String {
+    let millis = timeout.as_millis();
+    if millis < 1_000 {
+        format!("{millis} ms")
+    } else {
+        format!("{} s", (millis + 500) / 1_000)
+    }
+}
+
 fn timestamp(time: std::time::SystemTime) -> String {
     let millis = time
         .duration_since(std::time::UNIX_EPOCH)
@@ -494,6 +511,36 @@ impl iced::advanced::widget::Operation for HealthFocus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reply bounded by a deadline reads as the wait that was set, not as
+    /// the nanoseconds left over.
+    #[test]
+    fn an_unanswered_reply_reads_as_whole_seconds() {
+        let unresponsive = |timeout| daemon_health::State::Unresponsive {
+            since: std::time::SystemTime::UNIX_EPOCH,
+            timeout,
+        };
+        let detail = health_detail(&unresponsive(std::time::Duration::from_nanos(
+            29_999_936_852,
+        )))
+        .unwrap();
+        assert!(
+            detail.ends_with("A reply timed out after 30 s."),
+            "{detail}"
+        );
+        let detail = health_detail(&unresponsive(std::time::Duration::from_secs(20))).unwrap();
+        assert!(
+            detail.ends_with("A reply timed out after 20 s."),
+            "{detail}"
+        );
+        let detail = health_detail(&unresponsive(std::time::Duration::from_millis(250))).unwrap();
+        assert!(
+            detail.ends_with("A reply timed out after 250 ms."),
+            "{detail}"
+        );
+        assert_eq!(health_detail(&daemon_health::State::Responsive), None);
+    }
+
     fn key(key: keyboard::key::Named) -> keyboard::Event {
         keyboard::Event::KeyPressed {
             key: keyboard::Key::Named(key.clone()),
