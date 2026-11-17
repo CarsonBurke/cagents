@@ -180,6 +180,13 @@ impl ControlGate {
             .expect("an exclusive wait without a deadline cannot expire")
     }
 
+    /// Exclusive requests waiting without queuing, for tests to know a
+    /// request has reached its wait.
+    #[cfg(test)]
+    pub(super) fn unqueued_waiters(&self) -> usize {
+        self.counts().unqueued
+    }
+
     fn enter_exclusive(&self, deadline: Option<Instant>, queue: bool) -> Option<Exclusive<'_>> {
         let mut counts = self.counts();
         *counts.waiters(queue) += 1;
