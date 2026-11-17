@@ -71,3 +71,17 @@ src/font/system/weight_match_tests.rs checks that matching reads no font file,
 and src/font/system/fallback_choice_tests.rs that every fallback choice over
 the repository fonts, for each family, weight, style and script, is the one
 upstream made.
+
+Linear multiline insertion and deletion (cagents #3001)
+
+Upstream Editor::insert_at inserts each new line at the same index of
+Buffer::lines, which moves every line inserted before it, and delete_range
+removes lines one at a time while collecting them at the front of the change.
+Both are quadratic in the number of lines. Pasting 600 KiB of 80-byte lines
+into the chat composer took about 170 ms, and deleting a selection that size
+about 150 ms, while iced held the font system lock. insert_at now builds the
+new lines and splices them in once, and delete_range drains the removed lines
+once. Lines, endings, attribute splits, the returned cursor and the recorded
+change are the same as upstream's. The application test
+repository_widget::text_editor::tests::native_multiline_insert_and_delete_keep_lines_order_and_history
+checks them, including undoing both changes.

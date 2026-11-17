@@ -230,31 +230,23 @@ impl<'buffer> Edit<'buffer> for Editor<'buffer> {
 
     fn delete_range(&mut self, start: Cursor, end: Cursor) {
         let change_item = self.with_buffer_mut(|buffer| {
-            // Collect removed data for change tracking
-            let mut change_lines = Vec::new();
+            // Delete the selection from the last line, keeping the part after it
+            let end_line_opt =
+                (end.line > start.line).then(|| buffer.lines[end.line].split_off(end.index));
 
-            // Delete the selection from the last line
-            let end_line_opt = if end.line > start.line {
-                // Get part of line after selection
-                let after = buffer.lines[end.line].split_off(end.index);
-
-                // Remove end line
-                let removed = buffer.lines.remove(end.line);
-                change_lines.insert(0, removed);
-
-                Some(after)
+            // cagents: remove the interior lines and what remains of the last
+            // one in a single drain. Removing them one at a time moved every
+            // later line once per removed line, and collecting them at the
+            // front of the change moved every earlier one: deleting a 600 KiB
+            // selection took 150 ms under the font lock.
+            let removed_lines = if end.line > start.line {
+                buffer.lines.drain(start.line + 1..=end.line).collect()
             } else {
-                None
+                Vec::new()
             };
 
-            // Delete interior lines (in reverse for safety)
-            for line_i in (start.line + 1..end.line).rev() {
-                let removed = buffer.lines.remove(line_i);
-                change_lines.insert(0, removed);
-            }
-
             // Delete the selection from the first line
-            {
+            let first_removed = {
                 let line = &mut buffer.lines[start.line];
 
                 // Get part after selection if start line is also end line
@@ -266,7 +258,6 @@ impl<'buffer> Edit<'buffer> for Editor<'buffer> {
 
                 // Delete selected part of line
                 let removed = line.split_off(start.index);
-                change_lines.insert(0, removed);
 
                 // Re-add part of line after selection
                 if let Some(after) = after_opt {
@@ -281,7 +272,10 @@ impl<'buffer> Edit<'buffer> for Editor<'buffer> {
                     }
                     line.append(&end_line);
                 }
-            }
+
+                removed
+            };
+            let change_lines = core::iter::once(first_removed).chain(removed_lines);
 
             let mut text = String::new();
             let mut last_ending: Option<LineEnding> = None;
@@ -382,6 +376,12 @@ impl<'buffer> Edit<'buffer> for Editor<'buffer> {
                     Shaping::Advanced,
                 ));
             }
+            // cagents: build the new lines first and splice them in once.
+            // Inserting each at `insert_line` moved every line already
+            // inserted, so pasting 600 KiB of short lines took 170 ms under
+            // the font lock. Attributes are still split from the end, so the
+            // lines are collected last first and then reversed.
+            let mut inserted = Vec::with_capacity(lines_iter.len());
             // Add last line
             if let Some((range, ending)) = lines_iter.next_back() {
                 let data_line = &data[range];
@@ -393,8 +393,7 @@ impl<'buffer> Edit<'buffer> for Editor<'buffer> {
                     Shaping::Advanced,
                 );
                 tmp.append(&after);
-                buffer.lines.insert(insert_line, tmp);
-                cursor.line += 1;
+                inserted.push(tmp);
             } else {
                 line.append(&after);
             }
@@ -402,15 +401,16 @@ impl<'buffer> Edit<'buffer> for Editor<'buffer> {
             for (range, ending) in lines_iter.rev() {
                 let data_line = &data[range];
                 remaining_split_len -= data_line.len() + ending.as_str().len();
-                let tmp = BufferLine::new(
+                inserted.push(BufferLine::new(
                     data_line,
                     ending,
                     final_attrs.split_off(remaining_split_len),
                     Shaping::Advanced,
-                );
-                buffer.lines.insert(insert_line, tmp);
-                cursor.line += 1;
+                ));
             }
+            inserted.reverse();
+            cursor.line += inserted.len();
+            buffer.lines.splice(insert_line..insert_line, inserted);
 
             assert_eq!(remaining_split_len, 0);
 
