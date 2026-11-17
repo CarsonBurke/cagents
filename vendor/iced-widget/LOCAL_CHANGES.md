@@ -40,8 +40,10 @@ Local change: inline code styling (src/markdown.rs)
 renderer and this one share it, so chat prose and every `markdown::view`
 surface draw inline code the same way. `Style` gains
 `inline_code_relative_size`, the size of inline code relative to the text
-around it, set through `Span::relative_size`. The default of 1.0 keeps
-upstream's size. `inline_code_color` becomes an `Option`, where `None`
+around it, set through `Span::relative_size`, and
+`inline_code_inline_padding`, room laid out before and after inline code
+inside its background, set through `Span::inline_padding`. The defaults of
+1.0 and 0.0 keep upstream's size and layout. `inline_code_color` becomes an `Option`, where `None`
 leaves inline code in the color of the text around it. The default stays
 upstream's white.
 

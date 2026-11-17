@@ -74,14 +74,21 @@ button uses this (`vendor/libcosmic/PATCH.md`); the app regression is
 
 ## Relative span size
 
-`Span::relative_size` sets a span's size as a fraction of its own `size`, or
-of the paragraph's size when it has none, like CSS's `em`. Unlike `size`, it
+`Span::relative_size` scales a span's own `size`, or the paragraph's size
+when it has none. Unlike `size`, it
 keeps the paragraph's line height when the span sets none. Inline code in
 chat prose uses it to sit a step smaller than the sentence around it without
 changing the height of the lines it falls on (cagents#3002). `Span::metrics`
 resolves a span's font size and line height in a paragraph. The renderer's
 `Paragraph::with_spans` (`vendor/iced-graphics`) and the app's own shaping
 for long paragraphs both take a span's metrics from it, so they agree.
+
+`Span::inline_padding` lays out room in logical pixels at a span's start and
+end, like CSS inline padding. Unlike the draw-only `padding`, it moves the
+text around the span and lies inside its glyph bounds, so the highlight
+covers it. Inline code uses it to keep its chip clear of the letters and
+punctuation beside it. It maps to cosmic-text's `Attrs::inline_padding`
+(`vendor/cosmic-text/LOCAL_CHANGES.md`).
 
 ```sh
 cargo test --manifest-path vendor/iced-core/Cargo.toml text::span_metrics_tests

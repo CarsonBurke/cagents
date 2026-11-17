@@ -1115,6 +1115,9 @@ pub struct Style {
     pub inline_code_highlight: Highlight,
     /// The [`Padding`] to be applied to the background of inline code.
     pub inline_code_padding: Padding,
+    /// The room in logical pixels laid out before and after inline code,
+    /// inside its background.
+    pub inline_code_inline_padding: f32,
     /// The [`Color`] to be applied to inline code, or `None` for the color
     /// of the text around it.
     pub inline_code_color: Option<Color>,
@@ -1143,6 +1146,7 @@ impl Style {
             inline_code_color: Some(Color::WHITE),
             inline_code_font: Font::MONOSPACE,
             inline_code_relative_size: 1.0,
+            inline_code_inline_padding: 0.0,
             code_block_font: Font::MONOSPACE,
             link_color: palette.primary,
         }
@@ -1158,7 +1162,8 @@ impl Style {
             .color_maybe(self.inline_code_color)
             .background(self.inline_code_highlight.background)
             .border(self.inline_code_highlight.border)
-            .padding(self.inline_code_padding);
+            .padding(self.inline_code_padding)
+            .inline_padding(self.inline_code_inline_padding);
         if self.inline_code_relative_size == 1.0 {
             span
         } else {

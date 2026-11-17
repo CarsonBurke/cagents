@@ -14,7 +14,10 @@ The application regression compares native plain/rich paragraph bounds at narrow
 
 ## Relative span size
 
-`Paragraph::with_spans` takes each span's font size and line height from
+`text::to_span_attributes` converts a span to the cosmic-text attributes it
+is shaped with. It takes the span's font size and line height from
 `Span::metrics` (`vendor/iced-core/README.cagents.md`), so a span with a
-relative size is shaped at that size on the paragraph's line height. Spans
-without one are shaped as upstream shapes them.
+relative size is shaped at that size on the paragraph's line height, and it
+converts `Span::inline_padding` to EM at the span's size.
+`Paragraph::with_spans` and the app's own shaping for long paragraphs both use
+it, so they agree. Spans without these are shaped as upstream shapes them.

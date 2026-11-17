@@ -438,8 +438,8 @@ pub struct Span<'a, Link = (), Font = crate::Font> {
     pub size: Option<Pixels>,
     /// The [`LineHeight`] of the [`Span`].
     pub line_height: Option<LineHeight>,
-    /// The size of the [`Span`] as a fraction of its own [`size`], or of
-    /// the paragraph's size when it has none, like CSS's `em`.
+    /// A factor applied to the [`Span`]'s [`size`], or to the paragraph's
+    /// size when it has none.
     ///
     /// Unlike [`size`], it keeps the paragraph's line height when
     /// [`line_height`] is unset, so a span set smaller than the text around
@@ -460,6 +460,14 @@ pub struct Span<'a, Link = (), Font = crate::Font> {
     ///
     /// Currently, it only affects the bounds of the [`Highlight`].
     pub padding: Padding,
+    /// Horizontal room in logical pixels laid out at the [`Span`]'s start
+    /// and end, like CSS inline padding.
+    ///
+    /// Unlike [`padding`], it moves the text around the [`Span`] and lies
+    /// inside its bounds, so the [`Highlight`] covers it.
+    ///
+    /// [`padding`]: Self::padding
+    pub inline_padding: f32,
     /// Whether the [`Span`] should be underlined or not.
     pub underline: bool,
     /// Whether the [`Span`] should be struck through or not.
@@ -631,6 +639,14 @@ impl<'a, Link, Font> Span<'a, Link, Font> {
         self
     }
 
+    /// Sets the [`inline_padding`] of the [`Span`].
+    ///
+    /// [`inline_padding`]: Self::inline_padding
+    pub fn inline_padding(mut self, inline_padding: f32) -> Self {
+        self.inline_padding = inline_padding;
+        self
+    }
+
     /// Sets whether the [`Span`] should be underlined or not.
     pub fn underline(mut self, underline: bool) -> Self {
         self.underline = underline;
@@ -655,6 +671,7 @@ impl<'a, Link, Font> Span<'a, Link, Font> {
             link: self.link,
             highlight: self.highlight,
             padding: self.padding,
+            inline_padding: self.inline_padding,
             underline: self.underline,
             strikethrough: self.strikethrough,
         }
@@ -673,6 +690,7 @@ impl<Link, Font> Default for Span<'_, Link, Font> {
             link: None,
             highlight: None,
             padding: Padding::default(),
+            inline_padding: 0.0,
             underline: false,
             strikethrough: false,
         }
@@ -691,6 +709,7 @@ impl<Link, Font: PartialEq> PartialEq for Span<'_, Link, Font> {
             && self.size == other.size
             && self.line_height == other.line_height
             && self.relative_size == other.relative_size
+            && self.inline_padding == other.inline_padding
             && self.font == other.font
             && self.color == other.color
     }

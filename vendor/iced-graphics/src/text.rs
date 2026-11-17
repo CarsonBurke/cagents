@@ -283,6 +283,36 @@ pub fn to_attributes(font: Font) -> cosmic_text::Attrs<'static> {
         .style(to_style(font.style))
 }
 
+/// Converts a rich text [`Span`] to the [`cosmic_text::Attrs`] it is shaped
+/// with in a paragraph of `font`, `size` and `line_height`.
+///
+/// [`Span`]: crate::core::text::Span
+pub fn to_span_attributes<Link>(
+    span: &crate::core::text::Span<'_, Link, Font>,
+    font: Font,
+    size: Pixels,
+    line_height: crate::core::text::LineHeight,
+) -> cosmic_text::Attrs<'static> {
+    let mut attrs = to_attributes(span.font.unwrap_or(font));
+    let span_size = match span.metrics(size, line_height) {
+        Some((span_size, span_line_height)) => {
+            attrs = attrs.metrics(cosmic_text::Metrics::new(
+                span_size.0,
+                span_line_height.0,
+            ));
+            span_size
+        }
+        None => size,
+    };
+    if let Some(color) = span.color {
+        attrs = attrs.color(to_color(color));
+    }
+    if span.inline_padding != 0.0 && span_size.0 > 0.0 {
+        attrs = attrs.inline_padding(span.inline_padding / span_size.0);
+    }
+    attrs
+}
+
 fn to_family(family: font::Family) -> cosmic_text::Family<'static> {
     match family {
         font::Family::Name(name) => cosmic_text::Family::Name(name),
