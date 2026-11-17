@@ -744,7 +744,9 @@ class Jobserver(unittest.TestCase):
     def test_a_build_gets_more_as_it_takes_them_and_what_it_gives_back_goes_to_the_pool(self):
         jobserver = self.join()
         self.take(jobserver, self.TOKENS)
-        self.assertEqual(jobserver.taken, self.TOKENS)
+        # The stocker counts a token after writing it, so the build can hold
+        # the last ones before it has counted them.
+        self.wait_for(lambda: jobserver.taken == self.TOKENS, "every token counted as taken")
         self.give_back(jobserver, 3)
         self.wait_for(lambda: jobserver.taken < self.TOKENS, "the returned tokens to go back")
         self.settle(jobserver)
