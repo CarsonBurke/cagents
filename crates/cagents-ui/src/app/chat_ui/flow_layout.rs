@@ -942,14 +942,7 @@ impl Prepared {
         buffer.set_wrap(graphics_text::to_wrap(wrapping));
         buffer.set_rich_text(
             spans.iter().enumerate().map(|(index, span)| {
-                let mut attrs = graphics_text::to_attributes(span.font.unwrap_or(font));
-                if let Some((span_size, span_line_height)) = span.metrics(size, line_height) {
-                    attrs =
-                        attrs.metrics(cosmic_text::Metrics::new(span_size.0, span_line_height.0));
-                }
-                if let Some(color) = span.color {
-                    attrs = attrs.color(graphics_text::to_color(color));
-                }
+                let attrs = graphics_text::to_span_attributes(span, font, size, line_height);
                 (span.text.as_ref(), attrs.metadata(index))
             }),
             &graphics_text::to_attributes(font),
@@ -1000,7 +993,7 @@ fn reference(
 }
 
 #[test]
-fn large_paragraphs_lay_out_smaller_inline_code_on_the_prose_pitch() {
+fn large_paragraphs_lay_out_inline_code_as_small_paragraphs_do() {
     // Paragraphs past the flow threshold are shaped here rather than by
     // iced; inline code set smaller must keep the same lines either way.
     let spans = super::selectable_prose::inline_code_answer_spans(&cosmic::Theme::dark());
@@ -1035,6 +1028,20 @@ fn large_paragraphs_lay_out_smaller_inline_code_on_the_prose_pitch() {
         {
             assert_eq!(before.line_y.to_bits(), after.line_y.to_bits());
             assert_eq!(before.line_height.to_bits(), after.line_height.to_bits());
+            // Glyph for glyph, including the room laid out around code.
+            let geometry = |glyphs: &[cosmic_text::LayoutGlyph]| {
+                glyphs
+                    .iter()
+                    .map(|glyph| {
+                        (
+                            glyph.x.to_bits(),
+                            glyph.w.to_bits(),
+                            glyph.x_offset.to_bits(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(geometry(before.glyphs), geometry(after.glyphs));
         }
     }
 }

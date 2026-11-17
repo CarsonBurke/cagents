@@ -182,25 +182,27 @@ pub fn display<'a>(text: impl Into<Cow<'a, str>> + 'a) -> ShellText<'a> {
 /// with code keep the same pitch as lines without.
 pub const INLINE_CODE_RELATIVE_SIZE: f32 = 0.9;
 
-/// Where the chip behind inline code sits, relative to the line box of
-/// prose set at `size`.
+/// How far the chip behind inline code comes into the line box of prose
+/// set at `size`.
 ///
 /// The highlight starts as the whole line box, and a chip that tall touched
-/// the chip on the next line. The negative vertical padding pulls the chip
-/// into the box so it covers inline code's glyphs, from the top of its
-/// capitals and brackets to the bottom of its descenders, with about a
-/// pixel of room. Those glyphs sit low in the box, so the chip comes in
-/// further at the top than at the bottom. The horizontal padding leaves a
-/// little room beside the first and last letters. It still stays inside the
-/// spaces between words, because the padding takes no room in the layout.
+/// the chip on the next line. The chip drops the half-leading and a little
+/// more from the top, which leaves about a pixel above inline code's
+/// capitals and brackets. Its descenders reach the bottom of the box, so
+/// the bottom stays where it is.
 pub fn inline_code_padding(size: f32) -> cosmic::iced::Padding {
     let half_leading = (LineHeight::default().to_absolute(size.into()).0 - size) / 2.0;
     cosmic::iced::Padding {
         top: -(half_leading + size * 0.08),
-        bottom: -(half_leading - size * 0.2).max(0.0),
-        left: 2.0,
-        right: 2.0,
+        ..cosmic::iced::Padding::ZERO
     }
+}
+
+/// The room laid out before and after inline code in prose set at `size`,
+/// which the chip covers. Being laid out, it keeps the chip clear of the
+/// letters and punctuation beside the code.
+pub fn inline_code_inline_padding(size: f32) -> f32 {
+    size * 0.2
 }
 
 /// Markdown shares the shell's semantic palette and a compact heading scale.
@@ -220,6 +222,7 @@ pub fn markdown_settings(theme: &Theme, size: f32) -> cosmic::widget::markdown::
     style.inline_code_highlight.border.radius = RADIUS_XS.into();
     style.inline_code_relative_size = INLINE_CODE_RELATIVE_SIZE;
     style.inline_code_padding = inline_code_padding(size);
+    style.inline_code_inline_padding = inline_code_inline_padding(size);
     markdown::Settings {
         h1_size: (size + GRID_UNIT).into(),
         h2_size: (size + GRID_UNIT / 2.0).into(),

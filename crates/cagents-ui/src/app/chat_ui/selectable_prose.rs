@@ -2348,6 +2348,7 @@ mod tests {
             "needle"
         );
     }
+
     fn shaped(spans: Arc<[Span<'static, markdown::Uri>]>, width: f32) -> State {
         State {
             plain: spans
@@ -2411,6 +2412,29 @@ mod tests {
                 assert!(
                     (baseline - shared).abs() < 0.01,
                     "line {line} at {width}: baseline {baseline} against {shared}"
+                );
+            }
+            // Each code span lays out room at both ends, inside its glyph
+            // boxes, so the chip keeps clear of the letters beside it.
+            let room = design::inline_code_inline_padding(size);
+            for (index, span) in spans.iter().enumerate().filter(|(index, _)| code(*index)) {
+                let glyphs = paragraph
+                    .buffer()
+                    .layout_runs()
+                    .flat_map(|run| run.glyphs.iter())
+                    .filter(|glyph| glyph.metadata == index)
+                    .collect::<Vec<_>>();
+                let first = glyphs.first().expect("shaped code");
+                assert!((first.x_offset * first.font_size - room).abs() < 0.01);
+                // Monospace letters share one advance; the edges add the room.
+                // A space the span wraps at is not laid out, so count glyphs.
+                let advance = glyphs[1].w;
+                let span_width = glyphs.iter().map(|glyph| glyph.w).sum::<f32>();
+                let letters = glyphs.len() as f32;
+                assert!(
+                    (span_width - (letters * advance + 2.0 * room)).abs() < 0.01,
+                    "{:?} at {width}",
+                    span.text
                 );
             }
             assert!(mixed > 0, "{width} has lines with code beside prose");
@@ -2502,11 +2526,16 @@ mod tests {
                 let index = (y as usize * width as usize + x as usize) * 4;
                 pixels[index..index + 4].try_into().unwrap()
             };
-            // Beside the first letter, halfway down: the chip.
-            let x = left - 1.0;
+            // In the room before the first letter, halfway down: the chip.
+            let x = left + design::inline_code_inline_padding(design::TEXT_PROSE) / 2.0;
             assert!(
                 distinct(at(x, top + line_height * 0.6), chip.into_rgba8()) <= 2,
                 "the chip is painted beside its code"
+            );
+            // The space before the code stays the surface.
+            assert!(
+                distinct(at(left - 1.0, top + line_height * 0.6), base.into_rgba8()) <= 2,
+                "the chip stays within its code's room"
             );
             // The top of the line box stays the surface, so the chip on
             // the line above never meets this one.
