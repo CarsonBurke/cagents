@@ -720,7 +720,7 @@ struct Codex {
     children: BTreeMap<String, Box<Codex>>,
     /// Where the nickname shown for each child was learned, by child ID. It
     /// outlives a child's parser, which a crowded conversation can evict and
-    /// readmit, and covers children never admitted.
+    /// readmit.
     child_names: BTreeMap<String, ChildName>,
     branch_points: Vec<chat::BranchPoint>,
     is_child: bool,
@@ -1022,8 +1022,9 @@ impl Codex {
         Ok(nickname.is_some())
     }
     /// Publish the nickname a child's own thread read reports, which can name
-    /// a child discovered without one. It is the child's current name unless
-    /// a live notification has reported one since the read was requested.
+    /// a child discovered without one. A name already current, such as the
+    /// one in the live notification that requested the read, stands: Codex
+    /// names a child once, when it spawns it, so a read never corrects one.
     fn read_child_name(&mut self, id: &str, thread: &Value, step: &mut Step) {
         let Some(nickname) = agent_nickname(thread) else {
             return;
@@ -1573,8 +1574,10 @@ impl Codex {
     fn page(&mut self, page: &Value, step: &mut Step, earlier: bool) -> Result<(), String> {
         let mut items = Vec::new();
         // Children whose nickname this page set. The page is read oldest
-        // first, so a later call on it may advance that name; a name known
-        // before the page is newer than any it records.
+        // first, so a later call on it may advance that name. A name known
+        // before the page stands: it came from a listing, a live
+        // notification or a newer page, or, when the latest page is read
+        // again, from that page's earlier reading.
         let mut named = std::collections::BTreeSet::new();
         for turn in array(page, "data")?.iter().rev() {
             let turn_id = string(turn, "id")?;

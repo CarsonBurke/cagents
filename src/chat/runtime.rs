@@ -6797,7 +6797,7 @@ mod tests {
             ]),
             "a page names an unknown child by its latest call, and no other"
         );
-        // A thread read answered before the live name cannot replace it.
+        // The thread read requested with the live name cannot replace it.
         let resumed = adapter
             .receive(json!({"id":read,"result":{
                 "thread":{"id":"child","agentNickname":"Scout","status":{"type":"active"}},
