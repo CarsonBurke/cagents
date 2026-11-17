@@ -113,6 +113,9 @@ pub enum ShortcutScope {
     Review,
     /// Only in a native chat pane; other panes retain the configured keys.
     Chat,
+    /// Only in a pane with an inspector: not on an application page such as
+    /// Settings, which has none, nor with no pane focused.
+    Inspector,
 }
 
 impl ShortcutScope {
@@ -124,6 +127,7 @@ impl ShortcutScope {
             Self::OutsideTerminal => focused != FocusedPane::Terminal,
             Self::Review => focused == FocusedPane::Review,
             Self::Chat => focused == FocusedPane::Chat,
+            Self::Inspector => !matches!(focused, FocusedPane::Page | FocusedPane::None),
         }
     }
 }
@@ -137,9 +141,14 @@ pub enum FocusedPane {
     Review,
     /// A native chat composer and transcript.
     Chat,
-    /// Any other pane, or none.
-    #[default]
+    /// An application page, such as Settings, which belongs to no worktree
+    /// and so has no inspector.
+    Page,
+    /// Any other pane.
     Other,
+    /// No pane has focus.
+    #[default]
+    None,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,7 +213,7 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
         action: GlobalShortcut::ToggleInspector,
         label: "Toggle inspector",
         repeatable: false,
-        scope: ShortcutScope::Workspace,
+        scope: ShortcutScope::Inspector,
     },
     ShortcutDescriptor {
         action: GlobalShortcut::OpenSettings,
@@ -5688,6 +5697,39 @@ mod tests {
             workspace.focus_adjacent(direction).unwrap();
         }
         assert_eq!(workspace.focused(), Some(cards[0]));
+    }
+
+    /// The inspector shortcut acts in every pane with an inspector, a
+    /// terminal included, and leaves the chord to an application page, which
+    /// has none, and to a window with no pane focused.
+    #[test]
+    fn the_inspector_shortcut_acts_only_where_there_is_an_inspector() {
+        use keyboard::key::Code;
+        let shortcuts = KeyboardShortcuts::default();
+        let modifiers = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
+        for (focused, acts) in [
+            (FocusedPane::Terminal, true),
+            (FocusedPane::Review, true),
+            (FocusedPane::Chat, true),
+            (FocusedPane::Other, true),
+            (FocusedPane::Page, false),
+            (FocusedPane::None, false),
+        ] {
+            assert_eq!(
+                global_shortcut(
+                    &key_press("i", Code::KeyI, modifiers, false),
+                    &shortcuts,
+                    focused
+                ),
+                acts.then_some(GlobalShortcut::ToggleInspector),
+                "{focused:?}"
+            );
+            assert_eq!(
+                ShortcutScope::Inspector.applies_to(focused),
+                acts,
+                "{focused:?}"
+            );
+        }
     }
 
     #[test]

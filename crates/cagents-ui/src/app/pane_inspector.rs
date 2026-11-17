@@ -13,6 +13,9 @@
 //! only one open inspector draws them: the focused pane's, or, while the
 //! focused pane's inspector is closed, the last one that drew them. Every
 //! other open inspector counts its own changes and offers to show them.
+//!
+//! Only a pane whose work belongs to a worktree has an inspector; see
+//! [`offers_inspector`].
 
 use super::*;
 
@@ -25,6 +28,27 @@ pub(super) const TOGGLE_INSET: f32 = space::XS;
 
 /// Content stops a standard gap before the floating toggle's leading edge.
 pub(super) const TOGGLE_CLEARANCE: f32 = TOGGLE_INSET + design::PRIMARY_CONTROL_SIZE + space::S;
+
+/// Whether a pane of `kind` has an inspector.
+///
+/// The inspector shows a pane's work: its conversation's pull requests, the
+/// worktree's changes and files, an editor's language-server results. A
+/// terminal, chat or editor names its worktree; a pull request pane its
+/// repository; a browser lives in a worktree's or channel's strip, beside the
+/// work it previews, and shows that strip's worktree. An application page -
+/// Settings, Accounts, Automations, the Work board of every worktree -
+/// belongs to no worktree, so its inspector could only show whichever
+/// worktree the window last bound, which has nothing to do with the page.
+pub(super) fn offers_inspector(kind: &CardKind) -> bool {
+    match kind {
+        CardKind::Terminal(_)
+        | CardKind::Chat(_)
+        | CardKind::Browser(_)
+        | CardKind::PullRequests(_)
+        | CardKind::Repository(_) => true,
+        CardKind::Settings | CardKind::Accounts | CardKind::Automations | CardKind::Work => false,
+    }
+}
 
 /// One pane's inspector.
 #[derive(Debug, Clone, Copy, Default)]
@@ -92,7 +116,7 @@ impl PaneInspectors {
     }
 
     /// The panes to save as open, in a stable order, among the cards `known`
-    /// says still exist.
+    /// says still exist and have an inspector.
     pub(super) fn saved(&self, known: impl Fn(CardId) -> bool) -> Vec<CardId> {
         let mut open: Vec<CardId> = self
             .panes
@@ -212,23 +236,31 @@ impl PaneInspectors {
     /// pane's open inspector,
     /// or stays with the one that last drew it, else goes to the first
     /// open one on screen. `cards` is every pane in the window, `focused`
-    /// the focused one, and `on_screen` says which the strip shows.
+    /// the focused one, `inspects` says which have an inspector, and
+    /// `on_screen` says which the strip shows.
+    ///
+    /// A pane without an inspector restores none: whatever was saved open
+    /// for it is dropped, and a legacy window's one inspector waits for the
+    /// first focused pane that has one.
     pub(super) fn sync(
         &mut self,
         cards: &[CardId],
         focused: Option<CardId>,
+        inspects: impl Fn(CardId) -> bool,
         narrow: impl Fn(CardId) -> bool,
         on_screen: impl Fn(CardId) -> bool,
     ) {
+        let focused = focused.filter(|card| inspects(*card));
         for card in cards {
             if self.panes.contains_key(card) {
                 continue;
             }
-            let open =
-                self.restored_open.remove(card) || (self.legacy_open && Some(*card) == focused);
-            if self.legacy_open && Some(*card) == focused {
+            let restored = self.restored_open.remove(card);
+            let legacy = self.legacy_open && Some(*card) == focused;
+            if legacy {
                 self.legacy_open = false;
             }
+            let open = (restored || legacy) && inspects(*card);
             self.panes.insert(
                 *card,
                 PaneState {
@@ -326,12 +358,25 @@ impl Cagents {
     }
 
     /// The focused pane, whose inspector the keyboard shortcut and the
-    /// commands that show their results there open.
+    /// commands that show their results there open, if it has one.
     pub(super) fn focused_inspector_pane(&self) -> Option<CardId> {
-        self.workspace.focused()
+        self.workspace
+            .focused()
+            .filter(|card| self.pane_has_inspector(*card))
     }
 
+    /// Whether the pane has an inspector; see [`offers_inspector`].
+    pub(super) fn pane_has_inspector(&self, card: CardId) -> bool {
+        self.card_state(card)
+            .is_some_and(|card| offers_inspector(&card.kind))
+    }
+
+    /// Opens or closes the pane's inspector. A pane without one never opens
+    /// it.
     pub(super) fn set_pane_inspector_open(&mut self, card: CardId, open: bool) -> Task<Message> {
+        if open && !self.pane_has_inspector(card) {
+            return Task::none();
+        }
         let closing_overlay =
             !open && self.pane_inspector_layout(card) == Some(InspectorLayout::Overlay);
         let narrow = self.pane_too_narrow(card);
@@ -409,12 +454,21 @@ impl Cagents {
     /// Runs at the tail of every update, before the source-control rebind;
     /// see [`PaneInspectors::sync`].
     pub(super) fn sync_pane_inspectors(&mut self) {
-        let cards: Vec<CardId> = self.durable.cards.iter().map(|card| card.id).collect();
+        let mut cards = Vec::with_capacity(self.durable.cards.len());
+        // At most the few application pages, so a scan is cheapest.
+        let mut without = Vec::new();
+        for card in &self.durable.cards {
+            cards.push(card.id);
+            if !offers_inspector(&card.kind) {
+                without.push(card.id);
+            }
+        }
         let focused = self.workspace.focused();
         let workspace = &self.workspace;
         self.pane_inspectors.sync(
             &cards,
             focused,
+            |card| !without.contains(&card),
             |card| pane_too_narrow(workspace, card),
             |card| {
                 workspace
@@ -652,14 +706,14 @@ mod tests {
     fn each_pane_opens_and_closes_its_own_inspector() {
         let panes = cards(2);
         let mut inspectors = PaneInspectors::default();
-        inspectors.sync(&panes, Some(panes[0]), |_| false, |_| true);
+        inspectors.sync(&panes, Some(panes[0]), |_| true, |_| false, |_| true);
         assert!(!inspectors.is_open(panes[0]) && !inspectors.is_open(panes[1]));
         open(&mut inspectors, panes[0]);
-        inspectors.sync(&panes, Some(panes[0]), |_| false, |_| true);
+        inspectors.sync(&panes, Some(panes[0]), |_| true, |_| false, |_| true);
         assert!(inspectors.is_open(panes[0]));
         assert!(!inspectors.is_open(panes[1]), "the other pane stays closed");
         // Focus moving to the other pane leaves both as they were.
-        inspectors.sync(&panes, Some(panes[1]), |_| false, |_| true);
+        inspectors.sync(&panes, Some(panes[1]), |_| true, |_| false, |_| true);
         assert!(inspectors.is_open(panes[0]) && !inspectors.is_open(panes[1]));
     }
 
@@ -667,15 +721,15 @@ mod tests {
     fn a_pane_opened_from_another_copies_its_inspector() {
         let panes = cards(1);
         let mut inspectors = PaneInspectors::default();
-        inspectors.sync(&panes, Some(panes[0]), |_| false, |_| true);
+        inspectors.sync(&panes, Some(panes[0]), |_| true, |_| false, |_| true);
         open(&mut inspectors, panes[0]);
-        inspectors.sync(&panes, Some(panes[0]), |_| false, |_| true);
+        inspectors.sync(&panes, Some(panes[0]), |_| true, |_| false, |_| true);
         let split = CardId::new();
         inspectors.inherit(panes[0], split);
         // Saved before the workspace brings it, it is saved open.
         assert_eq!(inspectors.saved(|_| true).len(), 2);
         let both = [panes[0], split];
-        inspectors.sync(&both, Some(split), |_| false, |_| true);
+        inspectors.sync(&both, Some(split), |_| true, |_| false, |_| true);
         assert!(
             inspectors.is_open(split),
             "copied from the pane it came from"
@@ -684,16 +738,23 @@ mod tests {
         // From a pane with its inspector closed, the new pane's is closed,
         // and a pane merely opened beside an open one is closed too.
         let mut inspectors = PaneInspectors::default();
-        inspectors.sync(&panes, Some(panes[0]), |_| false, |_| true);
+        inspectors.sync(&panes, Some(panes[0]), |_| true, |_| false, |_| true);
         let split = CardId::new();
         inspectors.inherit(panes[0], split);
-        inspectors.sync(&[panes[0], split], Some(split), |_| false, |_| true);
+        inspectors.sync(
+            &[panes[0], split],
+            Some(split),
+            |_| true,
+            |_| false,
+            |_| true,
+        );
         assert!(!inspectors.is_open(split));
         open(&mut inspectors, panes[0]);
         let beside = CardId::new();
         inspectors.sync(
             &[panes[0], split, beside],
             Some(beside),
+            |_| true,
             |_| false,
             |_| true,
         );
@@ -704,15 +765,15 @@ mod tests {
     fn open_inspectors_survive_a_restart_and_a_legacy_window_keeps_its_one() {
         let panes = cards(3);
         let mut inspectors = PaneInspectors::default();
-        inspectors.sync(&panes, Some(panes[0]), |_| false, |_| true);
+        inspectors.sync(&panes, Some(panes[0]), |_| true, |_| false, |_| true);
         open(&mut inspectors, panes[2]);
         let saved = inspectors.saved(|_| true);
         assert_eq!(saved, vec![panes[2]]);
 
         // The workspace may arrive after the window view.
         let mut restored = PaneInspectors::restore(Some(saved), false);
-        restored.sync(&[], None, |_| false, |_| true);
-        restored.sync(&panes, Some(panes[0]), |_| false, |_| true);
+        restored.sync(&[], None, |_| true, |_| false, |_| true);
+        restored.sync(&panes, Some(panes[0]), |_| true, |_| false, |_| true);
         assert!(restored.is_open(panes[2]));
         assert!(!restored.is_open(panes[0]) && !restored.is_open(panes[1]));
         // A pane saved open but not yet seen is still saved open.
@@ -722,11 +783,11 @@ mod tests {
         // A window saved with its one inspector open opens the focused
         // pane's; one saved closed opens none.
         let mut legacy = PaneInspectors::restore(None, true);
-        legacy.sync(&panes, Some(panes[1]), |_| false, |_| true);
+        legacy.sync(&panes, Some(panes[1]), |_| true, |_| false, |_| true);
         assert!(legacy.is_open(panes[1]));
         assert!(!legacy.is_open(panes[0]) && !legacy.is_open(panes[2]));
         let mut closed = PaneInspectors::restore(None, false);
-        closed.sync(&panes, Some(panes[1]), |_| false, |_| true);
+        closed.sync(&panes, Some(panes[1]), |_| true, |_| false, |_| true);
         assert!(panes.iter().all(|pane| !closed.is_open(*pane)));
     }
 
@@ -735,9 +796,9 @@ mod tests {
         let panes = cards(1);
         let pane = panes[0];
         let mut inspectors = PaneInspectors::default();
-        inspectors.sync(&panes, Some(pane), |_| false, |_| true);
+        inspectors.sync(&panes, Some(pane), |_| true, |_| false, |_| true);
         open(&mut inspectors, pane);
-        inspectors.sync(&panes, Some(pane), |_| true, |_| true);
+        inspectors.sync(&panes, Some(pane), |_| true, |_| true, |_| true);
         assert!(!inspectors.is_open(pane), "narrowing closes it");
         assert!(!inspectors.is_visible(pane), "at once, without a slide");
         assert_eq!(
@@ -746,26 +807,26 @@ mod tests {
             "a restart in a wider window brings it back"
         );
         // Widening brings it back.
-        inspectors.sync(&panes, Some(pane), |_| false, |_| true);
+        inspectors.sync(&panes, Some(pane), |_| true, |_| false, |_| true);
         assert!(inspectors.is_open(pane));
-        inspectors.sync(&panes, Some(pane), |_| true, |_| true);
+        inspectors.sync(&panes, Some(pane), |_| true, |_| true, |_| true);
         assert!(!inspectors.is_open(pane));
 
         // Reopened while narrow, it stays open, over the content.
         assert!(inspectors.set_open(pane, true, true, None, Instant::now()));
-        inspectors.sync(&panes, Some(pane), |_| true, |_| true);
+        inspectors.sync(&panes, Some(pane), |_| true, |_| true, |_| true);
         assert!(inspectors.is_open(pane) && inspectors.opened_narrow(pane));
         // Once the pane is wide again it docks, and narrowing closes it.
-        inspectors.sync(&panes, Some(pane), |_| false, |_| true);
+        inspectors.sync(&panes, Some(pane), |_| true, |_| false, |_| true);
         assert!(inspectors.is_open(pane) && !inspectors.opened_narrow(pane));
-        inspectors.sync(&panes, Some(pane), |_| true, |_| true);
+        inspectors.sync(&panes, Some(pane), |_| true, |_| true, |_| true);
         assert!(!inspectors.is_open(pane));
 
         // Closed by the user, it stays closed when the pane widens.
         let now = Instant::now();
         assert!(inspectors.set_open(pane, true, true, None, now));
         assert!(inspectors.set_open(pane, false, true, None, now));
-        inspectors.sync(&panes, Some(pane), |_| false, |_| true);
+        inspectors.sync(&panes, Some(pane), |_| true, |_| false, |_| true);
         assert!(!inspectors.is_open(pane));
         assert!(inspectors.saved(|_| true).is_empty());
     }
@@ -802,6 +863,11 @@ mod tests {
 
     /// Where the pane's view lays out its inspector toggle.
     fn toggle_bounds(app: &Cagents, card: CardId, size: iced::Size) -> iced::Rectangle {
+        mounted_toggle(app, card, size).expect("the pane mounts its inspector toggle")
+    }
+
+    /// Where the pane's view lays out its inspector toggle, if it mounts one.
+    fn mounted_toggle(app: &Cagents, card: CardId, size: iced::Size) -> Option<iced::Rectangle> {
         use cosmic::iced::advanced::widget::{Operation, Tree, operation::Focusable};
         use cosmic::iced::advanced::{Layout, layout};
 
@@ -834,7 +900,7 @@ mod tests {
         element
             .as_widget_mut()
             .operate(&mut tree, Layout::new(&node), &renderer, &mut find);
-        find.1.expect("the pane mounts its inspector toggle")
+        find.1
     }
 
     #[test]
@@ -880,28 +946,28 @@ mod tests {
     fn source_control_follows_the_focused_open_inspector_or_stays_where_it_was() {
         let panes = cards(3);
         let mut inspectors = PaneInspectors::default();
-        inspectors.sync(&panes, Some(panes[0]), |_| false, |_| true);
+        inspectors.sync(&panes, Some(panes[0]), |_| true, |_| false, |_| true);
         assert_eq!(inspectors.source_control(), None);
         open(&mut inspectors, panes[0]);
-        inspectors.sync(&panes, Some(panes[0]), |_| false, |_| true);
+        inspectors.sync(&panes, Some(panes[0]), |_| true, |_| false, |_| true);
         assert_eq!(inspectors.source_control(), Some(panes[0]));
         // Focusing a pane with its inspector closed keeps it where it is.
-        inspectors.sync(&panes, Some(panes[2]), |_| false, |_| true);
+        inspectors.sync(&panes, Some(panes[2]), |_| true, |_| false, |_| true);
         assert_eq!(inspectors.source_control(), Some(panes[0]));
         // Focusing another open one moves it there.
         open(&mut inspectors, panes[1]);
-        inspectors.sync(&panes, Some(panes[1]), |_| false, |_| true);
+        inspectors.sync(&panes, Some(panes[1]), |_| true, |_| false, |_| true);
         assert_eq!(inspectors.source_control(), Some(panes[1]));
         // Closing that one hands it to the inspector still open.
         let now = Instant::now();
         inspectors.set_open(panes[1], false, false, None, now);
         inspectors.advance(now + DIALOG_TRANSITION_DURATION);
-        inspectors.sync(&panes, Some(panes[1]), |_| false, |_| true);
+        inspectors.sync(&panes, Some(panes[1]), |_| true, |_| false, |_| true);
         assert_eq!(inspectors.source_control(), Some(panes[0]));
         // With none open, none draws it.
         inspectors.set_open(panes[0], false, false, None, now);
         inspectors.advance(now + DIALOG_TRANSITION_DURATION);
-        inspectors.sync(&panes, Some(panes[1]), |_| false, |_| true);
+        inspectors.sync(&panes, Some(panes[1]), |_| true, |_| false, |_| true);
         assert_eq!(inspectors.source_control(), None);
     }
 
@@ -909,29 +975,211 @@ mod tests {
     fn source_control_leaves_an_inspector_the_strip_scrolled_away() {
         let panes = cards(3);
         let mut inspectors = PaneInspectors::default();
-        inspectors.sync(&panes, Some(panes[0]), |_| false, |_| true);
+        inspectors.sync(&panes, Some(panes[0]), |_| true, |_| false, |_| true);
         open(&mut inspectors, panes[0]);
         open(&mut inspectors, panes[2]);
-        inspectors.sync(&panes, Some(panes[0]), |_| false, |_| true);
+        inspectors.sync(&panes, Some(panes[0]), |_| true, |_| false, |_| true);
         assert_eq!(inspectors.source_control(), Some(panes[0]));
         // Focus moves to a closed pane and the strip scrolls the owner away:
         // the open inspector still in view draws it.
         let on_screen = |card| card != panes[0];
-        inspectors.sync(&panes, Some(panes[1]), |_| false, on_screen);
+        inspectors.sync(&panes, Some(panes[1]), |_| true, |_| false, on_screen);
         assert_eq!(inspectors.source_control(), Some(panes[2]));
         assert!(inspectors.is_open(panes[0]), "scrolled away, still open");
         // With no open inspector in view, none draws it.
-        inspectors.sync(&panes, Some(panes[1]), |_| false, |card| card == panes[1]);
+        inspectors.sync(
+            &panes,
+            Some(panes[1]),
+            |_| true,
+            |_| false,
+            |card| card == panes[1],
+        );
         assert_eq!(inspectors.source_control(), None);
+    }
+
+    /// The application pages, which belong to no worktree.
+    const PAGES: [CardKind; 4] = [
+        CardKind::Settings,
+        CardKind::Accounts,
+        CardKind::Automations,
+        CardKind::Work,
+    ];
+
+    #[test]
+    fn only_panes_whose_work_belongs_to_a_worktree_offer_an_inspector() {
+        let directory = PathBuf::from("/work/project");
+        let recipe = crate::model::LaunchRecipe {
+            program: "/bin/sh".into(),
+            arguments: Vec::new(),
+            working_directory: directory.clone(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let url = Url::parse("http://localhost:8080/").unwrap();
+        let with_work = [
+            ("terminal", super::super::tests::terminal_card_state().kind),
+            (
+                "chat",
+                CardKind::Chat(crate::chat::Session {
+                    id: crate::model::TerminalId::new(),
+                    launch: crate::chat::Launch {
+                        provider: crate::agent::Provider::Omp,
+                        recipe,
+                        session_id: None,
+                    },
+                    proof: None,
+                    terminal: None,
+                    owned_codex_listener: None,
+                    native_continuity: Default::default(),
+                }),
+            ),
+            (
+                "browser",
+                CardKind::Browser(crate::model::BrowserSession {
+                    id: crate::model::BrowserId::new(),
+                    current_url: url.clone(),
+                    history: vec![url],
+                    history_index: 0,
+                    scroll_x: 0.0,
+                    scroll_y: 0.0,
+                    fidelity: crate::model::BrowserRestoreFidelity::UrlOnly,
+                }),
+            ),
+            (
+                "pull requests",
+                CardKind::PullRequests(crate::model::PullRequestView {
+                    repository: directory.clone(),
+                    selected_number: Some(1),
+                    file_panel_width: None,
+                    file_panel_collapsed: None,
+                }),
+            ),
+            (
+                "repository",
+                CardKind::Repository(crate::model::RepositoryView {
+                    project: ProjectId::new(),
+                    repository: directory.clone(),
+                    worktree: directory.clone(),
+                    selected_file: None,
+                }),
+            ),
+            (
+                "editor",
+                CardKind::Repository(crate::model::RepositoryView {
+                    project: ProjectId::new(),
+                    repository: directory.clone(),
+                    worktree: directory,
+                    selected_file: Some("src/main.rs".into()),
+                }),
+            ),
+        ];
+        for (name, kind) in &with_work {
+            assert!(offers_inspector(kind), "a {name} pane has an inspector");
+        }
+        for page in &PAGES {
+            assert!(!offers_inspector(page), "{page:?} has no inspector");
+        }
+    }
+
+    /// A terminal app with `page` opened beside its terminal and focused.
+    fn page_app(page: &CardKind) -> (Cagents, CardId, CardId) {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let terminal = app.workspace.focused().unwrap();
+        drop(app.open_utility_card(page.clone()));
+        let page = app.workspace.focused().unwrap();
+        assert_ne!(page, terminal, "the page opens as its own pane");
+        drop(app.workspace.resize_viewport(1200.0));
+        app.sync_pane_inspectors();
+        (app, terminal, page)
+    }
+
+    #[test]
+    fn an_application_page_has_no_toggle_and_nothing_opens_its_inspector() {
+        let size = iced::Size::new(1200.0, 800.0);
+        for kind in &PAGES {
+            let (mut app, terminal, page) = page_app(kind);
+            assert!(!app.pane_has_inspector(page), "{kind:?}");
+            assert_eq!(
+                mounted_toggle(&app, page, size),
+                None,
+                "{kind:?} mounts no toggle, so it takes no room or focus stop"
+            );
+            assert_eq!(app.focused_inspector_pane(), None, "{kind:?}");
+
+            // Neither the shortcut, the toggle's message nor a command that
+            // shows its result in the inspector opens one.
+            drop(app.update(Message::ToggleContextInspector));
+            drop(app.update(Message::TogglePaneInspector(page)));
+            drop(app.set_pane_inspector_open(page, true));
+            app.settle_pane_inspectors();
+            assert!(!app.pane_inspectors.is_visible(page), "{kind:?}");
+            assert_eq!(app.pane_inspector_layout(page), None, "{kind:?}");
+            assert_eq!(app.pane_inspectors.source_control(), None, "{kind:?}");
+            assert!(
+                app.pane_inspectors
+                    .saved(|card| app.pane_has_inspector(card))
+                    .is_empty(),
+                "{kind:?}"
+            );
+
+            // The terminal beside it keeps its toggle and its inspector,
+            // which keeps source control while the page has focus.
+            assert!(mounted_toggle(&app, terminal, size).is_some(), "{kind:?}");
+            app.open_pane_inspector_now(terminal);
+            assert!(app.pane_inspectors.is_open(terminal), "{kind:?}");
+            drop(app.workspace.focus(page));
+            app.sync_pane_inspectors();
+            assert_eq!(
+                app.pane_inspectors.source_control(),
+                Some(terminal),
+                "{kind:?} never takes source control from the open inspector"
+            );
+            drop(app.update(Message::ToggleContextInspector));
+            assert!(
+                app.pane_inspectors.is_open(terminal),
+                "{kind:?}: the shortcut on the page leaves another pane's inspector alone"
+            );
+        }
+    }
+
+    #[test]
+    fn a_page_saved_open_restores_closed_and_leaves_other_panes_saved_open() {
+        let panes = cards(3);
+        let page = panes[1];
+        let inspects = |card: CardId| card != page;
+        // `saved` lists its panes sorted.
+        let mut others = vec![panes[0], panes[2]];
+        others.sort_unstable();
+        let mut restored = PaneInspectors::restore(Some(panes.clone()), false);
+        // Before the workspace brings them, a page is not saved open.
+        assert_eq!(restored.saved(inspects), others);
+        restored.sync(&panes, Some(page), inspects, |_| false, |_| true);
+        assert!(!restored.is_open(page) && !restored.is_visible(page));
+        assert!(restored.is_open(panes[0]) && restored.is_open(panes[2]));
+        assert_eq!(restored.source_control(), Some(panes[0]));
+        assert_eq!(
+            restored.saved(|_| true),
+            others,
+            "the page's saved state is dropped, the others' kept"
+        );
+
+        // A legacy window focused on a page opens the first pane with an
+        // inspector the user focuses instead.
+        let mut legacy = PaneInspectors::restore(None, true);
+        legacy.sync(&panes, Some(page), inspects, |_| false, |_| true);
+        assert!(panes.iter().all(|card| !legacy.is_open(*card)));
+        legacy.sync(&panes, Some(panes[2]), inspects, |_| false, |_| true);
+        assert!(legacy.is_open(panes[2]));
+        assert!(!legacy.is_open(page) && !legacy.is_open(panes[0]));
     }
 
     #[test]
     fn closing_a_pane_forgets_its_inspector() {
         let panes = cards(2);
         let mut inspectors = PaneInspectors::default();
-        inspectors.sync(&panes, Some(panes[0]), |_| false, |_| true);
+        inspectors.sync(&panes, Some(panes[0]), |_| true, |_| false, |_| true);
         open(&mut inspectors, panes[1]);
-        inspectors.sync(&panes[..1], Some(panes[0]), |_| false, |_| true);
+        inspectors.sync(&panes[..1], Some(panes[0]), |_| true, |_| false, |_| true);
         assert!(!inspectors.is_visible(panes[1]));
         assert!(inspectors.saved(|_| true).is_empty());
     }

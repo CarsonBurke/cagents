@@ -1880,6 +1880,31 @@ mod tests {
             before
         );
     }
+    /// An application page has no inspector, so the palette offers no
+    /// command to toggle one there.
+    #[test]
+    fn palette_offers_the_inspector_only_where_the_focused_pane_has_one() {
+        let offers = |app: &Cagents| {
+            app.palette_entries().iter().any(|(_, _, message)| {
+                matches!(message, Message::RunCommand(Command::ToggleInspector))
+            })
+        };
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        assert!(offers(&app), "a terminal has an inspector");
+        for page in [
+            CardKind::Settings,
+            CardKind::Accounts,
+            CardKind::Automations,
+            CardKind::Work,
+        ] {
+            drop(app.open_utility_card(page.clone()));
+            assert!(!offers(&app), "{page:?} has no inspector");
+        }
+        assert!(
+            !offers(&super::super::tests::context_inspector_test_app(false)),
+            "nor does a window with no pane"
+        );
+    }
     #[test]
     fn palette_filters_commands_without_changing_workspace() {
         let mut app = super::super::tests::context_inspector_test_app(true);
