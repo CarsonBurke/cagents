@@ -365,6 +365,19 @@ class Comparison(unittest.TestCase):
         projection = records.paused_history_projection(before,after,source)
         self.assertEqual(projection['launch']['recipe']['arguments'],arguments)
 
+    def test_a_cli_without_launch_environments_is_compared_without_the_stores(self):
+        recipe = {'program':'claude','arguments':[],'working_directory':'/repo'}
+        stored = {'id':'chat','launch':{'recipe':{**recipe,'environment':{'TOKEN':'value'}}}}
+        printed = {'id':'chat','launch':{'recipe':recipe}}
+        self.assertEqual(records.as_printed(stored,printed),printed)
+        # An older CLI that printed the environment is compared with all of it.
+        self.assertEqual(records.as_printed(stored,stored),stored)
+        other = {'id':'chat','launch':{'recipe':{**recipe,'environment':{'TOKEN':'other'}}}}
+        self.assertNotEqual(records.as_printed(stored,other),other)
+        # Only a recipe's environment goes, not another object's.
+        settings = {'environment':{'KEEP':'1'},'program':'x'}
+        self.assertEqual(records.without_launch_environments(settings),settings)
+
     def test_console_program_change_requires_exact_target_same_run_and_pane(self):
         before, after = self.paused_replacement()
         before['root'] = after['root'] = '/var/tmp/cr/test'
@@ -382,12 +395,24 @@ class Comparison(unittest.TestCase):
         self.assertTrue(records.console_relaunch(before,after,'terminal'))
         changes = records.compare(before,after)
         self.assertFalse(any(row['regression'] for row in changes),changes)
+        # An older CLI printed the launch environment the new one leaves out.
+        with_environment = copy.deepcopy(before)
+        with_environment['agents']['agent']['agent']['console']['launch']['environment'] = {'TOKEN':'value'}
+        without_environment = copy.deepcopy(after)
+        del without_environment['agents']['agent']['agent']['console']['launch']['environment']
+        self.assertTrue(records.console_relaunch(with_environment,without_environment,'terminal'))
+        # And a rollback to a CLI that prints it again.
+        rollback_before = copy.deepcopy(before)
+        del rollback_before['agents']['agent']['agent']['console']['launch']['environment']
+        rollback_after = copy.deepcopy(after)
+        rollback_after['agents']['agent']['agent']['console']['launch']['environment'] = {'TOKEN':'value'}
+        self.assertTrue(records.console_relaunch(rollback_before,rollback_after,'terminal'))
         mutations = {
             'wrong-target':lambda a:a['target'].update(version='other'),
             'failed-update':lambda a:a['update_status'].update(phase='Failed'),
             'new-run':lambda a:a['agents']['agent'].update(run='new-run'),
             'interrupted':lambda a:a['agents']['agent'].update(state='Interrupted'),
-            'new-recipe':lambda a:a['agents']['agent']['agent']['console']['launch'].update(environment={'X':'other'}),
+            'new-recipe':lambda a:a['agents']['agent']['agent']['console']['launch'].update(working_directory='/other'),
             'new-pane':lambda a:a['stores']['windows/main/sessions.sqlite3']['rows']['terminal_recipes'][0].update(terminal_id='foreign'),
             'unverified':lambda a:a['recovery']['current']['outcome'].update(state='unverified')}
         for name, mutate in mutations.items():
@@ -861,6 +886,23 @@ class ChatViews(unittest.TestCase):
                 selected = scenario.selected_chat(root,'main','exact-card','exact-channel',descriptor)
                 self.assertEqual(selected['session'], descriptor)
                 self.assertEqual(path.read_bytes(), original)
+                # The CLI's record leaves out the launch environment the store keeps.
+                recipe = {'program':'claude','arguments':[],'working_directory':'/repo'}
+                stored = {**descriptor,'launch':{**descriptor['launch'],
+                                                 'recipe':{**recipe,'environment':{'TOKEN':'value'}}}}
+                db.execute('UPDATE cards SET content_json=?',[json.dumps(stored)])
+                db.commit()
+                printed = {**descriptor,'launch':{**descriptor['launch'],'recipe':recipe}}
+                self.assertEqual(scenario.selected_chat(root,'main','exact-card','exact-channel',printed)['session'],
+                                 stored)
+                self.assertIsNone(scenario.selected_chat(root,'main','exact-card','exact-channel',
+                    {**printed,'launch':{**printed['launch'],'recipe':{**recipe,'program':'foreign'}}}))
+                # A copy that states its environment is still compared whole.
+                self.assertIsNotNone(scenario.selected_chat(root,'main','exact-card','exact-channel',stored))
+                self.assertIsNone(scenario.selected_chat(root,'main','exact-card','exact-channel',
+                    {**stored,'launch':{**stored['launch'],'recipe':{**recipe,'environment':{'TOKEN':'other'}}}}))
+                db.execute('UPDATE cards SET content_json=?',[json.dumps(descriptor)])
+                db.commit()
                 for expected in ({**descriptor,'id':'foreign'},
                                  {**descriptor,'launch':{'provider':'Codex','session_id':'issued-thread'}},
                                  {**descriptor,'launch':{'provider':'Claude','session_id':'foreign-thread'}},
@@ -1484,6 +1526,13 @@ class NativeTerminalAfterRestore(unittest.TestCase):
         result=scenario.new_terminal_action_contract(evidence,version)
         self.assertEqual(result['shell']['pid'],500)
         self.assertEqual(result['daemon']['pid'],400)
+        # The census and the store keep the launch environment `terminal show` leaves out.
+        stored=copy.deepcopy(evidence)
+        recipe={**stored['terminal']['data']['terminal']['session']['launch'],'arguments':[]}
+        stored['terminal']['data']['terminal']['session']['launch']=recipe
+        stored['census']['terminals'][0]['launch']={**recipe,'environment':{'TOKEN':'value'}}
+        stored['selected_card']['recipe']={**recipe,'environment':{'TOKEN':'value'}}
+        self.assertEqual(scenario.new_terminal_action_contract(stored,version)['shell']['pid'],500)
         cases=[]
         changed=copy.deepcopy(evidence);changed['after_processes']['processes'][0]['pid']=101;cases.append(changed)
         changed=copy.deepcopy(evidence);changed['after_windows']={'main':11,'second':20};cases.append(changed)

@@ -223,14 +223,16 @@ fn json_outcome(kind: &Kind, output: &str) -> Option<Outcome> {
         .get("agent")
         .zip(run_data.get("run"))
         .and_then(|(agent, run)| {
-            let agent: crate::agent_execution::Agent =
-                serde_json::from_value(agent.clone()).ok()?;
+            let agent: Launched = serde_json::from_value(agent.clone()).ok()?;
             let run: crate::agent_execution::Run = serde_json::from_value(run.clone()).ok()?;
             if run.agent != agent.id {
                 return None;
             }
-            let channel = agent.channel();
-            let placement = Some(agent.placement.clone());
+            let channel = match &agent.placement {
+                crate::agent_execution::Placement::Channel(id) => Some(*id),
+                crate::agent_execution::Placement::Worktree { .. } => None,
+            };
+            let placement = Some(agent.placement);
             Some(crate::chat::coordination::Run {
                 agent: crate::agent_execution::mailbox::short(agent.id),
                 provider: agent.spec.provider.executable().to_owned(),
@@ -302,6 +304,28 @@ fn json_outcome(kind: &Kind, output: &str) -> Option<Outcome> {
         messages,
         ..Outcome::default()
     })
+}
+
+/// The fields of a reply's agent record that say how its run was launched.
+/// Only these are read, so the rest of the record, such as a hosted
+/// session's launch recipe whose environment the CLI no longer prints, may
+/// change without hiding the run.
+#[derive(Deserialize)]
+struct Launched {
+    id: crate::model::AgentId,
+    spec: LaunchedSpec,
+    #[serde(
+        alias = "channel",
+        deserialize_with = "crate::agent_execution::placement_from_legacy"
+    )]
+    placement: crate::agent_execution::Placement,
+}
+
+#[derive(Deserialize)]
+struct LaunchedSpec {
+    provider: crate::agent::Provider,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
 }
 
 fn read(kind: &Kind, output: &str) -> Outcome {
@@ -574,6 +598,31 @@ mod tests {
         let human = parse("cagents agent spawn Review", None).unwrap();
         let result = super::outcome(&human, "Accepted agent 1a2b3c4d run 5e6f7a8b");
         assert!(result.run.unwrap().channel.is_none());
+    }
+
+    /// Status, spawn and wait print the agent's record without its launch
+    /// environments, and its run is read from what remains.
+    #[test]
+    fn json_run_reads_a_record_without_launch_environments() {
+        let status = parse("cagents --json agent status reviewer", None).unwrap();
+        let mut reply = json_run("agent.status", Some("gpt-6-luna"));
+        let mut agent = super::super::tests::agent_with_credentials();
+        agent.id = reply["data"]["agent"]["id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        reply["data"]["agent"] = serde_json::to_value(&agent).unwrap();
+        super::super::withhold_launch_environments(&mut reply);
+        assert!(
+            reply["data"]["agent"]["session"]["Chat"]["launch"]["recipe"]
+                .get("environment")
+                .is_none()
+        );
+        let run = super::outcome(&status, &reply.to_string()).run.unwrap();
+        assert_eq!(run.provider, "claude");
+        assert_eq!(run.result, "Reviewed.");
+        assert_eq!(run.channel, agent.channel());
     }
 
     #[test]

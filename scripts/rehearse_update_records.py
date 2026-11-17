@@ -900,6 +900,35 @@ def load_snapshot(path: Path) -> dict:
     return value
 
 
+LAUNCH_RECIPE_FIELDS = ("program", "arguments", "working_directory", "environment")
+
+
+def without_launch_environments(value: Any) -> Any:
+    """`value` without the environment of any launch recipe it holds.
+
+    The CLI's `--json` stopped printing launch environments, whose values can
+    be credentials, while stores, censuses and older CLIs still hold them. A
+    recipe is compared by everything else it states, as the CLI recognizes
+    one: an object with every field in LAUNCH_RECIPE_FIELDS.
+    """
+    if isinstance(value, dict):
+        recipe = all(field in value for field in LAUNCH_RECIPE_FIELDS)
+        return {key: without_launch_environments(item) for key, item in value.items()
+                if not (recipe and key == "environment")}
+    if isinstance(value, list):
+        return [without_launch_environments(item) for item in value]
+    return value
+
+
+def as_printed(stored: Any, printed: Any) -> Any:
+    """`stored` as a CLI's `printed` copy of it states it.
+
+    A CLI that leaves launch environments out prints none, and `stored` is
+    compared without its own; a CLI that printed them is compared whole.
+    """
+    return without_launch_environments(stored) if without_launch_environments(printed) == printed else stored
+
+
 def project(row: dict, name: str) -> dict:
     if name == "agents":
         agent = row.get("agent", {})
@@ -1053,7 +1082,9 @@ def console_relaunch(before: dict, after: dict, terminal_id: str) -> bool:
             continue
         current = after["agents"].get(key, {})
         replacement = current.get("agent", {}).get("console") or {}
+        # Either side may come from a CLI that leaves environments out.
         old_recipe, new_recipe = console.get("launch", {}), replacement.get("launch", {})
+        old_recipe, new_recipe = as_printed(old_recipe, new_recipe), as_printed(new_recipe, old_recipe)
         if (not row.get("run") or current.get("run") != row["run"]
                 or row.get("state") != "Running" or current.get("state") != "Running"
                 or replacement.get("id") != terminal_id or new_recipe.get("program") != program

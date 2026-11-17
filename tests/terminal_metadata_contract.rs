@@ -340,8 +340,12 @@ fn cli_inventory_reads_real_pty_titles_without_exporting_launch_environment() {
         assert!(row.get(field).is_none());
     }
     assert_eq!(shown["data"]["terminal"]["session"]["id"], id.to_string());
-    assert_eq!(
-        shown["data"]["terminal"]["session"]["launch"]["environment"]["FIXTURE_DISPLAY_ONLY"],
-        "full descriptor only"
+    // Show keeps the recipe, but no output names its environment's values.
+    let launch = &shown["data"]["terminal"]["session"]["launch"];
+    assert!(launch["program"].is_string(), "{launch}");
+    assert!(launch.get("environment").is_none(), "{launch}");
+    assert!(
+        !shown.to_string().contains("full descriptor only"),
+        "{shown}"
     );
 }

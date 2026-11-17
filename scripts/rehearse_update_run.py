@@ -391,6 +391,7 @@ def terminal_live_proof(continuity):
 
 
 def same_serving_terminal(left, right, proof):
+    right=records.as_printed(right,left)
     return (terminal_live_proof(left.get('continuity'))==proof
             and terminal_live_proof(right.get('continuity'))==proof
             and {**left,'continuity':{'live':proof}}=={**right,'continuity':{'live':proof}})
@@ -425,7 +426,7 @@ def new_terminal_action_contract(evidence, version_root):
         raise RuntimeError('the new terminal has no verified Ready daemon and exact live descriptor')
     card=evidence['selected_card']
     if (not card['focused'] or card['card'] in evidence['cards_before_input']
-            or card['terminal_id']!=terminal.get('id') or card['recipe']!=terminal.get('launch')
+            or card['terminal_id']!=terminal.get('id') or records.as_printed(card['recipe'],terminal.get('launch'))!=terminal.get('launch')
             or terminal_live_proof(card['continuity'])!=proof or terminal_live_proof(terminal.get('continuity'))!=proof):
         raise RuntimeError('the native user action did not focus a newly issued terminal card')
     line=evidence['output_line']
@@ -599,12 +600,13 @@ def selected_chat(root, slot, card_id, channel_id, expected, required_thread=Non
         launch = descriptor.get('launch', {})
         proof = expected.get('proof')
         thread = launch.get('session_id')
-        bound = copy.deepcopy(descriptor)
+        # The store keeps the launch environment a newer CLI leaves out.
+        bound = copy.deepcopy(records.as_printed(descriptor, expected))
         if expected.get('launch',{}).get('session_id') is None:
             bound.get('launch',{}).update(session_id=None)
         if (descriptor.get('id') != expected['id']
                 or launch.get('provider') != expected['launch']['provider']
-                or launch.get('recipe') != expected['launch'].get('recipe')
+                or bound.get('launch',{}).get('recipe') != expected['launch'].get('recipe')
                 or not isinstance(proof,dict) or descriptor.get('proof') != proof
                 or any(not isinstance(proof.get(field),str) or not proof[field]
                        for field in ('host_session_id','boot_id','host_incarnation'))
@@ -1339,7 +1341,7 @@ class Rehearsal:
                     if (not code and isinstance(shown.get('data',{}).get('proof'),dict)
                             and terminal_live_proof(actual.get('continuity'))==shown.get('data',{}).get('proof')
                             and terminal_live_proof(selected['continuity'])==shown.get('data',{}).get('proof')
-                            and selected['recipe']==actual['launch']):
+                            and records.as_printed(selected['recipe'],actual['launch'])==actual['launch']):
                         if expect_failure:
                             raise RuntimeError('the expected before failure instead opened a live terminal')
                         break
