@@ -17739,9 +17739,15 @@ impl Application for Cagents {
                 }
             }
             Message::AcknowledgeVisiblePane { card, epoch } => {
-                if epoch == self.attention_focus_epoch && self.pane_is_active(card) {
-                    self.acknowledge_visible_pane()
-                } else { Task::none() }
+                let due = epoch == self.attention_focus_epoch && self.pane_is_active(card);
+                // A dwell that marks nothing read records only that it ended,
+                // which the notification presence after the projection reads.
+                if (!due || self.visible_dwell_reads_nothing())
+                    && !self.update_tail_may_close_or_commit()
+                {
+                    projection = Projection::Unchanged;
+                }
+                if due { self.acknowledge_visible_pane() } else { Task::none() }
             }
             Message::FocusCard(id) => {
                 // Explicit activation also cancels a pending entry on this same

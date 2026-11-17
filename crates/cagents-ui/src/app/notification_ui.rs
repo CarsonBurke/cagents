@@ -543,6 +543,18 @@ impl Cagents {
         })
     }
 
+    /// Whether [`Self::acknowledge_visible_pane`] would only record that the
+    /// visible pane's dwell ended: the pane is still the one the dwell began
+    /// on, no notice from then is unread and its card has no unread update.
+    pub(super) fn visible_dwell_reads_nothing(&self) -> bool {
+        let visible = self.visible_attention_owner();
+        visible.is_some_and(|pane| {
+            self.notification_ui.visible_pane == visible
+                && self.notification_ui.visible_notices.is_empty()
+                && !self.sidebar_state.has_card_update(pane.card)
+        })
+    }
+
     pub(super) fn acknowledge_visible_pane(&mut self) -> Task<Message> {
         // A conversation can be replaced inside the same focused card. Check
         // its owner again before consuming a timer's captured journal IDs,
@@ -1911,6 +1923,33 @@ mod tests {
             app.notification_ui.pending.lock().unwrap().acknowledged,
             BTreeSet::from([id])
         );
+    }
+
+    /// A dwell ending on a pane with nothing unread, or a timer a later
+    /// focus superseded, changes nothing the projection reads; one that marks
+    /// an update read clears its sidebar attention.
+    #[test]
+    fn attention_dwell_projects_only_when_it_marks_something_read() {
+        use super::super::terminal_output_tests::projections;
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        app.refresh_ui.focused = true;
+        let card = app.workspace.focused().unwrap();
+        assert!(app.pane_is_active(card));
+        drop(app.sync_visible_attention());
+        let epoch = app.attention_focus_epoch;
+        assert!(app.visible_dwell_reads_nothing());
+        let projected = projections();
+        drop(app.update(Message::AcknowledgeVisiblePane {
+            card,
+            epoch: epoch.wrapping_sub(1),
+        }));
+        drop(app.update(Message::AcknowledgeVisiblePane { card, epoch }));
+        assert_eq!(projections(), projected, "nothing was unread");
+
+        app.sidebar_state.observe_card_update(card);
+        drop(app.update(Message::AcknowledgeVisiblePane { card, epoch }));
+        assert!(!app.sidebar_state.has_card_update(card));
+        assert_eq!(projections(), projected + 1, "the update was read");
     }
 
     #[test]

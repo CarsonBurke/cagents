@@ -406,6 +406,7 @@ impl Cagents {
                 message,
                 Message::ReplicaCaptureDue(_)
                     | Message::NavigationSaveDue(_)
+                    | Message::AcknowledgeVisiblePane { .. }
                     | Message::TerminalWake { .. }
                     | Message::WorkspaceModelObserved(_)
                     | Message::KeyEvent { .. }
