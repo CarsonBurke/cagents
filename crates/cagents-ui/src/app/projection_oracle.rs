@@ -56,7 +56,17 @@ pub(super) fn enabled() -> bool {
     #[cfg(not(test))]
     {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| std::env::var_os("CAGENTS_PROJECTION_ORACLE").is_some())
+        *ENABLED.get_or_init(|| {
+            let enabled = std::env::var_os("CAGENTS_PROJECTION_ORACLE").is_some();
+            if enabled {
+                // So a log without reports shows the check ran.
+                tracing::info!(
+                    target: "cagents::projection_oracle",
+                    "checking every narrower update projection against the full one"
+                );
+            }
+            enabled
+        })
     }
 }
 
