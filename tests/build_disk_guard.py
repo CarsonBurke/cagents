@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise scripts/build-disk-guard with private locks and a stand-in pruner."""
 
+import ctypes
 import fcntl
 import os
 import select
@@ -26,10 +27,37 @@ def until(path):
             f'[ $i -lt {HANG_GUARD * 20} ]; do sleep 0.1; i=$((i + 1)); done\n')
 
 
+PR_SET_CHILD_SUBREAPER = 36
+
+
+def adopt_orphans():
+    """Makes this process the parent of every process its children leave
+    behind, as the guard leaves the pruner it starts in the background."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), "prctl(PR_SET_CHILD_SUBREAPER)")
+
+
+def children():
+    """This process's living and unreaped children, with their command lines."""
+    found = {}
+    for task in Path("/proc/self/task").iterdir():
+        for pid in (task / "children").read_text().split():
+            try:
+                found[pid] = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode().strip()
+            except OSError:
+                found[pid] = "?"
+    return found
+
+
 class BuildDiskGuard(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="cagents-disk-guard-")
         self.addCleanup(temporary.cleanup)
+        # Runs before the directory goes: a pruner started in the background
+        # writes into it, so none may outlive the test.
+        adopt_orphans()
+        self.addCleanup(self.reap)
         self.root = Path(temporary.name)
         self.pruned = self.root / "pruned"
         self.env = {
@@ -45,6 +73,19 @@ class BuildDiskGuard(unittest.TestCase):
         self.env["CAGENTS_BUILD_PRUNE_INTERVAL_HOURS"] = "0"
         self.env["CAGENTS_BUILD_PRUNE_STATE"] = str(self.root / "pruner")
         self.env["CAGENTS_BUILD_PRUNE_ROOTS"] = str(self.root / "roots")
+
+    def reap(self):
+        """Waits for every process the guards started to end, and reaps it."""
+        deadline = time.monotonic() + HANG_GUARD
+        while True:
+            try:
+                pid, _ = os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                return
+            if pid:
+                continue
+            self.assertLess(time.monotonic(), deadline, f"still running: {children()}")
+            time.sleep(0.05)
 
     def guard(self, floor, directory=None, guard=GUARD):
         return subprocess.run(
@@ -254,6 +295,7 @@ class BuildDiskGuard(unittest.TestCase):
         long_ago = time.time() - 2 * 3600
         os.utime(self.root / "pruner.scheduled", (long_ago, long_ago))
         self.assertIn("in the background", self.guard(self.band(), guard=guard).stderr)
+        self.assertEqual(len(self.calls(calls, 2)), 2)
 
     def stand_in_offload(self, guard):
         """A stand-in for the offload helper beside `guard`, recording how it
