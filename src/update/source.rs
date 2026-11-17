@@ -61,7 +61,8 @@ const SOURCE_BUSY_PAUSE: Duration = Duration::from_secs(1);
 /// the daemon queues a stop preflight or confirmation for exclusive admission
 /// for up to 2.5 s (`host::client::exclusive_patience`), and then answers.
 /// A request sharing a deadline is not sent with less than this left, so a run
-/// of such requests ends within its deadline however the source is loaded.
+/// of such requests ends near its deadline however the source is loaded; only
+/// an admitted reply slower than the remaining half second can run past it.
 const SOURCE_ATTEMPT_ALLOWANCE: Duration = Duration::from_secs(3);
 
 /// How long one source request that the source refused while finishing another
@@ -77,7 +78,7 @@ pub(crate) enum BusyPatience {
     PerRequest(Duration),
     /// Every request shares this deadline, so a run of several requests ends
     /// within a known time however busy the source stays: no attempt starts
-    /// unless it can finish before the deadline.
+    /// unless its admission wait and a prompt reply fit before the deadline.
     Until(Instant),
 }
 
@@ -343,7 +344,7 @@ impl Client {
     /// while it finishes another operation, asking it again on the same
     /// connection within this client's busy patience. Ownership is rechecked
     /// before every attempt. Under a shared deadline, no attempt is sent
-    /// unless it can finish before that deadline. A source still busy when
+    /// unless its admission wait and a prompt reply fit before that deadline. A source still busy when
     /// patience ends is reported as [`UpdateError::SourceBusy`] with
     /// `still_busy`, naming the authenticated daemon; any other reply is final
     /// at once.
@@ -357,10 +358,13 @@ impl Client {
         let allowance = self.attempt_allowance;
         let reply = retrying_busy(
             || {
+                // Rechecked even when no time is left, so a busy result only
+                // ever names a daemon that still owns the source.
+                let client = self.verified().map_err(Asked::Unverified)?;
                 if shared && Instant::now() + allowance > give_up {
                     return Err(Asked::OutOfTime);
                 }
-                request(self.verified().map_err(Asked::Unverified)?).map_err(Asked::Replied)
+                request(client).map_err(Asked::Replied)
             },
             Asked::is_busy,
             give_up,

@@ -12,9 +12,9 @@ const VERSION: u8 = 1;
 /// How long the update lets `verify-update-census` run before stopping it.
 const VERIFIER_LIMIT: Duration = Duration::from_secs(20);
 /// The deadline, from the start of one verifier run, that every inventory
-/// fence of that run shares. No fence is sent unless it can finish, admission
-/// wait included, before this deadline, so a daemon that is busy, steadily or
-/// on and off, is reported in the run's own receipt. The rest of
+/// fence of that run shares. No fence is sent unless its admission wait and a
+/// prompt reply fit before this deadline, so a daemon that is busy, steadily
+/// or on and off, is reported in the run's own receipt. The rest of
 /// [`VERIFIER_LIMIT`] covers starting, connecting and the ordinary reads, which
 /// need no exclusive admission.
 const VERIFIER_BUSY_PATIENCE: Duration = Duration::from_secs(10);
