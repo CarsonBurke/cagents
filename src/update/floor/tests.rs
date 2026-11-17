@@ -273,7 +273,10 @@ impl FloorSource for FakeSource {
             // What `source::Client::confirm_shutdown` says once the source
             // refused the stop as busy past its patience.
             self.event("ShutdownV1 Confirm busy");
-            return Err(invalid(source::STILL_BUSY_TO_STOP));
+            return Err(UpdateError::SourceBusy {
+                serving: Box::new(capability.proof),
+                message: source::STILL_BUSY_TO_STOP.into(),
+            });
         }
         self.event("ShutdownV1 Confirm");
         let outcome = self

@@ -29,6 +29,7 @@ pub(crate) struct Client {
     /// How long requests the source refuses as busy are asked again.
     busy: BusyPatience,
     busy_pause: Duration,
+    attempt_allowance: Duration,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -56,6 +57,13 @@ const PREPARE_BUSY_PATIENCE: Duration = Duration::from_secs(60);
 /// clients' ordinary requests, so the pause gives them room in between.
 const SOURCE_BUSY_PAUSE: Duration = Duration::from_secs(1);
 
+/// How long one exclusive source request can take even when it is admitted:
+/// the daemon queues a stop preflight or confirmation for exclusive admission
+/// for up to 2.5 s (`host::client::exclusive_patience`), and then answers.
+/// A request sharing a deadline is not sent with less than this left, so a run
+/// of such requests ends within its deadline however the source is loaded.
+const SOURCE_ATTEMPT_ALLOWANCE: Duration = Duration::from_secs(3);
+
 /// How long one source request that the source refused while finishing another
 /// operation keeps being asked again, unless its caller shares one deadline
 /// across several requests. Such a refusal changed nothing, so asking again is
@@ -68,7 +76,8 @@ pub(crate) enum BusyPatience {
     /// Each request may be asked again for this long.
     PerRequest(Duration),
     /// Every request shares this deadline, so a run of several requests ends
-    /// within a known time however busy the source stays.
+    /// within a known time however busy the source stays: no attempt starts
+    /// unless it can finish before the deadline.
     Until(Instant),
 }
 
@@ -132,15 +141,18 @@ fn prepare_retrying_busy(
 /// What an inventory fence still refused as busy when its patience ended says.
 /// The fence only issues an expiring capability, so the check changed nothing;
 /// each caller says what was kept and what to retry.
-pub(crate) const STILL_BUSY_TO_CHECK: &str = "The daemon stayed busy finishing another operation and refused every inventory check, so the check could not finish; the check itself changed nothing";
+pub(crate) const STILL_BUSY_TO_CHECK: &str = "The daemon was busy finishing other operations, so the inventory check could not finish in time; the check itself changed nothing";
 /// What a service stop's preflight or confirmation still refused as busy when
 /// its patience ended says. Neither changed anything.
-pub(crate) const STILL_BUSY_TO_STOP: &str = "The terminal service stayed busy finishing another operation and refused the stop each time, so nothing was stopped. Retry the update once it finishes.";
+pub(crate) const STILL_BUSY_TO_STOP: &str = "The terminal service was busy finishing other operations and refused the stop, so nothing was stopped. Retry the update once it finishes.";
 
 /// One attempt of a request asked again while the source is busy.
 enum Asked {
     /// The source's ownership no longer verifies; nothing was sent.
     Unverified(UpdateError),
+    /// A shared deadline left too little time for another attempt, which
+    /// was not sent.
+    OutOfTime,
     Replied(ControlError),
 }
 
@@ -310,6 +322,7 @@ impl Client {
             peer,
             busy: BusyPatience::PER_REQUEST,
             busy_pause: SOURCE_BUSY_PAUSE,
+            attempt_allowance: SOURCE_ATTEMPT_ALLOWANCE,
         })
     }
 
@@ -329,17 +342,26 @@ impl Client {
     /// Sends `request`, which the source refuses before admitting anything
     /// while it finishes another operation, asking it again on the same
     /// connection within this client's busy patience. Ownership is rechecked
-    /// before every attempt. A source still busy when patience ends is
-    /// reported as [`UpdateError::SourceBusy`] with `still_busy`, naming the
-    /// authenticated daemon that refused; any other reply is final at once.
+    /// before every attempt. Under a shared deadline, no attempt is sent
+    /// unless it can finish before that deadline. A source still busy when
+    /// patience ends is reported as [`UpdateError::SourceBusy`] with
+    /// `still_busy`, naming the authenticated daemon; any other reply is final
+    /// at once.
     fn asked_while_busy<T>(
         &mut self,
         mut request: impl FnMut(&mut ControlClient) -> Result<T, ControlError>,
         still_busy: &str,
     ) -> Result<T, UpdateError> {
         let (give_up, pause) = (self.busy.give_up(), self.busy_pause);
+        let shared = matches!(self.busy, BusyPatience::Until(_));
+        let allowance = self.attempt_allowance;
         let reply = retrying_busy(
-            || request(self.verified().map_err(Asked::Unverified)?).map_err(Asked::Replied),
+            || {
+                if shared && Instant::now() + allowance > give_up {
+                    return Err(Asked::OutOfTime);
+                }
+                request(self.verified().map_err(Asked::Unverified)?).map_err(Asked::Replied)
+            },
             Asked::is_busy,
             give_up,
             pause,
@@ -347,6 +369,10 @@ impl Client {
         match reply {
             Ok(reply) => Ok(reply),
             Err(Asked::Unverified(error)) => Err(error),
+            Err(Asked::OutOfTime) => Err(UpdateError::SourceBusy {
+                serving: Box::new(self.proof().clone()),
+                message: still_busy.into(),
+            }),
             Err(Asked::Replied(error)) if error.is_daemon_busy() => Err(UpdateError::SourceBusy {
                 serving: Box::new(self.proof().clone()),
                 message: still_busy.into(),
@@ -1212,6 +1238,7 @@ mod prepare_receipt_tests {
             peer: observed,
             busy: BusyPatience::PER_REQUEST,
             busy_pause: Duration::from_millis(1),
+            attempt_allowance: Duration::ZERO,
         };
         assert_eq!(client.proof(), &proof);
         LeasedSource {
@@ -1322,7 +1349,7 @@ mod prepare_receipt_tests {
 
     /// A source still busy when patience ends names the daemon that refused
     /// and says that nothing changed. A shared deadline bounds a whole run of
-    /// requests: once it has passed, the next request is asked only once.
+    /// requests: once it has passed, the next request is not sent at all.
     #[test]
     fn a_source_still_busy_past_a_shared_deadline_says_nothing_changed() {
         let mut source = leased_source(vec![busy(); 200], None);
@@ -1339,9 +1366,35 @@ mod prepare_receipt_tests {
         );
         let fenced = source.asked.try_iter().count();
         assert!((2..=6).contains(&fenced), "{fenced} fences");
+        // The retry stops once a pause would cross the deadline, which may
+        // still be a few milliseconds ahead; be past it.
+        std::thread::sleep(Duration::from_millis(60));
         let error = source.client.shutdown_preflight().unwrap_err();
-        assert_eq!(error.to_string(), STILL_BUSY_TO_STOP);
+        assert!(
+            matches!(&error, UpdateError::SourceBusy { message, .. } if message == STILL_BUSY_TO_STOP)
+        );
         assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(source.finish().is_empty());
+    }
+
+    /// Under a shared deadline an attempt is sent only if it can finish,
+    /// admission wait included, before the deadline; a lone request with its
+    /// own patience is always asked at least once.
+    #[test]
+    fn a_shared_deadline_sends_no_attempt_it_cannot_finish() {
+        let mut source = leased_source(vec![preflight(7)], None);
+        source.client.attempt_allowance = SOURCE_ATTEMPT_ALLOWANCE;
+        source.client = source
+            .client
+            .with_busy_patience(BusyPatience::shared_for(Duration::from_secs(1)));
+        let error = source.client.inventory_generation().unwrap_err();
+        assert!(matches!(error, UpdateError::SourceBusy { .. }), "{error:?}");
+        assert!(source.finish().is_empty());
+
+        let mut source = leased_source(vec![preflight(7)], None);
+        source.client.attempt_allowance = SOURCE_ATTEMPT_ALLOWANCE;
+        source.client = source.client.with_busy_patience(BusyPatience::ONCE);
+        assert_eq!(source.client.inventory_generation().unwrap(), 7);
         assert_eq!(source.finish().len(), 1);
     }
 

@@ -68,10 +68,17 @@ pub(crate) fn run(
         let windows = recovery_window_slots(&pending.windows, &current_windows);
         guard.close_prepared_windows(&current_windows, Duration::from_secs(45))?;
         guard.relaunch_windows(&windows, &ui)?;
-        verify(&pending, &daemon)?;
-        recovery::retire_current_service(source::BusyPatience::for_one_run())?;
-        let outcome = verify(&pending, &daemon)?;
-        return Ok(report(&outcome));
+        let outcome = verify(&pending, &daemon).and_then(|_| {
+            recovery::retire_current_service(source::BusyPatience::for_one_run())?;
+            verify(&pending, &daemon)
+        });
+        return match outcome {
+            Ok(outcome) => Ok(report(&outcome)),
+            Err(error @ UpdateError::SourceBusy { .. }) => Err(invalid(format!(
+                "Recovery could not be verified: {error}. The serving daemon was kept and its windows were reopened; repeat this recovery once the daemon finishes"
+            ))),
+            Err(error) => Err(error),
+        };
     }
     let paths = crate::daemon::RuntimePaths::discover().map_err(|e| invalid(e.to_string()))?;
     let handoff = LeaseHandoff::try_acquire(&paths).map_err(|e| invalid(e.to_string()))?

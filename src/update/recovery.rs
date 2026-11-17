@@ -11,10 +11,12 @@ use std::collections::BTreeSet;
 const VERSION: u8 = 1;
 /// How long the update lets `verify-update-census` run before stopping it.
 const VERIFIER_LIMIT: Duration = Duration::from_secs(20);
-/// How long one verifier run, across every read it makes, asks a busy daemon
-/// again. The rest of [`VERIFIER_LIMIT`] covers connecting, listing and each
-/// read's last refused attempt, so a daemon that stays busy is reported in the
-/// run's own receipt rather than the run being stopped without one.
+/// The deadline, from the start of one verifier run, that every inventory
+/// fence of that run shares. No fence is sent unless it can finish, admission
+/// wait included, before this deadline, so a daemon that is busy, steadily or
+/// on and off, is reported in the run's own receipt. The rest of
+/// [`VERIFIER_LIMIT`] covers starting, connecting and the ordinary reads, which
+/// need no exclusive admission.
 const VERIFIER_BUSY_PATIENCE: Duration = Duration::from_secs(10);
 pub(crate) const CENSUS_ENV: &str = "CAGENTS_INSTALL_CENSUS_PATH";
 pub(crate) const OUTCOME_ENV: &str = "CAGENTS_INSTALL_OUTCOME_PATH";
@@ -517,7 +519,9 @@ impl Census {
 
 impl Receipt {
     /// The busy refusal a census recorded through [`Census::unobserved`]: the
-    /// only receipt naming a serving daemon without its readiness.
+    /// only receipt naming a serving daemon without its readiness. That shape,
+    /// rather than a new field, marks it, because the coordinator that reads a
+    /// verifier's receipt may be an older build that refuses unknown fields.
     pub(crate) fn still_busy(&self) -> Option<UpdateError> {
         match &self.outcome {
             Outcome::Unverified {
@@ -1477,7 +1481,8 @@ fn retirement_partition(
         Outcome::Usable { .. } => Err(invalid(
             "The root recovery receipt does not match this Ready serving proof and current inventory; completion was not authorized",
         )),
-        _ => Err(receipt.failure()),
+        // Keep a busy census busy, so its caller still records a serving daemon.
+        _ => Err(receipt.still_busy().unwrap_or_else(|| receipt.failure())),
     }
 }
 
@@ -1639,9 +1644,9 @@ pub(crate) fn verify_file_with_candidate(
     verify_file(census, outcome, true, false, false, false)
 }
 
-/// One verifier run, as `verify-update-census` performs it. Every daemon read
-/// shares one [`VERIFIER_BUSY_PATIENCE`], so the run finishes its receipt
-/// within [`VERIFIER_LIMIT`] however long the daemon stays busy.
+/// One verifier run, as `verify-update-census` performs it. Every inventory
+/// fence shares one [`VERIFIER_BUSY_PATIENCE`] deadline, so a busy daemon
+/// cannot keep the run from writing its receipt within [`VERIFIER_LIMIT`].
 pub(crate) fn verify_file(
     census: &Path,
     outcome: &Path,
@@ -1688,7 +1693,10 @@ fn verify_file_within(
         census.verify(busy)?
     };
     if require_original {
-        let unchanged = matches!(&receipt.outcome,Outcome::Usable{serving,..} if census.source.as_ref()==Some(serving));
+        // A busy receipt naming the original daemon says it is still serving.
+        let unchanged = matches!(&receipt.outcome,
+            Outcome::Usable { serving, .. } | Outcome::Unverified { serving: Some(serving), readiness: None, .. }
+                if census.source.as_ref() == Some(serving));
         if !unchanged
             && !((allow_absent || require_absent) && matches!(receipt.outcome, Outcome::NoSource))
         {
@@ -2119,14 +2127,27 @@ mod tests {
         );
     }
 
-    /// The verifier's busy patience leaves its run time to connect, list and
-    /// receive the last refused attempt, which may queue 2.5 s for admission,
-    /// before the update stops it.
+    /// Retirement reads its root receipt through the same census. A daemon
+    /// that stayed busy there is still reported busy and serving, not as a
+    /// failed recovery with every terminal missing.
     #[test]
-    fn update_recovery_verifier_reports_a_busy_daemon_before_its_limit() {
-        let connect = Duration::from_secs(5);
-        let last_attempt = Duration::from_millis(2500);
-        assert!(VERIFIER_BUSY_PATIENCE + last_attempt + connect < VERIFIER_LIMIT);
+    fn update_recovery_retirement_keeps_a_busy_census_busy() {
+        let census = census(&terminal());
+        let receipt = census
+            .unobserved(&UpdateError::SourceBusy {
+                serving: Box::new(proof()),
+                message: source::STILL_BUSY_TO_CHECK.into(),
+            })
+            .unwrap();
+        let error =
+            retirement_partition(&receipt, &proof(), &StartupState::Ready, &[], &[]).unwrap_err();
+        assert!(
+            matches!(&error, UpdateError::SourceBusy { serving, message }
+                if **serving == proof() && message == source::STILL_BUSY_TO_CHECK),
+            "{error:?}"
+        );
+        let saved = census.unobserved(&error).unwrap();
+        assert!(saved.has_listener() && saved.still_busy().is_some());
     }
 
     #[test]
