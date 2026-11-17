@@ -135,6 +135,9 @@ class Classification(unittest.TestCase):
             self.assertEqual(cargo_warnings.workspace_root(root / "crates/ui"), root.resolve())
             self.assertEqual(cargo_warnings.workspace_root(root / "crates/empty"), root.resolve())
             (root / "Cargo.toml").write_text("[workspace\n")
+            # A manifest that does not parse is where Cargo stops, too.
+            (root / "crates/ui/Cargo.toml").write_text("[package\n")
+            self.assertEqual(cargo_warnings.workspace_root(root / "crates/ui"), (root / "crates/ui").resolve())
             with self.assertRaises(cargo_warnings.WorkspaceUnreadable):
                 cargo_warnings.workspace_packages(root)
 

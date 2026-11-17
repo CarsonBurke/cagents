@@ -74,7 +74,9 @@ def workspace_root(directory):
             if "workspace" in tomllib.loads(text):
                 return candidate
         except tomllib.TOMLDecodeError:
-            continue
+            # Cargo stops at a manifest it cannot read; so does this, rather
+            # than judge against some workspace further up.
+            return candidate
     return nearest
 
 

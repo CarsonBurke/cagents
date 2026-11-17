@@ -822,6 +822,36 @@ class Evidence(unittest.TestCase):
         self.assertIn("--instance native-review --in-session", (self.logs / "runner").read_text())
         self.run_tool("stop")
 
+    def test_the_session_cargo_replays_a_build_however_it_reports(self) -> None:
+        self.built()
+        self.run_tool("start", "after")
+        self.wait_for(lambda: (self.logs / "ui-ran").exists(), '(self.logs / "ui-ran").exists()')
+        session_cargo = next(self.task.rglob("session-bin/cargo"))
+        state = session_cargo.parent.parent
+        recorded = subprocess.run(
+            ["bash", "-c", 'eval "$(grep ^recorded= "$1")" && printf %s "$recorded"', "_", str(session_cargo)],
+            capture_output=True, text=True, check=True,
+        ).stdout.splitlines()
+        target = next(path for path in self.task.glob("target-after*") if path.is_dir())
+        # As while the runner starts: replayed, not run.
+        (state / "replaying").touch()
+        try:
+            def replay(*arguments: str) -> subprocess.CompletedProcess:
+                return subprocess.run([str(session_cargo), "build", *arguments], capture_output=True, text=True,
+                                      env={**self.env, "CARGO_TARGET_DIR": str(target)})
+            # scripts/cargo-lane chooses how Cargo reports; that asks for no other build.
+            for report in (["--message-format=json"], ["--message-format", "json"], ["--quiet"]):
+                for request in recorded:
+                    replayed = replay(*report, *request.split())
+                    self.assertEqual(replayed.returncode, 0, (report, request, replayed.stderr))
+            refused = replay("--message-format=json", "--profile", "dev-runtime", "--bin", "elsewhere")
+            self.assertEqual(refused.returncode, 101)
+            self.assertIn("build did not compile that", refused.stderr)
+        finally:
+            (state / "replaying").unlink(missing_ok=True)
+            (state / "failed").unlink(missing_ok=True)
+        self.run_tool("stop")
+
     def test_the_repositorys_own_runner_starts_through_the_session_cargo(self) -> None:
         checkout = self.checkout("after")
         shutil.copytree(REPOSITORY / "scripts", checkout / "scripts", dirs_exist_ok=True)
@@ -2663,7 +2693,7 @@ class RemoteEvidence(unittest.TestCase):
         # In one slot, held for the three, as the tool says to build them.
         self.assertEqual([arguments for _, arguments in gate], [
             "exec --hold",
-            *(f"build --profile dev-runtime --bin {name}" for name in ("cagents", "cagentsd", "cagents-ui")),
+            *(f"build --message-format=json --profile dev-runtime --bin {name}" for name in ("cagents", "cagentsd", "cagents-ui")),
         ])
         # The host takes the executables built here, of the edited files, and
         # what they were built with.
