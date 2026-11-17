@@ -1003,10 +1003,32 @@ fn agent_list_fields_select_from_a_compact_row() {
         );
         assert_eq!(agent["project"], "Fixture", "{agent}");
     }
-    // Without fields, `--json` keeps each agent's whole record.
-    let full: serde_json::Value =
+}
+
+#[test]
+fn agent_list_json_reports_compact_rows() {
+    let value: serde_json::Value =
         serde_json::from_str(&output(Listing::Agents, true, true)).unwrap();
-    assert!(full["data"]["agents"][0]["agent"]["spec"].is_object());
+    assert_eq!(value["command"], "agent.list");
+    let channel = value["data"]["agents"][0]["channel"].clone();
+    assert!(channel.is_string(), "{value}");
+    // Each fact once, by ID and name: no launch recipe, no repository beside
+    // the project, and nothing unknown, such as a model or account.
+    assert_eq!(
+        value["data"],
+        serde_json::json!({"agents": [{
+            "id": "abcdef00-0000-4000-8000-000000000001",
+            "name": "Fixture reviewer",
+            "provider": "claude",
+            "state": "waiting",
+            "run": "12345678-0000-4000-8000-000000000001",
+            "project": "Fixture",
+            "directory": "/fixture",
+            "channel": channel,
+            "console": "00000000-0000-4000-8000-000000000002",
+            "created_at": 0
+        }]})
+    );
 }
 
 #[test]
@@ -1122,16 +1144,13 @@ fn standalone_account_list_json_is_metadata_only_and_lowercase() {
 const ENVIRONMENT_SENTINEL: &str = "ENVIRONMENT_CREDENTIAL_SENTINEL";
 
 #[test]
-fn agent_list_json_keeps_records_without_launch_environments() {
-    let rendered = output(Listing::Agents, true, true);
-    assert!(!rendered.contains(ENVIRONMENT_SENTINEL), "{rendered}");
-    let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
-    let console = &value["data"]["agents"][0]["agent"]["console"];
-    assert_eq!(console["launch"]["program"], "/fixture/cagents");
-    assert!(console["launch"].get("environment").is_none(), "{console}");
-    let relaunch = &console["continuity"]["relaunch_available"]["recipe"];
-    assert_eq!(relaunch["program"], "/fixture/cagents");
-    assert!(relaunch.get("environment").is_none(), "{relaunch}");
+fn agent_list_json_prints_no_launch_recipe() {
+    // `agent status` prints the record, recipes without their environments.
+    for arguments in [&[][..], &["--fields", "id,console,session"]] {
+        let rendered = output_with(Listing::Agents, true, true, arguments);
+        assert!(!rendered.contains(ENVIRONMENT_SENTINEL), "{rendered}");
+        assert!(!rendered.contains("/fixture/cagents"), "{rendered}");
+    }
 }
 
 #[test]

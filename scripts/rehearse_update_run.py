@@ -735,6 +735,25 @@ class Rehearsal:
             data = {'raw': output}
         return code, data
 
+    def agent_record(self, agent_id, *, start=False, check=True):
+        """`agent_id`'s whole record beside its latest `run` and `state`.
+
+        `agent status` prints it on every CLI a rehearsal installs; `agent
+        list` stopped printing records when its rows became compact (#2941).
+        """
+        _, status = self.cli(*(() if start else ('--no-start',)),'agent','status',agent_id,check=check)
+        record = records.agent_record(status)
+        # `agent status` reads a closed agent too, which `agent list` left out.
+        if record['agent'].get('closed'):
+            raise ValueError(f'agent {agent_id} is closed')
+        return record
+
+    def listed_agents(self, *, start=False):
+        """Each open agent's `id`, `name` and lowercase `state`, as either CLI lists them."""
+        _, listing = self.cli(*(() if start else ('--no-start',)),'agent','list',check=False)
+        rows = listing.get('data',{}).get('agents',[]) if isinstance(listing,dict) else []
+        return [records.listed_agent(row) for row in rows if isinstance(row,dict)]
+
     def observed_update(self, *args):
         spec=importlib.util.spec_from_file_location('rehearsal_window_monitor',
             Path(__file__).with_name('rehearse_update_records.py'))
@@ -757,8 +776,7 @@ class Rehearsal:
         try:
             seed=seeded_codex(self.root)
             agent_id=seed['agent_id']
-            _,listing=self.cli('--no-start','agent','list')
-            original=next(row for row in listing['data']['agents'] if row['agent']['id']==agent_id)
+            original=self.agent_record(agent_id)
             require_seeded_codex(seed,original)
             source=original['agent']['session']['Chat']
             socket=source['owned_codex_listener']['socket']
@@ -792,8 +810,7 @@ class Rehearsal:
                                   or not isinstance(completed[0].get('time'),(int,float))
                                   or completed[0]['time']<parent['time']):
                     raise RuntimeError('case-invalid: original parent did not complete normally')
-                _,listing=self.cli('--no-start','agent','list')
-                current=next(row for row in listing['data']['agents'] if row['agent']['id']==agent_id)
+                current=self.agent_record(agent_id)
                 if current['agent']['session']!=original['agent']['session'] or current.get('run')!=original['run']:
                     raise RuntimeError('case-invalid: natural idle changed the original agent/run')
                 evidence.update(parent=parent,fixture_events=events,agent=current)
@@ -840,11 +857,11 @@ class Rehearsal:
             before=json.loads((self.root/'records/before/snapshot.json').read_text())
             seed=seeded_codex(self.root)
             require_seeded_codex(seed,before['agents'][seed['agent_id']])
-            _,agents=self.cli('--no-start','agent','list')
+            agent=self.agent_record(seed['agent_id'])
             _,terminals=self.cli('--no-start','terminal','list','--all')
             events=[json.loads(line) for line in (self.root/'logs/codex-provider.jsonl').read_text().splitlines() if line]
-            evidence.update(agents=agents,terminals=terminals,fixture_events=events)
-            evidence['active']=active_working_contract(before,agents['data']['agents'],
+            evidence.update(agent=agent,terminals=terminals,fixture_events=events)
+            evidence['active']=active_working_contract(before,[agent],
                 terminals['data'].get('proof'),events,seed['agent_id'])
             evidence['valid']=True
         except (RuntimeError,OSError,ValueError,KeyError,TypeError) as exc:
@@ -920,8 +937,6 @@ class Rehearsal:
         targets = [item for item in seeds if item['state'] in ('named-chat','codex-chat')]
         if not targets or not any(item['state']=='named-chat' for item in targets):
             raise RuntimeError('the seeded Claude chat identity is unavailable for native evidence')
-        _, response = self.cli('--no-start','agent','list')
-        agents = {row['agent']['id']:row['agent'] for row in response['data']['agents']}
         _, response = self.cli('--no-start','channel','list')
         channels = response['data']['channels']
         originals = (json.loads((self.root/f'ui-chats-{baseline}.json').read_text())
@@ -931,7 +946,7 @@ class Rehearsal:
         evidence = []
         for item in targets:
             original = item['response']['data']['agent']
-            current = agents[original['id']]
+            current = self.agent_record(original['id'])['agent']
             channel_id = original['placement']['Channel']
             if (current['placement'] != original['placement']
                     or current['spec']['target']['repository'] != original['spec']['target']['repository']):
@@ -1045,8 +1060,7 @@ class Rehearsal:
         if seed is None:
             return
         agent = seed['response']['data']['agent']
-        _, response = self.cli('--no-start','agent','list')
-        status = next(row for row in response['data']['agents'] if row['agent']['id']==agent['id'])
+        status = self.agent_record(agent['id'])
         console = status['agent'].get('console')
         if not console or status['state'] != 'Running' or not status.get('run'):
             raise RuntimeError('the seeded console is not Running with a live run')
@@ -1494,10 +1508,8 @@ class Rehearsal:
         if not args.no_codex:
             deadline = time.monotonic()+40
             while True:
-                _, listing = self.cli('agent','list',check=False)
-                agents = listing.get('data',{}).get('agents',[])
-                matching = [a for a in agents if a.get('agent',{}).get('name') == 'codex-alpha']
-                states = [str(a.get('state','')).lower() for a in matching]
+                matching = [a for a in self.listed_agents(start=True) if a['name'] == 'codex-alpha']
+                states = [a['state'] for a in matching]
                 if states and all(state in ('running','idle') for state in states):
                     break
                 if time.monotonic() >= deadline or any(state in ('failed','interrupted') for state in states):
@@ -1505,20 +1517,17 @@ class Rehearsal:
                     break
                 time.sleep(.5)
             for entry in evidence:
-                if entry['state'] == 'codex-chat':
-                    entry['verified_agents'] = matching
-                    if matching:
-                        _, status = self.cli('agent','status',matching[0]['agent']['id'],check=False)
-                        entry['verified_status'] = status
+                if entry['state'] == 'codex-chat' and matching:
+                    _, status = self.cli('agent','status',matching[0]['id'],check=False)
+                    entry['verified_status'] = status
         # After the Codex startup check: seeding takes minutes, longer than its turn.
         if args.scale_chats:
             self.seed_scale(args, seed)
         # Verify each spawn against OLD's actual inventories, including chat titles.
         _, session_list = self.cli('sessions','--all',check=False)
-        _, agent_list = self.cli('agent','list',check=False)
+        listed = {agent['id'] for agent in self.listed_agents(start=True)}
         _, terminal_list = self.cli('terminal','list',check=False)
         _, channel_list = self.cli('channel','list',check=False)
-        agents = agent_list.get('data',{}).get('agents',[])
         sessions = session_list.get('data',{}).get('sessions',[])
         for entry in evidence:
             data = entry.get('response',{}).get('data',{})
@@ -1526,7 +1535,12 @@ class Rehearsal:
             terminal_id = data.get('terminal',{}).get('session',{}).get('id')
             channel_id = data.get('channel',{}).get('id')
             if agent_id:
-                entry['verified_agents'] = [a for a in agents if a['agent']['id']==agent_id]
+                entry['verified_agents'] = []
+                if agent_id in listed:
+                    try:
+                        entry['verified_agents'].append(self.agent_record(agent_id,start=True,check=False))
+                    except ValueError as error:
+                        self.errors.append(f'{entry["state"]}: {error}')
                 chat_id = next(((a['agent'].get('session') or {}).get('Chat',{}).get('id') for a in entry['verified_agents']),None)
                 entry['verified_chats'] = [row for row in sessions if row['id']==chat_id]
                 if not entry['verified_agents']:
@@ -1579,12 +1593,9 @@ class Rehearsal:
         (src/agent_execution.rs); the seed's own chats hold some slots for good.
         """
         while True:
-            _, listing = self.cli('agent','list',check=False)
-            active = sum(row.get('agent',{}).get('origin') == 'User'
-                         and (state in ('accepted','running','waiting')
-                              or state == 'interrupted' and not row.get('agent',{}).get('closed'))
-                         for row in listing.get('data',{}).get('agents',[])
-                         for state in [str(row.get('state','')).lower()])
+            # The person's own agents, as they list only open ones.
+            active = sum(agent['state'] in ('accepted','running','waiting','interrupted')
+                         for agent in self.listed_agents(start=True))
             if active < 8:
                 return True
             if time.monotonic() >= deadline:
@@ -1632,9 +1643,7 @@ class Rehearsal:
                      ('alpha','beta')[index % 2])
             deadline = time.monotonic()+120+2*len(names)
             while True:
-                _, listing = self.cli('agent','list',check=False)
-                states = {row['agent'].get('name'): str(row.get('state','')).lower()
-                          for row in listing.get('data',{}).get('agents',[])}
+                states = {agent['name']: agent['state'] for agent in self.listed_agents(start=True)}
                 # A chat's run is its first turn: Succeeded once that settles.
                 pending = [name for name in names if states.get(name) != 'succeeded']
                 if not pending:
