@@ -34,6 +34,7 @@ impl Reopen {
             chat::Recovery::AfterRestart => Some(Self::AfterRestart),
             chat::Recovery::Account
             | chat::Recovery::Retry
+            | chat::Recovery::Busy
             | chat::Recovery::Capacity
             | chat::Recovery::Fresh => None,
         }

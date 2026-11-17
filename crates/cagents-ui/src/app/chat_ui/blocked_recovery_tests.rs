@@ -921,6 +921,7 @@ fn each_blocked_refusal_kind_renders_its_own_headline_and_caption() {
     for recovery in [
         chat::Recovery::Account,
         chat::Recovery::Retry,
+        chat::Recovery::Busy,
         chat::Recovery::Capacity,
         chat::Recovery::Fresh,
     ] {

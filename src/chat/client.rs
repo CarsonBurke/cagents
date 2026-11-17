@@ -56,6 +56,7 @@ fn start_failure(error: ipc::ProtocolError) -> StartFailure {
     let recovery = match error.code {
         ipc::ProtocolErrorCode::AccountRemoved => super::Recovery::Account,
         ipc::ProtocolErrorCode::ChatCapacity => super::Recovery::Capacity,
+        _ if error.is_daemon_busy() => super::Recovery::Busy,
         _ if error.retryable => super::Recovery::Retry,
         // Only the daemon's own whole sentence, never text that quotes it.
         _ if [
@@ -4015,6 +4016,38 @@ mod tests {
                 assert_eq!(failure.message, "the daemon's exact reason");
             }
         }
+    }
+
+    /// The daemon's busy refusal of an exclusive start, such as an account
+    /// switch, is typed apart from other retryable failures, because it alone
+    /// proves nothing was admitted. Only its own whole retryable sentence.
+    #[test]
+    fn only_the_daemons_busy_refusal_is_typed_busy() {
+        use super::super::Recovery;
+        use ipc::ProtocolErrorCode;
+
+        let recovery = |message: &str, retryable| {
+            start_failure(ipc::ProtocolError::new(
+                ProtocolErrorCode::Internal,
+                message,
+                retryable,
+            ))
+            .recovery
+        };
+        // As `host::control_gate::busy` refuses; its own tests pin that.
+        let busy = start_failure(ipc::ProtocolError::new(
+            ProtocolErrorCode::Internal,
+            ipc::DAEMON_BUSY,
+            true,
+        ));
+        assert_eq!(busy.recovery, Recovery::Busy);
+        assert_eq!(busy.message, ipc::DAEMON_BUSY);
+        assert!(!Recovery::Busy.is_blocked());
+        assert_eq!(recovery(ipc::DAEMON_BUSY, false), Recovery::Blocked);
+        assert_eq!(
+            recovery(&format!("Provider said: {}", ipc::DAEMON_BUSY), true),
+            Recovery::Retry
+        );
     }
 
     #[test]

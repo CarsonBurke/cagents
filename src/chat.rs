@@ -353,6 +353,12 @@ pub enum Recovery {
     /// it - a stopped daemon, a busy writer, a provider that failed to launch -
     /// can succeed on the next attempt.
     Retry,
+    /// The daemon was finishing another operation and refused this start
+    /// before admitting it ([`crate::terminal_ipc::DAEMON_BUSY`]). Unlike
+    /// [`Self::Retry`], this proves the request changed nothing: the card
+    /// keeps whatever it held, including a live conversation an account
+    /// switch was about to move, and the same request may be sent again.
+    Busy,
     /// The daemon refused this start and reported that repeating it cannot help.
     /// Keep the saved conversation and diagnostic without offering a retry.
     Blocked,
