@@ -760,6 +760,87 @@ mod tests {
         assert_eq!(app.inspector_panel_pin(), None);
     }
 
+    /// Escape closing an inspector that covers a narrow chat pane, while it
+    /// shows work in another worktree, gives the source control and file
+    /// panels back to the focused pane's worktree when its slide ends, and
+    /// every update on the way leaves the derived state as a full projection
+    /// would. Settling is off, so nothing but the updates' own work
+    /// projects.
+    #[test]
+    fn closing_an_overlaid_inspector_by_keyboard_releases_its_work_once_it_slides_away() {
+        crate::app::projection_oracle::disable_settling();
+        let (
+            mut app,
+            Panes {
+                conversation, chat, ..
+            },
+        ) = conversation_app();
+        // Projects lists /repo/main and /repo/fix-sidebar.
+        app.sidebar_model = crate::sidebar::tests::panel_model();
+        app.refresh_sidebar_worktree_panes();
+        app.sync_pull_request_inspector();
+        drop(app.handle_pull_request_ui(listed_with(
+            conversation,
+            1,
+            &[],
+            vec![edited("/repo/fix-sidebar", None)],
+            true,
+        )));
+        drop(app.project_workspace(true));
+        // Opened again in a narrow window, the inspector covers the pane.
+        drop(app.set_pane_inspector_open(chat, false));
+        app.settle_pane_inspectors();
+        drop(app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::Resized(500.0),
+        }));
+        drop(app.update(Message::TogglePaneInspector(chat)));
+        app.settle_pane_inspectors();
+        assert_eq!(
+            app.pane_inspector_layout(chat),
+            Some(InspectorLayout::Overlay)
+        );
+        let active = |app: &Cagents| {
+            app.sidebar_state
+                .active_worktree()
+                .map(|key| key.canonical_path.clone())
+        };
+        let pinned = Some(PathBuf::from("/repo/fix-sidebar"));
+        assert_eq!(app.inspector_panel_pin(), pinned);
+        assert_eq!(active(&app), pinned, "the panels show the inspector's work");
+        let escape = keyboard::Key::Named(keyboard::key::Named::Escape);
+        drop(app.update(Message::KeyEvent {
+            event: keyboard::Event::KeyPressed {
+                modified_key: escape.clone(),
+                key: escape,
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            },
+            captured: false,
+        }));
+        assert!(!app.pane_inspectors.is_open(chat));
+        assert_eq!(
+            active(&app),
+            pinned,
+            "the panels keep the work while the inspector slides away"
+        );
+        crate::app::projection_oracle::assert_projected(&mut app);
+        drop(app.update(Message::Frame(
+            std::time::Instant::now() + super::super::DIALOG_TRANSITION_DURATION * 2,
+        )));
+        assert!(!app.pane_inspectors.is_visible(chat));
+        assert_eq!(app.inspector_panel_pin(), None);
+        assert_ne!(
+            active(&app),
+            pinned,
+            "the panels let go of the closed inspector's work"
+        );
+        crate::app::projection_oracle::assert_projected(&mut app);
+    }
+
     fn edited(path: &str, pull_request: Option<u64>) -> crate::work::ConversationWorktree {
         crate::work::ConversationWorktree {
             path: PathBuf::from(path),

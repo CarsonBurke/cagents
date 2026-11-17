@@ -626,45 +626,45 @@ mod tests {
         assert_projected(&mut app);
     }
 
-    /// Escape closing a dialog leaves nothing derived behind it, without a
-    /// later update projecting it.
+    /// An open dialog holds off the read of the agents' pending requests a
+    /// focused window owes. Escape closing it lets the projection start that
+    /// read at once, not when a later update projects: the dismissal itself
+    /// changes nothing the read depends on, only the dialog that held it.
     #[test]
     fn dismissing_a_dialog_by_keyboard_projects_at_once() {
         use keyboard::key::Named;
         disable_settling();
         let (mut app, _, _, channel) = two_worktree_app();
+        // A focused window showing a project whose requests it has not read.
+        app.sidebar_model.projects.push(
+            SidebarProject::new(
+                ProjectId::new(),
+                RepositoryId::new(),
+                "Fixture".into(),
+                "/fixture".into(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .with_kind(ProjectKind::Folder),
+        );
+        app.active_workspace = Some("/fixture".into());
+        app.refresh_ui.focused = true;
         drop(
             app.update(Message::ChannelUi(channel_ui::Action::RequestDelete(
                 channel,
             ))),
         );
         assert!(app.channel_ui.modal_open());
-        drop(app.update(named(Named::Escape, keyboard::Modifiers::empty(), true)));
-        assert!(!app.channel_ui.modal_open());
-        assert_projected(&mut app);
-    }
-
-    /// Escape closing an inspector that covers a narrow pane updates what
-    /// the inspector drew, such as the source control it bound, at once.
-    #[test]
-    fn closing_an_overlaid_inspector_by_keyboard_projects_at_once() {
-        use keyboard::key::Named;
-        disable_settling();
-        let mut app = crate::app::tests::context_inspector_test_app(true);
-        let card = app.workspace.focused().unwrap();
-        drop(app.project_workspace(true));
-        drop(app.update(Message::Viewport {
-            generation: app.workspace_view_generation,
-            event: WorkspaceViewportEvent::Resized(500.0),
-        }));
-        drop(app.update(Message::TogglePaneInspector(card)));
-        app.settle_pane_inspectors();
-        assert_eq!(
-            app.pane_inspector_layout(card),
-            Some(InspectorLayout::Overlay)
+        assert!(
+            !app.automation_approval.reading(),
+            "the dialog holds the read off"
         );
         drop(app.update(named(Named::Escape, keyboard::Modifiers::empty(), true)));
-        assert!(!app.pane_inspectors.is_open(card));
+        assert!(!app.channel_ui.modal_open());
+        assert!(
+            app.automation_approval.reading(),
+            "the read the dialog held off starts as it closes"
+        );
         assert_projected(&mut app);
     }
 

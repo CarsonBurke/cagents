@@ -42,6 +42,12 @@ impl State {
             self.reading, self.reading_for, self.generation
         )
     }
+
+    /// Whether a read of pending requests is in flight.
+    #[cfg(test)]
+    pub(super) fn reading(&self) -> bool {
+        self.reading
+    }
 }
 
 /// How soon a focused window that owes a read tries it again, while an open
