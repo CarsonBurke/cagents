@@ -58,7 +58,8 @@ class Job:
 
 # What the update rehearsal's suites load from scripts/, and the fixtures its
 # private user runs in place of providers and GitHub.
-REHEARSAL_MODULES = tuple(f"scripts/rehearse_update_{module}.py" for module in ("records", "run", "restart", "fault", "pty"))
+REHEARSAL_SCRIPTS = ("scripts/rehearse-update", "scripts/native_slots.py",
+                     *(f"scripts/rehearse_update_{module}.py" for module in ("records", "run", "restart", "fault", "pty")))
 REHEARSAL_FIXTURES = tuple(f"tests/fixtures/{fixture}" for fixture in (
     "chat-composer-claude.sh", "fixture-gh.sh", "rehearsal-codex.sh", "rehearsal-codex.py",
     "codex-tool-rows.py", "terminal-escape-codex.py"))
@@ -153,13 +154,12 @@ JOBS = (
     # The desktop, installed archives and a real update run only on fw16 (see
     # "Rehearsing an update" in docs/development.md).
     Job("update rehearsal", suites=(
-        Suite("update rehearsal", "tests/rehearse_update.py",
-              sources=("scripts/rehearse-update", *REHEARSAL_MODULES, "scripts/native_slots.py",
-                       *REHEARSAL_FIXTURES),
+        Suite("update rehearsal", "tests/rehearse_update.py", sources=(*REHEARSAL_SCRIPTS, *REHEARSAL_FIXTURES),
               syntax=(("bash", "scripts/rehearse-update"),)),
-        Suite("update rehearsal staging", "tests/rehearse_update_staging.py", sources=REHEARSAL_MODULES),
+        Suite("update rehearsal staging", "tests/rehearse_update_staging.py", sources=REHEARSAL_SCRIPTS),
         Suite("update rehearsal retry", "tests/rehearse_update_retry.py",
-              sources=("scripts/rehearse_update_retry.py", *REHEARSAL_MODULES)),
+              sources=("scripts/rehearse_update_retry.py", *REHEARSAL_SCRIPTS, *REHEARSAL_FIXTURES,
+                       "tests/fixtures/rehearsal-startup-bind.c")),
         Suite("update rehearsal startup bind fixture", "tests/rehearse_update_retry_bind.py",
               sources=("tests/fixtures/rehearsal-startup-bind.c",)),
         Suite("update rehearsal Codex peer", "tests/rehearse_codex.py",

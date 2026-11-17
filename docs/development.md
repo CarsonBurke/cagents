@@ -2482,8 +2482,9 @@ mise run test:scripts "update rehearsal"
 /usr/bin/python3 -I -B tests/rehearse_update.py -v   # one suite
 ```
 
-From a hosted agent's shell, the nine tests that run the harness itself skip,
+From a hosted agent's shell, the nine tests that need the harness to act skip,
 since it refuses inherited authority; CI and a plain `ssh fw16` shell run them.
+The tests of that refusal still run.
 The two that run `stop` also skip where the user has no systemd user manager,
 and the startup bind fixture's check skips without a C compiler.
 
