@@ -786,8 +786,10 @@ pub fn is_upgrade_recovery(source: &Session, replacement: &Session) -> bool {
 /// no authority by itself; only an authenticated `ChatPrepareResume` answer on
 /// the same daemon stream may produce one.
 pub fn is_retained_resume_successor(source: &Session, successor: &Session) -> bool {
-    if crate::upgrade::floor::load().is_ok_and(|ledger| ledger.resume_source(source).is_some())
-        && source.launch.session_id.is_some()
+    // Only a named source can be an upgrade's resume source; check that
+    // before reading the ledger from disk.
+    if source.launch.session_id.is_some()
+        && crate::upgrade::floor::load().is_ok_and(|ledger| ledger.resume_source(source).is_some())
     {
         let mut expected = source.clone();
         expected.reset_owned_codex_listener();
