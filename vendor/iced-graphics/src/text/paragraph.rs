@@ -139,19 +139,11 @@ impl core::text::Paragraph for Paragraph {
             text.content.iter().enumerate().map(|(i, span)| {
                 let attrs = text::to_attributes(span.font.unwrap_or(text.font));
 
-                let attrs = match (span.size, span.line_height) {
-                    (None, None) => attrs,
-                    _ => {
-                        let size = span.size.unwrap_or(text.size);
-
-                        attrs.metrics(cosmic_text::Metrics::new(
-                            size.into(),
-                            span.line_height
-                                .unwrap_or(text.line_height)
-                                .to_absolute(size)
-                                .into(),
-                        ))
-                    }
+                let attrs = match span.metrics(text.size, text.line_height) {
+                    None => attrs,
+                    Some((size, line_height)) => attrs.metrics(
+                        cosmic_text::Metrics::new(size.into(), line_height.into()),
+                    ),
                 };
 
                 let attrs = if let Some(color) = span.color {

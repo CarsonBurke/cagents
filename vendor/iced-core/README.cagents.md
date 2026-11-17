@@ -71,3 +71,18 @@ consider only stops, plus the focused widget, so traversal moves on from a
 control disabled while it held focus. `focus` by id is unchanged. libcosmic's
 button uses this (`vendor/libcosmic/PATCH.md`); the app regression is
 `ui_controls::button::tests::disabled_buttons_are_not_focus_stops`.
+
+## Relative span size
+
+`Span::relative_size` sets a span's size as a fraction of its own `size`, or
+of the paragraph's size when it has none, like CSS's `em`. Unlike `size`, it
+keeps the paragraph's line height when the span sets none. Inline code in
+chat prose uses it to sit a step smaller than the sentence around it without
+changing the height of the lines it falls on (cagents#3002). `Span::metrics`
+resolves a span's font size and line height in a paragraph. The renderer's
+`Paragraph::with_spans` (`vendor/iced-graphics`) and the app's own shaping
+for long paragraphs both take a span's metrics from it, so they agree.
+
+```sh
+cargo test --manifest-path vendor/iced-core/Cargo.toml text::span_metrics_tests
+```
