@@ -1200,7 +1200,9 @@ fn verified_windows_within(
         if legacy || remaining.is_zero() {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
-                if exclusive {
+                // An exclusive holder first seen as the wait ends is most
+                // likely a peer's probe; without a wait, none can be.
+                if legacy || (exclusive && patience.is_zero()) {
                     OLDER_WINDOW_RUNNING
                 } else {
                     "another cagents window is still opening; try again in a moment"
