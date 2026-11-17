@@ -306,7 +306,8 @@ pub(crate) fn remove_fenced(
         "An update or another worktree removal is in progress; retry shortly".to_owned()
     })?;
     let policy = windows;
-    let windows = crate::instance::verified_running_windows().map_err(|error| error.to_string())?;
+    let windows =
+        crate::instance::verified_admitted_windows().map_err(|error| error.to_string())?;
     if (policy == WindowPolicy::RequireOne && windows.is_empty())
         || windows
             .iter()
