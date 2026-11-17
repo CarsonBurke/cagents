@@ -24,7 +24,7 @@ pub(super) fn measure_tab_title(title: &str) -> f32 {
 
 #[derive(Debug, Default)]
 pub(super) struct State {
-    hovered_tab: Option<CardId>,
+    pub(super) hovered_tab: Option<CardId>,
     pub(super) closing_group: Vec<CardId>,
     pub(super) user_titles: HashMap<CardId, String>,
     /// Accepted spawn labels, read without loading a provider conversation.
@@ -2414,6 +2414,21 @@ impl Cagents {
             }
             row => row,
         })
+    }
+
+    /// [`Self::update_chrome`] for the update loop, which also answers how
+    /// much of the workspace projection the action changed. `None` leaves
+    /// the update's own choice.
+    ///
+    /// The pointer crossing the tab strip hovers a tab and then none, twice
+    /// per tab it passes. The hovered tab is drawn straight from this state,
+    /// and no projection reads it.
+    pub(super) fn update_chrome_ui(
+        &mut self,
+        action: Action,
+    ) -> (Task<Message>, Option<Projection>) {
+        let projection = matches!(action, Action::HoverTab(_)).then_some(Projection::Unchanged);
+        (self.update_chrome(action), projection)
     }
 
     pub(super) fn update_chrome(&mut self, action: Action) -> Task<Message> {

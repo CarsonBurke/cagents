@@ -162,6 +162,13 @@ A nested `update` counts toward the outermost one. Overlays' own layout and
 drawing, the libcosmic chrome around the application view, and the renderer's
 presentation run outside the measured root, so the thread's CPU time exceeds
 the traced total.
+The `Projection` phase breaks out the share of `update` spent on its
+projection tail, without adding to any total. A label such as
+`Full Sidebar(OpenChannel` or `Unchanged ChatUi(Wake` names the projection an
+update took and its message; `Camera` is the full projection's panning path,
+and `Postlude` the work every update ends with. `stage chrome`,
+`stage sidebar_channels` and the other `stage` labels time the tail's stages
+across all updates.
 Each five-second report also covers the frames the shell presented, on any of
 its surfaces: how many, the p50/p95/p99/max **work** of each, and the same
 quantiles of the **interval** between consecutive presentations, as
@@ -429,6 +436,28 @@ change is a reported terminal title (OSC 0/2) runs only chrome, which includes
 the window title. Reported titles on their own cause at most one save, and
 one publication to shared views, every three seconds. The unit tests in `crates/cagents-ui/src/app/terminal_output_tests.rs`
 count the tail passes, chrome syncs and saves each message causes.
+
+The full projection is the default. An update projects less only where the
+handler for its message declares what it changed, by returning a narrower
+`Projection` beside its task, so a new handler is correct before it is fast.
+Typing is the busiest case: a key that a text field took, a key release and a
+modifier change answer nothing in the workspace and project nothing, and the
+pointer crossing the tab strip changes only which tab is drawn hovered.
+
+`app/projection_oracle.rs` checks each narrower declaration. After an update
+whose projection was narrower than `Full`, it runs the full projection and
+compares what the workspace derives: the sidebar model and state, card chrome
+and indices, terminal ordinals, pane and window titles, inspectors, transcript
+probes, worktree owners and protections. Every unit test built with debug
+assertions runs it and fails, naming the message and the stale part. Before
+each outermost update it first brings that state up to date, because tests
+often arrange state directly and leave its projection to the next update. Set
+`CAGENTS_PROJECTION_ORACLE` for a development build to run the same check
+natively. It logs to the `cagents::projection_oracle` target, both a stale
+declaration and state found stale before an update, with the update before
+it, and keeps what the full projection repaired. The check doubles the
+projection work, so the timing tests turn it off and native measurements run
+without the variable.
 
 The native workload has no script. In the browserless development runner,
 inside a nested niri session with fresh private HOME and XDG directories, open

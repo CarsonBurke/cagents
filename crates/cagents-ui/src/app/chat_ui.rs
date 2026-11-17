@@ -682,7 +682,7 @@ impl Action {
     /// These are a conversation's wakes and the results of the background
     /// work they start. An account report changes the window's accounts, so
     /// its wake is not among them.
-    fn local_scope(&self) -> Option<LocalScope> {
+    pub(super) fn local_scope(&self) -> Option<LocalScope> {
         match self {
             Self::Wake(_, Wake::AccountUsage) => None,
             Self::Wake(target, _)
@@ -21279,6 +21279,7 @@ pub(in crate::app) mod tests {
     #[test]
     #[ignore = "measurement: run with --ignored --nocapture under --profile dev-runtime"]
     fn measure_unchanged_saves_after_a_draft_at_desktop_inventory_scale() {
+        crate::app::projection_oracle::disable();
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = draft_chat(&mut app);
         write(&mut app, card, "kept draft");

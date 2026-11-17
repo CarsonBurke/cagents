@@ -2048,9 +2048,11 @@ harness, it provides:
   compositor presentation. Add `--ui-trace` to `start` for a live log of
   UI-thread work by phase and message; see "UI thread trace" in
   `docs/performance.md`. Add `--workspace-trace` to record shared-model update
-  timing, scope projection choices and activity redraw intervals. Both trace
-  flags apply to the requested session and its relaunches; ordinary sessions
-  keep their default logging. Recreate the same workload on each revision when comparing
+  timing, scope projection choices and activity redraw intervals. Add
+  `--projection-oracle` to check every narrowed update projection against the
+  full one; see "Busy terminals and the update tail" in `docs/performance.md`.
+  These flags apply to the requested session and its relaunches; ordinary
+  sessions keep their default logging. Recreate the same workload on each revision when comparing
   startup; a saved descriptor whose provider was killed is not a live chat.
 - **Matching evidence.** `start` refuses a checkout that changed since its build.
   `shots/manifest.tsv` records each image's revision, source state, requested

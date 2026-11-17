@@ -32,6 +32,18 @@ pub(super) struct State {
     restore_keyboard_nav: Option<bool>,
 }
 
+impl State {
+    /// The read of pending requests in flight, if any, for the projection
+    /// check: the full projection starts one a window owes.
+    #[cfg(any(test, feature = "development"))]
+    pub(super) fn projection_view(&self) -> String {
+        format!(
+            "reading {} for {:?} (generation {})",
+            self.reading, self.reading_for, self.generation
+        )
+    }
+}
+
 /// How soon a focused window that owes a read tries it again, while an open
 /// review, the workspace switcher or a read already in flight holds it off
 /// and nothing else that could end that happens.

@@ -321,7 +321,9 @@ impl Recorder {
 }
 
 /// The message's outer two variant names, from its bounded `Debug` output.
-fn label(message: &dyn Debug) -> Box<str> {
+/// Payloads, which may hold what someone typed, are formatted only up to
+/// the bound and never kept: the label ends with the second variant's name.
+pub fn label(message: &dyn Debug) -> Box<str> {
     let mut bounded = Bounded(String::with_capacity(LABEL_BYTES));
     // Stopping early is the point; the error only reports it.
     let _ = write!(bounded, "{message:?}");

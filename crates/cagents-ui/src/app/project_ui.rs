@@ -371,6 +371,10 @@ impl Cagents {
                 paths.push(runtime.descriptor.worktree.clone());
             }
         }
+        #[cfg(any(test, feature = "development"))]
+        if super::projection_oracle::enabled() {
+            self.projected_protections = paths.iter().cloned().collect();
+        }
         if let Err(error) = self.worktree_protections.sync(paths) {
             tracing::debug!(%error, "automatic worktree cleanup unavailable until window scopes are protected");
         }

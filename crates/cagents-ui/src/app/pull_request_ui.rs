@@ -106,6 +106,13 @@ pub struct State {
 }
 
 impl State {
+    /// The conversations the shown inspectors follow, for the projection
+    /// check.
+    #[cfg(any(test, feature = "development"))]
+    pub(super) fn projection_view(&self) -> String {
+        super::projection_oracle::sorted_entries(&self.conversations)
+    }
+
     fn conversation(&self, card: CardId) -> Option<&conversation::State> {
         self.conversations.get(&card)
     }

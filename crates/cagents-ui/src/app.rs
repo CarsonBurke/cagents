@@ -36,6 +36,8 @@ mod palette_ui;
 mod pane_inspector;
 mod pr_checkout_ui;
 mod project_ui;
+#[cfg(any(test, feature = "development"))]
+mod projection_oracle;
 mod pull_request_ui;
 #[cfg(test)]
 mod question_tests;
@@ -1167,6 +1169,14 @@ struct TerminalWakeup {
 /// terminals wake about once per frame each, so a wake that changed nothing a
 /// projection reads must not pay for every card's sidebar, chrome and
 /// protection bookkeeping.
+///
+/// Every update projects `Full` unless what handled its message declares
+/// less: a handler that knows what it changed returns its projection beside
+/// its task, as [`Cagents::update_chat_ui`] and [`Cagents::update_chrome_ui`]
+/// do, and `update` projects that instead. A message nothing declares for keeps the
+/// full projection, so a new or changed handler is correct before it is
+/// fast. Tests check every narrower declaration against the full projection
+/// (`projection_oracle`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Projection {
     /// Nothing any projection reads changed: grid output, repaint ticks.
@@ -5217,6 +5227,7 @@ struct CardLabels {
 
 /// Inputs that can change a terminal's presentation. Ordinary runtime wakes
 /// reuse the numbered title instead of allocating it again for every pane.
+#[derive(Debug)]
 struct TerminalTitleSource {
     reported: String,
     directory: PathBuf,
@@ -5246,6 +5257,7 @@ impl TerminalTitleSource {
 /// Both embed the card id and title, so they are built when a card appears or
 /// is renamed instead of once per rendered frame. Reusing an id also keeps the
 /// card's accessibility node stable across frames.
+#[derive(Debug)]
 struct CardChrome {
     tooltip: String,
     focus_id: widget::Id,
@@ -5646,6 +5658,10 @@ pub struct Cagents {
     worktree_offsets: HashMap<PathBuf, f32>,
     channel_offsets: HashMap<crate::model::ChannelId, f32>,
     worktree_owners: HashMap<CardId, PathBuf>,
+    /// The worktrees the last protection sync asked to protect, which the
+    /// projection check compares.
+    #[cfg(any(test, feature = "development"))]
+    projected_protections: std::collections::BTreeSet<PathBuf>,
     known_worktree_roots: worktree_ui::KnownWorktreeRoots,
     worktree_paths: worktree_ui::WorktreePathIndex,
     /// What the projects list of pull requests, by repository and number,
@@ -8931,6 +8947,53 @@ impl Cagents {
         self.prune_presence();
     }
 
+    /// Rebuilds everything the workspace derives for the sidebar, the panes'
+    /// chrome and inspectors, source control and worktree protection, from
+    /// the state as it now stands. This is the `Full` projection, which every
+    /// narrower one must agree with.
+    fn project_workspace(&mut self, reconcile_row_selection: bool) -> Task<Message> {
+        projection_stage!("worktree_protections", self.sync_worktree_protections());
+        projection_stage!("sidebar_selection", self.synchronize_sidebar_selection());
+        projection_stage!("sidebar_channels", self.refresh_sidebar_channels());
+        projection_stage!(
+            "retained_attention",
+            self.sidebar_state
+                .prune_retained_attention(&self.sidebar_model)
+        );
+        if reconcile_row_selection {
+            projection_stage!("row_selection", self.prune_sidebar_row_selection());
+        }
+        projection_stage!("worktree_panes", self.refresh_sidebar_worktree_panes());
+        // Ahead of the rebind, which pins what the inspector drawing source
+        // control chose: a pane that has just arrived, closed or taken focus
+        // must not show the last binding for a frame.
+        projection_stage!("pane_inspectors", self.sync_pane_inspectors());
+        projection_stage!("pull_request_inspector", self.sync_pull_request_inspector());
+        let binding = projection_stage!("source_control", self.rebind_source_control());
+        if let Some(source) = self.sidebar_model.source_control.as_ref() {
+            let selected = self
+                .workspace
+                .focused()
+                .and_then(|card| match self.cards.get(&card) {
+                    Some(CardRuntime::Repository(runtime))
+                        if runtime.descriptor.worktree == source.key.canonical_path =>
+                    {
+                        runtime.selected_path()
+                    }
+                    _ => None,
+                });
+            self.sidebar_state.select_file(&source.key, selected);
+        }
+        // `view` cannot rebuild the chrome cache itself, so refresh it here.
+        let chrome = projection_stage!("chrome", self.sync_chrome());
+        let terminal_probes =
+            projection_stage!("transcript_probes", self.terminal_transcript_probes());
+        // Another project shown, or a review or the workspace switcher closed.
+        let approval =
+            projection_stage!("automation_requests", self.read_owed_automation_requests());
+        Task::batch([binding, chrome, terminal_probes, approval])
+    }
+
     /// Builds chrome for cards that appeared or were renamed, drops entries for
     /// cards the workspace no longer holds, and renames the window.
     fn sync_chrome(&mut self) -> Task<Message> {
@@ -9025,9 +9088,11 @@ impl Cagents {
         channel: Option<&crate::model::ProjectChannel>,
     ) -> (Option<CardChrome>, Option<String>) {
         #[cfg(test)]
-        self.shared_views
-            .chrome_cards_visited
-            .set(self.shared_views.chrome_cards_visited.get() + 1);
+        if !projection_oracle::verifying() {
+            self.shared_views
+                .chrome_cards_visited
+                .set(self.shared_views.chrome_cards_visited.get() + 1);
+        }
         let type_label = card_kind_labels(Some(&card.kind)).type_label;
         let title = self.repository_chrome_with(card, || {
             self.card_display_title_with_chat_title(card, || self.chat_channel_title(card, channel))
@@ -9915,15 +9980,16 @@ impl Cagents {
     /// its transcript, a button or nothing at all holding the keyboard -
     /// goes into its message input at the caret, which then keeps the
     /// keyboard. Chords stay with whatever they belong to, such as copying a
-    /// transcript selection.
-    fn type_into_chat_input(&mut self, event: &keyboard::Event) -> Task<Message> {
+    /// transcript selection. `None` when the key typed nothing, and so
+    /// changed nothing.
+    fn type_into_chat_input(&mut self, event: &keyboard::Event) -> Option<Task<Message>> {
         let keyboard::Event::KeyPressed {
             text: Some(text),
             modifiers,
             ..
         } = event
         else {
-            return Task::none();
+            return None;
         };
         if modifiers.control()
             || modifiers.alt()
@@ -9931,13 +9997,13 @@ impl Cagents {
             || text.is_empty()
             || text.chars().any(char::is_control)
         {
-            return Task::none();
+            return None;
         }
         let Some(card) = self.workspace.focused() else {
-            return Task::none();
+            return None;
         };
         if !self.chat_input_drawn(card) || !self.card_holds_keyboard(card) {
-            return Task::none();
+            return None;
         }
         // An open picker's search field stands in for the input, and is
         // where the keyboard already belongs.
@@ -9945,7 +10011,7 @@ impl Cagents {
             Some(CardRuntime::Chat(runtime)) if runtime.focus_control() == "chat-composer" => {
                 runtime.target
             }
-            _ => return Task::none(),
+            _ => return None,
         };
         let mut tasks: Vec<Task<Message>> = text
             .chars()
@@ -9963,7 +10029,7 @@ impl Cagents {
             iced::widget::operation::focus(card_control_id(card, "chat-composer"))
                 .map(cosmic::Action::App),
         );
-        Task::batch(tasks)
+        Some(Task::batch(tasks))
     }
 
     fn card_container_id(&self, card: CardId) -> widget::Id {
@@ -15134,6 +15200,8 @@ impl Application for Cagents {
             worktree_offsets: HashMap::new(),
             channel_offsets: HashMap::new(),
             worktree_owners: HashMap::new(),
+            #[cfg(any(test, feature = "development"))]
+            projected_protections: Default::default(),
             known_worktree_roots: worktrees
                 .iter()
                 .map(|worktree| worktree.path.clone())
@@ -15363,6 +15431,10 @@ impl Application for Cagents {
             }
             return Task::batch([settled, self.update(message)]);
         }
+        #[cfg(any(test, feature = "development"))]
+        let (_running, settled_projection) = self.settle_projection(&message);
+        #[cfg(not(any(test, feature = "development")))]
+        let settled_projection = Task::none();
         let notice_control = self.notice_control_severity();
         let attention_scope_changed = matches!(
             &message,
@@ -15501,6 +15573,9 @@ impl Application for Cagents {
                 | Message::WindowResized(..)
         );
         let model_update = matches!(&message, Message::WorkspaceModelObserved(_));
+        #[cfg(any(test, feature = "development"))]
+        let oracle_message = projection_oracle::enabled()
+            .then(|| crate::performance::ui_trace::label(&message));
         let mut projection = if repaint_tick(&message)
             || background_poll(&message)
             || matches!(message, Message::ReplicaCaptureDue(_))
@@ -18589,8 +18664,21 @@ impl Application for Cagents {
                         };
                         self.run_workspace_command(command, modifiers)
                     }
-                    None if !captured => self.type_into_chat_input(&event),
-                    None => Task::none(),
+                    None => match (!captured)
+                        .then(|| self.type_into_chat_input(&event))
+                        .flatten()
+                    {
+                        Some(typed) => typed,
+                        // Nothing answered the key: a key a text field took,
+                        // a release or a modifier change. What it changed on
+                        // the way here, the held modifiers, the tab history's
+                        // cycle and a copy's intent, is read by no projection.
+                        // Typing comes this way at input rate.
+                        None => {
+                            projection = Projection::Unchanged;
+                            Task::none()
+                        }
+                    },
                 }
             }
             #[cfg(feature = "latency-harness")]
@@ -18734,7 +18822,13 @@ impl Application for Cagents {
                 Task::none()
             }
             Message::CommitUi(action) => self.update_commit_ui(action),
-            Message::ChromeUi(action) => self.update_chrome(action),
+            Message::ChromeUi(action) => {
+                let (task, chrome_projection) = self.update_chrome_ui(action);
+                if let Some(chrome_projection) = chrome_projection {
+                    projection = chrome_projection;
+                }
+                task
+            }
             Message::ChannelUi(action) => self.handle_channel_ui(action),
             Message::SidebarSelection(action) => self.update_sidebar_selection(action),
             Message::BranchUi(action) => self.update_branch_ui(action),
@@ -19111,9 +19205,6 @@ impl Application for Cagents {
         if model_update && matches!(projection, Projection::Full | Projection::Chrome) {
             projection_stage!("replica_snapshot", self.materialize_replica_snapshot());
         }
-        if projection == Projection::Full {
-            projection_stage!("worktree_protections", self.sync_worktree_protections());
-        }
         self.sync_popup_keyboard_nav();
         // The transport wording the health banner replaces may sit in either
         // part of a notice: a reworded one keeps the raw reason as detail.
@@ -19131,14 +19222,8 @@ impl Application for Cagents {
         if self.latency_focus != self.workspace.focused() {
             self.latency.abandon_pending();
         }
-        match projection {
-            Projection::Unchanged => {
-                return Task::batch([
-                    task,
-                    self.reconcile_notice_popup(),
-                    self.release_deferred_navigation_if_unblocked(),
-                ]);
-            }
+        let projected = match &projection {
+            Projection::Unchanged => self.reconcile_notice_popup(),
             // A reported title reaches the tabs, the window title and the
             // Attention list's pane rows; nothing else in the sidebar, nor
             // worktree ownership or protections, reads it.
@@ -19162,70 +19247,40 @@ impl Application for Cagents {
                 } else {
                     Task::none()
                 };
-                return Task::batch([
-                    task,
-                    chrome,
-                    notices,
-                    snapshot,
-                    self.release_deferred_navigation_if_unblocked(),
-                ]);
+                Task::batch([chrome, notices, snapshot])
             }
-            Projection::Full => {}
-        }
-        if camera_only {
-            return Task::batch([task, self.release_deferred_navigation_if_unblocked()]);
-        }
-        #[cfg(test)]
-        terminal_output_tests::record_projection();
-        #[cfg(test)]
-        if model_update {
-            self.shared_views.structural_tail_count += 1;
-        }
-        let notices = projection_stage!("notice_popup", self.reconcile_notice_popup());
-        projection_stage!("sidebar_selection", self.synchronize_sidebar_selection());
-        projection_stage!("sidebar_channels", self.refresh_sidebar_channels());
-        projection_stage!("retained_attention", self.sidebar_state
-            .prune_retained_attention(&self.sidebar_model));
-        if reconcile_row_selection {
-            projection_stage!("row_selection", self.prune_sidebar_row_selection());
-        }
-        projection_stage!("worktree_panes", self.refresh_sidebar_worktree_panes());
-        // Ahead of the rebind, which pins what the inspector drawing source
-        // control chose: a pane that has just arrived, closed or taken focus
-        // must not show the last binding for a frame.
-        projection_stage!("pane_inspectors", self.sync_pane_inspectors());
-        projection_stage!("pull_request_inspector", self.sync_pull_request_inspector());
-        let binding = projection_stage!("source_control", self.rebind_source_control());
-        if let Some(source) = self.sidebar_model.source_control.as_ref() {
-            let selected = self
-                .workspace
-                .focused()
-                .and_then(|card| match self.cards.get(&card) {
-                    Some(CardRuntime::Repository(runtime))
-                        if runtime.descriptor.worktree == source.key.canonical_path =>
-                    {
-                        runtime.selected_path()
-                    }
-                    _ => None,
-                });
-            self.sidebar_state.select_file(&source.key, selected);
-        }
-        // `view` cannot rebuild the chrome cache itself, so refresh it here.
-        let chrome = projection_stage!("chrome", self.sync_chrome());
-        let deferred = self.release_deferred_navigation_if_unblocked();
-        let terminal_probes =
-            projection_stage!("transcript_probes", self.terminal_transcript_probes());
-        // Another project shown, or a review or the workspace switcher closed.
-        let approval =
-            projection_stage!("automation_requests", self.read_owed_automation_requests());
+            // Panning and resizing the workspace move no label, selected
+            // worktree or repository binding. A frame can end an animation
+            // that releases a pane, so its worktree protection is kept.
+            Projection::Full if camera_only => {
+                projection_stage!("worktree_protections", self.sync_worktree_protections());
+                Task::none()
+            }
+            Projection::Full => {
+                #[cfg(test)]
+                terminal_output_tests::record_projection();
+                #[cfg(test)]
+                if model_update {
+                    self.shared_views.structural_tail_count += 1;
+                }
+                let notices = projection_stage!("notice_popup", self.reconcile_notice_popup());
+                Task::batch([notices, self.project_workspace(reconcile_row_selection)])
+            }
+        };
+        #[cfg(any(test, feature = "development"))]
+        let projected = Task::batch([
+            projected,
+            self.verify_projection(
+                oracle_message.as_deref(),
+                &projection,
+                camera_only,
+                reconcile_row_selection,
+            ),
+        ]);
         Task::batch([
             task,
-            binding,
-            chrome,
-            deferred,
-            notices,
-            terminal_probes,
-            approval,
+            projected,
+            self.release_deferred_navigation_if_unblocked(),
         ])
             })();
         let _postlude_trace = crate::performance::ui_trace::projection("Postlude");
@@ -19244,7 +19299,15 @@ impl Application for Cagents {
         // mounted visible chats are inspected by this bounded handoff.
         let limit_usage =
             projection_stage!("chat_limit_accounts", self.refresh_chat_limit_accounts());
-        Task::batch([task, activation, visibility, keyboard, preview, limit_usage])
+        Task::batch([
+            settled_projection,
+            task,
+            activation,
+            visibility,
+            keyboard,
+            preview,
+            limit_usage,
+        ])
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -31674,6 +31737,8 @@ mod tests {
             channel_offsets: HashMap::new(),
             worktree_offsets: HashMap::new(),
             worktree_owners: HashMap::new(),
+            #[cfg(any(test, feature = "development"))]
+            projected_protections: Default::default(),
             known_worktree_roots: worktree_ui::KnownWorktreeRoots::default(),
             worktree_paths: worktree_ui::WorktreePathIndex::default(),
             pull_request_board: chat_ui::PullRequestBoard::default(),

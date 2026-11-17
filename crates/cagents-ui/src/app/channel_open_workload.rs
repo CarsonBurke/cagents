@@ -406,6 +406,7 @@ fn opening_a_channel_while_a_save_is_in_flight_copies_no_card() {
 #[test]
 #[ignore = "timing workload; run optimized with --ignored --nocapture"]
 fn channel_open_timing() {
+    super::projection_oracle::disable();
     let (mut app, channels, _directory) = large_workspace(&Scale::LARGE);
     let mut renderer = super::tests::headless_renderer();
     let mut cache = frame(&app, Default::default(), &mut renderer);
@@ -473,6 +474,7 @@ fn channel_open_timing() {
 #[test]
 #[ignore = "timing workload; run optimized with --ignored --nocapture"]
 fn worktree_open_timing() {
+    super::projection_oracle::disable();
     let (mut app, _channels, _directory) = large_workspace(&Scale::LARGE);
     let project = &app.sidebar_model.projects[0];
     let rows = &project.worktrees;
@@ -517,6 +519,7 @@ fn worktree_open_timing() {
 #[test]
 #[ignore = "timing workload; run optimized with --ignored --nocapture"]
 fn navigation_save_timing() {
+    super::projection_oracle::disable();
     let (mut app, channels, directory) = large_workspace(&Scale::LARGE);
     app.shared_views.skip_rediscovery_check();
     let targets = &channels[..Scale::LARGE.chats];
@@ -597,6 +600,7 @@ fn navigation_save_timing() {
 #[test]
 #[ignore = "timing workload; run optimized with --ignored --nocapture"]
 fn new_worktree_save_timing() {
+    super::projection_oracle::disable();
     let (mut app, _channels, _directory) = large_workspace(&Scale::LARGE);
     app.shared_views.skip_rediscovery_check();
     // The daemon acknowledges each seed and lists its view.
@@ -663,6 +667,7 @@ fn new_worktree_save_timing() {
 #[test]
 #[ignore = "timing workload; run optimized with --ignored --nocapture"]
 fn steady_frame_phases() {
+    super::projection_oracle::disable();
     use iced::advanced::widget::{Tree, tree::NAMED};
 
     fn nodes(tree: &Tree) -> usize {
@@ -731,6 +736,7 @@ fn steady_frame_phases() {
 #[test]
 #[ignore = "timing workload; run optimized with --ignored --nocapture"]
 fn pull_request_label_upkeep_timing() {
+    super::projection_oracle::disable();
     const LISTED: u64 = 100;
     const TURNS: usize = 16;
     const SHOWN: usize = 4;
@@ -831,6 +837,7 @@ fn pull_request_label_upkeep_timing() {
 #[test]
 #[ignore = "timing workload; run optimized with --ignored --nocapture"]
 fn projection_tail_timing() {
+    super::projection_oracle::disable();
     const ROUNDS: usize = 64;
     let (mut app, channels, _directory) = large_workspace(&Scale::LARGE);
     drop(app.update(Message::Sidebar(SidebarAction::OpenChannel {
