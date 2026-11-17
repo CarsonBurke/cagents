@@ -23345,6 +23345,13 @@ pub(in crate::app) mod tests {
         card
     }
 
+    /// A chat still starting, with its first message on its way.
+    pub(in crate::app) fn chat_sending_its_first_message(app: &mut Cagents) -> CardId {
+        let (card, _) = starting_chat(app);
+        assert!(app.chat_first_message_on_its_way(card).is_some());
+        card
+    }
+
     /// A live Claude chat whose turn is still running.
     pub(in crate::app) fn working_chat(app: &mut Cagents, session_id: &str) -> CardId {
         let card = live_chat_for_provider(app, Provider::Claude, Some(session_id));

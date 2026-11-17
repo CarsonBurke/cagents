@@ -2,9 +2,12 @@
 //! answer, unless it is routine, and Escape takes it away.
 //!
 //! The test walks [`Question::ALL`] and opens each question through the
-//! update its user starts it with, so a new question can't slip past: adding
-//! one to [`Question`] is the only way to give it a confirmation surface, and
-//! the exhaustive `match` in [`open`] then asks for the way it opens.
+//! update its user starts it with. A [`confirmation_surface`] must name its
+//! question, every question is in that list, and the exhaustive `match` in
+//! [`open`] asks how a new one opens, so a new question is tested as soon as
+//! it exists.
+//!
+//! [`confirmation_surface`]: super::dialog_ui::confirmation_surface
 
 use super::dialog_ui::{Consequence, Question};
 use super::*;
@@ -127,6 +130,21 @@ fn open(question: Question) -> Opened {
         Question::StopWorkingChat => {
             let mut app = tests::context_inspector_test_app(false);
             let card = chat_ui::tests::working_chat(&mut app, "working");
+            let opening = app.update(Message::CloseCard(card));
+            opened(
+                app,
+                opening,
+                id("dialog.chat-close.cancel"),
+                id("dialog.chat-close.confirm"),
+            )
+        }
+        Question::StopSendingFirstMessage => {
+            let mut app = tests::context_inspector_test_app(false);
+            let card = chat_ui::tests::chat_sending_its_first_message(&mut app);
+            // Losing the message is asked about even by someone who chose
+            // not to be asked before stopping a working chat.
+            app.settings
+                .set_asks(settings::Confirmation::StopWorkingChat, false);
             let opening = app.update(Message::CloseCard(card));
             opened(
                 app,
@@ -276,7 +294,8 @@ fn asked(element: Option<Element<'_, Message>>) -> Option<Question> {
         .as_widget_mut()
         .operate(&mut tree, Layout::new(&node), &renderer, &mut find);
     Question::ALL
-        .into_iter()
+        .iter()
+        .copied()
         .find(|question| find.0.contains(&question.surface_id()))
 }
 
@@ -312,7 +331,7 @@ fn escape() -> Message {
 /// dismisses every one of them.
 #[test]
 fn every_question_opens_on_its_safe_answer_unless_routine_and_escape_dismisses_it() {
-    for question in Question::ALL {
+    for &question in Question::ALL {
         let Opened {
             mut app,
             opening,
@@ -381,13 +400,19 @@ fn every_question_opens_on_its_safe_answer_unless_routine_and_escape_dismisses_i
 #[test]
 fn only_skippable_questions_are_routine() {
     let routine = Question::ALL
-        .into_iter()
+        .iter()
+        .copied()
         .filter_map(Question::skippable)
         .collect::<Vec<_>>();
     assert_eq!(routine, settings::Confirmation::ALL);
-    assert_eq!(
-        Question::DiscardUnsentMessage.consequence(),
-        Consequence::Irreversible,
-        "an unsent message is gone for good once its tab closes"
-    );
+    for question in [
+        Question::StopSendingFirstMessage,
+        Question::DiscardUnsentMessage,
+    ] {
+        assert_eq!(
+            question.consequence(),
+            Consequence::Irreversible,
+            "{question:?} loses a message nothing brings back"
+        );
+    }
 }

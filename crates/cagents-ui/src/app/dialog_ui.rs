@@ -208,19 +208,38 @@ impl Consequence {
     }
 }
 
-/// Every question the application asks in a [`confirmation_surface`]. Each
-/// names what its committing action costs, so where the keyboard starts is
-/// decided here, once, rather than by whichever code opens the dialog: a
-/// dialog that loses work can't open with Enter on its destructive button
-/// because its opener reused a routine question's focus.
-///
-/// Only questions whose action is common and recoverable, and which the
-/// person may choose not to be asked again, are routine (#2711).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Question {
+/// Declares [`Question`] and the list of all of it the tests walk, together,
+/// so no question can be left off the list.
+macro_rules! questions {
+    ($($(#[$doc:meta])* $question:ident,)*) => {
+        /// Every question the application asks in a [`confirmation_surface`]. Each
+        /// names what its committing action costs, so where the keyboard starts is
+        /// decided here, once, rather than by whichever code opens the dialog: a
+        /// dialog that loses work can't open with Enter on its destructive button
+        /// because its opener reused a routine question's focus.
+        ///
+        /// Only questions whose action is common and recoverable, and which the
+        /// person may choose not to be asked again, are routine (#2711).
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub(crate) enum Question {
+            $($(#[$doc])* $question,)*
+        }
+
+        impl Question {
+            /// Every question, in declaration order.
+            #[cfg(test)]
+            pub(crate) const ALL: &'static [Self] = &[$(Self::$question,)*];
+        }
+    };
+}
+
+questions! {
     /// Closing a chat that may still be working; its conversation stays in
     /// history.
     StopWorkingChat,
+    /// Closing a chat whose first message is still on its way: the message
+    /// is discarded with it.
+    StopSendingFirstMessage,
     /// Closing a tab whose first message couldn't start: the unsent message
     /// is gone for good.
     DiscardUnsentMessage,
@@ -253,24 +272,6 @@ pub(crate) enum Question {
 }
 
 impl Question {
-    #[cfg(test)]
-    pub(crate) const ALL: [Self; 14] = [
-        Self::StopWorkingChat,
-        Self::DiscardUnsentMessage,
-        Self::CloseActiveTerminal,
-        Self::LeaveTerminalProcessesRunning,
-        Self::TerminalPaneKept,
-        Self::ResetSettings,
-        Self::DiscardChanges,
-        Self::DeleteSidebarSelection,
-        Self::RemoveProject,
-        Self::DeleteWorktree,
-        Self::DeleteChannel,
-        Self::CloseWithUnsavedWork,
-        Self::DiscardAutomationDraft,
-        Self::PasteMultipleLines,
-    ];
-
     pub(crate) const fn consequence(self) -> Consequence {
         match self {
             Self::StopWorkingChat => Consequence::Routine(settings::Confirmation::StopWorkingChat),
@@ -278,7 +279,8 @@ impl Question {
                 Consequence::Routine(settings::Confirmation::CloseActiveTerminal)
             }
             Self::TerminalPaneKept => Consequence::Report,
-            Self::DiscardUnsentMessage
+            Self::StopSendingFirstMessage
+            | Self::DiscardUnsentMessage
             | Self::LeaveTerminalProcessesRunning
             | Self::ResetSettings
             | Self::DiscardChanges

@@ -2,9 +2,11 @@
 //! that is still working asks first, as a terminal running a process does. The
 //! window may not be the one that started it, or know how far it has got.
 //! The conversation stays in history, so this is a routine question: Enter
-//! answers it, and the person may choose not to be asked again. A tab whose
-//! first message couldn't start asks instead whether to discard that unsent
-//! message, which nothing brings back: that question opens on Cancel.
+//! answers it, and the person may choose not to be asked again. Closing a
+//! chat whose first message hasn't arrived discards that message, which
+//! nothing brings back, so those questions are always asked and open on
+//! their dismissal: one whose message is still on its way, and one whose
+//! message couldn't start and is kept unsent in the composer.
 
 use super::*;
 
@@ -24,22 +26,11 @@ pub(super) struct ChatCloseConfirm {
     session: TerminalId,
     /// False when this window cannot tell, as while it is still attaching.
     certain: bool,
-    /// A refused first message is still an unsent draft, not a running chat.
-    discard_draft: bool,
+    /// Decided when the question opens, so the answer it starts on doesn't
+    /// change under the person reading it.
+    question: dialog_ui::Question,
     restore_card: Option<CardId>,
     restore_keyboard_nav: bool,
-}
-
-impl ChatCloseConfirm {
-    /// Which question this close asks: discarding an unsent message, or
-    /// stopping a conversation that stays in history.
-    fn question(&self) -> dialog_ui::Question {
-        if self.discard_draft {
-            dialog_ui::Question::DiscardUnsentMessage
-        } else {
-            dialog_ui::Question::StopWorkingChat
-        }
-    }
 }
 
 impl Cagents {
@@ -70,9 +61,7 @@ impl Cagents {
         // A question asked beside a close under way could end up under that
         // close's own dialog. A chat with nothing to ask doesn't have to wait.
         if self.chat_close_dialog_visible()
-            || ((self.chat_close_would_ask(card).is_some()
-                || self.blocked_draft_discard(card).is_some())
-                && self.another_close_under_way(card))
+            || (self.chat_close_would_ask(card).is_some() && self.another_close_under_way(card))
         {
             self.queue_card_close(card, false);
             return Some(Task::none());
@@ -80,35 +69,44 @@ impl Cagents {
         self.ask_before_chat_close(card)
     }
 
-    /// The working conversation a close of this card would ask about, unless
-    /// the person chose not to be asked.
-    fn chat_close_would_ask(&self, card: CardId) -> Option<(TerminalId, bool)> {
-        self.asks(QUESTION)
-            .then(|| self.chat_working_session(card))
-            .flatten()
+    /// What a close of this card would ask, about which conversation, and
+    /// whether this window is sure it is working. A close that loses a first
+    /// message is asked about whatever the stop-question setting says: that
+    /// setting governs stopping work, not losing text.
+    fn chat_close_would_ask(
+        &self,
+        card: CardId,
+    ) -> Option<(dialog_ui::Question, TerminalId, bool)> {
+        if let Some(session) = self.blocked_draft_discard(card) {
+            return Some((dialog_ui::Question::DiscardUnsentMessage, session, true));
+        }
+        let (session, certain) = self.chat_working_session(card)?;
+        if self.chat_first_message_on_its_way(card).is_some() {
+            Some((
+                dialog_ui::Question::StopSendingFirstMessage,
+                session,
+                certain,
+            ))
+        } else {
+            self.asks(QUESTION)
+                .then_some((dialog_ui::Question::StopWorkingChat, session, certain))
+        }
     }
 
     pub(super) fn ask_before_chat_close(&mut self, card: CardId) -> Option<Task<Message>> {
-        // An unsent first message is asked about whatever the stop-question
-        // setting says: that setting governs stopping work, not losing text.
-        let draft = self.blocked_draft_discard(card);
-        let (session, certain) = draft
-            .map(|session| (session, true))
-            .or_else(|| self.chat_close_would_ask(card))?;
+        let (question, session, certain) = self.chat_close_would_ask(card)?;
         if !self.prepare_shared_removal(card) {
             return Some(Task::none());
         }
         let restore_keyboard_nav = self.core.keyboard_nav();
-        let intent = ChatCloseConfirm {
+        self.chat_close_confirm = Some(ChatCloseConfirm {
             card,
             session,
             certain,
-            discard_draft: draft.is_some(),
+            question,
             restore_card: self.workspace.focused(),
             restore_keyboard_nav,
-        };
-        let question = intent.question();
-        self.chat_close_confirm = Some(intent);
+        });
         self.core.set_keyboard_nav(false);
         Some(self.open_question(question, widget::Id::new(CANCEL), widget::Id::new(CONFIRM)))
     }
@@ -118,7 +116,7 @@ impl Cagents {
     fn chat_close_target_current(&self, intent: &ChatCloseConfirm) -> bool {
         self.card_state(intent.card).is_some_and(|state| {
             state.existence.is_open()
-                && (!intent.discard_draft
+                && (intent.question != dialog_ui::Question::DiscardUnsentMessage
                     || self.blocked_draft_discard(intent.card) == Some(intent.session))
                 && matches!(&state.kind, CardKind::Chat(session) if session.id == intent.session)
         })
@@ -187,9 +185,9 @@ impl Cagents {
         if current {
             // Only a close that goes ahead keeps a tick in "Don't ask again";
             // one whose conversation changed meanwhile answered nothing.
-            // The discard question has no "Don't ask again" of its own.
-            let remember = if intent.question().skippable().is_some() {
-                self.commit_confirmation(QUESTION)
+            // A question about losing a message has no "Don't ask again".
+            let remember = if let Some(confirmation) = intent.question.skippable() {
+                self.commit_confirmation(confirmation)
             } else {
                 self.dismiss_confirmation(QUESTION);
                 Task::none()
@@ -223,7 +221,7 @@ impl Cagents {
                     .map(|chrome| chrome.title.to_string())
             });
         let question = intent.map_or(dialog_ui::Question::StopWorkingChat, |intent| {
-            intent.question()
+            intent.question
         });
         let discard_draft = question == dialog_ui::Question::DiscardUnsentMessage;
         let title = if discard_draft {

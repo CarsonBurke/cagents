@@ -43,13 +43,16 @@ impl CloseIntent {
         self.detail.is_some() && !self.unreadable.is_empty()
     }
 
-    /// What the dialog asks: whether to close beside processes left running,
-    /// a report of why the pane was kept, or whether to stop the processes.
+    /// What the dialog asks: whether to close beside processes left running
+    /// (and, once the person said yes, that close under way), a report of why
+    /// the pane was kept, or whether to stop the processes.
     fn question(&self) -> dialog_ui::Question {
         if self.offers_leaving() {
             dialog_ui::Question::LeaveTerminalProcessesRunning
         } else if self.detail.is_some() {
             dialog_ui::Question::TerminalPaneKept
+        } else if !self.active && !self.leave.is_empty() {
+            dialog_ui::Question::LeaveTerminalProcessesRunning
         } else {
             dialog_ui::Question::CloseActiveTerminal
         }
