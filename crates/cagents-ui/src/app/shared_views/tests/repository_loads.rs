@@ -18,14 +18,18 @@ struct RestoredProject {
 
 /// A window whose registry already holds three projects, each with a channel
 /// and a worktree view this window has never adopted, plus a channel of its
-/// own the registry has never heard of. An unrelated project is already
-/// settled. Identifiers are fixed, so every [`Self::app`] is the same window.
+/// own the registry has never heard of. A fourth project, with a channel of its
+/// own, is one the registry has never heard of either. An unrelated project is
+/// already settled. Identifiers are fixed, so every [`Self::app`] is the same
+/// window.
 struct RestoredWorkspace {
     id: crate::model::WorkspaceId,
     identity: uuid::Uuid,
     unrelated: (ProjectId, RepositoryId, ChannelId, CardId, BrowserId),
     unshared: ChannelId,
     projects: Vec<RestoredProject>,
+    /// The project the registry lacks, and its channel.
+    unknown: (ProjectId, RepositoryId, ChannelId),
 }
 
 fn browser_pane((id, browser): (CardId, BrowserId), title: &str) -> Pane {
@@ -79,6 +83,7 @@ impl RestoredWorkspace {
                     worktree_pane: (CardId::new(), BrowserId::new()),
                 })
                 .collect(),
+            unknown: (ProjectId::new(), RepositoryId::new(), ChannelId::new()),
         }
     }
 
@@ -175,31 +180,49 @@ impl RestoredWorkspace {
                 .push(browser_pane(project.worktree_pane, "Worktree pane"));
             app.workspace_model.views.extend([channel, worktree]);
         }
+        let (unknown, unknown_id, unknown_channel) = self.unknown;
+        let unknown_index = self.projects.len();
+        app.sidebar_model.projects.push(SidebarProject::new(
+            unknown,
+            unknown_id,
+            format!("project-{unknown_index}"),
+            repository(unknown_index),
+            vec![],
+            vec![],
+        ));
+        app.repository_generations.insert(unknown, 1);
         let durable = Arc::make_mut(&mut app.durable);
-        durable.channels.push(ProjectChannel {
-            id: self.unshared,
-            project_id: self.projects[0].id,
-            title: "Never shared".into(),
-            title_source: Default::default(),
-            ordinal: 9,
-            shared: false,
-            cards: vec![],
-            focused: None,
-        });
+        for (id, project_id, ordinal) in [
+            (self.unshared, self.projects[0].id, 9),
+            (unknown_channel, unknown, 10),
+        ] {
+            durable.channels.push(ProjectChannel {
+                id,
+                project_id,
+                title: "Never shared".into(),
+                title_source: Default::default(),
+                ordinal,
+                shared: false,
+                cards: vec![],
+                focused: None,
+            });
+        }
         app.workspace_model.sequence = 2;
 
         let loads = self
             .projects
             .iter()
+            .map(|project| project.id)
+            .chain([unknown])
             .enumerate()
-            .map(|(index, project)| Message::RepositoryLoaded {
+            .map(|(index, id)| Message::RepositoryLoaded {
                 open_cards: false,
-                project_id: project.id,
+                project_id: id,
                 generation: 1,
                 result: Ok(Box::new(LoadedRepository {
                     project: ProjectState {
                         kind: Default::default(),
-                        id: project.id,
+                        id,
                         generation: 0,
                         name: format!("project-{index}"),
                         repository: repository(index),
@@ -250,9 +273,11 @@ fn reconciled(app: &Cagents, published: &TestModelRequests) -> Reconciled {
 
 /// Startup's background loads now share one pass over their repositories'
 /// scopes. That pass must leave exactly what a complete reconciliation of the
-/// same loads leaves, and what one pass per load left before the loads were
-/// coalesced: the same adopted channels and panes, the same saved workspace,
-/// the same edits sent to the registry.
+/// same loads leaves: the same adopted channels and panes, the same saved
+/// workspace, the same edits sent to the registry. It must also leave the
+/// same state as a pass after each load, which is how loads reconciled before
+/// they were coalesced (here run with the rest of the current code, not
+/// against the older revision).
 #[test]
 fn coalesced_repository_loads_leave_what_a_complete_reconciliation_leaves() {
     let workspace = RestoredWorkspace::new();
@@ -268,7 +293,7 @@ fn coalesced_repository_loads_leave_what_a_complete_reconciliation_leaves() {
         for load in loads {
             drop(app.update(load));
         }
-        assert_eq!(app.pending_repository_reconciliation.len(), 3);
+        assert_eq!(app.pending_repository_reconciliation.len(), 4);
         drop(app.update(Message::RepositoryReconciliationDue));
     });
     let per_load = run(&|app, loads| {
@@ -308,6 +333,26 @@ fn coalesced_repository_loads_leave_what_a_complete_reconciliation_leaves() {
         ),
         "the channel the registry never heard of is introduced"
     );
+    let (_, _, unknown_channel) = workspace.unknown;
+    let unknown = repository(workspace.projects.len());
+    let opened = coalesced
+        .published
+        .iter()
+        .position(|edit| matches!(edit, ModelEdit::OpenProject { repository, .. } if *repository == unknown))
+        .expect("the project the registry lacks is opened");
+    let created = coalesced
+        .published
+        .iter()
+        .position(
+            |edit| matches!(edit, ModelEdit::CreateChannel { id, .. } if *id == unknown_channel),
+        )
+        .expect("its channel is introduced");
+    assert!(opened < created, "a channel's project is opened before it");
+    assert!(
+        !coalesced.published.iter().any(|edit| matches!(edit,
+            ModelEdit::OpenProject { repository, .. } if *repository != unknown)),
+        "projects the registry holds are not opened again"
+    );
 
     for (name, other) in [("complete", &complete), ("per load", &per_load)] {
         assert_eq!(
@@ -321,15 +366,23 @@ fn coalesced_repository_loads_leave_what_a_complete_reconciliation_leaves() {
         );
     }
     assert_eq!(coalesced.published, complete.published);
-    // One pass per load re-sent the channel each pass until the registry
-    // acknowledged it; one shared pass sends each edit once.
-    let mut first_sent = Vec::new();
-    for edit in per_load.published {
-        if !first_sent.contains(&edit) {
-            first_sent.push(edit);
+    // A pass per load sends the same edits, but each pass re-sends what the
+    // registry has not acknowledged yet, and the first pass runs before the
+    // later loads open their projects: the same edits, in another order.
+    let distinct = |edits: &[ModelEdit]| {
+        let mut distinct = Vec::new();
+        for edit in edits {
+            if !distinct.contains(edit) {
+                distinct.push(edit.clone());
+            }
         }
-    }
-    assert_eq!(coalesced.published, first_sent);
+        distinct.sort_by_key(|edit| format!("{edit:?}"));
+        distinct
+    };
+    assert_eq!(
+        distinct(&coalesced.published),
+        distinct(&per_load.published)
+    );
 }
 
 /// Opening a project's cards is the user waiting on that project, so its load

@@ -197,9 +197,6 @@ pub struct EdgeChanges {
     pub effects: EditEffects,
 }
 
-/// A title edge may use the metadata-only projector only when its canonical
-/// effects contain no other work. Scoped recovery or lifecycle effects still
-/// need the complete reconciliation, even when the original edit was a title.
 /// Whether `model` is a registry's and holds this project row as a window
 /// would open it.
 ///
@@ -217,6 +214,9 @@ fn holds_project(model: &WorkspaceModel, repository: &Path, name: &str, kind: Pr
             .is_some_and(|held| held.name == name && held.kind == kind)
 }
 
+/// A title edge may use the metadata-only projector only when its canonical
+/// effects contain no other work. Scoped recovery or lifecycle effects still
+/// need the complete reconciliation, even when the original edit was a title.
 fn channel_title_only(
     edit: &ModelEdit,
     effects: &EditEffects,
@@ -3085,6 +3085,7 @@ impl Cagents {
         let repository = project.repository.clone();
         let name = project.name.clone();
         let kind = project.kind;
+        self.project_ui.opened.insert(repository.clone());
         if self.project_ui.is_reopening(&repository) {
             self.publish_model_edit(ModelEdit::ReopenProject {
                 repository,
@@ -3106,16 +3107,18 @@ impl Cagents {
     /// A repository load skips `OpenProject` for a project the registry it
     /// last heard from holds (see [`holds_project`]). When that registry is
     /// replaced, its successor never received those opens, so they are sent
-    /// here: except for a project the successor tombstoned, which closes
-    /// instead, and one whose repository could not be read, which no load
-    /// opened.
+    /// here for every project a load has opened. A project still loading opens
+    /// itself when its load lands, against the successor's model. A project
+    /// the successor tombstoned closes instead, and one whose checkout a later
+    /// read could not reach is not opened anywhere it is missing.
     fn introduce_open_projects(&mut self, model: &WorkspaceModel, opened: &mut HashSet<PathBuf>) {
         let unknown = self
             .sidebar_model
             .projects
             .iter()
             .filter(|project| {
-                project.unreachable.is_none()
+                self.project_ui.opened.contains(&project.repository)
+                    && project.unreachable.is_none()
                     && !self.project_ui.closed.contains(&project.repository)
                     && !model.closed_projects.contains(&project.repository)
                     && !holds_project(model, &project.repository, &project.name, project.kind)
@@ -9073,8 +9076,9 @@ mod tests {
 
     /// A load skips opening a project the registry it knows holds. If that
     /// registry is then replaced, its successor was never told; joining it
-    /// sends the open the load skipped. Reconnecting to the same registry, or
-    /// joining one that holds the project, sends nothing.
+    /// sends the open the load skipped, for loaded projects only.
+    /// Reconnecting to the same registry, or joining one that holds the
+    /// project, sends nothing.
     #[test]
     fn joining_a_replacement_registry_reopens_projects_it_lacks() {
         let (mut app, project, repository) = app_with_project();
@@ -9105,13 +9109,56 @@ mod tests {
             "the same registry already answered for its own project rows"
         );
 
-        drop(app.apply_workspace_model_update(ModelUpdate::Connected(registry(Vec::new()))));
-        assert_eq!(opens(drain(&published)), 1);
+        // Beside it: a project still loading, one whose checkout a later read
+        // could not reach, one this window closed, and one the successor
+        // tombstoned. None of them is opened.
+        let others = ["loading", "unreachable", "closed", "tombstoned"].map(|name| {
+            let repository = PathBuf::from(format!("/{name}/.git"));
+            let mut row = SidebarProject::new(
+                ProjectId::new(),
+                RepositoryId::new(),
+                name.into(),
+                repository.clone(),
+                Vec::new(),
+                Vec::new(),
+            );
+            if name != "loading" {
+                app.project_ui.opened.insert(repository.clone());
+            }
+            if name == "unreachable" {
+                row.unreachable = Some("the checkout is gone".into());
+            }
+            if name == "closed" {
+                app.project_ui.closed.insert(repository.clone());
+            }
+            app.sidebar_model.projects.push(row);
+            repository
+        });
+        let mut successor = registry(Vec::new());
+        successor.closed_projects.push(others[3].clone());
+        drop(app.apply_workspace_model_update(ModelUpdate::Connected(successor)));
+        let edits = drain(&published);
+        assert!(
+            !edits.iter().any(|edit| matches!(edit,
+                ModelEdit::OpenProject { repository, .. } if others.contains(repository))),
+            "{edits:?}"
+        );
+        assert_eq!(opens(edits), 1);
 
         let mut holding = registry(Vec::new());
         holding.projects.push(held_project(&repository));
         drop(app.apply_workspace_model_update(ModelUpdate::Connected(holding)));
         assert_eq!(opens(drain(&published)), 0);
+
+        // Only a complete pass introduces: a repository pass leaves it owed.
+        app.workspace_model.projects.clear();
+        app.shared_views.unintroduced_projects = true;
+        drop(app.reconcile_workspace_model_for_repository(&repository));
+        assert_eq!(opens(drain(&published)), 0);
+        assert!(app.shared_views.unintroduced_projects);
+        drop(app.reconcile_workspace_model());
+        assert_eq!(opens(drain(&published)), 1);
+        assert!(!app.shared_views.unintroduced_projects);
     }
 
     /// Before a window has shared a channel, the registry's silence about that
