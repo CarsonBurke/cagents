@@ -72,7 +72,7 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
 };
 
 /// Directory entries a rollout search visits before giving up.
-#[cfg(feature = "host")]
+#[cfg(any(feature = "ui", feature = "host"))]
 const ROLLOUT_SCAN: usize = 262_144;
 
 /// The one rollout recording thread `id` under a Codex home: Codex files each
@@ -82,8 +82,8 @@ const ROLLOUT_SCAN: usize = 262_144;
 /// may be a link, as when it is kept with other configuration; links inside
 /// it are refused and the scan is bounded, so a damaged or hostile history
 /// cannot redirect or stall it.
-#[cfg(feature = "host")]
-pub(crate) fn rollout(home: &std::path::Path, id: &str) -> Result<PathBuf, String> {
+#[cfg(any(feature = "ui", feature = "host"))]
+pub fn rollout(home: &std::path::Path, id: &str) -> Result<PathBuf, String> {
     let suffix = rollout_suffix(id)?;
     let sessions = resolved_home(home)?.join("sessions");
     let mut budget = ROLLOUT_SCAN;
@@ -118,7 +118,7 @@ pub(crate) fn archived_rollout(home: &std::path::Path, id: &str) -> Result<PathB
 
 /// The Codex home with its links resolved, or a missing history when there
 /// is none.
-#[cfg(feature = "host")]
+#[cfg(any(feature = "ui", feature = "host"))]
 fn resolved_home(home: &std::path::Path) -> Result<PathBuf, String> {
     match home.canonicalize() {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -128,7 +128,7 @@ fn resolved_home(home: &std::path::Path) -> Result<PathBuf, String> {
     }
 }
 
-#[cfg(feature = "host")]
+#[cfg(any(feature = "ui", feature = "host"))]
 fn rollout_suffix(id: &str) -> Result<String, String> {
     if id.len() != 36 || uuid::Uuid::parse_str(id).is_err() {
         return Err("Codex thread ID is not an exact UUID".into());
@@ -136,7 +136,7 @@ fn rollout_suffix(id: &str) -> Result<String, String> {
     Ok(format!("-{id}.jsonl"))
 }
 
-#[cfg(feature = "host")]
+#[cfg(any(feature = "ui", feature = "host"))]
 fn one_rollout(found: Vec<PathBuf>) -> Result<PathBuf, String> {
     match <[PathBuf; 1]>::try_from(found) {
         Ok([path]) => Ok(path),
@@ -147,7 +147,7 @@ fn one_rollout(found: Vec<PathBuf>) -> Result<PathBuf, String> {
 
 /// `YYYY/MM/DD` for the UTC day a version-7 thread ID was minted and the
 /// days either side, which cover every local time zone.
-#[cfg(feature = "host")]
+#[cfg(any(feature = "ui", feature = "host"))]
 fn creation_days(id: &str) -> Vec<String> {
     let Ok(uuid) = uuid::Uuid::parse_str(id) else {
         return Vec::new();
@@ -170,7 +170,7 @@ fn creation_days(id: &str) -> Vec<String> {
         .collect()
 }
 
-#[cfg(feature = "host")]
+#[cfg(any(feature = "ui", feature = "host"))]
 fn find_rollouts(
     root: &std::path::Path,
     depth: usize,

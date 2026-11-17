@@ -106,6 +106,7 @@ mod logical_prose;
 mod markdown;
 mod markdown_source;
 mod monospace;
+mod opening_name;
 mod pending_admission;
 mod permissions;
 mod preparation;
@@ -307,6 +308,9 @@ pub enum Action {
     /// a terminal can take its place.
     ReturnedLocally(Target, Result<(), ReturnRefused>),
     Wake(Target, Wake),
+    /// What the opening of a pane's conversation names its channel, read
+    /// once because the chat's loaded window starts after it.
+    OpeningName(CardId, String, Option<String>),
     UpdatesAcknowledged(Target, Result<(), String>),
     Reconnect(Target),
     DraftStartCheckpointed(Target, uuid::Uuid, Result<(), String>),
@@ -751,6 +755,7 @@ impl Action {
             Self::Retired(..) => "Retired",
             Self::ReturnedLocally(..) => "ReturnedLocally",
             Self::Wake(..) => "Wake",
+            Self::OpeningName(..) => "OpeningName",
             Self::UpdatesAcknowledged(..) => "UpdatesAcknowledged",
             Self::Reconnect(..) => "Reconnect",
             Self::DraftStartCheckpointed(..) => "DraftStartCheckpointed",
@@ -1181,6 +1186,10 @@ impl Resend {
 
 pub(super) struct State {
     channel_names: HashMap<Target, ChannelNameObservation>,
+    /// What the opening of each pane's conversation named, read at most once
+    /// while the window runs for a channel with no name: `None` while the
+    /// read runs, then the name it found, if any.
+    opening_names: HashMap<(CardId, String), Option<Option<String>>>,
     pub(super) image_viewer: Option<images::Gallery>,
     files: HashMap<PathBuf, Arc<Vec<String>>>,
     sender: async_channel::Sender<(Target, Wake)>,
@@ -1257,6 +1266,7 @@ impl Default for State {
         Self {
             image_viewer: None,
             channel_names: HashMap::new(),
+            opening_names: HashMap::new(),
             files: HashMap::new(),
             sender,
             receiver,
@@ -10387,7 +10397,7 @@ impl Cagents {
 
     /// A title may precede its pane's first shared-view acknowledgement. Retry
     /// the retained candidate after projection, with the newly accepted proof.
-    pub(super) fn refresh_channel_title_suggestions(&mut self) {
+    pub(super) fn refresh_channel_title_suggestions(&mut self) -> Task<Message> {
         for target in self
             .chat_ui
             .channel_names
@@ -10413,6 +10423,7 @@ impl Cagents {
         // A refused original revision is never rewritten in the publisher.
         // A newly accepted projection can make a fresh suggestion from the
         // current runtime; unchanged proofs do not create a retry loop.
+        let mut openings = Vec::new();
         for (card, proof) in &proofs {
             if !self.channel_needs_name(*card) {
                 continue;
@@ -10444,6 +10455,9 @@ impl Cagents {
                 observation.pending = observation.title.is_some();
                 observation.last_view = Some(*proof);
             }
+            // A pane that became a channel's primary chat, or a channel that
+            // lost its name, may need its conversation's opening.
+            openings.extend(self.request_opening_name(target));
         }
         let candidates = self
             .chat_ui
@@ -10463,6 +10477,11 @@ impl Cagents {
             } else {
                 self.chat_ui.channel_names.remove(&target);
             }
+        }
+        if openings.is_empty() {
+            Task::none()
+        } else {
+            Task::batch(openings)
         }
     }
 
@@ -11573,6 +11592,9 @@ impl Cagents {
             Action::AccountRestored(card, result) => {
                 return self.chat_account_restored(card, result);
             }
+            Action::OpeningName(card, conversation, title) => {
+                self.opening_name_read(card, conversation, title);
+            }
             Action::DraftSkills(target, launch, skills) => {
                 if let Some(runtime) = self.chat_card_runtime_mut(target)
                     && runtime.is_draft()
@@ -12272,6 +12294,8 @@ impl Cagents {
                         if let Some((name, source)) = channel_name {
                             self.publish_observed_channel_name(target, name, source);
                         }
+                        let opening_name =
+                            self.request_opening_name(target).unwrap_or_else(Task::none);
                         self.observe_agent_activity_for_card(target.card, Some(activity));
                         // A new request can reject before its first Changed
                         // wake reaches this window. Historical reopen alone
@@ -12315,6 +12339,7 @@ impl Cagents {
                             submitted,
                             usage,
                             limits,
+                            opening_name,
                             self.list_chat_models(target.card),
                             self.dispatch_queued(target),
                         ]);
@@ -24210,7 +24235,7 @@ pub(in crate::app) mod tests {
         channel.cards = vec![b, a];
         channel.title.clear();
         channel.title_source = ChannelTitleSource::Prompt;
-        app.refresh_channel_title_suggestions();
+        drop(app.refresh_channel_title_suggestions());
         assert_eq!(app.durable.channels[0].title, "Secondary encryption review");
         assert_eq!(
             app.durable.channels[0].title_source,
