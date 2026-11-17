@@ -403,11 +403,13 @@ pub(in crate::app) mod tests {
     }
 
     /// The open dialog reads its blockers live on every frame. With many
-    /// worktrees and sessions filed only by directory, drawing it must not
-    /// resolve any of those paths on disk.
+    /// worktrees, drawing it must not resolve any of their paths on disk. The
+    /// unsaved editor and the review checkout are filed by their repository
+    /// or channel, and the one session filed only by its directory blocks
+    /// nothing, so neither check needs a project's directory scope.
     #[test]
     fn drawing_a_project_group_dialog_resolves_no_paths_on_disk() {
-        let (mut app, project, _) = fixture();
+        let (mut app, project, channels) = fixture();
         let worktrees = |name: &str| {
             (0..200)
                 .map(|index| {
@@ -425,24 +427,69 @@ pub(in crate::app) mod tests {
                 .collect::<Vec<_>>()
         };
         app.sidebar_model.projects[0].worktrees = worktrees("selection-project");
-        let other = ProjectId::new();
-        app.sidebar_model.projects.push(SidebarProject::new(
-            other,
-            RepositoryId::new(),
-            "Other project".into(),
-            "/other-project".into(),
-            worktrees("other-project"),
-            Vec::new(),
-        ));
-        let cards = app.durable.cards.len();
+        let [reviewing, idle] = [ProjectId::new(), ProjectId::new()];
+        for (id, name) in [(reviewing, "reviewing-project"), (idle, "idle-project")] {
+            app.sidebar_model.projects.push(SidebarProject::new(
+                id,
+                RepositoryId::new(),
+                name.into(),
+                format!("/{name}").into(),
+                worktrees(name),
+                Vec::new(),
+            ));
+        }
+        let review_channel = ChannelId::new();
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .push(ProjectChannel {
+                title_source: Default::default(),
+                id: review_channel,
+                project_id: reviewing,
+                title: "Review".into(),
+                ordinal: 0,
+                shared: false,
+                cards: Vec::new(),
+                focused: None,
+            });
+        app.refresh_sidebar_channels();
+
+        // The selected project has an unsaved editor and sessions in its
+        // channel.
         drop(app.add_terminal("/selection-project-wt/wt-3/src".into()));
-        drop(app.add_terminal("/other-project-wt/wt-7".into()));
-        assert_eq!(app.durable.cards.len(), cards + 2);
-        app.project_ui
-            .removing
-            .insert("/selection-project".into(), Vec::new());
-        app.select_sidebar_rows(SelectionRow::Project(project), SelectionIntent::Toggle);
-        app.select_sidebar_rows(SelectionRow::Project(other), SelectionIntent::Toggle);
+        drop(app.add_repository_card(
+            project,
+            "/selection-project".into(),
+            "/selection-project-wt/wt-1".into(),
+        ));
+        let editor = app.workspace.focused().unwrap();
+        app.cards.insert(
+            editor,
+            CardRuntime::Repository(Box::new(RepositoryRuntime::dirty_fixture(editor))),
+        );
+        // Another project's review is reconciling its checkout.
+        Arc::make_mut(&mut app.durable).active_channel = Some(review_channel);
+        let (review, _) = app.add_pull_requests_card("/reviewing-project".into());
+        let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&review) else {
+            panic!("pull request pane")
+        };
+        pane.review.fixture_existing_checkout_pending();
+        drop(app.add_terminal("/reviewing-project-wt/wt-7".into()));
+        // A session outside every channel is filed only by its directory.
+        // Nothing about it blocks, so neither check asks who owns it.
+        Arc::make_mut(&mut app.durable).active_channel = None;
+        drop(app.add_terminal("/idle-project-wt/wt-9".into()));
+        let unfiled = app.workspace.focused().unwrap();
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .all(|channel| !channel.cards.contains(&unfiled))
+        );
+        Arc::make_mut(&mut app.durable).active_channel = Some(channels[2]);
+
+        for id in [project, reviewing, idle] {
+            app.select_sidebar_rows(SelectionRow::Project(id), SelectionIntent::Toggle);
+        }
         drop(app.begin_sidebar_group_delete());
 
         let before = super::super::project_ui::scope_resolutions();
@@ -454,13 +501,26 @@ pub(in crate::app) mod tests {
             before,
             "drawing the dialog resolved paths on disk"
         );
-        // The live blocker still reaches the frame without that work.
+        // The live blockers still reach the frame without that work.
         assert_eq!(
             app.sidebar_selection_ui.dialog.as_ref().unwrap().blocked(),
-            1
+            2
         );
-        assert!(app.selected_project_removal_blocker(project).is_some());
-        assert!(app.selected_project_removal_blocker(other).is_none());
+        assert_eq!(
+            app.selected_project_removal_blocker(project).as_deref(),
+            Some("Save or close this project's unsaved editor buffers first.")
+        );
+        assert_eq!(
+            app.selected_project_removal_blocker(reviewing).as_deref(),
+            Some(
+                "Wait for checkout reconciliation to settle before closing or updating the window."
+            )
+        );
+        assert_eq!(app.selected_project_removal_blocker(idle), None);
+        // A blocked member still holds the whole group.
+        drop(app.update_sidebar_selection(Action::Confirm));
+        assert!(app.project_ui.removing.is_empty());
+        assert!(app.sidebar_selection_ui.dialog.is_some());
     }
 
     /// A group confirmation holds each channel to the panes it counted. One
