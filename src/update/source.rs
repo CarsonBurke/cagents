@@ -844,6 +844,91 @@ mod prepare_receipt_tests {
     }
 
     #[test]
+    fn a_busy_source_is_asked_again_on_the_same_connection_and_then_prepares() {
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("busy-source"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("daemon"),
+        };
+        let daemon = impact::DaemonImpact {
+            capability: ShutdownCapability {
+                proof: proof.clone(),
+                token: "confirmed-prepare".into(),
+                inventory_generation: 1,
+                live_terminals: 0,
+                background_subagents: 0,
+                background_identity: String::new(),
+                expires_at_unix_ms: i64::MAX,
+            },
+            policy: impact::Policy::WhenIdle,
+            sessions: Vec::new(),
+            blockers: Vec::new(),
+        };
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let server = std::thread::spawn(move || {
+            let reply = |peer: &mut UnixStream, request_id, message| {
+                write_frame(
+                    peer,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(request_id),
+                        proof: proof.clone(),
+                        message,
+                    },
+                )
+                .unwrap();
+            };
+            let connect: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+            reply(
+                &mut peer,
+                connect.request_id,
+                ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: proof.clone(),
+                        resumed: Vec::new(),
+                    },
+                },
+            );
+            let mut prepares = Vec::new();
+            for attempt in 0..3 {
+                let prepare: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                assert!(matches!(
+                    prepare.request,
+                    ClientRequest::PrepareConfirmedUpgrade { .. }
+                ));
+                prepares.push(prepare.request_id);
+                let message = if attempt < 2 {
+                    ServerMessage::Error(ProtocolError::new(
+                        ProtocolErrorCode::Internal,
+                        crate::terminal_ipc::DAEMON_BUSY,
+                        true,
+                    ))
+                } else {
+                    ServerMessage::Response {
+                        response: ServerResponse::UpgradePrepared {
+                            terminals: 2,
+                            chats: 1,
+                        },
+                    }
+                };
+                reply(&mut peer, prepare.request_id, message);
+            }
+            prepares
+        });
+        let mut client = ControlClient::from_stream(stream).unwrap();
+        let reply = prepare_retrying_busy(
+            || prepare_reply(client.prepare_confirmed_upgrade(daemon.clone(), false)),
+            Duration::from_secs(30),
+            Duration::from_millis(1),
+        );
+        assert_eq!(reply.unwrap(), (2, 1));
+        let prepares = server.join().unwrap();
+        assert_eq!(prepares.len(), 3);
+        assert!(prepares.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
     fn a_busy_source_is_asked_again_until_it_answers_or_patience_ends() {
         let busy = || PrepareError::Busy(invalid("busy"));
         let mut attempts = 0;
