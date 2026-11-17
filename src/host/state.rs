@@ -6063,14 +6063,15 @@ pub(super) mod tests {
             workspace_model::views::{Pane, Scope},
         };
         const SESSION: &str = "12345678-1234-4234-8234-123456789abc";
-        // A provider that has reported its conversation, untitled, or that
-        // has not reported one yet, as Claude before it reads a first prompt.
-        struct Untitled(Option<&'static str>);
-        impl Adapter for Untitled {
+        // A provider that has reported its conversation, with or without a
+        // title, or that has not reported one yet, as Claude before it reads
+        // a first prompt.
+        struct Reports(Option<&'static str>, Option<&'static str>);
+        impl Adapter for Reports {
             fn initialize(&mut self) -> Result<Step, String> {
                 let session = self.0.map(|id| Event::Session {
                     id: id.into(),
-                    title: None,
+                    title: self.1.map(str::to_owned),
                 });
                 Ok(Step {
                     events: session.into_iter().chain([Event::Ready(true)]).collect(),
@@ -6096,21 +6097,18 @@ pub(super) mod tests {
             environment: Default::default(),
             unset_environment: Default::default(),
         };
-        let start = |session: Option<&'static str>| {
+        let start = |session: Option<&'static str>, title: Option<&'static str>| {
             let mut spec = ProcessSpec::from(&recipe);
             spec.transport = TransportSpec::History;
-            let mut adapter = Untitled(session);
+            let mut adapter = Reports(session, title);
             let mut initial = adapter.initialize().unwrap();
             let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
             let handle =
                 chat::runtime::Handle::start(spec, Box::new(adapter), initial, store, None, |_| {})
                     .unwrap();
             let deadline = Instant::now() + Duration::from_secs(5);
-            while handle
-                .conversation_title()
-                .ok()
-                .map(|(reported, _)| reported)
-                != Some(session.map(str::to_owned))
+            while handle.conversation_title().ok()
+                != Some((session.map(str::to_owned), title.map(str::to_owned)))
             {
                 assert!(
                     Instant::now() < deadline,
@@ -6120,8 +6118,9 @@ pub(super) mod tests {
             }
             handle
         };
-        let reported = start(Some(SESSION));
-        let unreported = start(None);
+        let reported = start(Some(SESSION), None);
+        let unreported = start(None, None);
+        let titled = start(Some(SESSION), Some("Roadmap review"));
         // The window shows the chat as it started: before its provider
         // reported the conversation the daemon's chat now holds.
         let session = chat::Session {
@@ -6206,14 +6205,22 @@ pub(super) mod tests {
                     .revision;
                 (id, card, revision)
             };
-        let suggest =
-            |(id, card, revision): (ChannelId, CardId, u64)| ModelEdit::SuggestConversationTitle {
+        let suggest_as = |(id, card, revision): (ChannelId, CardId, u64), title: &str, source| {
+            ModelEdit::SuggestConversationTitle {
                 id,
                 card,
                 expected_revision: revision,
-                title: "Plan the quarterly roadmap review".into(),
-                source: ChannelTitleSource::Prompt,
-            };
+                title: title.into(),
+                source,
+            }
+        };
+        let suggest = |channel| {
+            suggest_as(
+                channel,
+                "Plan the quarterly roadmap review",
+                ChannelTitleSource::Prompt,
+            )
+        };
         let title = |state: &HostState, id| {
             state
                 .read_model()
@@ -6239,6 +6246,32 @@ pub(super) mod tests {
             "Plan the quarterly roadmap review"
         );
 
+        // The title rules still hold for such a pane: once the provider has
+        // titled the conversation, a first-prompt name and any other name
+        // than the provider's are refused, and the provider's is accepted.
+        for (name, source) in [
+            (
+                "Plan the quarterly roadmap review",
+                ChannelTitleSource::Prompt,
+            ),
+            ("Encryption audit", ChannelTitleSource::Provider),
+        ] {
+            let refused = channel(&mut state, &titled, session.clone());
+            let error = state
+                .edit_model(1, suggest_as(refused, name, source))
+                .unwrap_err();
+            assert_eq!(error.code, ProtocolErrorCode::InvalidRequest);
+            assert_eq!(title(&state, refused.0), "");
+        }
+        let provider = channel(&mut state, &titled, session.clone());
+        state
+            .edit_model(
+                1,
+                suggest_as(provider, "Roadmap review", ChannelTitleSource::Provider),
+            )
+            .unwrap();
+        assert_eq!(title(&state, provider.0), "Roadmap review");
+
         // A pane that recorded another conversation is still refused, and so
         // is one whose provider has not confirmed the recorded one.
         let mut other = session.clone();
@@ -6261,6 +6294,7 @@ pub(super) mod tests {
         );
         reported.close().unwrap();
         unreported.close().unwrap();
+        titled.close().unwrap();
     }
 
     #[test]
