@@ -202,6 +202,8 @@ impl LayoutRun<'_> {
 pub struct LayoutRunIter<'b> {
     lines: &'b [BufferLine],
     height_opt: Option<f32>,
+    /// How far above the top of the region runs are still yielded.
+    above: f32,
     line_height: f32,
     scroll: f32,
     line_i: usize,
@@ -221,6 +223,39 @@ impl<'b> LayoutRunIter<'b> {
         )
     }
 
+    /// cagents: the runs of the viewport and of its overscan, see
+    /// [`Buffer::set_overscan`]. Starts at the earliest laid-out line that
+    /// reaches into the overscan above the viewport.
+    fn with_overscan(buffer: &'b Buffer) -> Self {
+        let (above, below) = buffer.overscan;
+        let mut start = buffer.scroll.line;
+        let mut scroll = buffer.scroll.vertical;
+        while scroll < above && start > 0 {
+            let line = &buffer.lines[start - 1];
+            let (Some(_), Some(layout)) = (line.shape_opt(), line.layout_opt()) else {
+                break;
+            };
+            start -= 1;
+            scroll += layout
+                .iter()
+                .map(|layout_line| {
+                    layout_line
+                        .line_height_opt
+                        .unwrap_or(buffer.metrics.line_height)
+                })
+                .sum::<f32>();
+        }
+        let mut runs = Self::from_lines(
+            buffer.lines.as_slice(),
+            buffer.height_opt.map(|height| height + below),
+            buffer.metrics.line_height,
+            scroll,
+            start,
+        );
+        runs.above = above;
+        runs
+    }
+
     pub const fn from_lines(
         lines: &'b [BufferLine],
         height_opt: Option<f32>,
@@ -231,6 +266,7 @@ impl<'b> LayoutRunIter<'b> {
         Self {
             lines,
             height_opt,
+            above: 0.0,
             line_height,
             scroll,
             line_i: start,
@@ -264,7 +300,7 @@ impl<'b> Iterator for LayoutRunIter<'b> {
                     }
                 }
                 self.line_top += line_height;
-                if line_y + layout_line.max_descent < 0.0 {
+                if line_y + layout_line.max_descent < -self.above {
                     continue;
                 }
 
@@ -338,6 +374,9 @@ pub struct Buffer {
     width_opt: Option<f32>,
     height_opt: Option<f32>,
     scroll: Scroll,
+    /// cagents: how far above and below the viewport lines are also laid
+    /// out and drawn, see [`Buffer::set_overscan`].
+    overscan: (f32, f32),
     /// True if a redraw is requires. Set to false after processing
     redraw: bool,
     wrap: Wrap,
@@ -357,6 +396,7 @@ impl Clone for Buffer {
             width_opt: self.width_opt,
             height_opt: self.height_opt,
             scroll: self.scroll,
+            overscan: self.overscan,
             redraw: self.redraw,
             wrap: self.wrap,
             ellipsize: self.ellipsize,
@@ -425,6 +465,7 @@ impl Buffer {
             width_opt: None,
             height_opt: None,
             scroll: Scroll::default(),
+            overscan: (0.0, 0.0),
             redraw: false,
             wrap: Wrap::WordOrGlyph,
             ellipsize: Ellipsize::None,
@@ -645,6 +686,7 @@ impl Buffer {
 
             let scroll_start = self.scroll.vertical;
             let scroll_end = scroll_start + self.height_opt.unwrap_or(f32::INFINITY);
+            let layout_end = scroll_end + self.overscan.1;
 
             if prune {
                 for line_i in 0..self.scroll.line {
@@ -653,7 +695,7 @@ impl Buffer {
             }
             let mut total_height = 0.0;
             for line_i in self.scroll.line..self.lines.len() {
-                if total_height > scroll_end {
+                if total_height > layout_end {
                     if prune {
                         self.lines[line_i].reset_shaping();
                         continue;
@@ -683,6 +725,20 @@ impl Buffer {
                 self.scroll.vertical -= scroll_end - total_height;
             } else {
                 // Done adjusting scroll
+                break;
+            }
+        }
+
+        // cagents: lay out the lines the overscan above the viewport reaches.
+        let mut above = self.overscan.0 - self.scroll.vertical;
+        let mut line_i = self.scroll.line;
+        while above > 0.0 && line_i > 0 {
+            line_i -= 1;
+            if let Some(layout) = self.line_layout(font_system, line_i) {
+                for layout_line in layout {
+                    above -= layout_line.line_height_opt.unwrap_or(metrics.line_height);
+                }
+            } else {
                 break;
             }
         }
@@ -885,6 +941,28 @@ impl Buffer {
     /// Get the current scroll location
     pub const fn scroll(&self) -> Scroll {
         self.scroll
+    }
+
+    /// cagents: how far above and below the viewport lines are also laid
+    /// out and drawn, see [`Buffer::set_overscan`].
+    pub const fn overscan(&self) -> (f32, f32) {
+        self.overscan
+    }
+
+    /// cagents: also lay out and draw the lines within `above` of the top of
+    /// the viewport and `below` its bottom, so that text can continue into a
+    /// margin around the viewport rather than stop at its edge.
+    ///
+    /// [`Buffer::draw_runs`] and [`Buffer::hit`] include those lines.
+    /// Scrolling, cursor motion and [`Buffer::layout_runs`] still keep to the
+    /// viewport.
+    pub fn set_overscan(&mut self, above: f32, below: f32) {
+        let overscan = (above.max(0.0), below.max(0.0));
+        if overscan != self.overscan {
+            self.overscan = overscan;
+            self.dirty |= DirtyFlags::SCROLL;
+            self.redraw = true;
+        }
     }
 
     /// Set the current scroll location
@@ -1172,6 +1250,14 @@ impl Buffer {
         LayoutRunIter::new(self)
     }
 
+    /// cagents: the runs to draw: those of [`Buffer::layout_runs`], and
+    /// those of the overscan above and below the viewport that are laid out,
+    /// see [`Buffer::set_overscan`]. Runs above the viewport have a negative
+    /// `line_top`.
+    pub fn draw_runs(&self) -> LayoutRunIter<'_> {
+        LayoutRunIter::with_overscan(self)
+    }
+
     /// Convert x, y position to Cursor (hit detection).
     ///
     /// Call [`shape_until_scroll`] first to ensure the buffer is up to date,
@@ -1184,7 +1270,8 @@ impl Buffer {
 
         let mut new_cursor_opt = None;
 
-        let mut runs = self.layout_runs().peekable();
+        // cagents: what is drawn in the overscan can be hit too.
+        let mut runs = self.draw_runs().peekable();
         let mut first_run = true;
         while let Some(run) = runs.next() {
             let line_top = run.line_top;

@@ -18,3 +18,7 @@ scripts/cargo-gate test --manifest-path vendor/iced-wgpu/Cargo.toml --features s
 ```
 
 Cargo cannot run it with `-p iced_wgpu` from the parent workspace because this vendored package is not a workspace member. Its standalone lockfile and build artifacts are local test output.
+
+# Editor overscan (#2824)
+
+The editor's text area iterates `Buffer::draw_runs` instead of `layout_runs`, so the lines in the overscan bands reach the glyph renderer. The clip still comes from the widget. iced_tiny_skia is not vendored, so the software fallback draws only the viewport.

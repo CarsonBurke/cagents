@@ -128,6 +128,7 @@ pub struct TextEditor<
     min_height: f32,
     max_height: f32,
     padding: Padding,
+    overscan: (f32, f32),
     wrapping: Wrapping,
     ellipsize: text::Ellipsize,
     class: Theme::Class<'a>,
@@ -161,6 +162,7 @@ where
             min_height: 0.0,
             max_height: f32::INFINITY,
             padding: Padding::new(5.0),
+            overscan: (0.0, 0.0),
             wrapping: Wrapping::default(),
             class: <Theme as Catalog>::default(),
             ellipsize: Ellipsize::default(),
@@ -262,6 +264,35 @@ where
         self
     }
 
+    /// cagents: lets text scrolled past the top or the bottom of the text
+    /// area carry on up to `above` and `below` into the vertical padding,
+    /// rather than stop at the padding's inner edge. The editor still
+    /// scrolls, and reveals its cursor, within the text area.
+    /// [`Content::overflow`] tells how far the drawn text reaches, for
+    /// instance to fade it out.
+    pub fn overscan(mut self, above: f32, below: f32) -> Self {
+        self.overscan = (above.max(0.0), below.max(0.0));
+        self
+    }
+
+    /// The text area extended by the overscan: where text is drawn.
+    fn drawn_bounds(&self, text_bounds: Rectangle) -> Rectangle {
+        let (above, below) = self.clamped_overscan();
+
+        Rectangle {
+            y: text_bounds.y - above,
+            height: text_bounds.height + above + below,
+            ..text_bounds
+        }
+    }
+
+    fn clamped_overscan(&self) -> (f32, f32) {
+        (
+            self.overscan.0.min(self.padding.top),
+            self.overscan.1.min(self.padding.bottom),
+        )
+    }
+
     /// Sets the [`Wrapping`] strategy of the [`TextEditor`].
     pub fn wrapping(mut self, wrapping: Wrapping) -> Self {
         self.wrapping = wrapping;
@@ -309,6 +340,7 @@ where
             min_height: self.min_height,
             max_height: self.max_height,
             padding: self.padding,
+            overscan: self.overscan,
             wrapping: self.wrapping,
             ellipsize: self.ellipsize,
             class: self.class,
@@ -498,6 +530,13 @@ where
     pub fn is_empty(&self) -> bool {
         self.0.borrow().editor.is_empty()
     }
+
+    /// cagents: how far the drawn text reaches past the top and the bottom
+    /// of the text area, into the overscan of the [`TextEditor`] that last
+    /// laid it out. See [`TextEditor::overscan`].
+    pub fn overflow(&self) -> (f32, f32) {
+        self.0.borrow().editor.overflow()
+    }
 }
 
 impl<Renderer> Clone for Content<Renderer>
@@ -669,6 +708,9 @@ where
             .height(self.height)
             .min_height(self.min_height)
             .max_height(self.max_height);
+
+        let (above, below) = self.clamped_overscan();
+        internal.editor.set_overscan(above, below);
 
         internal.editor.update(
             limits.shrink(self.padding).max(),
@@ -1086,7 +1128,7 @@ where
                 &internal.editor,
                 text_bounds.position(),
                 style.value,
-                text_bounds,
+                self.drawn_bounds(text_bounds),
             );
         }
 
@@ -1109,7 +1151,7 @@ where
                         );
 
                     if let Some(clipped_cursor) =
-                        text_bounds.intersection(&cursor)
+                        self.drawn_bounds(text_bounds).intersection(&cursor)
                     {
                         renderer.fill_quad(
                             renderer::Quad {
@@ -1121,8 +1163,10 @@ where
                     }
                 }
                 Selection::Range(ranges) => {
+                    let drawn_bounds = self.drawn_bounds(text_bounds);
+
                     for range in ranges.into_iter().filter_map(|range| {
-                        text_bounds.intersection(&(range + translation))
+                        drawn_bounds.intersection(&(range + translation))
                     }) {
                         renderer.fill_quad(
                             renderer::Quad {

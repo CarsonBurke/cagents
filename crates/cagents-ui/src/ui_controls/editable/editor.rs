@@ -13,6 +13,15 @@ pub struct TextEditor<'a, Message> {
     on_action: Option<Rc<dyn Fn(text_editor::Action) -> Message + 'a>>,
     on_cursor: Option<Rc<dyn Fn(text_editor::Cursor) -> Message + 'a>>,
     read_only: bool,
+    padding: Padding,
+    padding_fade: Option<PaddingFade<'a>>,
+}
+/// Text scrolled into the editor's vertical padding, and the surface it fades
+/// into there. See [`TextEditor::fade_into_padding`].
+struct PaddingFade<'a> {
+    above: f32,
+    below: f32,
+    fill: Box<dyn Fn(&Theme) -> cosmic::iced::Color + 'a>,
 }
 struct EditorState {
     identity: State,
@@ -28,6 +37,9 @@ impl<'a, Message: Clone + 'static> TextEditor<'a, Message> {
             on_action: None,
             on_cursor: None,
             read_only: false,
+            // The native editor's own default.
+            padding: Padding::new(5.0),
+            padding_fade: None,
         }
     }
     pub fn id(mut self, id: Id) -> Self {
@@ -78,7 +90,30 @@ impl<'a, Message: Clone + 'static> TextEditor<'a, Message> {
         self
     }
     pub fn padding(mut self, padding: impl Into<Padding>) -> Self {
-        self.inner = self.inner.padding(padding);
+        self.padding = padding.into();
+        self.inner = self.inner.padding(self.padding);
+        self
+    }
+    /// Lets text scrolled past the top or the bottom of the text area carry
+    /// on up to `above` and `below` into the vertical padding, fading into
+    /// `fill` there, rather than being cut off at the padding's inner edge.
+    ///
+    /// `fill` is the surface the editor is drawn on. The fade is as deep as
+    /// the text reaches into the padding, so it is absent while that end of
+    /// the text is in view and grows as it scrolls away. The editor still
+    /// scrolls, and keeps its caret, within the text area.
+    pub fn fade_into_padding(
+        mut self,
+        above: f32,
+        below: f32,
+        fill: impl Fn(&Theme) -> cosmic::iced::Color + 'a,
+    ) -> Self {
+        self.inner = self.inner.overscan(above, below);
+        self.padding_fade = Some(PaddingFade {
+            above,
+            below,
+            fill: Box::new(fill),
+        });
         self
     }
     pub fn wrapping(mut self, wrapping: cosmic::iced::widget::text::Wrapping) -> Self {
@@ -192,6 +227,32 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for TextEditor<'
             cursor,
             viewport,
         );
+        if let Some(fade) = &self.padding_fade {
+            let (above, below) = self.content.overflow();
+            if above > 0.0 || below > 0.0 {
+                let bounds = layout.bounds();
+                let text = bounds.shrink(self.padding);
+                let reach = (
+                    fade.above.clamp(0.0, self.padding.top),
+                    fade.below.clamp(0.0, self.padding.bottom),
+                );
+                let drawn = Rectangle {
+                    y: text.y - reach.0,
+                    height: text.height + reach.0 + reach.1,
+                    ..bounds
+                };
+                let color = (fade.fill)(theme);
+                cosmic::iced::advanced::Renderer::with_layer(renderer, drawn, |renderer| {
+                    crate::interaction::fade_vertical_edges(
+                        renderer,
+                        drawn,
+                        above.min(reach.0),
+                        below.min(reach.1),
+                        color,
+                    );
+                });
+            }
+        }
     }
     fn mouse_interaction(
         &self,

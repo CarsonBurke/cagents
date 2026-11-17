@@ -4230,6 +4230,88 @@ mod tests {
     /// editor out the same way: construction, then `update` at its bounds.
     /// A restored or recalled long draft must not shape lines it never shows
     /// under the shared font lock (#2973).
+    /// An overscan lets the native editor draw, and be clicked, past its
+    /// viewport (#2824): the composer's draft runs on into its inset there.
+    /// Scrolling and the visible runs still keep to the viewport.
+    #[test]
+    fn native_overscan_draws_text_past_the_viewport_and_reports_how_far() {
+        use cosmic::iced::advanced::text::editor::Selection;
+        // Five 20 px lines fill the viewport exactly, so a scroll by whole
+        // lines lands exactly on a line.
+        fn lay_out(editor: &mut NativeEditor) {
+            lay_out_at(editor, 700.0);
+        }
+        fn lay_out_at(editor: &mut NativeEditor, width: f32) {
+            editor.update(
+                Size::new(width, 100.0),
+                cosmic::iced::Font::DEFAULT,
+                Pixels(14.0),
+                LineHeight::Absolute(Pixels(20.0)),
+                Wrapping::Word,
+                &mut highlighter::PlainText::new(&()),
+            );
+        }
+        fn lines(runs: cosmic_text::LayoutRunIter<'_>) -> Vec<usize> {
+            runs.map(|run| run.line_i).collect()
+        }
+        use cosmic::iced::advanced::graphics::text::cosmic_text;
+        let text = (0..40)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let mut editor = NativeEditor::with_text(&text);
+        editor.set_overscan(8.0, 8.0);
+        lay_out(&mut editor);
+        assert_eq!(editor.overflow(), (0.0, 8.0));
+        assert_eq!(lines(editor.buffer().layout_runs()), [0, 1, 2, 3, 4]);
+        assert_eq!(lines(editor.buffer().draw_runs()), [0, 1, 2, 3, 4, 5]);
+
+        editor.perform(Action::Scroll { lines: 10 });
+        lay_out(&mut editor);
+        assert_eq!(editor.overflow(), (8.0, 8.0));
+        assert_eq!(lines(editor.buffer().layout_runs()), [10, 11, 12, 13, 14]);
+        assert_eq!(
+            lines(editor.buffer().draw_runs()),
+            [9, 10, 11, 12, 13, 14, 15]
+        );
+        // A new width discards every line's layout; the line above the
+        // viewport is laid out again with the ones in it.
+        lay_out_at(&mut editor, 600.0);
+        assert_eq!(
+            lines(editor.buffer().draw_runs()),
+            [9, 10, 11, 12, 13, 14, 15]
+        );
+        editor.perform(Action::SelectAll);
+        let Selection::Range(regions) = editor.selection() else {
+            panic!("everything is selected");
+        };
+        assert!(regions.iter().any(|region| region.y < 0.0));
+        assert!(regions.iter().any(|region| region.y >= 100.0));
+        // A click on the line drawn in the top margin lands on it.
+        editor.perform(Action::Click(Point::new(5.0, -4.0)));
+        assert_eq!(editor.cursor().position.line, 9);
+
+        // Jumping to the end lays out the line above the viewport as well,
+        // although it was never in view.
+        let mut editor = NativeEditor::with_text(&text);
+        editor.set_overscan(8.0, 8.0);
+        lay_out(&mut editor);
+        editor.perform(Action::Move(Motion::DocumentEnd));
+        lay_out(&mut editor);
+        assert_eq!(editor.overflow(), (8.0, 0.0));
+        assert_eq!(lines(editor.buffer().draw_runs())[0], 34);
+
+        // Without an overscan nothing past the viewport is drawn.
+        editor.set_overscan(0.0, 0.0);
+        lay_out(&mut editor);
+        assert_eq!(editor.overflow(), (0.0, 0.0));
+        assert_eq!(
+            lines(editor.buffer().draw_runs()),
+            lines(editor.buffer().layout_runs())
+        );
+    }
+
     #[test]
     fn native_constructor_defers_shaping_to_the_viewport() {
         fn shaped(editor: &NativeEditor) -> usize {

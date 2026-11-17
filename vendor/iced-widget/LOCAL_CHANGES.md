@@ -51,3 +51,9 @@ Why: monospace letters at the prose's size read larger and heavier than
 the sentence around them, and full-strength ink made code brighter than the
 prose (cagents#3002). The app's regressions are in
 crates/cagents-ui/src/app/chat_ui/selectable_prose.rs and flow_layout.rs.
+
+## Text editor overscan (cagents #2824)
+
+`TextEditor::overscan(above, below)` lets text draw into the editor's top and bottom padding, up to the padding itself. The widget sets the overscan on its editor during layout, and clips the text, caret and selection to the text area plus that band. The placeholder still uses the text area. `Content::overflow` reports how far drawn text reaches into each band, so the app can fade it out (`ui_controls::editable::editor`, `fade_into_padding`).
+
+Why: a scrolled composer draft was sliced at the padding's inner edge (#2824). Remove this when upstream editors can draw into their padding.

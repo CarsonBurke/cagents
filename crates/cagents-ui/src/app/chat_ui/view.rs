@@ -3367,6 +3367,15 @@ impl Runtime {
         };
         // The editor grows with the draft up to the ceiling, then scrolls.
         // The vertical rail stays reserved so the text keeps its measure.
+        // A scrolled draft runs on through the editor's vertical inset to
+        // the composer's border, fading into the composer there rather than
+        // being sliced at the inset (#2824).
+        let composer_fill = if self.drop_hover {
+            design::accent_wash
+        } else {
+            design::raised
+        };
+        let reach = COMPOSER_INSET_Y - design::BORDER_WIDTH;
         let editor = crate::ui_controls::field::editor("Message", &self.composer)
             .id(card_control_id(target.card, "chat-composer"))
             // Nothing can be typed while the conversation changes hands.
@@ -3378,6 +3387,7 @@ impl Runtime {
                 COMPOSER_INSET_Y,
                 space::XS,
             ])))
+            .fade_into_padding(reach, reach, composer_fill)
             .class(cosmic::theme::iced::TextEditor::Custom(Box::new(
                 composer_editor_style,
             )));
@@ -3569,11 +3579,7 @@ impl Runtime {
             )
             .id(card_control_id(target.card, "chat-composer-surface"))
             .class(design::surface(
-                Some(if self.drop_hover {
-                    design::accent_wash
-                } else {
-                    design::raised
-                }),
+                Some(composer_fill),
                 [design::RADIUS_M; 4],
                 true,
             ))
