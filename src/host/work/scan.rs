@@ -149,10 +149,22 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
         .filter_map(|tip| Some((tip.refname.strip_prefix("refs/heads/")?, tip)))
         .collect::<BTreeMap<_, _>>();
 
+    // Earlier facts by worktree, and the Git directory the retained watch
+    // plan read for each: looked up once per record, not searched for.
+    let retained = previous
+        .into_iter()
+        .flat_map(|previous| &previous.worktrees)
+        .map(|old| (old.id, old))
+        .collect::<HashMap<_, _>>();
+    let planned = previous
+        .and_then(|previous| previous.plan.as_ref())
+        .into_iter()
+        .flat_map(|plan| &plan.worktrees)
+        .map(|worktree| (worktree.id, worktree.git_dir.as_path()))
+        .collect::<HashMap<_, _>>();
     let mut worktrees = Vec::new();
     for record in records.iter().filter(|record| !record.bare) {
-        let old =
-            previous.and_then(|previous| previous.worktrees.iter().find(|old| old.id == record.id));
+        let old = retained.get(&record.id).copied();
         // A shared ref change names no worktree; a commit, reset or branch
         // switch moves the head `git worktree list` reports.
         let reread = full
@@ -203,7 +215,13 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
                 worktree.head = old.head.clone();
             }
         }
-        worktree.link = git_dir(&record.path, previous_plan(previous, record.id))
+        worktree.link = planned
+            .get(&record.id)
+            .map(|git_dir| git_dir.to_path_buf())
+            .or_else(|| {
+                crate::project_location::git_directories(&record.path)
+                    .map(|directories| directories.private)
+            })
             .and_then(|git_dir| crate::linear::context::linked_in_git_dir(&git_dir).ok())
             .flatten();
         worktrees.push(worktree);
@@ -211,6 +229,11 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
 
     // Head commit times: a branch's from the census, a detached head's from
     // one batched log read, reused while the head does not move.
+    let dated = retained
+        .values()
+        .filter_map(|old| old.head.as_ref())
+        .filter_map(|head| Some((head.oid.as_str(), head.committed_at_unix_ms?)))
+        .collect::<HashMap<_, _>>();
     let mut missing_times = Vec::new();
     for worktree in &mut worktrees {
         let Some(head) = &mut worktree.head else {
@@ -221,17 +244,9 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
             .as_deref()
             .and_then(|branch| local_tips.get(branch))
             .filter(|tip| tip.oid == head.oid);
-        head.committed_at_unix_ms = tip.and_then(|tip| tip.committed_at_unix_ms).or_else(|| {
-            previous
-                .and_then(|previous| {
-                    previous
-                        .worktrees
-                        .iter()
-                        .filter_map(|old| old.head.as_ref())
-                        .find(|old| old.oid == head.oid)
-                })
-                .and_then(|old| old.committed_at_unix_ms)
-        });
+        head.committed_at_unix_ms = tip
+            .and_then(|tip| tip.committed_at_unix_ms)
+            .or_else(|| dated.get(head.oid.as_str()).copied());
         if head.committed_at_unix_ms.is_none() {
             missing_times.push(head.oid.clone());
         }
@@ -524,33 +539,6 @@ fn dirty(root: &Path, status: &StatusSnapshot) -> Dirty {
         conflicted: u32::try_from(conflicted.len()).unwrap_or(u32::MAX),
         newest_modified_at_unix_ms: newest,
     }
-}
-
-fn previous_plan(previous: Option<&Local>, id: WorktreeId) -> Option<&Path> {
-    previous?
-        .plan
-        .as_ref()?
-        .worktrees
-        .iter()
-        .find(|worktree| worktree.id == id)
-        .map(|worktree| worktree.git_dir.as_path())
-}
-
-/// A worktree's administrative directory: `.git` itself in a primary checkout,
-/// or the directory a linked worktree's `.git` file names. Read from the
-/// filesystem, as Git discovers it, so no process is spent per worktree.
-fn git_dir(root: &Path, known: Option<&Path>) -> Option<PathBuf> {
-    if let Some(known) = known {
-        return Some(known.to_owned());
-    }
-    let marker = root.join(".git");
-    let metadata = std::fs::metadata(&marker).ok()?;
-    if metadata.is_dir() {
-        return Some(marker);
-    }
-    let content = std::fs::read_to_string(&marker).ok()?;
-    let named = content.strip_prefix("gitdir:")?.trim();
-    std::fs::canonicalize(root.join(named)).ok()
 }
 
 /// Whether a failed read is explained by the directory no longer being a
