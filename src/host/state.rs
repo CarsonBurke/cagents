@@ -903,7 +903,16 @@ impl HostState {
                         busy,
                     )
                 })?;
-            if session.is_none() || session != expected.launch.session_id {
+            // A pane that has not recorded its conversation is identified by
+            // its resident chat, as the view writer identifies it, whether or
+            // not the provider has reported the conversation yet: Claude
+            // reports it only after it reads the first prompt, and a chat
+            // shown in no window reads no snapshot, so its pane learns the
+            // conversation only when someone opens it. A pane that recorded
+            // one names only that conversation.
+            if let Some(recorded) = &expected.launch.session_id
+                && session.as_ref() != Some(recorded)
+            {
                 return Err(invalid());
             }
             let current_title = current_title
@@ -6043,6 +6052,215 @@ pub(super) mod tests {
             "Final encryption audit"
         );
         handle.close().unwrap();
+    }
+
+    #[test]
+    fn a_pane_that_has_not_recorded_its_conversation_takes_its_first_prompt_name() {
+        use crate::{
+            chat::protocol::{Adapter, ProcessSpec, Step, TransportSpec},
+            chat::{self, Command, Event},
+            model::{CardId, CardKind, ChannelId, ChannelTitleSource, LaunchRecipe},
+            workspace_model::views::{Pane, Scope},
+        };
+        const SESSION: &str = "12345678-1234-4234-8234-123456789abc";
+        // A provider that has reported its conversation, untitled, or that
+        // has not reported one yet, as Claude before it reads a first prompt.
+        struct Untitled(Option<&'static str>);
+        impl Adapter for Untitled {
+            fn initialize(&mut self) -> Result<Step, String> {
+                let session = self.0.map(|id| Event::Session {
+                    id: id.into(),
+                    title: None,
+                });
+                Ok(Step {
+                    events: session.into_iter().chain([Event::Ready(true)]).collect(),
+                    ..Default::default()
+                })
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = test_host();
+        state.install_model(
+            super::super::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap(),
+        );
+        let recipe = LaunchRecipe {
+            program: "claude".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let start = |session: Option<&'static str>| {
+            let mut spec = ProcessSpec::from(&recipe);
+            spec.transport = TransportSpec::History;
+            let mut adapter = Untitled(session);
+            let mut initial = adapter.initialize().unwrap();
+            let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+            let handle =
+                chat::runtime::Handle::start(spec, Box::new(adapter), initial, store, None, |_| {})
+                    .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while handle
+                .conversation_title()
+                .ok()
+                .map(|(reported, _)| reported)
+                != Some(session.map(str::to_owned))
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "history worker did not publish its exact session"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            handle
+        };
+        let reported = start(Some(SESSION));
+        let unreported = start(None);
+        // The window shows the chat as it started: before its provider
+        // reported the conversation the daemon's chat now holds.
+        let session = chat::Session {
+            id: TerminalId::new(),
+            proof: Some(state.proof().clone()),
+            terminal: None,
+            native_continuity: Default::default(),
+            owned_codex_listener: None,
+            launch: chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                recipe,
+                session_id: None,
+            },
+        };
+        state
+            .edit_model(
+                1,
+                ModelEdit::OpenProject {
+                    repository: directory.path().into(),
+                    name: "project".into(),
+                    kind: Default::default(),
+                },
+            )
+            .unwrap();
+        let pane = |card, session: chat::Session| Pane {
+            id: card,
+            title: "Chat".into(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: 1.,
+            scope: Some(directory.path().into()),
+            kind: CardKind::Chat(session),
+        };
+        // Each channel's pane shows its own resident chat of the same
+        // conversation.
+        let channel =
+            |state: &mut HostState, handle: &chat::runtime::Handle, mut session: chat::Session| {
+                session.id = TerminalId::new();
+                state.chats.insert(
+                    session.id,
+                    super::super::chat::Record {
+                        execution_instance: uuid::Uuid::new_v4(),
+                        session: session.clone(),
+                        handle: handle.clone(),
+                        console_recipe: None,
+                        paired_terminal: None,
+                        source_process: None,
+                        subscribers: BTreeMap::new(),
+                        observations: BTreeMap::new(),
+                        completion_observed: false,
+                        returning_terminal: false,
+                    },
+                );
+                let id = ChannelId::new();
+                let card = CardId::new();
+                state
+                    .edit_model(
+                        1,
+                        ModelEdit::CreateChannel {
+                            id,
+                            repository: directory.path().into(),
+                            title: String::new(),
+                            title_source: Default::default(),
+                        },
+                    )
+                    .unwrap();
+                let model = state
+                    .edit_model(
+                        1,
+                        ModelEdit::SeedView {
+                            scope: Scope::Channel(id),
+                            closed: Vec::new(),
+                            panes: vec![pane(card, session)],
+                        },
+                    )
+                    .unwrap();
+                let revision = model
+                    .views
+                    .iter()
+                    .find(|view| view.scope == Scope::Channel(id))
+                    .unwrap()
+                    .revision;
+                (id, card, revision)
+            };
+        let suggest =
+            |(id, card, revision): (ChannelId, CardId, u64)| ModelEdit::SuggestConversationTitle {
+                id,
+                card,
+                expected_revision: revision,
+                title: "Plan the quarterly roadmap review".into(),
+                source: ChannelTitleSource::Prompt,
+            };
+        let title = |state: &HostState, id| {
+            state
+                .read_model()
+                .unwrap()
+                .channels
+                .into_iter()
+                .find(|channel| channel.id == id)
+                .unwrap()
+                .title
+        };
+
+        let unrecorded = channel(&mut state, &reported, session.clone());
+        state.edit_model(1, suggest(unrecorded)).unwrap();
+        assert_eq!(
+            title(&state, unrecorded.0),
+            "Plan the quarterly roadmap review"
+        );
+        // Nor does the provider need to have reported the conversation.
+        let unreported_channel = channel(&mut state, &unreported, session.clone());
+        state.edit_model(1, suggest(unreported_channel)).unwrap();
+        assert_eq!(
+            title(&state, unreported_channel.0),
+            "Plan the quarterly roadmap review"
+        );
+
+        // A pane that recorded another conversation is still refused, and so
+        // is one whose provider has not confirmed the recorded one.
+        let mut other = session.clone();
+        other.launch.session_id = Some("87654321-4321-4321-8321-cba987654321".into());
+        let mut recorded = session;
+        recorded.launch.session_id = Some(SESSION.into());
+        for (handle, pane) in [(&reported, other), (&unreported, recorded.clone())] {
+            let refused = channel(&mut state, handle, pane);
+            let error = state.edit_model(1, suggest(refused)).unwrap_err();
+            assert_eq!(error.code, ProtocolErrorCode::InvalidRequest);
+            assert_eq!(title(&state, refused.0), "");
+        }
+
+        // The recorded conversation itself is accepted, as before.
+        let recorded = channel(&mut state, &reported, recorded);
+        state.edit_model(1, suggest(recorded)).unwrap();
+        assert_eq!(
+            title(&state, recorded.0),
+            "Plan the quarterly roadmap review"
+        );
+        reported.close().unwrap();
+        unreported.close().unwrap();
     }
 
     #[test]
