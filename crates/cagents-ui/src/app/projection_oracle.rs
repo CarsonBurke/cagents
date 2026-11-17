@@ -400,11 +400,11 @@ impl Cagents {
     fn may_project_narrowly(&self, message: &Message) -> bool {
         repaint_tick(message)
             || background_poll(message)
-            || self.navigation_save_is_stale(message)
             || matches!(message, Message::ChatUi(action) if action.local_scope().is_some())
             || matches!(
                 message,
                 Message::ReplicaCaptureDue(_)
+                    | Message::NavigationSaveDue(_)
                     | Message::TerminalWake { .. }
                     | Message::WorkspaceModelObserved(_)
                     | Message::KeyEvent { .. }

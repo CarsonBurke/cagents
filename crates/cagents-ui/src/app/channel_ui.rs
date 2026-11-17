@@ -3917,6 +3917,49 @@ pub(in crate::app) mod tests {
         assert_eq!(app.durable.active_channel, Some(first));
     }
 
+    /// The deferred save of a sidebar click writes where the window is, which
+    /// the click already projected, so it projects nothing more. A save that
+    /// also changes what a channel holds projects everything. The projection
+    /// oracle checks both against the full projection.
+    #[test]
+    fn a_navigation_save_projects_only_what_it_changed() {
+        use super::super::terminal_output_tests::projections;
+        let (mut app, first, second, _) = channel_with_a_conversation();
+        drop(app.select_channel(first));
+        drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
+        drop(app.update(Message::Sidebar(SidebarAction::OpenChannel {
+            channel_id: second,
+        })));
+        assert!(app.navigation_save.is_some());
+        let projected = projections();
+        drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
+        assert!(app.navigation_save.is_none(), "the save ran");
+        assert_eq!(projections(), projected, "nothing left to project");
+
+        // A pane closed since the click leaves its channel at the save.
+        drop(app.update(Message::Sidebar(SidebarAction::OpenChannel {
+            channel_id: first,
+        })));
+        let closed = app
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == first)
+            .unwrap()
+            .cards[0];
+        app.card_state_mut(closed).unwrap().existence =
+            super::super::project_ui::removed_existence("closed by the test");
+        let projected = projections();
+        drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
+        assert!(
+            !app.durable
+                .channels
+                .iter()
+                .any(|channel| channel.cards.contains(&closed))
+        );
+        assert_eq!(projections(), projected + 1, "the channel's panes changed");
+    }
+
     /// A channel's conversations are reachable nowhere else, so deleting one
     /// has to take them with it, say so first, and leave the workspace on a
     /// scope that still exists.

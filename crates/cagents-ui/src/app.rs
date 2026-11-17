@@ -1602,6 +1602,39 @@ impl Default for PanePresence {
 /// window gave, which the shared registry already holds, waits the same way.
 const NAVIGATION_SAVE_DELAY: Duration = Duration::from_secs(1);
 
+/// What a save writes that a projection reads.
+///
+/// The navigation it saves was projected when it happened. A save then
+/// snapshots the strip into the active channel, which can reorder its panes
+/// and drops closed cards from every channel, and prunes pending terminal
+/// creations; worktree protections read where editors are
+/// (`repository_navigation`). It also writes where the window is (`active_worktree`,
+/// `worktree_focus`), its history, drafts and shared-view bookkeeping, none of
+/// which a projection reads. When none of these changed, the save leaves
+/// nothing to project.
+#[derive(PartialEq)]
+struct SavedProjectionInputs {
+    channels: Vec<crate::model::ProjectChannel>,
+    focused: Option<CardId>,
+    pending_terminal_creations: HashSet<CardId>,
+    repository_navigation: HashMap<CardId, crate::model::RepositoryNavigation>,
+}
+
+impl SavedProjectionInputs {
+    fn capture(app: &Cagents) -> Self {
+        Self {
+            channels: app.durable.channels.clone(),
+            focused: app.durable.focused,
+            pending_terminal_creations: app.durable.pending_terminal_creations.clone(),
+            repository_navigation: app.durable.repository_navigation.clone(),
+        }
+    }
+
+    fn unchanged(&self, app: &Cagents) -> bool {
+        *self == Self::capture(app)
+    }
+}
+
 /// What a save deferred by [`NAVIGATION_SAVE_DELAY`] has to do when it falls
 /// due. Ordered so that merging two requests keeps the larger one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -18389,10 +18422,16 @@ impl Application for Cagents {
                 Task::none()
             }
             Message::NavigationSaveDue(generation) => {
-                match self.navigation_save_due(generation) {
-                    Some(DeferredSave::Views) => self.persist(),
-                    Some(DeferredSave::Snapshot) => self.save_snapshot(),
-                    None => {}
+                // A stale timer already projects nothing.
+                if let Some(save) = self.navigation_save_due(generation) {
+                    let before = SavedProjectionInputs::capture(self);
+                    match save {
+                        DeferredSave::Views => self.persist(),
+                        DeferredSave::Snapshot => self.save_snapshot(),
+                    }
+                    if before.unchanged(self) {
+                        projection = Projection::Unchanged;
+                    }
                 }
                 Task::none()
             }
