@@ -106,8 +106,9 @@ struct Ledger {
 pub struct Instance {
     directories: Directories,
     /// The data directory, locked exclusively: the ledger is read, checked and
-    /// rewritten under this lock.
-    _lock: File,
+    /// rewritten under this lock. It is released when the instance is dropped,
+    /// even if a concurrent fork still holds a copy of its descriptor.
+    _lock: crate::instance::OwnedLock,
 }
 
 impl Instance {
@@ -121,24 +122,18 @@ impl Instance {
             .map_err(|error| format!("Cannot create {}: {error}", directories.data.display()))?;
         let lock = File::open(&directories.data)
             .map_err(|error| format!("Cannot open {}: {error}", directories.data.display()))?;
-        // SAFETY: flock receives a live descriptor and scalar flags.
-        if unsafe {
-            libc::flock(
-                std::os::fd::AsRawFd::as_raw_fd(&lock),
-                libc::LOCK_EX | libc::LOCK_NB,
-            )
-        } != 0
-        {
-            let error = io::Error::last_os_error();
-            return Err(if error.kind() == io::ErrorKind::WouldBlock {
-                format!(
-                    "Another seed is writing this instance ({}). Let it finish first.",
-                    directories.data.display()
-                )
-            } else {
-                format!("Cannot lock {}: {error}", directories.data.display())
-            });
-        }
+        let lock = crate::instance::owned_file_lock(lock, libc::LOCK_EX | libc::LOCK_NB).map_err(
+            |error| {
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    format!(
+                        "Another seed is writing this instance ({}). Let it finish first.",
+                        directories.data.display()
+                    )
+                } else {
+                    format!("Cannot lock {}: {error}", directories.data.display())
+                }
+            },
+        )?;
         Ok(Self {
             directories,
             _lock: lock,
@@ -706,6 +701,24 @@ mod tests {
         assert!(error.contains("Another seed is writing"), "{error}");
         drop(first);
         Instance::admit(&plan, dirs).unwrap();
+    }
+
+    /// A process forked by another thread holds a copy of the lock's
+    /// descriptor until it execs, and closing the instance's own copy alone
+    /// would leave the instance locked until then: the window's seed would
+    /// refuse the instance the daemon's seed had just finished with.
+    #[test]
+    fn a_finished_seed_frees_the_instance_despite_a_forked_copy() {
+        let directory = tempfile::tempdir().unwrap();
+        let plan = test_support::small(directory.path());
+        let dirs = directories(&plan.root, None);
+        let first = Instance::admit(&plan, dirs.clone()).unwrap();
+        // dup shares the open file description, as a fork that has not yet
+        // reached exec does.
+        let forked = first._lock.try_clone().unwrap();
+        drop(first);
+        Instance::admit(&plan, dirs).unwrap();
+        drop(forked);
     }
 
     /// The unnamed instance is the login daemon's: only directories inside the
