@@ -609,14 +609,79 @@ impl Reservation {
             })
     }
 
-    pub(crate) fn create_home(
+    /// Creates the reserved fresh home and records its pending sign-in.
+    ///
+    /// Enrolling the home needs the control gate's writer for a moment, and
+    /// a person who asked for the account is waiting for the answer, so a
+    /// busy gate is waited out for up to [`ENROLLMENT_PATIENCE`]. Each busy
+    /// attempt has already withdrawn its directory and released the registry
+    /// and lifecycle leases, so the wait holds nothing a request admitted to
+    /// the gate could be blocked on. Past the deadline the error is still
+    /// [`EnrollmentBusy`](crate::account::home::EnrollmentBusy), with nothing
+    /// left behind.
+    pub(crate) fn create_pending_home(
         &self,
+        store: &Store,
         homes: &crate::account::home::Homes,
         provider: crate::agent::Provider,
+        started_at: u64,
         system: Option<&Path>,
         config: crate::account::home::CodexConfig,
     ) -> std::io::Result<(uuid::Uuid, PathBuf)> {
-        self.create_home_initialized(homes, provider, system, config, |_| Ok(()))
+        self.create_pending_home_within(
+            store,
+            homes,
+            provider,
+            started_at,
+            system,
+            config,
+            ENROLLMENT_PATIENCE,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the same operands as create_pending_home, plus its patience"
+    )]
+    fn create_pending_home_within(
+        &self,
+        store: &Store,
+        homes: &crate::account::home::Homes,
+        provider: crate::agent::Provider,
+        started_at: u64,
+        system: Option<&Path>,
+        config: crate::account::home::CodexConfig,
+        patience: std::time::Duration,
+    ) -> std::io::Result<(uuid::Uuid, PathBuf)> {
+        let deadline = std::time::Instant::now() + patience;
+        loop {
+            self.verify().map_err(std::io::Error::other)?;
+            match store.try_create_pending_reserved(self, homes, provider, started_at, || {
+                self.create_home_initialized(homes, provider, system, config, |_| Ok(()))
+            }) {
+                Err(error)
+                    if crate::account::home::EnrollmentBusy::is(&error)
+                        && self.await_writer(deadline) => {}
+                result => return result,
+            }
+        }
+    }
+
+    /// Waits, holding no lease, until the control gate would admit a writer,
+    /// or `false` at `deadline`. It does not queue, so it holds back no other
+    /// request, and it keeps the admission only for the instant it is
+    /// observed: enrollment takes its own when it is ready.
+    fn await_writer(&self, deadline: std::time::Instant) -> bool {
+        let Some(host) = self.host.upgrade() else {
+            return false;
+        };
+        let gate = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .control_gate
+            .clone();
+        drop(host);
+        gate.exclusive_when_free_until(deadline).is_some()
     }
 
     fn create_home_initialized(
@@ -669,7 +734,12 @@ impl Reservation {
     /// Runs before any seed under the already-held registry/lifecycle leases.
     /// Never load the registry here. Observe original FDs/maps off the control
     /// writer, then atomically replace this immutable roster under a brief
-    /// try-write. Busy/failure retains the fresh files and publishes no row.
+    /// try-write. It never waits for that writer: a request admitted to the
+    /// gate may be blocking on the very leases held here. A busy gate, or
+    /// reservations that changed meanwhile, is
+    /// [`EnrollmentBusy`](crate::account::home::EnrollmentBusy), on which
+    /// creation withdraws the untouched directory; any other failure retains
+    /// the fresh files. Neither publishes a row.
     fn enroll_created_home(
         &self,
         created: &crate::account::home::NewHomeCreationReceipt,
@@ -743,19 +813,16 @@ impl Reservation {
             .unwrap_or_else(|p| p.into_inner())
             .control_gate
             .clone();
-        let writer = gate.try_exclusive().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::WouldBlock,
-                super::control_gate::busy().message,
-            )
-        })?;
+        let writer = gate
+            .try_exclusive()
+            .ok_or_else(crate::account::home::EnrollmentBusy::error)?;
         super::client::ensure_control_open(&host)
             .map_err(|error| io::Error::other(error.message))?;
         let mut entries = self.map.lock().unwrap_or_else(|p| p.into_inner());
         if !same_basis(&basis, &entries) {
-            return Err(io::Error::other(
-                "Account reservations changed during home enrollment; retry creation",
-            ));
+            // Another operation reserved or released in the meantime. Like a
+            // busy gate, that leaves this home untouched and worth another try.
+            return Err(crate::account::home::EnrollmentBusy::error());
         }
         entries.insert(self.token, Arc::new(updated));
         drop(entries);
@@ -858,6 +925,12 @@ const RESTORE_OVERLAP: std::time::Duration = std::time::Duration::from_secs(
         - 2 * crate::account::probe::TIMEOUT.as_secs()
         - 10,
 );
+/// How long creating an account waits for the control gate to admit the
+/// moment's writer that enrolls its new home. The person who asked is
+/// waiting for the answer either way; past this, they are told the daemon is
+/// busy and nothing was created.
+const ENROLLMENT_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// The most sweeps a home whose check did not finish - its provider timed
 /// out, say - is passed over before it is asked about again.
 const RESTORE_BACKOFF_LIMIT: u32 = 64;
@@ -1677,35 +1750,108 @@ pub(crate) mod tests {
                 .any(|pending| pending.key == key)
         );
     }
-    #[test]
-    fn failed_enrollment_retains_unseeded_home_without_publication() {
+    fn creating(provider: Provider) -> (tempfile::TempDir, Homes, Store, SharedHost, Reservation) {
         let root = tempfile::tempdir().unwrap();
         let homes = Homes::at(root.path().join("homes"));
         let store = Store::at(root.path().join("registry"));
         let host = host();
         let key = uuid::Uuid::new_v4();
-        let target = homes.path(Provider::Codex, key);
         let mut reservation = Reservation::test_install(
             &host,
-            &[Account::managed(Provider::Codex, key, target.clone())],
+            &[Account::managed(provider, key, homes.path(provider, key))],
             store.clone(),
             &homes,
         )
         .unwrap();
-        reservation.create = Some((Provider::Codex, key));
+        reservation.create = Some((provider, key));
+        (root, homes, store, host, reservation)
+    }
+    #[test]
+    fn a_creation_the_gate_stays_too_busy_for_leaves_nothing_behind() {
+        let (_root, homes, store, host, reservation) = creating(Provider::Codex);
+        let (_, key) = reservation.create.unwrap();
+        let target = homes.path(Provider::Codex, key);
         let gate = host.lock().unwrap().control_gate.clone();
         let held = gate.shared();
+        let error = reservation
+            .create_pending_home_within(
+                &store,
+                &homes,
+                Provider::Codex,
+                1,
+                None,
+                CodexConfig::Shared,
+                std::time::Duration::from_millis(50),
+            )
+            .unwrap_err();
+        assert!(crate::account::home::EnrollmentBusy::is(&error), "{error}");
+        assert!(!target.exists(), "the busy attempt withdrew its directory");
+        assert!(store.try_load().unwrap().pending().is_empty());
+        assert!(
+            reservation.current().unwrap().homes[0].pin.is_none(),
+            "no directory was enrolled in the reservation"
+        );
+        assert_eq!(gate.unqueued_waiters(), 0);
+        drop(held);
+        // The same reservation creates the home once the gate is free.
+        assert_eq!(
+            reservation
+                .create_pending_home(
+                    &store,
+                    &homes,
+                    Provider::Codex,
+                    1,
+                    None,
+                    CodexConfig::Shared
+                )
+                .unwrap(),
+            (key, target)
+        );
+    }
+    #[test]
+    fn a_creation_waits_out_a_busy_gate_holding_no_lease() {
+        let (_root, homes, store, host, reservation) = creating(Provider::Codex);
+        let (_, key) = reservation.create.unwrap();
+        let target = homes.path(Provider::Codex, key);
+        let gate = host.lock().unwrap().control_gate.clone();
+        let held = gate.shared();
+        std::thread::scope(|scope| {
+            let creation = scope.spawn(|| {
+                reservation.create_pending_home_within(
+                    &store,
+                    &homes,
+                    Provider::Codex,
+                    1,
+                    None,
+                    CodexConfig::Shared,
+                    std::time::Duration::from_secs(30),
+                )
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while gate.unqueued_waiters() == 0 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "creation never waited"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            // While it waits, nothing is on disk and no lease is held: the
+            // registry and the lifecycle lock are free to anyone else.
+            assert!(!target.exists());
+            drop(store.try_load().unwrap());
+            drop(homes.try_lifecycle_lock().unwrap());
+            drop(held);
+            assert_eq!(creation.join().unwrap().unwrap(), (key, target.clone()));
+        });
+        assert!(target.is_dir());
         assert!(
             store
-                .try_create_pending_reserved(&reservation, &homes, Provider::Codex, 1, || {
-                    reservation.create_home(&homes, Provider::Codex, None, CodexConfig::Shared)
-                })
-                .is_err()
+                .load()
+                .unwrap()
+                .pending()
+                .iter()
+                .any(|pending| pending.key == key)
         );
-        assert!(target.is_dir());
-        assert!(std::fs::read_dir(&target).unwrap().next().is_none());
-        assert!(store.try_load().unwrap().pending().is_empty());
-        drop(held);
     }
     #[test]
     fn scoped_registry_mutation_refuses_changed_relevant_metadata() {

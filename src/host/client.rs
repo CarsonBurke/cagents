@@ -1156,6 +1156,17 @@ fn terminal_io_request(request: &ClientRequest) -> bool {
     )
 }
 
+/// A busy refusal stays the gate's own retryable one, so a client tells the
+/// person to wait and retry rather than reporting a failed operation.
+fn lifecycle_refusal(error: crate::account::remote::LifecycleError) -> ProtocolError {
+    match error {
+        crate::account::remote::LifecycleError::Busy => control_gate::busy(),
+        crate::account::remote::LifecycleError::Failed(message) => {
+            ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
+        }
+    }
+}
+
 fn process_wire_request(
     host: &SharedHost,
     client_id: ClientId,
@@ -1223,9 +1234,7 @@ fn process_wire_request(
             _ => super::account_lifecycle::Reservation::for_operation(host, operation)?,
         };
         let value = crate::account::remote::execute_reserved(operation.clone(), &reservation)
-            .map_err(|message| {
-                ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
-            })?;
+            .map_err(lifecycle_refusal)?;
         return Ok((
             ServerResponse::DeviceOperation {
                 reply: crate::device_service::Reply::AccountLifecycle(value),

@@ -170,12 +170,31 @@ pub(crate) fn execute(_operation: Operation) -> Result<serde_json::Value, String
     Err("Account lifecycle requires the selected daemon's scoped admission reservation".into())
 }
 
+/// Why an account lifecycle operation did not complete.
+#[cfg(feature = "host")]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum LifecycleError {
+    /// The daemon stayed too busy to admit the change. Nothing changed, so
+    /// the same request can be sent again.
+    #[error("{}", crate::terminal_ipc::DAEMON_BUSY)]
+    Busy,
+    #[error("{0}")]
+    Failed(String),
+}
+
+#[cfg(feature = "host")]
+impl<T: Into<String>> From<T> for LifecycleError {
+    fn from(message: T) -> Self {
+        Self::Failed(message.into())
+    }
+}
+
 /// The opaque host reservation remains borrowed throughout provider I/O.
 #[cfg(feature = "host")]
 pub(crate) fn execute_reserved(
     operation: Operation,
     reservation: &crate::host::AccountReservation,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, LifecycleError> {
     use super::{home::Homes, registry::Store};
     let homes = Homes::installation().ok_or("The device has no account data directory")?;
     let store = Store::installation().ok_or("The device has no account registry")?;
@@ -188,7 +207,7 @@ fn execute_at(
     reservation: &crate::host::AccountReservation,
     homes: super::home::Homes,
     store: super::registry::Store,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, LifecycleError> {
     use super::{
         Account, UsageStatus,
         home::CodexConfig,
@@ -213,20 +232,26 @@ fn execute_at(
             let program = probe::find_executable(provider.executable(), search.as_deref())
                 .ok_or("The provider CLI is not installed on this device")?;
             let system = Account::system(provider).resolved_home();
-            let (key, home) = reservation.commit(|| {
-                store.try_create_pending_reserved(reservation, &homes, provider, now, || {
-                    reservation.create_home(
-                        &homes,
-                        provider,
-                        system.as_deref(),
-                        if copy_codex_config {
-                            CodexConfig::Copy
-                        } else {
-                            CodexConfig::Shared
-                        },
-                    )
-                })
-            })?;
+            let (key, home) = reservation
+                .create_pending_home(
+                    &store,
+                    &homes,
+                    provider,
+                    now,
+                    system.as_deref(),
+                    if copy_codex_config {
+                        CodexConfig::Copy
+                    } else {
+                        CodexConfig::Shared
+                    },
+                )
+                .map_err(|error| {
+                    if super::home::EnrollmentBusy::is(&error) {
+                        LifecycleError::Busy
+                    } else {
+                        error.to_string().into()
+                    }
+                })?;
             let account = Account::managed(provider, key, home.clone());
             let recipe = match login_recipe_with_path(&account, program, search.as_deref()) {
                 Ok(recipe) => recipe,
@@ -234,10 +259,12 @@ fn execute_at(
                     return Err(format!(
                         "{error}; the new account home and pending registration were retained at {}. Retry sign-in after fixing the launch configuration.",
                         home.display()
-                    ));
+                    )
+                    .into());
                 }
             };
-            serde_json::to_value(Created { key, home, recipe }).map_err(|error| error.to_string())
+            serde_json::to_value(Created { key, home, recipe })
+                .map_err(|error| error.to_string().into())
         }
         Operation::Link {
             provider,
@@ -260,7 +287,7 @@ fn execute_at(
                 })
             })?;
             let key = result?;
-            serde_json::to_value((registry, key)).map_err(|error| error.to_string())
+            serde_json::to_value((registry, key)).map_err(|error| error.to_string().into())
         }
         Operation::Register { provider, key } => {
             let registry = store.try_load().map_err(|error| error.to_string())?;
@@ -274,7 +301,7 @@ fn execute_at(
                     identity: None,
                     snapshot: None,
                 })
-                .map_err(|error| error.to_string());
+                .map_err(|error| error.to_string().into());
             }
             if !registry
                 .pending()
@@ -289,7 +316,7 @@ fn execute_at(
                     Outcome::Answered {
                         identity, snapshot, ..
                     } => (identity, snapshot),
-                    Outcome::Failed(error) => return Err(error),
+                    Outcome::Failed(error) => return Err(error.into()),
                     Outcome::Busy => {
                         return Err(
                             "The provider is already verifying another account; try again".into(),
@@ -304,7 +331,7 @@ fn execute_at(
                     store.try_update_reserved(reservation, |registry| registry.release(key, &homes))
                 })?;
                 return serde_json::to_value(Settled::Abandoned(Some(registry)))
-                    .map_err(|error| error.to_string());
+                    .map_err(|error| error.to_string().into());
             }
             // The pending-home probe may have taken a long time. The live
             // token fences daemon ingress, but an external rename/replacement
@@ -355,7 +382,7 @@ fn execute_at(
                     }
                 }
             };
-            serde_json::to_value(settled).map_err(|error| error.to_string())
+            serde_json::to_value(settled).map_err(|error| error.to_string().into())
         }
         Operation::Abandon { provider, key } => {
             let registry = store.try_load().map_err(|error| error.to_string())?;
@@ -370,12 +397,12 @@ fn execute_at(
                 store.try_update_reserved(reservation, |registry| registry.release(key, &homes))
             })?;
             serde_json::to_value(Settled::Abandoned(Some(registry)))
-                .map_err(|error| error.to_string())
+                .map_err(|error| error.to_string().into())
         }
         Operation::Restore { provider, key } => {
             let restored = restore_reserved(&runtime, reservation, &homes, &store, provider, key)
                 .map_err(|failure| failure.message)?;
-            serde_json::to_value(restored).map_err(|error| error.to_string())
+            serde_json::to_value(restored).map_err(|error| error.to_string().into())
         }
         Operation::Remove { id } => {
             let registry = store.try_load().map_err(|error| error.to_string())?;
@@ -398,7 +425,7 @@ fn execute_at(
             } else {
                 return Err("File deletion is not available in this build. Your account and its files were kept.".into());
             };
-            serde_json::to_value((registry, error)).map_err(|error| error.to_string())
+            serde_json::to_value((registry, error)).map_err(|error| error.to_string().into())
         }
     }
 }
@@ -708,7 +735,11 @@ mod tests {
             store.clone(),
         )
         .unwrap_err();
-        assert!(error.contains("Your account and its files were kept"));
+        assert!(
+            error
+                .to_string()
+                .contains("Your account and its files were kept")
+        );
         assert_eq!(before, store.load().unwrap());
         assert_eq!(inode, home.metadata().unwrap().ino());
         assert_eq!(

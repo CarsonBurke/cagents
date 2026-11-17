@@ -37,6 +37,46 @@ impl NewHomeCreationReceipt {
         same_directory(&self.parent, &self.parent_path)?;
         same_directory(&self.directory, &self.path)
     }
+
+    /// Removes the directory this receipt proves was made, once nothing has
+    /// been written into it. The name is examined and removed relative to the
+    /// parent descriptor held since `mkdirat`, so no path is resolved again:
+    /// only that name, still bound to that directory, is removed, and the
+    /// kernel refuses to remove it unless it is empty. Anything else is an
+    /// error and leaves every file in place.
+    #[cfg(any(test, feature = "host"))]
+    pub(crate) fn withdraw(self) -> io::Result<()> {
+        let name = std::ffi::CString::new(self.key.hyphenated().to_string())
+            .expect("UUID has no zero byte");
+        let held = self.directory.metadata()?;
+        let mut named = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: the held parent descriptor and CString outlive the call,
+        // which initializes `named` when it succeeds.
+        if unsafe {
+            libc::fstatat(
+                self.parent.as_raw_fd(),
+                name.as_ptr(),
+                named.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fstatat succeeded, so it wrote the whole structure.
+        let named = unsafe { named.assume_init() };
+        if (named.st_dev, named.st_ino) != (held.dev(), held.ino()) {
+            return Err(io::Error::other(
+                "The newly created account directory changed; files were retained",
+            ));
+        }
+        // SAFETY: as above. AT_REMOVEDIR removes only an empty directory.
+        if unsafe { libc::unlinkat(self.parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        self.parent.sync_all()
+    }
 }
 /// What host enrollment and initializers read from a fresh home.
 #[cfg(any(test, feature = "host"))]
@@ -224,6 +264,60 @@ mod tests {
         );
         assert!(!path.join("settings.json").exists());
         assert!(store.load().unwrap().pending().is_empty());
+    }
+    #[test]
+    fn busy_enrollment_withdraws_only_the_untouched_directory_it_made() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let homes = Homes::at(root.path().join("homes"));
+        let store = crate::account::registry::Store::at(root.path().join("registry"));
+        let mut created_path = None;
+        let error = store
+            .create_pending(&homes, Provider::Claude, 1, || {
+                homes.create_with_config_initialized(
+                    Provider::Claude,
+                    None,
+                    CodexConfig::Shared,
+                    |created| {
+                        created_path = Some(created.home().to_owned());
+                        Err(EnrollmentBusy::error())
+                    },
+                )
+            })
+            .unwrap_err();
+        assert!(EnrollmentBusy::is(&error), "{error}");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        let path = created_path.unwrap();
+        assert!(!path.exists(), "an untouched busy home is withdrawn");
+        assert!(path.parent().unwrap().is_dir());
+        assert!(store.load().unwrap().pending().is_empty());
+
+        // A directory with anything in it stays for recovery, as does a name
+        // that no longer leads to the directory this call made.
+        for replace in [false, true] {
+            let mut kept = Vec::new();
+            let error = homes
+                .create_with_config_initialized(
+                    Provider::Claude,
+                    None,
+                    CodexConfig::Shared,
+                    |created| {
+                        if replace {
+                            let moved = created.home().with_extension("original");
+                            fs::rename(created.home(), &moved)?;
+                            fs::create_dir(created.home())?;
+                            kept.extend([moved, created.home().to_owned()]);
+                        } else {
+                            fs::write(created.home().join("written"), "keep")?;
+                            kept.push(created.home().join("written"));
+                        }
+                        Err(EnrollmentBusy::error())
+                    },
+                )
+                .unwrap_err();
+            assert!(!EnrollmentBusy::is(&error));
+            assert!(error.to_string().contains("files were retained"), "{error}");
+            assert!(kept.iter().all(|path| path.exists()), "{kept:?}");
+        }
     }
     #[test]
     fn replaced_child_or_parent_cannot_rebind_creation_receipt() {

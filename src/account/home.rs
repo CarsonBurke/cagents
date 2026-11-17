@@ -62,6 +62,27 @@ pub(crate) use creation::NewHomeCreationReceipt;
 const REMOVING_PREFIX: &str = ".removing-";
 const CONFIG_LIMIT: u64 = 8 * 1024 * 1024;
 
+/// An initializer's refusal because the daemon was too busy to enroll the
+/// new home. The initializer wrote nothing, so creation withdraws the empty
+/// directory it just made and returns this error as it is: the request
+/// changed nothing and can be sent again.
+#[cfg(any(test, feature = "host"))]
+#[derive(Debug, thiserror::Error)]
+#[error("{}", crate::terminal_ipc::DAEMON_BUSY)]
+pub(crate) struct EnrollmentBusy;
+
+#[cfg(any(test, feature = "host"))]
+impl EnrollmentBusy {
+    pub(crate) fn error() -> io::Error {
+        io::Error::new(io::ErrorKind::WouldBlock, Self)
+    }
+
+    /// Whether `error` is this refusal, unwrapped.
+    pub(crate) fn is(error: &io::Error) -> bool {
+        error.get_ref().is_some_and(|inner| inner.is::<Self>())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CodexConfig {
     #[default]
@@ -267,6 +288,14 @@ impl Homes {
         let path = self.path(provider, key);
         let created = creation::create(&parent, provider, key)?;
         if let Err(error) = initialize(&created).and_then(|()| created.revalidate()) {
+            // Busy enrollment changed nothing, so the empty directory this
+            // call made is withdrawn and the caller may simply ask again.
+            // Anything else, or a directory that is no longer exactly that,
+            // stays for explicit recovery.
+            #[cfg(any(test, feature = "host"))]
+            if EnrollmentBusy::is(&error) && created.withdraw().is_ok() {
+                return Err(error);
+            }
             return Err(io::Error::new(
                 error.kind(),
                 format!(
