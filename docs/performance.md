@@ -347,7 +347,11 @@ hosted and daemon IPC connections reuse frame buffers.
 
 Opt-in `cagents::terminal_pipeline=trace` records parse/capture, encode/decode,
 UI apply, and draw stages where exercised; tracing overhead is excluded from
-release throughput claims. Summarize a collected log with:
+release throughput claims. The daemon also records `redraw_host_lock`: how long
+each redraw broadcast that queued a frame held the host lock, summed over its
+holds. It does not include time spent waiting for the lock. The daemon prints
+these stages only with `CAGENTS_LOCAL_DEBUG=1` and `RUST_LOG` set. Summarize a
+collected log with:
 
 ```sh
 target/release/examples/terminal-workload --summarize-trace /path/to/trace
