@@ -584,7 +584,7 @@ fn scope_descriptor(
         chat_drafts: HashMap::new(),
         chat_draft_attachments: HashMap::new(),
         chat_waiting_messages: HashMap::new(),
-        closed_chat_drafts: HashMap::new(),
+        kept_chat_drafts: HashMap::new(),
         agent_updates: Default::default(),
         workspace_history: Vec::new(),
         repository_navigation: HashMap::new(),

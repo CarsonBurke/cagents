@@ -258,7 +258,7 @@ pub struct WorkspaceManifest {
     pub chat_drafts: HashMap<CardId, String>,
     pub chat_draft_attachments: HashMap<CardId, Vec<crate::chat::Attachment>>,
     pub chat_waiting_messages: HashMap<CardId, crate::model::SavedQueue>,
-    pub closed_chat_drafts: HashMap<CardId, crate::model::ClosedChatDraft>,
+    pub kept_chat_drafts: HashMap<CardId, crate::model::KeptChatDraft>,
     pub agent_updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
     pub workspace_history: Vec<WorkspaceDestination>,
     pub repository_navigation: HashMap<CardId, crate::model::RepositoryNavigation>,
@@ -2183,7 +2183,7 @@ impl StateStore {
             chat_drafts: manifest.chat_drafts,
             chat_draft_attachments: manifest.chat_draft_attachments,
             chat_waiting_messages: manifest.chat_waiting_messages,
-            closed_chat_drafts: manifest.closed_chat_drafts,
+            kept_chat_drafts: manifest.kept_chat_drafts,
             agent_updates: manifest.agent_updates,
             workspace_history: manifest.workspace_history,
             repository_navigation: manifest.repository_navigation,
@@ -2201,9 +2201,9 @@ impl StateStore {
             .retain(|id, _| open_chats.contains_key(id));
         // A closed chat's draft waits for that chat to reopen as another card.
         state
-            .closed_chat_drafts
+            .kept_chat_drafts
             .retain(|id, _| !open_chats.contains_key(id));
-        crate::model::ClosedChatDraft::retain_newest(&mut state.closed_chat_drafts);
+        crate::model::KeptChatDraft::retain_recent(&mut state.kept_chat_drafts, now_unix_ms());
         if !warnings.is_empty() {
             retarget_dropped_cards(&mut state);
         }
@@ -4349,17 +4349,17 @@ fn save_workspace_transaction(
         &format!("workspace:{workspace_id}:navigation:chat_waiting_messages"),
         &ordered_map_json(&waiting)?,
     )?;
-    let mut closed_drafts = state
-        .closed_chat_drafts
+    let mut kept_drafts = state
+        .kept_chat_drafts
         .iter()
         .filter(|(id, _)| !open_chats.contains_key(id))
         .map(|(id, draft)| (*id, draft.clone()))
         .collect::<HashMap<_, _>>();
-    crate::model::ClosedChatDraft::retain_newest(&mut closed_drafts);
+    crate::model::KeptChatDraft::retain_recent(&mut kept_drafts, now_unix_ms());
     set_metadata(
         transaction,
-        &format!("workspace:{workspace_id}:navigation:closed_chat_drafts"),
-        &ordered_map_json(&closed_drafts)?,
+        &format!("workspace:{workspace_id}:navigation:kept_chat_drafts"),
+        &ordered_map_json(&kept_drafts)?,
     )?;
     set_metadata(
         transaction,
@@ -6011,9 +6011,9 @@ fn load_workspace_manifest_connection(
         .map(|value| from_json("workspace chat waiting messages", &value))
         .transpose()?
         .unwrap_or_default(),
-        closed_chat_drafts: metadata(
+        kept_chat_drafts: metadata(
             connection,
-            &format!("workspace:{id}:navigation:closed_chat_drafts"),
+            &format!("workspace:{id}:navigation:kept_chat_drafts"),
         )?
         .map(|value| from_json("workspace closed chat drafts", &value))
         .transpose()?
@@ -6709,7 +6709,7 @@ mod tests {
             chat_drafts: HashMap::new(),
             chat_draft_attachments: HashMap::new(),
             chat_waiting_messages: HashMap::new(),
-            closed_chat_drafts: HashMap::new(),
+            kept_chat_drafts: HashMap::new(),
             agent_updates: BTreeMap::new(),
             workspace_history: Vec::new(),
             repository_navigation: HashMap::new(),
@@ -8178,15 +8178,16 @@ mod tests {
     /// A closed chat's draft is restored for reopening its conversation,
     /// after a restart too; the window holds a bounded number of them.
     #[test]
-    fn closed_chat_drafts_survive_a_restart() {
-        use crate::model::ClosedChatDraft;
+    fn kept_chat_drafts_survive_a_restart() {
+        use crate::model::KeptChatDraft;
         let directory = tempdir().unwrap();
         let boot_id = boot("closed-draft-boot");
         let store =
             StateStore::open(directory.path().join("closed.sqlite3"), boot_id.clone()).unwrap();
         let mut workspace = workspace_with_terminal(&boot_id);
         let closed = CardId::new();
-        let draft = |text: &str, at: i64| ClosedChatDraft {
+        let now = now_unix_ms();
+        let draft = |text: &str, at: i64| KeptChatDraft {
             text: text.into(),
             attachments: Vec::new(),
             waiting: vec![crate::chat::QueuedMessage {
@@ -8196,40 +8197,47 @@ mod tests {
                 delivery: Default::default(),
                 attachments: Vec::new(),
             }],
+            sending: false,
             closed_at_unix_ms: at,
         };
         workspace
-            .closed_chat_drafts
-            .insert(closed, draft("unsent", i64::MAX));
-        for index in 0..ClosedChatDraft::LIMIT {
+            .kept_chat_drafts
+            .insert(closed, draft("unsent", now));
+        for index in 0..KeptChatDraft::LIMIT {
             workspace
-                .closed_chat_drafts
-                .insert(CardId::new(), draft("older", index as i64));
+                .kept_chat_drafts
+                .insert(CardId::new(), draft("older", now - 1 - index as i64));
         }
+        let expired = CardId::new();
+        workspace.kept_chat_drafts.insert(
+            expired,
+            draft("expired", now - KeptChatDraft::RETENTION_MS - 60_000),
+        );
         let mut lane = SaveLane::default();
         lane.save(&store, &workspace).unwrap();
         let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
-        assert_eq!(restored.closed_chat_drafts.len(), ClosedChatDraft::LIMIT);
-        assert_eq!(
-            restored.closed_chat_drafts[&closed],
-            draft("unsent", i64::MAX)
+        assert_eq!(restored.kept_chat_drafts.len(), KeptChatDraft::LIMIT);
+        assert_eq!(restored.kept_chat_drafts[&closed], draft("unsent", now));
+        assert!(
+            !restored.kept_chat_drafts.contains_key(&expired),
+            "a draft past its retention is not kept"
         );
         assert!(
             !restored
-                .closed_chat_drafts
+                .kept_chat_drafts
                 .values()
-                .any(|kept| kept.closed_at_unix_ms == 0),
+                .any(|kept| kept.closed_at_unix_ms == now - KeptChatDraft::LIMIT as i64),
             "the oldest gives way"
         );
 
-        workspace.closed_chat_drafts.clear();
+        workspace.kept_chat_drafts.clear();
         lane.save(&store, &workspace).unwrap();
         assert!(
             store
                 .load_workspace(workspace.id, None)
                 .unwrap()
                 .unwrap()
-                .closed_chat_drafts
+                .kept_chat_drafts
                 .is_empty()
         );
     }
@@ -8372,6 +8380,7 @@ mod tests {
                 host_incarnation: "1".into(),
             }),
             messages: vec![message],
+            stopped: false,
         };
         workspace.chat_waiting_messages.insert(chat, queue.clone());
         // A card this workspace no longer holds keeps nothing.

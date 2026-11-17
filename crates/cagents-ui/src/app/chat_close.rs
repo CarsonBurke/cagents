@@ -1,13 +1,13 @@
 //! Closing a pane closes it in every window and stops what it runs, so a chat
 //! that is still working asks first, as a terminal running a process does. The
 //! window may not be the one that started it, or know how far it has got.
-//! The conversation stays in history, and so does anything it had not sent
-//! (see `chat_ui::kept_draft`), so this is a routine question: Enter
-//! answers it, and the person may choose not to be asked again. Closing a
-//! chat whose first message hasn't arrived discards that message, which
-//! nothing brings back, so those questions are always asked and open on
-//! their dismissal: one whose message is still on its way, and one whose
-//! message couldn't start and is kept unsent in the composer.
+//! The conversation stays in history, and this window keeps anything it had
+//! not sent for when it reopens (see `chat_ui::kept_draft`), so this is a
+//! routine question: Enter answers it, and the person may choose not to be
+//! asked again. Closing a chat whose first message hasn't arrived discards
+//! that message, which nothing brings back, so those questions are always
+//! asked and open on their dismissal: one whose message is still on its way,
+//! and one whose message couldn't start and is kept unsent in the composer.
 
 use super::*;
 
@@ -30,6 +30,9 @@ pub(super) struct ChatCloseConfirm {
     /// Decided when the question opens, so the answer it starts on doesn't
     /// change under the person reading it.
     question: dialog_ui::Question,
+    /// Whether closing keeps anything unsent for a reopened conversation,
+    /// which the question then says.
+    keeps_unsent: bool,
     restore_card: Option<CardId>,
     restore_keyboard_nav: bool,
 }
@@ -40,7 +43,7 @@ impl Cagents {
         self.reset_shared_removal_for_new_close(card);
         // A discard confirmed for an earlier close that didn't go ahead
         // answers nothing about this one.
-        self.discard_draft_on_close(card, false);
+        self.forget_close_loss(card);
         self.continue_chat_close(card)
     }
 
@@ -103,11 +106,13 @@ impl Cagents {
             return Some(Task::none());
         }
         let restore_keyboard_nav = self.core.keyboard_nav();
+        let keeps_unsent = self.close_keeps_unsent(card, question);
         self.chat_close_confirm = Some(ChatCloseConfirm {
             card,
             session,
             certain,
             question,
+            keeps_unsent,
             restore_card: self.workspace.focused(),
             restore_keyboard_nav,
         });
@@ -196,17 +201,9 @@ impl Cagents {
                 self.dismiss_confirmation(QUESTION);
                 Task::none()
             };
-            // The reader chose to discard the message, so the close keeps
-            // nothing of it for a reopened conversation. Stopping a working
-            // chat keeps what it had not sent.
-            self.discard_draft_on_close(
-                intent.card,
-                matches!(
-                    intent.question,
-                    dialog_ui::Question::DiscardUnsentMessage
-                        | dialog_ui::Question::StopSendingFirstMessage
-                ),
-            );
+            // A message the reader chose to discard is not kept for a
+            // reopened conversation; the rest of what it had not sent is.
+            self.confirm_close_loss(intent.card, intent.session, intent.question);
             Task::batch([remember, self.begin_chat_close(intent.card)])
         } else {
             self.dismiss_confirmation(QUESTION);
@@ -256,10 +253,18 @@ impl Cagents {
         } else {
             "It may still be working. Closing it stops it and closes it in every window."
         };
-        // Nothing unsent is lost, but the reader should know where it goes.
-        let kept = (question == dialog_ui::Question::StopWorkingChat
-            && intent.is_some_and(|intent| !self.closed_chat_draft(intent.card).is_empty()))
-        .then_some("What you haven't sent yet comes back when you reopen it.");
+        // What isn't lost, the reader should know where to find.
+        let kept = intent
+            .filter(|intent| intent.keeps_unsent)
+            .and_then(|_| match question {
+                dialog_ui::Question::StopWorkingChat => {
+                    Some("What you haven't sent yet comes back when you reopen it in this window.")
+                }
+                dialog_ui::Question::StopSendingFirstMessage => Some(
+                    "Anything else you haven't sent comes back when you reopen it in this window.",
+                ),
+                _ => None,
+            });
         dialog_ui::overlay(
             dialog_ui::confirmation_surface(
                 question,

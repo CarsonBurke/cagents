@@ -1314,9 +1314,7 @@ impl Cagents {
             self.chat_is_unused(*card) && self.workspace.order().any(|id| id == *card)
         });
         // What it had not sent when its card closed comes back with it.
-        let draft_from = self
-            .reclaim_closed_chat_draft(entry.card)
-            .then_some(entry.card);
+        let draft_from = self.reclaim_kept_draft(entry.card).then_some(entry.card);
         let insert = self.insert_resumed_chat_card(session, replace, user_title, draft_from);
         // Manual names were installed before insertion. Otherwise publish
         // the saved automatic title instead of the provider's generic name.

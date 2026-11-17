@@ -6993,9 +6993,7 @@ impl Cagents {
         self.register_presence(id, Exposure::Visible, residency);
         // A reopened chat takes back what it had not sent when it closed; a
         // clone of an open one starts with an empty composer.
-        if reopening
-            && matches!(card.kind, CardKind::Chat(_))
-            && self.reclaim_closed_chat_draft(source_id)
+        if reopening && matches!(card.kind, CardKind::Chat(_)) && self.reclaim_kept_draft(source_id)
         {
             self.move_chat_draft(source_id, id);
         }
