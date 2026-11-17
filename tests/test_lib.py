@@ -186,6 +186,15 @@ class TestLib(unittest.TestCase):
             if (ROOT / "scripts" / name).exists():
                 shutil.copy2(ROOT / "scripts" / name, scripts / name)
         (self.root / "Cargo.toml").write_text("# private fake Cargo manifest\n")
+        # The lanes, as mise.toml defines them, and their check, recorded.
+        shutil.copy2(ROOT / "mise.toml", self.root / "mise.toml")
+        (scripts / "cargo-lane").write_text(
+            "#!/usr/bin/python3\nimport json, os, sys\nfrom pathlib import Path\n"
+            "root = Path(os.environ['TEST_ROOT'])\n"
+            "with open(root / 'checked.jsonl', 'a') as log:\n"
+            "    log.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            "sys.exit(json.loads((root / 'control.json').read_text()).get('check_exit', 0))\n")
+        (scripts / "cargo-lane").chmod(0o755)
         (self.root / "bin").mkdir()
         for path in (self.root / "bin/cargo", self.root / "libtest"):
             path.write_text(TOOL)
@@ -563,6 +572,30 @@ class TestLib(unittest.TestCase):
                 self.assert_no_test()
                 self.assertFalse(self.held())
 
+    def checks(self):
+        log = self.root / "checked.jsonl"
+        return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+
+    def test_passing_tests_are_followed_by_their_lanes_check(self):
+        # Built only under cfg(test), an item only tests use looks used; main's
+        # build check, of every target, says otherwise.
+        lanes = {"cli": ["--locked", "--no-default-features"],
+                 "host": ["--locked", "--no-default-features", "--features", "host"],
+                 "shared-ui": ["--locked", "--no-default-features", "--package", "cagents",
+                               "--package", "cagents-ui", "--features", "cagents/ui"]}
+        lanes["ui"] = lanes["shared-ui"]
+        for lane, selection in lanes.items():
+            with self.subTest(lane=lane):
+                (self.root / "checked.jsonl").unlink(missing_ok=True)
+                result = self.invoke(lane, "module::one", "--profile", "dev-runtime")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.checks(), [["check", *selection, "--lib", "--bins", "--examples"]])
+        # Its status is the task's.
+        (self.root / "checked.jsonl").unlink()
+        self.configure(check_exit=1)
+        self.assertEqual(self.invoke("cli", "module::one").returncode, 1)
+        self.assertEqual(len(self.checks()), 1)
+
     def test_compile_diagnostics_and_failure_status_are_preserved(self):
         self.configure(diagnostics=True, build_exit=41)
         result = self.invoke("cli", "module::one")
@@ -571,6 +604,7 @@ class TestLib(unittest.TestCase):
         self.assertIn("compiler stderr", result.stderr)
         self.assertEqual([event["phase"] for event in self.events()], ["metadata", "compiler"])
         self.assert_no_test()
+        self.assertEqual(self.checks(), [])
         self.assertFalse(self.held())
 
     def test_protected_environment_stdin_and_final_exec_exit_are_preserved(self):
