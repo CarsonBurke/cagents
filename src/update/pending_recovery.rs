@@ -178,21 +178,16 @@ fn recovery_window_slots(pending: &[String], current: &[String]) -> Vec<String> 
 
 fn verify(pending: &PendingRecovery, daemon: &Path) -> Result<recovery::Receipt, UpdateError> {
     let socket = crate::terminal_ipc::daemon_socket_path()?;
-    let source::Client { mut client, peer } =
-        source::Client::connect(&socket).map_err(|e| invalid(e.to_string()))?;
-    peer.verify(client.proof())?;
-    if peer.executable()? != daemon
+    let mut client = source::Client::connect(&socket).map_err(|e| invalid(e.to_string()))?;
+    if client.serving_executable()? != daemon
         || client.protocol() != crate::terminal_ipc::PROTOCOL_VERSION
-        || client.startup_state().map_err(|e| invalid(e.to_string()))?
-            != crate::terminal_ipc::StartupState::Ready
+        || client.startup_state()? != crate::terminal_ipc::StartupState::Ready
     {
         return Err(invalid("The selected target daemon is not Ready"));
     }
-    let generation = client
-        .shutdown_preflight()
-        .map_err(|e| invalid(e.to_string()))?
-        .capability
-        .inventory_generation;
+    // The fence is asked again while the daemon finishes another operation,
+    // which refuses it before issuing anything, rather than failing recovery.
+    let generation = client.inventory_generation()?;
     let original = recovery::Census::from_pending(uuid::Uuid::new_v4().to_string(), pending)?;
     let receipt = original.verify()?;
     if !receipt.usable() {
@@ -201,26 +196,17 @@ fn verify(pending: &PendingRecovery, daemon: &Path) -> Result<recovery::Receipt,
             receipt.outcome
         )));
     }
-    if client
-        .shutdown_preflight()
-        .map_err(|e| invalid(e.to_string()))?
-        .capability
-        .inventory_generation
-        != generation
-    {
+    if client.inventory_generation()? != generation {
         return Err(invalid(
             "Recovery inventory changed during verification; no success was reported",
         ));
     }
-    if client.startup_state().map_err(|e| invalid(e.to_string()))?
-        != crate::terminal_ipc::StartupState::Ready
-    {
+    if client.startup_state()? != crate::terminal_ipc::StartupState::Ready {
         return Err(invalid(
             "The recovery service ceased to be Ready during verification",
         ));
     }
-    peer.verify(client.proof())?;
-    if peer.executable()? != daemon {
+    if client.serving_executable()? != daemon {
         return Err(invalid("The serving recovery executable changed"));
     }
     Ok(receipt)

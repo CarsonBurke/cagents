@@ -51,20 +51,65 @@ pub(crate) enum PrepareError {
 const PREPARE_BUSY_PATIENCE: Duration = Duration::from_secs(60);
 const PREPARE_BUSY_PAUSE: Duration = Duration::from_secs(1);
 
-fn prepare_retrying_busy(
-    mut attempt: impl FnMut() -> Result<(u64, u64), PrepareError>,
+/// How long a source request that the source refused while finishing another
+/// operation keeps being asked again. Such a refusal admitted nothing, so
+/// asking again is safe; the caller is already waiting on the answer.
+const SOURCE_BUSY_PATIENCE: Duration = Duration::from_secs(30);
+
+/// Asks `attempt` again, after `pause`, while its error is `busy` and
+/// `patience` lasts. Any other reply is final at once.
+fn retrying_busy<T, E>(
+    mut attempt: impl FnMut() -> Result<T, E>,
+    busy: impl Fn(&E) -> bool,
     patience: Duration,
     pause: Duration,
-) -> Result<(u64, u64), PrepareError> {
+) -> Result<T, E> {
     let give_up = Instant::now() + patience;
     loop {
         match attempt() {
-            Err(PrepareError::Busy(_)) if Instant::now() + pause < give_up => {
+            Err(error) if busy(&error) && Instant::now() + pause < give_up => {
                 std::thread::sleep(pause);
             }
             reply => return reply,
         }
     }
+}
+
+fn prepare_retrying_busy(
+    attempt: impl FnMut() -> Result<(u64, u64), PrepareError>,
+    patience: Duration,
+    pause: Duration,
+) -> Result<(u64, u64), PrepareError> {
+    retrying_busy(
+        attempt,
+        |error| matches!(error, PrepareError::Busy(_)),
+        patience,
+        pause,
+    )
+}
+
+/// What a source request that admits nothing when refused as busy says once
+/// the source stayed busy past [`SOURCE_BUSY_PATIENCE`].
+const STILL_BUSY: &str = "The daemon stayed busy finishing another operation and refused each request, so nothing was changed. Retry once it finishes.";
+const STILL_BUSY_TO_STOP: &str = "The terminal service stayed busy finishing another operation and refused the stop each time, so nothing was stopped. Retry the update once it finishes.";
+
+/// A request the source refuses before admitting anything while it finishes
+/// another operation, asked again on the same connection until it answers or
+/// `patience` ends. A source still busy then is reported as `still_busy`, not
+/// as a failure that might have changed something.
+fn asked_while_busy<T>(
+    attempt: impl FnMut() -> Result<T, ControlError>,
+    still_busy: &str,
+    patience: Duration,
+    pause: Duration,
+) -> Result<T, UpdateError> {
+    retrying_busy(attempt, ControlError::is_daemon_busy, patience, pause).map_err(|error| {
+        if error.is_daemon_busy() {
+            invalid(still_busy)
+        } else {
+            invalid(error.to_string())
+        }
+    })
 }
 
 impl From<PrepareError> for UpdateError {
@@ -294,13 +339,20 @@ impl Client {
             .map_err(|error| invalid(error.to_string()))
     }
 
+    /// Preflight only issues an expiring capability, and a busy source refuses
+    /// it before issuing anything, so it is asked again while busy.
     pub(crate) fn shutdown_preflight(
         &mut self,
     ) -> Result<crate::terminal_ipc::ShutdownCapability, UpdateError> {
-        self.verified()?
-            .shutdown_preflight()
-            .map(|preflight| preflight.capability)
-            .map_err(|error| invalid(error.to_string()))
+        let client = self.verified()?;
+        let preflight = asked_while_busy(
+            || client.shutdown_preflight(),
+            STILL_BUSY,
+            SOURCE_BUSY_PATIENCE,
+            PREPARE_BUSY_PAUSE,
+        )?;
+        self.peer.verify(self.client.proof())?;
+        Ok(preflight.capability)
     }
 
     pub(crate) fn confirm_shutdown(
@@ -310,9 +362,16 @@ impl Client {
         if &capability.proof != self.proof() {
             return Err(invalid("The source changed before its confirmed stop"));
         }
-        self.verified()?
-            .confirm_shutdown(capability)
-            .map_err(|error| invalid(error.to_string()))
+        // The gate refuses a busy stop before reading its capability, so the
+        // same capability is offered again; one that expires meanwhile is
+        // answered as Expired, and the review starts over.
+        let client = self.verified()?;
+        asked_while_busy(
+            || client.confirm_shutdown(capability.clone()),
+            STILL_BUSY_TO_STOP,
+            SOURCE_BUSY_PATIENCE,
+            PREPARE_BUSY_PAUSE,
+        )
     }
 
     /// The conversations the source lists, as it issued them.
@@ -326,10 +385,13 @@ impl Client {
     /// RPCs. Preflight only issues an ephemeral capability; it never stops,
     /// adopts or replays a session. No capability is confirmed by this reader.
     pub(crate) fn inventory_generation(&mut self) -> Result<u64, UpdateError> {
-        let preflight = self
-            .verified()?
-            .shutdown_preflight()
-            .map_err(|error| invalid(error.to_string()))?;
+        let client = self.verified()?;
+        let preflight = asked_while_busy(
+            || client.shutdown_preflight(),
+            STILL_BUSY,
+            SOURCE_BUSY_PATIENCE,
+            PREPARE_BUSY_PAUSE,
+        )?;
         self.peer.verify(self.client.proof())?;
         if preflight.capability.proof != *self.client.proof() {
             return Err(invalid("The inventory fence belongs to another daemon"));
@@ -365,9 +427,14 @@ impl Client {
         &mut self,
         session: crate::chat::Session,
     ) -> Result<crate::chat::Snapshot, UpdateError> {
-        self.verified()?
-            .close_chat_with_snapshot(session)
-            .map_err(|error| invalid(error.to_string()))
+        // A busy source refuses the release before closing anything.
+        let client = self.verified()?;
+        asked_while_busy(
+            || client.close_chat_with_snapshot(session.clone()),
+            STILL_BUSY,
+            SOURCE_BUSY_PATIENCE,
+            PREPARE_BUSY_PAUSE,
+        )
     }
 }
 
@@ -976,6 +1043,133 @@ mod prepare_receipt_tests {
         );
         assert!(matches!(reply, Err(PrepareError::Busy(_))));
         assert!((1..=5).contains(&attempts), "{attempts} attempts");
+    }
+
+    /// A source that answers each preflight with `replies`, in order, on one
+    /// connection. Returns the client and the number of preflights asked.
+    fn preflight_source(
+        replies: Vec<ServerMessage>,
+    ) -> (ControlClient, std::thread::JoinHandle<usize>) {
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("busy-fence"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("daemon"),
+        };
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let server = std::thread::spawn(move || {
+            let reply = |peer: &mut UnixStream, request_id, message| {
+                write_frame(
+                    peer,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(request_id),
+                        proof: proof.clone(),
+                        message,
+                    },
+                )
+                .unwrap();
+            };
+            let connect: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+            reply(
+                &mut peer,
+                connect.request_id,
+                ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: proof.clone(),
+                        resumed: Vec::new(),
+                    },
+                },
+            );
+            let mut asked = 0;
+            for message in replies {
+                let Ok(Some(request)) = read_frame::<ClientEnvelope>(&mut peer) else {
+                    break;
+                };
+                assert!(matches!(request.request, ClientRequest::ShutdownV1 { .. }));
+                asked += 1;
+                reply(&mut peer, request.request_id, message);
+            }
+            asked
+        });
+        (ControlClient::from_stream(stream).unwrap(), server)
+    }
+
+    fn busy() -> ServerMessage {
+        ServerMessage::Error(ProtocolError::new(
+            ProtocolErrorCode::Internal,
+            crate::terminal_ipc::DAEMON_BUSY,
+            true,
+        ))
+    }
+
+    /// The inventory fence and a service stop's preflight are refused before
+    /// anything is issued while the daemon finishes another operation, so a
+    /// recovery check or an update asks again instead of reporting the
+    /// daemon's terminals missing or ending the update.
+    #[test]
+    fn a_busy_source_is_asked_again_for_its_preflight() {
+        let capability = ShutdownCapability {
+            proof: HostSessionProof {
+                host_session_id: HostSessionId::new("busy-fence"),
+                boot_id: BootId::new("boot"),
+                host_incarnation: HostIncarnation::new("daemon"),
+            },
+            token: "fence".into(),
+            inventory_generation: 7,
+            live_terminals: 0,
+            background_subagents: 0,
+            background_identity: String::new(),
+            expires_at_unix_ms: i64::MAX,
+        };
+        let (mut client, server) = preflight_source(vec![
+            busy(),
+            busy(),
+            ServerMessage::Response {
+                response: ServerResponse::ShutdownPreflight(
+                    crate::terminal_ipc::ShutdownPreflight { capability },
+                ),
+            },
+        ]);
+        let preflight = asked_while_busy(
+            || client.shutdown_preflight(),
+            STILL_BUSY,
+            Duration::from_secs(30),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        assert_eq!(preflight.capability.inventory_generation, 7);
+        assert_eq!(server.join().unwrap(), 3);
+    }
+
+    /// A source still busy when patience ends says that nothing changed; any
+    /// other refusal is final at once and keeps its own words.
+    #[test]
+    fn a_source_busy_past_patience_says_nothing_changed() {
+        let (mut client, server) = preflight_source(vec![busy(); 50]);
+        let error = asked_while_busy(
+            || client.shutdown_preflight(),
+            STILL_BUSY_TO_STOP,
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), STILL_BUSY_TO_STOP);
+        drop(client);
+        assert!((1..=6).contains(&server.join().unwrap()));
+
+        let (mut client, server) = preflight_source(vec![ServerMessage::Error(
+            ProtocolError::new(ProtocolErrorCode::InvalidRequest, "Not now", false),
+        )]);
+        let error = asked_while_busy(
+            || client.shutdown_preflight(),
+            STILL_BUSY,
+            Duration::from_secs(30),
+            Duration::from_millis(1),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("Not now"), "{error}");
+        assert_eq!(server.join().unwrap(), 1);
     }
 }
 
