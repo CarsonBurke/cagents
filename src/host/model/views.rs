@@ -1151,6 +1151,48 @@ fn record_scope_removal(
     Ok(())
 }
 
+/// The conversation a channel's first chat pane shows, which its automatic
+/// name describes.
+struct PrimaryConversation<'a> {
+    pane: crate::model::CardId,
+    chat: &'a crate::chat::Session,
+}
+
+impl<'a> PrimaryConversation<'a> {
+    fn of(view: &'a View) -> Option<Self> {
+        view.panes.iter().find_map(|pane| match &pane.kind {
+            crate::model::CardKind::Chat(chat) => Some(Self {
+                pane: pane.id,
+                chat,
+            }),
+            _ => None,
+        })
+    }
+
+    /// Whether `next` is still this conversation, so the name it earned
+    /// stays. The provider's conversation identity decides: a chat resumed
+    /// after its process ended is a new cagents chat of the same provider
+    /// conversation in the same pane. A chat that has not reported its
+    /// conversation yet is identified by the cagents chat until it does, so
+    /// learning that first conversation ID is not a replacement, and by the
+    /// resume that continues it when its process ended unnamed.
+    fn continues_as(&self, next: &Self) -> bool {
+        let (chat, next_chat) = (self.chat, next.chat);
+        if self.pane != next.pane || chat.launch.provider != next_chat.launch.provider {
+            return false;
+        }
+        match (&chat.launch.session_id, &next_chat.launch.session_id) {
+            (Some(conversation), Some(next)) => conversation == next,
+            (Some(_), None) => false,
+            (None, _) => {
+                chat.id == next_chat.id
+                    || chat.has_unnamed_retained_claude_actor()
+                        && crate::chat::is_retained_resume_successor(chat, next_chat)
+            }
+        }
+    }
+}
+
 fn write(db: &Connection, view: &View, recorder: &mut Recorder) -> Result<(), String> {
     let before = read(db, &view.scope)?;
     write_from(db, &before, view, recorder)
@@ -1166,32 +1208,19 @@ pub(super) fn write_from(
     recorder: &mut Recorder,
 ) -> Result<(), String> {
     if let Scope::Channel(id) = &view.scope {
-        let primary = |view: &View| {
-            view.panes.iter().find_map(|pane| match &pane.kind {
-                crate::model::CardKind::Chat(session) => Some((
-                    pane.id,
-                    session.id,
-                    session.launch.provider,
-                    session.launch.session_id.clone(),
-                )),
-                _ => None,
-            })
+        let previous = PrimaryConversation::of(before);
+        let current = PrimaryConversation::of(view);
+        let continued = match (&previous, &current) {
+            (Some(previous), Some(current)) => previous.continues_as(current),
+            (None, None) => true,
+            _ => false,
         };
-        let previous = primary(before);
-        let current = primary(view);
-        let learned_thread = matches!(
-            (&previous, &current),
-            (
-                Some((old_card, old_session, old_provider, None)),
-                Some((card, session, provider, Some(_))),
-            ) if old_card == card && old_session == session && old_provider == provider
-        );
-        if previous != current && !learned_thread {
+        if !continued {
             // A new primary conversation starts a new automatic naming choice.
             // Manual/legacy names describe the channel and survive all moves.
             // The first pane realizes the task that already named an accepted
             // agent's channel; keep that prompt fallback until useful metadata
-            // improves it. Learning its first thread ID is not a replacement.
+            // improves it.
             let first_adoption = previous.is_none() && current.is_some();
             if db
                 .execute(
@@ -1791,6 +1820,7 @@ mod tests {
         for source in [Prompt, Provider, Manual] {
             for transition in [
                 "pane",
+                "pane-same-thread",
                 "runtime",
                 "provider",
                 "thread",
@@ -1834,8 +1864,14 @@ mod tests {
                         pane: live_chat_pane(Some("other-thread")),
                         before: Some(original.id),
                     },
+                    "pane-same-thread" => Change::Insert {
+                        pane: live_chat_pane(Some("first-thread")),
+                        before: Some(original.id),
+                    },
+                    // A new chat that has not reported a conversation yet.
                     "runtime" => {
                         chat.id = crate::model::TerminalId::new();
+                        chat.launch.session_id = None;
                         Change::Update {
                             before: original,
                             pane: replacement,
@@ -1874,6 +1910,143 @@ mod tests {
                     if source == Manual { Manual } else { Prompt },
                 );
             }
+        }
+    }
+
+    #[test]
+    fn a_resumed_primary_conversation_keeps_its_automatic_channel_title() {
+        use crate::model::ChannelTitleSource::{Prompt, Provider};
+        for provider in [
+            crate::agent::Provider::Claude,
+            crate::agent::Provider::Codex,
+        ] {
+            for source in [Prompt, Provider] {
+                for successor in ["resumed", "reconnected"] {
+                    let (mut registry, _directory, _, _) = setup();
+                    let channel = ChannelId::new();
+                    registry
+                        .apply(&ModelEdit::CreateChannel {
+                            id: channel,
+                            repository: "/repo".into(),
+                            title: "Accepted task".into(),
+                            title_source: Prompt,
+                        })
+                        .unwrap();
+                    let mut original = live_chat_pane(Some("first-thread"));
+                    let CardKind::Chat(chat) = &mut original.kind else {
+                        unreachable!()
+                    };
+                    chat.launch.provider = provider;
+                    seed(&mut registry, channel, vec![original.clone()]);
+                    if source == Provider {
+                        registry
+                            .apply(&ModelEdit::SuggestChannelTitle {
+                                id: channel,
+                                title: "Chosen task".into(),
+                                source,
+                            })
+                            .unwrap();
+                    }
+                    let title = if source == Provider {
+                        "Chosen task"
+                    } else {
+                        "Accepted task"
+                    };
+                    let mut next = original.clone();
+                    let CardKind::Chat(chat) = &mut next.kind else {
+                        unreachable!()
+                    };
+                    match successor {
+                        // After a restart the same provider conversation
+                        // resumes as a new chat, still unproved by a host.
+                        "resumed" => {
+                            chat.id = crate::model::TerminalId::new();
+                            chat.proof = None;
+                        }
+                        // The same chat proved by a new host session.
+                        "reconnected" => {
+                            chat.proof = Some(crate::model::HostSessionProof {
+                                host_session_id: "next-host".into(),
+                                boot_id: "next-boot".into(),
+                                host_incarnation: "next-owner".into(),
+                            });
+                        }
+                        _ => unreachable!(),
+                    }
+                    let update = edit(
+                        &mut registry,
+                        channel,
+                        Change::Update {
+                            before: original,
+                            pane: next,
+                        },
+                    );
+                    registry.apply(&update).unwrap();
+                    assert_canonical_channel_title(&registry, channel, title, source);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resuming_an_unnamed_retained_claude_chat_keeps_its_channel_title() {
+        let conversation = uuid::Uuid::new_v4().to_string();
+        for successor in ["confirmed", "unconfirmed", "different-launch"] {
+            let (mut registry, _directory, _, _) = setup();
+            let channel = ChannelId::new();
+            registry
+                .apply(&ModelEdit::CreateChannel {
+                    id: channel,
+                    repository: "/repo".into(),
+                    title: "Accepted task".into(),
+                    title_source: crate::model::ChannelTitleSource::Prompt,
+                })
+                .unwrap();
+            let mut original = live_chat_pane(None);
+            let CardKind::Chat(chat) = &mut original.kind else {
+                unreachable!()
+            };
+            chat.launch.provider = crate::agent::Provider::Claude;
+            chat.launch.recipe.program = "/usr/bin/claude".into();
+            chat.native_continuity =
+                crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+            assert!(chat.has_unnamed_retained_claude_actor());
+            seed(&mut registry, channel, vec![original.clone()]);
+            let mut next = original.clone();
+            let CardKind::Chat(chat) = &mut next.kind else {
+                unreachable!()
+            };
+            chat.id = crate::model::TerminalId::new();
+            chat.proof = None;
+            chat.native_continuity = crate::chat::NativeContinuity::ReconnectOnly;
+            match successor {
+                // The conversation the ended actor confirmed resumes.
+                "confirmed" => chat.launch.session_id = Some(conversation.clone()),
+                // An actor that confirmed none never had a prompt accepted,
+                // so the pane starts its first conversation in place.
+                "unconfirmed" => {}
+                "different-launch" => chat.launch.recipe.arguments.push("--other".into()),
+                _ => unreachable!(),
+            }
+            let update = edit(
+                &mut registry,
+                channel,
+                Change::Update {
+                    before: original,
+                    pane: next,
+                },
+            );
+            registry.apply(&update).unwrap();
+            assert_canonical_channel_title(
+                &registry,
+                channel,
+                if successor == "different-launch" {
+                    ""
+                } else {
+                    "Accepted task"
+                },
+                crate::model::ChannelTitleSource::Prompt,
+            );
         }
     }
 
