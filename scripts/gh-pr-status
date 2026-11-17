@@ -449,10 +449,13 @@ def check_passed(check):
     return check.get("status") == "COMPLETED" and check.get("conclusion") in ("SUCCESS", "NEUTRAL", "SKIPPED")
 
 
-def reported_check(check):
-    """A check as the Rust CLI reports it: no timestamps, and links only where it has not passed."""
-    dropped = {"startedAt", "completedAt"} | ({"detailsUrl", "targetUrl", "description"} if check_passed(check) else set())
-    return {field: value for field, value in check.items() if field not in dropped}
+def reported_snapshot(snapshot):
+    """SNAPSHOT as the Rust CLI reports it: passing checks counted in
+    `checks_passed`, and the rest listed without timestamps."""
+    checks = snapshot.get("checks", [])
+    listed = [{field: value for field, value in check.items() if field not in ("startedAt", "completedAt")}
+              for check in checks if not check_passed(check)]
+    return {**snapshot, "checks": listed, "checks_passed": len(checks) - len(listed)}
 
 
 def expect_head(document, head):
@@ -508,9 +511,9 @@ def output(saved, key, as_json, head=None):
     fetched = saved.get("fetched_at")
     failed = bool(saved.get("error")) or not saved.get("snapshot")
     snapshot = saved.get("snapshot")
-    if snapshot:
-        snapshot = {**snapshot, "checks": [reported_check(check) for check in snapshot.get("checks", [])]}
     partial = not snapshot or (not snapshot["checks_complete"] and not snapshot["checks"])
+    if snapshot:
+        snapshot = reported_snapshot(snapshot)
     bootstrap = "Single REST bootstrap read; CI and review decision are unknown."
     # The CLI's REST read, made while GraphQL is rate limited, knows CI but
     # not the review decision; it is no reason to treat CI as unknown.

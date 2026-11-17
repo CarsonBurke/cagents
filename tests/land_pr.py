@@ -85,10 +85,11 @@ head = subprocess.check_output(["git", "-C", str(root / "origin.git"), "rev-pars
                                 "refs/heads/" + branch], text=True).strip()
 pr = {"state": answer.get("state", "OPEN"), "isDraft": False, "headRefOid": answer.get("head", head),
       "mergeable": answer.get("mergeable", "MERGEABLE")}
-checks = answer.get("checks", [{"__typename": "CheckRun", "name": "contracts",
-                                "status": "COMPLETED", "conclusion": "SUCCESS"}])
+# As gh-pr-status reports them: passing checks counted, the rest listed.
+checks = answer.get("checks", [])
 print(json.dumps({"ok": True, "data": {
     "snapshot": {"pull_request": pr, "checks_state": answer.get("ci", "SUCCESS"), "checks": checks,
+                 "checks_passed": answer.get("passed", 1),
                  "checks_complete": answer.get("complete", True),
                  "transport": answer.get("transport", "graphql")},
     "fetched_at": int(os.environ.get("FAKE_STATUS_NOW") or time.time()) + answer.get("age", 0), "retry_at": answer.get("retry_at"),
@@ -453,6 +454,13 @@ class LandTests(unittest.TestCase):
         (self.root / "merge-error").write_text("gh: Pull Request is not mergeable (HTTP 405)")
         self.assertEqual(self.run_land(), land.REFUSED)
         self.assertIn("HTTP 405", self.output)
+
+    def test_a_report_that_still_lists_passing_checks_lands(self):
+        # An older gh-pr-status's REST fallback lists every check, passed or not.
+        self.status({"passed": None, "checks": [
+            {"__typename": "CheckRun", "name": "contracts", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"__typename": "StatusContext", "context": "deploy", "state": "SUCCESS"}]})
+        self.assertEqual(self.run_land(), 0, self.output)
 
     def test_aggregate_success_lands_past_the_hundred_listed_checks(self):
         self.status({"complete": False})
