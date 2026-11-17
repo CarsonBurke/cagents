@@ -747,14 +747,18 @@ window is read every 15 s, and any other every 120 s; reads due within the
 next 15 s share one scan. Previously one recent edit anywhere made the whole
 project re-read every worktree every 15 s.
 
-`scripts/measure-work-polling BIN_DIR [WORKTREES] [SECONDS] [ACTIVE]` builds a
-private fixture from a matched `cagents` and `cagentsd`: a project of
-WORKTREES worktrees (default 250) with 40 tracked directories each, which it
-checks exceeds the watch budget, and ACTIVE (default 3) freshly edited
-worktrees. After the board has read every checkout once, it counts the
-`git status` reads the daemon starts and the CPU of its exited children over
-SECONDS (default 300). It removes everything it created on exit and refuses
-agent authority; run it from `ssh fw16`.
+`scripts/measure-work-polling BIN_DIR [WORKTREES] [SECONDS] [ACTIVE]
+[DIRECTORIES]` builds a private fixture from a matched `cagents` and
+`cagentsd`: a project of WORKTREES worktrees (default 250) with DIRECTORIES
+tracked directories each (default 40), which it checks exceeds the watch
+budget, and ACTIVE (default 3) freshly edited worktrees. It first reports the
+load: when every checkout had a status, when the watches were registered, and
+the Git commands and CPU until the daemon settled. Then it counts the Git
+commands and `git status` reads the daemon starts and the CPU it and its
+exited children use over SECONDS (default 300). Commands are counted from
+Git's own trace2 records, which the fixture's daemon writes for every Git
+process, so even the shortest are seen. It removes everything it created on
+exit and refuses agent authority; run it from `ssh fw16`.
 
 Reference on fw16 (Ryzen 7 7840HS), `dev-runtime`, 250 worktrees, 3 active,
 300 s, `0ac78d249` (before) against `9b8523e9a` (after):
@@ -768,6 +772,34 @@ Reference on fw16 (Ryzen 7 7840HS), `dev-runtime`, 250 worktrees, 3 active,
 A fixture checkout holds 40 files. A real checkout costs more per read: on a
 347-worktree repository with 8 active worktrees, the scanner's Git processes
 took at least half a core before this change.
+
+### Watch planning
+
+A watch plan needs each worktree's Git directories and the paths its index
+tracks. It read the directories with two `git rev-parse` processes per
+worktree and the paths with `git ls-files`, and the window's fallback scan,
+which names every worktree, repeated all three each minute. The directories
+now come from the checkout's `.git` marker and `commondir`, as Git's own
+discovery reads them, and a census is kept while its index file keeps the
+identity it had when read.
+
+The first load on fw16, `dev-runtime`, 3 active worktrees, 180 s, `c82fe6d5c`
+(before) against the change that introduced this (after); the host was
+shared with other work:
+
+| Worktrees | Load Git commands, before | After | `git rev-parse`, before | After |
+| --- | --- | --- | --- | --- |
+| 250 | 1,264 | 762 | 503 | 1 |
+| 1,000 | 5,014 | 3,012 | 2,003 | 1 |
+| 3,000 | 15,021 | 9,019 | 6,003 | 1 |
+
+At 3,000 worktrees the daemon registered its watches 49 s after the project
+opened rather than 57 s, and the load used 3.7 s of daemon CPU rather than 6.2
+s, and 25.2 s of Git CPU rather than 32.9 s. Polling after the load is
+unchanged: 1.58, 5.74 and 16.86 `git status` reads per second at 250, 1,000
+and 3,000 worktrees, because the watch budget leaves each project uncovered.
+The load still reads every status twice: once in the scan that builds the
+plan, and once after its watches are registered.
 
 ## Git watcher during builds
 
