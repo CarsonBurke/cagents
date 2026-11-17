@@ -92,9 +92,6 @@ impl editor::Editor for Editor {
             line_height: 1.0,
         });
 
-        let mut font_system =
-            text::font_system().write().expect("Write font system");
-
         buffer.set_text(
             text,
             &cosmic_text::Attrs::new(),
@@ -102,10 +99,19 @@ impl editor::Editor for Editor {
             None,
         );
 
-        buffer.shape_until_scroll(font_system.raw(), false);
+        // cagents: leave the lines unshaped. The buffer has no height yet, so
+        // shaping here would cover every line, under the process-wide font
+        // lock, usually with attributes the first `update` replaces anyway.
+        // That `update` sizes the buffer and shapes only what its viewport
+        // shows.
+        let version = text::font_system()
+            .read()
+            .expect("Read font system")
+            .version();
+
         Editor(Some(Arc::new(Internal {
             editor: cosmic_text::Editor::new(buffer),
-            version: font_system.version(),
+            version,
             ..Default::default()
         })))
     }
