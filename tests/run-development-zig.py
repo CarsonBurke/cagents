@@ -46,7 +46,7 @@ class ZigDiscovery(unittest.TestCase):
         self.runner = checkout / "scripts/run-development"
         shutil.copy2(SOURCE, self.runner)
         shutil.copy2(GATE, checkout / "scripts/cargo-gate")
-        for helper in ("cargo-gate-command.py", "build-host"):
+        for helper in ("cargo-gate-command.py", "build-host", "cargo-lane", "cargo_warnings.py"):
             shutil.copy2(GATE.with_name(helper), checkout / "scripts" / helper)
         (checkout / "mise.toml").write_text('[tools]\nzig = "0.15.2"\n')
 
@@ -132,7 +132,8 @@ exit 83
                 result, calls = self.run_runner(FAKE_ZIG_FORMAT=format_name)
                 self.assertEqual(result.returncode, 83, result.stderr)
                 self.assertEqual(len(calls), 1)
-                self.assertIn("build --locked --profile dev-runtime --no-default-features", calls[0])
+                self.assertIn("build --message-format=json --locked --profile dev-runtime --no-default-features",
+                              calls[0])
                 self.assertIn(f"zig={self.real}", calls[0])
                 self.assertIn(f"home={self.home}|xdg={self.xdg}|mise={self.data}", calls[0])
                 self.cargo_calls.unlink()
@@ -1133,7 +1134,8 @@ exit 1
     def test_both_lanes_build_one_cli_and_daemon_and_differ_only_in_the_ui(self):
         _, browserless = self.launch("--browserless")
         _, integrated = self.launch()
-        common = "build --locked --profile dev-runtime"
+        # Through scripts/cargo-lane, which reads Cargo's messages as JSON.
+        common = "build --message-format=json --locked --profile dev-runtime"
         self.assertEqual(browserless[:2], [
             f"{common} --no-default-features --features development --bin cagents",
             f"{common} --no-default-features --features development,host --bin cagentsd",

@@ -35,6 +35,10 @@ import sys
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+# Builds run through this, and a bytecode cache written into scripts/ would
+# change the checkout: the runner's freshness check would then see an edit and
+# rebuild on the next launch.
+sys.dont_write_bytecode = True
 import cargo_warnings
 
 PROGRAM = "cargo-lane"
