@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import re
 from pathlib import Path
 import shlex
 import shutil
@@ -131,8 +132,9 @@ class InARealScope(unittest.TestCase):
             cgroup = pathlib.Path("/proc/self/cgroup").read_text().strip()
             pathlib.Path("{unit}").write_text(cgroup.rsplit("/", 1)[1])
             # Outlasting run_tool's timeout, so that its returning at all shows
-            # the scope ended this child and its open output.
-            child = subprocess.Popen(["sh", "-c", 'echo $$ >{survivor}; exec sleep 300'])
+            # the scope ended this child and its open output. Ignoring SIGTERM,
+            # it is killed only once the stop times out, which fails the unit.
+            child = subprocess.Popen(["sh", "-c", 'trap "" TERM; echo $$ >{survivor}; exec sleep 300'])
             # A ceiling, so that a mutant without the limit fails the test
             # instead of filling the host's memory and swap.
             chunks = [bytearray(b"x") * (16 * 2**20) for _ in range(64)]
@@ -225,6 +227,24 @@ class InARealScope(unittest.TestCase):
         _, errors = wrapper.communicate(timeout=HANG_GUARD)
         self.wait_for(lambda: not Path(f"/proc/{pid}").exists(), "it outlived the scope")
         self.assertNotIn("over the limit", errors)
+        self.assert_not_left_failed(unit.read_text().strip())
+
+    def test_an_interrupted_command_that_went_over_the_limit_says_so(self):
+        marker = self.root / "pid"
+        unit = self.root / "unit"
+        interrupted = self.root / "interrupted"
+        # Like Ctrl-C on `cargo test` while one of its tests is killed for its memory.
+        script = (f'{LEAF} >"{unit}"; trap \': >"{interrupted}"\' INT; echo $$ >"{marker}"; '
+                  f'while [ ! -e "{interrupted}" ]; do sleep 0.01; done; '
+                  f'{sys.executable} -I -c \'c = [bytearray(b"x") * (16 * 2**20) for _ in range(64)]\'')
+        wrapper = subprocess.Popen([str(TOOL), "sh", "-c", script], env=self.env,
+                                   stderr=subprocess.PIPE, text=True)
+        self.addCleanup(wrapper.communicate)
+        self.wait_for(lambda: marker.exists() and marker.read_text().strip(), "never started")
+        wrapper.send_signal(signal.SIGINT)
+        _, errors = wrapper.communicate(timeout=HANG_GUARD)
+        self.assertEqual(wrapper.returncode, 137, errors)
+        self.assertIn("stopped sh because it and the processes it started went over the limit", errors)
         self.assert_not_left_failed(unit.read_text().strip())
 
     def test_an_interrupted_command_ends_a_calling_script_too(self):
@@ -330,6 +350,8 @@ class InARealScope(unittest.TestCase):
         log = (state / "cagents/leftover-processes.log").read_text()
         self.assertRegex(log, r"cagents-capped-\S+\.scope in .*: sh -c ")
         self.assertIn(f"  pid {pid}, up ", log)
+        # Killed once the stop timed out, which fails the unit.
+        self.assert_not_left_failed(re.search(r"cagents-capped-\S+\.scope", log)[0])
 
     def test_a_command_that_leaves_nothing_running_is_not_reported(self):
         state = self.root / "state"
