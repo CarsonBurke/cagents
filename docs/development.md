@@ -199,7 +199,9 @@ Each task runs one `scripts/cargo-gate check --locked` command with its lane's
 features, `--no-default-features --features host` for the daemon for example;
 `mise.toml` defines the lanes once. The `ui` lane selects both packages,
 `--package cagents --package cagents-ui --features cagents/ui`, and `browser`
-selects `--package cagents-ui --features integrated-browser`.
+selects `--package cagents-ui --features browser-protocol-fixture`: the
+integrated browser with the Wayland registry test server its tests use, as main's
+build check selects it.
 
 Every lane compiles the workspace's crates without warnings, tests included,
 and a new warning is a regression to fix in the change that adds it. An item
@@ -224,15 +226,17 @@ browserless UI lanes' tests (`scripts/cargo-gate test ... --all-targets`,
 about to run them, skip that check. The integrated UI has no test lane; keep
 its check.
 
-A test lane narrowed with arguments, such as `mise run test:ui -- --lib`,
-builds the lane's code only under `cfg(test)`, where an item only tests use
-looks used. So once its tests pass, the task also checks the lane's library,
-binaries and examples (`--lib --bins --examples`), as main's build check does
-with every target, and fails on what that finds. A method only tests called
-reached main that way (#2920), its author having run a narrowed test lane. On
-fw16 that check took about 20 s of compiling after a narrowed UI test build of
-about 3 minutes, and up to 95 s where the slot had no earlier check to reuse,
-besides its own wait in the queue. `scripts/cargo-gate check --features ui`
+A test lane narrowed with arguments, such as `mise run test:ui -- --lib`, and
+`mise run test:lib` may build the lane's library only under `cfg(test)`,
+where an item only tests use looks used. So once their tests pass, these tasks
+also check the lane's library, binaries and examples, as main's build check
+does, and their status is that check's. A method only tests called reached
+main that way (#3006, fixed by #3035): its author ran a narrowed test lane and
+no check. On fw16 this check took about 20 s to compile where the slot had
+checked before and 70 to 95 s where it had not, after a narrowed UI test build
+of about 3 minutes, and it waits for its own build slot. It does not check the
+test targets the narrowed run skipped, so before review still run the lane's
+check, or its tests with every target. `scripts/cargo-gate check --features ui`
 without `--package cagents-ui` checks only the shared library, not the
 application; `mise run check:ui` checks both.
 
