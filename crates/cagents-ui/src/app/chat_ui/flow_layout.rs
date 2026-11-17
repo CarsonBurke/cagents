@@ -943,15 +943,9 @@ impl Prepared {
         buffer.set_rich_text(
             spans.iter().enumerate().map(|(index, span)| {
                 let mut attrs = graphics_text::to_attributes(span.font.unwrap_or(font));
-                if span.size.is_some() || span.line_height.is_some() {
-                    let span_size = span.size.unwrap_or(size);
-                    attrs = attrs.metrics(cosmic_text::Metrics::new(
-                        span_size.0,
-                        span.line_height
-                            .unwrap_or(line_height)
-                            .to_absolute(span_size)
-                            .0,
-                    ));
+                if let Some((span_size, span_line_height)) = span.metrics(size, line_height) {
+                    attrs =
+                        attrs.metrics(cosmic_text::Metrics::new(span_size.0, span_line_height.0));
                 }
                 if let Some(color) = span.color {
                     attrs = attrs.color(graphics_text::to_color(color));
@@ -1003,6 +997,46 @@ fn reference(
         wrapping,
         ellipsize: Default::default(),
     })
+}
+
+#[test]
+fn large_paragraphs_lay_out_smaller_inline_code_on_the_prose_pitch() {
+    // Paragraphs past the flow threshold are shaped here rather than by
+    // iced; inline code set smaller must keep the same lines either way.
+    let spans = super::selectable_prose::inline_code_answer_spans(&cosmic::Theme::dark());
+    let size = iced::Pixels(design::TEXT_PROSE);
+    let pitch = iced::widget::text::LineHeight::default()
+        .to_absolute(size)
+        .0;
+    for width in [700.0, 260.0, 150.0] {
+        let full = reference(
+            &spans,
+            size,
+            iced::Font::DEFAULT,
+            width,
+            iced::widget::text::Wrapping::WordOrGlyph,
+        );
+        let prepared = Prepared::new(
+            &spans,
+            size,
+            iced::Font::DEFAULT,
+            width,
+            iced::widget::text::Wrapping::WordOrGlyph,
+        );
+        let lines = full.buffer().layout_runs().count();
+        assert_eq!(prepared.snapshot.visual_line_count(), lines);
+        assert_eq!(prepared.snapshot.height(), full.min_height());
+        assert!((full.min_height() - lines as f32 * pitch).abs() < 0.01);
+        let projected = prepared.snapshot.project(0..lines).expect("every line");
+        for (before, after) in full
+            .buffer()
+            .layout_runs()
+            .zip(projected.buffer().layout_runs())
+        {
+            assert_eq!(before.line_y.to_bits(), after.line_y.to_bits());
+            assert_eq!(before.line_height.to_bits(), after.line_height.to_bits());
+        }
+    }
 }
 
 #[test]

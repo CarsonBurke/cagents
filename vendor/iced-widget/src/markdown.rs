@@ -315,11 +315,7 @@ impl Span {
                 let span = span(text.clone()).strikethrough(*strikethrough);
 
                 let span = if *code {
-                    span.font(style.inline_code_font)
-                        .color(style.inline_code_color)
-                        .background(style.inline_code_highlight.background)
-                        .border(style.inline_code_highlight.border)
-                        .padding(style.inline_code_padding)
+                    style.inline_code(span)
                 } else if *strong || *emphasis {
                     span.font(Font {
                         weight: if *strong {
@@ -1119,10 +1115,15 @@ pub struct Style {
     pub inline_code_highlight: Highlight,
     /// The [`Padding`] to be applied to the background of inline code.
     pub inline_code_padding: Padding,
-    /// The [`Color`] to be applied to inline code.
-    pub inline_code_color: Color,
+    /// The [`Color`] to be applied to inline code, or `None` for the color
+    /// of the text around it.
+    pub inline_code_color: Option<Color>,
     /// The [`Font`] to be applied to inline code.
     pub inline_code_font: Font,
+    /// The size of inline code relative to the text around it.
+    ///
+    /// Inline code keeps the line height of its paragraph whatever its size.
+    pub inline_code_relative_size: f32,
     /// The [`Font`] to be applied to code blocks.
     pub code_block_font: Font,
     /// The [`Color`] to be applied to links.
@@ -1139,10 +1140,29 @@ impl Style {
                 background: color!(0x111111).into(),
                 border: border::rounded(4),
             },
-            inline_code_color: Color::WHITE,
+            inline_code_color: Some(Color::WHITE),
             inline_code_font: Font::MONOSPACE,
+            inline_code_relative_size: 1.0,
             code_block_font: Font::MONOSPACE,
             link_color: palette.primary,
+        }
+    }
+
+    /// Styles `span` as inline code.
+    pub fn inline_code<'a, Link>(
+        &self,
+        span: text::Span<'a, Link>,
+    ) -> text::Span<'a, Link> {
+        let span = span
+            .font(self.inline_code_font)
+            .color_maybe(self.inline_code_color)
+            .background(self.inline_code_highlight.background)
+            .border(self.inline_code_highlight.border)
+            .padding(self.inline_code_padding);
+        if self.inline_code_relative_size == 1.0 {
+            span
+        } else {
+            span.relative_size(self.inline_code_relative_size)
         }
     }
 }

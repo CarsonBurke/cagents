@@ -34,7 +34,7 @@ use cosmic::{
     widget::text::Text,
 };
 
-use super::{GRID_UNIT, RADIUS_XS, accent_color, muted_text, raised, space};
+use super::{GRID_UNIT, RADIUS_XS, accent_color, code_chip, muted_text, space};
 
 /// The size of nearly everything in the shell: rows, controls, labels.
 pub const TEXT_BODY: f32 = 13.0;
@@ -172,6 +172,37 @@ pub fn display<'a>(text: impl Into<Cow<'a, str>> + 'a) -> ShellText<'a> {
         .font(weighted(Weight::Bold))
 }
 
+/// The size of inline code relative to the prose it sits in.
+///
+/// A monospace face's letters are wider and denser than proportional ones:
+/// with the default faces the two share an x-height, but the monospace
+/// lowercase advances 15% further, so code at the prose's size read larger
+/// and heavier than the sentence around it. At nine tenths its letters take
+/// the prose's room and weight. The line height stays the prose's, so lines
+/// with code keep the same pitch as lines without.
+pub const INLINE_CODE_RELATIVE_SIZE: f32 = 0.9;
+
+/// Where the chip behind inline code sits, relative to the line box of
+/// prose set at `size`.
+///
+/// The highlight starts as the whole line box, and a chip that tall touched
+/// the chip on the next line. The negative vertical padding pulls the chip
+/// into the box so it covers inline code's glyphs, from the top of its
+/// capitals and brackets to the bottom of its descenders, with about a
+/// pixel of room. Those glyphs sit low in the box, so the chip comes in
+/// further at the top than at the bottom. The horizontal padding leaves a
+/// little room beside the first and last letters. It still stays inside the
+/// spaces between words, because the padding takes no room in the layout.
+pub fn inline_code_padding(size: f32) -> cosmic::iced::Padding {
+    let half_leading = (LineHeight::default().to_absolute(size.into()).0 - size) / 2.0;
+    cosmic::iced::Padding {
+        top: -(half_leading + size * 0.08),
+        bottom: -(half_leading - size * 0.2).max(0.0),
+        left: 2.0,
+        right: 2.0,
+    }
+}
+
 /// Markdown shares the shell's semantic palette and a compact heading scale.
 pub fn markdown_settings(theme: &Theme, size: f32) -> cosmic::widget::markdown::Settings {
     use cosmic::{iced, widget::markdown};
@@ -181,9 +212,14 @@ pub fn markdown_settings(theme: &Theme, size: f32) -> cosmic::widget::markdown::
         iced::Theme::Light
     });
     style.link_color = accent_color(theme);
-    style.inline_code_color = theme.cosmic().background(false).on.into();
-    style.inline_code_highlight.background = raised(theme).into();
+    // Code reads in the color of the sentence it is part of; the chip is
+    // what sets it apart. Full-strength ink made it brighter than the
+    // prose around it.
+    style.inline_code_color = None;
+    style.inline_code_highlight.background = code_chip(theme).into();
     style.inline_code_highlight.border.radius = RADIUS_XS.into();
+    style.inline_code_relative_size = INLINE_CODE_RELATIVE_SIZE;
+    style.inline_code_padding = inline_code_padding(size);
     markdown::Settings {
         h1_size: (size + GRID_UNIT).into(),
         h2_size: (size + GRID_UNIT / 2.0).into(),

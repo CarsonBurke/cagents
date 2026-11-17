@@ -173,6 +173,17 @@ pub fn raised(theme: &Theme) -> Color {
     mix(base(theme), theme.current_container().on.into(), 0.045)
 }
 
+/// The chip behind inline code in prose.
+///
+/// The chip is all that sets a short identifier apart from the words around
+/// it, so it needs more weight than [`raised`]. At that step's 4.5% it was
+/// a few levels off a dark pane and could not be seen. It stays a tint
+/// toward the ink, so it reads the same way on light and dark surfaces and
+/// stays well under the text's own contrast.
+pub fn code_chip(theme: &Theme) -> Color {
+    mix(base(theme), theme.current_container().on.into(), 0.1)
+}
+
 /// One step below the surface, for content quoted from elsewhere.
 pub fn sunken(theme: &Theme) -> Color {
     let on: Color = theme.current_container().on.into();
