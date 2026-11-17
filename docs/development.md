@@ -102,11 +102,12 @@ tests' own build reports for what it compiles; `check:host` covers the daemon's
 whole build. Both the task and the sentinel judge a warning with
 `scripts/cargo_warnings.py`.
 
-The development runner (`mise run dev`) and `scripts/native-evidence build`
-run their three builds through `scripts/cargo-lane --allow-warnings`: the
-same rule for what shows, but a workspace warning, still named on the
-closing line, does not fail a build that has to start the app. Without it,
-each build of the UI replayed the vendored crates' warnings, about 16,000
+The development runner (`mise run dev`) and `scripts/native-evidence build`,
+on the build host or in your checkout with `--remote`, run their three
+builds through `scripts/cargo-lane --allow-warnings`: the same rule for
+what shows, but a workspace warning, still named on the closing line, does
+not fail a build that has to start the app. Without it,
+each build of the UI replayed the vendored crates' warnings, about 17,000
 tokens, even when it compiled only `cagents`. The policy is applied to
 what Cargo reports rather than by capping the vendored crates' lints when
 they compile: lints capped at compile time would leave a unit already
