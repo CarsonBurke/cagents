@@ -40,6 +40,10 @@ _custody_spec = importlib.util.spec_from_file_location("fixture_custody", ROOT /
 _custody = importlib.util.module_from_spec(_custody_spec)
 _custody_spec.loader.exec_module(_custody)
 FixtureDirectory = _custody.FixtureDirectory
+# Isolated Python (-I) leaves this directory off sys.path.
+_cargo_spec = importlib.util.spec_from_file_location("cargo_fixture", ROOT / "tests/cargo_fixture.py")
+cargo_fixture = importlib.util.module_from_spec(_cargo_spec)
+_cargo_spec.loader.exec_module(cargo_fixture)
 
 
 def load_offload():
@@ -597,6 +601,19 @@ class ThisHost(unittest.TestCase):
         self.assertEqual(tomllib.loads(text), {"profile": {"dev": {
             "debug": "line-tables-only", "incremental": True, "package": {"*": {"debug": 0}}}}})
 
+    def test_profiles_come_from_the_cargo_home_cargo_reads(self):
+        self.assertEqual(offload.user_cargo_config({"CARGO_HOME": "/elsewhere/cargo"}),
+                         "/elsewhere/cargo/config.toml")
+        self.assertEqual(offload.user_cargo_config({"HOME": "/home/u"}), "/home/u/.cargo/config.toml")
+        self.assertEqual(offload.user_cargo_config({"HOME": "/home/u", "CARGO_HOME": ""}),
+                         "/home/u/.cargo/config.toml")
+        # Cargo reads the legacy file in preference to config.toml.
+        with tempfile.TemporaryDirectory(prefix="cagents-cargo-home-", dir="/var/tmp") as home:
+            Path(home, "config.toml").touch()
+            self.assertEqual(offload.user_cargo_config({"CARGO_HOME": home}), f"{home}/config.toml")
+            Path(home, "config").touch()
+            self.assertEqual(offload.user_cargo_config({"CARGO_HOME": home}), f"{home}/config")
+
     def test_a_missing_config_gives_no_profiles(self):
         self.assertEqual(offload.profile_config("/nonexistent/config.toml"), "")
 
@@ -627,7 +644,7 @@ if [ "$1" = marked ]; then
     # A host with a stray Git marker above its temporary directory.
     shift
     cd "$HOME"
-    exec env -i HOME="$HOME" PATH="$STAND_IN_HOST_PATH" CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" \
+    exec env -i HOME="$HOME" PATH="$STAND_IN_HOST_PATH" CARGO_HOME="$HOME/.cargo" RUSTUP_HOME="$RUSTUP_HOME" \
         CAGENTS_BUILD_SCOPE=0 CAGENTS_BUILD_LOCK="$HOME/shares.lock" CAGENTS_BUILD_SLOTS="${STAND_IN_SHARES:-4}" \
         CAGENTS_OFFLOAD_TEMPORARY_ROOT="$HOME/stray/cof" \
         sh -c "mkdir -p '$HOME/stray/.git'; $*"
@@ -642,7 +659,7 @@ ulimit -Sn 256
 # its configuration would, and inside the stand-in's home, which the test
 # removes. Its builds take their memory shares in that home, in place rather
 # than in a systemd scope; a test may say how many shares the host has.
-exec env -i HOME="$HOME" PATH="$STAND_IN_HOST_PATH" CARGO_HOME="$CARGO_HOME" \
+exec env -i HOME="$HOME" PATH="$STAND_IN_HOST_PATH" CARGO_HOME="$HOME/.cargo" \
     RUSTUP_HOME="$RUSTUP_HOME" CARGO_BUILD_BUILD_DIR="$HOME/build{workspace-root}/target" \
     CAGENTS_BUILD_SCOPE=0 CAGENTS_BUILD_LOCK="$HOME/shares.lock" CAGENTS_BUILD_SLOTS="${STAND_IN_SHARES:-4}" \
     CAGENTS_OFFLOAD_TEMPORARY_ROOT="$HOME/cof" sh -c "$*"
@@ -688,17 +705,23 @@ class StandInHost(unittest.TestCase):
         shutil.copy2(ROOT / "rust-toolchain.toml", self.crate)
         self.scope.run(["git", "init", "-q"], cwd=self.crate, check=True)
         home = Path.home()
-        self.env = {
+        # rustup's proxies, which find the toolchains through RUSTUP_HOME.
+        self.cargo_bin = cargo_fixture.user_cargo_home() / "bin"
+        # This end has a private Cargo home, and the stand-in host one in its
+        # own home: the user's would bring their configuration and make Cargo
+        # wait on, and report, the package-cache lock that every other build
+        # on this machine takes.
+        self.env = cargo_fixture.private_cargo_environment(self.root / "cargo-home", {
             key: value for key, value in os.environ.items()
-            if not key.startswith(("CAGENTS_BUILD_", "CARGO_BUILD_"))
-        } | {
+            if not key.startswith("CAGENTS_BUILD_")
+        }) | {
             "PATH": os.pathsep.join([str(python_tools), str(tools), os.environ["PATH"]]),
             # A build host's `cargo` is rustup's, as fw16's is, rather than
             # whatever wraps it first on this host's PATH: mise's shim, for
             # one, raises the open-file limit the build is meant to keep.
             "STAND_IN_HOST_PATH": os.pathsep.join([
                 str(python_tools),
-                os.path.join(os.environ.get("CARGO_HOME", str(home / ".cargo")), "bin"),
+                str(self.cargo_bin),
                 os.environ["PATH"]]),
             "CAGENTS_BUILD_LOCK": str(self.root / "slot.lock"),
             # Builds here run in place, never in a scope of this host's.
@@ -710,7 +733,6 @@ class StandInHost(unittest.TestCase):
             "CAGENTS_BUILD_REMOTE_FREE_FLOOR_GIB": "1",
             "CAGENTS_BUILD_REMOTE_RETRY_SECONDS": "1",
             "CAGENTS_BUILD_INSTALLED_GATE": "",
-            "CARGO_HOME": os.environ.get("CARGO_HOME", str(home / ".cargo")),
             "RUSTUP_HOME": os.environ.get("RUSTUP_HOME", str(home / ".rustup")),
             "CARGO_BUILD_BUILD_DIR": str(self.root / "local-build"),
             "XDG_RUNTIME_DIR": str(self.root / "runtime"),
@@ -721,8 +743,8 @@ class StandInHost(unittest.TestCase):
                               capture_output=True, text=True, timeout=timeout)
 
     def remote_env(self):
-        # The stand-in host's home holds the slots; Cargo and rustup keep the
-        # real ones, which the environment names.
+        # The stand-in host's home holds the slots and its Cargo home; rustup
+        # keeps the toolchains the environment names.
         return self.env | {"HOME": str(self.host_home)}
 
     def test_a_build_runs_remotely_and_its_executable_comes_back(self):
@@ -810,7 +832,7 @@ fn bounded_allocation() {
         shell = self.root / "tools/host-shell"
         settings = {
             "HOME": self.host_home, "PATH": self.env["STAND_IN_HOST_PATH"],
-            "CARGO_HOME": self.env["CARGO_HOME"], "RUSTUP_HOME": self.env["RUSTUP_HOME"],
+            "CARGO_HOME": self.host_home / ".cargo", "RUSTUP_HOME": self.env["RUSTUP_HOME"],
             "CARGO_BUILD_BUILD_DIR": f"{self.host_home}/build{{workspace-root}}/target",
             "CAGENTS_BUILD_SCOPE": "0", "CAGENTS_BUILD_LOCK": self.host_home / "shares.lock",
             "CAGENTS_BUILD_SLOTS": "4", "CAGENTS_OFFLOAD_TEMPORARY_ROOT": self.host_home / "cof",
@@ -1404,7 +1426,7 @@ fn bounded_allocation() {
         # Rustup's Cargo follows the wrapper, ahead of any wrapper of this
         # host's own, which would look for the next `cargo` the same way.
         env["PATH"] = os.pathsep.join(
-            [str(wrappers), os.path.join(env["CARGO_HOME"], "bin"), env["PATH"]])
+            [str(wrappers), str(self.cargo_bin), env["PATH"]])
         result = self.gate_run("exec", "sh", "-ec", "cargo build --bin probe",
                                env=env, timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1412,7 +1434,7 @@ fn bounded_allocation() {
         self.assertFalse((self.root / "local-build").exists())
 
     def test_cargo_in_an_exec_command_reached_by_path_does_not_compile_here(self):
-        cargo = os.path.join(self.env["CARGO_HOME"], "bin", "cargo")
+        cargo = str(self.cargo_bin / "cargo")
         for command in (f"'{cargo}' build --bin probe", '"$CARGO_PATH" build --bin probe'):
             with self.subTest(command=command):
                 result = self.gate_run("exec", "sh", "-ec", command,
@@ -1461,7 +1483,7 @@ fn bounded_allocation() {
         # looks `cargo` up on PATH again, finds the gate's and builds on the
         # build host, so nothing reaches the guard. rustup's Cargo, first
         # here as on the build host, compiles here.
-        cargo = os.path.join(self.env["CARGO_HOME"], "bin", "cargo")
+        cargo = str(self.cargo_bin / "cargo")
         env = self.remote_env() | self.logging_rustc_wrapper()
         env["PATH"] = os.pathsep.join([os.path.dirname(cargo), env["PATH"]])
         result = self.gate_run(
@@ -1824,7 +1846,7 @@ fn bounded_allocation() {
         # The generous startup budget is not the assertion: the barrier proves
         # that an admitted build stays alive across that exact deadline.
         wrapper = self.root / "record-cargo"
-        cargo = str(Path(self.env["CARGO_HOME"], "bin/cargo"))
+        cargo = str(self.cargo_bin / "cargo")
         wrapper.write_text(
             "#!/usr/bin/python3\nimport os,pathlib,sys\n"
             "deadline = os.environ.get('CAGENTS_BUILD_ADMISSION_DEADLINE')\n"
