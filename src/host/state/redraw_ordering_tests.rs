@@ -571,15 +571,26 @@ enum HiddenWhileStarting {
     ByAnotherClient,
 }
 
+/// Fills the worker's bounded command queue, as a worker busy with a flood of
+/// input would leave it.
+fn fill_commands(stream: &RenderStreamFixture) {
+    let refused = std::iter::repeat_with(|| stream.handle.scroll_to_bottom()).find_map(Result::err);
+    assert_eq!(refused, Some(TerminalSendError::Full));
+}
+
 /// A spawning client is attached hidden until its spawn is published. Its
 /// worker may be hidden meanwhile, so publishing it visible must reveal the
-/// worker, or it captures nothing more until the terminal exits.
+/// worker, or it captures nothing more until the terminal exits. The
+/// publication has committed by then, so the reveal must not be refusable by
+/// a full command queue either.
 #[test]
 fn publishing_a_spawn_reveals_a_worker_hidden_while_it_started() {
-    for (hidden_by, initially_visible) in [
-        (HiddenWhileStarting::ByWake, true),
-        (HiddenWhileStarting::ByAnotherClient, true),
-        (HiddenWhileStarting::ByWake, false),
+    for (hidden_by, initially_visible, queue_full) in [
+        (HiddenWhileStarting::ByWake, true, false),
+        (HiddenWhileStarting::ByAnotherClient, true, false),
+        (HiddenWhileStarting::ByWake, false, false),
+        (HiddenWhileStarting::ByWake, true, true),
+        (HiddenWhileStarting::ByAnotherClient, true, true),
     ] {
         let shared = host();
         let id = TerminalId::new();
@@ -626,6 +637,9 @@ fn publishing_a_spawn_reveals_a_worker_hidden_while_it_started() {
             }
         }
         assert_eq!(stream.drain_visibility(), Some(false), "{hidden_by:?}");
+        if queue_full {
+            fill_commands(&stream);
+        }
 
         let options = TerminalSpawnOptions {
             initially_visible,
@@ -635,9 +649,47 @@ fn publishing_a_spawn_reveals_a_worker_hidden_while_it_started() {
         assert_eq!(
             stream.drain_visibility(),
             initially_visible.then_some(true),
-            "{hidden_by:?}, initially visible: {initially_visible}"
+            "{hidden_by:?}, initially visible: {initially_visible}, queue full: {queue_full}"
         );
     }
+}
+
+/// Visibility requests are levels, not queued commands: a full command queue
+/// refuses none of them, and the newest replaces a redraw's Hide.
+#[test]
+fn a_full_command_queue_refuses_no_visibility_change() {
+    let fixture = Fixture::new();
+    let set = |visibility| {
+        fixture
+            .shared
+            .lock()
+            .unwrap()
+            .set_visibility(1, fixture.id, visibility)
+    };
+    set(TerminalVisibility::Hidden).unwrap();
+    // The worker published before it applied the hide; the redraw re-asks.
+    broadcast_redraw(
+        &Arc::downgrade(&fixture.shared),
+        fixture.id,
+        1,
+        &fixture.stream.handle,
+    );
+    assert_eq!(fixture.stream.pending_visibility(), Some(false));
+    fill_commands(&fixture.stream);
+    set(TerminalVisibility::Visible).unwrap();
+    assert_eq!(fixture.stream.drain_visibility(), Some(true));
+
+    fill_commands(&fixture.stream);
+    set(TerminalVisibility::Hibernated).unwrap();
+    assert_eq!(fixture.stream.drain_visibility(), Some(false));
+    fill_commands(&fixture.stream);
+    let mut state = fixture.shared.lock().unwrap();
+    state.register_client(2);
+    state.attach(2, fixture.id).unwrap();
+    assert_eq!(fixture.stream.drain_visibility(), Some(false), "attach");
+    fill_commands(&fixture.stream);
+    state.detach(2, fixture.id).unwrap();
+    assert_eq!(fixture.stream.drain_visibility(), Some(false), "detach");
 }
 
 /// The same property with real threads: two broadcasts race for every
