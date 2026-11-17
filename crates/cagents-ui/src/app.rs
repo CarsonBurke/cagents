@@ -1188,6 +1188,10 @@ enum Projection {
     Chrome,
     /// Stable shared presentation, including retained local scope members.
     ScopedChrome(Vec<CardId>),
+    /// Only a terminal's transcript probe changed, or its retry time came.
+    /// Nothing but the probe stage reads probes, and that stage starts the
+    /// probes now due.
+    TranscriptProbes,
     /// Anything else, including every user action.
     Full,
 }
@@ -1199,6 +1203,7 @@ impl Projection {
             Self::Unchanged => "Unchanged",
             Self::Chrome => "Chrome",
             Self::ScopedChrome(_) => "ScopedChrome",
+            Self::TranscriptProbes => "TranscriptProbes",
             Self::Full => "Full",
         }
     }
@@ -10892,6 +10897,16 @@ impl Cagents {
             .filter(|_| generation == self.navigation_save_generation)
     }
 
+    /// Whether the work every update does after its handler, committing
+    /// settings on blur and settling queued or pending closes, may change
+    /// what a projection reads. A handler's narrower projection describes
+    /// only what the handler changed.
+    fn update_tail_may_close_or_commit(&self) -> bool {
+        self.settings_blur_pending()
+            || !self.queued_card_closes.is_empty()
+            || self.workspace.pending_close().is_some()
+    }
+
     /// A navigation save timer with nothing left to save changes nothing a
     /// projection reads, so it skips the sidebar and chrome rebuild.
     fn navigation_save_is_stale(&self, message: &Message) -> bool {
@@ -16184,7 +16199,12 @@ impl Application for Cagents {
             Projection::Full
         };
         let task = match message {
-            Message::TerminalFailure(action) => self.update_terminal_failure(action),
+            Message::TerminalFailure(action) => {
+                if action.only_touches_probes() && !self.update_tail_may_close_or_commit() {
+                    projection = Projection::TranscriptProbes;
+                }
+                self.update_terminal_failure(action)
+            }
             Message::TerminalSave(action) => self.update_terminal_save(action),
             Message::SavedTerminal(action) => self.update_saved_terminal(action),
             Message::Device(action) => self.update_device(action),
@@ -18429,7 +18449,7 @@ impl Application for Cagents {
                         DeferredSave::Views => self.persist(),
                         DeferredSave::Snapshot => self.save_snapshot(),
                     }
-                    if before.unchanged(self) {
+                    if before.unchanged(self) && !self.update_tail_may_close_or_commit() {
                         projection = Projection::Unchanged;
                     }
                 }
@@ -19449,9 +19469,7 @@ impl Application for Cagents {
         // Scoped proof was established during dispatch. Settings commit and
         // close processing can invalidate it before chrome is projected.
         if matches!(projection, Projection::ScopedChrome(_))
-            && (self.settings_blur_pending()
-                || !self.queued_card_closes.is_empty()
-                || self.workspace.pending_close().is_some())
+            && self.update_tail_may_close_or_commit()
         {
             projection = Projection::Full;
         }
@@ -19526,6 +19544,10 @@ impl Application for Cagents {
                 };
                 Task::batch([chrome, notices, snapshot])
             }
+            Projection::TranscriptProbes => Task::batch([
+                self.reconcile_notice_popup(),
+                projection_stage!("transcript_probes", self.terminal_transcript_probes()),
+            ]),
             // Panning and resizing the workspace move no label, selected
             // worktree or repository binding. A frame can end an animation
             // that releases a pane, so its worktree protection is kept.

@@ -401,6 +401,7 @@ impl Cagents {
         repaint_tick(message)
             || background_poll(message)
             || matches!(message, Message::ChatUi(action) if action.local_scope().is_some())
+            || matches!(message, Message::TerminalFailure(action) if action.only_touches_probes())
             || matches!(
                 message,
                 Message::ReplicaCaptureDue(_)
