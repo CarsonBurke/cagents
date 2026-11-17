@@ -12,6 +12,8 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 import rehearse_update_retry as retry
+# Bounds only a hang; a passing run returns as soon as its process exits.
+HANG_GUARD = 60
 
 WORK = {'claude_chat_launches': 3, 'claude_user_prompts': 4, 'codex_chat_launches': 1,
         'codex_thread_starts': 1, 'codex_turn_starts': 1}
@@ -83,8 +85,8 @@ class RetryAdmission(unittest.TestCase):
                     'agents': {'agent': {'agent': {'id': 'agent', 'console': {'id': 'terminal',
                         'launch': {'program': program, 'arguments': ['agent', 'console', 'agent']}}},
                         'run': 'original-run', 'state': 'Running'}},
-                    'stores': {'sessions': {'rows': {'cards': [{'card_id': 'console', 'kind_tag': 'terminal',
-                        'existence': 'open'}], 'terminal_recipes': [{'card_id': 'console', 'terminal_id': 'terminal'}]}}}}
+                    'stores': {'sessions': {'rows': {'cards': [{'card_id': 'console', 'workspace_id': 'workspace',
+                        'ordinal': 0, 'kind_tag': 'terminal', 'existence': 'open'}], 'terminal_recipes': [{'card_id': 'console', 'terminal_id': 'terminal'}]}}}}
         def bind_receipt(source, target, transaction):
             census = {'version': 1, 'transaction': transaction, 'source': source['serving']}
             receipt = {'version': 1, 'transaction': transaction, 'census_digest': transaction,
@@ -265,10 +267,12 @@ class ReviewEvidence(unittest.TestCase):
             root = Path(temporary)
             (root / '.rehearse-update').write_text(str(root))
             (root / 'retry/first').mkdir(parents=True)
-            child = 'import time;print("Proceed? [Y/n] ",flush=True);time.sleep(60)'
+            # The child outlasts the hang guard, so the helper returning at all
+            # shows it ended the child instead of waiting for an answer.
+            child = f'import time;print("Proceed? [Y/n] ",flush=True);time.sleep({2 * HANG_GUARD})'
             result = subprocess.run([sys.executable, '-B', retry.pty.__file__, '--review-root', root,
                                      '--review-output', root / 'retry/first/previews', '--', sys.executable, '-c', child],
-                                    capture_output=True, text=True, timeout=8)
+                                    capture_output=True, text=True, timeout=HANG_GUARD)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('FileNotFoundError', result.stderr)
 

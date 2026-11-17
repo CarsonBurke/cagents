@@ -6899,7 +6899,7 @@ impl Cagents {
             Some(CardRuntime::Repository(runtime)) => runtime.navigation(),
             _ => None,
         };
-        self.duplicate_pane_with_navigation(source, owner, navigation)
+        self.duplicate_pane_with_navigation(source, owner, navigation, false)
     }
 
     fn duplicate_pane_in_scope(
@@ -6908,7 +6908,7 @@ impl Cagents {
         owner: Option<PathBuf>,
     ) -> Task<Message> {
         // Reopening a saved pane has no live clone navigation to inherit.
-        self.duplicate_pane_with_navigation(source, owner, None)
+        self.duplicate_pane_with_navigation(source, owner, None, true)
     }
 
     fn duplicate_pane_with_navigation(
@@ -6916,6 +6916,7 @@ impl Cagents {
         source: CardState,
         owner: Option<PathBuf>,
         navigation: Option<crate::model::RepositoryNavigation>,
+        reopening: bool,
     ) -> Task<Message> {
         #[cfg(not(feature = "integrated-browser"))]
         if let CardKind::Browser(session) = &source.kind {
@@ -7026,6 +7027,12 @@ impl Cagents {
         }
         self.register_channel_card(id);
         self.register_presence(id, Exposure::Visible, residency);
+        // A reopened chat takes back what it had not sent when it closed; a
+        // clone of an open one starts with an empty composer.
+        if reopening && matches!(card.kind, CardKind::Chat(_)) && self.reclaim_kept_draft(source_id)
+        {
+            self.move_chat_draft(source_id, id);
+        }
         let start = match card.kind {
             CardKind::Terminal(session) => {
                 self.cards.insert(id, CardRuntime::Loading);

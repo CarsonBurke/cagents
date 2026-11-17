@@ -12,6 +12,8 @@ import unittest
 from unittest.mock import patch
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/gh-coordinate.py"
+# Bounds only a hang; a passing wait returns as soon as its process does.
+HANG_GUARD = 60
 SPEC = importlib.util.spec_from_file_location("gh_coordinate", SCRIPT)
 coordinate = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(coordinate)
@@ -20,7 +22,10 @@ import json, os, sys, time
 from pathlib import Path
 started = time.monotonic()
 body = sys.stdin.buffer.read()
-entry = {"started": started, "argv": sys.argv[1:], "stdin": body.hex()}
+# The admission record this run inherited; its lease keeps others from rewriting it.
+records = list(Path(".git/cagents-gh-content").glob("*.lock"))
+admitted = json.loads(records[0].read_text())["started"] if len(records) == 1 else None
+entry = {"started": started, "admitted": admitted, "argv": sys.argv[1:], "stdin": body.hex()}
 fd = os.open(os.environ["FIXTURE_LOG"], os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
 os.write(fd, json.dumps(entry).encode() + b"\n")
 os.close(fd)
@@ -60,10 +65,10 @@ class CoordinationTests(unittest.TestCase):
             if process.poll() is None:
                 process.terminate()
                 try:
-                    process.wait(timeout=3)
+                    process.wait(timeout=HANG_GUARD)
                 except subprocess.TimeoutExpired:
                     process.kill()
-                    process.wait(timeout=3)
+                    process.wait(timeout=HANG_GUARD)
             for stream in (process.stdin, process.stdout, process.stderr):
                 if stream:
                     stream.close()
@@ -71,12 +76,12 @@ class CoordinationTests(unittest.TestCase):
 
     def git(self, *args):
         return subprocess.run(["git", *args], cwd=self.repo, env=self.environment,
-                              capture_output=True, check=True, timeout=5)
+                              capture_output=True, check=True, timeout=HANG_GUARD)
 
     def command(self, args, wait=30, real=None):
         return [str(SCRIPT), "--real", str(real or self.real), "--wait", str(wait), "--", *args]
 
-    def run_helper(self, args, wait=30, body=b"", cwd=None, extra=None, timeout=3, real=None):
+    def run_helper(self, args, wait=30, body=b"", cwd=None, extra=None, timeout=HANG_GUARD, real=None):
         return subprocess.run(self.command(args, wait, real), cwd=cwd or self.repo,
                               env=dict(self.environment, **(extra or {})), input=body,
                               capture_output=True, timeout=timeout)
@@ -92,7 +97,7 @@ class CoordinationTests(unittest.TestCase):
         return [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
 
     def wait_for_calls(self, count):
-        deadline = time.monotonic() + 3
+        deadline = time.monotonic() + HANG_GUARD
         while len(self.calls()) < count and time.monotonic() < deadline:
             time.sleep(0.01)
         self.assertGreaterEqual(len(self.calls()), count, "fake gh did not start")
@@ -136,18 +141,18 @@ class CoordinationTests(unittest.TestCase):
         ]
         for args in commands:
             with self.subTest(args=args):
-                started = time.monotonic()
                 result = self.run_helper(args, cwd=self.root, body=b'{"query":"mutation Unclassified{x}"}',
                                          extra={"PATH": str(fakebin)})
+                # A read that waited behind the held writer would announce
+                # the wait on stderr and, after --wait 30, be deferred.
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stderr, b"err\n")
-                self.assertLess(time.monotonic() - started, 1)
                 self.assertEqual(self.calls()[-1]["argv"], args)
         self.assertFalse(marker.exists())
         self.assertEqual(cooldown.stat().st_mtime_ns, before)
         self.assertIsNone(writer.poll(), "a read disturbed the still-running writer")
         release.touch()
-        writer.communicate(timeout=3)
+        writer.communicate(timeout=HANG_GUARD)
 
     def test_busy_write_is_bounded_and_never_executes_real_gh(self):
         writer, release = self.held_writer()
@@ -157,37 +162,42 @@ class CoordinationTests(unittest.TestCase):
         record.write_text(json.dumps({"boot": "an-expired-boot", "started": 0}))
         for wait in (0, 0.15):
             with self.subTest(wait=wait):
-                started = time.monotonic()
+                # The writer is held until released, so returning at all shows
+                # the budget ended the wait; the budget's length is pinned by
+                # test_wait_budget_bounds_a_blocked_admission, and its wiring
+                # from --wait by test_wait_option_reaches_admission.
                 result = self.run_helper(["pr", "comment", "2", "-R", "owner/repo"], wait=wait)
                 self.assert_deferred(result)
-                self.assertEqual(result.stderr.count(b"waiting for content admission"), int(wait > 0))
-                self.assertLess(time.monotonic() - started, wait + 0.7)
+                # The budget starts before Git is located, so a slow start can
+                # spend a short one before the notice; a notice states it.
+                notices = result.stderr.count(b"waiting for content admission")
+                self.assertLessEqual(notices, int(wait > 0))
+                if notices:
+                    self.assertIn(f"(at most {wait:g}s total)".encode(), result.stderr)
                 self.assertEqual(len(self.calls()), 1)
         release.touch()
-        writer.communicate(timeout=3)
+        writer.communicate(timeout=HANG_GUARD)
 
     def test_nonblocking_environment_overrides_wait_without_notice_or_execution(self):
         writer, release = self.held_writer()
-        started = time.monotonic()
+        # Waiting the 30 s budget would announce itself; no notice means no wait.
         result = self.run_helper(["pr", "comment", "2", "-R", "owner/repo"], wait=30,
                                  extra={"CAGENTS_GH_NONBLOCKING": "1"})
         self.assert_deferred(result)
         self.assertTrue(result.stderr.startswith(b"cagents-gh: deferred "))
         self.assertNotIn(b"waiting for content admission", result.stderr)
-        self.assertLess(time.monotonic() - started, 0.7)
         self.assertEqual(len(self.calls()), 1)
         self.assertIsNone(writer.poll())
         release.touch()
-        writer.communicate(timeout=3)
+        writer.communicate(timeout=HANG_GUARD)
 
     def test_started_write_has_no_wait_budget_timeout_and_other_repositories_do_not_wait(self):
         writer, release = self.held_writer()  # --wait 0 affects admission only.
         time.sleep(0.15)
         self.assertIsNone(writer.poll())
-        started = time.monotonic()
+        # With --wait 0, sharing the held writer's lock would be deferred.
         result = self.run_helper(["issue", "create", "-R", "owner/other", "--title", "fixture"], wait=0)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertLess(time.monotonic() - started, 1)
         self.assertEqual(len(self.calls()), 2)
         result = self.run_helper(["pr", "comment", "1", "-R", "ghe.example/owner/repo"], wait=0)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -198,7 +208,7 @@ class CoordinationTests(unittest.TestCase):
                                  wait=0, cwd=other_git)
         self.assertEqual(result.returncode, 0, result.stderr)
         release.touch()
-        writer.communicate(timeout=3)
+        writer.communicate(timeout=HANG_GUARD)
 
     def test_worktrees_share_the_same_target_lock(self):
         self.git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
@@ -213,20 +223,22 @@ class CoordinationTests(unittest.TestCase):
         self.assert_deferred(result)
         self.assertEqual(len(self.calls()), 1)
         release.touch()
-        writer.communicate(timeout=3)
+        writer.communicate(timeout=HANG_GUARD)
 
     def test_simultaneous_writes_are_serial_and_spaced_eight_seconds(self):
         first = self.start(["pr", "comment", "1", "-R", "owner/repo"], extra={"FIXTURE_HOLD": "0.3"})
         second = self.start(["issue", "comment", "2", "-R", "owner/repo"])
-        outputs = [first.communicate(timeout=12), second.communicate(timeout=12)]
+        outputs = [first.communicate(timeout=HANG_GUARD), second.communicate(timeout=HANG_GUARD)]
         notices = b"".join(output[1] for output in outputs)
         self.assertEqual(notices.count(b"waiting for content admission"), 1)
         self.assertIn(b"at most 30s total", notices)
         self.assertEqual(first.returncode, 0)
         self.assertEqual(second.returncode, 0)
-        calls = sorted(self.calls(), key=lambda call: call["started"])
+        # Measure the spacing between the admissions themselves, which a
+        # slowly starting gh cannot shorten.
+        calls = sorted(self.calls(), key=lambda call: call["admitted"])
         self.assertEqual(len(calls), 2)
-        self.assertGreaterEqual(calls[1]["started"] - calls[0]["started"], 7.9)
+        self.assertGreaterEqual(calls[1]["admitted"] - calls[0]["admitted"], coordinate.WRITE_INTERVAL)
 
     def test_diagnostic_failure_does_not_change_admission(self):
         with patch.object(coordinate, "git_common_dir", return_value=self.repo / ".git"), \
@@ -244,6 +256,50 @@ class CoordinationTests(unittest.TestCase):
             finally:
                 if lease is not None:
                     os.close(lease)
+
+    def test_wait_budget_bounds_a_blocked_admission(self):
+        target = ("github.com", "owner", "repo")
+        clock = [100.0]
+        sleeps = []
+
+        def sleep(seconds):
+            # A regression that ignored the budget must fail, not spin forever.
+            sleeps.append(seconds)
+            self.assertLess(len(sleeps), 1000, "admission kept sleeping past its budget")
+            clock[0] += seconds
+            self.assertLessEqual(clock[0], 100.0 + 0.15 + 1, "admission slept past its budget")
+
+        with patch.object(coordinate, "git_common_dir", return_value=self.repo / ".git"), \
+                patch.object(coordinate.time, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(coordinate.time, "sleep", side_effect=sleep), \
+                patch.object(coordinate, "waiting_notice") as notice:
+            holder = coordinate.admit(target, 0)
+            try:
+                for wait in (0, 0.15):
+                    with self.subTest(wait=wait):
+                        started = clock[0]
+                        with self.assertRaises(coordinate.Deferred):
+                            coordinate.admit(target, wait)
+                        self.assertGreaterEqual(clock[0] - started, wait)
+                        self.assertLessEqual(clock[0] - started, wait + 1e-9)
+                self.assertEqual(notice.call_count, 1)
+            finally:
+                os.close(holder)
+
+    def test_wait_option_reaches_admission(self):
+        for nonblocking, expected in ((None, 0.15), ("1", 0)):
+            with self.subTest(nonblocking=nonblocking):
+                environment = {key: value for key, value in os.environ.items() if key != "CAGENTS_GH_NONBLOCKING"}
+                if nonblocking:
+                    environment["CAGENTS_GH_NONBLOCKING"] = nonblocking
+                argv = [str(SCRIPT), "--real", str(self.real), "--wait", "0.15", "--",
+                        "pr", "comment", "2", "-R", "owner/repo"]
+                with patch.dict(os.environ, environment, clear=True), patch.object(coordinate.sys, "argv", argv), \
+                        patch.object(coordinate, "admit", side_effect=coordinate.Deferred("held")) as admit, \
+                        patch.object(coordinate, "diagnostic"):
+                    self.assertEqual(coordinate.main(), 75)
+                admit.assert_called_once_with(("github.com", "owner", "repo"), expected)
+                self.assertFalse(self.calls())
 
     def test_full_stderr_pipe_cannot_block_the_notice_or_change_inherited_flags(self):
         read_fd, write_fd = os.pipe()
@@ -263,7 +319,7 @@ class CoordinationTests(unittest.TestCase):
                 "m.waiting_notice(30); print('returned')"
             )
             result = subprocess.run(["/usr/bin/python3", "-I", "-B", "-c", program, str(SCRIPT)],
-                                    stdout=subprocess.PIPE, stderr=write_fd, timeout=2)
+                                    stdout=subprocess.PIPE, stderr=write_fd, timeout=HANG_GUARD)
             self.assertEqual((result.returncode, result.stdout), (0, b"returned\n"))
             self.assertEqual(fcntl.fcntl(write_fd, fcntl.F_GETFL), flags)
         finally:
@@ -282,15 +338,14 @@ class CoordinationTests(unittest.TestCase):
                 except BlockingIOError:
                     break
             fcntl.fcntl(write_fd, fcntl.F_SETFL, flags)
-            started = time.monotonic()
             result = subprocess.run(
                 self.command(["pr", "comment", "2", "-R", "owner/repo"], wait=0),
                 cwd=self.repo, env=self.environment, stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE, stderr=write_fd, timeout=2,
+                stdout=subprocess.PIPE, stderr=write_fd, timeout=HANG_GUARD,
             )
-            # Do not drain stderr: refusal must finish with that pipe still full.
+            # Do not drain stderr: refusal must finish with that pipe still
+            # full. Nothing drains it, so a blocked write would never return.
             self.assertEqual((result.returncode, result.stdout), (75, b""))
-            self.assertLess(time.monotonic() - started, 0.7)
             self.assertEqual(len(self.calls()), 1)
             self.assertEqual(fcntl.fcntl(write_fd, fcntl.F_GETFL), flags)
             self.assertIsNone(writer.poll())
@@ -298,7 +353,7 @@ class CoordinationTests(unittest.TestCase):
             os.close(read_fd)
             os.close(write_fd)
             release.touch()
-            writer.communicate(timeout=3)
+            writer.communicate(timeout=HANG_GUARD)
 
     def test_stdio_exit_status_and_arguments_are_unchanged(self):
         args = ["pr", "review", "https://github.com/Owner/Repo/pull/42", "--repo", "owner/repo",

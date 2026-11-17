@@ -14,6 +14,21 @@ import unittest
 
 SOURCE = Path(__file__).resolve().parents[1] / "scripts/run-development"
 GATE = SOURCE.with_name("cargo-gate")
+# Bounds only a hang. Every call and wait it guards returns as soon as the runner
+# finishes or its event happens, so a slow but healthy host never reaches it.
+HANG_GUARD = 60
+# A fake build no passing test waits out: a launch that returns within the guard
+# while one runs has ended it.
+OUTLASTING_BUILD = str(2 * HANG_GUARD)
+
+
+def wait_until(predicate, message):
+    """Polls PREDICATE until it holds, failing with MESSAGE after HANG_GUARD."""
+    deadline = time.monotonic() + HANG_GUARD
+    while not predicate():
+        if time.monotonic() >= deadline:
+            raise AssertionError(message)
+        time.sleep(0.02)
 
 
 class ZigDiscovery(unittest.TestCase):
@@ -86,7 +101,7 @@ exit 83
         environment.update(changes)
         result = subprocess.run(
             [str(self.runner), "--browserless"], cwd=self.root,
-            env=environment, capture_output=True, text=True, timeout=3,
+            env=environment, capture_output=True, text=True, timeout=HANG_GUARD,
         )
         calls = self.cargo_calls.read_text().splitlines() if self.cargo_calls.exists() else []
         self.assertFalse(self.shim_calls.exists(), "mise shim was executed")
@@ -101,7 +116,7 @@ exit 83
                     env=(self.env if not flags else self.env | {
                         "XDG_RUNTIME_DIR": str(self.root / "nh-evidence"),
                         "DISPLAY": "", "NIRI_SOCKET": "private-niri.sock",
-                    }), capture_output=True, text=True, timeout=3,
+                    }), capture_output=True, text=True, timeout=HANG_GUARD,
                 )
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertFalse(self.cargo_calls.exists())
@@ -237,6 +252,12 @@ case $1 in
     build)
         printf '%s\\n' "$*" >> "$CARGO_CALLS"
         sleep "${FAKE_BUILD_SECONDS:-0}"
+        # Until the test releases it, bounded so a failing test leaks nothing.
+        waited=0
+        while [ -n "${FAKE_BUILD_RELEASE:-}" ] && [ ! -e "$FAKE_BUILD_RELEASE" ] &&
+            [ "$waited" -lt "$FAKE_BUILD_BOUND" ]; do
+            sleep 0.05; waited=$((waited + 1))
+        done
         for argument do binary=$argument; done
         if [ "$binary" = "${FAKE_FAIL_BINARY:-}" ]; then exit 101; fi
         mkdir -p "$FAKE_TARGET/dev-runtime" "$FAKE_BUILD/dev-runtime/build/script-1" \\
@@ -271,8 +292,9 @@ exit 83
             FAKE_SOURCE=str(self.source), FAKE_VENDORED=str(self.vendored),
             FAKE_GIT_INDEX=str(self.git_index),
             FAKE_WATCHED_DIRECTORY=str(self.root / "shared/assets"),
+            FAKE_BUILD_BOUND=str(2 * HANG_GUARD * 20),
         )
-        for name in ("FAKE_WATCHED", "FAKE_COMPILED", "FAKE_BUILD_SECONDS"):
+        for name in ("FAKE_WATCHED", "FAKE_COMPILED", "FAKE_BUILD_SECONDS", "FAKE_BUILD_RELEASE"):
             self.env.pop(name, None)
 
     def launch(self, *arguments, **changes):
@@ -280,7 +302,7 @@ exit 83
         environment.update(changes)
         result = subprocess.run(
             [str(self.runner), *arguments], cwd=self.root,
-            env=environment, capture_output=True, text=True, timeout=10,
+            env=environment, capture_output=True, text=True, timeout=HANG_GUARD,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.cargo_calls.read_text().splitlines() if self.cargo_calls.exists() else []
@@ -305,7 +327,7 @@ exit 83
         environment = self.env | {"CAGENTS_EVIDENCE_NATIVE_LOCK": str(lock)} | changes
         return subprocess.run(
             [*holder, str(lock), str(self.runner), "--browserless"], cwd=self.root,
-            env=environment, capture_output=True, text=True, timeout=10,
+            env=environment, capture_output=True, text=True, timeout=HANG_GUARD,
         )
 
     def fake_cargo_reports_its_guard(self):
@@ -381,7 +403,7 @@ exit 83
         result = subprocess.run(
             ["flock", "--close", str(lock), "sh", "-c", f'"{self.runner}" --browserless; exit $?'],
             cwd=self.root, env=self.env | {"CAGENTS_EVIDENCE_NATIVE_LOCK": str(lock)},
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=HANG_GUARD,
         )
         self.assert_compiling_is_forbidden(result, guard_calls)
 
@@ -394,7 +416,7 @@ exit 83
         result = subprocess.run(
             ["flock", "--close", str(slot), "sh", "-c", f'"{self.runner}" --browserless; exit $?'],
             cwd=self.root, env=self.env | {"CAGENTS_EVIDENCE_NATIVE_LOCK": str(lock)},
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=HANG_GUARD,
         )
         self.assert_compiling_is_forbidden(result, guard_calls)
 
@@ -407,20 +429,18 @@ exit 83
         result = subprocess.run(
             ["flock", "--close", str(lock), str(self.runner), "--browserless"],
             cwd=self.root, env=self.env | {"CAGENTS_EVIDENCE_NATIVE_LOCK": str(link)},
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=HANG_GUARD,
         )
         self.assert_compiling_is_forbidden(result, guard_calls)
 
     def holding_the_lock_elsewhere(self):
         lock = self.root / "native-lock"
         lock.touch()
-        holder = subprocess.Popen(["flock", "--close", str(lock), "sleep", "30"], start_new_session=True)
+        holder = subprocess.Popen(["flock", "--close", str(lock), "sleep", "infinity"], start_new_session=True)
         self.addCleanup(holder.wait)
         self.addCleanup(os.killpg, holder.pid, signal.SIGKILL)
-        deadline = time.monotonic() + 5
-        while subprocess.run(["flock", "-n", str(lock), "true"]).returncode == 0:
-            self.assertLess(time.monotonic(), deadline)
-            time.sleep(0.01)
+        wait_until(lambda: subprocess.run(["flock", "-n", str(lock), "true"]).returncode != 0,
+                   "the holder never took the lock")
         return lock
 
     def compositor(self, name="niri", **environment):
@@ -430,7 +450,7 @@ exit 83
         shutil.copy(shutil.which("sleep"), executable)
         without_display = {key: value for key, value in self.env.items()
                            if key not in ("WAYLAND_DISPLAY", "DISPLAY")}
-        process = subprocess.Popen([str(executable), "30"], env=without_display | environment)
+        process = subprocess.Popen([str(executable), "infinity"], env=without_display | environment)
         self.addCleanup(process.wait)
         self.addCleanup(process.kill)
         return f"/run/user/1000/niri.wayland-2.{process.pid}.sock"
@@ -451,7 +471,7 @@ exit 83
                 environment = self.env | {"CAGENTS_EVIDENCE_NATIVE_LOCK": str(lock)} | changes
                 result = subprocess.run(
                     [str(self.runner), "--browserless"], cwd=self.root, env=environment,
-                    capture_output=True, text=True, timeout=10,
+                    capture_output=True, text=True, timeout=HANG_GUARD,
                 )
                 self.assert_compiling_is_forbidden(result, guard_calls)
                 guard_calls.unlink()
@@ -516,14 +536,16 @@ exit 83
         self.assert_skipped("--browserless")
 
     def test_a_guarded_build_that_outlasts_its_bound_gives_up_with_everything_it_started(self):
-        started = time.monotonic()
+        # capture_output returns only once nothing below the launch keeps its
+        # pipes open, and the build outlasts the hang guard: returning at all
+        # shows the bound ended all of it.
         result = self.under_native_lock(
-            "flock", "--close", FAKE_BUILD_SECONDS="30", CAGENTS_NATIVE_LOCK_BUILD_SECONDS="1",
+            "flock", "--close", FAKE_BUILD_SECONDS=OUTLASTING_BUILD, CAGENTS_NATIVE_LOCK_BUILD_SECONDS="1",
         )
-        # capture_output returns only once nothing below the launch keeps its pipes open.
-        self.assertLess(time.monotonic() - started, 8)
         self.assertEqual(result.returncode, 124, result.stderr)
         self.assertIn("refusing to keep waiting while holding the native lock", result.stderr)
+        # The configured bound, not some other, ended it.
+        self.assertIn("took over 1 seconds", result.stderr)
 
     def test_ending_a_guarded_launch_ends_its_build_and_frees_a_plain_flocks_lock(self):
         lock = self.root / "native-lock"
@@ -537,52 +559,47 @@ exit 83
             with self.subTest(signal=name):
                 holder = subprocess.Popen(
                     ["flock", str(lock), str(self.runner), "--browserless"], cwd=self.root,
-                    env=self.env | {"CAGENTS_EVIDENCE_NATIVE_LOCK": str(lock), "FAKE_BUILD_SECONDS": "60"},
+                    env=self.env | {"CAGENTS_EVIDENCE_NATIVE_LOCK": str(lock), "FAKE_BUILD_SECONDS": OUTLASTING_BUILD},
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
                 )
                 self.addCleanup(holder.wait)
-                self.addCleanup(lambda process=holder: process.poll() is None and process.kill())
-                deadline = time.monotonic() + 8
-                while not self.cargo_calls.exists():
-                    self.assertLess(time.monotonic(), deadline, "the build never started")
-                    time.sleep(0.02)
+                # The whole session: a runner orphaned by a failing test, and its build.
+                self.addCleanup(os.killpg, holder.pid, signal.SIGKILL)
+                wait_until(self.cargo_calls.exists, "the build never started")
                 runner = int(subprocess.run(
                     ["pgrep", "-P", str(holder.pid)], capture_output=True, text=True,
                 ).stdout.split()[0])
                 deliver(holder.pid, runner)
-                deadline = time.monotonic() + 5
-                while subprocess.run(["flock", "-n", str(lock), "true"]).returncode != 0:
-                    self.assertLess(time.monotonic(), deadline, "the build kept the native lock")
-                    time.sleep(0.05)
+                wait_until(lambda: subprocess.run(["flock", "-n", str(lock), "true"]).returncode == 0,
+                           "the build kept the native lock")
                 self.cargo_calls.unlink()
 
     def test_a_launch_that_ends_before_its_build_can_follow_it_starts_no_build(self):
         arming = self.root / "arming"
         real = shutil.which("setpriv")
         slow = self.root / "bin/setpriv"
-        slow.write_text(f'#!/bin/sh\n: >"{arming}"\nsleep 1\nexec "{real}" "$@"\n')
+        # It goes on only once the launch that started it has ended, however
+        # slowly the test gets to end it; bounded, so a failing test leaks nothing.
+        slow.write_text(f'#!/bin/sh\nlaunch=$PPID\n: >"{arming}"\nwaited=0\n'
+                        f'while kill -0 "$launch" 2>/dev/null && [ "$waited" -lt {HANG_GUARD * 10} ]; do\n'
+                        f'    sleep 0.1; waited=$((waited + 1))\ndone\nexec "{real}" "$@"\n')
         slow.chmod(0o755)
         lock = self.root / "native-lock"
         lock.touch()
         holder = subprocess.Popen(
             ["flock", str(lock), str(self.runner), "--browserless"], cwd=self.root,
-            env=self.env | {"CAGENTS_EVIDENCE_NATIVE_LOCK": str(lock), "FAKE_BUILD_SECONDS": "60"},
+            env=self.env | {"CAGENTS_EVIDENCE_NATIVE_LOCK": str(lock), "FAKE_BUILD_SECONDS": OUTLASTING_BUILD},
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
         )
         self.addCleanup(holder.wait)
-        self.addCleanup(lambda: holder.poll() is None and holder.kill())
-        deadline = time.monotonic() + 8
-        while not arming.exists():
-            self.assertLess(time.monotonic(), deadline, "the build never began")
-            time.sleep(0.01)
+        self.addCleanup(os.killpg, holder.pid, signal.SIGKILL)
+        wait_until(arming.exists, "the build never began")
         runner = int(subprocess.run(
             ["pgrep", "-P", str(holder.pid)], capture_output=True, text=True,
         ).stdout.split()[0])
         os.kill(runner, signal.SIGKILL)
-        deadline = time.monotonic() + 5
-        while subprocess.run(["flock", "-n", str(lock), "true"]).returncode != 0:
-            self.assertLess(time.monotonic(), deadline, "the build kept the native lock")
-            time.sleep(0.05)
+        wait_until(lambda: subprocess.run(["flock", "-n", str(lock), "true"]).returncode == 0,
+                   "the build kept the native lock")
         self.assertFalse(self.cargo_calls.exists())
 
     def test_a_bound_that_is_not_a_positive_number_refuses_to_build(self):
@@ -623,7 +640,7 @@ exit 83
         result = subprocess.run(
             ["flock", "--close", str(lock), str(self.runner), "--hot"], cwd=self.root,
             env=self.env | {"CAGENTS_EVIDENCE_NATIVE_LOCK": str(lock)},
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=HANG_GUARD,
         )
         self.assertEqual(result.returncode, 78, result.stderr)
         self.assertIn("hot reload always builds", result.stderr)
@@ -670,7 +687,7 @@ exit 83
         caller.mkdir()
         result = subprocess.run(
             [str(self.runner), "--browserless", "--instance", "logged", "--daemon-log", "daemon.log"],
-            cwd=caller, env=self.env, capture_output=True, text=True, timeout=10,
+            cwd=caller, env=self.env, capture_output=True, text=True, timeout=HANG_GUARD,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(started.read_text(), f"{caller / 'daemon.log'}|1\n")
@@ -805,29 +822,39 @@ exit 83
         launch that started later."""
         self.assert_built("--browserless")
         self.source.write_text("fn main() { first }\n")
-        slow = dict(self.env, FAKE_BUILD_SECONDS="1")
+        # Each build waits for its release, so the edit lands during the first
+        # and the second has recorded nothing when the third decides.
+        first_release, second_release = self.root / "release-first", self.root / "release-second"
+        self.addCleanup(second_release.touch)
+        self.addCleanup(first_release.touch)
         first = subprocess.Popen(
-            [str(self.runner), "--browserless"], cwd=self.root, env=slow,
+            [str(self.runner), "--browserless"], cwd=self.root,
+            env=self.env | {"FAKE_BUILD_RELEASE": str(first_release)},
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
         )
-        deadline = time.monotonic() + 5
-        while not self.cargo_calls.exists():
-            self.assertLess(time.monotonic(), deadline, "the first launch never built")
-            time.sleep(0.02)
+        wait_until(self.cargo_calls.exists, "the first launch never built")
         self.source.write_text("fn main() { edited }\n")
         second = subprocess.Popen(
-            [str(self.runner), "--browserless"], cwd=self.root, env=slow,
+            [str(self.runner), "--browserless"], cwd=self.root,
+            env=self.env | {"FAKE_BUILD_RELEASE": str(second_release)},
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
         )
-        self.assertEqual(first.wait(timeout=10), 0, first.stderr.read())
-        third = subprocess.run(
+        first_release.touch()
+        self.assertEqual(first.wait(timeout=HANG_GUARD), 0, first.stderr.read())
+        third = subprocess.Popen(
             [str(self.runner), "--browserless"], cwd=self.root, env=self.env,
-            capture_output=True, text=True, timeout=15,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
         )
-        self.assertEqual(third.returncode, 0, third.stderr)
-        self.assertNotIn("skipping the build", third.stderr,
+        # The third queues behind the held second build once it has decided to
+        # build: its start stamp beside the second's. Skipping would end it.
+        started = lambda: len(list((self.target / "dev-runtime").glob(".run-development-started.??????")))
+        wait_until(lambda: started() == 2 or third.poll() is not None, "the third launch never decided")
+        second_release.touch()
+        _, third_stderr = third.communicate(timeout=HANG_GUARD)
+        self.assertEqual(third.returncode, 0, third_stderr)
+        self.assertNotIn("skipping the build", third_stderr,
                          "a launch skipped the build after an edit made during one")
-        self.assertEqual(second.wait(timeout=15), 0, second.stderr.read())
+        self.assertEqual(second.wait(timeout=HANG_GUARD), 0, second.stderr.read())
         self.cargo_calls.unlink()
         self.assert_skipped("--browserless")
 
@@ -837,7 +864,7 @@ exit 83
         result = subprocess.run(
             [str(self.runner), "--browserless"], cwd=self.root,
             env=dict(self.env, FAKE_FAIL_BINARY="cagents-ui"),
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=HANG_GUARD,
         )
         self.assertEqual(result.returncode, 101, result.stderr)
         self.cargo_calls.unlink()
@@ -861,7 +888,6 @@ exit 83
         lock = runtime / "cagents-development-fx1/cagentsd.lock"
         lock.parent.mkdir()
         # Like a daemon, it keeps its instance's lock open until fixture cleanup.
-        # Listing repeatedly may take longer than a short sleep under host load.
         process = subprocess.Popen(
             ["/bin/sh", "-c", 'exec 9>>"$1" && exec "$2" infinity', "sh", str(lock), str(daemon)],
             env={"XDG_RUNTIME_DIR": str(runtime), "CAGENTS_DEVELOPMENT_INSTANCE": "fx1"})
@@ -871,17 +897,15 @@ exit 83
         def listing():
             result = subprocess.run(
                 [str(self.runner), "--list-instances"], cwd=self.root,
-                env=self.env, capture_output=True, text=True, timeout=10)
+                env=self.env, capture_output=True, text=True, timeout=HANG_GUARD)
             self.assertEqual(result.returncode, 0, result.stderr)
             lines = result.stdout.splitlines()
             index = lines.index(next(line for line in lines if f"pid {process.pid}," in line))
             return lines[index:index + 6]
 
-        deadline = time.monotonic() + 5
-        while not any(os.readlink(f"/proc/{process.pid}/fd/{fd}") == str(lock)
-                      for fd in os.listdir(f"/proc/{process.pid}/fd")):
-            self.assertLess(time.monotonic(), deadline, "fixture daemon never opened its lock")
-            time.sleep(0.01)
+        wait_until(lambda: any(os.readlink(f"/proc/{process.pid}/fd/{fd}") == str(lock)
+                               for fd in os.listdir(f"/proc/{process.pid}/fd")),
+                   "fixture daemon never opened its lock")
         block = listing()
         self.assertEqual(
             block[4],
@@ -947,7 +971,7 @@ exit 83
             command = [str(daemon), "-c", '"$@"; exit $?', "sh", "env", *inner_environment, *command]
         return subprocess.run(
             command,
-            cwd=self.root, env=environment, capture_output=True, text=True, timeout=10)
+            cwd=self.root, env=environment, capture_output=True, text=True, timeout=HANG_GUARD)
 
     def fake_harness_session(self):
         """A harness whose instance session is live, with its runtime directory."""
@@ -1010,7 +1034,7 @@ exit 1
         hosted = subprocess.run(
             [str(self.runner), "--stop-instance", "hx"], cwd=self.root,
             env=self.env | {"CAGENTS_AGENT_AUTHORITY": "inert-fixture-role"},
-            capture_output=True, text=True, timeout=10)
+            capture_output=True, text=True, timeout=HANG_GUARD)
         self.assertEqual(hosted.returncode, 1, hosted.stderr)
         self.assertIn("cannot tell", hosted.stderr)
         # A person's own terminal has no daemon above it either.
@@ -1018,7 +1042,7 @@ exit 1
         environment.pop("CAGENTS_AGENT_AUTHORITY", None)
         own = subprocess.run(
             [str(self.runner), "--stop-instance", "hx"], cwd=self.root,
-            env=environment, capture_output=True, text=True, timeout=10)
+            env=environment, capture_output=True, text=True, timeout=HANG_GUARD)
         self.assertEqual(own.returncode, 0, own.stderr)
 
     def test_the_app_keeps_the_daemons_hosting_its_starter(self):
@@ -1072,7 +1096,7 @@ exit 1
                 result = subprocess.run(
                     [str(self.runner), "--browserless"], cwd=self.root,
                     env={**self.env, **guarded, **changes},
-                    capture_output=True, text=True, timeout=10,
+                    capture_output=True, text=True, timeout=HANG_GUARD,
                 )
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertIn("not a niri-harness session", result.stderr)
@@ -1080,18 +1104,20 @@ exit 1
         self.assert_built("--browserless", **guarded)
 
     def test_a_terminated_launch_leaves_no_stamps(self):
+        # The build waits for its release, so the signal always arrives during it.
+        release = self.root / "release-build"
+        self.addCleanup(release.touch)
         launch = subprocess.Popen(
             [str(self.runner), "--browserless"], cwd=self.root,
-            env=dict(self.env, FAKE_BUILD_SECONDS="1"),
+            env=dict(self.env, FAKE_BUILD_RELEASE=str(release)),
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        deadline = time.monotonic() + 5
-        while not self.cargo_calls.exists():
-            self.assertLess(time.monotonic(), deadline, "the launch never built")
-            time.sleep(0.02)
+        wait_until(self.cargo_calls.exists, "the launch never built")
         # The runner alone, as a supervisor stopping it would.
         launch.send_signal(signal.SIGTERM)
-        self.assertEqual(launch.wait(timeout=10), 143)
+        # Its trap runs once the foreground build returns.
+        release.touch()
+        self.assertEqual(launch.wait(timeout=HANG_GUARD), 143)
         leftovers = [path.name for path in (self.target / "dev-runtime").iterdir()
                      if path.name.startswith((".run-development-started", ".run-development-record"))]
         self.assertEqual(leftovers, [])
@@ -1119,15 +1145,6 @@ exit 1
 
 def process_start(pid):
     return Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[19]
-
-
-def wait_for(predicate, timeout=10.0):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return True
-        time.sleep(0.05)
-    return predicate()
 
 
 class InstanceLifetime(unittest.TestCase):
@@ -1201,7 +1218,7 @@ exit 1
         if record is not None:
             (runtime / "cagents-run-development.owner").write_text(
                 "".join(f"{key}={value}\n" for key, value in record.items()))
-        process = subprocess.Popen(["sleep", "60"], env={"XDG_RUNTIME_DIR": str(runtime),
+        process = subprocess.Popen(["sleep", "infinity"], env={"XDG_RUNTIME_DIR": str(runtime),
                                                           "PATH": "/usr/bin:/bin"})
         self.addCleanup(lambda: (process.kill(), process.wait()))
         return runtime, process
@@ -1217,15 +1234,12 @@ exit 1
 
     def run_runner(self, *arguments, **changes):
         return subprocess.run([str(self.runner), *arguments], cwd=self.root,
-                              env=self.env | changes, capture_output=True, text=True, timeout=30)
+                              env=self.env | changes, capture_output=True, text=True, timeout=HANG_GUARD)
 
     def assert_stopped(self, runtime, process):
-        self.assertEqual(process.wait(timeout=15), -signal.SIGTERM)
+        self.assertEqual(process.wait(timeout=HANG_GUARD), -signal.SIGTERM)
         # A watcher sweeps once the processes it signalled have gone.
-        deadline = time.monotonic() + 15
-        while runtime.exists():
-            self.assertLess(time.monotonic(), deadline, "the runtime was not swept")
-            time.sleep(0.1)
+        wait_until(lambda: not runtime.exists(), "the runtime was not swept")
 
     def test_gc_stops_an_instance_whose_starter_ended_past_its_grace(self):
         old = int(time.time()) - 100
@@ -1300,10 +1314,7 @@ exit 1
         self.assertIn("Instance kept is running in niri-harness session cagents-kept; it runs until "
                       "you stop it, or 600 seconds after it started.", result.stdout)
         record = self.sessions / "cagents-kept.runtime/cagents-run-development.owner"
-        deadline = time.monotonic() + 10
-        while "watcher=" not in record.read_text():
-            self.assertLess(time.monotonic(), deadline, "no watcher recorded itself")
-            time.sleep(0.05)
+        wait_until(lambda: "watcher=" in record.read_text(), "no watcher recorded itself")
         text = record.read_text()
         self.assertIn("lifetime=kept\n", text)
         self.assertIn("ttl=600\n", text)
@@ -1312,11 +1323,9 @@ exit 1
         # The watcher outlives the launch, and ends with its session.
         self.assertTrue(Path(f"/proc/{watcher}").exists())
         (self.sessions / "cagents-kept").unlink()
-        deadline = time.monotonic() + 10
-        while Path(f"/proc/{watcher}").exists() and \
-                Path(f"/proc/{watcher}/stat").read_text().rsplit(") ", 1)[1][0] != "Z":
-            self.assertLess(time.monotonic(), deadline, "the watcher outlived its session")
-            time.sleep(0.05)
+        wait_until(lambda: not Path(f"/proc/{watcher}").exists()
+                   or Path(f"/proc/{watcher}/stat").read_text().rsplit(") ", 1)[1][0] == "Z",
+                   "the watcher outlived its session")
 
     def test_a_kept_launch_without_a_ttl_leaves_no_watcher(self):
         result = self.run_runner("--browserless", "--instance", "forever", "--keep")
@@ -1344,7 +1353,7 @@ exit 1
             ["sh", "-c", 'XDG_RUNTIME_DIR="$1" "$2" --gc; echo caller-survived', "sh",
              str(self.runtime_root), str(self.runner)],
             cwd=self.root, env=self.env | {"XDG_RUNTIME_DIR": str(runtime)},
-            capture_output=True, text=True, timeout=30)
+            capture_output=True, text=True, timeout=HANG_GUARD)
         self.assertIn("caller-survived", result.stdout, result.stderr)
         self.assert_stopped(runtime, process)
 
@@ -1355,7 +1364,7 @@ exit 1
         root = self.sessions / "cagents-odd.d root"
         root.mkdir()
         os.utime(root, (time.time() - 120, time.time() - 120))
-        process = subprocess.Popen(["sleep", "60"], env={"XDG_RUNTIME_DIR": str(shared)})
+        process = subprocess.Popen(["sleep", "infinity"], env={"XDG_RUNTIME_DIR": str(shared)})
         self.addCleanup(lambda: (process.kill(), process.wait()))
         result = self.run_runner("--gc")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1373,7 +1382,7 @@ exit 1
         os.utime(root, (time.time() - 120, time.time() - 120))
         environment = {key: value for key, value in self.env.items() if key != "XDG_RUNTIME_DIR"}
         result = subprocess.run([str(self.runner), "--gc"], cwd=self.root, env=environment,
-                                capture_output=True, text=True, timeout=30)
+                                capture_output=True, text=True, timeout=HANG_GUARD)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("XDG_RUNTIME_DIR", result.stderr)
         # Outside the user's runtime directory, so not a session's own.
@@ -1398,7 +1407,7 @@ exit 1
                                  XDG_RUNTIME_DIR=str(caller), CAGENTS_INSTANCE_WATCH_SECONDS="0.2")
         self.assertEqual(result.returncode, 0, result.stderr)
         record = self.sessions / "cagents-inner.runtime/cagents-run-development.owner"
-        self.assertTrue(wait_for(lambda: "watcher=" in record.read_text()))
+        wait_until(lambda: "watcher=" in record.read_text(), "no watcher recorded itself")
         watcher = int(record.read_text().split("watcher=", 1)[1].split()[0])
         self.addCleanup(lambda: os.kill(watcher, signal.SIGKILL) if Path(f"/proc/{watcher}").exists() else None)
         environment = Path(f"/proc/{watcher}/environ").read_bytes().split(b"\0")
@@ -1427,7 +1436,7 @@ exit 1
         self.assertIsNone(process.poll())
 
     def test_the_watcher_stops_its_instance_once_the_starter_has_been_gone_for_the_grace(self):
-        owner = subprocess.Popen(["sleep", "60"])
+        owner = subprocess.Popen(["sleep", "infinity"])
         self.addCleanup(lambda: (owner.kill(), owner.wait()))
         runtime, process = self.session("watched", record={
             "owner": owner.pid, "owner_start": process_start(owner.pid), "owner_name": "sleep",
@@ -1436,14 +1445,15 @@ exit 1
                                    env=self.env | {"CAGENTS_INSTANCE_WATCH_SECONDS": "0.2"},
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.addCleanup(lambda: (watcher.kill(), watcher.wait()))
+        wait_until(lambda: f"watcher={watcher.pid}\n" in (runtime / "cagents-run-development.owner").read_text(),
+                   "the watcher never recorded itself")
+        # Past the grace, while its starter runs, the instance does.
         time.sleep(1.5)
-        # While its starter runs, the instance does.
         self.assertIsNone(process.poll())
-        self.assertIn(f"watcher={watcher.pid}\n", (runtime / "cagents-run-development.owner").read_text())
         owner.kill()
         owner.wait()
         self.assert_stopped(runtime, process)
-        self.assertEqual(watcher.wait(timeout=10), 0)
+        self.assertEqual(watcher.wait(timeout=HANG_GUARD), 0)
         log = (self.root / "state/cagents-development-watched/run-development.log").read_text()
         self.assertIn("stopped: sleep (pid", log)
 
@@ -1454,7 +1464,7 @@ exit 1
                                    env=self.env | {"CAGENTS_INSTANCE_WATCH_SECONDS": "0.2"})
         self.addCleanup(lambda: (watcher.kill(), watcher.wait()))
         (self.sessions / "cagents-short").unlink()
-        self.assertEqual(watcher.wait(timeout=10), 0)
+        self.assertEqual(watcher.wait(timeout=HANG_GUARD), 0)
         self.assertIsNone(process.poll(), "a watcher whose session ended stopped something")
 
     def test_storage_unused_for_the_given_days_is_removed_but_not_running_or_unnamed(self):
@@ -1477,7 +1487,7 @@ exit 1
         # Only cached data left of this one.
         (self.root / "cache/cagents-development-cacheonly").mkdir()
         os.utime(self.root / "cache/cagents-development-cacheonly", (old, old))
-        daemon = subprocess.Popen(["sleep", "60"], env={"CAGENTS_DEVELOPMENT_INSTANCE": "running"})
+        daemon = subprocess.Popen(["sleep", "infinity"], env={"CAGENTS_DEVELOPMENT_INSTANCE": "running"})
         self.addCleanup(lambda: (daemon.kill(), daemon.wait()))
         result = self.run_runner("--gc", "--storage", "7")
         self.assertEqual(result.returncode, 0, result.stderr)

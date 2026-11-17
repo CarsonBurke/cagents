@@ -22,6 +22,9 @@ spec = importlib.util.spec_from_loader(loader.name, loader)
 hot = importlib.util.module_from_spec(spec)
 loader.exec_module(hot)
 
+# Bounds only a hang: a passing sandboxed run returns long before it.
+HANG_GUARD = 60
+
 
 class HotRunner(unittest.TestCase):
     @contextmanager
@@ -261,7 +264,7 @@ print(json.dumps({'uid':os.getuid(),'errors':results,'offline':os.environ.get('C
             original = hot.ROOT
             hot.ROOT = root
             try:
-                result = subprocess.run(hot.sandbox(["python3", str(script)], offline=True), capture_output=True, text=True, timeout=10)
+                result = subprocess.run(hot.sandbox(["python3", str(script)], offline=True), capture_output=True, text=True, timeout=HANG_GUARD)
             finally:
                 hot.ROOT = original
             self.assertEqual(result.returncode, 0, result.stderr)

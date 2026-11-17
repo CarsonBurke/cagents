@@ -11,6 +11,8 @@ import time
 import unittest
 
 SCRIPT = Path(__file__).resolve().parent / "fixtures/chat-composer-claude.sh"
+# Bounds only a hang; a passing run returns as soon as the provider exits.
+HANG_GUARD = 60
 
 
 def prompt(number):
@@ -31,7 +33,7 @@ class Provider(unittest.TestCase):
         started = time.monotonic()
         result = subprocess.run(
             [str(SCRIPT), *arguments], cwd=self.project, capture_output=True, text=True,
-            input="".join(json.dumps(frame) + "\n" for frame in frames), timeout=60,
+            input="".join(json.dumps(frame) + "\n" for frame in frames), timeout=HANG_GUARD,
             env={"HOME": str(self.root / "home"), "CLAUDE_CONFIG_DIR": str(self.config),
                  "PATH": "/usr/local/bin:/usr/bin:/bin"})
         output = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
@@ -53,7 +55,7 @@ class Provider(unittest.TestCase):
                 environment["CLAUDE_CONFIG_DIR"] = str(config)
             result = subprocess.run(
                 [str(SCRIPT), "auth", "status", "--json"], cwd=self.project,
-                capture_output=True, text=True, timeout=5, env=environment)
+                capture_output=True, text=True, timeout=HANG_GUARD, env=environment)
             self.assertEqual(result.returncode, 0, result.stderr)
             return json.loads(result.stdout)
 
@@ -292,9 +294,11 @@ class Provider(unittest.TestCase):
         self.assertGreaterEqual(elapsed, 1.5)
         # Then it takes the prompt as usual.
         self.assertTrue(any(frame.get("subtype") == "init" for frame in output), output)
-        probe, _, elapsed = self.run_provider("--no-session-persistence")
+        # A start held this long would outlast the hang guard, so the probe
+        # returning at all shows it was not held.
+        (self.config / "fixture-slow-start").write_text(f"{2 * HANG_GUARD}\n")
+        probe, _, _ = self.run_provider("--no-session-persistence")
         self.assertEqual(probe.returncode, 0, probe.stderr)
-        self.assertLess(elapsed, 1.5)
 
     def test_long_history_replays_once_as_one_chain_and_finishes_the_first_turn(self):
         session = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"

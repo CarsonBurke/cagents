@@ -14,6 +14,8 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOL = ROOT / "scripts/bounded"
+# Bounds only a hang: every wait it guards returns as soon as what it waits for happens.
+HANG_GUARD = 60
 
 
 def running(pid):
@@ -24,7 +26,7 @@ def running(pid):
         return False
 
 
-def wait_for(predicate, timeout=10.0):
+def wait_for(predicate, timeout=HANG_GUARD):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if predicate():
@@ -90,19 +92,19 @@ class Bounded(unittest.TestCase):
 
     def test_its_exit_status_is_the_commands(self):
         result = subprocess.run([TOOL, "--", "sh", "-c", "exit 7"], env=self.env,
-                                capture_output=True, text=True, timeout=20)
+                                capture_output=True, text=True, timeout=HANG_GUARD)
         self.assertEqual(result.returncode, 7, result.stderr)
         self.assertEqual(self.records(), [])
 
     def test_what_it_left_running_ends_with_it(self):
         result = subprocess.run([TOOL, "--", self.workload("exit 0\n")], env=self.env,
-                                capture_output=True, text=True, timeout=20)
+                                capture_output=True, text=True, timeout=HANG_GUARD)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assert_all_stopped()
 
     def test_the_time_limit_stops_everything_it_started(self):
         process = self.start("--ttl", "1", "--name", "probe", "--", self.workload("sleep 300\n"))
-        _, stderr = process.communicate(timeout=20)
+        _, stderr = process.communicate(timeout=HANG_GUARD)
         self.assertEqual(process.returncode, 124, stderr)
         self.assertRegex(stderr, r"stopped probe after \d+s: its --ttl of 1 seconds passed")
         self.assert_all_stopped()
@@ -115,7 +117,7 @@ class Bounded(unittest.TestCase):
         self.assertTrue(wait_for(lambda: len(self.recorded_pids()) == 2))
         owner.kill()
         owner.wait()
-        _, stderr = process.communicate(timeout=20)
+        _, stderr = process.communicate(timeout=HANG_GUARD)
         self.assertEqual(process.returncode, 143, stderr)
         self.assertIn(f"its owner, sleep 300 (pid {owner.pid}), ended", stderr)
         self.assert_all_stopped()
@@ -141,15 +143,22 @@ class Bounded(unittest.TestCase):
         process = self.start("--", self.workload("sleep 300\n"))
         self.assertTrue(wait_for(lambda: len(self.recorded_pids()) == 2))
         process.terminate()
-        _, stderr = process.communicate(timeout=20)
+        _, stderr = process.communicate(timeout=HANG_GUARD)
         self.assertEqual(process.returncode, 143, stderr)
         self.assertIn("this wrapper got SIGTERM", stderr)
         self.assert_all_stopped()
 
+    def ignoring_term(self):
+        """A workload body that ignores TERM, saying so once it does: a stop
+        sent before then would end it without the kill under test."""
+        return f"trap '' TERM\n: >\"{self.directory}/ignoring\"\nwhile :; do sleep 0.1; done\n"
+
     def test_a_workload_that_ignores_term_is_killed(self):
-        process = self.start("--ttl", "1", "--", self.workload("trap '' TERM\nwhile :; do sleep 0.1; done\n"))
-        _, stderr = process.communicate(timeout=20)
-        self.assertEqual(process.returncode, 124, stderr)
+        process = self.start("--", self.workload(self.ignoring_term()))
+        self.assertTrue(wait_for((self.directory / "ignoring").exists))
+        process.terminate()
+        _, stderr = process.communicate(timeout=HANG_GUARD)
+        self.assertEqual(process.returncode, 143, stderr)
         self.assertIn("it ignored TERM, so it was killed", stderr)
         self.assert_all_stopped()
 
@@ -171,7 +180,7 @@ class Bounded(unittest.TestCase):
         self.assertRegex(listing.stdout,
                          r"its wrapper was killed; scripts/bounded --reap stops the 2 processes")
         reaped = subprocess.run([TOOL, "--reap"], env=self.env, capture_output=True, text=True,
-                                timeout=20)
+                                timeout=HANG_GUARD)
         self.assertEqual(reaped.returncode, 0, reaped.stderr)
         self.assertIn("stopped probe: its wrapper had been killed, leaving 2 processes", reaped.stderr)
         self.assert_all_stopped()
@@ -179,37 +188,48 @@ class Bounded(unittest.TestCase):
 
     def test_what_cleared_its_environment_but_stayed_in_the_group_goes_too(self):
         unmarked = f'env -i sh -c \'echo $$ >>"{self.pids}"; trap "" TERM; exec sleep 300\' &\n'
-        for name, body, arguments in (("after it exits", unmarked + "sleep 0.3\nexit 0\n", []),
-                                      ("when stopped", unmarked + "sleep 300\n", ["--ttl", "1"])):
+        # Until all three have recorded themselves, within the hang guard.
+        recorded = (f'i=0; while [ "$(wc -l <"{self.pids}")" -lt 3 ] && [ $i -lt {HANG_GUARD * 10} ]; '
+                    'do sleep 0.1; i=$((i + 1)); done\n')
+        for name, body, stop in (("after it exits", unmarked + recorded + "exit 0\n", False),
+                                 ("when stopped", unmarked + "sleep 300\n", True)):
             with self.subTest(name):
                 self.pids.unlink(missing_ok=True)
-                process = self.start(*arguments, "--", self.workload(body))
-                process.communicate(timeout=30)
+                process = self.start("--", self.workload(body))
                 self.assertTrue(wait_for(lambda: len(self.recorded_pids()) == 3))
+                if stop:
+                    process.terminate()
+                process.communicate(timeout=HANG_GUARD)
                 self.assert_all_stopped()
 
     def test_a_command_that_cannot_run_says_so_and_leaves_no_record(self):
         result = subprocess.run([TOOL, "--", str(self.directory / "missing")], env=self.env,
-                                capture_output=True, text=True, timeout=20)
+                                capture_output=True, text=True, timeout=HANG_GUARD)
         self.assertEqual(result.returncode, 127)
         self.assertIn("bounded: cannot run", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
         self.assertEqual(self.records(), [])
 
     def test_an_owner_that_exited_unreaped_has_ended(self):
-        owner = subprocess.Popen(["sleep", "1"])
+        owner = subprocess.Popen(["sleep", "infinity"])
         self.addCleanup(owner.wait)
-        process = self.start("--ttl", "60", "--owner", str(owner.pid), "--", self.workload("sleep 300\n"))
-        _, stderr = process.communicate(timeout=20)
+        self.addCleanup(owner.kill)  # Runs first, so a failure cannot leave the wait hanging.
+        process = self.start("--owner", str(owner.pid), "--", self.workload("sleep 300\n"))
+        # Its record is written once it has found the owner running.
+        self.assertTrue(wait_for(self.records))
+        owner.kill()  # Not waited for: it stays a zombie.
+        _, stderr = process.communicate(timeout=HANG_GUARD)
         self.assertEqual(process.returncode, 143, stderr)
         self.assertIn("ended", stderr)
         self.assert_all_stopped()
 
     def test_a_nested_workload_stays_the_outer_ones(self):
-        inner = self.workload("trap '' TERM\nwhile :; do sleep 0.1; done\n")
-        process = self.start("--ttl", "1", "--", str(TOOL), "--ttl", "60", "--", inner)
-        _, stderr = process.communicate(timeout=30)
-        self.assertEqual(process.returncode, 124, stderr)
+        inner = self.workload(self.ignoring_term())
+        process = self.start("--", str(TOOL), "--", inner)
+        self.assertTrue(wait_for((self.directory / "ignoring").exists))
+        process.terminate()
+        _, stderr = process.communicate(timeout=HANG_GUARD)
+        self.assertEqual(process.returncode, 143, stderr)
         self.assert_all_stopped()
         self.assertTrue(wait_for(lambda: not self.records()), (self.records(), stderr))
 
@@ -220,7 +240,7 @@ class Bounded(unittest.TestCase):
                                    (["--ttl", "inf", "--", "true"], "--ttl must be a positive"),
                                    (["--owner", "999999999", "--", "true"], "is not running")):
             result = subprocess.run([TOOL, *arguments], env=self.env, capture_output=True,
-                                    text=True, timeout=20)
+                                    text=True, timeout=HANG_GUARD)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn(message, result.stderr)
 

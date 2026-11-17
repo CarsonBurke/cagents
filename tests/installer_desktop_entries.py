@@ -12,6 +12,8 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+# Bounds only a hang; a passing wait returns as soon as its event arrives.
+HANG_GUARD = 60
 CASES = (
     ("plain", "prefix-plain"),
     ("spaces", "prefix with spaces"),
@@ -70,7 +72,7 @@ class InstallerDesktopEntries(unittest.TestCase):
         autostart.parent.mkdir(parents=True)
         result = subprocess.run(
             ["/bin/sh", str(self.generator), str(executable), str(prefix), str(stage)],
-            cwd=self.directory, text=True, capture_output=True, timeout=10,
+            cwd=self.directory, text=True, capture_output=True, timeout=HANG_GUARD,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         return prefix, executable, {"application": application, "autostart": autostart}
@@ -90,10 +92,10 @@ class InstallerDesktopEntries(unittest.TestCase):
                     result = subprocess.run(
                         [gio, "launch", str(entries[kind])],
                         cwd=self.directory, env=environment,
-                        text=True, capture_output=True, timeout=10,
+                        text=True, capture_output=True, timeout=HANG_GUARD,
                     )
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    deadline = time.monotonic() + 2
+                    deadline = time.monotonic() + HANG_GUARD
                     while not receipt.exists() and time.monotonic() < deadline:
                         time.sleep(0.01)
                     self.assertTrue(receipt.exists(), "fixture was not launched: " + result.stderr)
@@ -110,7 +112,7 @@ class InstallerDesktopEntries(unittest.TestCase):
             for kind, desktop in entries.items():
                 with self.subTest(prefix=suffix, entry=kind):
                     result = subprocess.run(
-                        [validator, str(desktop)], text=True, capture_output=True, timeout=10,
+                        [validator, str(desktop)], text=True, capture_output=True, timeout=HANG_GUARD,
                     )
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
@@ -120,7 +122,7 @@ class InstallerDesktopEntries(unittest.TestCase):
             self.skipTest("system Python is required for independent GLib key-file decoding")
         probe = subprocess.run(
             [str(system_python), "-c", "from gi.repository import GLib"],
-            text=True, capture_output=True, timeout=10,
+            text=True, capture_output=True, timeout=HANG_GUARD,
         )
         if probe.returncode:
             self.skipTest("system Python GLib introspection is unavailable")
@@ -137,7 +139,7 @@ print(json.dumps({name: entry.get_string("Desktop Entry", name)
                 prefix, executable, entries = self.make_entries(name, suffix)
                 result = subprocess.run(
                     [str(system_python), "-c", reader, str(entries["application"])],
-                    text=True, capture_output=True, timeout=10,
+                    text=True, capture_output=True, timeout=HANG_GUARD,
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
                 values = json.loads(result.stdout)

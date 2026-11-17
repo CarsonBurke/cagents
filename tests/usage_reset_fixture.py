@@ -15,6 +15,8 @@ SOURCE = Path(__file__).resolve().parent / "fixtures/usage-reset-fixture.py"
 SPEC = importlib.util.spec_from_file_location("usage_reset_fixture", SOURCE)
 FIXTURE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(FIXTURE)
+# Bounds only a hang; a passing wait returns as soon as its answer arrives.
+HANG_GUARD = 60
 
 
 class UsageResetFixture(unittest.TestCase):
@@ -48,7 +50,7 @@ class UsageResetFixture(unittest.TestCase):
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
-        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=HANG_GUARD)
         self.addCleanup(connection.close)
         for path in ("/api/oauth/profile", "/api/oauth/usage?cedar_ember=1&skip_spend=1",
                      "/api/oauth/usage?at_wall=1&skip_spend=1"):
@@ -108,7 +110,7 @@ class UsageResetFixture(unittest.TestCase):
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
-        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=HANG_GUARD)
         self.addCleanup(connection.close)
         headers = {"Authorization": f"Bearer {FIXTURE.FAKE_TOKEN}", "Content-Type": "application/json"}
         for name, identifier, other, scopes in (
@@ -189,7 +191,7 @@ class UsageResetFixture(unittest.TestCase):
         self.addCleanup(server.shutdown)
         path = f"/api/organizations/{FIXTURE.ORGANIZATION}/reset_rate_limits"
         body = json.dumps({"program": "cedar_ember", "grant_id": "fable-fixture", "request_id": "post-send"})
-        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=HANG_GUARD)
         self.addCleanup(connection.close)
         headers = {"Authorization": f"Bearer {FIXTURE.FAKE_TOKEN}", "Content-Type": "application/json"}
         connection.request("POST", path, body=body, headers=headers)
@@ -197,7 +199,7 @@ class UsageResetFixture(unittest.TestCase):
             connection.getresponse()
         self.assertEqual(self.read(self.claude)["consume_count"], 1)
         connection.close()
-        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=HANG_GUARD)
         self.addCleanup(connection.close)
         connection.request("GET", "/api/oauth/usage?cedar_ember=1&skip_spend=1", headers=headers)
         response = connection.getresponse()
@@ -223,7 +225,7 @@ class UsageResetFixture(unittest.TestCase):
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
-        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=HANG_GUARD)
         self.addCleanup(connection.close)
         path = f"/api/organizations/{FIXTURE.ORGANIZATION}/reset_rate_limits"
         body = json.dumps({"program": "cedar_ember", "grant_id": "fable-fixture", "request_id": "unconfirmed-key"})
@@ -253,7 +255,7 @@ class UsageResetFixture(unittest.TestCase):
         process = subprocess.run(["/usr/bin/python3", "-I", str(peer), "app-server"],
                                  input="".join(json.dumps(frame) + "\n" for frame in requests), text=True,
                                  env={**os.environ, "CAGENTS_USAGE_RESETS_FIXTURE_ROOT": str(self.root),
-                                      "CODEX_HOME": str(self.codex)}, capture_output=True, timeout=5)
+                                      "CODEX_HOME": str(self.codex)}, capture_output=True, timeout=HANG_GUARD)
         self.assertEqual(process.returncode, 0, process.stderr)
         frames = [json.loads(line) for line in process.stdout.splitlines()]
         self.assertEqual(frames[1]["result"]["rateLimitResetCredits"]["availableCount"], 2)
@@ -270,12 +272,12 @@ class UsageResetFixture(unittest.TestCase):
                        "CODEX_HOME": str(self.codex)}
         sent = subprocess.run(["/usr/bin/python3", "-I", str(peer), "app-server"],
                               input=json.dumps(claim) + "\n", text=True, env=environment,
-                              capture_output=True, timeout=5)
+                              capture_output=True, timeout=HANG_GUARD)
         self.assertEqual((sent.returncode, sent.stdout), (0, ""), sent.stderr)
         self.assertEqual(self.read(self.codex)["consume_count"], 1)
         replay = subprocess.run(["/usr/bin/python3", "-I", str(peer), "app-server"],
                                 input=json.dumps(claim) + "\n", text=True, env=environment,
-                                capture_output=True, timeout=5)
+                                capture_output=True, timeout=HANG_GUARD)
         self.assertEqual(replay.returncode, 0, replay.stderr)
         self.assertEqual(json.loads(replay.stdout)["result"], {"outcome": "reset"})
         self.assertEqual(self.read(self.codex)["consume_count"], 1)
@@ -374,8 +376,8 @@ class UsageResetFixture(unittest.TestCase):
             frames = []
             while True:
                 while b"\n" not in buffered:
-                    ready, _, _ = select.select([process.stdout], [], [], 5)
-                    self.assertTrue(ready, "fake Codex did not answer within five seconds")
+                    ready, _, _ = select.select([process.stdout], [], [], HANG_GUARD)
+                    self.assertTrue(ready, f"fake Codex did not answer within {HANG_GUARD} seconds")
                     part = os.read(process.stdout.fileno(), 8192)
                     self.assertTrue(part, "fake Codex exited before answering")
                     buffered.extend(part)
@@ -418,10 +420,10 @@ class UsageResetFixture(unittest.TestCase):
         finally:
             process.stdin.close()
             try:
-                process.wait(timeout=5)
+                process.wait(timeout=HANG_GUARD)
             except subprocess.TimeoutExpired:
                 process.kill()
-                process.wait(timeout=5)
+                process.wait(timeout=HANG_GUARD)
                 raise
             finally:
                 process.stdout.close()
@@ -451,7 +453,7 @@ class UsageResetFixture(unittest.TestCase):
         script = SOURCE.with_name("chat-composer-claude.sh")
         process = subprocess.run(["/bin/sh", str(script), "auth", "status", "--json"],
                                  env={"HOME": str(self.root / "home"), "CLAUDE_CONFIG_DIR": str(self.claude),
-                                      "PATH": "/usr/bin:/bin"}, capture_output=True, text=True, timeout=5)
+                                      "PATH": "/usr/bin:/bin"}, capture_output=True, text=True, timeout=HANG_GUARD)
         self.assertEqual(process.returncode, 0, process.stderr)
         auth = json.loads(process.stdout)
         self.assertEqual(auth["email"], state["profile"]["account"]["email"])
@@ -465,7 +467,7 @@ class UsageResetFixture(unittest.TestCase):
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         before = self.read(self.claude)
-        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=HANG_GUARD)
         self.addCleanup(connection.close)
         headers = {"Authorization": f"Bearer {FIXTURE.FAKE_TOKEN}"}
         expected = [

@@ -24,7 +24,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc, Condvar, Mutex, OnceLock, Weak,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -143,7 +143,6 @@ enum Command {
         case_sensitive: bool,
         latest: Arc<AtomicU64>,
     },
-    HostVisibility(Visibility),
     Hide,
     Reveal,
     Hibernate,
@@ -329,6 +328,47 @@ enum Visibility {
     Hibernated,
 }
 
+/// The visibility the host last asked a live worker for, until the worker
+/// applies it.
+///
+/// Host visibility is a level, not an edge: only the newest request matters,
+/// so it is a slot the worker reconciles rather than a command in its bounded
+/// queue. A queued request could be refused when the queue is full, and a
+/// refused reveal left the worker hidden, capturing nothing, while a client
+/// showed it. It could also be overtaken: a reveal accepted while an earlier
+/// hide waited in the queue was undone by that hide.
+struct PendingVisibility(AtomicU8);
+
+impl PendingVisibility {
+    const NONE: u8 = 0;
+
+    fn new() -> Self {
+        Self(AtomicU8::new(Self::NONE))
+    }
+
+    fn set(&self, visibility: Visibility) {
+        let encoded = match visibility {
+            Visibility::Visible => 1,
+            Visibility::Hidden => 2,
+            Visibility::Hibernated => 3,
+        };
+        self.0.store(encoded, Ordering::Release);
+    }
+
+    fn take(&self) -> Option<Visibility> {
+        Self::decode(self.0.swap(Self::NONE, Ordering::AcqRel))
+    }
+
+    fn decode(encoded: u8) -> Option<Visibility> {
+        match encoded {
+            1 => Some(Visibility::Visible),
+            2 => Some(Visibility::Hidden),
+            3 => Some(Visibility::Hibernated),
+            _ => None,
+        }
+    }
+}
+
 type WakeCallback = dyn Fn(TerminalWake) + Send + Sync + 'static;
 
 enum ArchivePhase {
@@ -500,6 +540,9 @@ struct PublishedState {
     /// reveal forces.
     announced_generation: AtomicU64,
     visible: AtomicBool,
+    /// What [`TerminalHandle::set_host_visibility`] last asked a live worker
+    /// for, until the worker applies it.
+    host_visibility: PendingVisibility,
     /// The newest generation published before the worker last stopped
     /// showing the terminal. `visible` turns on when a reveal starts, before
     /// its capture is published or while a synchronized update holds it back;
@@ -592,6 +635,7 @@ impl PublishedState {
             transcript_location: OnceLock::new(),
             announced_generation: AtomicU64::new(0),
             visible: AtomicBool::new(visible),
+            host_visibility: PendingVisibility::new(),
             hidden_through: AtomicU64::new(0),
             wake,
             output_observer: OnceLock::new(),
@@ -699,7 +743,6 @@ impl PublishedState {
         // of whether its completed scrollback could be archived. They do not
         // need the parser or history, and must not repeat a retention failure.
         let visible = match &command {
-            Command::HostVisibility(visibility) => Some(*visibility == Visibility::Visible),
             Command::Hide | Command::Hibernate => Some(false),
             Command::Reveal => Some(true),
             Command::Restore { visible } => Some(*visible),
@@ -1058,22 +1101,45 @@ impl RenderStreamFixture {
         self.commands.len()
     }
 
-    /// Drains the queued commands, returning whether the last one that sets
-    /// visibility leaves the worker visible.
+    /// Takes what a worker would apply next: the host's pending visibility
+    /// request, or else the last queued command that sets visibility. Returns
+    /// whether it leaves the worker visible. Queued commands are drained.
     pub(crate) fn drain_visibility(&self) -> Option<bool> {
         fn visibility(command: &Command) -> Option<bool> {
             match command {
                 Command::Admitted { command, .. } => visibility(command),
-                Command::HostVisibility(visibility) => Some(*visibility == Visibility::Visible),
                 Command::Hide | Command::Hibernate => Some(false),
                 Command::Reveal => Some(true),
                 Command::Restore { visible } => Some(*visible),
                 _ => None,
             }
         }
-        self.commands
+        let queued = self
+            .commands
             .try_iter()
-            .fold(None, |visible, command| visibility(&command).or(visible))
+            .fold(None, |visible, command| visibility(&command).or(visible));
+        self.handle
+            .inner
+            .published
+            .host_visibility
+            .take()
+            .map(|pending| pending == Visibility::Visible)
+            .or(queued)
+    }
+
+    /// Takes the host's visibility request the worker has not applied yet.
+    pub(crate) fn take_host_visibility(&self) -> Option<super::ipc::TerminalVisibility> {
+        use super::ipc::TerminalVisibility;
+        self.handle
+            .inner
+            .published
+            .host_visibility
+            .take()
+            .map(|pending| match pending {
+                Visibility::Visible => TerminalVisibility::Visible,
+                Visibility::Hidden => TerminalVisibility::Hidden,
+                Visibility::Hibernated => TerminalVisibility::Hibernated,
+            })
     }
 }
 
@@ -1901,15 +1967,49 @@ impl TerminalHandle {
             }));
     }
 
-    pub(crate) fn set_host_visibility(
-        &self,
-        visibility: super::ipc::TerminalVisibility,
-    ) -> Result<(), TerminalSendError> {
-        self.try_command(Command::HostVisibility(match visibility {
+    /// Asks the worker to show, hide or hibernate its terminal for the host.
+    ///
+    /// This cannot be refused. Only the newest request matters, so it
+    /// replaces any the worker has not applied yet, and the worker applies it
+    /// before the next event it handles, including a command queued after
+    /// this call. A worker that has stopped has nothing left to present.
+    pub(crate) fn set_host_visibility(&self, visibility: super::ipc::TerminalVisibility) {
+        let visibility = match visibility {
             super::ipc::TerminalVisibility::Visible => Visibility::Visible,
             super::ipc::TerminalVisibility::Hidden => Visibility::Hidden,
             super::ipc::TerminalVisibility::Hibernated => Visibility::Hibernated,
-        }))
+        };
+        let published = &self.inner.published;
+        // Subscription is observational; it must not activate or parse the
+        // parked reader of an unconfirmed original merely to list, inspect or
+        // close its owner.
+        if self.startup_unresolved() {
+            published
+                .visible
+                .store(visibility == Visibility::Visible, Ordering::Release);
+            return;
+        }
+        if published.shutdown_requested.load(Ordering::Acquire) {
+            return;
+        }
+        // The worker enters archive preparation under this lock and takes
+        // any unapplied request with it, so a request is either taken there
+        // or applied to the archive here, never lost in between.
+        let phase = published.archive.lock().unwrap_or_else(|p| p.into_inner());
+        match &*phase {
+            ArchivePhase::Live => {
+                published.host_visibility.set(visibility);
+                // The capture wake also ends the worker's wait; a full slot
+                // means a wake is already pending.
+                let _ = published.capture_tx.try_send(());
+            }
+            // Visibility belongs to the retained surface, which needs neither
+            // the parser nor history.
+            ArchivePhase::Preparing | ArchivePhase::Frozen { .. } => published
+                .visible
+                .store(visibility == Visibility::Visible, Ordering::Release),
+            ArchivePhase::Released => {}
+        }
     }
 
     pub fn hide(&self) -> Result<(), TerminalSendError> {
@@ -2353,20 +2453,8 @@ impl TerminalHandle {
     }
 
     fn try_command(&self, command: Command) -> Result<(), TerminalSendError> {
-        if self.startup_unresolved() {
-            match &command {
-                Command::CloseChecked { .. } => {}
-                // Subscription is observational; it must not activate or parse
-                // the parked reader merely to list/inspect/close its owner.
-                Command::HostVisibility(visibility) => {
-                    self.inner
-                        .published
-                        .visible
-                        .store(*visibility == Visibility::Visible, Ordering::Release);
-                    return Ok(());
-                }
-                _ => return Err(TerminalSendError::Closed),
-            }
+        if self.startup_unresolved() && !matches!(command, Command::CloseChecked { .. }) {
+            return Err(TerminalSendError::Closed);
         }
         // Stop closes admission even when an existing cached reader holds the
         // archive lock. Natural completion alone leaves read-only commands live.
@@ -2383,14 +2471,6 @@ impl TerminalHandle {
         // can land between the final drain and worker teardown.
         let published = &self.inner.published;
         let mut phase = published.archive.lock().unwrap_or_else(|p| p.into_inner());
-        if matches!(*phase, ArchivePhase::Preparing)
-            && let Command::HostVisibility(visibility) = &command
-        {
-            published
-                .visible
-                .store(*visibility == Visibility::Visible, Ordering::Release);
-            return Ok(());
-        }
         // Fast terminal controls share a bounded dispatcher. Waiting for a
         // different terminal's final screen would occupy its input capacity;
         // refuse admission so the caller can retry after archival completes.
@@ -3549,6 +3629,9 @@ impl Worker {
                             .min(),
                     )
                 });
+            // Before the event, so a command queued after a visibility
+            // request sees it applied, as it would had the request queued.
+            self.apply_host_visibility();
             match event {
                 WorkerEvent::Command(Some(command)) => {
                     // A command selected together with the priority wake must
@@ -3667,11 +3750,21 @@ impl Worker {
             _ => None,
         });
         if !shutting_down && completion.is_some() {
-            *self
-                .published
-                .archive
-                .lock()
-                .unwrap_or_else(|p| p.into_inner()) = ArchivePhase::Preparing;
+            {
+                let mut phase = self
+                    .published
+                    .archive
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                *phase = ArchivePhase::Preparing;
+                // A request the loop did not reach goes to the retained
+                // surface, as every later one does.
+                if let Some(visibility) = self.published.host_visibility.take() {
+                    self.published
+                        .visible
+                        .store(visibility == Visibility::Visible, Ordering::Release);
+                }
+            }
             let history = archive::History::capture(
                 &mut self.terminal,
                 &self.published.snapshot.load_full(),
@@ -4224,11 +4317,6 @@ impl Worker {
                     Err(error) => self.error("copy terminal selection", error),
                 }
             }
-            Command::HostVisibility(visibility) => match visibility {
-                Visibility::Visible => self.reveal(),
-                Visibility::Hidden => self.set_hidden(),
-                Visibility::Hibernated => self.hibernate_visuals(),
-            },
             Command::Reveal => self.reveal(),
             Command::Hibernate => self.hibernate_visuals(),
             Command::Restore { visible } => self.restore_visuals(visible),
@@ -4405,6 +4493,15 @@ impl Worker {
         self.current_size = size;
         if self.visibility == Visibility::Visible {
             self.publish_snapshot(true);
+        }
+    }
+
+    fn apply_host_visibility(&mut self) {
+        match self.published.host_visibility.take() {
+            Some(Visibility::Visible) => self.reveal(),
+            Some(Visibility::Hidden) => self.set_hidden(),
+            Some(Visibility::Hibernated) => self.hibernate_visuals(),
+            None => {}
         }
     }
 
@@ -7681,9 +7778,7 @@ mod tests {
         )
         .unwrap();
         *handle.inner.published.archive.lock().unwrap() = ArchivePhase::Preparing;
-        handle
-            .set_host_visibility(super::super::ipc::TerminalVisibility::Hidden)
-            .unwrap();
+        handle.set_host_visibility(super::super::ipc::TerminalVisibility::Hidden);
         assert!(!handle.inner.published.visible.load(Ordering::Acquire));
         // Preparation never finishes on its own, so a request that waited
         // for it without a bound would not return.
@@ -7694,6 +7789,53 @@ mod tests {
         assert_eq!(searched, Err(TerminalSendError::Closed));
         *handle.inner.published.archive.lock().unwrap() = ArchivePhase::Live;
         handle.inner.published.archive_ready.notify_all();
+        handle.shutdown().unwrap();
+    }
+
+    /// A full command queue is when a worker is busiest, not when it may
+    /// ignore a reveal: a refused one left it hidden, capturing nothing,
+    /// while a client showed it.
+    #[test]
+    fn a_host_reveal_reaches_a_worker_whose_command_queue_is_full() {
+        let (woken, wakes) = crossbeam_channel::unbounded();
+        let handle = TerminalHandle::spawn(
+            shell_session("exec /bin/cat"),
+            TerminalConfig {
+                initially_visible: false,
+                command_capacity: 4,
+                ..TerminalConfig::default()
+            },
+            move |wake| {
+                let _ = woken.send(wake.generation);
+            },
+        )
+        .unwrap();
+        // The worker answers this read and then waits, inside the command,
+        // until the test takes the answer, so nothing drains the queue. The
+        // read keeps its admission permit while it is handled, so the queue
+        // stays full whether or not the worker has taken it yet.
+        let (reply, read) = crossbeam_channel::bounded(0);
+        handle
+            .try_command(Command::ReadViewport {
+                offset: None,
+                rows: None,
+                reply,
+            })
+            .unwrap();
+        let refused = std::iter::repeat_with(|| handle.scroll_to_bottom()).find_map(Result::err);
+        assert_eq!(refused, Some(TerminalSendError::Full));
+        assert!(
+            wakes.try_recv().is_err(),
+            "a hidden worker announced a frame"
+        );
+
+        handle.set_host_visibility(super::super::ipc::TerminalVisibility::Visible);
+        read.recv_timeout(crate::test_timing::EVENTUALLY)
+            .expect("the worker never read the viewport")
+            .unwrap();
+        wakes
+            .recv_timeout(crate::test_timing::EVENTUALLY)
+            .expect("the revealed worker published nothing");
         handle.shutdown().unwrap();
     }
 
@@ -9647,9 +9789,7 @@ os._exit(0)
             for _ in 0..3 {
                 // HostState refreshes focus and the size owner's saved size
                 // when revealing/focusing a completed terminal.
-                handle
-                    .set_host_visibility(super::super::ipc::TerminalVisibility::Visible)
-                    .unwrap();
+                handle.set_host_visibility(super::super::ipc::TerminalVisibility::Visible);
                 handle.focus(true).unwrap();
                 handle
                     .resize(TerminalSize {
@@ -9676,9 +9816,7 @@ os._exit(0)
         for hibernated in [false, true] {
             let (handle, events) = completed_without_history(hibernated);
             let _: Vec<_> = events.try_iter().collect();
-            handle
-                .set_host_visibility(super::super::ipc::TerminalVisibility::Visible)
-                .unwrap();
+            handle.set_host_visibility(super::super::ipc::TerminalVisibility::Visible);
             for _ in 0..3 {
                 let screen = handle.viewport_snapshot(Some(0), Some(1), true).unwrap();
                 assert!(!screen.detached);
@@ -9710,8 +9848,7 @@ os._exit(0)
         );
         fixture
             .handle
-            .set_host_visibility(super::super::ipc::TerminalVisibility::Visible)
-            .unwrap();
+            .set_host_visibility(super::super::ipc::TerminalVisibility::Visible);
 
         let read = fixture.handle.viewport_snapshot(None, None, true).unwrap();
         assert_eq!(read.generation, 1);

@@ -9,6 +9,8 @@ import unittest
 
 
 INSTALLER = Path(__file__).resolve().parents[1] / "install.sh"
+# Bounds only a hang; a passing run returns as soon as its process exits.
+HANG_GUARD = 60
 
 
 @unittest.skipUnless(
@@ -51,7 +53,7 @@ class InstallerPlatform(unittest.TestCase):
         }
         return subprocess.run(
             ["/bin/sh", str(INSTALLER), "--prefix", str(self.prefix), *args],
-            env=env, cwd=self.root, text=True, capture_output=True, timeout=3,
+            env=env, cwd=self.root, text=True, capture_output=True, timeout=HANG_GUARD,
         )
 
     def assert_unchanged(self):

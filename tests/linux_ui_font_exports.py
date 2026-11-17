@@ -15,6 +15,8 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+# Bounds only a hang; each compile, run or inspection returns when it finishes.
+HANG_GUARD = 60
 
 
 class LinuxUiFontExports(unittest.TestCase):
@@ -32,7 +34,7 @@ class LinuxUiFontExports(unittest.TestCase):
             cls.directory.mkdir(mode=0o700, parents=True)
         cls.commands = []
         cls.script = cls.directory / "actual-build-script"
-        cls.command(["rustc", "--edition=2024", str(ROOT / "crates/cagents-ui/build.rs"), "-o", str(cls.script)], timeout=30)
+        cls.command(["rustc", "--edition=2024", str(ROOT / "crates/cagents-ui/build.rs"), "-o", str(cls.script)], timeout=HANG_GUARD)
 
     @classmethod
     def command(cls, arguments, *, timeout, env=None):
@@ -67,7 +69,7 @@ class LinuxUiFontExports(unittest.TestCase):
         environment.update(CARGO_CFG_TARGET_OS=target, CARGO_PKG_VERSION="9.9.9",
                            CARGO_MANIFEST_DIR=str(output), OUT_DIR=str(output))
         environment.update({"CARGO_FEATURE_" + feature: "1" for feature in features})
-        result = self.command([str(self.script)], env=environment, timeout=10)
+        result = self.command([str(self.script)], env=environment, timeout=HANG_GUARD)
         instructions = [line for line in result.stdout.splitlines()
                         if line.startswith("cargo:rustc-link-")]
         return output, instructions
@@ -144,7 +146,7 @@ int main(void) {
                                 "-l:" + shared_system.name, "-Wl,-rpath,$ORIGIN", "-o", str(shared_consumer)],
                 ]
                 for command in commands:
-                    self.command(command, timeout=20)
+                    self.command(command, timeout=HANG_GUARD)
                 for variant, extra, expected in (
                     ("before", [], "direct=17,19 shared=17,19 runtime=97 import=89\n"),
                     ("after", flags, "direct=17,19 shared=73,79 runtime=97 import=89\n"),
@@ -155,10 +157,10 @@ int main(void) {
                     command = compiler + [str(application), "-L" + str(output),
                         "-l:" + shared_consumer.name, "-l:" + shared_system.name,
                         "-Wl,-rpath,$ORIGIN", *extra, "-Wl,--export-dynamic", "-o", str(program)]
-                    self.command(command, timeout=20)
-                    actual = self.command([str(program)], timeout=5)
+                    self.command(command, timeout=HANG_GUARD)
+                    actual = self.command([str(program)], timeout=HANG_GUARD)
                     self.assertEqual(actual.stdout, expected)
-                    dynamic = self.command(["readelf", "--wide", "--dyn-syms", str(program)], timeout=5)
+                    dynamic = self.command(["readelf", "--wide", "--dyn-syms", str(program)], timeout=HANG_GUARD)
                     self.assertEqual(dynamic.stderr, "")
                     rows = [line.split() for line in dynamic.stdout.splitlines()
                             if line.split() and line.split()[0].rstrip(":").isdigit()]

@@ -19,6 +19,8 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 CHECKER = ROOT / "scripts/check-format"
 CACHE_HELPER = ROOT / "scripts/check-format-cache.py"
+# Bounds only a hang; a passing run returns as soon as the checker exits.
+HANG_GUARD = 60
 INCLUDED = (
     "src/modules.rs",
     "crates/cagents-ui/src/modules.rs",
@@ -54,7 +56,7 @@ class FormatCheck(unittest.TestCase):
         # Calling from outside the fixture verifies checkout-relative resolution.
         return subprocess.run(
             [str(self.script)], cwd=self.root.parent, env=env,
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=HANG_GUARD,
         )
 
     def mock_tools(self, cargo_status=0, rustfmt_status=0):
@@ -141,7 +143,7 @@ sys.exit({status})
                 log.unlink(missing_ok=True)
                 result = subprocess.run(
                     [str(self.script), "--write"], cwd=self.root.parent, env=env,
-                    capture_output=True, text=True, timeout=30,
+                    capture_output=True, text=True, timeout=HANG_GUARD,
                 )
                 self.assertEqual(result.returncode, cargo_status or rustfmt_status)
                 self.assertEqual(
@@ -159,7 +161,7 @@ sys.exit({status})
             with self.subTest(arguments=arguments):
                 result = subprocess.run(
                     [str(self.script), *arguments], cwd=self.root.parent, env=env,
-                    capture_output=True, text=True, timeout=30,
+                    capture_output=True, text=True, timeout=HANG_GUARD,
                 )
                 self.assertEqual(result.returncode, 2)
                 self.assertFalse(log.exists())
@@ -363,7 +365,7 @@ sys.exit({status})
         self.write("src/outside.rs", "fn local_module() {}\n")
         def checked(command):
             return subprocess.run(
-                ["rustfmt", *command], cwd=self.root, capture_output=True, timeout=10,
+                ["rustfmt", *command], cwd=self.root, capture_output=True, timeout=HANG_GUARD,
             ).returncode
 
         for attribute in (
@@ -658,7 +660,7 @@ include!("../tests/support/repository_scale.rs");
                 cargo = subprocess.run(
                     ["cargo", "fmt", "--check", "-p", "cagents", "-p", "cagents-ui"],
                     cwd=self.root, env=env,
-                    capture_output=True, text=True, timeout=30,
+                    capture_output=True, text=True, timeout=HANG_GUARD,
                 )
                 self.assertEqual(cargo.returncode, 0, cargo.stdout + cargo.stderr)
                 checked = self.run_checker(env)

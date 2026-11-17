@@ -96,6 +96,8 @@ mod fold;
 mod frozen_source_tests;
 mod hover;
 pub(super) mod images;
+mod kept_draft;
+use kept_draft::ConfirmedLoss;
 mod layout;
 mod literal_content;
 mod logical_prose;
@@ -1203,6 +1205,14 @@ pub(super) struct State {
     /// The provider queue each card last saved, until a connection to its
     /// conversation shows whether the provider that held it is still there.
     waiting: HashMap<CardId, SavedQueue>,
+    /// What the reader confirmed a card's close discards, for the
+    /// conversation the question was about, so that close keeps no more
+    /// than the rest to bring back.
+    confirmed_losses: HashMap<CardId, (TerminalId, ConfirmedLoss)>,
+    /// Cards reopening a conversation with the message their last card was
+    /// still sending as it closed. Their composer drops it once the
+    /// transcript shows it arrived.
+    sending_on_close: HashSet<CardId>,
     /// Drafts another window started, whose cards are attaching to that
     /// conversation. Their carried-over unsent text may repeat its first
     /// message, which is checked once the transcript shows it.
@@ -1249,6 +1259,8 @@ impl Default for State {
             draft_attachments: HashMap::new(),
             peer_started: HashMap::new(),
             waiting: HashMap::new(),
+            confirmed_losses: HashMap::new(),
+            sending_on_close: HashSet::new(),
             started_elsewhere: HashSet::new(),
             default_chats: HashSet::new(),
             parked: HashMap::new(),
@@ -2893,6 +2905,16 @@ fn unaccounted(
     remaining
 }
 
+/// Which message of the conversation carried-over unsent text may repeat.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DraftEcho {
+    /// The first, which another window started the conversation with.
+    First,
+    /// The latest, which the conversation's last card was still sending as it
+    /// closed.
+    Latest,
+}
+
 /// What came back to the composer from a provider queue that did not survive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RestoredWaiting {
@@ -3057,10 +3079,10 @@ pub(super) struct Runtime {
     image_pastes_saving: usize,
     submit_after_paste: Option<PromptMode>,
     attachment_chooser_pending: Option<uuid::Uuid>,
-    /// The composer revision at which unsent text carried over from a draft
-    /// another window started may still repeat that window's first message.
-    /// Cleared once the transcript settles it, or the reader edits the text.
-    first_message_echo: Option<u64>,
+    /// The composer revision at which carried-over unsent text may still
+    /// repeat a message the conversation received, and which one. Cleared
+    /// once the transcript settles it, or the reader edits the text.
+    draft_echo: Option<(u64, DraftEcho)>,
     expanded: HashSet<String>,
     child_expanded: HashMap<String, HashSet<String>>,
     child_unfolded: HashMap<String, HashSet<String>>,
@@ -3925,47 +3947,51 @@ impl Runtime {
             .unwrap_or(&self.attachments)
     }
 
-    /// Checks carried-over unsent text against the first message of the
-    /// conversation another window started from this draft, once the
-    /// transcript shows it.
-    fn await_first_message_echo(&mut self) {
-        self.first_message_echo = Some(self.revision);
-        self.settle_first_message_echo();
+    /// Checks carried-over unsent text against the message `echo` names,
+    /// once the transcript shows it.
+    fn await_draft_echo(&mut self, echo: DraftEcho) {
+        self.draft_echo = Some((self.revision, echo));
+        self.settle_draft_echo();
     }
 
-    /// Drops the composer text if it is exactly the conversation's first
-    /// message, which the window that started it already sent, so it is not
-    /// offered again. Any other text is the reader's own and stays.
-    fn settle_first_message_echo(&mut self) {
-        let Some(revision) = self.first_message_echo else {
+    /// Drops the composer text if it is exactly the message it may repeat,
+    /// which the conversation already has, so it is not offered again. Any
+    /// other text is the reader's own and stays.
+    fn settle_draft_echo(&mut self) {
+        let Some((revision, echo)) = self.draft_echo else {
             return;
         };
         if revision != self.revision || !self.attachments.is_empty() {
             // Edited since, or more than the text: no longer a copy.
-            self.first_message_echo = None;
+            self.draft_echo = None;
             return;
         }
         if self.snapshot.history_loading || !self.visible.load(Ordering::Relaxed) {
             return;
         }
-        let first = self
+        let mut sent = self
             .snapshot
             .items
             .iter()
-            .find_map(|item| match &item.content {
+            .filter_map(|item| match &item.content {
                 chat::ItemContent::Text { text, .. } if item.role == chat::Role::User => Some(text),
                 _ => None,
             });
-        let Some(first) = first else {
+        let message = match echo {
+            // The first message counts only where the transcript starts.
+            DraftEcho::First => sent.next().filter(|_| !self.snapshot.has_earlier),
+            DraftEcho::Latest => sent.last(),
+        };
+        let Some(message) = message else {
             if self.snapshot.has_earlier {
-                // The first message is not in view, so nothing can be shown
-                // to repeat it.
-                self.first_message_echo = None;
+                // The message is not in view, so nothing can be shown to
+                // repeat it.
+                self.draft_echo = None;
             }
             return;
         };
-        self.first_message_echo = None;
-        if !self.snapshot.has_earlier && self.composer.text().trim() == first.trim() {
+        self.draft_echo = None;
+        if self.composer.text().trim() == message.trim() {
             self.replace_draft(text_editor::Content::new());
         }
     }
@@ -3976,10 +4002,15 @@ impl Runtime {
     /// the order they were written; restoring it never automatically submits
     /// any part.
     fn persistent_draft(&self) -> (String, Vec<Attachment>) {
+        self.unsent_with_held(self.queued.as_ref())
+    }
+
+    /// The composer's text and attachments, after `queued` and the held
+    /// follow-ups, each part on its own line, every attachment once.
+    fn unsent_with_held(&self, queued: Option<&Queued>) -> (String, Vec<Attachment>) {
         let followups = (!self.followups.is_empty()).then(|| self.combined_followups());
-        let held = self
-            .queued
-            .iter()
+        let held = queued
+            .into_iter()
             .map(|queued| (queued.source.text(), queued.attachments.as_slice()))
             .chain(
                 followups
@@ -4167,7 +4198,7 @@ impl Runtime {
             image_pastes_saving: 0,
             submit_after_paste: None,
             attachment_chooser_pending: None,
-            first_message_echo: None,
+            draft_echo: None,
             expanded: HashSet::new(),
             child_expanded: HashMap::new(),
             child_unfolded: HashMap::new(),
@@ -5416,7 +5447,7 @@ impl Runtime {
         self.prepare_local_prompt();
         self.refresh_session();
         self.refresh_snapshot();
-        self.settle_first_message_echo();
+        self.settle_draft_echo();
     }
 
     fn refresh_snapshot(&mut self) {
@@ -8802,15 +8833,18 @@ impl Cagents {
         self.insert_chat_card_with_lifetime(session, beside, false, draft_from, None)
     }
 
-    /// Restore an existing conversation's manual pane name before its first
-    /// shared publication or provider attachment can report another title.
+    /// Opens a saved conversation in a new card, restoring its manual pane
+    /// name before its first shared publication or provider attachment can
+    /// report another title. `draft_from` is the card it was closed in, whose
+    /// kept draft the new card takes.
     pub(super) fn insert_resumed_chat_card(
         &mut self,
         session: chat::Session,
         beside: Option<CardId>,
         user_title: Option<String>,
+        draft_from: Option<CardId>,
     ) -> Task<Message> {
-        self.insert_chat_card_with_lifetime(session, beside, false, None, user_title)
+        self.insert_chat_card_with_lifetime(session, beside, false, draft_from, user_title)
     }
 
     fn insert_chat_card_with_lifetime(
@@ -8834,15 +8868,8 @@ impl Cagents {
         tracing::debug!(target: "cagents::pane_open", stage = "requested", card = ?card_id, kind = "chat");
         // A stopped terminal cannot be converted in place. If its chat had
         // been parked before a restart, the new conversation owns that text.
-        if let Some(source) = draft_from
-            && let Some(attachments) = self.chat_ui.draft_attachments.remove(&source)
-        {
-            self.chat_ui.draft_attachments.insert(card_id, attachments);
-        }
-        if let Some(source) = draft_from
-            && let Some(draft) = self.chat_ui.drafts.remove(&source)
-        {
-            self.chat_ui.drafts.insert(card_id, draft);
+        if let Some(source) = draft_from {
+            self.move_chat_draft(source, card_id);
         }
         if ephemeral {
             self.chat_ui.default_chats.insert(card_id);
@@ -9170,7 +9197,9 @@ impl Cagents {
             runtime.replace_attachments(attachments);
         }
         if self.chat_ui.started_elsewhere.remove(&card) {
-            runtime.await_first_message_echo();
+            runtime.await_draft_echo(DraftEcho::First);
+        } else if self.chat_ui.sending_on_close.remove(&card) {
+            runtime.await_draft_echo(DraftEcho::Latest);
         }
     }
 
@@ -9361,6 +9390,8 @@ impl Cagents {
         self.chat_ui.drafts.remove(&card);
         self.chat_ui.draft_attachments.remove(&card);
         self.chat_ui.waiting.remove(&card);
+        self.chat_ui.confirmed_losses.remove(&card);
+        self.chat_ui.sending_on_close.remove(&card);
         self.chat_ui.started_elsewhere.remove(&card);
         self.chat_ui.parked.remove(&card);
         self.chat_ui.fresh_offers.remove(&card);
@@ -12085,12 +12116,16 @@ impl Cagents {
                         // this conversation last connected through is older
                         // than that connection: a build that keeps no queue
                         // ran in between, and the queue is no longer news.
-                        let mut waiting =
-                            if saved.host.is_some() && saved.host == attempt.session.proof {
-                                saved.messages
-                            } else {
-                                Vec::new()
-                            };
+                        // What a close stopped while its provider still held it
+                        // is held nowhere now, and comes back with the reopened
+                        // conversation unless the conversation shows it arrived.
+                        let (mut waiting, stopped) = if saved.stopped {
+                            (Vec::new(), saved.messages)
+                        } else if saved.host.is_some() && saved.host == attempt.session.proof {
+                            (saved.messages, Vec::new())
+                        } else {
+                            (Vec::new(), Vec::new())
+                        };
                         let channel_name = self.observe_channel_name(target, &snapshot);
                         let title = channel_name.as_ref().map(|(title, _)| title.clone());
                         let activity = Activity {
@@ -12178,6 +12213,11 @@ impl Cagents {
                         // rest may never have reached the agent, or may have
                         // just before the last one went: either way it is the
                         // reader's to send again, edit or discard.
+                        for message in stopped {
+                            if !waiting.iter().any(|saved| saved.id == message.id) {
+                                waiting.push(message);
+                            }
+                        }
                         let waiting = unaccounted(&snapshot, waiting);
                         let restored_waiting = !waiting.is_empty();
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
@@ -19643,7 +19683,11 @@ pub(in crate::app) mod tests {
     }
 
     pub(super) fn draft_chat_for_provider(app: &mut Cagents, provider: Provider) -> CardId {
-        let _ = app.new_native_chat(provider, Some(PathBuf::from(FIXTURE_DIRECTORY)));
+        draft_chat_in(app, provider, Path::new(FIXTURE_DIRECTORY))
+    }
+
+    pub(super) fn draft_chat_in(app: &mut Cagents, provider: Provider, directory: &Path) -> CardId {
+        let _ = app.new_native_chat(provider, Some(directory.to_owned()));
         let card = app.workspace.focused().unwrap();
         assert!(
             matches!(app.cards.get(&card), Some(CardRuntime::Chat(runtime)) if runtime.is_draft()),
@@ -23069,7 +23113,14 @@ pub(in crate::app) mod tests {
         starting_chat_for_provider(app, Provider::Codex)
     }
     fn starting_chat_for_provider(app: &mut Cagents, provider: Provider) -> (CardId, Target) {
-        let card = draft_chat_for_provider(app, provider);
+        starting_chat_in(app, provider, Path::new(FIXTURE_DIRECTORY))
+    }
+    pub(super) fn starting_chat_in(
+        app: &mut Cagents,
+        provider: Provider,
+        directory: &Path,
+    ) -> (CardId, Target) {
+        let card = draft_chat_in(app, provider, directory);
         write(app, card, "hello");
         submit(app, card);
         let target = app
@@ -23364,7 +23415,17 @@ pub(in crate::app) mod tests {
         provider: Provider,
         session_id: Option<&str>,
     ) -> CardId {
-        let (card, target) = starting_chat_for_provider(app, provider);
+        live_chat_in(app, provider, Path::new(FIXTURE_DIRECTORY), session_id)
+    }
+
+    /// A conversation that started in `directory`.
+    pub(in crate::app) fn live_chat_in(
+        app: &mut Cagents,
+        provider: Provider,
+        directory: &Path,
+        session_id: Option<&str>,
+    ) -> CardId {
+        let (card, target) = starting_chat_in(app, provider, directory);
         let handle = fixture_handle(app, card, session_id);
         answer_start(app, target, Ok(handle));
         assert!(matches!(app.cards.get(&card), Some(CardRuntime::Chat(_))));
@@ -23975,7 +24036,7 @@ pub(in crate::app) mod tests {
     }
 
     /// Answers the command `card` is waiting on with `result`.
-    fn settle(app: &mut Cagents, card: CardId, result: Result<(), String>) {
+    pub(super) fn settle(app: &mut Cagents, card: CardId, result: Result<(), String>) {
         let runtime = chat_runtime(app, card);
         let id = runtime.pending.as_ref().expect("a command is pending").id;
         let target = runtime.target;
@@ -25514,6 +25575,7 @@ pub(in crate::app) mod tests {
             SavedQueue {
                 host: Some(daemon_proof(queue_daemon)),
                 messages: waiting,
+                stopped: false,
             },
         );
         let target = chat_runtime_attempt(&app, card);
@@ -25813,6 +25875,7 @@ pub(in crate::app) mod tests {
             Some(&SavedQueue {
                 host: Some(daemon_proof("fixture")),
                 messages: saved_queue(),
+                stopped: false,
             })
         );
         // The provider's next publication is saved when it arrives.

@@ -119,7 +119,8 @@ fn held_old_completion_and_wake_cannot_advance_or_hide_a_same_id_successor() {
             assert!(!state.terminals[&id].handle.same_worker(&old.handle));
             assert!(!state.subscriptions.viewports.contains_key(&(1, id)));
         }
-        let commands = successor.queued_commands();
+        // Whatever installing the successor asked of it.
+        successor.drain_visibility();
         drop(release);
         assert!(
             done.recv_timeout(Duration::from_secs(2)).unwrap(),
@@ -132,15 +133,15 @@ fn held_old_completion_and_wake_cannot_advance_or_hide_a_same_id_successor() {
             assert_eq!(state.terminals[&id].event_sequence, 0);
         }
         assert_eq!(
-            successor.queued_commands(),
-            commands,
+            successor.drain_visibility(),
+            None,
             "old redraw hid successor"
         );
         if !visible {
             successor.publish(2);
             assert_eq!(
-                successor.queued_commands(),
-                commands + 1,
+                successor.drain_visibility(),
+                Some(false),
                 "control: the current hidden worker must receive Hide"
             );
             shared

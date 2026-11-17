@@ -16,6 +16,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOL = ROOT / "scripts" / "lock-holders"
+# Bounds only a hang: every wait it guards returns as soon as what it waits for happens.
+HANG_GUARD = 60
 
 
 class LockHolders(unittest.TestCase):
@@ -34,7 +36,7 @@ class LockHolders(unittest.TestCase):
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(pid, signal.SIGKILL)
         for process in self.processes:
-            process.wait(timeout=5)
+            process.wait(timeout=HANG_GUARD)
 
     def start(self, *command):
         # Its own process group, so cleanup reaches what it starts.
@@ -48,13 +50,13 @@ class LockHolders(unittest.TestCase):
     def report(self):
         result = subprocess.run(
             [sys.executable, "-I", "-B", str(TOOL), str(self.lock)],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=HANG_GUARD,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout
 
     def wait_for(self, predicate, label):
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + HANG_GUARD
         while not predicate():
             self.assertLess(time.monotonic(), deadline, f"timed out waiting for {label}")
             time.sleep(0.05)
@@ -84,7 +86,7 @@ class LockHolders(unittest.TestCase):
         self.assertNotIn(f"{self.lock}.cost", locks)
 
     def test_an_ordinary_holder_and_its_waiter_raise_no_warning(self):
-        holder = self.start("flock", str(self.lock), "sleep", "60")
+        holder = self.start("flock", str(self.lock), "sleep", "infinity")
         self.wait_for(self.holds, "holder")
         waiter = self.start("flock", str(self.lock), "true")
         self.wait_for(lambda: f"waiting: {waiter.pid}" in self.report(), "waiter")
@@ -98,12 +100,17 @@ class LockHolders(unittest.TestCase):
 
     def test_a_leftover_that_inherited_the_lock_is_named_and_left_running(self):
         pid_file = self.root / "daemon"
+
+        def end_daemon():  # It left the holder's group, so ending that group misses it.
+            with contextlib.suppress(FileNotFoundError, ValueError, ProcessLookupError):
+                os.killpg(int(pid_file.read_text()), signal.SIGKILL)
+
+        self.addCleanup(end_daemon)
         self.start(
             "flock", str(self.lock), "sh", "-c",
-            'setsid sleep 60 & echo $! > "$0.new"; mv "$0.new" "$0"', str(pid_file),
-        ).wait(timeout=10)
+            'setsid sleep infinity & echo $! > "$0.new"; mv "$0.new" "$0"', str(pid_file),
+        ).wait(timeout=HANG_GUARD)
         daemon = int(pid_file.read_text())
-        self.pids.append(daemon)
         self.assertTrue(self.holds(), "the fixture must reproduce the inherited lock")
         report = self.report()
         self.assertIn(f"holder {daemon} sleep", report)
@@ -135,14 +142,14 @@ class LockHolders(unittest.TestCase):
         """An unrecognized holder that takes the lock itself, then runs BODY."""
         return self.start(
             sys.executable, "-c",
-            "import fcntl, os, sys, time\n"
+            "import fcntl, os, signal, sys, time\n"
             "lock = open(sys.argv[1], 'a')\n"
             "fcntl.flock(lock, fcntl.LOCK_EX)\n" + textwrap.dedent(body),
             str(self.lock),
         )
 
     def test_a_holder_that_took_the_lock_itself_is_not_suspected_of_inheriting_it(self):
-        holder = self.python_holder("time.sleep(60)")
+        holder = self.python_holder("signal.pause()")
         self.wait_for(self.holds, "holder")
         report = self.report()
         self.assertRegex(
@@ -162,11 +169,11 @@ class LockHolders(unittest.TestCase):
         for _ in range(2):
             taker = self.start(
                 sys.executable, "-c",
-                "import fcntl, os, sys, time\n"
+                "import fcntl, os, signal, sys, time\n"
                 "lock = open(sys.argv[1], 'a')\n"
                 "fcntl.flock(lock, fcntl.LOCK_SH)\n"
                 "open(sys.argv[1] + '.' + str(os.getpid()), 'w').close()\n"
-                "time.sleep(60)\n",
+                "signal.pause()\n",
                 str(self.lock),
             )
             takers.append(taker)
@@ -182,9 +189,9 @@ class LockHolders(unittest.TestCase):
             child = os.fork()
             if child == 0:
                 open({str(pid_file)!r}, "w").write(str(os.getpid()))
-                time.sleep(60)
+                signal.pause()
                 os._exit(0)
-            time.sleep(60)
+            signal.pause()
         """)
         self.wait_for(lambda: pid_file.exists() and pid_file.read_text(), "child")
         child = int(pid_file.read_text())
@@ -211,10 +218,10 @@ class LockHolders(unittest.TestCase):
             child = os.fork()
             if child == 0:
                 open({str(pid_file)!r}, "w").write(str(os.getpid()))
-                time.sleep(60)
+                signal.pause()
                 os._exit(0)
             lock.close()
-            time.sleep(60)
+            signal.pause()
         """)
         self.wait_for(lambda: pid_file.exists() and pid_file.read_text(), "child")
         child = int(pid_file.read_text())
@@ -227,7 +234,7 @@ class LockHolders(unittest.TestCase):
 
     def test_a_shell_holding_the_lock_of_a_flock_that_exited_is_only_undetermined(self):
         # The usual `exec 9>LOCK; flock 9`: the process that took the lock has gone.
-        shell = self.start("bash", "-c", 'exec 9>"$0"; flock 9; exec -a holder-shell sleep 60',
+        shell = self.start("bash", "-c", 'exec 9>"$0"; flock 9; exec -a holder-shell sleep infinity',
                            str(self.lock))
         self.wait_for(self.holds, "holder")
         report = self.report()
@@ -238,7 +245,7 @@ class LockHolders(unittest.TestCase):
         self.assertNotRegex(notes, "(?i)kill|leftover")
 
     def test_a_holders_figure_is_labeled_as_its_process_age(self):
-        self.start("flock", str(self.lock), "sleep", "60")
+        self.start("flock", str(self.lock), "sleep", "infinity")
         self.wait_for(self.holds, "holder")
         report = self.report()
         self.assertRegex(report, r"process age \d+:\d\d:\d\d")
@@ -265,7 +272,7 @@ class LockHolders(unittest.TestCase):
     def test_a_holder_waiting_for_another_lock_says_which(self):
         other = self.root / "other.lock"
         other.touch()
-        self.start("flock", str(other), "sleep", "60")
+        self.start("flock", str(other), "sleep", "infinity")
         original = self.lock
         self.lock = other
         self.wait_for(self.holds, "other holder")
@@ -276,7 +283,7 @@ class LockHolders(unittest.TestCase):
         def report():
             return subprocess.run(
                 [sys.executable, "-I", "-B", str(TOOL), str(self.lock)],
-                capture_output=True, text=True, timeout=30, env=environment,
+                capture_output=True, text=True, timeout=HANG_GUARD, env=environment,
             ).stdout
         self.wait_for(lambda: "waiting for" in report(), "the note")
         text = report()
@@ -286,7 +293,7 @@ class LockHolders(unittest.TestCase):
     def test_a_gates_queue_head_waiting_for_a_slot_gets_no_note(self):
         other = self.root / "slot.lock"
         other.touch()
-        self.start("flock", str(other), "sleep", "60")
+        self.start("flock", str(other), "sleep", "infinity")
         original = self.lock
         self.lock = other
         self.wait_for(self.holds, "slot holder")
@@ -298,7 +305,7 @@ class LockHolders(unittest.TestCase):
         self.lock = original
         report = subprocess.run(
             [sys.executable, "-I", "-B", str(TOOL), str(queue)], capture_output=True, text=True,
-            timeout=30, env=os.environ | {"CAGENTS_BUILD_LOCK": str(other)},
+            timeout=HANG_GUARD, env=os.environ | {"CAGENTS_BUILD_LOCK": str(other)},
         ).stdout
         self.assertNotIn(f"waiting for {other}", report)
 
@@ -315,7 +322,7 @@ class LockHolders(unittest.TestCase):
         queue = self.root / "shared.lock.queue"
         queue.touch()
         self.lock = queue
-        self.start("flock", str(queue), "sleep", "60")
+        self.start("flock", str(queue), "sleep", "infinity")
         self.wait_for(self.holds, "holder")
         self.assertNotIn("note:", self.report())
 
@@ -324,7 +331,7 @@ class LockHolders(unittest.TestCase):
                      "prune-build-dirs"):
             with self.subTest(name=name):
                 program = self.root / name
-                program.write_text(f'#!/bin/sh\nexec 9>>"{self.lock}"\nflock 9\nsleep 60 9>&- &\nwait\n')
+                program.write_text(f'#!/bin/sh\nexec 9>>"{self.lock}"\nflock 9\nsleep infinity 9>&- &\nwait\n')
                 program.chmod(0o755)
                 self.start(str(program))
                 self.wait_for(self.holds, "holder")
@@ -342,7 +349,7 @@ class LockHolders(unittest.TestCase):
             import fcntl, subprocess
             share = open({str(self.lock)!r}, "a")
             fcntl.flock(share, fcntl.LOCK_EX)
-            subprocess.run(["sleep", "60"])
+            subprocess.run(["sleep", "infinity"])
             """))
         program.chmod(0o755)
         self.start(str(program))
@@ -352,14 +359,14 @@ class LockHolders(unittest.TestCase):
     def test_a_lock_named_through_a_symlink_is_found(self):
         link = self.root / "link.lock"
         link.symlink_to(self.lock)
-        holder = self.start("flock", str(self.lock), "sleep", "60")
+        holder = self.start("flock", str(self.lock), "sleep", "infinity")
         self.wait_for(self.holds, "holder")
         real, self.lock = self.lock, link
         self.assertIn(f"holder {holder.pid} flock", self.report())
         self.lock = real
 
     def test_a_paused_waiter_is_listed_and_a_bystander_is_not(self):
-        holder = self.start("flock", str(self.lock), "sleep", "60")
+        holder = self.start("flock", str(self.lock), "sleep", "infinity")
         self.wait_for(self.holds, "holder")
         waiter = self.start("flock", str(self.lock), "true")
         self.wait_for(lambda: f"waiting: {waiter.pid}" in self.report(), "waiter")
@@ -369,7 +376,7 @@ class LockHolders(unittest.TestCase):
         os.kill(waiter.pid, signal.SIGCONT)
         # Open but blocked on another lock: not waiting for this one.
         other = self.root / "other.lock"
-        taken = self.start("flock", str(other), "sleep", "60")
+        taken = self.start("flock", str(other), "sleep", "infinity")
         self.wait_for(lambda: self.is_held(other), "other holder")
         with self.lock.open("a") as opened:
             bystander = subprocess.Popen(
@@ -402,14 +409,15 @@ class LockHolders(unittest.TestCase):
         strange = os.fsencode(self.root) + b"/\xff"
         os.mkdir(strange)
         holder = subprocess.Popen(
-            ["flock", str(self.lock), "sleep", "60"], cwd=strange, start_new_session=True,
+            ["flock", str(self.lock), "sleep", "infinity"], cwd=strange, start_new_session=True,
         )
         self.processes.append(holder)
         self.pids.append(holder.pid)
         self.wait_for(self.holds, "holder")
         result = subprocess.run(
             [sys.executable, "-I", "-B", str(TOOL), str(self.lock)],
-            capture_output=True, env=os.environ | {"PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}, timeout=30,
+            capture_output=True, env=os.environ | {"PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"},
+            timeout=HANG_GUARD,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 

@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Exercise scripts/seed-build-dir on private directories."""
 
+import fcntl
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
 import textwrap
+import threading
 import time
 import tomllib
 import unittest
@@ -19,6 +21,8 @@ CARGO_TAG = (
 )
 REPOSITORY = Path(__file__).resolve().parents[1]
 SEED = REPOSITORY / "scripts/seed-build-dir"
+# Bounds only a hang: every wait it guards returns as soon as what it waits for happens.
+HANG_GUARD = 60
 # The probes live outside the repository, beyond its rust-toolchain.toml.
 TOOLCHAIN = tomllib.loads((REPOSITORY / "rust-toolchain.toml").read_text())["toolchain"]["channel"]
 
@@ -172,7 +176,7 @@ class CopiedFingerprints(unittest.TestCase):
         run("git", "worktree", "add", "-q", "--detach", str(worktree))
         self.diverge(worktree)
         result = subprocess.run([SEED], cwd=worktree, env=git, capture_output=True, text=True,
-                                timeout=60)
+                                timeout=HANG_GUARD)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(f"seeded {builds / str(worktree).lstrip('/') / 'target'} from {main_build}",
                       result.stderr)
@@ -241,7 +245,7 @@ class CopiedFingerprints(unittest.TestCase):
         (tools / "find").chmod(0o755)
         result = subprocess.run([SEED, "--forget-local", ""], cwd=worktree,
                                 env={**self.env, "PATH": f"{tools}:{os.environ['PATH']}"},
-                                capture_output=True, text=True, timeout=30)
+                                capture_output=True, text=True, timeout=HANG_GUARD)
         self.assertFalse(searched.exists())
         self.assertEqual(result.returncode, 2)
 
@@ -376,7 +380,7 @@ class SeedBuildDir(unittest.TestCase):
         return subprocess.run(
             [str(SEED), "--from", str(self.source), "--to", str(self.destination), *arguments],
             cwd=self.checkout, env={**self.env, **changes},
-            capture_output=True, text=True, timeout=60,
+            capture_output=True, text=True, timeout=HANG_GUARD,
         )
 
     def seed_to_cargos_choice(self, tools):
@@ -384,7 +388,7 @@ class SeedBuildDir(unittest.TestCase):
         return subprocess.run(
             [str(SEED), "--from", str(self.source)], cwd=self.checkout,
             env={**self.env, "PATH": f"{tools}:{os.environ['PATH']}"},
-            capture_output=True, text=True, timeout=60,
+            capture_output=True, text=True, timeout=HANG_GUARD,
         )
 
     def fingerprints(self, *names):
@@ -515,16 +519,19 @@ exit 37
             with self.subTest(lock=lock):
                 for profile in ("debug", "dev-runtime"):
                     subprocess.run(["rm", "-rf", "--", self.destination / profile], check=True)
-                holder = subprocess.Popen(
-                    ["flock", "-x", self.source / "debug" / lock, "sleep", "2"])
-                self.addCleanup(holder.kill)
-                time.sleep(0.3)
-                started = time.monotonic()
-                result = self.seed()
+                # Held here, as a build would, and let go two seconds after
+                # the seed starts.
+                with open(self.source / "debug" / lock, "a") as held:
+                    fcntl.flock(held, fcntl.LOCK_EX)
+                    release = threading.Timer(2, held.close)
+                    started = time.monotonic()
+                    release.start()
+                    result = self.seed()
+                    release.cancel()
+                    release.join()
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("seeded", result.stderr)
                 self.assertGreaterEqual(time.monotonic() - started, 1.5)
-                holder.wait(timeout=10)
 
     def test_a_built_directory_is_left_alone(self):
         (self.destination / "debug/.fingerprint").mkdir(parents=True)
@@ -547,11 +554,11 @@ exit 37
         for name, run in (
             ("missing source", lambda: subprocess.run(
                 [str(SEED), "--from", str(self.root / "absent"), "--to", str(self.destination)],
-                env=self.env, capture_output=True, text=True, timeout=60)),
+                env=self.env, capture_output=True, text=True, timeout=HANG_GUARD)),
             ("opted out", lambda: self.seed(CAGENTS_BUILD_SEED="0")),
             ("same directory", lambda: subprocess.run(
                 [str(SEED), "--from", str(self.source), "--to", str(self.source)],
-                env=self.env, capture_output=True, text=True, timeout=60)),
+                env=self.env, capture_output=True, text=True, timeout=HANG_GUARD)),
         ):
             with self.subTest(case=name):
                 result = run()

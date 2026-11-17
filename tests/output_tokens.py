@@ -13,6 +13,8 @@ import unittest
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
+# Bounds only a hang; a passing wait returns as soon as its event arrives.
+HANG_GUARD = 60
 loader = importlib.machinery.SourceFileLoader("output_tokens", str(ROOT / "scripts/output-tokens"))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 tokens = importlib.util.module_from_spec(spec)
@@ -115,8 +117,19 @@ class OutputTokens(unittest.TestCase):
         self.assertEqual(err, "noted\n2 tokens, 11 bytes (stdout 1/5, stderr 1/6), exit 0\n")
 
     def test_show_streams_output_live_in_the_order_it_arrives(self):
-        script = "echo out1; sleep 0.2; echo err1 >&2; sleep 0.2; echo out2"
-        status, out, _ = self.run_tool("--show", "--", "sh", "-c", script, merged=True)
+        # Each write waits until the tool has read it from the pipe, so the
+        # next can never be ready alongside it, however slowly the tool runs.
+        script = (
+            "import fcntl, os, struct, termios, time\n"
+            "def drained(fd):\n"
+            f"    deadline = time.monotonic() + {HANG_GUARD}\n"
+            "    while time.monotonic() < deadline and struct.unpack('i', fcntl.ioctl(\n"
+            "            fd, termios.FIONREAD, struct.pack('i', 0)))[0]:\n"
+            "        time.sleep(0.01)\n"
+            "for fd, text in ((1, b'out1\\n'), (2, b'err1\\n'), (1, b'out2\\n')):\n"
+            "    os.write(fd, text)\n"
+            "    drained(fd)\n")
+        status, out, _ = self.run_tool("--show", "--", sys.executable, "-c", script, merged=True)
         self.assertEqual(status, 0)
         self.assertEqual(out.splitlines()[:3], ["out1", "err1", "out2"])
 

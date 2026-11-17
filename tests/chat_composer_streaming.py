@@ -19,6 +19,7 @@ _provider_spec = importlib.util.spec_from_file_location(
 chat_composer_provider = importlib.util.module_from_spec(_provider_spec)
 _provider_spec.loader.exec_module(chat_composer_provider)
 SCRIPT = chat_composer_provider.SCRIPT
+HANG_GUARD = chat_composer_provider.HANG_GUARD
 prompt = chat_composer_provider.prompt
 
 
@@ -54,7 +55,7 @@ class Peer:
             os.killpg(self.process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        self.process.wait(timeout=5)
+        self.process.wait(timeout=HANG_GUARD)
         self.selector.close()
         for pipe in (self.process.stdin, self.process.stdout, self.process.stderr):
             pipe.close()
@@ -66,7 +67,7 @@ class Peer:
         self.process.stdin.write(data)
         self.process.stdin.flush()
 
-    def until(self, predicate, timeout=3):
+    def until(self, predicate, timeout=HANG_GUARD):
         deadline = time.monotonic() + timeout
         while True:
             while b"\n" in self.buffer:
@@ -157,8 +158,9 @@ class Streaming(unittest.TestCase):
         late = {"type": "assistant", "uuid": "replay-never-@TURN@",
                 "message": {"id": "replay-never-@TURN@", "role": "assistant",
                             "content": [{"type": "text", "text": "Must not escape interruption."}]}}
+        # The 600-second pause outlasts every hang guard below, so each
+        # answer arriving at all shows the replay remains duplex.
         peer = self.start_replay({"_sleep": 600}, late, {"_end": True})
-        started = time.monotonic()
         peer.send(control("get_usage"))
         self.assertEqual(peer.response("get_usage")["response"]["response"], {"remaining": 17})
         peer.send(control("stop_task", task_id="fixture-background-command"))
@@ -168,7 +170,6 @@ class Streaming(unittest.TestCase):
         peer.send(prompt(99))
         peer.until(lambda f: f.get("command_uuid") == "prompt-99" and f.get("state") == "queued")
         peer.interrupt()
-        self.assertLess(time.monotonic() - started, 3, "the 600-second replay remains duplex")
         self.assertEqual([f["uuid"] for f in self.history()], ["prompt-1", "replay-start-1"])
         self.assertEqual(sum(f.get("type") == "result" for f in peer.frames), 1)
         self.assertFalse(any(f.get("uuid", "").startswith("replay-never-") for f in peer.frames))
@@ -184,7 +185,7 @@ class Streaming(unittest.TestCase):
                          ["prompt-1", "replay-start-1", "prompt-2", "fixture-message-2"])
         self.assertEqual(history[2]["parentUuid"], "replay-start-1")
         peer.process.stdin.close()
-        self.assertEqual(peer.process.wait(timeout=3), 0)
+        self.assertEqual(peer.process.wait(timeout=HANG_GUARD), 0)
         self.assertEqual(peer.process.stderr.read(), b"")
 
     def test_partial_interrupt_survives_a_replay_pause_deadline(self):
@@ -206,7 +207,7 @@ class Streaming(unittest.TestCase):
     def test_eof_during_long_replay_pause_exits_without_a_sleeper(self):
         peer = self.start_replay({"_sleep": 600})
         peer.process.stdin.close()
-        self.assertEqual(peer.process.wait(timeout=3), 0)
+        self.assertEqual(peer.process.wait(timeout=HANG_GUARD), 0)
         self.assertEqual(peer.process.stderr.read(), b"")
         self.assertEqual([f["uuid"] for f in self.history()], ["prompt-1", "replay-start-1"])
 
@@ -222,9 +223,9 @@ class Streaming(unittest.TestCase):
 
     def test_interrupt_settles_before_the_remaining_long_reply_and_can_start_another_turn(self):
         peer = self.start()
-        started = time.monotonic()
+        # The full stream takes 64 seconds; one that finished first would end
+        # with deltas and an assistant message, which the checks below refuse.
         peer.interrupt()
-        self.assertLess(time.monotonic() - started, 3)  # Full stream takes 64 seconds.
         result_at = next(i for i, f in enumerate(peer.frames) if f.get("type") == "result")
         self.assertFalse(any(delta(f) for f in peer.frames[result_at:]))
         self.assertEqual(sum(f.get("type") == "result" for f in peer.frames), 1)
@@ -295,7 +296,7 @@ class Streaming(unittest.TestCase):
         self.assertEqual(stopped, ["fixture-task-scout-1", "fixture-task-planner-1"])
         self.assertFalse(any(f.get("uuid") == "fixture-message-1" for f in self.history()))
         peer.process.stdin.close()
-        self.assertEqual(peer.process.wait(timeout=5), 0)
+        self.assertEqual(peer.process.wait(timeout=HANG_GUARD), 0)
         self.assertEqual(peer.process.stderr.read(), b"")
 
     def test_partial_control_survives_a_chunk_deadline_without_blocking_deltas(self):
@@ -316,14 +317,16 @@ class Streaming(unittest.TestCase):
     def test_controls_do_not_restart_the_chunk_delay(self):
         (self.config / "fixture-stream-reply").write_text("0.3\n")
         peer = self.start()
-        started = time.monotonic()
-        for index in range(8):
+        # Keep controls arriving faster than the chunk delay until the next
+        # chunk is emitted; a delay each control restarted would never end.
+        deadline = time.monotonic() + HANG_GUARD
+        index = 0
+        while sum(delta(f) for f in peer.frames) < 2:
+            self.assertLess(time.monotonic(), deadline, "controls starved the next chunk")
             peer.send(control("initialize", str(index)))
             peer.response(str(index))
             time.sleep(0.05)
-        # At least one chunk was emitted while the controls kept arriving.
-        self.assertGreaterEqual(sum(delta(f) for f in peer.frames), 2)
-        self.assertLess(time.monotonic() - started, 2)
+            index += 1
         peer.interrupt()
 
     def test_eof_finishes_the_finite_stream_and_discards_an_unterminated_input_tail(self):
@@ -332,7 +335,7 @@ class Streaming(unittest.TestCase):
         (self.config / "fixture-stream-reply").write_text("0.01\n")
         result = subprocess.run(
             [str(SCRIPT)], cwd=self.project, capture_output=True, text=True,
-            input=json.dumps(prompt(1)) + '\n{"type":"control_request"', timeout=5,
+            input=json.dumps(prompt(1)) + '\n{"type":"control_request"', timeout=HANG_GUARD,
             env={"HOME": str(self.config.parent), "CLAUDE_CONFIG_DIR": str(self.config),
                  "PATH": "/usr/local/bin:/usr/bin:/bin"})
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -347,7 +350,7 @@ class Streaming(unittest.TestCase):
             with self.subTest(value=value):
                 (self.config / "fixture-stream-reply").write_text(value + "\n")
                 result = subprocess.run([str(SCRIPT)], cwd=self.project, input="", text=True,
-                                        capture_output=True, timeout=5,
+                                        capture_output=True, timeout=HANG_GUARD,
                                         env={"HOME": str(self.config.parent),
                                              "CLAUDE_CONFIG_DIR": str(self.config),
                                              "PATH": "/usr/local/bin:/usr/bin:/bin"})
@@ -361,7 +364,7 @@ class Streaming(unittest.TestCase):
         (self.config / "fixture-stream-reply").write_text("0\n24\n")
         result = subprocess.run(
             [str(SCRIPT)], cwd=self.project, capture_output=True, text=True,
-            input=json.dumps(prompt(1)) + "\n", timeout=10,
+            input=json.dumps(prompt(1)) + "\n", timeout=HANG_GUARD,
             env={"HOME": str(self.config.parent), "CLAUDE_CONFIG_DIR": str(self.config),
                  "PATH": "/usr/local/bin:/usr/bin:/bin"})
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -377,7 +380,7 @@ class Streaming(unittest.TestCase):
         (self.config / "fixture-stream-reply").write_text("0\n")
         result = subprocess.run(
             [str(SCRIPT)], cwd=self.project, capture_output=True, text=True,
-            input=json.dumps(prompt(1)) + "\n", timeout=10,
+            input=json.dumps(prompt(1)) + "\n", timeout=HANG_GUARD,
             env={"HOME": str(self.config.parent), "CLAUDE_CONFIG_DIR": str(self.config),
                  "PATH": "/usr/local/bin:/usr/bin:/bin"})
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -390,7 +393,7 @@ class Streaming(unittest.TestCase):
             with self.subTest(value=value):
                 (self.config / "fixture-stream-reply").write_text("0.1\n" + value + "\n")
                 result = subprocess.run([str(SCRIPT)], cwd=self.project, input="", text=True,
-                                        capture_output=True, timeout=5,
+                                        capture_output=True, timeout=HANG_GUARD,
                                         env={"HOME": str(self.config.parent),
                                              "CLAUDE_CONFIG_DIR": str(self.config),
                                              "PATH": "/usr/local/bin:/usr/bin:/bin"})

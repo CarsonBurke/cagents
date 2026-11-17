@@ -19,6 +19,8 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/gh-observe"
+# Bounds only a hang; a passing wait returns as soon as its event arrives.
+HANG_GUARD = 60
 loader = importlib.machinery.SourceFileLoader("gh_observe", str(SCRIPT))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 observe = importlib.util.module_from_spec(spec)
@@ -342,12 +344,12 @@ sys.exit(42)
         return {**self.env, "EXPECT_GH_ARGS": json.dumps(self.args), **(changes or {})}
 
     def invoke(self, changes=None, cwd=None, http=True):
-        return subprocess.run([str(SCRIPT), "--shim", str(self.real), self.scope, "http" if http else "calls", *self.args], input=b"input bytes\x00", capture_output=True, env=self.environment(changes), cwd=cwd or self.repo, timeout=3)
+        return subprocess.run([str(SCRIPT), "--shim", str(self.real), self.scope, "http" if http else "calls", *self.args], input=b"input bytes\x00", capture_output=True, env=self.environment(changes), cwd=cwd or self.repo, timeout=HANG_GUARD)
 
     def opted_in(self, command=None, changes=None, http=True):
         command = command or ["gh", *self.args]
         profile = ["--http"] if http else []
-        return subprocess.run([str(SCRIPT), "run", "--real", str(self.real), "--repository", str(self.repo), *profile, "--", *command], input=b"input bytes\x00", capture_output=True, env=self.environment(changes), cwd=self.repo, timeout=5)
+        return subprocess.run([str(SCRIPT), "run", "--real", str(self.real), "--repository", str(self.repo), *profile, "--", *command], input=b"input bytes\x00", capture_output=True, env=self.environment(changes), cwd=self.repo, timeout=HANG_GUARD)
 
     def rows(self):
         return [json.loads(line) for file in (self.root / "state/cagents/gh-observe").glob("*.jsonl") for line in file.read_text().splitlines()]
@@ -447,9 +449,32 @@ sys.exit(42)
         try:
             for descriptor in descriptors:
                 fcntl.flock(descriptor, fcntl.LOCK_EX)
-            started = time.monotonic()
-            self.assert_unchanged(self.opted_in(changes={"CAGENTS_GH_COORDINATE": "1", "CAGENTS_GH_NONBLOCKING": "0"}))
-            self.assertLess(time.monotonic() - started, 2)
+            changes = {"CAGENTS_GH_COORDINATE": "1", "CAGENTS_GH_NONBLOCKING": "0"}
+            # The locks stay held and the cooldown lasts an hour, so a gated
+            # request would be deferred or outlast the hang guard.
+            self.assert_unchanged(self.opted_in(changes=changes))
+            self.assertEqual(data.read_text(), contents)
+
+            # A gate that waited and then failed open would also pass that, so
+            # prove in-process that the shim reaches real gh without a lock
+            # or sleep. Failing the fork takes its direct exec of real gh; the
+            # forked path only redirects stderr before the same exec.
+            class Executed(BaseException):
+                pass
+
+            def refused(*_arguments, **_options):
+                raise AssertionError("the shim waited before executing real gh")
+
+            with patch.dict(os.environ, self.environment(changes), clear=True), \
+                    patch.object(observe, "repository_identity", return_value=self.scope), \
+                    patch.object(observe.os, "fork", side_effect=OSError("fork unavailable")), \
+                    patch.object(observe, "exec_real", side_effect=Executed) as execute, \
+                    patch.object(observe.time, "sleep", side_effect=refused), \
+                    patch.object(fcntl, "flock", side_effect=refused), \
+                    patch.object(fcntl, "lockf", side_effect=refused):
+                with self.assertRaises(Executed):
+                    observe.shim(str(self.real), self.scope, self.args, http=True)
+            execute.assert_called_once_with(str(self.real), self.args)
             self.assertEqual(data.read_text(), contents)
         finally:
             for descriptor in descriptors:
@@ -507,14 +532,14 @@ sys.exit(42)
         try:
             launched = self.opted_in(["/usr/bin/python3", "-c", launcher], changes=env)
             self.assertEqual(launched.returncode, 0, launched.stderr)
-            deadline = time.monotonic() + 3
+            deadline = time.monotonic() + HANG_GUARD
             while not ready.exists() and time.monotonic() < deadline:
                 time.sleep(0.01)
             self.assertTrue(ready.exists())
             process = json.loads(ready.read_text())
             self.assertTrue(Path(process["wrapper"]).exists())
             release.touch()
-            deadline = time.monotonic() + 3
+            deadline = time.monotonic() + HANG_GUARD
             while not result.exists() and time.monotonic() < deadline:
                 time.sleep(0.01)
             self.assertTrue(result.exists())
@@ -559,12 +584,12 @@ sys.exit(42)
                     self.assertEqual(identity["group"], os.getpgrp())
                     self.assertEqual(identity["session"], os.getsid(0))
                     process.send_signal(signum)
-                    process.communicate(timeout=3)
+                    process.communicate(timeout=HANG_GUARD)
                     self.assertEqual(process.returncode, -signum)
                 finally:
                     if process.poll() is None:
                         process.kill()
-                        process.communicate(timeout=3)
+                        process.communicate(timeout=HANG_GUARD)
 
     def test_run_exec_preserves_tty_descriptors_and_pid(self):
         ready = self.root / "tty-ready.json"
@@ -573,13 +598,13 @@ sys.exit(42)
         process = subprocess.Popen([str(SCRIPT), "run", "--real", str(self.real), "--repository", str(self.repo), "--", "/usr/bin/python3", "-c", code], env=self.environment({"READY": str(ready)}), cwd=self.repo, stdin=slave, stdout=slave, stderr=slave)
         os.close(slave)
         try:
-            self.assertEqual(process.wait(timeout=3), 42)
+            self.assertEqual(process.wait(timeout=HANG_GUARD), 42)
             identity = json.loads(ready.read_text())
             self.assertEqual(identity, {"pid": process.pid, "group": os.getpgrp(), "ttys": [True, True, True]})
         finally:
             if process.poll() is None:
                 process.kill()
-                process.wait(timeout=3)
+                process.wait(timeout=HANG_GUARD)
             os.close(master)
 
     def test_truncated_debug_preserves_diagnostic_even_after_parser_failure(self):
