@@ -468,6 +468,61 @@ class InstalledGateSync(unittest.TestCase):
         self.assertEqual(self.recorded(), self.first)
 
 
+class OwnedCommandSupervisor(unittest.TestCase):
+    """scripts/cargo-gate-command.py on its own, with a command that reports
+    which signals it ignores and waits."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory(prefix="cagents-supervisor-", dir="/var/tmp")
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.ignored = self.root / "ignored"
+        self.command = [sys.executable, "-I", "-c", textwrap.dedent(f"""
+            import pathlib, signal
+            status = pathlib.Path("/proc/self/status").read_text().splitlines()
+            mask = next(line.split()[1] for line in status if line.startswith("SigIgn:"))
+            pathlib.Path({str(self.ignored)!r}).write_text(mask)
+            signal.pause()
+        """)]
+
+    def supervise(self, *options, ignore=()):
+        def ignoring():
+            for number in ignore:
+                signal.signal(number, signal.SIG_IGN)
+        process = subprocess.Popen(
+            [sys.executable, "-I", str(ROOT / "scripts/cargo-gate-command.py"), *options, "/dev/null",
+             *self.command], stdin=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+            preexec_fn=ignoring)
+        self.addCleanup(lambda: process.poll() is None and (process.kill(), process.wait()))
+        deadline = time.monotonic() + HANG_GUARD
+        while not self.ignored.exists():
+            self.assertLess(time.monotonic(), deadline, "the command never started")
+            if process.poll() is not None:
+                self.fail(process.stderr.read())
+            time.sleep(0.02)
+        return process
+
+    def test_a_signal_the_caller_ignores_cancels_nothing_and_stays_ignored(self):
+        # As under nohup.
+        process = self.supervise(ignore=(signal.SIGHUP,))
+        self.assertTrue(int(self.ignored.read_text(), 16) & (1 << (signal.SIGHUP - 1)))
+        process.send_signal(signal.SIGHUP)
+        time.sleep(0.3)
+        self.assertIsNone(process.poll())
+        process.terminate()
+        self.assertEqual(process.wait(timeout=HANG_GUARD), 128 + signal.SIGTERM)
+
+    def test_a_wrapper_dies_by_the_signal_that_cancelled_it_and_names_itself(self):
+        process = self.supervise("--wrapper", "some-wrapper")
+        process.send_signal(signal.SIGINT)
+        self.assertEqual(process.wait(timeout=HANG_GUARD), -signal.SIGINT)
+        failed = subprocess.run(
+            [sys.executable, "-I", str(ROOT / "scripts/cargo-gate-command.py"), "--wrapper", "some-wrapper",
+             "/dev/null", str(self.root / "missing")], capture_output=True, text=True, timeout=HANG_GUARD)
+        self.assertEqual(failed.returncode, 127)
+        self.assertTrue(failed.stderr.startswith("some-wrapper: "), failed.stderr)
+
+
 class HeldCommand(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

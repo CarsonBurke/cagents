@@ -2535,8 +2535,14 @@ class RemoteEvidence(unittest.TestCase):
         def state(pid: int) -> str:
             return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
 
-        stages = ("claim", "tool", "transport", "upload", "rsync", "checkout", "build", "status",
-                  "stopped", "stopped-wrapper")
+        # The checkout's own gate, building locally, holds on too.
+        gate = (checkout / "scripts/cargo-gate").read_text().replace(
+            "#!/bin/bash\n", '#!/bin/bash\n[ "${STUB_SSH_STAGE:-}" != local-build ] || [ "$1" = exec ] || '
+            'exec "$STUB_PYTHON" "$STUB_LOG/block-ssh.py"\n', 1)
+        self.assertIn("local-build", gate)
+        write_executable(checkout / "scripts/cargo-gate", gate, self.logs)
+        stages = ("claim", "tool", "transport", "local-build", "upload", "rsync", "checkout", "build",
+                  "status", "stopped", "stopped-wrapper")
         for stage in stages:
             for number in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
                 with self.subTest(stage=stage, signal=number):
@@ -2579,7 +2585,8 @@ class RemoteEvidence(unittest.TestCase):
                         # The wrapper alone, as a worker cancelling its own tool
                         # does; never its caller's process group.
                         process.send_signal(number)
-                        self.assertEqual(process.wait(timeout=HANG_GUARD), 128 + number,
+                        # Dying by the signal, so a calling shell stops as it would.
+                        self.assertEqual(process.wait(timeout=HANG_GUARD), -number,
                                          (self.logs / "cancel-output").read_text())
                         self.assertFalse(Path(f"/proc/{child}").exists(), "the connection outlived the wrapper")
                         # rsync ends its own connection, with a signal of its choosing.
@@ -2595,6 +2602,52 @@ class RemoteEvidence(unittest.TestCase):
                         if process.poll() is None:
                             process.kill()
                         process.wait(timeout=HANG_GUARD)
+
+    def test_a_signal_its_caller_ignores_ends_nothing(self) -> None:
+        # As under `nohup … &`, which a long pair or build is run with.
+        checkout = self.checkout("after", {"src.rs": "old\n"})
+        self.run_tool("build", "after", str(checkout))
+        (self.logs / "block-ssh.py").write_text(textwrap.dedent("""\
+            import os
+            import signal
+            from pathlib import Path
+            root = Path(os.environ["STUB_LOG"])
+            (root / "ssh-pid").write_text(str(os.getpid()))
+            signal.pause()
+        """))
+        ssh = REMOTE_STUBS["ssh"].replace("        login=(", textwrap.indent(textwrap.dedent("""
+            if [ "$*" = "bash -s" ] && [[ $(tee "$STUB_LOG/script") = *'remote_main build before '* ]]; then
+                exec "$STUB_PYTHON" "$STUB_LOG/block-ssh.py"
+            fi
+            [ "$*" != "bash -s" ] || exec 0<"$STUB_LOG/script"
+        """), "        ") + "\n        login=(", 1)
+        write_executable(self.bin / "ssh", ssh, self.logs)
+        process = subprocess.Popen(
+            [str(SCRIPT), "--remote", "buildhost", "--task", str(self.task), "build", "before", str(checkout)],
+            env={**self.env, "STUB_PYTHON": sys.executable}, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+            preexec_fn=lambda: signal.signal(signal.SIGHUP, signal.SIG_IGN),
+        )
+        pid_file = self.logs / "ssh-pid"
+        try:
+            deadline = time.monotonic() + HANG_GUARD
+            while not pid_file.exists() and process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.02)
+            child = int(pid_file.read_text())
+            process.send_signal(signal.SIGHUP)
+            time.sleep(0.5)
+            self.assertIsNone(process.poll())
+            # The connection keeps the ignore it inherited.
+            ignored = next(int(line.split()[1], 16) for line in Path(f"/proc/{child}/status").read_text().splitlines()
+                           if line.startswith("SigIgn:"))
+            self.assertTrue(ignored & (1 << (signal.SIGHUP - 1)))
+            process.terminate()
+            self.assertEqual(process.wait(timeout=HANG_GUARD), -signal.SIGTERM)
+            self.assertFalse(Path(f"/proc/{child}").exists())
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=HANG_GUARD)
 
     def test_a_failed_connection_keeps_its_exit_status(self) -> None:
         write_executable(self.bin / "ssh", "#!/bin/sh\nexit 37\n", self.logs)

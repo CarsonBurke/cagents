@@ -22,14 +22,16 @@ tool_root=${self%/scripts/*}
 # trap until the command it waits for ends, and command substitutions hold
 # most of them. So the wrapper runs under the supervisor of the gate's owned
 # commands. On TERM, HUP or INT it ends this shell, then every connection the
-# shell left, and reaps them before it exits; the host sees each connection
-# go and ends its work. Otherwise it passes the exit status on.
+# shell left, and reaps them before it dies by that signal; the host sees each
+# connection go and ends its work. A signal the caller ignores, as nohup
+# ignores HUP, stays ignored. Otherwise it passes the exit status on.
 if [ "${CAGENTS_EVIDENCE_REMOTE_SUPERVISOR:-}" = "$PPID" ]; then
     unset CAGENTS_EVIDENCE_REMOTE_SUPERVISOR
 else
     export CAGENTS_EVIDENCE_REMOTE_SUPERVISOR=$$
     # It reads cancellation from a file too, which this never writes.
-    exec /usr/bin/python3 "$tool_root/scripts/cargo-gate-command.py" /dev/null "$self" "$@"
+    exec /usr/bin/python3 -I "$tool_root/scripts/cargo-gate-command.py" --wrapper native-evidence-remote \
+        /dev/null "$self" "$@"
 fi
 
 usage() {
