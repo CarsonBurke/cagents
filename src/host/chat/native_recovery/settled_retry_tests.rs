@@ -717,7 +717,10 @@ fn verify_over_private_socket(
     fixture: &Fixture,
     original: &crate::update::recovery::Census,
 ) -> crate::update::recovery::Receipt {
-    let verified = with_private_socket(fixture, || original.verify()).unwrap();
+    let verified = with_private_socket(fixture, || {
+        original.verify(crate::update::source::BusyPatience::ONCE)
+    })
+    .unwrap();
     eprintln!(
         "private serving proof {:?}: {:?}",
         fixture.proof, verified.outcome
@@ -1163,8 +1166,13 @@ fn cold_host_hop(root: PathBuf, incarnation: &str) {
                 // bounded Busy; it cannot claim a second completion. Retry
                 // only after the winning helper has joined.
                 let results = thread::scope(|scope| {
-                    let first = scope.spawn(crate::update::recovery::retire_current_service);
-                    let second = scope.spawn(crate::update::recovery::retire_current_service);
+                    let retire = || {
+                        crate::update::recovery::retire_current_service(
+                            crate::update::source::BusyPatience::ONCE,
+                        )
+                    };
+                    let first = scope.spawn(retire);
+                    let second = scope.spawn(retire);
                     [first.join().unwrap(), second.join().unwrap()]
                 });
                 assert_eq!(
@@ -1191,7 +1199,10 @@ fn cold_host_hop(root: PathBuf, incarnation: &str) {
                     "{results:?}"
                 );
                 assert!(matches!(
-                    crate::update::recovery::retire_current_service().unwrap(),
+                    crate::update::recovery::retire_current_service(
+                        crate::update::source::BusyPatience::ONCE
+                    )
+                    .unwrap(),
                     crate::update::recovery::RetirementStatus::AlreadyCompleted
                 ));
                 Ok::<_, crate::update::UpdateError>(
@@ -1255,7 +1266,10 @@ fn cold_host_hop(root: PathBuf, incarnation: &str) {
         let (admitted, captured) = with_private_socket(&fixture, || {
             (
                 crate::update::inspect_pending_recovery(&candidate_cli, None),
-                crate::update::recovery::Census::capture(uuid::Uuid::new_v4().to_string()),
+                crate::update::recovery::Census::capture(
+                    uuid::Uuid::new_v4().to_string(),
+                    crate::update::source::BusyPatience::ONCE,
+                ),
             )
         });
         admitted.unwrap();
@@ -1303,9 +1317,14 @@ fn cold_host_hop(root: PathBuf, incarnation: &str) {
         );
         let (retired, admitted, captured) = with_private_socket(&fixture, || {
             (
-                crate::update::recovery::retire_current_service(),
+                crate::update::recovery::retire_current_service(
+                    crate::update::source::BusyPatience::ONCE,
+                ),
                 crate::update::inspect_pending_recovery(&candidate_cli, None),
-                crate::update::recovery::Census::capture(uuid::Uuid::new_v4().to_string()),
+                crate::update::recovery::Census::capture(
+                    uuid::Uuid::new_v4().to_string(),
+                    crate::update::source::BusyPatience::ONCE,
+                ),
             )
         });
         assert!(matches!(

@@ -119,6 +119,14 @@ pub enum UpdateError {
     Refused(Box<impact::Refusal>),
     #[error("{0} timed out")]
     Timeout(&'static str),
+    /// The source daemon refused a request as busy each time it was asked,
+    /// before admitting anything. `serving` is the authenticated daemon that
+    /// answered, so a receipt can say a daemon is serving.
+    #[error("{message}")]
+    SourceBusy {
+        serving: Box<crate::model::HostSessionProof>,
+        message: String,
+    },
     #[error("{0}")]
     Io(#[from] io::Error),
     #[error("invalid release metadata: {0}")]
@@ -1812,7 +1820,11 @@ fn verify_reopened_service(
         .as_ref()
         .ok_or_else(|| invalid("No pre-update census exists; recovery readiness is unverified"))?;
     let absence = (!recovery.shutdown_requested && census.source.is_none())
-        .then(|| census.verify_absence().ok())
+        .then(|| {
+            census
+                .verify_absence(source::BusyPatience::for_one_run())
+                .ok()
+        })
         .flatten();
     let receipt = if let Some(absence) = absence {
         absence
@@ -2223,7 +2235,7 @@ fn finish_handoff(
     let mut verified = probe_recovery(census, &target, state, &job.id, &mut recording_errors)?;
     if !needed
         && census.source.is_none()
-        && let Ok(absence) = census.verify_absence()
+        && let Ok(absence) = census.verify_absence(source::BusyPatience::for_one_run())
     {
         // A file-only installation did not remove a daemon. Verified absence
         // is a separate outcome, never readiness or preservation of a service.
@@ -2416,7 +2428,7 @@ fn probe_recovery(
         Ok(receipt) => Ok(receipt),
         Err(error) => {
             errors.push(error.to_string());
-            census.verify()
+            census.verify(source::BusyPatience::for_one_run())
         }
     }
 }
