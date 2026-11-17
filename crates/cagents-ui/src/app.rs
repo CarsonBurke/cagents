@@ -9115,7 +9115,10 @@ impl Cagents {
     /// Whether `card` gets chrome, the tab, title and accessible names drawn
     /// for a pane. A closed card is drawn nowhere, and a long-lived workspace
     /// holds far more closed cards than open ones, so they get none unless
-    /// the workspace strip still holds one (`held_closed`).
+    /// the workspace strip still holds one (`held_closed`). An update that
+    /// drops such a card from the strip leaves its chrome until the next full
+    /// projection, which the projection oracle would report; no update does,
+    /// as the strip lets a pane go before its card closes.
     fn wears_chrome(card: &CardState, held_closed: &[CardId]) -> bool {
         !matches!(card.existence, Existence::Closed { .. }) || held_closed.contains(&card.id)
     }

@@ -452,15 +452,55 @@ mod tests {
     fn a_closed_card_the_strip_still_holds_keeps_its_chrome() {
         let mut app = tab_fixture(2, 1600.0);
         let card = app.durable.cards[1].id;
-        let chrome = app.card_chrome[&card].title.clone();
         app.card_state_mut(card).unwrap().existence =
             super::super::project_ui::removed_existence("closed by the test");
+        // Still dressed, and still kept current, by both projection paths.
+        app.chrome_ui.user_titles.insert(card, "Renamed".into());
         drop(app.sync_chrome());
-        assert_eq!(app.card_chrome[&card].title, chrome);
+        assert_eq!(app.card_chrome[&card].title, "Renamed");
+        app.chrome_ui
+            .user_titles
+            .insert(card, "Renamed again".into());
+        drop(app.sync_scoped_chrome(&[card]));
+        assert_eq!(app.card_chrome[&card].title, "Renamed again");
+        // Once the strip lets it go, neither path dresses it.
         app.workspace = Cagents::rebuild_workspace(&app.durable);
+        drop(app.sync_scoped_chrome(&[card]));
+        assert!(!app.card_chrome.contains_key(&card));
         drop(app.sync_chrome());
         assert!(!app.card_chrome.contains_key(&card));
         assert_eq!(app.chrome_ui.terminal_ordinals[&card], 2);
+    }
+
+    /// A closed terminal has no chrome, so only the workspace changing
+    /// releases its number when the card leaves it; the next terminal still
+    /// counts on from the highest number given.
+    #[test]
+    fn a_closed_terminal_leaving_the_workspace_releases_its_number() {
+        let mut app = tab_fixture(2, 1600.0);
+        let mut history = super::super::tests::terminal_card_state();
+        history.existence = super::super::project_ui::removed_existence("history");
+        let history_id = history.id;
+        Arc::make_mut(&mut app.durable).cards.push(history);
+        drop(app.sync_chrome());
+        assert_eq!(app.chrome_ui.terminal_ordinals[&history_id], 3);
+        let chrome = app.card_chrome.len();
+        Arc::make_mut(&mut app.durable)
+            .cards
+            .retain(|card| card.id != history_id);
+        drop(app.sync_chrome());
+        assert_eq!(app.card_chrome.len(), chrome, "it had no chrome to drop");
+        assert!(!app.chrome_ui.terminal_ordinals.contains_key(&history_id));
+        let added = super::super::tests::terminal_card_state();
+        let added_id = added.id;
+        Arc::make_mut(&mut app.durable).cards.push(added);
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        drop(app.sync_chrome());
+        assert!(
+            app.card_chrome[&added_id].title.ends_with("(4)"),
+            "{}",
+            app.card_chrome[&added_id].title
+        );
     }
     use super::*;
 

@@ -877,6 +877,16 @@ fn projection_tail_timing() {
     timed("project_workspace (Full)", &mut app, &mut |app| {
         drop(app.project_workspace(false))
     });
+    // Most full projections follow an edit, which gives the workspace a new
+    // address and so rebuilds the card index and prunes terminal numbers.
+    timed(
+        "project_workspace (Full) after an edit",
+        &mut app,
+        &mut |app| {
+            Arc::make_mut(&mut app.durable);
+            drop(app.project_workspace(false))
+        },
+    );
     timed("  worktree_protections", &mut app, &mut |app| {
         app.sync_worktree_protections()
     });
