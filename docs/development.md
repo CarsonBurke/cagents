@@ -2050,7 +2050,9 @@ harness, it provides:
   `docs/performance.md`. Add `--workspace-trace` to record shared-model update
   timing, scope projection choices and activity redraw intervals. Add
   `--projection-oracle` to check every narrowed update projection against the
-  full one; see "Busy terminals and the update tail" in `docs/performance.md`.
+  full one; such a session repairs what it finds and so behaves like one that
+  projects everything, and its log is the evidence. See "Busy terminals and
+  the update tail" in `docs/performance.md`.
   These flags apply to the requested session and its relaunches; ordinary
   sessions keep their default logging. Recreate the same workload on each revision when comparing
   startup; a saved descriptor whose provider was killed is not a live chat.

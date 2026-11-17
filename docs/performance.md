@@ -440,24 +440,40 @@ count the tail passes, chrome syncs and saves each message causes.
 The full projection is the default. An update projects less only where the
 handler for its message declares what it changed, by returning a narrower
 `Projection` beside its task, so a new handler is correct before it is fast.
-Typing is the busiest case: a key that a text field took, a key release and a
+A handler that returns before the projection makes the same claim. Typing is
+the busiest case: a key that a text field took, a key release and a
 modifier change answer nothing in the workspace and project nothing, and the
-pointer crossing the tab strip changes only which tab is drawn hovered.
+pointer crossing the tab strip changes only which tab is drawn hovered. A key
+that does something, such as Ctrl+Tab moving the focus or Escape closing a
+dialog, projects everything in its own update rather than leaving the
+projection to whatever message comes next.
 
 `app/projection_oracle.rs` checks each narrower declaration. After an update
 whose projection was narrower than `Full`, it runs the full projection and
 compares what the workspace derives: the sidebar model and state, card chrome
 and indices, terminal ordinals, pane and window titles, inspectors, transcript
-probes, worktree owners and protections. Every unit test built with debug
-assertions runs it and fails, naming the message and the stale part. Before
-each outermost update it first brings that state up to date, because tests
-often arrange state directly and leave its projection to the next update. Set
-`CAGENTS_PROJECTION_ORACLE` for a development build to run the same check
-natively. It logs to the `cagents::projection_oracle` target, both a stale
-declaration and state found stale before an update, with the update before
-it, and keeps what the full projection repaired. The check doubles the
-projection work, so the timing tests turn it off and native measurements run
-without the variable.
+probes, worktree owners and protections, the panes whose working directory
+and find bar are kept, and which source control, branch comparison and
+history reads are current. It does not compare the tasks the projection
+returns. Every unit test built with debug assertions runs it and fails,
+naming the message and the stale part. Before an outermost update whose
+message can project narrowly it first brings that state up to date, because
+tests often arrange state directly and leave its projection to the next
+update. An update whose handler returned before projecting is checked when
+it returns if its state was brought up to date first. Otherwise the next
+update that brings the state up to date reports what it found stale against
+that earlier update, rather than repairing it silently; stale state found
+after an update that did project is put down to a test's own arrangement.
+
+Set `CAGENTS_PROJECTION_ORACLE` for a development build to run the same
+check natively. It logs to the `cagents::projection_oracle` target, both a
+stale declaration and state found stale before an update, with the update
+before it. Each check keeps what its full projection repaired and runs the
+tasks it returned, so such a session behaves as though every update
+projected everything: it cannot show a stale title or sidebar, and only its
+log shows whether a declaration was wrong. The check adds full projections
+to narrower updates, so the timing tests turn it off and native measurements
+run without the variable.
 
 The workload for these declarations is the `realistic` native evidence seed
 (18 projects, 76 channels, 1769 cards) at 1600x1000 under `--ui-trace`, with
