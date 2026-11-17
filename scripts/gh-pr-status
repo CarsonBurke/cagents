@@ -3,6 +3,7 @@
 import argparse
 import contextlib
 import email.utils
+import errno
 import fcntl
 import fnmatch
 import hashlib
@@ -25,6 +26,9 @@ MAX_BYTES = 4 * 1024 * 1024
 REFRESH = 120
 BUILD_RETRY = 600
 HEAD_NOT_SHOWN = 5  # A readable snapshot that does not yet show --expect-head.
+# Launch errors that mean the cached binary itself is unusable, rather than
+# that this host could not start a process just now (EAGAIN, ENOMEM).
+UNUSABLE_BINARY = {errno.ENOEXEC, errno.EACCES, errno.ELIBBAD}
 DEFAULT_SOURCE = "refs/remotes/origin/main"
 # Cache the status implementation, not every unrelated change to the app.
 BUILD_INPUTS = ["src/github*", "src/control/gh.rs", "src/control.rs", "src/modules.rs",
@@ -452,7 +456,10 @@ def reported_check(check):
 
 
 def expect_head(document, head):
-    """Label DOCUMENT stale unless its snapshot shows HEAD; True when it does not.
+    """Label DOCUMENT stale unless its snapshot shows HEAD.
+
+    The exit status the check calls for: 0 when the snapshot shows HEAD,
+    HEAD_NOT_SHOWN when it shows another head, and 4 when it shows none.
 
     A read made in the seconds after a push can still see the previous head,
     and the cache then serves that snapshot as fresh for its whole interval.
@@ -461,17 +468,22 @@ def expect_head(document, head):
     """
     data = document.get("data") if isinstance(document, dict) else None
     if not isinstance(data, dict):
-        return False
+        return 4
     data["expected_head"] = head
     pr = (data.get("snapshot") or {}).get("pull_request") or {}
     shown = pr.get("headRefOid")
-    if not shown or shown.lower() == head:
-        return False
+    if isinstance(shown, str) and shown.lower() == head:
+        return 0
     data["stale"] = True
-    data.setdefault("limitations", []).append(
+    limitations = data.setdefault("limitations", [])
+    if not isinstance(shown, str) or not shown:
+        limitations.append(f"This report shows no head, so it cannot confirm {head}. Read again"
+                           + (" after retry_at." if data.get("retry_at") else "."))
+        return 4
+    limitations.append(
         f"This snapshot shows head {shown}, not {head}: GitHub may not show that push yet. "
         + ("Read again after retry_at." if data.get("retry_at") else "Read again."))
-    return True
+    return HEAD_NOT_SHOWN
 
 
 def checked_cli(result, head):
@@ -486,9 +498,9 @@ def checked_cli(result, head):
             print("gh-pr-status: the cached CLI printed no JSON report, so the head is unchecked",
                   file=sys.stderr)
         return status or 4
-    moved = expect_head(document, head)
+    checked = expect_head(document, head)
     print(json.dumps(document, separators=(",", ":"), ensure_ascii=False))
-    return status or (HEAD_NOT_SHOWN if moved else 0)
+    return status or checked
 
 
 def output(saved, key, as_json, head=None):
@@ -514,10 +526,10 @@ def output(saved, key, as_json, head=None):
     if as_json:
         document = {"ok": True, "command": "gh.pr_status", "data": report,
                     "limitations": [bootstrap] if partial else []}
-        moved = head is not None and expect_head(document, head)
+        checked = expect_head(document, head) if head is not None else 0
         print(json.dumps(document))
-        if moved and not failed:
-            return HEAD_NOT_SHOWN
+        if not failed:
+            return checked
     else:
         pr = (report["snapshot"] or {}).get("pull_request", {})
         print(f'{authority(key)}/{key["repository"]["owner"]}/{key["repository"]["name"]} #{key["number"]}: '
@@ -573,7 +585,8 @@ def main():
         except OSError as error:
             print(f"gh-pr-status: cached CLI cannot start ({error}); using shared REST cache", file=sys.stderr)
             current = binary.stat() if binary.exists() else None
-            if current and (current.st_dev, current.st_ino, current.st_mtime_ns, current.st_size) == (
+            if error.errno in UNUSABLE_BINARY and current and (
+                    current.st_dev, current.st_ino, current.st_mtime_ns, current.st_size) == (
                     identity.st_dev, identity.st_ino, identity.st_mtime_ns, identity.st_size):
                 binary.unlink()
             break

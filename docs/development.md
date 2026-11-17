@@ -1772,9 +1772,9 @@ scripts/gh-pr-status 1234 -R CarsonBurke/cagents --json --expect-head "$(git rev
 While the snapshot shows another head, the report has `stale: true`,
 `expected_head` and a `data.limitations` entry naming both heads, and the
 command exits 5; read again after `retry_at`. If a read after `retry_at`
-still shows another head, the PR has moved past your push, for example
-through someone else's push; check that head rather than reading again. A
-failed refresh still exits 4.
+still shows another head, the PR shows a head other than yours: confirm your
+push landed (`git ls-remote origin BRANCH`) and check the head it shows rather
+than reading again. A failed refresh, or a report that shows no head, exits 4.
 The check is local: it sends no request and leaves the shared cache as it is.
 `--expect-head` needs `--json` and a full commit SHA.
 

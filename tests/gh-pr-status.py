@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 """Offline bootstrap, concurrency and shared-wire coverage; never builds Rust."""
+import errno
 import importlib.machinery
 import importlib.util
 import io
@@ -429,6 +430,50 @@ print(json.dumps(dict(reason='compiler-artifact',target=dict(name='cagents',kind
         data = json.loads(out.getvalue())["data"]
         self.assertTrue(data["stale"])
         self.assertEqual(data["expected_head"], "b" * 40)
+
+    def test_a_report_with_no_head_cannot_confirm_the_pushed_head(self):
+        self.invoke()
+        self.finish_builder()
+        for snapshot in (None, {"pull_request": {}}, {"pull_request": {"headRefOid": None}}):
+            with self.subTest(snapshot=snapshot):
+                self.root.joinpath("cli-output").write_text(json.dumps({
+                    "ok": True, "command": "gh.pr_status",
+                    "data": {"stale": False, "error": None, "retry_at": None, "snapshot": snapshot}}))
+                result = self.invoke(args=("--expect-head", "a" * 40))
+                self.assertEqual(result.returncode, 4, result.stderr)
+                data = json.loads(result.stdout)["data"]
+                self.assertTrue(data["stale"])
+                self.assertIn("cannot confirm", data["limitations"][-1])
+        self.root.joinpath("cli-output").write_text(json.dumps({"ok": True, "command": "gh.pr_status"}))
+        self.assertEqual(self.invoke(args=("--expect-head", "a" * 40)).returncode, 4)
+
+    def test_only_an_unusable_binary_is_discarded_when_the_cli_cannot_start(self):
+        self.invoke()
+        self.finish_builder()
+        common, _, key = status.build_context(self.repo, "origin/main")
+        binary = common / "gh-pr-status" / key / "cagents"
+        launch = subprocess.run
+
+        def run(command, *args, **kwargs):
+            if command[0] == str(binary):
+                raise OSError(errno.EAGAIN, "Resource temporarily unavailable")
+            return launch(command, *args, **kwargs)
+
+        argv = ["gh-pr-status", "7", "-R", "o/r", "--json", "--expect-head", "a" * 40]
+        with patch.object(status, "cached_cli", return_value=binary), \
+                patch.object(status.subprocess, "run", side_effect=run), \
+                patch("sys.argv", argv), patch("sys.stdout", new_callable=io.StringIO) as out, \
+                patch("sys.stderr", new_callable=io.StringIO):
+            self.assertEqual(status.main(), 0)
+        self.assertEqual(json.loads(out.getvalue())["data"]["source"], "rest-bootstrap")
+        self.assertTrue(binary.exists(), "a host that cannot fork just now keeps a good CLI")
+        # A binary that cannot be executed at all is discarded, as without the flag.
+        binary.write_text("not an executable format")
+        result = self.invoke(args=("--expect-head", "a" * 40))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("cannot start", result.stderr)
+        self.assertFalse(binary.exists())
+        self.assertEqual(len(self.lines("requests")), 1, "both fallbacks reuse the shared REST read")
 
     def test_an_expected_head_needs_json_and_a_full_sha(self):
         for args in (["--expect-head", "a" * 40], ["--json", "--expect-head", "abc123"]):
