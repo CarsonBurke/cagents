@@ -1493,6 +1493,21 @@ scripts/test-lib ui --profile dev-runtime --prefix app::chat_ui::
 scripts/test-lib shared-ui --prefix settings::
 ```
 
+Prefer `test-lib` while iterating on UI library tests.
+`mise run test:ui -- --lib MODULE::` builds both the `cagents-ui` and the shared library's test harnesses on
+every edit, whatever the filter matches, so an edit to the shared library
+recompiles roughly twice as much as `scripts/test-lib ui` does
+([#2319](https://github.com/CarsonBurke/cagents/issues/2319)). The two commands
+unify the shared library's dependency features differently, because `test:ui`
+also selects `cagents` and its dev-dependencies, so the shared library and the
+dependencies whose features differ are built once for each command: the first
+switch builds that second set, and alternating rebuilds the shared library
+both ways. The same holds between `test:ui` and `scripts/test-lib shared-ui`,
+which builds the shared library's harness without `test-support`. Keep to one
+while iterating.
+`test-lib` runs Cargo without the lane tasks' warnings check, so finish with the
+lane task.
+
 Use actual full test names, or repeat `--prefix MODULE::` for literal module
 groups. Prefixes expand to ordinary full names and overlapping selections run
 once. The command rejects missing names, duplicate exact names, empty groups,
