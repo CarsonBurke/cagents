@@ -114,7 +114,8 @@ pub enum ShortcutScope {
     /// Only in a native chat pane; other panes retain the configured keys.
     Chat,
     /// Only in a pane with an inspector: not on an application page such as
-    /// Settings, which has none, nor with no pane focused.
+    /// Settings, nor a browser outside a worktree's workspace, nor with no
+    /// pane focused.
     Inspector,
 }
 
@@ -127,7 +128,7 @@ impl ShortcutScope {
             Self::OutsideTerminal => focused != FocusedPane::Terminal,
             Self::Review => focused == FocusedPane::Review,
             Self::Chat => focused == FocusedPane::Chat,
-            Self::Inspector => !matches!(focused, FocusedPane::Page | FocusedPane::None),
+            Self::Inspector => !matches!(focused, FocusedPane::NoInspector | FocusedPane::None),
         }
     }
 }
@@ -141,9 +142,10 @@ pub enum FocusedPane {
     Review,
     /// A native chat composer and transcript.
     Chat,
-    /// An application page, such as Settings, which belongs to no worktree
-    /// and so has no inspector.
-    Page,
+    /// A pane with no inspector here: an application page such as Settings,
+    /// which belongs to no worktree, or a browser outside a worktree's
+    /// workspace, which has no worktree to show.
+    NoInspector,
     /// Any other pane.
     Other,
     /// No pane has focus.
@@ -5712,7 +5714,7 @@ mod tests {
             (FocusedPane::Review, true),
             (FocusedPane::Chat, true),
             (FocusedPane::Other, true),
-            (FocusedPane::Page, false),
+            (FocusedPane::NoInspector, false),
             (FocusedPane::None, false),
         ] {
             assert_eq!(
