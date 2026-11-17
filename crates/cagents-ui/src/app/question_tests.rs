@@ -68,13 +68,9 @@ fn review_popover(app: &Cagents) -> Option<Element<'_, Message>> {
     }
 }
 
-/// The focused pull request pane, wide enough to show its review beside
-/// the files.
 fn pull_request_pane(app: &Cagents) -> Option<Element<'_, Message>> {
     match focused_card(app)? {
-        (card, CardRuntime::PullRequests(pane)) => {
-            Some(app.pull_request_card_layout(card, pane, 1200.0))
-        }
+        (card, CardRuntime::PullRequests(pane)) => Some(app.pull_request_card_view(card, pane)),
         _ => None,
     }
 }
@@ -114,6 +110,8 @@ fn review_question(
     let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&card) else {
         panic!("a pull request pane");
     };
+    // The popover opens from the review's summary, beside the files.
+    pane.file_panel_collapsed = Some(false);
     pane.review = review::ready();
     if old_head {
         review::with_old_head_review(&mut pane.review);
@@ -289,9 +287,16 @@ fn install_update() -> Opened {
     opened(app, opening, id("update.cancel"), id("update.confirm"))
 }
 
-/// A focused pull request pane whose Check out pull request found a
-/// worktree already holding the branch, offered once preparing finishes.
+/// A focused pull request pane, its review shown beside the files, whose
+/// Check out pull request found a worktree already holding the branch,
+/// offered once preparing finishes.
 fn use_existing_checkout() -> Opened {
+    existing_checkout_offered(|_, _| ())
+}
+
+/// [`use_existing_checkout`], with `meanwhile` done to the app while the
+/// checkout prepares.
+fn existing_checkout_offered(meanwhile: impl FnOnce(&mut Cagents, CardId)) -> Opened {
     use crate::pull_request_review::checkout_ui::tests::ExistingCheckout;
     let fixture = ExistingCheckout::new();
     let (mut app, project) = tests::pull_request_test_app(&[1]);
@@ -300,8 +305,10 @@ fn use_existing_checkout() -> Opened {
     let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&card) else {
         panic!("a pull request pane");
     };
+    pane.file_panel_collapsed = Some(false);
     fixture.open_review(&mut pane.review);
     let generation = pane.review.selection_generation();
+    meanwhile(&mut app, card);
     let opening = app.update(Message::PullRequestCheckoutReady {
         card,
         project,
@@ -314,15 +321,21 @@ fn use_existing_checkout() -> Opened {
             ),
         ),
     });
-    let Some(CardRuntime::PullRequests(pane)) = app.cards.get(&card) else {
-        panic!("a pull request pane");
-    };
-    let (dismiss, confirm, _) = pane.review.existing_checkout_ids();
+    let (dismiss, confirm, _) = existing_checkout_ids(&app, card);
     Opened {
         view: pull_request_pane,
         _keep: Box::new(fixture),
         ..opened(app, opening, dismiss, confirm)
     }
+}
+
+/// The existing-checkout offer's dismissal and committing action in
+/// `card`, and Check out pull request, which asks it.
+fn existing_checkout_ids(app: &Cagents, card: CardId) -> (widget::Id, widget::Id, widget::Id) {
+    let Some(CardRuntime::PullRequests(pane)) = app.cards.get(&card) else {
+        panic!("a pull request pane");
+    };
+    pane.review.existing_checkout_ids()
 }
 
 /// Opens `question` the way its user does.
@@ -712,10 +725,8 @@ fn escape_on_an_inline_question_returns_focus_to_what_asked_it() {
                 )
             }
             Question::UseExistingCheckout => {
-                let Some((_, CardRuntime::PullRequests(pane))) = focused_card(&app) else {
-                    panic!("a pull request pane");
-                };
-                let (_, _, check_out) = pane.review.existing_checkout_ids();
+                let (card, _) = focused_card(&app).expect("the pull request pane");
+                let (_, _, check_out) = existing_checkout_ids(&app, card);
                 focused_in(pull_request_pane(&app), task, check_out)
             }
             _ => unreachable!("{question:?} is not asked in place"),
@@ -851,6 +862,143 @@ fn a_usage_reset_withdrawn_behind_the_focused_pane_leaves_focus_alone() {
             &account, "accounts", "start"
         )),
         "and left the keyboard out of the accounts pane"
+    );
+}
+
+/// The existing-checkout offer arrives after preparing, so it takes the
+/// keyboard only from someone still in its pane, where it shows and nothing
+/// is in front of it; and Escape doesn't answer it where it doesn't show.
+#[test]
+fn an_existing_checkout_offer_takes_the_keyboard_only_where_it_is_seen() {
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::an_existing_checkout_offer_takes_the_keyboard_only_where_it_is_seen"
+    )) {
+        return;
+    }
+    let elsewhere = existing_checkout_offered(|app, _| {
+        let chat = chat_ui::tests::working_chat(app, "elsewhere");
+        drop(app.workspace.focus(chat));
+    });
+    assert_eq!(
+        tests::focused(&elsewhere.app, elsewhere.opening),
+        None,
+        "another pane in front keeps the keyboard"
+    );
+    let behind_popover = existing_checkout_offered(|app, card| {
+        let Some(CardRuntime::PullRequests(pane)) = app.cards.get(&card) else {
+            panic!("a pull request pane");
+        };
+        let action = pane
+            .review
+            .review_action(crate::pull_request_review::discussion_ui::Action::ToggleReview);
+        drop(app.update(Message::PullRequestReview { card, action }));
+    });
+    assert_eq!(
+        tests::focused(&behind_popover.app, behind_popover.opening),
+        None,
+        "the review popover in front keeps the keyboard"
+    );
+    let Opened {
+        mut app,
+        opening,
+        dismiss,
+        _keep,
+        ..
+    } = existing_checkout_offered(|app, card| {
+        let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&card) else {
+            panic!("a pull request pane");
+        };
+        pane.file_panel_collapsed = Some(true);
+    });
+    assert_eq!(
+        tests::focused(&app, opening),
+        None,
+        "a hidden offer takes nothing"
+    );
+    let task = app.update(escape());
+    deliver(&mut app, task);
+    let card = app.workspace.focused().expect("the pull request pane");
+    let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&card) else {
+        panic!("a pull request pane");
+    };
+    pane.file_panel_collapsed = Some(false);
+    assert_eq!(
+        asked(pull_request_pane(&app)),
+        Some(Question::UseExistingCheckout),
+        "and Escape left it to find when the files show again"
+    );
+    assert_eq!(
+        tests::focused(
+            &app,
+            Question::UseExistingCheckout.focus(dismiss.clone(), dismiss.clone())
+        ),
+        Some(dismiss),
+        "where it is still answerable"
+    );
+}
+
+/// Answering the existing-checkout offer keeps the keyboard on the control
+/// that answered, which goes on to report the reconciliation, rather than
+/// dropping it as the question becomes its outcome.
+#[test]
+fn confirming_an_existing_checkout_keeps_the_keyboard_on_its_control() {
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::confirming_an_existing_checkout_keeps_the_keyboard_on_its_control"
+    )) {
+        return;
+    }
+    use cosmic::iced::advanced::widget::operation;
+    let Opened {
+        mut app,
+        confirm,
+        _keep,
+        ..
+    } = use_existing_checkout();
+    use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+    let mut renderer = tests::headless_renderer();
+    // Frames as the runtime builds them, each from the last one's widget
+    // state, named or not.
+    let mut cache = Some(Cache::new());
+    let mut frame = |app: &Cagents, operation: &mut dyn Operation| {
+        let mut ui = UserInterface::build(
+            pull_request_pane(app).expect("the pane is focused"),
+            iced::Size::new(1600.0, 1200.0),
+            cache.take().expect("the last frame's cache"),
+            &mut renderer,
+        );
+        ui.operate(&renderer, operation);
+        // A probe reports what it found as it finishes.
+        let _ = operation.finish();
+        cache = Some(ui.into_cache());
+    };
+    // Tab took the person to the committing action.
+    frame(
+        &app,
+        &mut operation::focusable::focus::<()>(confirm.clone()),
+    );
+    let press = dialog_ui::tests::enter_control(pull_request_pane(&app).unwrap(), confirm.clone());
+    // The reconciliation it starts runs Git on a worker; this frame is the
+    // one right after.
+    drop(app.update(press));
+    assert_eq!(
+        app.inline_question().map(|(question, _)| question),
+        None,
+        "Enter answered the offer"
+    );
+    let found = Arc::new(std::sync::Mutex::new(None));
+    let sink = Arc::clone(&found);
+    frame(
+        &app,
+        &mut operation::map(operation::focusable::find_focused(), move |id| {
+            *sink.lock().unwrap() = Some(id);
+        }),
+    );
+    assert_eq!(
+        found.lock().unwrap().clone(),
+        Some(confirm),
+        "the control that answered keeps the keyboard"
     );
 }
 

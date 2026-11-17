@@ -122,12 +122,13 @@ impl Cagents {
                         pane.review
                             .offer_existing_checkout(target, reconciliation, plan.notice);
                     // The offer arrives after preparing; it takes the keyboard
-                    // only from someone still in its pane, with nothing over
-                    // it, such as the review popover.
-                    let covered = pane.review.review_escape().is_some();
-                    if covered
-                        || self.workspace.focused() != Some(card)
+                    // only from someone still in its pane, where it shows, with
+                    // nothing over it, such as the review popover.
+                    if self.workspace.focused() != Some(card)
                         || self.pane_content_inputs_blocked(card)
+                        || !matches!(self.cards.get(&card), Some(CardRuntime::PullRequests(pane))
+                            if self.pull_request_side_shown(card, pane)
+                                && pane.review.review_escape().is_none())
                     {
                         return Task::none();
                     }

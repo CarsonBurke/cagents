@@ -509,7 +509,9 @@ impl Cagents {
             return None;
         }
         match self.cards.get(&card)? {
-            CardRuntime::PullRequests(pane) => {
+            // Its questions are asked in the side panel, which a narrow card
+            // hides: Escape can't answer what isn't there.
+            CardRuntime::PullRequests(pane) if self.pull_request_side_shown(card, pane) => {
                 let (question, action) = pane.review.pane_question()?;
                 Some((question, Message::PullRequestReview { card, action }))
             }
