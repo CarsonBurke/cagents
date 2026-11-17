@@ -876,12 +876,13 @@ class Rehearsal:
             slots[slot] = window
         return slots
 
-    def open_windows(self, slots, *options, version=None):
-        # A person opens the second window once the first is on screen. Two
-        # launches milliseconds apart race each other's startup instead.
+    def open_windows(self, slots):
+        # Open each window once the previous one has mapped. With an
+        # incompatible update staged, `cagents ui` launches milliseconds apart
+        # race each other's startup, and the later one refuses to start.
         for index, slot in enumerate(slots):
-            self.call('launch', *options, slot)
-            self.wait_windows(slots[:index+1], version=version)
+            self.call('launch', slot)
+            self.wait_windows(slots[:index+1])
 
     def wait_windows(self, required, timeout=60, version=None):
         deadline = time.monotonic()+timeout
@@ -1163,7 +1164,9 @@ class Rehearsal:
             time.sleep(.1)
         else:
             raise RuntimeError('ordinary UI processes did not close before existing-only relaunch')
-        self.open_windows(['main','second'],'--restore-existing-only',version=version)
+        for slot in ('main','second'):
+            self.call('launch','--restore-existing-only',slot)
+        self.wait_windows(['main','second'],version=version)
         self.capture_chats('existing-only')
         self.call('record','existing-only-after',timeout=150)
         after=json.loads((self.root/'records/existing-only-after/snapshot.json').read_text())
