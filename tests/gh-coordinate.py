@@ -22,7 +22,10 @@ import json, os, sys, time
 from pathlib import Path
 started = time.monotonic()
 body = sys.stdin.buffer.read()
-entry = {"started": started, "argv": sys.argv[1:], "stdin": body.hex()}
+# The admission record this run inherited; its lease keeps others from rewriting it.
+records = list(Path(".git/cagents-gh-content").glob("*.lock"))
+admitted = json.loads(records[0].read_text())["started"] if len(records) == 1 else None
+entry = {"started": started, "admitted": admitted, "argv": sys.argv[1:], "stdin": body.hex()}
 fd = os.open(os.environ["FIXTURE_LOG"], os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
 os.write(fd, json.dumps(entry).encode() + b"\n")
 os.close(fd)
@@ -161,10 +164,16 @@ class CoordinationTests(unittest.TestCase):
             with self.subTest(wait=wait):
                 # The writer is held until released, so returning at all shows
                 # the budget ended the wait; the budget's length is pinned by
-                # test_wait_budget_bounds_a_blocked_admission.
+                # test_wait_budget_bounds_a_blocked_admission, and its wiring
+                # from --wait by test_wait_option_reaches_admission.
                 result = self.run_helper(["pr", "comment", "2", "-R", "owner/repo"], wait=wait)
                 self.assert_deferred(result)
-                self.assertEqual(result.stderr.count(b"waiting for content admission"), int(wait > 0))
+                # The budget starts before Git is located, so a slow start can
+                # spend a short one before the notice; a notice states it.
+                notices = result.stderr.count(b"waiting for content admission")
+                self.assertLessEqual(notices, int(wait > 0))
+                if notices:
+                    self.assertIn(f"(at most {wait:g}s total)".encode(), result.stderr)
                 self.assertEqual(len(self.calls()), 1)
         release.touch()
         writer.communicate(timeout=HANG_GUARD)
@@ -225,9 +234,11 @@ class CoordinationTests(unittest.TestCase):
         self.assertIn(b"at most 30s total", notices)
         self.assertEqual(first.returncode, 0)
         self.assertEqual(second.returncode, 0)
-        calls = sorted(self.calls(), key=lambda call: call["started"])
+        # Measure the spacing between the admissions themselves, which a
+        # slowly starting gh cannot shorten.
+        calls = sorted(self.calls(), key=lambda call: call["admitted"])
         self.assertEqual(len(calls), 2)
-        self.assertGreaterEqual(calls[1]["started"] - calls[0]["started"], 7.9)
+        self.assertGreaterEqual(calls[1]["admitted"] - calls[0]["admitted"], coordinate.WRITE_INTERVAL)
 
     def test_diagnostic_failure_does_not_change_admission(self):
         with patch.object(coordinate, "git_common_dir", return_value=self.repo / ".git"), \
@@ -249,9 +260,14 @@ class CoordinationTests(unittest.TestCase):
     def test_wait_budget_bounds_a_blocked_admission(self):
         target = ("github.com", "owner", "repo")
         clock = [100.0]
+        sleeps = []
 
         def sleep(seconds):
+            # A regression that ignored the budget must fail, not spin forever.
+            sleeps.append(seconds)
+            self.assertLess(len(sleeps), 1000, "admission kept sleeping past its budget")
             clock[0] += seconds
+            self.assertLessEqual(clock[0], 100.0 + 0.15 + 1, "admission slept past its budget")
 
         with patch.object(coordinate, "git_common_dir", return_value=self.repo / ".git"), \
                 patch.object(coordinate.time, "monotonic", side_effect=lambda: clock[0]), \
@@ -269,6 +285,21 @@ class CoordinationTests(unittest.TestCase):
                 self.assertEqual(notice.call_count, 1)
             finally:
                 os.close(holder)
+
+    def test_wait_option_reaches_admission(self):
+        for nonblocking, expected in ((None, 0.15), ("1", 0)):
+            with self.subTest(nonblocking=nonblocking):
+                environment = {key: value for key, value in os.environ.items() if key != "CAGENTS_GH_NONBLOCKING"}
+                if nonblocking:
+                    environment["CAGENTS_GH_NONBLOCKING"] = nonblocking
+                argv = [str(SCRIPT), "--real", str(self.real), "--wait", "0.15", "--",
+                        "pr", "comment", "2", "-R", "owner/repo"]
+                with patch.dict(os.environ, environment, clear=True), patch.object(coordinate.sys, "argv", argv), \
+                        patch.object(coordinate, "admit", side_effect=coordinate.Deferred("held")) as admit, \
+                        patch.object(coordinate, "diagnostic"):
+                    self.assertEqual(coordinate.main(), 75)
+                admit.assert_called_once_with(("github.com", "owner", "repo"), expected)
+                self.assertFalse(self.calls())
 
     def test_full_stderr_pipe_cannot_block_the_notice_or_change_inherited_flags(self):
         read_fd, write_fd = os.pipe()

@@ -449,9 +449,32 @@ sys.exit(42)
         try:
             for descriptor in descriptors:
                 fcntl.flock(descriptor, fcntl.LOCK_EX)
+            changes = {"CAGENTS_GH_COORDINATE": "1", "CAGENTS_GH_NONBLOCKING": "0"}
             # The locks stay held and the cooldown lasts an hour, so a gated
             # request would be deferred or outlast the hang guard.
-            self.assert_unchanged(self.opted_in(changes={"CAGENTS_GH_COORDINATE": "1", "CAGENTS_GH_NONBLOCKING": "0"}))
+            self.assert_unchanged(self.opted_in(changes=changes))
+            self.assertEqual(data.read_text(), contents)
+
+            # A gate that waited and then failed open would also pass that, so
+            # prove in-process that the shim reaches real gh without a lock
+            # or sleep. Failing the fork takes its direct exec of real gh; the
+            # forked path only redirects stderr before the same exec.
+            class Executed(BaseException):
+                pass
+
+            def refused(*_arguments, **_options):
+                raise AssertionError("the shim waited before executing real gh")
+
+            with patch.dict(os.environ, self.environment(changes), clear=True), \
+                    patch.object(observe, "repository_identity", return_value=self.scope), \
+                    patch.object(observe.os, "fork", side_effect=OSError("fork unavailable")), \
+                    patch.object(observe, "exec_real", side_effect=Executed) as execute, \
+                    patch.object(observe.time, "sleep", side_effect=refused), \
+                    patch.object(fcntl, "flock", side_effect=refused), \
+                    patch.object(fcntl, "lockf", side_effect=refused):
+                with self.assertRaises(Executed):
+                    observe.shim(str(self.real), self.scope, self.args, http=True)
+            execute.assert_called_once_with(str(self.real), self.args)
             self.assertEqual(data.read_text(), contents)
         finally:
             for descriptor in descriptors:

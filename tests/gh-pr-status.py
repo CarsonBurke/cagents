@@ -43,7 +43,8 @@ class Fixture(unittest.TestCase):
                         XDG_STATE_HOME=str(self.root / "state"),
                         GH_CONFIG_DIR=str(self.repo / "config"), GH_TOKEN="fixture-token",
                         PATH=str(self.repo / "bin") + ":/usr/bin:/bin",
-                        FIXTURE_ROOT=str(self.root), FIXTURE_HANG_GUARD=str(HANG_GUARD),
+                        # Fakes outlast the callers' guard, so a stuck hold fails the caller first.
+                        FIXTURE_ROOT=str(self.root), FIXTURE_HOLD_LIMIT=str(2 * HANG_GUARD),
                         PYTHONDONTWRITEBYTECODE="1")
         for name in ["GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"]:
             self.env.pop(name, None)
@@ -66,7 +67,7 @@ if 'graphql' in sys.argv and (r/'graphql-response').exists():
     sys.exit(0)
 if (r/'hold-rest').exists():
     (r/'rest-started').touch()
-    deadline=time.monotonic()+float(os.environ['FIXTURE_HANG_GUARD'])
+    deadline=time.monotonic()+float(os.environ['FIXTURE_HOLD_LIMIT'])
     while not (r/'release-rest').exists():
         if time.monotonic()>deadline: sys.exit(9)
         time.sleep(.01)
@@ -85,7 +86,7 @@ from pathlib import Path
 r = Path(os.environ['FIXTURE_ROOT'])
 with (r/'builds').open('a') as f: f.write(json.dumps(dict(args=sys.argv[1:], source=Path('src/github_status.rs').read_text()))+'\\n')
 (r/'build-started').touch()
-deadline=time.monotonic()+float(os.environ['FIXTURE_HANG_GUARD'])
+deadline=time.monotonic()+float(os.environ['FIXTURE_HOLD_LIMIT'])
 while (r/'hold-build').exists() and not (r/'release-build').exists():
     if time.monotonic()>deadline: sys.exit(9)
     time.sleep(.01)

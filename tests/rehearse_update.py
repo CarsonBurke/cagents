@@ -35,6 +35,9 @@ sys.modules["rehearse_update_records"] = records
 AUTHORITY = ("CAGENTS_AGENT_AUTHORITY", "CAGENTS_AGENT_TOKEN", "CAGENTS_SESSION_TOKEN")
 # Bounds only a hang; a passing wait returns as soon as its event arrives.
 HANG_GUARD = 60
+# Lifetime of helper processes whose liveness a test asserts: longer than any
+# test, but finite, so a killed runner leaks nothing for long.
+HELPER_LIFETIME = str(10 * HANG_GUARD)
 
 
 def snapshot() -> dict:
@@ -589,7 +592,7 @@ class Comparison(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="rehearse-exe-") as temporary:
             root = Path(temporary)
             sleep_image = str(Path(shutil.which("sleep")).resolve())
-            peer = subprocess.Popen(["bash", "-c", 'exec -a /fake/old-version/bin/cagentsd sleep infinity'],
+            peer = subprocess.Popen(["bash", "-c", 'exec -a /fake/old-version/bin/cagentsd sleep ' + HELPER_LIFETIME],
                                     env={**os.environ, "HOME": str(root / "home")})
             try:
                 deadline = time.monotonic() + HANG_GUARD
@@ -1267,12 +1270,12 @@ class WindowCloseTracing(unittest.TestCase):
             slot=root/'rt/cagents-ui.lock.primary'
             owner=slot.open('w')
             fcntl.flock(owner,fcntl.LOCK_EX)
-            peer=subprocess.Popen([executable,'infinity'],pass_fds=(owner.fileno(),),
+            peer=subprocess.Popen([executable,HELPER_LIFETIME],pass_fds=(owner.fileno(),),
                 env={} if sanitized else {**os.environ,'HOME':str(root/'home'),'XDG_RUNTIME_DIR':str(root/'rt')})
             try:
                 fields=(Path('/proc')/str(peer.pid)/'stat').read_text().rsplit(')',1)[1].split()
                 row={'pid':peer.pid,'start_ticks':int(fields[19]),'executable':str(executable),
-                     'argv':[str(executable),'infinity']}
+                     'argv':[str(executable),HELPER_LIFETIME]}
                 before=root/'records/before/snapshot.json'
                 before.parent.mkdir(parents=True)
                 before.write_text(json.dumps({'processes':[row]}))
@@ -1376,11 +1379,11 @@ class WindowCloseTracing(unittest.TestCase):
             monitor=records.WindowCloseMonitor(root)
             def observe():
                 ready.set()
-                monitor.stop.wait(5)
+                monitor.stop.wait(HANG_GUARD)
             with patch.object(monitor,'observe',side_effect=observe):
                 with self.assertRaisesRegex(RuntimeError,'update failed'):
                     with monitor:
-                        self.assertTrue(ready.wait(2))
+                        self.assertTrue(ready.wait(HANG_GUARD))
                         raise RuntimeError('update failed')
             self.assertFalse(monitor.thread.is_alive())
             self.assertTrue(monitor.stop.is_set())
@@ -1413,8 +1416,8 @@ class WindowCloseTracing(unittest.TestCase):
             monitor=records.WindowCloseMonitor(root)
             def observe():
                 ready.set()
-                monitor.stop.wait(5)
-                release.wait(2)
+                monitor.stop.wait(HANG_GUARD)
+                release.wait(HANG_GUARD)
             waited=monitor.finished.wait
             interruptions=[]
             def interrupted_wait(timeout):
@@ -1426,7 +1429,7 @@ class WindowCloseTracing(unittest.TestCase):
                     patch.object(monitor.finished,'wait',side_effect=interrupted_wait):
                 with self.assertRaises(KeyboardInterrupt):
                     with monitor:
-                        self.assertTrue(ready.wait(2))
+                        self.assertTrue(ready.wait(HANG_GUARD))
             self.assertTrue(monitor.finished.is_set())
             self.assertFalse(monitor.thread.is_alive())
             self.assertTrue(monitor.output.closed)
@@ -2070,7 +2073,7 @@ else:sys.exit(2)
         cli.chmod(0o755)
         (prefix/'current').symlink_to('versions/new')
         launcher=self.root/'home/.local/bin/cagents';launcher.symlink_to(prefix/'current/bin/cagents')
-        peer=subprocess.Popen(['sleep','infinity'],env={**os.environ,'HOME':str(self.root/'home')})
+        peer=subprocess.Popen(['sleep',HELPER_LIFETIME],env={**os.environ,'HOME':str(self.root/'home')})
         try:
             result=self.call('stop-daemon')
             self.assertEqual(result.returncode,0,result.stdout+result.stderr)
@@ -2182,8 +2185,8 @@ else:sys.exit(2)
         unit = self.root.name+".scope"
         # The wrapper and second child retain the real environment. Only the
         # first child's HOME attributes this scope to the private root.
-        body = ('env HOME="$1/home" sleep infinity & echo $! >"$1/private.pid"; '
-                'sleep infinity & echo $! >"$1/unrelated.pid"; wait')
+        body = (f'env HOME="$1/home" sleep {HELPER_LIFETIME} & echo $! >"$1/private.pid"; '
+                f'sleep {HELPER_LIFETIME} & echo $! >"$1/unrelated.pid"; wait')
         peer = subprocess.Popen(["systemd-run", "--user", "--scope", "--unit="+unit,
                                  "bash", "-c", body, "bash", str(self.root)],
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -2424,7 +2427,8 @@ with open(log, 'a') as stream:
     stream.write(json.dumps({'pid': os.getpid(), 'at_unix_ms': 1,
                              'event': {'kind': 'final_flush', 'complete': True}}) + '\n')
 # Model the append's sync_data and directory sync, holding the lock until the
-# monitor stops this writer; cleanup kills it, and HOLD bounds a failed run.
+# monitor stops this writer; cleanup kills it, and HOLD, which outlasts the
+# test's guards, bounds a failed run.
 time.sleep(float(hold))
 """
 
@@ -2435,7 +2439,7 @@ time.sleep(float(hold))
             diagnostics.mkdir(parents=True)
             log, lock = diagnostics/'cagents-ui.0.jsonl', diagnostics/'cagents-ui.lock'
             log.write_text('')
-            writer = subprocess.Popen([sys.executable, '-I', '-c', self.WRITER, str(log), str(lock), str(HANG_GUARD)],
+            writer = subprocess.Popen([sys.executable, '-I', '-c', self.WRITER, str(log), str(lock), str(2 * HANG_GUARD)],
                                       stdin=subprocess.PIPE, text=True)
             self.addCleanup(writer.wait)
             self.addCleanup(writer.kill)
@@ -2458,6 +2462,10 @@ time.sleep(float(hold))
             monitor.stop = Stop()
             stall = threading.Thread(target=monitor.stall_after_flush)
             stall.start()
+            self.addCleanup(stall.join, HANG_GUARD)
+            # Registered last, so it runs first: a surviving stall thread ends
+            # before the pidfd it polls is closed and possibly reused.
+            self.addCleanup(monitor.stop.set)
             self.assertTrue(polling.wait(HANG_GUARD))
             writer.stdin.write('x')
             writer.stdin.flush()
