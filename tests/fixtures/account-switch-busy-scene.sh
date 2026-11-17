@@ -11,7 +11,8 @@
 # The scene starts a conversation on the primary account, reports that account
 # limited, keeps the daemon busy (see "An automatic account switch" in
 # docs/fixtures.md), sends, and captures the card once the switch is refused.
-# It then frees the daemon and sends again. With VARIANT=exit, the
+# It then sends again, frees the daemon while that retry waits, and
+# captures where the message went. With VARIANT=exit, the
 # conversation's own Codex process exits during the wait instead, and the
 # scene ends at the refusal. VARIANT=exclusive holds the daemon exclusively.
 set -euo pipefail
@@ -148,10 +149,11 @@ sleep 38
 shot refused
 [ "${VARIANT:-}" = exit ] && exit 0
 
-release
-sleep 3
-step released
+# Send again while the daemon is still busy: the retry waits in turn.
 composer
 "$ne" drive key Return >/dev/null
+sleep 5
+shot retry-waiting
+release
 sleep 15
 shot sent-again
