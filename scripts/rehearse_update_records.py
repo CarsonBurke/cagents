@@ -929,6 +929,12 @@ def as_printed(stored: Any, printed: Any) -> Any:
     return without_launch_environments(stored) if without_launch_environments(printed) == printed else stored
 
 
+# What a compact listing row leaves out as saying nothing (is_blank in
+# src/control/fields.rs). False is left out too, but 0 == False in Python,
+# and no projected session field is a flag.
+BLANK = (None, "", [], {})
+
+
 def project(row: dict, name: str) -> dict:
     if name == "agents":
         agent = row.get("agent", {})
@@ -949,6 +955,9 @@ def project(row: dict, name: str) -> dict:
         # Listings before the compact rows named provider, surface and state
         # in PascalCase and always stated a chat's surface; compare the
         # facts, not their spelling, across an update between the two.
+        # Compact rows also leave out a blank fact, such as an untitled
+        # conversation's "" title, that the older rows stated.
+        projected = {field: value for field, value in projected.items() if value not in BLANK}
         projected.setdefault("surface", "chat")
         for field in ("surface", "provider", "state"):
             if isinstance(projected.get(field), str):

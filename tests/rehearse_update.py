@@ -193,6 +193,19 @@ class Comparison(unittest.TestCase):
         self.assertEqual([(row["change"], row["regression"]) for row in records.compare(before, after)],
                          [("surface", True)])
 
+    def test_a_blank_fact_a_compact_row_leaves_out_is_unchanged(self):
+        # The older listing stated an untitled conversation's title, and a
+        # session without a failure, as empty; compact rows leave both out.
+        before, after = snapshot(), snapshot()
+        before["sessions"]["lineage"].update(title="", failure="", channel=None, directory="/repo")
+        after["sessions"]["lineage"].update(directory="/repo")
+        self.assertEqual(records.compare(before, after), [])
+        # A title that goes blank was still lost.
+        before["sessions"]["lineage"]["title"] = "Release notes"
+        self.assertEqual([(row["change"], row["before"], row["after"], row["regression"])
+                          for row in records.compare(before, after)],
+                         [("title", "Release notes", None, True)])
+
     def test_window_compositor_id_and_focus_are_not_persistent_identity(self):
         before, after = snapshot(), snapshot()
         after["windows"]["main"].update(id=20, focused=True)
