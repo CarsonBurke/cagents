@@ -357,7 +357,9 @@ in the fixture `HOME` and run `cli daemon preflight`; its client gives up
 after a few seconds. A debug daemon whose `HOME` is inside a native-evidence
 task keeps that preflight in ordinary admission while the file exists, for at
 most two minutes, as a slow request would, so a switch sent meanwhile waits at
-the control gate for its deadline and is refused there. Remove the file to
+the control gate for its deadline and is refused there. A marker reading
+`exclusive` holds the daemon as a long operation such as an update does, so
+even the switch's connection waits. Remove the file to
 free the daemon. Release builds and any other home ignore it.
 [`tests/fixtures/account-switch-busy-scene.sh`](../tests/fixtures/account-switch-busy-scene.sh)
 prepares both accounts and plays the refused switch, sending again once the

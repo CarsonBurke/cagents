@@ -13,7 +13,7 @@
 # docs/fixtures.md), sends, and captures the card once the switch is refused.
 # It then frees the daemon and sends again. With VARIANT=exit, the
 # conversation's own Codex process exits during the wait instead, and the
-# scene ends at the refusal.
+# scene ends at the refusal. VARIANT=exclusive holds the daemon exclusively.
 set -euo pipefail
 scene=${1:?usage: account-switch-busy-scene.sh prepare|wide|narrow}
 case $scene in prepare|wide|narrow) ;; *) exit 2 ;; esac
@@ -77,7 +77,9 @@ composer() {
     "$ne" drive click "$at" >/dev/null
 }
 hold() { # Keep the daemon busy with a held shutdown preflight.
-    "$ne" env sh -c 'touch "$HOME/.cagents-fixture-hold-preflight"'
+    # VARIANT=exclusive holds the daemon as a long operation does, so even
+    # the switch's handshake waits; otherwise as a slow ordinary request.
+    "$ne" env sh -c 'case $1 in exclusive) echo exclusive ;; esac >"$HOME/.cagents-fixture-hold-preflight"' sh "${VARIANT:-}"
     # The preflight's own client gives up after a few seconds; the daemon
     # keeps holding its admission until the marker goes.
     "$ne" cli daemon preflight >/dev/null 2>&1 || :
