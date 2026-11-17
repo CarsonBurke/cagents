@@ -63,9 +63,16 @@ locate() { # regex -> centre of the last matching text run
         tail -1 | awk '{printf "%d,%d", $1 + $3 / 2, $2 + $4 / 2}'
 }
 composer() {
-    local at
-    at=$(locate 'Message')
-    [ -n "$at" ] || at=$(locate 'Now list|questions|Send again')
+    local at attempt
+    for attempt in 1 2 3; do
+        at=$(locate 'Message|Now list|questions')
+        # OCR can miss the placeholder; the composer's + stays beside it.
+        [ -n "$at" ] || at=$("$ne" drive observe 2>/dev/null |
+            sed -nE '/ +\+$/s/^ *\[t[0-9]+\] +([0-9]+), +([0-9]+) +([0-9]+)x([0-9]+).*/\1 \2 \3 \4/p' |
+            awk '$2 > 700' | tail -1 | awk '{printf "%d,%d", $1 + 75, $2 + $4 / 2}')
+        [ -n "$at" ] && break
+        sleep 1
+    done
     [ -n "$at" ] || { echo 'Could not locate the native chat composer.' >&2; return 1; }
     "$ne" drive click "$at" >/dev/null
 }

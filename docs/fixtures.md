@@ -346,7 +346,8 @@ second linked home is a different account rather than a login conflict. With
 `fixture-rollouts` in a home, a new thread writes a minimal rollout under
 `sessions/`, as Codex keeps one; a peer asked to resume a thread it doesn't
 know takes it over when its own home has that rollout, as it does once an
-account switch has copied it there. Give each home its own
+account switch has copied it there. It does not replay the earlier turns, so
+after a switch the conversation shows only what follows. Give each home its own
 `fixture-rate-limits.json`, with `{"ordinaryUsageAllowed": false}` on the
 account that should send its conversations elsewhere, and choose automatic
 routing with `cli account default codex automatic`.

@@ -9,6 +9,7 @@
 //! ordinary admission until the marker is removed, at most [`LIMIT`], then
 //! proceeds as usual. A release build, any other home, or a home without the
 //! marker is unaffected.
+use super::control_gate::ControlGate;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -20,7 +21,7 @@ const LIMIT: Duration = Duration::from_secs(120);
 const POLL: Duration = Duration::from_millis(100);
 
 /// Holds ordinary admission at `gate` while the fixture asks for it.
-pub(super) fn hold_preflight(gate: &super::control_gate::ControlGate) {
+pub(super) fn hold_preflight(gate: &ControlGate) {
     if !cfg!(debug_assertions) {
         return;
     }
@@ -28,8 +29,12 @@ pub(super) fn hold_preflight(gate: &super::control_gate::ControlGate) {
         return;
     };
     tracing::warn!(path = %marker.display(), "native-evidence fixture is holding a shutdown preflight in ordinary admission");
+    hold(gate, &marker, Instant::now() + LIMIT);
+}
+
+/// Holds ordinary admission at `gate` while `marker` exists, until `until`.
+fn hold(gate: &ControlGate, marker: &Path, until: Instant) {
     let _ordinary = gate.shared();
-    let until = Instant::now() + LIMIT;
     while marker.is_file() && Instant::now() < until && !crate::daemon::termination_requested() {
         std::thread::sleep(POLL);
     }
@@ -51,6 +56,34 @@ fn marker(home: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_held_preflight_makes_a_must_win_request_wait_out_its_deadline() {
+        let home = tempfile::tempdir().unwrap();
+        let marker = home.path().join(MARKER);
+        std::fs::write(&marker, "").unwrap();
+        let gate = ControlGate::default();
+        std::thread::scope(|scope| {
+            let held = scope.spawn(|| hold(&gate, &marker, Instant::now() + LIMIT));
+            // Give the hold its admission before a must-win request queues.
+            while gate.try_exclusive().is_some() {
+                std::thread::yield_now();
+            }
+            let waited = Instant::now();
+            assert!(
+                gate.exclusive_until(Instant::now() + Duration::from_millis(300))
+                    .is_none(),
+                "refused at its deadline while the preflight is held"
+            );
+            assert!(waited.elapsed() >= Duration::from_millis(300));
+            std::fs::remove_file(&marker).unwrap();
+            held.join().unwrap();
+        });
+        assert!(
+            gate.try_exclusive().is_some(),
+            "removing the marker frees the gate"
+        );
+    }
 
     #[test]
     fn only_a_native_evidence_home_with_the_marker_holds() {
