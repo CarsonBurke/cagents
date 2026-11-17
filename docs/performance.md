@@ -801,6 +801,13 @@ and 3,000 worktrees, because the watch budget leaves each project uncovered.
 The load still reads every status twice: once in the scan that builds the
 plan, and once after its watches are registered.
 
+The window gains most. With a 1,000-worktree project open in the native app
+on the same host, and counted from trace2 over 180 s once the load had
+settled, the window started 11,473 Git commands (63.7 per second) before and
+4,006 (22.3 per second) after: one `git status` and one `git config` per
+worktree per fallback scan. Its own CPU fell from 3.7% to 1.3% of a core, and
+its Git children's from 18.6% to 6.1%.
+
 ## Git watcher during builds
 
 The daemon's Git watcher (`notify-rs inotify loop`, from the `notify` crate)
