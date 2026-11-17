@@ -700,6 +700,18 @@ class ReopenedWindows(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'windows did not map on new'):
                 rehearsal.wait_windows(['main','second'], timeout=1, version='new')
 
+    def test_each_window_opens_once_the_previous_one_maps(self):
+        spec = importlib.util.spec_from_file_location("rehearsal_run", REPOSITORY / "scripts/rehearse_update_run.py")
+        scenario = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(scenario)
+        rehearsal = scenario.Rehearsal('/var/tmp/rehearsal-test', str(SCRIPT))
+        events = []
+        with patch.object(rehearsal, 'call', side_effect=lambda *a, **k: events.append(a)), \
+                patch.object(rehearsal, 'wait_windows', side_effect=lambda slots, **k: events.append(('wait', slots))):
+            rehearsal.open_windows(['main','second'])
+        self.assertEqual(events, [('launch', 'main'), ('wait', ['main']),
+                                  ('launch', 'second'), ('wait', ['main','second'])])
+
 
 class ScaleSeed(unittest.TestCase):
     def module(self):
