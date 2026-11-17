@@ -93,8 +93,29 @@ impl Cagents {
             self.refresh_automation_choices();
         }
         let was_draft_dialog = self.automation_ui.draft_dialog_open();
+        let was_asking = self.automation_ui.question();
+        let cancels_question = matches!(action, Action::CancelConfirmation);
         let opens_run = matches!(action, Action::OpenSession);
         match self.automation_ui.update(action) {
+            None if self.automation_ui.question().is_some()
+                && self.automation_ui.question() != was_asking =>
+            {
+                let (_, question) = self.automation_ui.question().expect("asked above");
+                question.focus(
+                    crate::automation_ui::confirmation_cancel_id(),
+                    crate::automation_ui::confirmation_confirm_id(),
+                )
+            }
+            // A question dismissed leaves the keyboard on the control that
+            // asked it, not nowhere.
+            None if cancels_question && self.automation_ui.question().is_none() => match was_asking
+            {
+                Some((_, question)) => iced::widget::operation::focus(
+                    crate::automation_ui::question_opener_id(question),
+                )
+                .map(cosmic::Action::App),
+                None => Task::none(),
+            },
             None if !was_draft_dialog && self.automation_ui.draft_dialog_open() => {
                 iced::widget::operation::focus(crate::automation_ui::draft_dialog_focus_id())
                     .map(cosmic::Action::App)

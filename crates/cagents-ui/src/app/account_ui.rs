@@ -49,6 +49,10 @@ use crate::settings::AccountUsageDisplay;
 
 pub(super) mod resets;
 mod table;
+#[cfg(test)]
+pub(super) use table::tests as table_tests;
+#[cfg(test)]
+pub(super) use table::{forget_cancel_id, forget_confirm_id, forget_item_id};
 
 fn remote_lifecycle<T: serde::de::DeserializeOwned>(
     operation: account::remote::Operation,
@@ -2483,6 +2487,21 @@ impl Cagents {
         Task::batch([self.reload_registry(), discovery])
     }
 
+    /// Whether an account's menu asks whether to forget its home.
+    pub(super) fn account_forget_asked(&self) -> bool {
+        let table = &self.account_ui.table;
+        table.confirm_remove.is_some() && table.menu == table.confirm_remove
+    }
+
+    /// The account asked whether to spend one of its usage resets.
+    pub(super) fn usage_reset_asked(&self) -> Option<AccountId> {
+        self.account_ui
+            .accounts
+            .iter()
+            .find(|state| state.reset.confirmation.is_some())
+            .map(|state| state.id.clone())
+    }
+
     /// The account popups' share of a key event, like the chrome's popups:
     /// a dialog opening closes them, and Escape closes them before anything
     /// behind.
@@ -2491,19 +2510,6 @@ impl Cagents {
             for state in &mut self.account_ui.accounts {
                 state.reset.confirmation = None;
             }
-        }
-        if !self.modal_is_open()
-            && is_escape_press(event)
-            && self
-                .account_ui
-                .accounts
-                .iter()
-                .any(|state| state.reset.confirmation.is_some())
-        {
-            for state in &mut self.account_ui.accounts {
-                state.reset.confirmation = None;
-            }
-            return Some(Task::none());
         }
         if self.account_ui.popover.is_none() && !self.account_ui.table.has_popup() {
             return None;
@@ -3111,10 +3117,18 @@ impl Cagents {
             Action::ResetConfirm(id) => self.confirm_usage_reset(id),
             Action::ResetRecover(id, reset) => self.recover_usage_reset(id, reset),
             Action::ResetCancel(id) => {
-                if let Some(state) = self.account_ui.account_mut(&id) {
-                    state.reset.confirmation = None;
+                let asked = self
+                    .account_ui
+                    .account_mut(&id)
+                    .and_then(|state| state.reset.cancel());
+                // Back on the control that offered the reset, not nowhere.
+                match asked {
+                    Some(surface) => iced::widget::operation::focus(resets::reset_control_id(
+                        &id, &surface, "start",
+                    ))
+                    .map(cosmic::Action::App),
+                    None => Task::none(),
                 }
-                Task::none()
             }
             Action::ResetFinished {
                 id,
@@ -3844,14 +3858,18 @@ impl Cagents {
                 {
                     self.account_ui.table.confirm_in_use = self.cards_on_account(&id);
                     self.account_ui.table.menu = Some(id.clone());
-                    self.account_ui.table.confirm_remove = Some(id);
+                    self.account_ui.table.confirm_remove = Some(id.clone());
+                    return dialog_ui::Question::ForgetHome
+                        .focus(table::forget_cancel_id(&id), table::forget_confirm_id(&id));
                 }
                 Task::none()
             }
-            Action::RemoveCancel => {
-                self.account_ui.table.confirm_remove = None;
-                Task::none()
-            }
+            Action::RemoveCancel => match self.account_ui.table.confirm_remove.take() {
+                // Back in the menu, on the item that asked.
+                Some(id) => iced::widget::operation::focus(table::forget_item_id(&id))
+                    .map(cosmic::Action::App),
+                None => Task::none(),
+            },
             Action::RemoveConfirm(id) => self.remove_account(id),
             Action::ArchiveDuplicate(id) => {
                 let Some((key, retained)) = self.account_ui.account(&id).and_then(|account| {

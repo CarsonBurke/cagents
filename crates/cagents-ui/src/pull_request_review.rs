@@ -25,6 +25,7 @@ use cosmic::{
 use url::Url;
 
 use crate::{
+    app::dialog_ui::Question,
     design::{self, ROW_ICON_SIZE, space},
     github::{
         FileViewedState, GitHubRepoKey, GitHubReviewApi, PullRequest, PullRequestFiles,
@@ -41,6 +42,30 @@ use crate::{
 };
 
 type ActionTask = iced::Task<Action>;
+
+/// The dismissal and the committing action of a question a pane asks. One
+/// pane asks one question at a time in each place, and every pane has its
+/// own, so focusing one never reaches another pane's.
+struct QuestionIds {
+    dismiss: widget::Id,
+    confirm: widget::Id,
+    /// The controls that ask, where the keyboard returns on dismissal.
+    discard_in_review: widget::Id,
+    discard_in_composer: widget::Id,
+    submit: widget::Id,
+}
+
+impl Default for QuestionIds {
+    fn default() -> Self {
+        Self {
+            dismiss: widget::Id::unique(),
+            confirm: widget::Id::unique(),
+            discard_in_review: widget::Id::unique(),
+            discard_in_composer: widget::Id::unique(),
+            submit: widget::Id::unique(),
+        }
+    }
+}
 
 pub use cagents::review_cache as cache;
 pub mod checkout;
@@ -578,6 +603,8 @@ pub struct State {
     files_truncated: bool,
     pages: file_pages::Pages,
     file_scroll_id: widget::Id,
+    /// The answers of the question the pane asks, this pane's own.
+    question_ids: QuestionIds,
     reveal_row: Option<(usize, usize)>,
     rows: Vec<Row>,
     file_list_mode: FileListMode,
@@ -795,6 +822,7 @@ impl State {
             files_truncated: false,
             pages: file_pages::Pages::default(),
             file_scroll_id: widget::Id::unique(),
+            question_ids: QuestionIds::default(),
             reveal_row: None,
             rows: Vec::new(),
             file_list_mode: FileListMode::Tree,

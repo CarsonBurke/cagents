@@ -10154,6 +10154,11 @@ impl Cagents {
         if let Some(answer) = self.chrome_key_event(&event) {
             return answer;
         }
+        if is_escape_press(&event)
+            && let Some(dismiss) = self.inline_escape()
+        {
+            return (self.update(dismiss), Projection::Full);
+        }
         if let Some(task) = self.account_key_event(&event) {
             return (task, Projection::Full);
         }
@@ -35033,7 +35038,7 @@ mod tests {
 
     /// An app with one project whose GitHub state lists the given open pull
     /// requests, so a sidebar row can be resolved to a review target.
-    fn pull_request_test_app(numbers: &[u64]) -> (Cagents, ProjectId) {
+    pub(super) fn pull_request_test_app(numbers: &[u64]) -> (Cagents, ProjectId) {
         let mut app = context_inspector_test_app(false);
         let project = ProjectId::new();
         app.sidebar_model.projects.push(SidebarProject::new(

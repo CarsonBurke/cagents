@@ -1148,6 +1148,21 @@ fn actions<'a>(
         .into()
 }
 
+/// The answers of the question forgetting `account` asks in its menu.
+pub(in crate::app) fn forget_cancel_id(account: &AccountId) -> widget::Id {
+    widget::Id::new(format!("account-forget/{account}/cancel"))
+}
+
+pub(in crate::app) fn forget_confirm_id(account: &AccountId) -> widget::Id {
+    widget::Id::new(format!("account-forget/{account}/confirm"))
+}
+
+/// The menu item that asks it, where the keyboard returns when it is
+/// dismissed.
+pub(in crate::app) fn forget_item_id(account: &AccountId) -> widget::Id {
+    widget::Id::new(format!("account-forget/{account}/ask"))
+}
+
 /// What removing an account does to the cards open on it.
 fn in_use_warning<'a>(cards: usize, linked: bool) -> Element<'a, Message> {
     match cards {
@@ -1177,7 +1192,7 @@ fn menu<'a>(
     let action = |action| Message::AccountUi(action);
     let id = &account.id;
     let content: Element<'a, Message> = if state.table.confirm_remove.as_ref() == Some(id) {
-        widget::column::with_children(vec![
+        let question = widget::column::with_children(vec![
             design::body(if account.account.is_linked() {
                 format!("Forget {}?", state.display_name(account))
             } else {
@@ -1195,6 +1210,7 @@ fn menu<'a>(
             widget::row::with_children(vec![
                 iced::widget::Space::new().width(Length::Fill).into(),
                 crate::ui_controls::button::secondary("Cancel")
+                    .id(forget_cancel_id(id))
                     .on_press(action(Action::RemoveCancel))
                     .into(),
                 crate::ui_controls::button::destructive(if account.account.is_linked() {
@@ -1202,6 +1218,7 @@ fn menu<'a>(
                 } else {
                     "Removal unavailable"
                 })
+                    .id(forget_confirm_id(id))
                     .on_press_maybe(account.account.is_linked().then(|| action(Action::RemoveConfirm(id.clone()))))
                     .into(),
             ])
@@ -1209,8 +1226,11 @@ fn menu<'a>(
             .into(),
         ])
         .spacing(space::S)
-        .padding(space::S)
-        .into()
+        .padding(space::S);
+        crate::app::dialog_ui::inline_question(
+            crate::app::dialog_ui::Question::ForgetHome,
+            question,
+        )
     } else {
         let mut items: Vec<Element<'a, Message>> = Vec::new();
         if state.login_conflict(account).is_none() && !state.registry.is_default(&account.account) {
@@ -1317,6 +1337,7 @@ fn menu<'a>(
                     },
                     action(Action::Remove(id.clone())),
                 )
+                .id(forget_item_id(id))
                 .on_press_maybe(account.account.is_linked().then(|| action(Action::Remove(id.clone()))))
                 .into(),
             );
@@ -1391,7 +1412,7 @@ fn login_row<'a>(login: &'a Login) -> Element<'a, Message> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::app) mod tests {
     use super::*;
 
     #[test]
@@ -1951,6 +1972,45 @@ mod tests {
                 .any(|text| text.starts_with("Last check failed:")),
             "rows do not repeat the group's explanation: {texts:?}"
         );
+    }
+
+    /// A window with a linked Codex home, whose menu can offer to forget it,
+    /// and the directory holding the home.
+    pub(in crate::app) fn linked_home(app: &mut Cagents) -> (AccountId, tempfile::TempDir) {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("linked");
+        std::fs::create_dir(&home).unwrap();
+        let key = uuid::Uuid::new_v4();
+        let mut registry = app.account_ui.registry.clone();
+        registry
+            .link(
+                Provider::Codex,
+                key,
+                home.clone(),
+                None,
+                app.account_ui.homes.as_ref(),
+                1,
+            )
+            .unwrap();
+        app.account_ui.set_registry(registry);
+        (Account::linked(Provider::Codex, key, home).id(), directory)
+    }
+
+    /// The menu of the account asked about forgetting, while one is.
+    pub(in crate::app) fn asking_menu(app: &Cagents) -> Option<Element<'_, Message>> {
+        let id = app.account_ui.table.confirm_remove.as_ref()?;
+        Some(menu(app, app.account_ui.account(id)?, None))
+    }
+
+    /// The account whose menu is open, asking or not.
+    pub(in crate::app) fn menu_account(app: &Cagents) -> Option<AccountId> {
+        app.account_ui.table.menu.clone()
+    }
+
+    /// The account menu that is open, asking or not.
+    pub(in crate::app) fn open_menu(app: &Cagents) -> Option<Element<'_, Message>> {
+        let id = app.account_ui.table.menu.as_ref()?;
+        Some(menu(app, app.account_ui.account(id)?, None))
     }
 
     #[test]

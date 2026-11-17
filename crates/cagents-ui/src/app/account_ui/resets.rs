@@ -44,6 +44,8 @@ pub(super) struct Confirmation {
     key: String,
     total_count: u64,
     identity: Option<Identity>,
+    /// Where it was asked, so the keyboard can go back there.
+    surface: String,
 }
 
 #[derive(Debug, Clone)]
@@ -88,7 +90,13 @@ impl State {
         }
     }
 
-    fn prepare(&mut self, reset: UsageReset, total_count: u64, identity: Option<Identity>) {
+    fn prepare(
+        &mut self,
+        reset: UsageReset,
+        total_count: u64,
+        identity: Option<Identity>,
+        surface: String,
+    ) {
         if self.pending.is_some() || self.uncertain.contains_key(&reset.id) {
             return;
         }
@@ -98,7 +106,13 @@ impl State {
             key,
             total_count,
             identity,
+            surface,
         });
+    }
+
+    /// Withdraws the question, returning where it was asked.
+    pub(super) fn cancel(&mut self) -> Option<String> {
+        self.confirmation.take().map(|asked| asked.surface)
     }
 
     fn submit(
@@ -283,7 +297,13 @@ fn scope_choices(snapshot: &UsageSnapshot, state: &State, now: Millis) -> Vec<Sc
     choices
 }
 
-fn reset_control_id(account: &AccountId, surface: &str, control: &str) -> widget::Id {
+const QUESTION: dialog_ui::Question = dialog_ui::Question::UseUsageReset;
+
+pub(in crate::app) fn reset_control_id(
+    account: &AccountId,
+    surface: &str,
+    control: &str,
+) -> widget::Id {
     widget::Id::new(format!("usage-reset/{surface}/{account}/{control}"))
 }
 
@@ -515,10 +535,11 @@ impl Controls {
         if let Some(pending) = &self.state.pending {
             rows.push(design::caption(format!("Using {}…", pending.reset.reset_phrase())).into());
         } else if let Some(confirmation) = &self.state.confirmation {
+            let mut question: Vec<Element<'static, Message>> = Vec::new();
             let choices = scope_choices(&self.snapshot, &self.state, self.now);
             if choices.len() > 1 {
-                rows.push(design::caption("Reset scope").into());
-                rows.push(scope_selector(
+                question.push(design::caption("Reset scope").into());
+                question.push(scope_selector(
                     &self.id,
                     &self.name,
                     &self.surface,
@@ -527,12 +548,12 @@ impl Controls {
                     self.enabled,
                 ));
             }
-            rows.push(
+            question.push(
                 design::body(confirmation.reset.confirmation_question(&self.name))
                     .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
                     .into(),
             );
-            rows.push(
+            question.push(
                 design::caption(
                     confirmation
                         .reset
@@ -541,7 +562,7 @@ impl Controls {
                 .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
                 .into(),
             );
-            rows.push(
+            question.push(
                 widget::row::with_children(vec![
                     crate::ui_controls::button::primary("Use reset")
                         .id(reset_control_id(&self.id, &self.surface, "confirm"))
@@ -558,6 +579,12 @@ impl Controls {
                 .spacing(space::S)
                 .into(),
             );
+            rows.push(crate::app::dialog_ui::inline_question(
+                QUESTION,
+                widget::column::with_children(question)
+                    .spacing(space::XS)
+                    .width(Length::Fill),
+            ));
         } else if let Some(reset) = next_reset(&self.snapshot, &self.state, self.now) {
             let label = if self.limit_context {
                 "Use a reset".into()
@@ -769,7 +796,7 @@ impl Cagents {
             && let Some(state) = self.account_ui.account_mut(&id)
         {
             let reset_id = reset.id.clone();
-            state.reset.prepare(reset, count, identity);
+            state.reset.prepare(reset, count, identity, surface.clone());
             if state.reset.confirmation.is_some() {
                 // Native buttons participate in Tab traversal; arrow movement
                 // stays within the scope list and Enter only selects a scope.
@@ -777,12 +804,17 @@ impl Cagents {
                     && state.snapshot.as_ref().is_some_and(|snapshot| {
                         scope_choices(snapshot, &state.reset, now).len() > 1
                     });
-                let focus = if several {
-                    scope_choice_id(&id, &surface, &reset_id)
+                // A choice of scope comes first, so the person decides what
+                // the reset covers before being asked to spend it.
+                return if several {
+                    iced::widget::operation::focus(scope_choice_id(&id, &surface, &reset_id))
+                        .map(cosmic::Action::App)
                 } else {
-                    reset_control_id(&id, &surface, "cancel")
+                    QUESTION.focus(
+                        reset_control_id(&id, &surface, "cancel"),
+                        reset_control_id(&id, &surface, "confirm"),
+                    )
                 };
-                return iced::widget::operation::focus(focus).map(cosmic::Action::App);
             }
         }
         Task::none()
@@ -1029,7 +1061,7 @@ fn submit_attempt(id: AccountId, owner: u64, attempt: Attempt) -> Task<Message> 
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::app) mod tests {
     use super::*;
     use crate::app::tests::context_inspector_test_app;
     use account::resets::{ResetKind, ResetScope};
@@ -1055,6 +1087,33 @@ mod tests {
             span_secs: None,
             binding: false,
         }
+    }
+
+    /// A Claude account with one reset to spend on its nearly full session,
+    /// and the message its "Use reset" sends from the accounts page.
+    pub(in crate::app) fn spendable_reset(app: &mut Cagents) -> Message {
+        let now = now_ms();
+        let mut snapshot = UsageSnapshot::state(UsageStatus::Limited, "", now);
+        snapshot.windows = vec![window(account::WindowKind::Session, "session", 0.82)];
+        let mut session = reset(ResetScope::AccountSession);
+        session.id = "session-fixture".into();
+        snapshot.resets = vec![session.clone()];
+        let id = Account::system(Provider::Claude).id();
+        let state = app.account_ui.account_mut(&id).unwrap();
+        state.present = true;
+        state.snapshot = Some(snapshot);
+        app.account_ui.installed.insert(Provider::Claude, true);
+        Message::AccountUi(Action::ResetStart(id, session.id, "accounts".into(), false))
+    }
+
+    /// The Claude account's reset controls on the accounts page.
+    pub(in crate::app) fn reset_controls(app: &Cagents) -> Option<Element<'static, Message>> {
+        let id = Account::system(Provider::Claude).id();
+        Some(
+            app.usage_reset_controls(app.account_ui.account(&id)?)?
+                .on_surface("accounts")
+                .view(),
+        )
     }
 
     #[test]
@@ -1110,15 +1169,15 @@ mod tests {
     fn cancelling_and_double_submitting_never_start_an_extra_attempt() {
         let mut state = State::default();
         let grant = reset(ResetScope::AccountWeekly);
-        state.prepare(grant.clone(), 2, None);
+        state.prepare(grant.clone(), 2, None, "accounts".into());
         state.confirmation = None;
         assert!(state.submit(&grant, 2, None).is_none());
         assert!(!state.in_flight());
-        state.prepare(grant.clone(), 2, None);
+        state.prepare(grant.clone(), 2, None, "accounts".into());
         let attempt = state.submit(&grant, 2, None).unwrap();
         assert!(uuid::Uuid::parse_str(&attempt.key).is_ok());
         assert!(state.submit(&grant, 2, None).is_none());
-        state.prepare(grant.clone(), 2, None);
+        state.prepare(grant.clone(), 2, None, "accounts".into());
         assert!(state.confirmation.is_none());
     }
 
@@ -1126,15 +1185,15 @@ mod tests {
     fn uncertainty_recovery_reuses_the_original_idempotency_key() {
         let mut state = State::default();
         let grant = reset(ResetScope::AccountWeekly);
-        state.prepare(grant.clone(), 2, None);
+        state.prepare(grant.clone(), 2, None, "accounts".into());
         let first = state.submit(&grant, 2, None).unwrap();
         assert!(state.finish(&first.key, ConsumeStatus::Unconfirmed, "Check usage".into()));
-        state.prepare(grant.clone(), 2, None);
+        state.prepare(grant.clone(), 2, None, "accounts".into());
         assert!(state.confirmation.is_none());
         let second = state.recover(&grant.id, None).unwrap();
         assert_eq!(second.key, first.key);
         assert!(state.finish(&second.key, ConsumeStatus::Reset, "Used".into()));
-        state.prepare(grant, 2, None);
+        state.prepare(grant, 2, None, "accounts".into());
         assert_ne!(state.confirmation.as_ref().unwrap().key, first.key);
     }
 
@@ -1142,7 +1201,7 @@ mod tests {
     fn inventory_changes_require_a_new_confirmation() {
         let mut state = State::default();
         let mut grant = reset(ResetScope::AccountWeekly);
-        state.prepare(grant.clone(), 2, None);
+        state.prepare(grant.clone(), 2, None, "accounts".into());
         grant.available_count = 1;
         assert!(state.submit(&grant, 2, None).is_none());
         assert!(!state.in_flight());
@@ -1153,7 +1212,7 @@ mod tests {
     fn an_older_attempt_cannot_complete_the_current_attempt() {
         let mut state = State::default();
         let grant = reset(ResetScope::AccountWeekly);
-        state.prepare(grant.clone(), 2, None);
+        state.prepare(grant.clone(), 2, None, "accounts".into());
         let current = state.submit(&grant, 2, None).unwrap();
         assert!(!state.finish("older-key", ConsumeStatus::Reset, "Used".into()));
         assert_eq!(state.pending.as_ref().unwrap().key, current.key);
@@ -1166,7 +1225,9 @@ mod tests {
         let id = Account::system(Provider::Claude).id();
         let grant = reset(ResetScope::AccountWeekly);
         let state = app.account_ui.account_mut(&id).unwrap();
-        state.reset.prepare(grant.clone(), 2, None);
+        state
+            .reset
+            .prepare(grant.clone(), 2, None, "accounts".into());
         let attempt = state.reset.submit(&grant, 2, None).unwrap();
         let owner = state.owner;
         let mut before = UsageSnapshot::state(UsageStatus::Limited, "before", now_ms());
@@ -1219,7 +1280,7 @@ mod tests {
         assert_eq!(chosen.id, "first");
         assert_eq!(scope_count(&snapshot, chosen, now), 3);
         let mut state = State::default();
-        state.prepare(chosen.clone(), 3, None);
+        state.prepare(chosen.clone(), 3, None, "accounts".into());
         assert_eq!(state.confirmation.as_ref().unwrap().total_count, 3);
         let controls = Controls {
             id: Account::system(Provider::Codex).id(),
@@ -1267,7 +1328,7 @@ mod tests {
             organization: Some("fixture-organization-b".into()),
             ..Identity::default()
         };
-        state.prepare(grant.clone(), 2, Some(original));
+        state.prepare(grant.clone(), 2, Some(original), "accounts".into());
         assert!(state.submit(&grant, 2, Some(&changed)).is_none());
         assert!(!state.in_flight());
     }
@@ -1276,7 +1337,7 @@ mod tests {
         let now = now_ms();
         let original = reset(ResetScope::Model("Fable".into()));
         let mut state = State::default();
-        state.prepare(original.clone(), 2, None);
+        state.prepare(original.clone(), 2, None, "accounts".into());
         let attempt = state.submit(&original, 2, None).unwrap();
         state.finish(
             &attempt.key,
@@ -1310,7 +1371,7 @@ mod tests {
             ConsumeStatus::Unconfirmed,
             "Check again".into(),
         );
-        state.prepare(weekly.clone(), 2, None);
+        state.prepare(weekly.clone(), 2, None, "accounts".into());
         let separate = state.submit(&weekly, 2, None).unwrap();
         assert_ne!(separate.key, recovery.key);
         assert!(state.uncertain.contains_key(&original.id));
@@ -1321,7 +1382,7 @@ mod tests {
         let mut state = State::default();
         let mut recurring = reset(ResetScope::AccountSession);
         recurring.kind = ResetKind::WeeklySession;
-        state.prepare(recurring.clone(), 1, None);
+        state.prepare(recurring.clone(), 1, None, "accounts".into());
         let attempt = state.submit(&recurring, 1, None).unwrap();
         state.finish(
             &attempt.key,
@@ -1329,7 +1390,7 @@ mod tests {
             "Check usage".into(),
         );
         assert!(state.recover(&recurring.id, None).is_none());
-        state.prepare(recurring.clone(), 1, None);
+        state.prepare(recurring.clone(), 1, None, "accounts".into());
         assert!(state.confirmation.is_none());
     }
 
@@ -1364,7 +1425,7 @@ mod tests {
         recurring.kind = ResetKind::WeeklySession;
         recurring.expires_at = Some(period_end);
         let mut state = State::default();
-        state.prepare(recurring.clone(), 1, None);
+        state.prepare(recurring.clone(), 1, None, "accounts".into());
         let previous = state.submit(&recurring, 1, None).unwrap();
         state.finish(
             &previous.key,
@@ -1396,7 +1457,7 @@ mod tests {
         assert!(state.uncertain.is_empty());
         assert!(state.feedback.is_none());
         assert_eq!(next_reset(&snapshot, &state, now).unwrap().id, recurring.id);
-        state.prepare(next_period.clone(), 1, None);
+        state.prepare(next_period.clone(), 1, None, "accounts".into());
         let next = state.submit(&next_period, 1, None).unwrap();
         assert_ne!(
             next.key, previous.key,
@@ -1407,7 +1468,7 @@ mod tests {
     fn unavailable_recovery_preserves_the_original_uncertain_request_key() {
         let mut state = State::default();
         let grant = reset(ResetScope::AccountWeekly);
-        state.prepare(grant.clone(), 2, None);
+        state.prepare(grant.clone(), 2, None, "accounts".into());
         let original = state.submit(&grant, 2, None).unwrap();
         assert!(state.finish(
             &original.key,
@@ -1422,7 +1483,7 @@ mod tests {
             "Provider unavailable".into()
         ));
         assert_eq!(state.uncertain.get(&grant.id).unwrap().key, original.key);
-        state.prepare(grant.clone(), 2, None);
+        state.prepare(grant.clone(), 2, None, "accounts".into());
         assert!(state.confirmation.is_none());
         let next_retry = state.recover(&grant.id, None).unwrap();
         assert_eq!(next_retry.key, original.key);
@@ -1452,12 +1513,17 @@ mod tests {
                 |choice| choice.reset.id == fable.id && choice.label() == "Fable · 2 available"
             )
         );
-        state.prepare(session, 1, None);
+        state.prepare(session, 1, None, "accounts".into());
         let selected = choices
             .iter()
             .find(|choice| choice.reset.id == fable.id)
             .unwrap();
-        state.prepare(selected.reset.clone(), selected.count, None);
+        state.prepare(
+            selected.reset.clone(),
+            selected.count,
+            None,
+            "accounts".into(),
+        );
         let confirmed = state.confirmation.as_ref().unwrap();
         assert_eq!(confirmed.reset.id, fable.id);
         assert_eq!(confirmed.total_count, 2);
@@ -1466,7 +1532,7 @@ mod tests {
             .iter()
             .find(|choice| choice.reset.id != fable.id)
             .unwrap();
-        state.prepare(other.reset.clone(), other.count, None);
+        state.prepare(other.reset.clone(), other.count, None, "accounts".into());
         assert!(state.confirmation.is_none());
         let pending = state.pending.as_ref().unwrap();
         assert_eq!(pending.reset.id, fable.id);
@@ -1504,7 +1570,7 @@ mod tests {
         session.id = "session-fixture".into();
         snapshot.resets = vec![fable.clone(), session.clone()];
         let mut state = State::default();
-        state.prepare(fable.clone(), 2, None);
+        state.prepare(fable.clone(), 2, None, "accounts".into());
         let attempt = state.submit(&fable, 2, None).unwrap();
         state.finish(
             &attempt.key,
@@ -1788,7 +1854,7 @@ mod tests {
         session.id = "session-fixture".into();
         snapshot.resets = vec![fable.clone(), session.clone()];
         let mut state = State::default();
-        state.prepare(fable.clone(), 2, None);
+        state.prepare(fable.clone(), 2, None, "accounts".into());
         let controls = Controls {
             id: id.clone(),
             name: "Fixture".into(),
@@ -1908,7 +1974,7 @@ mod tests {
             ),
         ] {
             let mut state = State::default();
-            state.prepare(grant.clone(), 2, None);
+            state.prepare(grant.clone(), 2, None, "accounts".into());
             let attempt = state.submit(&grant, 2, None).unwrap();
             let mut controls = Controls {
                 id: Account::system(Provider::Claude).id(),
@@ -2145,7 +2211,9 @@ mod tests {
             let state = app.account_ui.account_mut(&id).unwrap();
             state.present = true;
             state.snapshot = Some(snapshot.clone());
-            state.reset.prepare(grant.clone(), 2, None);
+            state
+                .reset
+                .prepare(grant.clone(), 2, None, "accounts".into());
             let attempt = state.reset.submit(&grant, 2, None).unwrap();
             let owner = state.owner;
             for window in &mut snapshot.windows {
@@ -2244,7 +2312,9 @@ mod tests {
             let state = app.account_ui.account_mut(&id).unwrap();
             state.present = true;
             state.snapshot = Some(snapshot.clone());
-            state.reset.prepare(grant.clone(), 2, None);
+            state
+                .reset
+                .prepare(grant.clone(), 2, None, "accounts".into());
             let attempt = state.reset.submit(&grant, 2, None).unwrap();
             let owner = state.owner;
             drop(app.finish_usage_reset(
@@ -2686,7 +2756,9 @@ mod tests {
         partial.windows = vec![window(account::WindowKind::Session, "codex:primary", 1.0)];
         partial.resets = vec![grant.clone()];
         state.snapshot = Some(partial.clone());
-        state.reset.prepare(grant.clone(), 2, None);
+        state
+            .reset
+            .prepare(grant.clone(), 2, None, "accounts".into());
         let attempt = state.reset.submit(&grant, 2, None).unwrap();
         let owner = state.owner;
         let mut complete = UsageSnapshot::state(
@@ -2908,7 +2980,7 @@ mod tests {
                 .any(|group| !group.usable_now && group.count == 9)
         );
         let mut state = State::default();
-        state.prepare(grant, 2, None);
+        state.prepare(grant, 2, None, "accounts".into());
         let controls = Controls {
             id: Account::system(Provider::Claude).id(),
             name: "fixture@example.test".into(),
@@ -3044,7 +3116,9 @@ mod tests {
             "a model grant cannot clear the account window"
         );
         let original = controls.snapshot.resets[0].clone();
-        controls.state.prepare(original.clone(), 2, None);
+        controls
+            .state
+            .prepare(original.clone(), 2, None, "accounts".into());
         let attempt = controls.state.submit(&original, 2, None).unwrap();
         controls.state.finish(
             &attempt.key,

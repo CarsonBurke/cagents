@@ -35,6 +35,32 @@ impl Cagents {
             processes: Vec::new(),
             ending: false,
         });
+        let holders =
+            cosmic::task::message(Message::ChatUi(Action::AskCloseHolders(target, session)));
+        // The person who closed the pane in front of them is answered there;
+        // a pane closed from elsewhere doesn't take the keyboard from them.
+        if self.workspace.focused() == Some(card) {
+            Task::batch([
+                QUESTION.focus(close_refusal_dismiss_id(card), close_refusal_end_id(card)),
+                holders,
+            ])
+        } else {
+            holders
+        }
+    }
+
+    pub(super) fn ask_close_holders(
+        &mut self,
+        target: Target,
+        session: chat::Session,
+    ) -> Task<Message> {
+        if self.chat_return_session(target.card).as_ref() != Some(&session)
+            || self
+                .chat_runtime_mut(target)
+                .is_none_or(|runtime| runtime.close_refusal.is_none())
+        {
+            return Task::none();
+        }
         cosmic::task::future(async move {
             let asked = session.clone();
             let result = tokio::task::spawn_blocking(move || lost_processes(asked, Vec::new()))
@@ -43,6 +69,19 @@ impl Cagents {
                 .and_then(|result| result);
             Message::ChatUi(Action::CloseHolders(target, session, result))
         })
+    }
+
+    /// The refusal on the focused pane, which Escape dismisses.
+    pub(in crate::app) fn focused_close_refusal(&self) -> Option<Target> {
+        let card = self.workspace.focused()?;
+        let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
+            return None;
+        };
+        runtime
+            .close_refusal
+            .as_ref()
+            .filter(|refusal| !refusal.ending)
+            .map(|_| runtime.target)
     }
 
     pub(super) fn show_close_holders(
@@ -141,11 +180,19 @@ impl Cagents {
     }
 
     pub(super) fn dismiss_close_refusal(&mut self, target: Target) -> Task<Message> {
-        if let Some(runtime) = self.chat_runtime_mut(target) {
-            runtime.close_refusal = None;
-        }
+        let Some(runtime) = self.chat_runtime_mut(target) else {
+            return Task::none();
+        };
+        runtime.close_refusal = None;
         self.resolve_notice(NoticeKey::ChatClose(target.card));
-        Task::none()
+        // Dismissed in the pane in front of the person, the keyboard goes
+        // back to the conversation's composer rather than nowhere.
+        if self.workspace.focused() == Some(target.card) {
+            iced::widget::operation::focus(card_control_id(target.card, "chat-composer"))
+                .map(cosmic::Action::App)
+        } else {
+            Task::none()
+        }
     }
 }
 
@@ -221,7 +268,7 @@ fn end_label(count: usize) -> String {
 }
 
 impl Runtime {
-    pub(super) fn close_refusal_view(&self) -> Option<Element<'_, Message>> {
+    pub(in crate::app) fn close_refusal_view(&self) -> Option<Element<'_, Message>> {
         Some(refusal_panel(self.close_refusal.as_ref()?, self.target))
     }
 }
@@ -286,20 +333,23 @@ fn refusal_panel(refusal: &CloseRefusal, target: Target) -> Element<'_, Message>
             );
         }
     }
-    let mut buttons: Vec<Element<'_, Message>> = Vec::new();
+    // The dismissal leads, as in every question, and stays where it is when
+    // the action ending what holds the Close arrives beside it.
+    let mut buttons: Vec<Element<'_, Message>> = vec![
+        crate::ui_controls::button::secondary("Dismiss")
+            .id(close_refusal_dismiss_id(target.card))
+            .on_press_maybe((!refusal.ending).then(|| action(Action::DismissCloseRefusal(target))))
+            .into(),
+    ];
     if proved > 0 {
         buttons.push(
             crate::ui_controls::button::destructive(end_label(proved))
                 .instead("Ending…", refusal.ending)
+                .id(close_refusal_end_id(target.card))
                 .on_press_maybe((!refusal.ending).then(|| action(Action::EndCloseHolders(target))))
                 .into(),
         );
     }
-    buttons.push(
-        crate::ui_controls::button::secondary("Dismiss")
-            .on_press_maybe((!refusal.ending).then(|| action(Action::DismissCloseRefusal(target))))
-            .into(),
-    );
     // However long the reason and the commands, the answers stay in
     // reach and the conversation above keeps its room: only the detail
     // scrolls.
@@ -324,7 +374,20 @@ fn refusal_panel(refusal: &CloseRefusal, target: Target) -> Element<'_, Message>
             ..Default::default()
         }
     }));
-    widget::container(panel).center_x(Length::Fill).into()
+    crate::app::dialog_ui::inline_question(
+        QUESTION,
+        widget::container(panel).center_x(Length::Fill),
+    )
+}
+
+const QUESTION: crate::app::dialog_ui::Question = crate::app::dialog_ui::Question::EndCloseHolders;
+
+pub(in crate::app) fn close_refusal_dismiss_id(card: CardId) -> widget::Id {
+    card_control_id(card, "close-refusal.dismiss")
+}
+
+pub(in crate::app) fn close_refusal_end_id(card: CardId) -> widget::Id {
+    card_control_id(card, "close-refusal.end")
 }
 
 #[cfg(test)]
