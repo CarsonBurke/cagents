@@ -359,6 +359,11 @@ pub enum Recovery {
     /// keeps whatever it held, including a live conversation an account
     /// switch was about to move, and the same request may be sent again.
     Busy,
+    /// The daemon took the connection but did not answer its handshake in
+    /// time, so nothing was asked of it. As with [`Self::Busy`], the request
+    /// changed nothing and may be sent again, but nothing says the daemon is
+    /// finishing another operation: it may be hung.
+    Unresponsive,
     /// The daemon refused this start and reported that repeating it cannot help.
     /// Keep the saved conversation and diagnostic without offering a retry.
     Blocked,

@@ -1593,7 +1593,16 @@ fn verify_startup_stream(
     let client = if launch_is_updating(socket)? {
         crate::control::ControlClient::from_stream(stream)
     } else {
-        crate::control::ControlClient::from_stream_until(stream, deadline)
+        #[cfg(feature = "ui")]
+        let health_request = crate::daemon_health::begin();
+        let client = crate::control::ControlClient::from_stream_until(stream, deadline);
+        // A serving daemon that took the connection and never answered is
+        // as unresponsive as one that ignores a request, so the window says
+        // so and offers its restart. An update's listener is left out: it
+        // may still be restoring, and is not yet the daemon to restart.
+        #[cfg(feature = "ui")]
+        crate::daemon_health::connection(socket, &client, health_request);
+        client
     };
     verify_daemon_protocol(client)
 }
@@ -3369,6 +3378,91 @@ mod tests {
                 .unwrap(),
                 "a declared concurrent admission still owns its restoration allowance"
             );
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let name = std::thread::current().name().unwrap().to_owned();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", &name, "--nocapture"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", root.path())
+            .env("XDG_RUNTIME_DIR", root.path())
+            .env(CHILD, "1");
+        if let Some(authority) = std::env::var_os(crate::agent_execution::AUTHORITY_ENV) {
+            command.env(crate::agent_execution::AUTHORITY_ENV, authority);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// A serving daemon that takes the connection and never answers it is
+    /// reported unresponsive, so the window offers its restart; one that
+    /// answers clears that.
+    #[cfg(feature = "ui")]
+    #[test]
+    fn an_unanswered_readiness_handshake_reports_the_daemon_unresponsive() {
+        const CHILD: &str = "CAGENTS_TEST_UNANSWERED_READINESS";
+        if std::env::var_os(CHILD).is_some() {
+            let runtime = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
+            let socket = runtime
+                .join(crate::instance::runtime_subdirectory())
+                .join(crate::terminal_ipc::SOCKET_FILE_NAME);
+            std::fs::create_dir(socket.parent().unwrap()).unwrap();
+            let listener = UnixListener::bind(&socket).unwrap();
+            for answer in [false, true] {
+                let server = thread::scope(|scope| {
+                    let server = scope.spawn(|| {
+                        let (mut stream, _) = listener.accept().unwrap();
+                        let request: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+                        if !answer {
+                            // Held, as a hung daemon holds it, until the
+                            // client gives up.
+                            let _ = read_frame::<ClientEnvelope>(&mut stream);
+                            return;
+                        }
+                        let proof = proof("answering");
+                        write_frame(
+                            &mut stream,
+                            &ServerEnvelope {
+                                version: PROTOCOL_VERSION,
+                                request_id: Some(request.request_id),
+                                proof: proof.clone(),
+                                message: ServerMessage::Response {
+                                    response: ServerResponse::Connected {
+                                        proof,
+                                        resumed: vec![],
+                                    },
+                                },
+                            },
+                        )
+                        .unwrap();
+                    });
+                    let result = verify_startup_stream(
+                        &socket,
+                        UnixStream::connect(&socket).unwrap(),
+                        Instant::now(),
+                    );
+                    assert_eq!(result.is_ok(), answer, "{result:?}");
+                    server.join()
+                });
+                server.unwrap();
+                let health = crate::daemon_health::current();
+                if answer {
+                    assert_eq!(health, crate::daemon_health::State::Responsive);
+                } else {
+                    assert!(
+                        matches!(health, crate::daemon_health::State::Unresponsive { .. }),
+                        "{health:?}"
+                    );
+                }
+            }
             return;
         }
         let root = tempfile::tempdir().unwrap();

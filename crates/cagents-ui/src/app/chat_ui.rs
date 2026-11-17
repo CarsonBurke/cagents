@@ -7921,6 +7921,16 @@ impl Cagents {
         if !chat::is_account_recovery(&source, &replacement) {
             return Task::none();
         }
+        // A refused earlier attempt no longer describes this one, which may
+        // take as long to answer.
+        if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card)
+            && runtime
+                .error
+                .as_deref()
+                .is_some_and(chat::failure::is_account_switch_refusal)
+        {
+            runtime.error = None;
+        }
         let target = self.chat_ui.next_target(card);
         self.chat_ui.phases.insert(
             card,
@@ -12328,26 +12338,34 @@ impl Cagents {
                         ]);
                     }
                     Err(failure)
-                        if failure.recovery == chat::Recovery::Busy
-                            && account_source.is_some()
+                        if matches!(
+                            failure.recovery,
+                            chat::Recovery::Busy | chat::Recovery::Unresponsive
+                        ) && account_source.is_some()
                             && automatic_submit.is_some() =>
                     {
-                        // The daemon refused the automatic switch before
-                        // admitting it, so nothing moved: the conversation
-                        // is still on its own account and the candidate never
-                        // started, so there is nothing to retire and no
-                        // account to restore. The card stays exactly as it
-                        // was. While it is still connected it says why the
-                        // send did nothing; one that lost its connection
-                        // during the wait keeps that reason and its own
-                        // reconnect instead of advice to send again.
-                        tracing::info!(card = %target.card, reason = %failure.message, "account switch refused while the daemon was busy");
+                        // The daemon never admitted the automatic switch, so
+                        // nothing moved: the conversation is still on its own
+                        // account and the candidate never started, so there
+                        // is nothing to retire and no account to restore. The
+                        // card stays exactly as it was. While it is still
+                        // connected it says why the send did nothing; one
+                        // that lost its connection during the wait keeps that
+                        // reason and its own reconnect instead of advice to
+                        // send again.
+                        tracing::info!(card = %target.card, recovery = ?failure.recovery, reason = %failure.message, "the daemon did not admit an automatic account switch");
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card)
                             && !runtime.disconnected
                             && !runtime.snapshot.exited
                         {
-                            runtime.error =
-                                Some(chat::failure::delivery::ACCOUNT_SWITCH_BUSY.to_owned());
+                            runtime.error = Some(
+                                if failure.recovery == chat::Recovery::Busy {
+                                    chat::failure::delivery::ACCOUNT_SWITCH_BUSY
+                                } else {
+                                    chat::failure::delivery::ACCOUNT_SWITCH_UNANSWERED
+                                }
+                                .to_owned(),
+                            );
                         }
                         return Task::none();
                     }
@@ -12664,8 +12682,10 @@ impl Cagents {
                         // Sending again no longer applies: the provider's own
                         // report and the way back to it stand instead.
                         if runtime.snapshot.exited
-                            && runtime.error.as_deref()
-                                == Some(chat::failure::delivery::ACCOUNT_SWITCH_BUSY)
+                            && runtime
+                                .error
+                                .as_deref()
+                                .is_some_and(chat::failure::is_account_switch_refusal)
                         {
                             runtime.error = None;
                         }
@@ -19377,6 +19397,13 @@ pub(in crate::app) mod tests {
     fn a_busy_daemon_refusing_an_automatic_switch_keeps_the_conversation_on_its_account() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let (card, target) = limited_automatic_chat(&mut app, "Keep this message");
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .attachments
+            .push(Attachment {
+                path: "kept.png".into(),
+                reference: None,
+            });
         let source = chat_runtime(&app, card).session.clone();
         let handle = chat_runtime(&app, card).handle().unwrap().clone();
         drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send))));
@@ -19418,6 +19445,20 @@ pub(in crate::app) mod tests {
             Some(chat::failure::delivery::ACCOUNT_SWITCH_BUSY)
         );
         assert_eq!(runtime.composer.text().trim(), "Keep this message");
+        assert_eq!(runtime.attachments.len(), 1, "the attachment is kept too");
+        assert_eq!(runtime.attachments[0].path, PathBuf::from("kept.png"));
+        // It answers the send; the conversation and its last turn are fine.
+        assert_eq!(runtime.reported_errors().next(), None);
+        // As drawn on screen.
+        app.chat_runtime_mut(target).unwrap().reconcile_failure_ui();
+        let notice = chat_runtime(&app, card)
+            .failure_ui
+            .incidents
+            .iter()
+            .find(|incident| incident.guidance == "Send again in a moment.")
+            .expect("the refusal is shown");
+        assert!(notice.summary.starts_with("Your message wasn't sent."));
+        assert!(notice.explained, "no details that would only repeat it");
 
         drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send))));
         assert!(
@@ -19425,6 +19466,11 @@ pub(in crate::app) mod tests {
                 .attempt(card)
                 .is_some_and(|attempt| attempt.recovery.is_some()),
             "sending again retries the switch"
+        );
+        assert_eq!(
+            chat_runtime(&app, card).error,
+            None,
+            "the earlier refusal does not stand over the retry"
         );
 
         // The operation the daemon was finishing ended this conversation's
@@ -19488,6 +19534,68 @@ pub(in crate::app) mod tests {
         assert_eq!(runtime.composer.text().trim(), "Keep this message");
         assert!(!app.chat_ui.removed_accounts.contains(&card));
         assert!(!app.chat_ui.restorable_accounts.contains_key(&card));
+    }
+
+    /// A conversation already known to have exited when the refusal arrives
+    /// keeps its exit as the reason, not advice to send again.
+    #[test]
+    fn a_refusal_after_a_known_exit_leaves_the_exit_as_the_reason() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target) = limited_automatic_chat(&mut app, "Keep this message");
+        drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send))));
+        let attempt = chat_runtime_attempt(&app, card);
+        Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).exited = true;
+        answer_start(
+            &mut app,
+            attempt,
+            Err(chat::StartFailure {
+                message: crate::terminal_ipc::DAEMON_BUSY.into(),
+                recovery: chat::Recovery::Busy,
+            }),
+        );
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.error, None);
+        assert_eq!(runtime.composer.text().trim(), "Keep this message");
+        assert!(!app.chat_ui.removed_accounts.contains(&card));
+        assert!(!app.chat_ui.restorable_accounts.contains_key(&card));
+    }
+
+    /// A daemon that never answered the switch's connection was asked
+    /// nothing, so the conversation stays as it was, as with a busy refusal,
+    /// but the notice doesn't claim another operation held it.
+    #[test]
+    fn an_unanswered_switch_keeps_the_conversation_without_claiming_busy() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target) = limited_automatic_chat(&mut app, "Keep this message");
+        let source = chat_runtime(&app, card).session.clone();
+        drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send))));
+        let attempt = chat_runtime_attempt(&app, card);
+        answer_start(
+            &mut app,
+            attempt,
+            Err(chat::StartFailure {
+                message: "could not verify the running cagents daemon: the daemon did not answer within 30 s".into(),
+                recovery: chat::Recovery::Unresponsive,
+            }),
+        );
+        assert!(!app.chat_ui.removed_accounts.contains(&card));
+        assert!(
+            app.chat_ui
+                .retiring
+                .iter()
+                .all(|retiring| retiring.card != card)
+        );
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.target, target);
+        assert!(!runtime.disconnected);
+        assert_eq!(runtime.session, source);
+        assert_eq!(
+            runtime.error.as_deref(),
+            Some(chat::failure::delivery::ACCOUNT_SWITCH_UNANSWERED)
+        );
+        assert!(!chat::failure::delivery::ACCOUNT_SWITCH_UNANSWERED.contains("busy"));
+        assert_eq!(runtime.reported_errors().next(), None);
+        assert_eq!(runtime.composer.text().trim(), "Keep this message");
     }
 
     /// Any other failed switch still leaves the removed-account recovery in

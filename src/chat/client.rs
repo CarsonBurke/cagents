@@ -49,12 +49,10 @@ fn chat_socket(intent: Intent) -> Result<std::path::PathBuf, StartFailure> {
 
 /// An account switch that could not reach the daemon before asking for
 /// anything. A daemon that took the connection but did not finish the
-/// handshake in time is busy, as when an operation holds it beyond the
-/// switch's own wait; nothing was requested of it, so the switch is
-/// refused as busy rather than as a failure that may have closed the
-/// original.
+/// handshake in time was asked nothing, so the original is untouched; it may
+/// be held by a long operation or hung, which the client cannot tell apart.
 fn switch_unadmitted(error: crate::terminal::HostedTerminalStartError) -> StartFailure {
-    let busy = matches!(
+    let unanswered = matches!(
         error,
         crate::terminal::HostedTerminalStartError::HostProtocol(
             crate::control::ControlError::ReplyTimeout { .. }
@@ -62,8 +60,8 @@ fn switch_unadmitted(error: crate::terminal::HostedTerminalStartError) -> StartF
     );
     StartFailure {
         message: error.to_string(),
-        recovery: if busy {
-            super::Recovery::Busy
+        recovery: if unanswered {
+            super::Recovery::Unresponsive
         } else {
             super::Recovery::Retry
         },
@@ -4077,7 +4075,7 @@ mod tests {
     /// A daemon too busy to finish a switch's handshake refuses it as busy;
     /// one that can't be reached at all does not claim to be busy.
     #[test]
-    fn a_switch_whose_handshake_timed_out_is_refused_as_busy() {
+    fn a_switch_whose_handshake_timed_out_is_unanswered_not_busy() {
         use super::super::Recovery;
         use crate::terminal::HostedTerminalStartError;
 
@@ -4087,7 +4085,9 @@ mod tests {
                 error: ipc::FrameError::Io(io::ErrorKind::WouldBlock.into()),
             },
         ));
-        assert_eq!(timed_out.recovery, Recovery::Busy);
+        // Nothing says another operation holds the daemon; it may be hung.
+        assert_eq!(timed_out.recovery, Recovery::Unresponsive);
+        assert!(!Recovery::Unresponsive.is_blocked());
         assert!(timed_out.message.contains("did not answer within 30 s"));
         for unreachable in [
             HostedTerminalStartError::HostProtocol(crate::control::ControlError::ConnectionClosed),
