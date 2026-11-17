@@ -21,6 +21,8 @@ SMOKE = ROOT / "scripts/smoke-release-artifacts"
 PREPARE = ROOT / "scripts/prepare-release-smoke-rootfs"
 ENTRYPOINT = ROOT / "packaging/smoke-release-artifact"
 VERSION = "1.2.3"
+# Bounds only a hang; a passing wait returns as soon as its event arrives.
+HANG_GUARD = 60
 ARTIFACTS = (
     f"cagents_{VERSION}_amd64.deb",
     f"cagents-browserless_{VERSION}_amd64.deb",
@@ -84,7 +86,7 @@ class SmokeBoundary(unittest.TestCase):
             arguments = ["--dist", str(self.dist), "--version", VERSION, "--rootfs", str(self.base)]
         return subprocess.run(
             [str(script), *arguments], env=self.environment | environment,
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, timeout=HANG_GUARD,
         )
 
     def recorded(self):
@@ -277,7 +279,7 @@ class ShutdownOrdering(unittest.TestCase):
                      str(endpoint), str(acknowledged)],
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 )
-                self.assertTrue(select.select([daemon.stdout], [], [], 5)[0], "fixture listener did not start")
+                self.assertTrue(select.select([daemon.stdout], [], [], HANG_GUARD)[0], "fixture listener did not start")
                 self.assertEqual(daemon.stdout.readline(), "ready\n")
                 epoch = Path(f"/proc/{daemon.pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
                 executable = os.readlink(f"/proc/{daemon.pid}/exe")
@@ -329,7 +331,7 @@ class ShutdownOrdering(unittest.TestCase):
                     ["/bin/bash", "-c", script], env=environment,
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 )
-                deadline = time.monotonic() + 5
+                deadline = time.monotonic() + HANG_GUARD
                 while not (acknowledged.exists() and observed.exists()):
                     if smoke.poll() is not None or time.monotonic() >= deadline:
                         self.assertFalse(premature.exists(), "status queried the original closing listener before the identity wait")
@@ -339,12 +341,12 @@ class ShutdownOrdering(unittest.TestCase):
                 # This barrier, not a scheduling delay, holds the original socket
                 # open until the production same_daemon wait has actually begun.
                 with socket.socket(socket.AF_UNIX) as connection:
-                    connection.settimeout(1)
+                    connection.settimeout(HANG_GUARD)
                     connection.connect(str(endpoint))
                 daemon.stdin.write("exit\n")
                 daemon.stdin.flush()
-                daemon.wait(timeout=5)
-                stdout, stderr = smoke.communicate(timeout=10)
+                daemon.wait(timeout=HANG_GUARD)
+                stdout, stderr = smoke.communicate(timeout=HANG_GUARD)
                 self.assertFalse(premature.exists(), "status queried the original closing listener")
                 return smoke.returncode, stdout, stderr
             finally:
@@ -357,7 +359,7 @@ class ShutdownOrdering(unittest.TestCase):
                                 process.kill()
                             else:
                                 signal.pidfd_send_signal(pidfd, signal.SIGKILL)
-                        process.wait(timeout=5)
+                        process.wait(timeout=HANG_GUARD)
                     finally:
                         if pidfd is not None:
                             os.close(pidfd)

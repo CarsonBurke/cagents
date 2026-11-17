@@ -13,6 +13,8 @@ from pathlib import Path
 
 REPOSITORY = Path(__file__).resolve().parent.parent
 SCRIPT = REPOSITORY / "scripts" / "native_slots.py"
+# Bounds only a hang: a passing wait returns as soon as its event happens.
+HANG_GUARD = 60
 
 # Takes a slot on descriptors this shell owns, as native-evidence does, then
 # reports which one and keeps it until its stdin closes.
@@ -83,14 +85,14 @@ class NativeSlots(unittest.TestCase):
 
     def release(self, taker: subprocess.Popen) -> None:
         taker.stdin.close()
-        taker.wait(timeout=10)
+        taker.wait(timeout=HANG_GUARD)
 
     def slot(self, index: int) -> Path:
         return self.lock if index == 0 else Path(f"{self.lock}.{index}")
 
     def queued(self, count: int) -> None:
         """Waits until `count` requests wait for this test's lock files."""
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + HANG_GUARD
         while time.monotonic() < deadline:
             inodes = set()
             for path in (self.lock, Path(f"{self.lock}.queue"), Path(f"{self.lock}.1"), Path(f"{self.lock}.2")):
@@ -146,8 +148,10 @@ class NativeSlots(unittest.TestCase):
         self.queued(2)
         self.release(holder)
         # Both wait in the kernel's line for slot 0 and take it in turn;
-        # neither retries past the other.
-        if self.pending(older):
+        # neither retries past the other. Whichever reports first holds it.
+        ready, _, _ = select.select([older.stdout, newer.stdout], [], [], HANG_GUARD)
+        self.assertTrue(ready, "neither waiter took the freed slot")
+        if older.stdout not in ready:
             self.assertEqual(self.outcome(newer), "slot 0")
             self.assertTrue(self.pending(older))
             self.release(newer)
@@ -156,7 +160,7 @@ class NativeSlots(unittest.TestCase):
             self.assertEqual(older.stdout.readline().strip(), "older")
             self.assertTrue(self.pending(newer))
             older.stdin.close()
-            older.wait(timeout=10)
+            older.wait(timeout=HANG_GUARD)
             self.assertEqual(self.outcome(newer), "slot 0")
 
     def test_a_wait_that_runs_out_leaves_no_slot_or_queue_held(self) -> None:
@@ -184,7 +188,7 @@ class NativeSlots(unittest.TestCase):
                 pass_fds=(queue, slot), stdout=subprocess.PIPE, text=True)
             self.queued(1)
             waiter.send_signal(signal.SIGTERM)
-            self.assertEqual(waiter.wait(timeout=10), 128 + signal.SIGTERM)
+            self.assertEqual(waiter.wait(timeout=HANG_GUARD), 128 + signal.SIGTERM)
             waiter.stdout.close()
             self.release(holder)
             time.sleep(0.5)
@@ -202,7 +206,7 @@ class NativeSlots(unittest.TestCase):
             result = subprocess.run(
                 [sys.executable, "-I", str(SCRIPT), "acquire", "--queue-fd", str(queue), "--slot-fd", str(slot),
                  "--parent-pid", str(os.getpid() + 10_000_000)],
-                pass_fds=(queue, slot), capture_output=True, text=True, timeout=10)
+                pass_fds=(queue, slot), capture_output=True, text=True, timeout=HANG_GUARD)
             self.assertEqual(result.returncode, 75, result.stderr)
             self.assertFalse(held(self.lock))
         finally:

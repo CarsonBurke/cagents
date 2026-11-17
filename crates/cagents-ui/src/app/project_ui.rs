@@ -5,6 +5,7 @@ use crate::{
     model::{ChannelId, WorktreeId},
     sidebar::ProjectCommand,
 };
+use std::cell::OnceCell;
 
 #[derive(Debug, Clone)]
 struct AutomaticAttempt {
@@ -371,6 +372,10 @@ impl Cagents {
                 paths.push(runtime.descriptor.worktree.clone());
             }
         }
+        #[cfg(any(test, feature = "development"))]
+        if super::projection_oracle::enabled() {
+            self.projected_protections = paths.iter().cloned().collect();
+        }
         if let Err(error) = self.worktree_protections.sync(paths) {
             tracing::debug!(%error, "automatic worktree cleanup unavailable until window scopes are protected");
         }
@@ -695,15 +700,19 @@ impl Cagents {
         }))
     }
 
+    /// Read while the group deletion dialog is drawn, so it asks the
+    /// filesystem nothing unless a card that would block is filed only by its
+    /// directory.
     fn project_review_checkout_blocker(&self, project: ProjectId) -> Option<String> {
-        let scope = self.project_session_scope(project);
+        let scope = OnceCell::new();
         self.cards.iter().find_map(|(id, runtime)| {
+            let blocker = self.review_checkout_blocker(*id)?;
             let belongs = matches!(runtime, CardRuntime::PullRequests(pane)
                 if pane.project(&self.sidebar_model) == Some(project))
                 || self
                     .card_state(*id)
-                    .is_some_and(|card| self.project_owns_card(project, card, &scope));
-            belongs.then(|| self.review_checkout_blocker(*id)).flatten()
+                    .is_some_and(|card| self.project_owns_card_lazily(project, card, &scope));
+            belongs.then_some(blocker)
         })
     }
 
@@ -719,12 +728,32 @@ impl Cagents {
         ))
     }
 
+    /// Read while the group deletion dialog is drawn; see
+    /// [`Self::project_review_checkout_blocker`].
     fn project_has_unsaved_editors(&self, project: ProjectId) -> bool {
-        let scope = self.project_session_scope(project);
+        let scope = OnceCell::new();
         self.cards.iter().any(|(id, runtime)| {
             matches!(runtime, CardRuntime::Repository(editor)
                 if editor.blocks_navigation()
-                    && self.card_state(*id).is_some_and(|card| self.project_owns_card(project, card, &scope)))
+                    && self.card_state(*id).is_some_and(|card| self.project_owns_card_lazily(project, card, &scope)))
+        })
+    }
+
+    /// [`Self::project_owns_card`], building the project's scope only for a
+    /// card filed by nothing but its directory. The scope resolves every
+    /// worktree root of every project on disk, and most cards never need it.
+    fn project_owns_card_lazily(
+        &self,
+        project: ProjectId,
+        card: &CardState,
+        scope: &OnceCell<ProjectSessionScope>,
+    ) -> bool {
+        self.project_files_card(project, card).unwrap_or_else(|| {
+            card_in_scope(
+                card,
+                self.durable.card_scopes.get(&card.id),
+                scope.get_or_init(|| self.project_session_scope(project)),
+            )
         })
     }
 
@@ -747,24 +776,25 @@ impl Cagents {
         card: &CardState,
         scope: &ProjectSessionScope,
     ) -> bool {
+        self.project_files_card(project, card)
+            .unwrap_or_else(|| card_in_scope(card, self.durable.card_scopes.get(&card.id), scope))
+    }
+
+    /// Whether `project` owns `card` by a record that names its project: the
+    /// channel holding it, or the repository it views. `None` leaves the
+    /// answer to the card's directory.
+    fn project_files_card(&self, project: ProjectId, card: &CardState) -> Option<bool> {
         if let Some(channel) = self
             .durable
             .channels
             .iter()
             .find(|channel| channel.cards.contains(&card.id))
         {
-            return channel.project_id == project;
-        }
-        if let CardKind::Repository(view) = &card.kind {
-            return view.project == project;
-        }
-        if let Some(directory) = self.durable.card_scopes.get(&card.id) {
-            return scope.contains(directory);
+            return Some(channel.project_id == project);
         }
         match &card.kind {
-            CardKind::Terminal(session) => scope.contains(&session.launch.working_directory),
-            CardKind::Chat(session) => scope.contains(&session.launch.recipe.working_directory),
-            _ => false,
+            CardKind::Repository(view) => Some(view.project == project),
+            _ => None,
         }
     }
 
@@ -2241,6 +2271,19 @@ fn project_worktree_roots(project: &SidebarProject) -> Vec<PathBuf> {
     roots
 }
 
+/// Whether `scope` holds `card` by its explicit filing, or else by where its
+/// process works.
+fn card_in_scope(card: &CardState, filed: Option<&PathBuf>, scope: &ProjectSessionScope) -> bool {
+    if let Some(directory) = filed {
+        return scope.contains(directory);
+    }
+    match &card.kind {
+        CardKind::Terminal(session) => scope.contains(&session.launch.working_directory),
+        CardKind::Chat(session) => scope.contains(&session.launch.recipe.working_directory),
+        _ => false,
+    }
+}
+
 fn card_belongs_to(card: &CardState, path: &Path) -> bool {
     match &card.kind {
         CardKind::Terminal(session) => session.launch.working_directory.starts_with(path),
@@ -2490,12 +2533,30 @@ impl ProjectSessionOwnership {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static SCOPE_RESOLUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many paths this thread has resolved on disk for a project scope.
+#[cfg(test)]
+pub(super) fn scope_resolutions() -> usize {
+    SCOPE_RESOLUTIONS.get()
+}
+
+/// Resolves `path` on disk, as every root and directory a scope compares is.
+fn resolve_scope_path(path: &Path) -> Option<PathBuf> {
+    #[cfg(test)]
+    SCOPE_RESOLUTIONS.set(SCOPE_RESOLUTIONS.get() + 1);
+    path.canonicalize().ok()
+}
+
 impl ProjectSessionScope {
     fn new(roots: Vec<PathBuf>, protected: Vec<PathBuf>) -> Self {
         let canonical = |paths: Vec<PathBuf>| {
             paths
                 .into_iter()
-                .map(|path| path.canonicalize().unwrap_or(path))
+                .map(|path| resolve_scope_path(&path).unwrap_or(path))
                 .collect()
         };
         Self {
@@ -2505,9 +2566,7 @@ impl ProjectSessionScope {
     }
 
     fn contains(&self, directory: &Path) -> bool {
-        let directory = directory
-            .canonicalize()
-            .unwrap_or_else(|_| directory.to_path_buf());
+        let directory = resolve_scope_path(directory).unwrap_or_else(|| directory.to_path_buf());
         let depth = |roots: &[PathBuf]| {
             roots
                 .iter()
@@ -4764,8 +4823,12 @@ pub(in crate::app) mod tests {
         let _ = app.handle_project_action(Action::ConfirmDelete);
         loaded(&mut app, picked, picked_listing, true);
         assert_ne!(app.active_workspace.as_ref(), Some(&linked_path));
+        // The update that refused it reported why.
         assert_eq!(
-            app.status.as_ref().map(|notice| notice.message.as_str()),
+            app.notices
+                .recent()
+                .next()
+                .map(|entry| entry.notice.message.as_str()),
             Some("That worktree is being deleted.")
         );
         git(

@@ -1759,6 +1759,25 @@ for the rest of its two-minute interval, labeled `source: "rest-bootstrap"`.
 GitHub's REST answer has `mergeable: null` while it computes mergeability
 after a push, which the snapshot reports as `UNKNOWN`. No reported checks means unknown, not passing. Enterprise repositories also accept `--hostname HOST`.
 
+GitHub takes a few seconds after a push to show the new head. A read in that
+window, yours or another agent's, publishes the previous head, and every
+caller is then served that snapshot as fresh (`stale: false`) until its
+`retry_at`: two minutes after that read, not after the read before it. After
+pushing, name the head you pushed:
+
+```sh
+scripts/gh-pr-status 1234 -R CarsonBurke/cagents --json --expect-head "$(git rev-parse HEAD)"
+```
+
+While the snapshot shows another head, the report has `stale: true`,
+`expected_head` and a `data.limitations` entry naming both heads, and the
+command exits 5; read again after `retry_at`. If a read after `retry_at`
+still shows another head, the PR shows a head other than yours: confirm your
+push landed (`git ls-remote origin BRANCH`) and check the head it shows rather
+than reading again. A failed refresh, or a report that shows no head, exits 4.
+The check is local: it sends no request and leaves the shared cache as it is.
+`--expect-head` needs `--json` and a full commit SHA.
+
 While GraphQL is in a primary cooldown of its own and REST (`core`) is not,
 the CLI reads through REST instead of waiting for the GraphQL reset: `pulls/N`
 for head and merge state, then `check-runs`, `check-suites` and `status` for
@@ -2048,9 +2067,13 @@ harness, it provides:
   compositor presentation. Add `--ui-trace` to `start` for a live log of
   UI-thread work by phase and message; see "UI thread trace" in
   `docs/performance.md`. Add `--workspace-trace` to record shared-model update
-  timing, scope projection choices and activity redraw intervals. Both trace
-  flags apply to the requested session and its relaunches; ordinary sessions
-  keep their default logging. Recreate the same workload on each revision when comparing
+  timing, scope projection choices and activity redraw intervals. Add
+  `--projection-oracle` to check every narrowed update projection against the
+  full one; such a session repairs what it finds and so behaves like one that
+  projects everything, and its log is the evidence. See "Busy terminals and
+  the update tail" in `docs/performance.md`.
+  These flags apply to the requested session and its relaunches; ordinary
+  sessions keep their default logging. Recreate the same workload on each revision when comparing
   startup; a saved descriptor whose provider was killed is not a live chat.
 - **Matching evidence.** `start` refuses a checkout that changed since its build.
   `shots/manifest.tsv` records each image's revision, source state, requested
@@ -2472,8 +2495,21 @@ scripts/rehearse-update --root /var/tmp/cr/u2 cleanup
 display. `ceditor start BIN_DIR`, `record NAME`, `shot NAME` and `update DIR
 VERSION INSTALLER --answer yes` are available separately. `stop` retains evidence;
 `cleanup` stops everything and removes the marked root. Copy reports and images
-elsewhere before cleanup. Run the pure checks with
-`/usr/bin/python3 tests/rehearse_update.py`; no compositor or Rust build is needed.
+elsewhere before cleanup.
+
+The harness's pure checks need no compositor, archive or Rust build, and CI
+runs them as the `update rehearsal` job of the script contracts (see [Testing](#testing)):
+
+```sh
+mise run test:scripts "update rehearsal"
+/usr/bin/python3 -I -B tests/rehearse_update.py -v   # one suite
+```
+
+From a hosted agent's shell, the nine tests that need the harness to act skip,
+since it refuses inherited authority; CI and a plain `ssh fw16` shell run them.
+The tests of that refusal still run.
+The two that run `stop` also skip where the user has no systemd user manager,
+and the startup bind fixture's check skips without a C compiler.
 
 ## Troubleshooting
 

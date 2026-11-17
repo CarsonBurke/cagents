@@ -3247,6 +3247,19 @@ pub struct SidebarState {
 }
 
 impl SidebarState {
+    /// Clears the count of attention rebuilds, so two states compare by
+    /// what they hold rather than by how often they were rebuilt.
+    #[cfg(test)]
+    pub(crate) fn forget_attention_rebuilds(&mut self) {
+        self.attention_projection_rebuilds = 0;
+    }
+
+    /// The pane the Attention list draws as current.
+    #[cfg(test)]
+    pub(crate) fn focused_card(&self) -> Option<CardId> {
+        self.focused_card
+    }
+
     pub fn reveal_worktree(
         &mut self,
         project: &SidebarProject,

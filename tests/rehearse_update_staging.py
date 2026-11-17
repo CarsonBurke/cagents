@@ -15,6 +15,9 @@ import unittest
 from unittest.mock import Mock, patch
 
 SCRIPTS=Path(__file__).resolve().parents[1]/'scripts'
+# Bounds only a hang. A PTY helper given --timeout HANG_GUARD runs under an
+# outer guard twice as long, so its own deadline, which ends the peer, fires first.
+HANG_GUARD=60
 sys.path.insert(0,str(SCRIPTS))
 spec=importlib.util.spec_from_file_location('staging_scenario',SCRIPTS/'rehearse_update_run.py')
 scenario=importlib.util.module_from_spec(spec)
@@ -271,8 +274,8 @@ class IdlePromptGuard(unittest.TestCase):
             program='import pathlib,sys;print(sys.argv[1],flush=True);pathlib.Path(sys.argv[2]).write_text(sys.stdin.readline().strip())'
             result=subprocess.run([sys.executable,str(SCRIPTS/'rehearse_update_pty.py'),
                 '--require-idle','--answer','yes','--review-root',str(root),
-                '--review-output',str(root/'reviews/natural-idle'),'--timeout','5','--',
-                sys.executable,'-c',program,prompt,str(answers)],capture_output=True,text=True,timeout=10)
+                '--review-output',str(root/'reviews/natural-idle'),'--timeout',str(HANG_GUARD),'--',
+                sys.executable,'-c',program,prompt,str(answers)],capture_output=True,text=True,timeout=2*HANG_GUARD)
             captured=json.loads((root/'reviews/natural-idle/prompt-1.status.json').read_text())
             return result,answers.read_text(),captured
 
@@ -325,7 +328,7 @@ die() { printf '%s\\n' "$1" >&2; exit "${2:-1}"; }
 cmd_install() { touch "$root/unexpected-installer"; }
 cmd_stage "$root" new "$root/installer"
 '''
-            result=subprocess.run(['bash','-c',program,'fixture',str(root)],capture_output=True,text=True,timeout=10)
+            result=subprocess.run(['bash','-c',program,'fixture',str(root)],capture_output=True,text=True,timeout=HANG_GUARD)
             self.assertEqual(result.returncode,2,result.stdout+result.stderr)
             self.assertIn('requires an absent candidate',result.stderr)
             self.assertFalse((root/'unexpected-installer').exists())
@@ -350,7 +353,7 @@ user_env() { printf '%s\\n' "$user_home/.local/share/cagents-install/versions/ne
 cmd_app_or_env() { printf '%s\\n' "$@" > "$root/invocation"; }
 cmd_update /archive new /installer --use-staged --require-working --working i --answer yes --interrupt
 '''
-            result=subprocess.run(['bash','-c',program,'fixture',str(root)],capture_output=True,text=True,timeout=10)
+            result=subprocess.run(['bash','-c',program,'fixture',str(root)],capture_output=True,text=True,timeout=HANG_GUARD)
             self.assertEqual(result.returncode,0,result.stdout+result.stderr)
             invocation=(root/'invocation').read_text().splitlines()
             self.assertEqual(invocation[-4:],[cli,'daemon','upgrade','--interrupt'])
@@ -360,7 +363,7 @@ cmd_update /archive new /installer --use-staged --require-working --working i --
             for override in ('--yes','--version other','--version=other'):
                 (root/'invocation').unlink(missing_ok=True)
                 declined=subprocess.run(['bash','-c',program.replace('--interrupt\n','--interrupt '+override+'\n'),
-                    'fixture',str(root)],capture_output=True,text=True,timeout=10)
+                    'fixture',str(root)],capture_output=True,text=True,timeout=HANG_GUARD)
                 self.assertEqual(declined.returncode,2,declined.stdout+declined.stderr)
                 self.assertFalse((root/'invocation').exists())
 
@@ -375,9 +378,9 @@ class WorkingPromptGuard(unittest.TestCase):
                      ' print(prompt,flush=True)\n answers.append(sys.stdin.readline().strip())\n'
                      'open(sys.argv[2],"w").write(json.dumps(answers))\n')
             result=subprocess.run([sys.executable,str(SCRIPTS/'rehearse_update_pty.py'),
-                '--require-working','--answer','yes','--working','i','--timeout','5','--',
+                '--require-working','--answer','yes','--working','i','--timeout',str(HANG_GUARD),'--',
                 sys.executable,'-c',program,json.dumps(prompts),str(receipt)],
-                capture_output=True,text=True,timeout=10)
+                capture_output=True,text=True,timeout=2*HANG_GUARD)
             return result,json.loads(receipt.read_text())
 
     def test_unexpected_ordinary_or_stop_prompt_is_declined_before_consent(self):
@@ -401,7 +404,7 @@ class WorkingPromptGuard(unittest.TestCase):
             result=subprocess.run([sys.executable,str(SCRIPTS/'rehearse_update_pty.py'),
                 '--require-working','--',sys.executable,'-c',
                 'import pathlib,sys;pathlib.Path(sys.argv[1]).touch()',str(marker),'--yes'],
-                capture_output=True,text=True,timeout=10)
+                capture_output=True,text=True,timeout=HANG_GUARD)
             self.assertEqual(result.returncode,2,result.stdout+result.stderr)
             self.assertFalse(marker.exists())
             self.assertIn('forbids --yes',result.stderr)

@@ -78,8 +78,9 @@ impl Cagents {
         let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
             return None;
         };
-        // Every blocked surface says the draft is kept, and nothing restores
-        // it once its card closes: a reopened conversation gets a new card.
+        // Every blocked surface says the draft is kept, so closing the card
+        // asks before discarding it. A close that discards it keeps nothing
+        // for a reopened card (see `kept_draft`).
         (runtime.start_blocked.is_some()
             && (!runtime.composer.text().trim().is_empty() || !runtime.attachments.is_empty()))
         .then_some(runtime.session.id)

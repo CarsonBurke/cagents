@@ -441,10 +441,13 @@ fn a_broadcast_racing_a_snapshot_reply_still_applies_and_releases_credit() {
             text(&grid(0, &fixture.lines))
         );
         fixture.acknowledgement_releases_credit(&replay);
-        // The broadcast's frame is a base the client now holds in order.
-        let next = fixture.change(2, "next");
-        let planned = fixture.plan(next);
-        assert!(planned[0].delta);
+        // The broadcast's frame is a base the client now holds in order, so
+        // the next frame is planned as a delta against it. (The replay closed
+        // the connection, so read the recorded base rather than plan.)
+        assert!(
+            fixture.shared.lock().unwrap().subscriptions.sent[&(1, fixture.id)].queued,
+            "the next frame would not be a delta"
+        );
     }
 }
 
@@ -571,15 +574,26 @@ enum HiddenWhileStarting {
     ByAnotherClient,
 }
 
+/// Fills the worker's bounded command queue, as a worker busy with a flood of
+/// input would leave it.
+fn fill_commands(stream: &RenderStreamFixture) {
+    let refused = std::iter::repeat_with(|| stream.handle.scroll_to_bottom()).find_map(Result::err);
+    assert_eq!(refused, Some(TerminalSendError::Full));
+}
+
 /// A spawning client is attached hidden until its spawn is published. Its
 /// worker may be hidden meanwhile, so publishing it visible must reveal the
-/// worker, or it captures nothing more until the terminal exits.
+/// worker, or it captures nothing more until the terminal exits. The
+/// publication has committed by then, so the reveal must not be refusable by
+/// a full command queue either.
 #[test]
 fn publishing_a_spawn_reveals_a_worker_hidden_while_it_started() {
-    for (hidden_by, initially_visible) in [
-        (HiddenWhileStarting::ByWake, true),
-        (HiddenWhileStarting::ByAnotherClient, true),
-        (HiddenWhileStarting::ByWake, false),
+    for (hidden_by, initially_visible, queue_full) in [
+        (HiddenWhileStarting::ByWake, true, false),
+        (HiddenWhileStarting::ByAnotherClient, true, false),
+        (HiddenWhileStarting::ByWake, false, false),
+        (HiddenWhileStarting::ByWake, true, true),
+        (HiddenWhileStarting::ByAnotherClient, true, true),
     ] {
         let shared = host();
         let id = TerminalId::new();
@@ -626,6 +640,9 @@ fn publishing_a_spawn_reveals_a_worker_hidden_while_it_started() {
             }
         }
         assert_eq!(stream.drain_visibility(), Some(false), "{hidden_by:?}");
+        if queue_full {
+            fill_commands(&stream);
+        }
 
         let options = TerminalSpawnOptions {
             initially_visible,
@@ -635,9 +652,157 @@ fn publishing_a_spawn_reveals_a_worker_hidden_while_it_started() {
         assert_eq!(
             stream.drain_visibility(),
             initially_visible.then_some(true),
-            "{hidden_by:?}, initially visible: {initially_visible}"
+            "{hidden_by:?}, initially visible: {initially_visible}, queue full: {queue_full}"
         );
     }
+}
+
+/// Visibility requests are levels, not queued commands: a full command queue
+/// refuses none of them, and the newest replaces a redraw's Hide.
+#[test]
+fn a_full_command_queue_refuses_no_visibility_change() {
+    use TerminalVisibility::{Hibernated, Hidden, Visible};
+    let fixture = Fixture::new();
+    let set = |visibility| {
+        fixture
+            .shared
+            .lock()
+            .unwrap()
+            .set_visibility(1, fixture.id, visibility)
+    };
+    set(Hidden).unwrap();
+    // The worker published before it applied the hide; the redraw re-asks.
+    broadcast_redraw(
+        &Arc::downgrade(&fixture.shared),
+        fixture.id,
+        1,
+        &fixture.stream.handle,
+    );
+    assert_eq!(fixture.stream.take_host_visibility(), Some(Hidden));
+    // Every request below is made while the queue stays full.
+    fill_commands(&fixture.stream);
+    set(Visible).unwrap();
+    assert_eq!(fixture.stream.take_host_visibility(), Some(Visible));
+    set(Hibernated).unwrap();
+    assert_eq!(fixture.stream.take_host_visibility(), Some(Hibernated));
+    let mut state = fixture.shared.lock().unwrap();
+    state.register_client(2);
+    state.attach(2, fixture.id).unwrap();
+    assert_eq!(
+        fixture.stream.take_host_visibility(),
+        Some(Hidden),
+        "attach"
+    );
+    state.detach(2, fixture.id).unwrap();
+    assert_eq!(
+        fixture.stream.take_host_visibility(),
+        Some(Hibernated),
+        "detach"
+    );
+    drop(state);
+    fill_commands(&fixture.stream);
+}
+
+/// A worker reveals once per transition to Visible: each reveal forces a
+/// full capture and resets the subscriber's capture credit. A client leaving
+/// while another still shows the terminal changes nothing.
+#[test]
+fn a_client_leaving_a_terminal_another_shows_does_not_reveal_it_again() {
+    use TerminalVisibility::{Hidden, Visible};
+    let fixture = Fixture::new();
+    // Whatever installing the terminal asked of its worker.
+    fixture.stream.take_host_visibility();
+    let mut state = fixture.shared.lock().unwrap();
+    state.register_client(2);
+    state.attach(2, fixture.id).unwrap();
+    state.set_visibility(2, fixture.id, Visible).unwrap();
+    assert_eq!(fixture.stream.take_host_visibility(), None);
+    drop(state.unregister_client(2));
+    assert_eq!(
+        fixture.stream.take_host_visibility(),
+        None,
+        "the remaining viewer's terminal was revealed again"
+    );
+    // Control: the last viewer leaving does change it.
+    drop(state.unregister_client(1));
+    assert_eq!(fixture.stream.take_host_visibility(), Some(Hidden));
+}
+
+/// A redraw pushes its frames under the host lock. When that overflows a slow
+/// client's queue, what the queue discards, frames included, must be freed by
+/// the client's writer, not inside the broadcast's hold.
+#[test]
+fn a_redraw_overflowing_a_slow_client_frees_nothing_under_the_host_lock() {
+    let mut fixture = Fixture::new();
+    let proof = fixture.shared.lock().unwrap().proof_handle();
+    while fixture.delivery.queued() < DEFAULT_CLIENT_QUEUE_CAPACITY {
+        fixture
+            .delivery
+            .push(Outbound::broadcast(
+                &proof,
+                ServerMessage::TerminalObserved {
+                    terminal_id: TerminalId::new(),
+                    epoch: 0,
+                },
+            ))
+            .unwrap();
+    }
+    let queued = Arc::strong_count(&proof);
+    let generation = fixture.change(0, "over");
+    broadcast_redraw(
+        &Arc::downgrade(&fixture.shared),
+        fixture.id,
+        generation,
+        &fixture.stream.handle,
+    );
+    // The refused frame and the QueueFull notice joined the discarded queue.
+    assert_eq!(Arc::strong_count(&proof), queued + 2);
+    let next = fixture.change(1, "gone");
+    assert!(
+        fixture.plan(next).is_empty(),
+        "a frame was built for a closed connection"
+    );
+    let notice = fixture.delivery.pop().unwrap();
+    assert!(matches!(
+        notice.message,
+        ServerMessage::Error(ref error) if error.code == ProtocolErrorCode::QueueFull
+    ));
+    drop(notice);
+    assert!(fixture.delivery.pop().is_none());
+    assert_eq!(
+        Arc::strong_count(&proof),
+        queued - DEFAULT_CLIENT_QUEUE_CAPACITY
+    );
+}
+
+/// A connection that closes between the holds refuses the frame. It is
+/// neither recorded as sent nor freed under the commit's hold.
+#[test]
+fn a_frame_for_a_connection_closed_after_planning_is_refused() {
+    let mut fixture = Fixture::new();
+    let generation = fixture.change(0, "late");
+    let planned = fixture.plan(generation);
+    assert_eq!(planned.len(), 1);
+    let recorded = |fixture: &Fixture| {
+        Arc::clone(
+            fixture
+                .shared
+                .lock()
+                .unwrap()
+                .subscriptions
+                .last_sent(1, fixture.id)
+                .unwrap(),
+        )
+    };
+    let sent = recorded(&fixture);
+    let before = fixture.acknowledged_source();
+    fixture.delivery.close_after_drain();
+    fixture.commit(planned);
+    assert!(
+        Arc::ptr_eq(&recorded(&fixture), &sent),
+        "a refused frame was recorded as sent"
+    );
+    assert_eq!(fixture.acknowledged_source(), before);
 }
 
 /// The same property with real threads: two broadcasts race for every

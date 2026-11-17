@@ -18,6 +18,8 @@ ROOT = Path(__file__).resolve().parents[1]
 NATIVE = "x86_64-unknown-linux-gnu"
 PRODUCTS = ("cagents", "cagentsd", "cagents-ui")
 VERSION = "9.9.9"
+# Bounds only a hang; a passing run returns as soon as its process exits.
+HANG_GUARD = 60
 
 
 class PackageLinuxArtifacts(unittest.TestCase):
@@ -171,7 +173,7 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
             ["/bin/sh", str(self.checkout / "scripts/package-linux.sh"), "--variant", variant,
              *arguments],
             cwd=self.directory, env=self.environment | overrides,
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=HANG_GUARD,
         )
 
     def events(self, tool):
@@ -229,7 +231,7 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
         archive = self.dist / f"{name}-{version}-{NATIVE}.tar.gz"
         deb = self.dist / f"{name}_{version}_amd64.deb"
         deb_payload = subprocess.check_output(["dpkg-deb", "--fsys-tarfile", str(deb)],
-                                              env=self.environment, timeout=10)
+                                              env=self.environment, timeout=HANG_GUARD)
         with tarfile.open(archive, "r:gz") as portable, \
                 tarfile.open(fileobj=io.BytesIO(deb_payload), mode="r:") as debian:
             for product in PRODUCTS:
@@ -246,7 +248,7 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
             marker = debian.extractfile(f"./usr/libexec/{name}/.cagents-daemon-protocol").read()
             self.assertEqual(marker, f"127 {hashlib.sha256(daemon).hexdigest()}\n".encode())
         depends = subprocess.check_output(["dpkg-deb", "--field", str(deb), "Depends"],
-                                          env=self.environment, text=True, timeout=10)
+                                          env=self.environment, text=True, timeout=HANG_GUARD)
         self.assertIn("libc6 (>= 2.39)", depends)
         self.assertEqual("libegl1" in depends, variant == "full")
         self.assertEqual("xdg-utils" in depends, variant == "browserless")

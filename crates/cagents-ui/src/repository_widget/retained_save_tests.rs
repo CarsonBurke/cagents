@@ -137,12 +137,21 @@ fn load_state(runtime: &RepositoryRuntime) -> String {
     )
 }
 
+/// How long [`finish`] waits before calling the tasks hung. It only guards
+/// against a hang; the action limit catches a task that keeps rescheduling
+/// itself. The work it waits for can take iced's process-wide font lock,
+/// which other tests in the lane hold for up to seconds each while they shape
+/// long lines in the unoptimized test profile. In a full `test:ui` run a diff
+/// rebuild has taken 8 s, 3.4 s of it in a single wait for that lock; the
+/// whole test takes about 0.1 s on its own.
+const SETTLE_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub(super) async fn finish(
     runtime: &mut RepositoryRuntime,
     task: Task<RepositoryAction>,
 ) -> TaskTrace {
     let mut trace = TaskTrace::default();
-    let settled = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let settled = tokio::time::timeout(SETTLE_LIMIT, async {
         let mut tasks = vec![task];
         let mut actions = 0;
         while let Some(task) = tasks.pop() {
@@ -222,7 +231,7 @@ pub(super) async fn finish(
     .await;
     assert!(
         settled.is_ok(),
-        "repository tasks did not settle within 10s; trace={:?}; {}",
+        "repository tasks did not settle within {SETTLE_LIMIT:?}; trace={:?}; {}",
         trace.details,
         load_state(runtime)
     );

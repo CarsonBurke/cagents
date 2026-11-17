@@ -847,6 +847,8 @@ fn fenced_managed_chat_keeps_its_text_and_closes_without_stopping_a_session() {
     settle(&mut app, task);
     assert!(!app.card_state(pane.id).unwrap().existence.is_open());
     assert!(!app.workspace.order().any(|id| id == pane.id));
+    // What showed the pane forgets it as it closes.
+    crate::app::projection_oracle::assert_projected(&mut app);
     assert!(!app.durable.pending_chat_admissions.contains_key(&pane.id));
     assert!(
         app.recently_closed

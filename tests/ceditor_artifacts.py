@@ -12,6 +12,8 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+# Bounds only a hang; a passing wait returns as soon as its event arrives.
+HANG_GUARD = 60
 
 
 class CeditorArtifacts(unittest.TestCase):
@@ -120,7 +122,7 @@ sys.exit(101 if mode == "failed" else 0)
     def run_script(self, name, *arguments):
         return subprocess.run(
             ["/bin/sh", str(self.checkout / "scripts" / name), *arguments],
-            cwd=self.directory, env=self.environment, text=True, capture_output=True, timeout=10,
+            cwd=self.directory, env=self.environment, text=True, capture_output=True, timeout=HANG_GUARD,
         )
 
     def assert_success(self, result):
@@ -176,7 +178,7 @@ sys.exit(101 if mode == "failed" else 0)
                 result = subprocess.run(
                     ["/bin/sh", str(self.checkout / "scripts/run-ceditor-development"),
                      "--", *arguments],
-                    cwd=self.directory, env=environment, text=True, capture_output=True, timeout=10,
+                    cwd=self.directory, env=environment, text=True, capture_output=True, timeout=HANG_GUARD,
                 )
                 self.assert_success(result)
                 direct = json.loads(self.launch.read_text())
@@ -193,10 +195,10 @@ sys.exit(101 if mode == "failed" else 0)
                         result = subprocess.run(
                             [gio, "launch", str(desktop), *files],
                             cwd=self.directory, env=environment,
-                            text=True, capture_output=True, timeout=10,
+                            text=True, capture_output=True, timeout=HANG_GUARD,
                         )
                         self.assert_success(result)
-                        deadline = time.monotonic() + 2
+                        deadline = time.monotonic() + HANG_GUARD
                         while not self.launch.exists() and time.monotonic() < deadline:
                             time.sleep(0.01)
                         self.assertTrue(self.launch.exists(),

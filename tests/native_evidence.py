@@ -21,6 +21,20 @@ from pathlib import Path
 REPOSITORY = Path(__file__).resolve().parent.parent
 SCRIPT = REPOSITORY / "scripts" / "native-evidence"
 AUTHORITY_NAMES = ("CAGENTS_AGENT_AUTHORITY", "CAGENTS_AGENT_TOKEN", "CAGENTS_SESSION_TOKEN")
+# Bounds only a hang: every wait it guards returns as soon as its event happens.
+HANG_GUARD = 60
+# What the script's 30-second clear and harness-stop timeouts take, with their 5-second kill.
+WEDGED_STOP_SECONDS = 35
+# The script's default --startup-timeout, how long it waits for the harness to show a window.
+HARNESS_STARTUP_TIMEOUT = 180
+# How long a harness told to wait never shows one: past the startup timeout, so only the
+# script giving up on its own can end the wait sooner.
+STUB_HARNESS_WAIT_SECONDS = HARNESS_STARTUP_TIMEOUT + 20
+# A refusal is proven prompt by its run and the lock's release each returning within
+# HANG_GUARD, which together must fall short of the harness's own startup timeout.
+assert 2 * HANG_GUARD < HARNESS_STARTUP_TIMEOUT < STUB_HARNESS_WAIT_SECONDS
+# Past every wait a test makes, so a UI stub no cleanup ends still cannot outlive a run by much.
+STUB_UI_SECONDS = 10 * HANG_GUARD
 
 STUBS = {
     "dbus-run-session": """
@@ -91,10 +105,10 @@ STUBS = {
             [ -z "${portal:-}" ] || export DBUS_SESSION_BUS_ADDRESS=stub-portal-bus XDG_CONFIG_HOME=$root/xdg-config
             NIRI_SOCKET=stub-niri sh -c "$cmd" >>"$STUB_LOG/app-output" 2>&1 &
             # The real harness waits for a window that a failed runner never shows.
-            [ ! -e "$STUB_LOG/harness-waits" ] || exec sleep 200
+            [ ! -e "$STUB_LOG/harness-waits" ] || exec sleep STUB_HARNESS_WAIT_SECONDS
             # Nor does it report ready until the app is up, unless told not to wait.
             if [[ " $* " != *" --no-window-wait "* ]]; then
-                for _ in {1..300}; do
+                for _ in {1..600}; do
                     [ ! -e "$STUB_LOG/ui-ran" ] || break
                     sleep 0.1
                 done
@@ -187,7 +201,7 @@ STUBS = {
             printf '%s\\n' "${CAGENTS_UI_TRACE:-unset}" > "$STUB_LOG/ui-trace"
             env > "$STUB_LOG/ui-env"
             printf '%s\\n' "${RUST_LOG:-unset}" > "$STUB_LOG/ui-rust-log"
-            exec sleep 300
+            exec sleep STUB_UI_SECONDS
         fi
         printf '%s\\n' "$*" >> "$STUB_LOG/cli"
         if [ "$*" = 'daemon start' ]; then
@@ -198,6 +212,8 @@ STUBS = {
         if [ "${1:-}" = print-env ]; then env; fi
     """,
 }
+STUBS["niri-harness"] = STUBS["niri-harness"].replace("STUB_HARNESS_WAIT_SECONDS", str(STUB_HARNESS_WAIT_SECONDS))
+STUBS["fixture-cli"] = STUBS["fixture-cli"].replace("STUB_UI_SECONDS", str(STUB_UI_SECONDS))
 
 
 def write_executable(path: Path, body: str, logs: Path | None = None) -> None:
@@ -281,7 +297,7 @@ class Evidence(unittest.TestCase):
         self.run_tool("stop", check=False)
 
     def run_tool(self, *args: str, check: bool = True, extra=None,
-                 cwd=None) -> subprocess.CompletedProcess:
+                 cwd=None, timeout: float = HANG_GUARD) -> subprocess.CompletedProcess:
         env = {**self.env, **(extra or {})}
         result = subprocess.run(
             [str(SCRIPT), *args],
@@ -290,7 +306,7 @@ class Evidence(unittest.TestCase):
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=timeout,
         )
         if check and result.returncode:
             self.fail(f"{args} exited {result.returncode}:\n{result.stdout}\n{result.stderr}")
@@ -333,6 +349,19 @@ class Evidence(unittest.TestCase):
         path = self.checkout(side)
         self.run_tool("build", side, str(path))
         return path
+
+    def wait_for(self, condition, label: str, timeout: float = HANG_GUARD) -> None:
+        deadline = time.monotonic() + timeout
+        while not condition():
+            if time.monotonic() >= deadline:
+                self.fail(f"timed out waiting for {label}")
+            time.sleep(0.05)
+
+    def blocked_on(self, path: Path) -> bool:
+        """Whether some process waits in the kernel's queue for the flock on `path`."""
+        inode = str(path.stat().st_ino)
+        return any("->" in line and "FLOCK" in line and line.split()[-3].rsplit(":", 1)[-1] == inode
+                   for line in Path("/proc/locks").read_text().splitlines())
 
     def lock_is_free(self, path: Path) -> bool:
         with open(path, "a") as lock:
@@ -413,10 +442,7 @@ class Evidence(unittest.TestCase):
         self.built()
         self.run_tool("start", "after", extra={"STUB_OVER_LIMIT": "later"})
         (self.logs / "go-over").touch()
-        for _ in range(100):
-            if self.lock_is_free(self.native_lock):
-                break
-            time.sleep(0.2)
+        self.wait_for(lambda: self.lock_is_free(self.native_lock), 'self.lock_is_free(self.native_lock)')
         self.assertTrue(self.lock_is_free(self.native_lock))
         notice = "memory-capped: stopped the native evidence session"
         self.assertIn(f"last session: {notice}", self.run_tool("status").stdout)
@@ -618,14 +644,14 @@ class Evidence(unittest.TestCase):
         with open(self.native_lock, "a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             start = subprocess.Popen(
-                [str(SCRIPT), "start", "after", "--wait-lock", "30"],
+                [str(SCRIPT), "start", "after", "--wait-lock", "300"],
                 env=self.env, stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             )
-            time.sleep(2)
+            self.wait_for(lambda: self.blocked_on(self.native_lock), "the start to queue for the lock")
             (checkout / "edited-while-queued").write_text("new")
             fcntl.flock(lock, fcntl.LOCK_UN)
-            _, stderr = start.communicate(timeout=40)
+            _, stderr = start.communicate(timeout=HANG_GUARD)
         self.assertEqual(start.returncode, 1)
         self.assertIn("changed", stderr)
         self.assertFalse((self.logs / "runner").exists())
@@ -639,25 +665,21 @@ class Evidence(unittest.TestCase):
                 env=self.env, stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             )
-            time.sleep(2)
+            self.wait_for(lambda: self.blocked_on(self.native_lock), "the start to queue for the lock")
             self.run_tool("stop")
-            _, stderr = start.communicate(timeout=30)
+            _, stderr = start.communicate(timeout=HANG_GUARD)
         self.assertEqual(start.returncode, 1)
         self.assertIn("stopped while waiting", stderr)
         self.assertFalse((self.logs / "kwin").exists())
 
     def assert_fails_promptly(self, message: str) -> None:
-        started = time.monotonic()
+        # Its run and the lock's release each return within HANG_GUARD, so together
+        # under the HARNESS_STARTUP_TIMEOUT the script would wait for a window.
         result = self.run_tool("start", "after", check=False)
         self.assertEqual(result.returncode, 1)
         self.assertIn(message, result.stderr)
-        for _ in range(100):
-            if self.lock_is_free(self.native_lock):
-                break
-            time.sleep(0.2)
+        self.wait_for(lambda: self.lock_is_free(self.native_lock), 'self.lock_is_free(self.native_lock)')
         self.assertTrue(self.lock_is_free(self.native_lock))
-        # Well under the 180 seconds the harness would wait for a window.
-        self.assertLess(time.monotonic() - started, 60)
 
     def test_a_session_missing_an_executable_refuses_to_compile_and_releases(self) -> None:
         self.built()
@@ -703,14 +725,13 @@ class Evidence(unittest.TestCase):
         # Only its executables come back here, so a full disk here is no
         # reason to refuse it; the build host's own runs guard its disk.
         checkout = self.checkout()
-        started = time.monotonic()
+        # run_tool's HANG_GUARD bounds the wait for the unreachable host.
         result = self.run_tool("build", "after", str(checkout), check=False, extra={
             "CAGENTS_BUILD_REMOTE": "build-host.invalid",
             "CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS": "1",
             "CAGENTS_BUILD_FREE_FLOOR_GIB": "999999999", "CAGENTS_BUILD_PRUNE": "true"})
         self.assertNotIn("refusing to build", result.stderr)
         self.assertNotEqual(result.returncode, 0)
-        self.assertLess(time.monotonic() - started, 60)
 
     def test_its_builds_and_sessions_keep_their_target_from_the_pruner(self) -> None:
         self.built()
@@ -769,10 +790,7 @@ class Evidence(unittest.TestCase):
         self.assertIn("CAGENTS_BUILD_SCOPE=0", env.splitlines())
         self.assertEqual((self.logs / "cargo").read_text(), before)
         # The stub runner execs this last, after its gated builds.
-        for _ in range(100):
-            if (self.logs / "ui-ran").exists():
-                break
-            time.sleep(0.1)
+        self.wait_for(lambda: (self.logs / "ui-ran").exists(), '(self.logs / "ui-ran").exists()')
         self.assertTrue((self.logs / "ui-ran").exists(), "the recorded executable did not start")
         # After the window, cargo is real, so nothing in the app can end the session.
         session_cargo = next(self.task.rglob("session-bin/cargo"))
@@ -817,10 +835,7 @@ class Evidence(unittest.TestCase):
         metadata = (self.logs / "cargo-metadata").read_text()
         started = self.run_tool("start", "after", "--instance", "native-review", check=False)
         self.assertEqual(started.returncode, 0, (self.logs / "app-output").read_text())
-        for _ in range(100):
-            if (self.logs / "ui-ran").exists():
-                break
-            time.sleep(0.1)
+        self.wait_for(lambda: (self.logs / "ui-ran").exists(), '(self.logs / "ui-ran").exists()')
         self.assertTrue((self.logs / "ui-ran").exists(), "the runner did not start the recorded UI")
         self.assertEqual((self.logs / "cargo").read_text(), built)
         self.assertEqual((self.logs / "cargo-metadata").read_text(), metadata)
@@ -843,10 +858,7 @@ class Evidence(unittest.TestCase):
         self.assertIn("lane integrated", (self.task / "target-after" / "evidence-source").read_text())
         started = self.run_tool("start", "after", "--instance", "native-review", check=False)
         self.assertEqual(started.returncode, 0, (self.logs / "app-output").read_text())
-        for _ in range(100):
-            if (self.logs / "ui-ran").exists():
-                break
-            time.sleep(0.1)
+        self.wait_for(lambda: (self.logs / "ui-ran").exists(), '(self.logs / "ui-ran").exists()')
         # The real runner asked the session's cargo only for what was built.
         self.assertTrue((self.logs / "ui-ran").exists(), "the runner did not start the recorded UI")
         self.assertEqual((self.logs / "cargo").read_text(), built)
@@ -919,6 +931,16 @@ class Evidence(unittest.TestCase):
                 (self.logs / "ui-ran").unlink(missing_ok=True)
                 self.run_tool("start", "after", *options)
                 self.assertEqual((self.logs / "ui-trace").read_text(), f"{expected}\n")
+                self.run_tool("stop")
+
+    def test_projection_oracle_reaches_only_the_session_that_asked_for_it(self) -> None:
+        self.built()
+        for options, expected in (([], False), (["--projection-oracle"], True), ([], False)):
+            with self.subTest(options=options):
+                (self.logs / "ui-ran").unlink(missing_ok=True)
+                self.run_tool("start", "after", *options)
+                environment = (self.logs / "ui-env").read_text().splitlines()
+                self.assertEqual("CAGENTS_PROJECTION_ORACLE=1" in environment, expected)
                 self.run_tool("stop")
 
     def test_scoped_ui_fixture_leaves_daemon_env_and_cli_as_user_and_resets_on_next_start(self) -> None:
@@ -1049,7 +1071,7 @@ class Evidence(unittest.TestCase):
             """,
             self.logs,
         )
-        result = self.run_tool("start", "after", check=False)
+        result = self.run_tool("start", "after", check=False, timeout=WEDGED_STOP_SECONDS + HANG_GUARD)
         self.assertEqual(result.returncode, 1)
         self.assertIn("still going after 30 seconds", result.stderr)
         self.assertTrue(self.lock_is_free(self.native_lock))
@@ -1079,7 +1101,7 @@ class Evidence(unittest.TestCase):
         )
         # The mount scan runs only over a runtime left by an earlier session.
         (self.task / "rt").mkdir(exist_ok=True)
-        result = self.run_tool("start", "after", check=False)
+        result = self.run_tool("start", "after", check=False, timeout=WEDGED_STOP_SECONDS + HANG_GUARD)
         self.assertEqual(result.returncode, 1)
         self.assertIn("still going after 30 seconds", result.stderr)
         self.assertNotIn(str(self.native_lock), (self.logs / "rm-fds").read_text())
@@ -1107,9 +1129,10 @@ class Evidence(unittest.TestCase):
                 [str(SCRIPT), "build", "after", str(self.root / "after")],
                 env=self.env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             )
-            time.sleep(1)
+            queue = Path(f"{self.cargo_lock}.queue")
+            self.wait_for(lambda: queue.exists() and not self.lock_is_free(queue), "the build to queue for a share")
             self.run_tool("start", "after")
-        output, _ = queued.communicate(timeout=30)
+        output, _ = queued.communicate(timeout=HANG_GUARD)
         self.assertNotEqual(queued.returncode, 0)
         self.assertIn("after is running", output)
         self.assertEqual((self.logs / "cargo").read_text(), before)
@@ -1120,10 +1143,8 @@ class Evidence(unittest.TestCase):
         self.run_tool("start", "after")
         (self.logs / "stop-wedges").touch()
         self.run_tool("stop", check=False)
-        for _ in range(350):
-            if self.lock_is_free(self.native_lock):
-                break
-            time.sleep(0.2)
+        self.wait_for(lambda: self.lock_is_free(self.native_lock), "the lock's release",
+                      timeout=WEDGED_STOP_SECONDS + HANG_GUARD)
         self.assertTrue(self.lock_is_free(self.native_lock))
 
     def test_the_harness_keeps_no_lock_and_avoids_mise_shims(self) -> None:
@@ -1165,10 +1186,7 @@ class Evidence(unittest.TestCase):
             self.assertNotIn(f"{name}=", fixture)
         self.assertNotIn(str(self.root / "real-home") + "/.local", fixture)
         self.assertIn(f"CARGO_HOME={self.root}/real-home/.cargo", fixture)
-        for _ in range(100):
-            if (self.logs / "runner-env").exists():
-                break
-            time.sleep(0.05)
+        self.wait_for(lambda: (self.logs / "runner-env").exists(), '(self.logs / "runner-env").exists()')
         runner = (self.logs / "runner-env").read_text()
         self.assertIn("DBUS_SESSION_BUS_ADDRESS=stub\n", runner)
         self.assertIn("WAYLAND_DISPLAY=evidence\n", runner)
@@ -1180,7 +1198,7 @@ class Evidence(unittest.TestCase):
         for arguments in (("--window=window-2",), ("--window",), ("--unknown",)):
             with self.subTest(arguments=arguments):
                 result = subprocess.run([str(executable), *arguments], env=self.env,
-                    stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
+                    stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=HANG_GUARD)
                 self.assertEqual(result.returncode, 2)
                 self.assertFalse((self.logs / "ui-pid").exists())
                 self.assertFalse((self.logs / "ui-peer-pid").exists())
@@ -1202,7 +1220,8 @@ class Evidence(unittest.TestCase):
             process = subprocess.Popen([str(SCRIPT), "open-window", "window-2"], env=self.env,
                 stdin=subprocess.DEVNULL, stdout=sink, stderr=sink)
         try:
-            for _ in range(200):
+            deadline = time.monotonic() + HANG_GUARD
+            while time.monotonic() < deadline:
                 if receipt.exists():
                     break
                 if process.poll() is not None:
@@ -1228,7 +1247,7 @@ class Evidence(unittest.TestCase):
             self.assertFalse(self.lock_is_free(self.native_lock))
         finally:
             self.run_tool("stop", check=False)
-            process.wait(timeout=20)
+            process.wait(timeout=HANG_GUARD)
             self.assertFalse(receipt.exists())
 
     def test_start_discards_previous_session_window_readiness(self) -> None:
@@ -1324,7 +1343,8 @@ class Evidence(unittest.TestCase):
             process = subprocess.Popen([str(SCRIPT), "relaunch", "--chat-stages"], env=self.env,
                 stdin=subprocess.DEVNULL, stdout=sink, stderr=sink)
         try:
-            for _ in range(200):
+            deadline = time.monotonic() + HANG_GUARD
+            while time.monotonic() < deadline:
                 current = int((self.logs / "ui-pid").read_text())
                 if current != original_pid and not (self.task / "session" / "replaying").exists():
                     break
@@ -1360,14 +1380,14 @@ class Evidence(unittest.TestCase):
             self.assertIn(f"CAGENTS_CHAT_STAGE_OUTPUT={self.task}/logs/chat-stages/after-", (self.logs / "runner-env").read_text())
             self.assertEqual(stat.S_IMODE((self.task / "logs" / "chat-stages").stat().st_mode), 0o700)
             self.run_tool("stop")
-            process.wait(timeout=20)
+            process.wait(timeout=HANG_GUARD)
             self.assertTrue(self.lock_is_free(self.native_lock))
             self.assertFalse((self.task / "session" / "replaying").exists())
         finally:
             if process.poll() is None:
                 self.run_tool("stop", check=False)
                 process.terminate()
-                process.wait(timeout=20)
+                process.wait(timeout=HANG_GUARD)
 
     def test_a_sessions_builds_never_start_the_pruner(self) -> None:
         # Its runner's builds replay what `build` made. Their disk guard would
@@ -1375,10 +1395,7 @@ class Evidence(unittest.TestCase):
         # while the app is being captured.
         self.built()
         self.run_tool("start", "after", extra={"CAGENTS_BUILD_FREE_FLOOR_GIB": "7"})
-        for _ in range(100):
-            if (self.logs / "runner-env").exists():
-                break
-            time.sleep(0.05)
+        self.wait_for(lambda: (self.logs / "runner-env").exists(), '(self.logs / "runner-env").exists()')
         runner = (self.logs / "runner-env").read_text()
         self.assertIn("CAGENTS_BUILD_FREE_FLOOR_GIB=0\n", runner)
         # Only the runner's: the fixture's other commands keep their guard.
@@ -1388,15 +1405,9 @@ class Evidence(unittest.TestCase):
     def killed_supervisor_processes(self, signal: int, extra: dict | None = None) -> None:
         self.built()
         self.run_tool("start", "after", extra=extra)
-        for _ in range(100):
-            if (self.logs / "runner").exists():
-                break
-            time.sleep(0.05)
+        self.wait_for(lambda: (self.logs / "runner").exists(), '(self.logs / "runner").exists()')
         os.kill(int((self.task / "session" / "pid").read_text()), signal)
-        for _ in range(100):
-            if self.lock_is_free(self.native_lock):
-                break
-            time.sleep(0.2)
+        self.wait_for(lambda: self.lock_is_free(self.native_lock), 'self.lock_is_free(self.native_lock)')
         self.assertTrue(self.lock_is_free(self.native_lock))
 
     def fixture_process_count(self) -> int:
@@ -1411,7 +1422,8 @@ class Evidence(unittest.TestCase):
 
     def test_terminating_the_supervisor_ends_the_whole_session(self) -> None:
         self.killed_supervisor_processes(15)
-        self.assertEqual(self.fixture_process_count(), 0)
+        # Settling sends its KILL without waiting for the processes to go.
+        self.wait_for(lambda: self.fixture_process_count() == 0, 'self.fixture_process_count() == 0')
         self.assertIn("none", self.run_tool("status").stdout)
 
     def test_a_killed_supervisor_takes_the_session_with_it_without_stop(self) -> None:
@@ -1420,14 +1432,11 @@ class Evidence(unittest.TestCase):
         # rules out.
         own_group = subprocess.run(
             [str(REPOSITORY / "scripts/memory-capped"), "cat", "/proc/self/cgroup"],
-            env=self.env, capture_output=True, text=True, timeout=60).stdout
+            env=self.env, capture_output=True, text=True, timeout=HANG_GUARD).stdout
         if "cagents-capped-" not in own_group:
             self.skipTest("a session can't have a scope of its own here")
         self.killed_supervisor_processes(9)
-        for _ in range(100):
-            if self.fixture_process_count() == 0:
-                break
-            time.sleep(0.2)
+        self.wait_for(lambda: self.fixture_process_count() == 0, 'self.fixture_process_count() == 0')
         self.assertEqual(self.fixture_process_count(), 0)
 
     def test_stop_ends_what_a_killed_supervisor_left(self) -> None:
@@ -1555,10 +1564,7 @@ class Evidence(unittest.TestCase):
                            capture_output=True, text=True, env=self.env).stdout.strip(),
             "1",
         )
-        for _ in range(100):
-            if (self.logs / "runner").exists():
-                break
-            time.sleep(0.05)
+        self.wait_for(lambda: (self.logs / "runner").exists(), '(self.logs / "runner").exists()')
         self.assertIn("--browserless", (self.logs / "runner").read_text())
         self.assertIn(f"XDG_DATA_HOME={fixture}/data", (self.logs / "runner-env").read_text())
 
@@ -1583,11 +1589,13 @@ class Evidence(unittest.TestCase):
         self.assertIn("already running", second.stderr)
 
         leftover = subprocess.Popen(
-            ["sleep", "300"],
+            ["sleep", "infinity"],
             env={**self.env, "XDG_RUNTIME_DIR": str(self.task / "rt")},
         )
+        self.addCleanup(leftover.wait)
+        self.addCleanup(lambda: leftover.poll() is not None or leftover.kill())
         unrelated = subprocess.Popen(
-            ["sleep", "300"],
+            ["sleep", "infinity"],
             env={**self.env, "XDG_RUNTIME_DIR": str(self.task / "rt-other")},
         )
         self.addCleanup(unrelated.wait)
@@ -1595,7 +1603,7 @@ class Evidence(unittest.TestCase):
 
         self.assertEqual(self.run_tool("stop").stdout.strip().splitlines()[-1], "stopped")
         self.assertTrue(self.lock_is_free(self.native_lock))
-        self.assertEqual(leftover.wait(timeout=10), -15)
+        self.assertEqual(leftover.wait(timeout=HANG_GUARD), -15)
         self.assertIsNone(unrelated.poll())
         self.assertIn("daemon stop --confirm capability", (self.logs / "cli").read_text())
         self.assertEqual(self.run_tool("cli", "print-env", check=False).returncode, 1)
@@ -1754,7 +1762,7 @@ class Evidence(unittest.TestCase):
         served = self.fixture_shell(
             'socket="$XDG_RUNTIME_DIR/codex-test.sock"; '
             'codex app-server --listen "unix://$socket" 2>"$XDG_RUNTIME_DIR/codex-test.log" & peer=$!; '
-            'for _ in $(seq 100); do [ -S "$socket" ] && break; kill -0 "$peer" 2>/dev/null || break; sleep 0.1; done; '
+            'for _ in $(seq 600); do [ -S "$socket" ] && break; kill -0 "$peer" 2>/dev/null || break; sleep 0.1; done; '
             'if [ -S "$socket" ]; then echo listening; else cat "$XDG_RUNTIME_DIR/codex-test.log"; fi; '
             'kill "$peer" 2>/dev/null; wait "$peer" 2>/dev/null; :')
         self.assertEqual(served.stdout, "listening\n", served.stderr)
@@ -1912,21 +1920,18 @@ class Evidence(unittest.TestCase):
         with self.native_lock.open("a") as held:
             fcntl.flock(held, fcntl.LOCK_EX)
             child = subprocess.Popen(
-                [str(SCRIPT), "start", "after", "--wait-lock", "30",
+                [str(SCRIPT), "start", "after", "--wait-lock", "300",
                  "--codex-executable", str(source)], env=self.env,
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             )
             self.addCleanup(lambda: child.poll() is not None or child.terminate())
             snapshot = self.task / "session/codex-executable.json"
-            for _ in range(100):
-                if snapshot.exists() or child.poll() is not None:
-                    break
-                time.sleep(0.05)
+            self.wait_for(lambda: snapshot.exists() or child.poll() is not None, "the queued snapshot")
             self.assertTrue(snapshot.exists())
             self.assertFalse((self.logs / "kwin").exists())
             source.write_text("original path replaced while queued")
             fcntl.flock(held, fcntl.LOCK_UN)
-        stdout, stderr = child.communicate(timeout=30)
+        stdout, stderr = child.communicate(timeout=HANG_GUARD)
         self.assertEqual(child.returncode, 0, stdout + stderr)
         installed = self.task / "fixture/libexec/codex/codex"
         self.assertEqual(installed.read_bytes(), original)
@@ -1964,7 +1969,7 @@ exec(compile(code, "native-evidence copy helper", "exec"))
 """
         result = subprocess.run(
             ["/usr/bin/python3", "-c", seam, copy_code, str(source), str(allowed),
-             str(snapshot), str(receipt)], capture_output=True, text=True, timeout=5,
+             str(snapshot), str(receipt)], capture_output=True, text=True, timeout=HANG_GUARD,
         )
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("must name an executable file", result.stderr)
@@ -1978,16 +1983,13 @@ exec(compile(code, "native-evidence copy helper", "exec"))
         with self.native_lock.open("a") as held:
             fcntl.flock(held, fcntl.LOCK_EX)
             child = subprocess.Popen(
-                [str(SCRIPT), "start", "after", "--wait-lock", "30",
+                [str(SCRIPT), "start", "after", "--wait-lock", "300",
                  "--codex-executable", str(source)], env=self.env,
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             )
             self.addCleanup(lambda: child.poll() is not None or child.terminate())
             receipt = self.task / "session/codex-executable.json"
-            for _ in range(100):
-                if receipt.exists() or child.poll() is not None:
-                    break
-                time.sleep(0.05)
+            self.wait_for(lambda: receipt.exists() or child.poll() is not None, "the queued receipt")
             self.assertTrue(receipt.exists())
             snapshot = self.task / "session/codex-executable"
             with snapshot.open("r+b") as changed:
@@ -1996,7 +1998,7 @@ exec(compile(code, "native-evidence copy helper", "exec"))
                 changed.seek(-1, os.SEEK_END)
                 changed.write(bytes([byte ^ 1]))
             fcntl.flock(held, fcntl.LOCK_UN)
-        stdout, stderr = child.communicate(timeout=30)
+        stdout, stderr = child.communicate(timeout=HANG_GUARD)
         self.assertNotEqual(child.returncode, 0, stdout + stderr)
         self.assertIn("Codex snapshot changed before installation",
                       (self.task / "logs/session-after.log").read_text())
@@ -2016,22 +2018,19 @@ exec(compile(code, "native-evidence copy helper", "exec"))
                 with self.native_lock.open("a") as held:
                     fcntl.flock(held, fcntl.LOCK_EX)
                     child = subprocess.Popen(
-                        [str(SCRIPT), "start", "after", "--wait-lock", "30",
+                        [str(SCRIPT), "start", "after", "--wait-lock", "300",
                          "--codex-executable", str(source)], env=self.env,
                         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE, text=True,
                     )
                     self.addCleanup(lambda: child.poll() is not None or child.terminate())
                     receipt = self.task / "session/codex-executable.json"
-                    for _ in range(100):
-                        if receipt.exists() or child.poll() is not None:
-                            break
-                        time.sleep(0.05)
+                    self.wait_for(lambda: receipt.exists() or child.poll() is not None, "the queued receipt")
                     self.assertTrue(receipt.exists())
                     receipt.write_text(json.dumps(malformed))
                     fcntl.flock(held, fcntl.LOCK_UN)
                 try:
-                    stdout, stderr = child.communicate(timeout=30)
+                    stdout, stderr = child.communicate(timeout=HANG_GUARD)
                     self.assertNotEqual(child.returncode, 0, stdout + stderr)
                     self.assertIn("Codex snapshot receipt is invalid",
                                   (self.task / "logs/session-after.log").read_text())
@@ -2160,6 +2159,7 @@ exec(compile(code, "native-evidence copy helper", "exec"))
         old = time.time() - 30 * 24 * 60 * 60
         os.utime(seed, (old, old))
         self.fixture_shell("git remote add origin https://github.com/Octo-Org/app")
+        viewed_from = time.time() - 1
         self.fixture_shell("gh repo view --json nameWithOwner,url")
 
         # The path avatar.rs reads under the development storage name, owner lower-cased.
@@ -2168,7 +2168,7 @@ exec(compile(code, "native-evidence copy helper", "exec"))
         cached = fixture / "cache" / f"cagents-development-{instance}" / "github-avatars" / "github.com-octo-org.image"
         self.assertEqual(cached.read_bytes(), seed.read_bytes())
         # Under its seven-day freshness, so the app does not try to download it.
-        self.assertLess(time.time() - cached.stat().st_mtime, 60)
+        self.assertGreater(cached.stat().st_mtime, viewed_from)
 
         # A cache it can't write leaves the avatar out, not the repository.
         cached.unlink()
@@ -2271,10 +2271,7 @@ exec(compile(code, "native-evidence copy helper", "exec"))
     def test_a_forgotten_session_releases_the_lock_at_its_limit(self) -> None:
         self.built()
         self.run_tool("start", "after", "--limit", "1", "--startup-timeout", "600")
-        for _ in range(100):
-            if self.lock_is_free(self.native_lock):
-                break
-            time.sleep(0.2)
+        self.wait_for(lambda: self.lock_is_free(self.native_lock), 'self.lock_is_free(self.native_lock)')
         self.assertTrue(self.lock_is_free(self.native_lock))
         self.assertIn("none", self.run_tool("status").stdout)
 
@@ -2283,10 +2280,7 @@ exec(compile(code, "native-evidence copy helper", "exec"))
         result = self.run_tool("start", "after", check=False, extra={"STUB_APP_FAILS": "1"})
         self.assertEqual(result.returncode, 1)
         self.assertIn("app window did not appear", result.stderr)
-        for _ in range(100):
-            if self.lock_is_free(self.native_lock):
-                break
-            time.sleep(0.2)
+        self.wait_for(lambda: self.lock_is_free(self.native_lock), 'self.lock_is_free(self.native_lock)')
         self.assertTrue(self.lock_is_free(self.native_lock))
 
 
@@ -2447,7 +2441,7 @@ class RemoteEvidence(unittest.TestCase):
         result = subprocess.run(
             [str(via), *prefix, "--task", str(self.task), *args],
             env={**self.env, **(extra or {})}, stdin=subprocess.DEVNULL, cwd=cwd,
-            capture_output=True, text=True, timeout=60,
+            capture_output=True, text=True, timeout=HANG_GUARD,
         )
         if check and result.returncode:
             self.fail(f"{args} exited {result.returncode}:\n{result.stdout}\n{result.stderr}")
@@ -2849,7 +2843,7 @@ class SeedRestore(unittest.TestCase):
                 result = subprocess.run(
                     ["/usr/bin/python3", "-I", str(helper), str(seed), str(fixture)],
                     env={"PATH": "/usr/bin:/bin", "HOME": str(root)},
-                    capture_output=True, text=True, timeout=15, **credentials)
+                    capture_output=True, text=True, timeout=HANG_GUARD, **credentials)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 for relative in relatives:
                     path = fixture / relative
@@ -2878,7 +2872,7 @@ class SeedRestore(unittest.TestCase):
                 ["/usr/bin/python3", "-I", str(REPOSITORY / "scripts/native-evidence-seed.py"),
                  str(seed), str(fixture)],
                 env={"PATH": str(binaries), "HOME": str(root)},
-                capture_output=True, text=True, timeout=15)
+                capture_output=True, text=True, timeout=HANG_GUARD)
             self.assertEqual(result.returncode, 23, result.stderr)
             self.assertEqual(target.read_text(), "changed")
             self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o444)

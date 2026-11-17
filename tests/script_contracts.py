@@ -15,7 +15,6 @@ import signal
 import subprocess
 import sys
 import threading
-import time
 from pathlib import Path
 import tempfile
 import unittest
@@ -75,6 +74,38 @@ class Second(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 """
+
+
+# Bounds only a hang: a passing run returns long before it.
+HANG_GUARD = 60
+
+
+def kill_recorded(pid_file):
+    """Kills the process whose pid PID_FILE records, if one has been recorded."""
+    with contextlib.suppress(FileNotFoundError, ValueError, ProcessLookupError):
+        os.kill(int(pid_file.read_text()), signal.SIGKILL)
+
+
+@contextlib.contextmanager
+def hang_guard(pid_file):
+    """Kills the recorded process if the block outlasts HANG_GUARD.
+
+    Yields an event set only if the guard had to end the process, so a block
+    waiting on a process that never exits by itself proves, by finishing with
+    the event clear, that something else ended or stopped waiting for it.
+    """
+    fired = threading.Event()
+
+    def fire():
+        fired.set()
+        kill_recorded(pid_file)
+
+    timer = threading.Timer(HANG_GUARD, fire)
+    timer.start()
+    try:
+        yield fired
+    finally:
+        timer.cancel()
 
 
 @contextlib.contextmanager
@@ -293,33 +324,44 @@ class Running(Tree):
 
     def test_a_process_left_behind_does_not_hold_a_compact_run_open(self):
         self.write("tests/leaky.py", "import subprocess, sys\nfrom pathlib import Path\n"
-                                     "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+                                     "child = subprocess.Popen([sys.executable, '-c', 'import signal; signal.pause()'])\n"
                                      "Path('child.pid').write_text(str(child.pid))\n")
         jobs = (Job("job", (Suite("leaky", "tests/leaky.py"),)),)
-        started = time.monotonic()
-        try:
+        # The child never exits by itself, so returning before the guard ends it proves the run did not wait for it.
+        pid = self.root / "child.pid"
+        self.addCleanup(kill_recorded, pid)
+        with hang_guard(pid) as fired:
             status, output = self.job_output(jobs, "job")
-        finally:
-            pid = self.root / "child.pid"
-            if pid.exists():
-                with contextlib.suppress(ProcessLookupError):
-                    os.kill(int(pid.read_text()), 9)
-        self.assertLess(time.monotonic() - started, 30)
+        self.assertFalse(fired.is_set(), "the run waited for the process left behind")
         self.assertEqual(status, 0)
         self.assertRegex(output, r"^leaky \.\.\. ok \(passed, \d+\.\ds\)\n$")
 
     def test_an_interrupted_suite_is_named_with_what_it_printed(self):
-        self.write("tests/hung.py", "import time\nprint('progress before hang')\ntime.sleep(60)\n")
+        self.write("tests/hung.py", "import os, signal\nfrom pathlib import Path\nprint('progress before hang')\n"
+                                    "Path('hung.pid').write_text(str(os.getpid()))\nsignal.pause()\n")
         jobs = (Job("job", (Suite("hung", "tests/hung.py"),)),)
-        timer = threading.Timer(1.0, os.kill, (os.getpid(), signal.SIGINT))
-        started = time.monotonic()
-        with quiet() as read:
-            timer.start()
-            with self.assertRaises(KeyboardInterrupt):
-                contracts.run(self.root, "job", jobs=jobs, verbose=False)
+        pid = self.root / "hung.pid"
+        done = threading.Event()
+
+        def interrupt_once_hung():
+            # Only once the suite has printed and hangs, however long it takes to start.
+            while not done.wait(0.01):
+                if pid.exists():
+                    os.kill(os.getpid(), signal.SIGINT)
+                    return
+
+        interrupter = threading.Thread(target=interrupt_once_hung)
+        # The suite never exits by itself, so returning before the guard ends it proves the interrupt ended it.
+        with hang_guard(pid) as fired, quiet() as read:
+            interrupter.start()
+            try:
+                with self.assertRaises(KeyboardInterrupt):
+                    contracts.run(self.root, "job", jobs=jobs, verbose=False)
+            finally:
+                done.set()
+                interrupter.join()
             output = read()
-        timer.cancel()
-        self.assertLess(time.monotonic() - started, 30)
+        self.assertFalse(fired.is_set(), "the interrupt did not end the suite")
         self.assertEqual(output, "hung ... INTERRUPTED\nprogress before hang\n")
 
     def test_a_failing_log_keeps_prints_and_tracebacks_in_order(self):

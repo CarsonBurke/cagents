@@ -613,6 +613,12 @@ struct Deletion {
 }
 
 impl State {
+    /// The channels whose last change failed, for the projection check.
+    #[cfg(any(test, feature = "development"))]
+    pub(super) fn projection_view(&self) -> String {
+        super::projection_oracle::sorted_entries(&self.failed)
+    }
+
     pub fn modal_open(&self) -> bool {
         self.dialog.is_some()
     }

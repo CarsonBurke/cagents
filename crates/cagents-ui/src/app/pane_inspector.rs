@@ -62,6 +62,19 @@ pub(super) struct PaneInspectors {
 }
 
 impl PaneInspectors {
+    /// Every pane's inspector state, in a stable order, for the projection
+    /// check.
+    #[cfg(any(test, feature = "development"))]
+    pub(super) fn projection_view(&self) -> String {
+        format!(
+            "panes {} restored {} legacy {} source control {:?}",
+            super::projection_oracle::sorted_entries(&self.panes),
+            super::projection_oracle::sorted_items(&self.restored_open),
+            self.legacy_open,
+            self.source_control,
+        )
+    }
+
     /// What a window view saved: the panes whose inspectors were open, or,
     /// from a window saved before they were per pane, whether its one
     /// inspector was.

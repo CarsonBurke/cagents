@@ -8,7 +8,7 @@ import copy
 import hashlib
 import json
 import fcntl
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, redirect_stdout
 import os
 from pathlib import Path
 import sqlite3
@@ -28,11 +28,36 @@ from unittest.mock import patch
 
 REPOSITORY = Path(__file__).resolve().parent.parent
 SCRIPT = REPOSITORY / "scripts/rehearse-update"
-spec = importlib.util.spec_from_file_location("rehearsal_records", REPOSITORY / "scripts/rehearse_update_records.py")
-records = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(records)
-sys.modules["rehearse_update_records"] = records
+# The harness modules import their siblings, as they do when run from
+# scripts/. Without this, an unisolated run finds tests/native_slots.py, the
+# slot suite, under that name instead, and an isolated run finds nothing.
+sys.path.insert(0, str(REPOSITORY / "scripts"))
+import rehearse_update_records as records
 AUTHORITY = ("CAGENTS_AGENT_AUTHORITY", "CAGENTS_AGENT_TOKEN", "CAGENTS_SESSION_TOKEN")
+# Bounds only a hang; a passing wait returns as soon as its event arrives.
+HANG_GUARD = 60
+# Lifetime of helper processes whose liveness a test asserts: longer than any
+# test, but finite, so a killed runner leaks nothing for long.
+HELPER_LIFETIME = str(10 * HANG_GUARD)
+
+
+def require_user_manager(test: unittest.TestCase) -> None:
+    """Skip TEST unless the real systemd user manager answers as `stop` asks it.
+
+    `stop` lists running scopes there to prove none it attributed survive, so
+    it fails, as it should, on a host whose user has no manager.
+    """
+    try:
+        listed = subprocess.run(
+            ["systemctl", "--user", "--plain", "--no-legend", "--no-pager",
+             "list-units", "--type=scope", "--state=running"],
+            env={"HOME": os.environ.get("HOME", "/"), "XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}",
+                 "PATH": "/usr/local/bin:/usr/bin:/bin"},
+            capture_output=True, text=True, timeout=HANG_GUARD)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        test.skipTest(f"stop needs the systemd user manager: {error}")
+    if listed.returncode:
+        test.skipTest("stop needs the systemd user manager: " + (listed.stderr.strip() or f"exit {listed.returncode}"))
 
 
 def snapshot() -> dict:
@@ -167,6 +192,19 @@ class Comparison(unittest.TestCase):
         after["sessions"]["lineage"]["surface"] = "terminal"
         self.assertEqual([(row["change"], row["regression"]) for row in records.compare(before, after)],
                          [("surface", True)])
+
+    def test_a_blank_fact_a_compact_row_leaves_out_is_unchanged(self):
+        # The older listing stated an untitled conversation's title, and a
+        # session without a failure, as empty; compact rows leave both out.
+        before, after = snapshot(), snapshot()
+        before["sessions"]["lineage"].update(title="", failure="", channel=None, directory="/repo")
+        after["sessions"]["lineage"].update(directory="/repo")
+        self.assertEqual(records.compare(before, after), [])
+        # A title that goes blank was still lost.
+        before["sessions"]["lineage"]["title"] = "Release notes"
+        self.assertEqual([(row["change"], row["before"], row["after"], row["regression"])
+                          for row in records.compare(before, after)],
+                         [("title", "Release notes", None, True)])
 
     def test_window_compositor_id_and_focus_are_not_persistent_identity(self):
         before, after = snapshot(), snapshot()
@@ -474,7 +512,12 @@ class Comparison(unittest.TestCase):
             (state / f"{job}.recovery.json").write_text(records.dump(evidence["issued"]))
             (state / f"{job}.census.json").chmod(0o600)
             (state / f"{job}.recovery.json").chmod(0o600)
-            self.assertTrue(records.prepare_recovery(root, out))
+            printed = io.StringIO()
+            with redirect_stdout(printed):
+                self.assertTrue(records.prepare_recovery(root, out))
+            # cmd_record runs the verifier this names: the target's own CLI.
+            self.assertEqual(printed.getvalue(),
+                             f"{root}/home/.local/share/cagents-install/versions/candidate/bin/cagents\n")
             self.assertEqual((out / "recovery-census.json").read_bytes(), raw)
             self.assertEqual((out / "recovery-census.json").stat().st_mode & 0o777, 0o600)
             self.assertEqual((out / "recovery-issued.json").stat().st_mode & 0o777, 0o600)
@@ -587,10 +630,10 @@ class Comparison(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="rehearse-exe-") as temporary:
             root = Path(temporary)
             sleep_image = str(Path(shutil.which("sleep")).resolve())
-            peer = subprocess.Popen(["bash", "-c", 'exec -a /fake/old-version/bin/cagentsd sleep 60'],
+            peer = subprocess.Popen(["bash", "-c", 'exec -a /fake/old-version/bin/cagentsd sleep ' + HELPER_LIFETIME],
                                     env={**os.environ, "HOME": str(root / "home")})
             try:
-                deadline = time.monotonic() + 5
+                deadline = time.monotonic() + HANG_GUARD
                 while os.readlink(f"/proc/{peer.pid}/exe") != sleep_image:
                     self.assertIsNone(peer.poll())
                     self.assertLess(time.monotonic(), deadline)
@@ -602,7 +645,7 @@ class Comparison(unittest.TestCase):
                 self.assertGreater(row["start_ticks"], 0)
             finally:
                 peer.terminate()
-                peer.wait(timeout=5)
+                peer.wait(timeout=HANG_GUARD)
 
     def test_cli_accepts_record_directories_and_returns_failure(self):
         with tempfile.TemporaryDirectory(prefix="rehearse-record-") as temporary:
@@ -649,13 +692,25 @@ class ReopenedWindows(unittest.TestCase):
         expected = '/var/tmp/rehearsal-test/home/.local/share/cagents-install/versions/new/bin/cagents-ui'
         with patch.object(rehearsal, 'mapped', return_value=windows), \
                 patch.object(scenario.os, 'readlink', side_effect=[expected, expected]):
-            self.assertEqual(rehearsal.wait_windows(['main','second'], timeout=1, version='new'), windows)
+            self.assertEqual(rehearsal.wait_windows(['main','second'], timeout=HANG_GUARD, version='new'), windows)
         with patch.object(rehearsal, 'mapped', return_value=windows), \
                 patch.object(scenario.os, 'readlink', side_effect=[expected, expected.replace('/new/', '/old/')]), \
                 patch.object(scenario.time, 'monotonic', side_effect=[0, .1, 2]), \
                 patch.object(scenario.time, 'sleep'):
             with self.assertRaisesRegex(RuntimeError, 'windows did not map on new'):
                 rehearsal.wait_windows(['main','second'], timeout=1, version='new')
+
+    def test_each_window_opens_once_the_previous_one_maps(self):
+        spec = importlib.util.spec_from_file_location("rehearsal_run", REPOSITORY / "scripts/rehearse_update_run.py")
+        scenario = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(scenario)
+        rehearsal = scenario.Rehearsal('/var/tmp/rehearsal-test', str(SCRIPT))
+        events = []
+        with patch.object(rehearsal, 'call', side_effect=lambda *a, **k: events.append(a)), \
+                patch.object(rehearsal, 'wait_windows', side_effect=lambda slots, **k: events.append(('wait', slots))):
+            rehearsal.open_windows(['main','second'])
+        self.assertEqual(events, [('launch', 'main'), ('wait', ['main']),
+                                  ('launch', 'second'), ('wait', ['main','second'])])
 
 
 class ScaleSeed(unittest.TestCase):
@@ -1091,7 +1146,7 @@ class CandidateNamespace(unittest.TestCase):
 
 class NativeLockWaiter(unittest.TestCase):
     def waiting_child(self, peer):
-        deadline=time.monotonic()+5
+        deadline=time.monotonic()+HANG_GUARD
         while time.monotonic()<deadline:
             self.assertIsNone(peer.poll())
             try:
@@ -1109,7 +1164,7 @@ class NativeLockWaiter(unittest.TestCase):
 
     def assert_child_gone(self, identity):
         pid,start=identity
-        deadline=time.monotonic()+5
+        deadline=time.monotonic()+HANG_GUARD
         while time.monotonic()<deadline:
             try:
                 stat=Path(f'/proc/{pid}/stat').read_text().rsplit(')',1)[1].split()
@@ -1139,7 +1194,7 @@ class NativeLockWaiter(unittest.TestCase):
                     self.assertEqual(self.waiting_child(peer),child)
                     if mode=='acquire':
                         fcntl.flock(holder,fcntl.LOCK_UN)
-                        output,error=peer.communicate(timeout=5)
+                        output,error=peer.communicate(timeout=HANG_GUARD)
                         self.assertEqual(peer.returncode,0,output+error)
                         self.assert_child_gone(child)
                         with self.assertRaises(BlockingIOError):
@@ -1150,10 +1205,10 @@ class NativeLockWaiter(unittest.TestCase):
                             (root/'desktop/stop').touch()
                         else:
                             peer.send_signal(signal.SIGTERM if mode=='signal' else signal.SIGKILL)
-                        output,error=peer.communicate(timeout=5)
+                        output,error=peer.communicate(timeout=HANG_GUARD)
                         self.assertEqual(peer.returncode,{'stop':75,'signal':143,'abandon':-signal.SIGKILL}[mode],output+error)
                         if mode=='abandon':
-                            self.assertEqual(select.select([child_pidfd],[],[],5)[0],[child_pidfd])
+                            self.assertEqual(select.select([child_pidfd],[],[],HANG_GUARD)[0],[child_pidfd])
                             self.assertFalse(any(Path(f'/proc/{child[0]}/fd').glob('*')))
                         else:
                             self.assert_child_gone(child)
@@ -1169,7 +1224,7 @@ class NativeLockWaiter(unittest.TestCase):
                         os.close(child_pidfd)
                     if peer.poll() is None:
                         os.killpg(peer.pid,signal.SIGKILL)
-                        peer.communicate(timeout=5)
+                        peer.communicate(timeout=HANG_GUARD)
 
     def test_one_stable_waiter_transfers_the_lock_to_the_inherited_description(self):
         self.exercise('acquire')
@@ -1190,7 +1245,7 @@ class NativeLockWaiter(unittest.TestCase):
             with (root/'native.lock').open('w') as inherited:
                 result=subprocess.run([sys.executable,str(REPOSITORY/'scripts/rehearse_update_run.py'),str(root),str(SCRIPT),
                     'wait-native-lock','--fd',str(inherited.fileno()),'--parent-pid',str(os.getpid()+10000000)],
-                    pass_fds=(inherited.fileno(),),capture_output=True,text=True,timeout=5)
+                    pass_fds=(inherited.fileno(),),capture_output=True,text=True,timeout=HANG_GUARD)
                 self.assertEqual(result.returncode,75,result.stdout+result.stderr)
 
     def test_parent_death_before_child_arms_pdeathsig_cannot_enter_flock(self):
@@ -1214,7 +1269,7 @@ class NativeLockWaiter(unittest.TestCase):
                     text=True,start_new_session=True,env={**os.environ,'PATH':str(root/'bin')+':'+os.environ['PATH']})
                 child_fd=None
                 try:
-                    deadline=time.monotonic()+5
+                    deadline=time.monotonic()+HANG_GUARD
                     child=None
                     while time.monotonic()<deadline:
                         self.assertIsNone(peer.poll())
@@ -1232,18 +1287,18 @@ class NativeLockWaiter(unittest.TestCase):
                         time.sleep(.02)
                     else:self.fail('the lock child was not gated before its delayed prctl')
                     child_fd=os.pidfd_open(child)
-                    peer.kill();peer.wait(timeout=5)
+                    peer.kill();peer.wait(timeout=HANG_GUARD)
                     release.touch()
-                    self.assertEqual(select.select([child_fd],[],[],5)[0],[child_fd])
+                    self.assertEqual(select.select([child_fd],[],[],HANG_GUARD)[0],[child_fd])
                     self.assertFalse(any(Path(f'/proc/{child}/fd').glob('*')))
-                    peer.communicate(timeout=5)
+                    peer.communicate(timeout=HANG_GUARD)
                     fcntl.flock(holder,fcntl.LOCK_UN)
                     fcntl.flock(probe,fcntl.LOCK_EX|fcntl.LOCK_NB)
                     fcntl.flock(probe,fcntl.LOCK_UN)
                 finally:
                     release.touch()
                     if peer.poll() is None:
-                        peer.kill();peer.communicate(timeout=5)
+                        peer.kill();peer.communicate(timeout=HANG_GUARD)
                     if child_fd is not None:
                         try:signal.pidfd_send_signal(child_fd,signal.SIGTERM)
                         except ProcessLookupError:pass
@@ -1265,12 +1320,12 @@ class WindowCloseTracing(unittest.TestCase):
             slot=root/'rt/cagents-ui.lock.primary'
             owner=slot.open('w')
             fcntl.flock(owner,fcntl.LOCK_EX)
-            peer=subprocess.Popen([executable,'60'],pass_fds=(owner.fileno(),),
+            peer=subprocess.Popen([executable,HELPER_LIFETIME],pass_fds=(owner.fileno(),),
                 env={} if sanitized else {**os.environ,'HOME':str(root/'home'),'XDG_RUNTIME_DIR':str(root/'rt')})
             try:
                 fields=(Path('/proc')/str(peer.pid)/'stat').read_text().rsplit(')',1)[1].split()
                 row={'pid':peer.pid,'start_ticks':int(fields[19]),'executable':str(executable),
-                     'argv':[str(executable),'60']}
+                     'argv':[str(executable),HELPER_LIFETIME]}
                 before=root/'records/before/snapshot.json'
                 before.parent.mkdir(parents=True)
                 before.write_text(json.dumps({'processes':[row]}))
@@ -1278,7 +1333,7 @@ class WindowCloseTracing(unittest.TestCase):
             finally:
                 if peer.poll() is None:
                     peer.terminate()
-                peer.wait(timeout=5)
+                peer.wait(timeout=HANG_GUARD)
                 owner.close()
 
     def test_real_window_lease_observation_cannot_retain_or_acquire_the_lock(self):
@@ -1289,7 +1344,7 @@ class WindowCloseTracing(unittest.TestCase):
                 self.assertTrue(sampled['original_ui'])
                 self.assertTrue(any('FLOCK' in item['fdinfo'] for item in sampled['slot_descriptors']))
                 self.assertEqual(first['snapshot']['slots'][0]['inode'],slot.stat().st_ino)
-                peer.terminate();peer.wait(timeout=5);owner.close()
+                peer.terminate();peer.wait(timeout=HANG_GUARD);owner.close()
                 # This succeeds while the observer and its pidfd are still alive.
                 with slot.open('r') as probe:
                     fcntl.flock(probe,fcntl.LOCK_EX|fcntl.LOCK_NB)
@@ -1374,11 +1429,11 @@ class WindowCloseTracing(unittest.TestCase):
             monitor=records.WindowCloseMonitor(root)
             def observe():
                 ready.set()
-                monitor.stop.wait(5)
+                monitor.stop.wait(HANG_GUARD)
             with patch.object(monitor,'observe',side_effect=observe):
                 with self.assertRaisesRegex(RuntimeError,'update failed'):
                     with monitor:
-                        self.assertTrue(ready.wait(2))
+                        self.assertTrue(ready.wait(HANG_GUARD))
                         raise RuntimeError('update failed')
             self.assertFalse(monitor.thread.is_alive())
             self.assertTrue(monitor.stop.is_set())
@@ -1411,8 +1466,8 @@ class WindowCloseTracing(unittest.TestCase):
             monitor=records.WindowCloseMonitor(root)
             def observe():
                 ready.set()
-                monitor.stop.wait(5)
-                release.wait(2)
+                monitor.stop.wait(HANG_GUARD)
+                release.wait(HANG_GUARD)
             waited=monitor.finished.wait
             interruptions=[]
             def interrupted_wait(timeout):
@@ -1424,7 +1479,7 @@ class WindowCloseTracing(unittest.TestCase):
                     patch.object(monitor.finished,'wait',side_effect=interrupted_wait):
                 with self.assertRaises(KeyboardInterrupt):
                     with monitor:
-                        self.assertTrue(ready.wait(2))
+                        self.assertTrue(ready.wait(HANG_GUARD))
             self.assertTrue(monitor.finished.is_set())
             self.assertFalse(monitor.thread.is_alive())
             self.assertTrue(monitor.output.closed)
@@ -1889,10 +1944,12 @@ class ExistingOnlyReopen(unittest.TestCase):
 
 
 class Pty(unittest.TestCase):
-    def run_peer(self, body, *options):
+    def run_peer(self, body, *options, **kwargs):
         command = [sys.executable, str(REPOSITORY / "scripts/rehearse_update_pty.py"),
                    *options, "--", sys.executable, "-c", body]
-        return subprocess.run(command, capture_output=True, text=True, timeout=10)
+        # Outlasts a helper given --timeout HANG_GUARD, so the helper's own
+        # deadline, which also ends the peer, reports a hang first.
+        return subprocess.run(command, capture_output=True, text=True, timeout=2 * HANG_GUARD, **kwargs)
 
     def test_waits_for_split_prompt_and_answers_each_prompt_on_controlling_tty(self):
         result = self.run_peer(
@@ -1934,7 +1991,7 @@ class Pty(unittest.TestCase):
                     f"assert tty.readline().strip() == {answer!r}; "
                     + ("sys.stdout.write('Type \\\"stop\\\" to stop these and update. Anything else cancels.\\n'); "
                        "sys.stdout.flush(); assert tty.readline().strip() == 'stop'; " if answer == 'yes' else '')
-                    + "print('idle review answered')", '--answer', answer, '--working', 'i', '--stop', 'stop', '--timeout', '1')
+                    + "print('idle review answered')", '--answer', answer, '--working', 'i', '--stop', 'stop', '--timeout', str(HANG_GUARD))
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(result.stdout.count('[rehearsal prompt='), 2 if answer == 'yes' else 1)
                 self.assertIn('idle review answered', result.stdout)
@@ -1953,10 +2010,15 @@ class Pty(unittest.TestCase):
     def test_timeout_allows_peer_to_finish_sigterm_handler_before_pty_closes(self):
         with tempfile.TemporaryDirectory(prefix="ru-pty-") as temporary:
             marker = Path(temporary) / "terminated"
+            # The peer starts with SIGTERM blocked and unblocks it once its
+            # handler exists, so a slow interpreter start cannot let the .3 s
+            # deadline's SIGTERM kill it before the handler is installed.
             result = self.run_peer(
                 "import signal,time,pathlib; "
                 f"signal.signal(signal.SIGTERM, lambda *_: (time.sleep(.1), pathlib.Path({str(marker)!r}).write_text('done'), exit(0))); "
-                "print('ready',flush=True); time.sleep(30)", "--timeout", ".3")
+                "signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM}); "
+                "print('ready',flush=True); time.sleep(30)", "--timeout", ".3",
+                preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM}))
             self.assertEqual(result.returncode, 124, result.stdout + result.stderr)
             self.assertEqual(marker.read_text(), "done")
 
@@ -1989,6 +2051,7 @@ class Arguments(unittest.TestCase):
     @unittest.skipIf(any(name in os.environ for name in AUTHORITY),
                      "stop is tested in a genuine user shell; never strip authority")
     def test_stop_restores_only_its_private_preservation_fault(self):
+        require_user_manager(self)
         for fault in ("marker", "interrupted-rename", "unrelated-file", "unrelated-symlink"):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory(prefix="ru-stop-", dir="/var/tmp") as temporary:
                 root = Path(temporary)
@@ -2005,7 +2068,7 @@ class Arguments(unittest.TestCase):
                     (root / "unrelated-target").write_text("unrelated file; preserve me")
                     holders.symlink_to(root / "unrelated-target")
                 result = subprocess.run([str(SCRIPT), "--root", str(root), "stop"],
-                                        capture_output=True, text=True, timeout=20)
+                                        capture_output=True, text=True, timeout=HANG_GUARD)
                 self.assertEqual(result.returncode, 1 if fault.startswith("unrelated-") else 0,
                                  result.stdout + result.stderr)
                 if fault.startswith("unrelated-"):
@@ -2041,7 +2104,7 @@ class PrivateRoot(unittest.TestCase):
 
     def call(self, *args, **kwargs):
         return subprocess.run([str(SCRIPT), "--root", str(self.root), *args],
-                              capture_output=True, text=True, timeout=20, **kwargs)
+                              capture_output=True, text=True, timeout=HANG_GUARD, **kwargs)
 
     def test_counted_daemon_stop_is_private_and_leaves_other_private_processes_alive(self):
         self.assertEqual(self.call('init').returncode,0)
@@ -2061,7 +2124,7 @@ else:sys.exit(2)
         cli.chmod(0o755)
         (prefix/'current').symlink_to('versions/new')
         launcher=self.root/'home/.local/bin/cagents';launcher.symlink_to(prefix/'current/bin/cagents')
-        peer=subprocess.Popen(['sleep','60'],env={**os.environ,'HOME':str(self.root/'home')})
+        peer=subprocess.Popen(['sleep',HELPER_LIFETIME],env={**os.environ,'HOME':str(self.root/'home')})
         try:
             result=self.call('stop-daemon')
             self.assertEqual(result.returncode,0,result.stdout+result.stderr)
@@ -2073,7 +2136,7 @@ else:sys.exit(2)
             self.assertEqual(refused.returncode,2)
             self.assertIn('installed CLI',refused.stderr)
         finally:
-            peer.terminate();peer.wait(timeout=5)
+            peer.terminate();peer.wait(timeout=HANG_GUARD)
 
     def test_init_records_root_and_cleanup_refuses_mismatched_or_symlink_marker(self):
         result = self.call("init")
@@ -2136,7 +2199,7 @@ else:sys.exit(2)
         result=self.call('launch','--restore-existing-only','second',
             env={**os.environ,'PATH':str(tools)+':'+os.environ['PATH'],'PRIVATE_SECRET':'must-not-pass'})
         self.assertEqual(result.returncode,0,result.stdout+result.stderr)
-        deadline=time.monotonic()+5
+        deadline=time.monotonic()+HANG_GUARD
         while not output.exists():
             self.assertLess(time.monotonic(),deadline)
             time.sleep(.01)
@@ -2155,13 +2218,13 @@ else:sys.exit(2)
                                         env={**os.environ, "CAGENTS_EVIDENCE_NATIVE_LOCK": str(self.root / "native.lock")},
                                         stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
                 try:
-                    deadline = time.monotonic()+5
+                    deadline = time.monotonic()+HANG_GUARD
                     while "waiting for the native lock" not in (self.root / "waiter.log").read_text():
                         self.assertIsNone(peer.poll())
                         self.assertLess(time.monotonic(), deadline)
                         time.sleep(.05)
                     (desktop / "stop").touch()
-                    self.assertEqual(peer.wait(timeout=5), 0)
+                    self.assertEqual(peer.wait(timeout=HANG_GUARD), 0)
                     self.assertFalse((self.root / "logs/kwin.log").exists())
                 finally:
                     if peer.poll() is None:
@@ -2169,18 +2232,19 @@ else:sys.exit(2)
                         peer.wait()
 
     def test_stop_reports_surviving_attributed_scope_without_stopping_other_members(self):
+        require_user_manager(self)
         self.assertEqual(self.call("init").returncode, 0)
         unit = self.root.name+".scope"
         # The wrapper and second child retain the real environment. Only the
         # first child's HOME attributes this scope to the private root.
-        body = ('env HOME="$1/home" sleep 60 & echo $! >"$1/private.pid"; '
-                'sleep 60 & echo $! >"$1/unrelated.pid"; wait')
+        body = (f'env HOME="$1/home" sleep {HELPER_LIFETIME} & echo $! >"$1/private.pid"; '
+                f'sleep {HELPER_LIFETIME} & echo $! >"$1/unrelated.pid"; wait')
         peer = subprocess.Popen(["systemd-run", "--user", "--scope", "--unit="+unit,
                                  "bash", "-c", body, "bash", str(self.root)],
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                 start_new_session=True)
         try:
-            deadline = time.monotonic()+5
+            deadline = time.monotonic()+HANG_GUARD
             while not (self.root / "unrelated.pid").exists():
                 if peer.poll() is not None:
                     self.fail("scope fixture failed: "+peer.communicate()[1])
@@ -2198,7 +2262,7 @@ else:sys.exit(2)
                 os.killpg(peer.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            peer.communicate(timeout=5)
+            peer.communicate(timeout=HANG_GUARD)
 
     def test_drive_and_display_query_only_receive_allowlisted_environment(self):
         self.assertEqual(self.call("init").returncode, 0)
@@ -2391,8 +2455,10 @@ class FailedInitialization(unittest.TestCase):
                     raise RuntimeError("partly failed init")
                 return 1, "not initialized"
             args = type("Args", (), dict(old_version="old", new_version="new", ceditor=None))()
-            with patch.object(rehearsal, "call", side_effect=call):
+            printed = io.StringIO()
+            with patch.object(rehearsal, "call", side_effect=call), redirect_stdout(printed):
                 self.assertEqual(rehearsal.run(args), 1)
+            self.assertEqual(printed.getvalue(), f"Report: {root}/report.txt\n")
             self.assertEqual(commands, ["init", "record", "stop"])
             self.assertIn("Outcome: FAIL", (root / "report.txt").read_text())
             self.assertIn("partly failed init", (root / "report.txt").read_text())
@@ -2407,16 +2473,17 @@ class WindowStallUnderLock(unittest.TestCase):
 
     WRITER = r"""
 import fcntl, json, os, sys, time
-log, lock = sys.argv[1:]
+log, lock, hold = sys.argv[1:]
 descriptor = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
 sys.stdin.read(1)
 fcntl.flock(descriptor, fcntl.LOCK_EX)
 with open(log, 'a') as stream:
     stream.write(json.dumps({'pid': os.getpid(), 'at_unix_ms': 1,
                              'event': {'kind': 'final_flush', 'complete': True}}) + '\n')
-time.sleep(.05)  # the append's sync_data and directory sync
-fcntl.flock(descriptor, fcntl.LOCK_UN)
-time.sleep(30)
+# Model the append's sync_data and directory sync, holding the lock until the
+# monitor stops this writer; cleanup kills it, and HOLD, which outlasts the
+# test's guards, bounds a failed run.
+time.sleep(float(hold))
 """
 
     def test_stop_lands_while_the_window_holds_its_diagnostics_lock(self):
@@ -2426,9 +2493,10 @@ time.sleep(30)
             diagnostics.mkdir(parents=True)
             log, lock = diagnostics/'cagents-ui.0.jsonl', diagnostics/'cagents-ui.lock'
             log.write_text('')
-            writer = subprocess.Popen([sys.executable, '-I', '-c', self.WRITER, str(log), str(lock)],
+            writer = subprocess.Popen([sys.executable, '-I', '-c', self.WRITER, str(log), str(lock), str(2 * HANG_GUARD)],
                                       stdin=subprocess.PIPE, text=True)
             self.addCleanup(writer.wait)
+            self.addCleanup(writer.stdin.close)
             self.addCleanup(writer.kill)
             descriptor = os.pidfd_open(writer.pid)
             self.addCleanup(os.close, descriptor)
@@ -2437,12 +2505,26 @@ time.sleep(30)
             monitor.originals_by_pin = [{'argv': ['cagents-ui']}]
             events = []
             monitor.write = events.append
+            # The stall reads the log's starting offset before its first stop
+            # check; release the writer only once that check has run.
+            polling = threading.Event()
+
+            class Stop(threading.Event):
+                def is_set(self):
+                    polling.set()
+                    return super().is_set()
+
+            monitor.stop = Stop()
             stall = threading.Thread(target=monitor.stall_after_flush)
             stall.start()
-            time.sleep(.1)
+            self.addCleanup(stall.join, HANG_GUARD)
+            # Registered last, so it runs first: a surviving stall thread ends
+            # before the pidfd it polls is closed and possibly reused.
+            self.addCleanup(monitor.stop.set)
+            self.assertTrue(polling.wait(HANG_GUARD))
             writer.stdin.write('x')
             writer.stdin.flush()
-            stall.join(10)
+            stall.join(HANG_GUARD)
             self.assertFalse(stall.is_alive())
             [event] = events
             self.assertEqual(event['event'], 'stalled_window_after_flush')

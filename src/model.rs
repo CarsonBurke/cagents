@@ -412,6 +412,57 @@ pub struct TerminalExit {
     pub occurred_at_unix_ms: i64,
 }
 
+/// What a chat had not sent when its card closed: the composer's text and
+/// attachments, with any first message or follow-ups it was holding folded
+/// in, and the messages its provider was still holding, which stopped with
+/// it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeptChatDraft {
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub attachments: Vec<crate::chat::Attachment>,
+    #[serde(default)]
+    pub waiting: Vec<crate::chat::QueuedMessage>,
+    /// Whether `text` is the message the chat was still sending as it
+    /// closed, which the conversation may have received.
+    #[serde(default)]
+    pub sending: bool,
+    pub closed_at_unix_ms: i64,
+}
+
+impl KeptChatDraft {
+    /// Closed chats a window keeps drafts for; the oldest give way.
+    pub const LIMIT: usize = 32;
+    /// How long a draft waits for its chat to reopen. Pasted images it
+    /// names are kept as long.
+    pub const RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty() && self.attachments.is_empty() && self.waiting.is_empty()
+    }
+
+    /// Keeps the newest [`Self::LIMIT`] drafts that hold anything and closed
+    /// within [`Self::RETENTION_MS`] of `now_unix_ms`.
+    pub fn retain_recent(drafts: &mut HashMap<CardId, Self>, now_unix_ms: i64) {
+        drafts.retain(|_, draft| {
+            !draft.is_empty()
+                && now_unix_ms.saturating_sub(draft.closed_at_unix_ms) <= Self::RETENTION_MS
+        });
+        if drafts.len() <= Self::LIMIT {
+            return;
+        }
+        let mut order = drafts
+            .iter()
+            .map(|(card, draft)| (draft.closed_at_unix_ms, *card))
+            .collect::<Vec<_>>();
+        order.sort_unstable_by(|a, b| b.cmp(a));
+        for (_, card) in order.into_iter().skip(Self::LIMIT) {
+            drafts.remove(&card);
+        }
+    }
+}
+
 /// A chat provider's queue as last saved, with the daemon that held it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SavedQueue {
@@ -420,6 +471,11 @@ pub struct SavedQueue {
     /// with it; a queue an older build left behind names an earlier one.
     pub host: Option<HostSessionProof>,
     pub messages: Vec<crate::chat::QueuedMessage>,
+    /// Whether closing a card stopped the provider that held `messages`, so
+    /// that none holds them now, whichever daemon the conversation's
+    /// reopened card connects through.
+    #[serde(default)]
+    pub stopped: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1570,6 +1626,10 @@ pub struct WorkspaceState {
     /// a reopened conversation returns these to its composer, unsent.
     #[serde(default)]
     pub chat_waiting_messages: HashMap<CardId, SavedQueue>,
+    /// What chats closed in this window had not sent, keyed by the closed
+    /// card, so reopening the conversation brings it back to the composer.
+    #[serde(default)]
+    pub kept_chat_drafts: HashMap<CardId, KeptChatDraft>,
     /// Unseen semantic agent updates, including their last known worktree owner.
     #[serde(default)]
     pub agent_updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
@@ -1618,6 +1678,7 @@ impl Default for WorkspaceState {
             chat_drafts: HashMap::new(),
             chat_draft_attachments: HashMap::new(),
             chat_waiting_messages: HashMap::new(),
+            kept_chat_drafts: HashMap::new(),
             agent_updates: BTreeMap::new(),
             workspace_history: Vec::new(),
             repository_navigation: HashMap::new(),

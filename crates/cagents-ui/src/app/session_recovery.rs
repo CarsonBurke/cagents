@@ -817,7 +817,8 @@ mod tests {
         for _ in 0..10 {
             let task = app
                 .chrome_key_event(&key(keyboard::key::Named::Tab, false))
-                .unwrap();
+                .unwrap()
+                .0;
             if super::super::tests::focused_element(app.session_recovery_action().unwrap(), task)
                 == Some(recovery.clone())
             {

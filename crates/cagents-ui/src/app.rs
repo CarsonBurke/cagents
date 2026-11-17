@@ -36,6 +36,8 @@ mod palette_ui;
 mod pane_inspector;
 mod pr_checkout_ui;
 mod project_ui;
+#[cfg(any(test, feature = "development"))]
+mod projection_oracle;
 mod pull_request_ui;
 #[cfg(test)]
 mod question_tests;
@@ -1167,6 +1169,14 @@ struct TerminalWakeup {
 /// terminals wake about once per frame each, so a wake that changed nothing a
 /// projection reads must not pay for every card's sidebar, chrome and
 /// protection bookkeeping.
+///
+/// Every update projects `Full` unless what handled its message declares
+/// less: a handler that knows what it changed returns its projection beside
+/// its task, as [`Cagents::update_chat_ui`] and [`Cagents::update_chrome_ui`]
+/// do, and `update` projects that instead. A message nothing declares for keeps the
+/// full projection, so a new or changed handler is correct before it is
+/// fast. Tests check every narrower declaration against the full projection
+/// (`projection_oracle`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Projection {
     /// Nothing any projection reads changed: grid output, repaint ticks.
@@ -1178,6 +1188,26 @@ enum Projection {
     ScopedChrome(Vec<CardId>),
     /// Anything else, including every user action.
     Full,
+}
+
+impl Projection {
+    /// The variant's name, which the UI thread trace reports.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Unchanged => "Unchanged",
+            Self::Chrome => "Chrome",
+            Self::ScopedChrome(_) => "ScopedChrome",
+            Self::Full => "Full",
+        }
+    }
+}
+
+/// Evaluates a stage of an update's projection, timed in the UI thread trace.
+macro_rules! projection_stage {
+    ($stage:literal, $work:expr) => {{
+        let _stage = crate::performance::ui_trace::projection_stage($stage);
+        $work
+    }};
 }
 
 /// Runtime-reported terminal titles can animate several times a second
@@ -5197,6 +5227,7 @@ struct CardLabels {
 
 /// Inputs that can change a terminal's presentation. Ordinary runtime wakes
 /// reuse the numbered title instead of allocating it again for every pane.
+#[derive(Debug)]
 struct TerminalTitleSource {
     reported: String,
     directory: PathBuf,
@@ -5226,6 +5257,7 @@ impl TerminalTitleSource {
 /// Both embed the card id and title, so they are built when a card appears or
 /// is renamed instead of once per rendered frame. Reusing an id also keeps the
 /// card's accessibility node stable across frames.
+#[derive(Debug)]
 struct CardChrome {
     tooltip: String,
     focus_id: widget::Id,
@@ -5626,6 +5658,10 @@ pub struct Cagents {
     worktree_offsets: HashMap<PathBuf, f32>,
     channel_offsets: HashMap<crate::model::ChannelId, f32>,
     worktree_owners: HashMap<CardId, PathBuf>,
+    /// The worktrees the last protection sync asked to protect, which the
+    /// projection check compares.
+    #[cfg(any(test, feature = "development"))]
+    projected_protections: std::collections::BTreeSet<PathBuf>,
     known_worktree_roots: worktree_ui::KnownWorktreeRoots,
     worktree_paths: worktree_ui::WorktreePathIndex,
     /// What the projects list of pull requests, by repository and number,
@@ -6863,7 +6899,7 @@ impl Cagents {
             Some(CardRuntime::Repository(runtime)) => runtime.navigation(),
             _ => None,
         };
-        self.duplicate_pane_with_navigation(source, owner, navigation)
+        self.duplicate_pane_with_navigation(source, owner, navigation, false)
     }
 
     fn duplicate_pane_in_scope(
@@ -6872,7 +6908,7 @@ impl Cagents {
         owner: Option<PathBuf>,
     ) -> Task<Message> {
         // Reopening a saved pane has no live clone navigation to inherit.
-        self.duplicate_pane_with_navigation(source, owner, None)
+        self.duplicate_pane_with_navigation(source, owner, None, true)
     }
 
     fn duplicate_pane_with_navigation(
@@ -6880,6 +6916,7 @@ impl Cagents {
         source: CardState,
         owner: Option<PathBuf>,
         navigation: Option<crate::model::RepositoryNavigation>,
+        reopening: bool,
     ) -> Task<Message> {
         #[cfg(not(feature = "integrated-browser"))]
         if let CardKind::Browser(session) = &source.kind {
@@ -6990,6 +7027,12 @@ impl Cagents {
         }
         self.register_channel_card(id);
         self.register_presence(id, Exposure::Visible, residency);
+        // A reopened chat takes back what it had not sent when it closed; a
+        // clone of an open one starts with an empty composer.
+        if reopening && matches!(card.kind, CardKind::Chat(_)) && self.reclaim_kept_draft(source_id)
+        {
+            self.move_chat_draft(source_id, id);
+        }
         let start = match card.kind {
             CardKind::Terminal(session) => {
                 self.cards.insert(id, CardRuntime::Loading);
@@ -8911,6 +8954,53 @@ impl Cagents {
         self.prune_presence();
     }
 
+    /// Rebuilds everything the workspace derives for the sidebar, the panes'
+    /// chrome and inspectors, source control and worktree protection, from
+    /// the state as it now stands. This is the `Full` projection, which every
+    /// narrower one must agree with.
+    fn project_workspace(&mut self, reconcile_row_selection: bool) -> Task<Message> {
+        projection_stage!("worktree_protections", self.sync_worktree_protections());
+        projection_stage!("sidebar_selection", self.synchronize_sidebar_selection());
+        projection_stage!("sidebar_channels", self.refresh_sidebar_channels());
+        projection_stage!(
+            "retained_attention",
+            self.sidebar_state
+                .prune_retained_attention(&self.sidebar_model)
+        );
+        if reconcile_row_selection {
+            projection_stage!("row_selection", self.prune_sidebar_row_selection());
+        }
+        projection_stage!("worktree_panes", self.refresh_sidebar_worktree_panes());
+        // Ahead of the rebind, which pins what the inspector drawing source
+        // control chose: a pane that has just arrived, closed or taken focus
+        // must not show the last binding for a frame.
+        projection_stage!("pane_inspectors", self.sync_pane_inspectors());
+        projection_stage!("pull_request_inspector", self.sync_pull_request_inspector());
+        let binding = projection_stage!("source_control", self.rebind_source_control());
+        if let Some(source) = self.sidebar_model.source_control.as_ref() {
+            let selected = self
+                .workspace
+                .focused()
+                .and_then(|card| match self.cards.get(&card) {
+                    Some(CardRuntime::Repository(runtime))
+                        if runtime.descriptor.worktree == source.key.canonical_path =>
+                    {
+                        runtime.selected_path()
+                    }
+                    _ => None,
+                });
+            self.sidebar_state.select_file(&source.key, selected);
+        }
+        // `view` cannot rebuild the chrome cache itself, so refresh it here.
+        let chrome = projection_stage!("chrome", self.sync_chrome());
+        let terminal_probes =
+            projection_stage!("transcript_probes", self.terminal_transcript_probes());
+        // Another project shown, or a review or the workspace switcher closed.
+        let approval =
+            projection_stage!("automation_requests", self.read_owed_automation_requests());
+        Task::batch([binding, chrome, terminal_probes, approval])
+    }
+
     /// Builds chrome for cards that appeared or were renamed, drops entries for
     /// cards the workspace no longer holds, and renames the window.
     fn sync_chrome(&mut self) -> Task<Message> {
@@ -9005,9 +9095,11 @@ impl Cagents {
         channel: Option<&crate::model::ProjectChannel>,
     ) -> (Option<CardChrome>, Option<String>) {
         #[cfg(test)]
-        self.shared_views
-            .chrome_cards_visited
-            .set(self.shared_views.chrome_cards_visited.get() + 1);
+        if !projection_oracle::verifying() {
+            self.shared_views
+                .chrome_cards_visited
+                .set(self.shared_views.chrome_cards_visited.get() + 1);
+        }
         let type_label = card_kind_labels(Some(&card.kind)).type_label;
         let title = self.repository_chrome_with(card, || {
             self.card_display_title_with_chat_title(card, || self.chat_channel_title(card, channel))
@@ -9891,19 +9983,457 @@ impl Cagents {
         .map(cosmic::Action::App)
     }
 
+    /// Answers a key, with the projection its answer needs. A key that
+    /// does something projects everything, as the rest of `update` does:
+    /// what it did may move the focus, close a surface or change what any
+    /// part of the workspace shows, and nothing after it is relied on to
+    /// project that. Only an answer that changed nothing a projection
+    /// reads projects nothing: a key nothing took, a key a dialog's or the
+    /// palette's own field answers, a step with nowhere to go. Typing
+    /// reaches those at input rate.
+    fn key_event(&mut self, event: keyboard::Event, captured: bool) -> (Task<Message>, Projection) {
+        // A held chord copies once, so its repeats must not cancel the
+        // copy its first press started.
+        if let keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character(key),
+            modifiers,
+            repeat: false,
+            ..
+        } = &event
+            && modifiers.command()
+            && (key.eq_ignore_ascii_case("c") || key.eq_ignore_ascii_case("x"))
+        {
+            chat_ui::invalidate_copy_intent();
+        }
+        if let Some(task) = self.automation_approval_key(&event, captured) {
+            return (task, Projection::Full);
+        }
+        #[cfg(feature = "integrated-browser")]
+        if is_escape_press(&event) && self.browser_import_on_top() {
+            return (
+                self.update_browser_import(self.browser_import.escape_action()),
+                Projection::Full,
+            );
+        }
+        if let Some(task) = self.session_recovery_key_event(&event, captured) {
+            return (task, Projection::Full);
+        }
+        if let Some(task) = self.daemon_health_key_event(&event, captured) {
+            return (task, Projection::Full);
+        }
+        if let keyboard::Event::ModifiersChanged(modifiers) = &event {
+            self.keyboard_modifiers = *modifiers;
+        }
+        if let Some(gallery) = &self.chat_ui.image_viewer {
+            if let keyboard::Event::KeyPressed {
+                key,
+                physical_key,
+                modifiers,
+                repeat,
+                ..
+            } = &event
+            {
+                match key {
+                    // Layout-independent, like the other Ctrl chords.
+                    keyboard::Key::Character(_)
+                        if modifiers.command()
+                            && !modifiers.shift()
+                            && !modifiers.alt()
+                            && !modifiers.logo()
+                            && key
+                                .to_latin(*physical_key)
+                                .is_some_and(|key| key.eq_ignore_ascii_case(&'c')) =>
+                    {
+                        // A held chord copies once.
+                        if *repeat {
+                            return (Task::none(), Projection::Unchanged);
+                        }
+                        let image = gallery.selected_image();
+                        return (
+                            self.handle_chat_ui(chat_ui::Action::Image(
+                                image,
+                                chat_ui::images::ImageCommand::Copy,
+                            )),
+                            Projection::Full,
+                        );
+                    }
+                    // Escape is the viewer's own (`Gallery::view`), so that
+                    // one an open context menu claims closes only the menu.
+                    keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => {
+                        self.chat_ui.image_viewer.as_mut().unwrap().next(false);
+                    }
+                    keyboard::Key::Named(keyboard::key::Named::ArrowRight) => {
+                        self.chat_ui.image_viewer.as_mut().unwrap().next(true);
+                    }
+                    _ => {}
+                }
+            }
+            // Stepping through the gallery changes only the viewer.
+            return (Task::none(), Projection::Unchanged);
+        }
+        if !captured
+            && !self.workspace_inputs_blocked()
+            && workspace_widget::global_shortcut(
+                &event,
+                &self.settings.keyboard_shortcuts,
+                self.focused_pane(),
+            )
+            .is_none()
+            && let keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character(key),
+                modifiers,
+                ..
+            } = &event
+            && modifiers.control()
+            && modifiers.shift()
+            && !modifiers.alt()
+            && !modifiers.logo()
+            && key.eq_ignore_ascii_case("s")
+            && let Some(card) = self.workspace.focused()
+            && !self.pane_content_inputs_blocked(card)
+            && let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card)
+        {
+            let stage = runtime.selected_staging_selection(true).is_some();
+            if stage || runtime.selected_staging_selection(false).is_some() {
+                return (
+                    cosmic::task::message(Message::Repository(RepositoryAction::StageSelected {
+                        card,
+                        stage,
+                    })),
+                    Projection::Full,
+                );
+            }
+        }
+        if crate::tab_history::released(&event) {
+            self.tab_history.finish(self.workspace.focused());
+        }
+        if crate::tab_history::modifiers_released(&event, self.workspace_cycle_modifiers)
+            && let Some(since) = self.chrome_ui.workspace_preview_since
+        {
+            // A window losing focus is told its modifiers are released
+            // just before it is told about the focus. Deciding one
+            // message later lets that cancel instead of commit.
+            self.workspace_cycle_modifiers = keyboard::Modifiers::empty();
+            return (
+                cosmic::task::message(Message::WorkspaceSwitcherReleased(since)),
+                Projection::Full,
+            );
+        }
+        // Modal key capture must not swallow the modifier release
+        // that commits an already active navigation cycle.
+        if let Some(answer) = self.palette_key_event(&event) {
+            return answer;
+        }
+        if self.chrome_ui.workspace_preview.is_some() {
+            return (self.workspace_switcher_key(&event), Projection::Full);
+        }
+        if !self.workspace_inputs_blocked()
+            && !self.focused_repository_is_saving()
+            && let Some(backwards) = crate::tab_history::step_direction(&event)
+        {
+            let available: Vec<_> = self.workspace.order().collect();
+            self.tab_history.retain(|id| {
+                self.durable
+                    .cards
+                    .iter()
+                    .any(|card| card.id == id && card.existence.is_open())
+            });
+            if let Some(id) = self
+                .tab_history
+                .step(&available, self.workspace.focused(), backwards)
+                && let Ok(update) = self.workspace.focus(id)
+            {
+                return (
+                    self.apply_viewport(update, true, DurableChange::None),
+                    Projection::Full,
+                );
+            }
+            // No other pane to step to: only the history's cycle changed.
+            return (Task::none(), Projection::Unchanged);
+        }
+        if let Some(answer) = self.chrome_key_event(&event) {
+            return answer;
+        }
+        if let Some(task) = self.account_key_event(&event) {
+            return (task, Projection::Full);
+        }
+        // A widget that consumed Escape has already answered it - a
+        // focused terminal clearing its selection, for one. Running the
+        // chain anyway would close the inspector behind it in the same
+        // keystroke. Global shortcuts below are deliberately exempt:
+        // `WorkspaceSurface` captures those chords itself, before any
+        // child sees them, and relies on this message to act on them.
+        // A form dialog on top answers Escape before anything under
+        // it, such as a find bar or picker, and even when its focused
+        // field captured the key to blur itself: otherwise closing it
+        // would take a second press.
+        if is_escape_press(&event) && self.form_dialog_on_top() {
+            return (self.cancel_form_dialog(), Projection::Full);
+        }
+        // A close question opens over the composer or terminal it asks
+        // about, which keeps its focus and captures Escape under the
+        // dialog. The question answers it all the same.
+        if is_escape_press(&event) && self.update_ui.confirmation.is_none() {
+            if self.terminal_close_dialog_visible() {
+                return (self.cancel_terminal_close(), Projection::Full);
+            }
+            if self.chat_close_dialog_visible() {
+                return (
+                    cosmic::task::message(Message::CancelChatClose),
+                    Projection::Full,
+                );
+            }
+        }
+        if self.form_dialog_on_top()
+            && let Some(task) = self.resume_key_event(&event)
+        {
+            return (task, Projection::Full);
+        }
+        if is_escape_press(&event) && self.device_ui.menu_open && !self.modal_is_open() {
+            return (
+                self.update_device(device_ui::Action::Menu(false)),
+                Projection::Full,
+            );
+        }
+        // The model search field captures Escape to blur itself. Close
+        // its picker in the same press, while dialogs retain priority.
+        if is_escape_press(&event)
+            && self
+                .workspace
+                .focused()
+                .is_some_and(|card| !self.pane_content_inputs_blocked(card))
+            && self.dismiss_chat_picker()
+        {
+            return (
+                self.workspace.focused().map_or_else(Task::none, |card| {
+                    iced::widget::operation::focus(card_control_id(card, "chat-composer"))
+                        .map(cosmic::Action::App)
+                }),
+                Projection::Full,
+            );
+        }
+        if self.settings_reset_on_top() && is_escape_press(&event) {
+            return (self.close_settings_reset(), Projection::Full);
+        }
+        if is_escape_press(&event) && !captured {
+            if self.transient_work_close.is_some() {
+                return (
+                    cosmic::task::message(Message::CancelTransientWorkClose),
+                    Projection::Full,
+                );
+            }
+            if let Some(action) = self.automation_ui.keep_draft_action() {
+                return (self.update_automation_ui(action), Projection::Full);
+            }
+            if let Some((card, _)) = &self.terminal_paste {
+                return (
+                    self.handle_terminal_find(terminal_ui::Action::ConfirmPaste(*card, false)),
+                    Projection::Full,
+                );
+            }
+            if self.update_ui.confirmation.is_some() {
+                return (
+                    self.update_update_ui(update_ui::Action::CancelApply),
+                    Projection::Full,
+                );
+            }
+            if self.terminal_close_dialog_visible() {
+                return (self.cancel_terminal_close(), Projection::Full);
+            }
+            if self.chat_close_dialog_visible() {
+                return (
+                    cosmic::task::message(Message::CancelChatClose),
+                    Projection::Full,
+                );
+            }
+            if self.sidebar_state.pending_discard().is_some() {
+                return (
+                    cosmic::task::message(Message::Sidebar(SidebarAction::CancelDiscard)),
+                    Projection::Full,
+                );
+            }
+            if self.project_ui.modal_open() {
+                return (
+                    self.handle_project_action(project_ui::Action::Dismiss),
+                    Projection::Full,
+                );
+            }
+            if self.channel_ui.modal_open() {
+                return (
+                    self.handle_channel_ui(channel_ui::Action::Dismiss),
+                    Projection::Full,
+                );
+            }
+            if self.sidebar_selection_ui.dialog.is_some() {
+                return (
+                    self.update_sidebar_selection(sidebar_selection_ui::Action::Dismiss),
+                    Projection::Full,
+                );
+            }
+            if self.dirty_repository_close.is_some() {
+                if self.dirty_repository_close.as_ref().is_some_and(|close| {
+                    matches!(self.cards.get(&close.card), Some(CardRuntime::Repository(runtime)) if runtime.is_saving())
+                }) {
+                    return (Task::none(), Projection::Unchanged);
+                }
+                return (
+                    cosmic::task::message(Message::CancelRepositoryClose),
+                    Projection::Full,
+                );
+            }
+            // Ahead of the inspector and the sidebar because the find
+            // bar is the innermost thing the user is looking at, and
+            // behind the confirmations above because those are modal.
+            if let Some(card) = self.focused_repository_card_with_find() {
+                return (
+                    cosmic::task::message(Message::Repository(RepositoryAction::CloseFind {
+                        card,
+                    })),
+                    Projection::Full,
+                );
+            }
+            if self.worktree_dialog.is_some() || self.pull_request_dialog.is_some() {
+                return (
+                    cosmic::task::message(Message::CancelDialog),
+                    Projection::Full,
+                );
+            }
+            if self.sidebar_state.controls_expanded() {
+                return (
+                    self.update(Message::Sidebar(SidebarAction::ToggleControls)),
+                    Projection::Full,
+                );
+            }
+            // An inspector covering a narrow pane's content closes
+            // like the other surfaces over it.
+            if let Some(card) = self.workspace.focused()
+                && self.pane_inspectors.is_open(card)
+                && self.pane_inspector_layout(card) == Some(InspectorLayout::Overlay)
+            {
+                return (self.close_pane_inspector_overlay(card), Projection::Full);
+            }
+        }
+        if let Some(backwards) = is_tab_press(&event)
+            && self.dirty_repository_close.is_some()
+        {
+            return (self.cycle_dirty_close_focus(backwards), Projection::Full);
+        }
+        // A chord typed at a dialog is not the workspace's to act on:
+        // the close chord must not close the card behind the dialog.
+        // The dialog is an overlay, so it has already seen the
+        // keystroke by the time this runs, and what it does with one
+        // is its own affair.
+        if self.workspace_inputs_blocked() {
+            // The dialog's own fields answer what is typed at it, as their own
+            // messages: this changed nothing.
+            return (Task::none(), Projection::Unchanged);
+        }
+        if let Some(task) = self.chat_picker_key(&event) {
+            return (task, Projection::Full);
+        }
+        if let Some(card) = self.workspace.focused()
+            && !self.pane_content_inputs_blocked(card)
+            && self.terminal_find.get(&card).is_some_and(|find| find.open)
+            && let keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(key),
+                ..
+            } = &event
+        {
+            if *key == keyboard::key::Named::Escape && !captured {
+                return (
+                    self.handle_terminal_find(terminal_ui::Action::Close(card)),
+                    Projection::Full,
+                );
+            }
+        }
+        if let keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::F3),
+            modifiers,
+            ..
+        } = &event
+            && !modifiers.control()
+            && !modifiers.alt()
+            && !modifiers.logo()
+            && let Some(card) = self.focused_repository_card_with_find()
+        {
+            return (
+                cosmic::task::message(Message::Repository(if modifiers.shift() {
+                    RepositoryAction::FindPrevious { card }
+                } else {
+                    RepositoryAction::FindNext { card }
+                })),
+                Projection::Full,
+            );
+        }
+        #[cfg(feature = "integrated-browser")]
+        if !captured
+            && let Some(card) = self.workspace.focused()
+            && !self.pane_content_inputs_blocked(card)
+            && matches!(self.cards.get(&card), Some(CardRuntime::Browser(_)))
+            && let Some(message) = browser_shortcut(card, &event)
+        {
+            return (cosmic::task::message(message), Projection::Full);
+        }
+        if !captured && let Some(task) = self.chat_scroll_key(&event) {
+            return (task, Projection::Full);
+        }
+        if is_save_press(&event)
+            && let Some(card) = self.workspace.focused()
+            && !self.pane_content_inputs_blocked(card)
+            && matches!(self.cards.get(&card), Some(CardRuntime::Repository(_)))
+        {
+            return (
+                cosmic::task::message(Message::Repository(RepositoryAction::Save {
+                    card,
+                    overwrite: false,
+                })),
+                Projection::Full,
+            );
+        }
+        match workspace_widget::global_shortcut(
+            &event,
+            &self.settings.keyboard_shortcuts,
+            self.focused_pane(),
+        ) {
+            Some(command) => {
+                let modifiers = match event {
+                    keyboard::Event::KeyPressed { modifiers, .. } => modifiers,
+                    _ => keyboard::Modifiers::empty(),
+                };
+                (
+                    self.run_workspace_command(command, modifiers),
+                    Projection::Full,
+                )
+            }
+            None => match (!captured)
+                .then(|| self.type_into_chat_input(&event))
+                .flatten()
+            {
+                Some(typed) => (typed, Projection::Full),
+                // Nothing answered the key: a key a text field took,
+                // a release or a modifier change. What it changed on
+                // the way here, the held modifiers, the tab history's
+                // cycle and a copy's intent, is read by no projection.
+                // Typing comes this way at input rate.
+                None => (Task::none(), Projection::Unchanged),
+            },
+        }
+    }
+
     /// Text typed while a chat pane is focused but nothing took the key -
     /// its transcript, a button or nothing at all holding the keyboard -
     /// goes into its message input at the caret, which then keeps the
     /// keyboard. Chords stay with whatever they belong to, such as copying a
-    /// transcript selection.
-    fn type_into_chat_input(&mut self, event: &keyboard::Event) -> Task<Message> {
+    /// transcript selection. `None` when the key typed nothing, and so
+    /// changed nothing.
+    fn type_into_chat_input(&mut self, event: &keyboard::Event) -> Option<Task<Message>> {
         let keyboard::Event::KeyPressed {
             text: Some(text),
             modifiers,
             ..
         } = event
         else {
-            return Task::none();
+            return None;
         };
         if modifiers.control()
             || modifiers.alt()
@@ -9911,13 +10441,13 @@ impl Cagents {
             || text.is_empty()
             || text.chars().any(char::is_control)
         {
-            return Task::none();
+            return None;
         }
         let Some(card) = self.workspace.focused() else {
-            return Task::none();
+            return None;
         };
         if !self.chat_input_drawn(card) || !self.card_holds_keyboard(card) {
-            return Task::none();
+            return None;
         }
         // An open picker's search field stands in for the input, and is
         // where the keyboard already belongs.
@@ -9925,7 +10455,7 @@ impl Cagents {
             Some(CardRuntime::Chat(runtime)) if runtime.focus_control() == "chat-composer" => {
                 runtime.target
             }
-            _ => return Task::none(),
+            _ => return None,
         };
         let mut tasks: Vec<Task<Message>> = text
             .chars()
@@ -9943,7 +10473,7 @@ impl Cagents {
             iced::widget::operation::focus(card_control_id(card, "chat-composer"))
                 .map(cosmic::Action::App),
         );
-        Task::batch(tasks)
+        Some(Task::batch(tasks))
     }
 
     fn card_container_id(&self, card: CardId) -> widget::Id {
@@ -15114,6 +15644,8 @@ impl Application for Cagents {
             worktree_offsets: HashMap::new(),
             channel_offsets: HashMap::new(),
             worktree_owners: HashMap::new(),
+            #[cfg(any(test, feature = "development"))]
+            projected_protections: Default::default(),
             known_worktree_roots: worktrees
                 .iter()
                 .map(|worktree| worktree.path.clone())
@@ -15343,6 +15875,13 @@ impl Application for Cagents {
             }
             return Task::batch([settled, self.update(message)]);
         }
+        #[cfg(any(test, feature = "development"))]
+        let (_running, settled_projection) = self.settle_projection(&message);
+        #[cfg(any(test, feature = "development"))]
+        let oracle_message =
+            projection_oracle::enabled().then(|| crate::performance::ui_trace::label(&message));
+        #[cfg(not(any(test, feature = "development")))]
+        let settled_projection = Task::none();
         let notice_control = self.notice_control_severity();
         let attention_scope_changed = matches!(
             &message,
@@ -15725,7 +16264,7 @@ impl Application for Cagents {
                 );
                 let mut task = Task::none();
                 match result {
-                    Ok(loaded) => {
+                    Ok(loaded) => 'loaded: {
                         if self.project_ui.closed.contains(&loaded.project.repository) {
                             self.repository_generations.remove(&project_id);
                             return Task::none();
@@ -15839,14 +16378,13 @@ impl Application for Cagents {
                             self.review_repositories.remove(&project_id);
                             self.sync_worktree_operation_rows();
                             self.sidebar_model.data_state = SidebarDataState::Ready;
-                            let task = if open_cards && !self.refuse_in_deleting_worktree(&worktree)
-                            {
-                                self.select_worktree(worktree, true)
-                            } else {
-                                Task::none()
-                            };
-                            // This return skips the derived-row tail below, and
-                            // the new row may already hold the pane just opened.
+                            if open_cards && !self.refuse_in_deleting_worktree(&worktree) {
+                                task = self.select_worktree(worktree, true);
+                            }
+                            // Publishing the reopened project below reads the
+                            // rows before the projection after this update,
+                            // and the new row may already hold the pane just
+                            // opened.
                             self.refresh_sidebar_channels();
                             self.refresh_sidebar_worktree_panes();
                             if open_cards {
@@ -15860,7 +16398,10 @@ impl Application for Cagents {
                                     self.publish_project_opened(existing_id);
                                 }
                             }
-                            return task;
+                            // What the project adds, such as its new worktree
+                            // rows and the selection moving to one, is
+                            // projected after this update like any other.
+                            break 'loaded;
                         }
                         if let Some(session) = &self.session {
                             session.save_project(loaded.project.clone());
@@ -17145,8 +17686,7 @@ impl Application for Cagents {
                 // window::run silently drops callbacks for windows that have not
                 // opened yet. Initialize only after iced acknowledges this one.
                 #[cfg(feature = "integrated-browser")]
-                return Task::batch([report, self.browser_factory_task()]);
-                #[cfg(not(feature = "integrated-browser"))]
+                let report = Task::batch([report, self.browser_factory_task()]);
                 report
             }
             Message::VerifyStartupPanes => self.verify_startup_gate(),
@@ -17580,25 +18120,30 @@ impl Application for Cagents {
                     {
                         self.shared_views.fenced_closes.remove(&id);
                     }
-                    return closed.unwrap_or_else(Task::none);
+                    // Projected after this update, as any closed pane is.
+                    closed.unwrap_or_else(Task::none)
+                } else {
+                    if self
+                        .workspace
+                        .pending_close()
+                        .is_some_and(|pending| pending.unmounting == id)
+                    {
+                        self.close_commit_delivered = Some(id);
+                    }
+                    self.commit_requested_close(id)
                 }
-                if self
-                    .workspace
-                    .pending_close()
-                    .is_some_and(|pending| pending.unmounting == id)
-                {
-                    self.close_commit_delivered = Some(id);
-                }
-                self.commit_requested_close(id)
             }
+            // Moving a pane renumbers the tabs and the cards' order, which
+            // the projection after it derives from.
+            Message::Viewport {
+                generation,
+                event: WorkspaceViewportEvent::Reordered { card, before },
+            } if generation == self.workspace_view_generation => self.reorder_pane(card, before),
             Message::Viewport { generation, event } => {
                 // Native callbacks already queued by an unmounted worktree
                 // must never mutate the newly selected strip.
                 if generation != self.workspace_view_generation {
                     return Task::none();
-                }
-                if let WorkspaceViewportEvent::Reordered { card, before } = event {
-                    return self.reorder_pane(card, before);
                 }
                 if matches!(event, WorkspaceViewportEvent::DragScrolled(_))
                     && self.workspace_inputs_blocked()
@@ -18041,60 +18586,62 @@ impl Application for Cagents {
                 project_id,
                 repository,
                 result,
-            } => {
-                match result {
-                    Ok(WorktreeCreationOutcome::Created { worktree, warnings }) => {
-                        if let Some(session) = &self.session {
-                            session.save_worktrees([WorktreeState {
-                                id: worktree.id,
-                                project_id,
-                                generation: 0,
-                                path: worktree.path.clone(),
-                                branch: worktree.branch.as_deref().map(|branch| {
-                                    branch
-                                        .strip_prefix("refs/heads/")
-                                        .unwrap_or(branch)
-                                        .to_owned()
-                                }),
-                                existence: Existence::Open,
-                            }]);
-                        }
-                        self.status = Some(worktree_operations::created_worktree_notice(
-                            &worktree.path,
-                            &warnings,
-                        ));
-                        if let Some(project) = self
-                            .sidebar_model
-                            .projects
-                            .iter_mut()
-                            .find(|project| project.id == project_id)
-                        {
-                            project
-                                .worktrees
-                                .push(SidebarWorktree::from_repository(&worktree, None));
-                        }
-                        let terminal = self.select_worktree(worktree.path, true);
-                        let chrome = self.sync_chrome();
-                        return Task::batch([
-                            terminal,
-                            chrome,
-                            self.repository_load_task(repository, Some(project_id), false),
-                        ]);
+            } => match result {
+                Ok(WorktreeCreationOutcome::Created { worktree, warnings }) => {
+                    if let Some(session) = &self.session {
+                        session.save_worktrees([WorktreeState {
+                            id: worktree.id,
+                            project_id,
+                            generation: 0,
+                            path: worktree.path.clone(),
+                            branch: worktree.branch.as_deref().map(|branch| {
+                                branch
+                                    .strip_prefix("refs/heads/")
+                                    .unwrap_or(branch)
+                                    .to_owned()
+                            }),
+                            existence: Existence::Open,
+                        }]);
                     }
-                    Ok(WorktreeCreationOutcome::NotCreated { failure }) => {
-                        self.status = Some(TransientNotice::warning(format!(
-                            "Could not create the worktree: {failure}"
-                        )));
+                    self.status = Some(worktree_operations::created_worktree_notice(
+                        &worktree.path,
+                        &warnings,
+                    ));
+                    if let Some(project) = self
+                        .sidebar_model
+                        .projects
+                        .iter_mut()
+                        .find(|project| project.id == project_id)
+                    {
+                        project
+                            .worktrees
+                            .push(SidebarWorktree::from_repository(&worktree, None));
                     }
-                    Ok(WorktreeCreationOutcome::OutcomeUnknown { failure, .. }) => {
-                        self.status = Some(TransientNotice::warning(format!(
-                            "The worktree creation outcome is unknown. Refresh the project before trying again. {failure}"
-                        )));
-                    }
-                    Err(error) => self.status = Some(TransientNotice::error(error)),
+                    // The new row, the selection moving to it and its
+                    // terminal are projected after this update.
+                    let terminal = self.select_worktree(worktree.path, true);
+                    Task::batch([
+                        terminal,
+                        self.repository_load_task(repository, Some(project_id), false),
+                    ])
                 }
-                Task::none()
-            }
+                Ok(WorktreeCreationOutcome::NotCreated { failure }) => {
+                    self.status = Some(TransientNotice::warning(format!(
+                        "Could not create the worktree: {failure}"
+                    )));
+                    Task::none()
+                }
+                Ok(WorktreeCreationOutcome::OutcomeUnknown { failure, .. }) => {
+                    self.status = Some(TransientNotice::warning(format!(
+                        "The worktree creation outcome is unknown. Refresh the project before trying again. {failure}"
+                    )));
+                    Task::none()
+                }
+                Err(error) => {
+                    self.status = Some(TransientNotice::error(error));
+                    Task::none()
+                }
+            },
             Message::PullRequestBaseChanged(value) => {
                 if let Some(dialog) = &mut self.pull_request_dialog {
                     dialog.base = value;
@@ -18238,340 +18785,9 @@ impl Application for Cagents {
             },
             Message::CancelDialog => self.cancel_form_dialog(),
             Message::KeyEvent { event, captured } => {
-                // A held chord copies once, so its repeats must not cancel the
-                // copy its first press started.
-                if let keyboard::Event::KeyPressed { key: keyboard::Key::Character(key), modifiers, repeat: false, .. } = &event
-                    && modifiers.command() && (key.eq_ignore_ascii_case("c") || key.eq_ignore_ascii_case("x"))
-                {
-                    chat_ui::invalidate_copy_intent();
-                }
-                if let Some(task) = self.automation_approval_key(&event, captured) {
-                    return task;
-                }
-                #[cfg(feature = "integrated-browser")]
-                if is_escape_press(&event) && self.browser_import_on_top() {
-                    return self.update_browser_import(self.browser_import.escape_action());
-                }
-                if let Some(task) = self.session_recovery_key_event(&event, captured) {
-                    return task;
-                }
-                if let Some(task) = self.daemon_health_key_event(&event, captured) {
-                    return task;
-                }
-                if let keyboard::Event::ModifiersChanged(modifiers) = &event {
-                    self.keyboard_modifiers = *modifiers;
-                }
-                if let Some(gallery) = &self.chat_ui.image_viewer {
-                    if let keyboard::Event::KeyPressed {
-                        key,
-                        physical_key,
-                        modifiers,
-                        repeat,
-                        ..
-                    } = &event
-                    {
-                        match key {
-                            // Layout-independent, like the other Ctrl chords.
-                            keyboard::Key::Character(_)
-                                if modifiers.command()
-                                    && !modifiers.shift()
-                                    && !modifiers.alt()
-                                    && !modifiers.logo()
-                                    && key
-                                        .to_latin(*physical_key)
-                                        .is_some_and(|key| key.eq_ignore_ascii_case(&'c')) =>
-                            {
-                                // A held chord copies once.
-                                if *repeat {
-                                    return Task::none();
-                                }
-                                let image = gallery.selected_image();
-                                return self.handle_chat_ui(chat_ui::Action::Image(
-                                    image,
-                                    chat_ui::images::ImageCommand::Copy,
-                                ));
-                            }
-                            // Escape is the viewer's own (`Gallery::view`), so that
-                            // one an open context menu claims closes only the menu.
-                            keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => {
-                                self.chat_ui.image_viewer.as_mut().unwrap().next(false);
-                            }
-                            keyboard::Key::Named(keyboard::key::Named::ArrowRight) => {
-                                self.chat_ui.image_viewer.as_mut().unwrap().next(true);
-                            }
-                            _ => {}
-                        }
-                    }
-                    return Task::none();
-                }
-                if !captured
-                    && !self.workspace_inputs_blocked()
-                    && workspace_widget::global_shortcut(
-                        &event,
-                        &self.settings.keyboard_shortcuts,
-                        self.focused_pane(),
-                    )
-                    .is_none()
-                    && let keyboard::Event::KeyPressed {
-                        key: keyboard::Key::Character(key),
-                        modifiers,
-                        ..
-                    } = &event
-                    && modifiers.control()
-                    && modifiers.shift()
-                    && !modifiers.alt()
-                    && !modifiers.logo()
-                    && key.eq_ignore_ascii_case("s")
-                    && let Some(card) = self.workspace.focused()
-                    && !self.pane_content_inputs_blocked(card)
-                    && let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card)
-                {
-                    let stage = runtime.selected_staging_selection(true).is_some();
-                    if stage || runtime.selected_staging_selection(false).is_some() {
-                        return cosmic::task::message(Message::Repository(
-                            RepositoryAction::StageSelected { card, stage },
-                        ));
-                    }
-                }
-                if crate::tab_history::released(&event) {
-                    self.tab_history.finish(self.workspace.focused());
-                }
-                if crate::tab_history::modifiers_released(&event, self.workspace_cycle_modifiers)
-                    && let Some(since) = self.chrome_ui.workspace_preview_since
-                {
-                    // A window losing focus is told its modifiers are released
-                    // just before it is told about the focus. Deciding one
-                    // message later lets that cancel instead of commit.
-                    self.workspace_cycle_modifiers = keyboard::Modifiers::empty();
-                    return cosmic::task::message(Message::WorkspaceSwitcherReleased(since));
-                }
-                // Modal key capture must not swallow the modifier release
-                // that commits an already active navigation cycle.
-                if let Some(task) = self.palette_key_event(&event) {
-                    return task;
-                }
-                if self.chrome_ui.workspace_preview.is_some() {
-                    return self.workspace_switcher_key(&event);
-                }
-                if !self.workspace_inputs_blocked()
-                    && !self.focused_repository_is_saving()
-                    && let Some(backwards) = crate::tab_history::step_direction(&event)
-                {
-                    let available: Vec<_> = self.workspace.order().collect();
-                    self.tab_history.retain(|id| {
-                        self.durable
-                            .cards
-                            .iter()
-                            .any(|card| card.id == id && card.existence.is_open())
-                    });
-                    if let Some(id) =
-                        self.tab_history
-                            .step(&available, self.workspace.focused(), backwards)
-                        && let Ok(update) = self.workspace.focus(id)
-                    {
-                        return self.apply_viewport(update, true, DurableChange::None);
-                    }
-                    return Task::none();
-                }
-                if let Some(task) = self.chrome_key_event(&event) {
-                    return task;
-                }
-                if let Some(task) = self.account_key_event(&event) {
-                    return task;
-                }
-                // A widget that consumed Escape has already answered it - a
-                // focused terminal clearing its selection, for one. Running the
-                // chain anyway would close the inspector behind it in the same
-                // keystroke. Global shortcuts below are deliberately exempt:
-                // `WorkspaceSurface` captures those chords itself, before any
-                // child sees them, and relies on this message to act on them.
-                // A form dialog on top answers Escape before anything under
-                // it, such as a find bar or picker, and even when its focused
-                // field captured the key to blur itself: otherwise closing it
-                // would take a second press.
-                if is_escape_press(&event) && self.form_dialog_on_top() {
-                    return self.cancel_form_dialog();
-                }
-                // A close question opens over the composer or terminal it asks
-                // about, which keeps its focus and captures Escape under the
-                // dialog. The question answers it all the same.
-                if is_escape_press(&event) && self.update_ui.confirmation.is_none() {
-                    if self.terminal_close_dialog_visible() {
-                        return self.cancel_terminal_close();
-                    }
-                    if self.chat_close_dialog_visible() {
-                        return cosmic::task::message(Message::CancelChatClose);
-                    }
-                }
-                if self.form_dialog_on_top()
-                    && let Some(task) = self.resume_key_event(&event)
-                {
-                    return task;
-                }
-                if is_escape_press(&event) && self.device_ui.menu_open && !self.modal_is_open() {
-                    return self.update_device(device_ui::Action::Menu(false));
-                }
-                // The model search field captures Escape to blur itself. Close
-                // its picker in the same press, while dialogs retain priority.
-                if is_escape_press(&event)
-                    && self.workspace.focused().is_some_and(|card| !self.pane_content_inputs_blocked(card))
-                    && self.dismiss_chat_picker()
-                {
-                    return self.workspace.focused().map_or_else(Task::none, |card| {
-                        iced::widget::operation::focus(card_control_id(card, "chat-composer"))
-                            .map(cosmic::Action::App)
-                    });
-                }
-                if self.settings_reset_on_top() && is_escape_press(&event) {
-                    return self.close_settings_reset();
-                }
-                if is_escape_press(&event) && !captured {
-                    if self.transient_work_close.is_some() {
-                        return cosmic::task::message(Message::CancelTransientWorkClose);
-                    }
-                    if let Some(action) = self.automation_ui.keep_draft_action() {
-                        return self.update_automation_ui(action);
-                    }
-                    if let Some((card, _)) = &self.terminal_paste {
-                        return self
-                            .handle_terminal_find(terminal_ui::Action::ConfirmPaste(*card, false));
-                    }
-                    if self.update_ui.confirmation.is_some() {
-                        return self.update_update_ui(update_ui::Action::CancelApply);
-                    }
-                    if self.terminal_close_dialog_visible() {
-                        return self.cancel_terminal_close();
-                    }
-                    if self.chat_close_dialog_visible() {
-                        return cosmic::task::message(Message::CancelChatClose);
-                    }
-                    if self.sidebar_state.pending_discard().is_some() {
-                        return cosmic::task::message(Message::Sidebar(
-                            SidebarAction::CancelDiscard,
-                        ));
-                    }
-                    if self.project_ui.modal_open() {
-                        return self.handle_project_action(project_ui::Action::Dismiss);
-                    }
-                    if self.channel_ui.modal_open() {
-                        return self.handle_channel_ui(channel_ui::Action::Dismiss);
-                    }
-                    if self.sidebar_selection_ui.dialog.is_some() {
-                        return self
-                            .update_sidebar_selection(sidebar_selection_ui::Action::Dismiss);
-                    }
-                    if self.dirty_repository_close.is_some() {
-                        if self.dirty_repository_close.as_ref().is_some_and(|close| {
-                            matches!(self.cards.get(&close.card), Some(CardRuntime::Repository(runtime)) if runtime.is_saving())
-                        }) {
-                            return Task::none();
-                        }
-                        return cosmic::task::message(Message::CancelRepositoryClose);
-                    }
-                    // Ahead of the inspector and the sidebar because the find
-                    // bar is the innermost thing the user is looking at, and
-                    // behind the confirmations above because those are modal.
-                    if let Some(card) = self.focused_repository_card_with_find() {
-                        return cosmic::task::message(Message::Repository(
-                            RepositoryAction::CloseFind { card },
-                        ));
-                    }
-                    if self.worktree_dialog.is_some() || self.pull_request_dialog.is_some() {
-                        return cosmic::task::message(Message::CancelDialog);
-                    }
-                    if self.sidebar_state.controls_expanded() {
-                        return self.update(Message::Sidebar(SidebarAction::ToggleControls));
-                    }
-                    // An inspector covering a narrow pane's content closes
-                    // like the other surfaces over it.
-                    if let Some(card) = self.workspace.focused()
-                        && self.pane_inspectors.is_open(card)
-                        && self.pane_inspector_layout(card) == Some(InspectorLayout::Overlay)
-                    {
-                        return self.close_pane_inspector_overlay(card);
-                    }
-                }
-                if let Some(backwards) = is_tab_press(&event)
-                    && self.dirty_repository_close.is_some()
-                {
-                    return self.cycle_dirty_close_focus(backwards);
-                }
-                // A chord typed at a dialog is not the workspace's to act on:
-                // the close chord must not close the card behind the dialog.
-                // The dialog is an overlay, so it has already seen the
-                // keystroke by the time this runs, and what it does with one
-                // is its own affair.
-                if self.workspace_inputs_blocked() {
-                    return Task::none();
-                }
-                if let Some(task) = self.chat_picker_key(&event) {
-                    return task;
-                }
-                if let Some(card) = self.workspace.focused()
-                    && !self.pane_content_inputs_blocked(card)
-                    && self.terminal_find.get(&card).is_some_and(|find| find.open)
-                    && let keyboard::Event::KeyPressed {
-                        key: keyboard::Key::Named(key),
-                        ..
-                    } = &event
-                {
-                    if *key == keyboard::key::Named::Escape && !captured {
-                        return self.handle_terminal_find(terminal_ui::Action::Close(card));
-                    }
-                }
-                if let keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Named(keyboard::key::Named::F3),
-                    modifiers,
-                    ..
-                } = &event
-                    && !modifiers.control()
-                    && !modifiers.alt()
-                    && !modifiers.logo()
-                    && let Some(card) = self.focused_repository_card_with_find()
-                {
-                    return cosmic::task::message(Message::Repository(if modifiers.shift() {
-                        RepositoryAction::FindPrevious { card }
-                    } else {
-                        RepositoryAction::FindNext { card }
-                    }));
-                }
-                #[cfg(feature = "integrated-browser")]
-                if !captured
-                    && let Some(card) = self.workspace.focused()
-                    && !self.pane_content_inputs_blocked(card)
-                    && matches!(self.cards.get(&card), Some(CardRuntime::Browser(_)))
-                    && let Some(message) = browser_shortcut(card, &event)
-                {
-                    return cosmic::task::message(message);
-                }
-                if !captured && let Some(task) = self.chat_scroll_key(&event) {
-                    return task;
-                }
-                if is_save_press(&event)
-                    && let Some(card) = self.workspace.focused()
-                    && !self.pane_content_inputs_blocked(card)
-                    && matches!(self.cards.get(&card), Some(CardRuntime::Repository(_)))
-                {
-                    return cosmic::task::message(Message::Repository(RepositoryAction::Save {
-                        card,
-                        overwrite: false,
-                    }));
-                }
-                match workspace_widget::global_shortcut(
-                    &event,
-                    &self.settings.keyboard_shortcuts,
-                    self.focused_pane(),
-                ) {
-                    Some(command) => {
-                        let modifiers = match event {
-                            keyboard::Event::KeyPressed { modifiers, .. } => modifiers,
-                            _ => keyboard::Modifiers::empty(),
-                        };
-                        self.run_workspace_command(command, modifiers)
-                    }
-                    None if !captured => self.type_into_chat_input(&event),
-                    None => Task::none(),
-                }
+                let (task, key_projection) = self.key_event(event, captured);
+                projection = key_projection;
+                task
             }
             #[cfg(feature = "latency-harness")]
             Message::LatencyRedraw { generation, at } => {
@@ -18714,7 +18930,13 @@ impl Application for Cagents {
                 Task::none()
             }
             Message::CommitUi(action) => self.update_commit_ui(action),
-            Message::ChromeUi(action) => self.update_chrome(action),
+            Message::ChromeUi(action) => {
+                let (task, chrome_projection) = self.update_chrome_ui(action);
+                if let Some(chrome_projection) = chrome_projection {
+                    projection = chrome_projection;
+                }
+                task
+            }
             Message::ChannelUi(action) => self.handle_channel_ui(action),
             Message::SidebarSelection(action) => self.update_sidebar_selection(action),
             Message::BranchUi(action) => self.update_branch_ui(action),
@@ -19081,11 +19303,15 @@ impl Application for Cagents {
         if scoped_source.is_some_and(|source| source.as_ptr() != Arc::as_ptr(&self.durable)) {
             projection = Projection::Full;
         }
+        let _projection_trace = crate::performance::ui_trace::projection(
+            if camera_only && projection == Projection::Full {
+                "Camera"
+            } else {
+                projection.name()
+            },
+        );
         if model_update && matches!(projection, Projection::Full | Projection::Chrome) {
-            self.materialize_replica_snapshot();
-        }
-        if projection == Projection::Full {
-            self.sync_worktree_protections();
+            projection_stage!("replica_snapshot", self.materialize_replica_snapshot());
         }
         self.sync_popup_keyboard_nav();
         // The transport wording the health banner replaces may sit in either
@@ -19104,14 +19330,8 @@ impl Application for Cagents {
         if self.latency_focus != self.workspace.focused() {
             self.latency.abandon_pending();
         }
-        match projection {
-            Projection::Unchanged => {
-                return Task::batch([
-                    task,
-                    self.reconcile_notice_popup(),
-                    self.release_deferred_navigation_if_unblocked(),
-                ]);
-            }
+        let projected = match &projection {
+            Projection::Unchanged => self.reconcile_notice_popup(),
             // A reported title reaches the tabs, the window title and the
             // Attention list's pane rows; nothing else in the sidebar, nor
             // worktree ownership or protections, reads it.
@@ -19120,12 +19340,14 @@ impl Application for Cagents {
                 if model_update {
                     self.shared_views.chrome_tail_count += 1;
                 }
-                self.refresh_attention_card_rows();
+                projection_stage!("attention_card_rows", self.refresh_attention_card_rows());
                 let notices = self.reconcile_notice_popup();
                 let mut phase = WorkspaceProjectionTiming::new(_workspace_timing.is_some());
                 let chrome = match &projection {
-                    Projection::ScopedChrome(cards) => self.sync_scoped_chrome(cards),
-                    _ => self.sync_chrome(),
+                    Projection::ScopedChrome(cards) => {
+                        projection_stage!("scoped_chrome", self.sync_scoped_chrome(cards))
+                    }
+                    _ => projection_stage!("chrome", self.sync_chrome()),
                 };
                 phase.mark("selected_chrome");
                 let snapshot = if matches!(projection, Projection::ScopedChrome(_)) {
@@ -19133,85 +19355,73 @@ impl Application for Cagents {
                 } else {
                     Task::none()
                 };
-                return Task::batch([
-                    task,
-                    chrome,
-                    notices,
-                    snapshot,
-                    self.release_deferred_navigation_if_unblocked(),
-                ]);
+                Task::batch([chrome, notices, snapshot])
             }
-            Projection::Full => {}
-        }
-        if camera_only {
-            return Task::batch([task, self.release_deferred_navigation_if_unblocked()]);
-        }
-        #[cfg(test)]
-        terminal_output_tests::record_projection();
-        #[cfg(test)]
-        if model_update {
-            self.shared_views.structural_tail_count += 1;
-        }
-        let notices = self.reconcile_notice_popup();
-        self.synchronize_sidebar_selection();
-        self.refresh_sidebar_channels();
-        self.sidebar_state
-            .prune_retained_attention(&self.sidebar_model);
-        if reconcile_row_selection {
-            self.prune_sidebar_row_selection();
-        }
-        self.refresh_sidebar_worktree_panes();
-        // Ahead of the rebind, which pins what the inspector drawing source
-        // control chose: a pane that has just arrived, closed or taken focus
-        // must not show the last binding for a frame.
-        self.sync_pane_inspectors();
-        self.sync_pull_request_inspector();
-        let binding = self.rebind_source_control();
-        if let Some(source) = self.sidebar_model.source_control.as_ref() {
-            let selected = self
-                .workspace
-                .focused()
-                .and_then(|card| match self.cards.get(&card) {
-                    Some(CardRuntime::Repository(runtime))
-                        if runtime.descriptor.worktree == source.key.canonical_path =>
-                    {
-                        runtime.selected_path()
-                    }
-                    _ => None,
-                });
-            self.sidebar_state.select_file(&source.key, selected);
-        }
-        // `view` cannot rebuild the chrome cache itself, so refresh it here.
-        let chrome = self.sync_chrome();
-        let deferred = self.release_deferred_navigation_if_unblocked();
-        let terminal_probes = self.terminal_transcript_probes();
-        // Another project shown, or a review or the workspace switcher closed.
-        let approval = self.read_owed_automation_requests();
+            // Panning and resizing the workspace move no label, selected
+            // worktree or repository binding. A frame can end an animation
+            // that releases a pane, so its worktree protection is kept.
+            Projection::Full if camera_only => {
+                projection_stage!("worktree_protections", self.sync_worktree_protections());
+                Task::none()
+            }
+            Projection::Full => {
+                #[cfg(test)]
+                terminal_output_tests::record_projection();
+                #[cfg(test)]
+                if model_update {
+                    self.shared_views.structural_tail_count += 1;
+                }
+                let notices = projection_stage!("notice_popup", self.reconcile_notice_popup());
+                Task::batch([notices, self.project_workspace(reconcile_row_selection)])
+            }
+        };
+        #[cfg(any(test, feature = "development"))]
+        let projected = Task::batch([
+            projected,
+            self.verify_projection(
+                oracle_message.as_deref(),
+                &projection,
+                camera_only,
+                reconcile_row_selection,
+            ),
+        ]);
         Task::batch([
             task,
-            binding,
-            chrome,
-            deferred,
-            notices,
-            terminal_probes,
-            approval,
+            projected,
+            self.release_deferred_navigation_if_unblocked(),
         ])
             })();
-        self.reconcile_chat_failure_presentations();
+        // A handler that returned before the projection above skipped it.
+        #[cfg(any(test, feature = "development"))]
+        let task = Task::batch([
+            task,
+            self.check_skipped_projection(oracle_message.as_deref()),
+        ]);
+        let _postlude_trace = crate::performance::ui_trace::projection("Postlude");
+        projection_stage!("chat_failures", self.reconcile_chat_failure_presentations());
         if attention_scope_changed {
             self.notification_ui.scope_changed();
         }
-        self.sync_pull_request_labels();
+        projection_stage!("pull_request_labels", self.sync_pull_request_labels());
         let activation = self.retry_notification_activation();
-        let visibility = self.sync_visible_attention();
-        self.sync_notification_presence();
+        let visibility = projection_stage!("visible_attention", self.sync_visible_attention());
+        projection_stage!("notification_presence", self.sync_notification_presence());
         let keyboard = self.settle_owed_keyboard();
         let preview = self.settle_workspace_switcher_preview();
         // Showing a cold chat can classify a current rejection synchronously,
         // including disconnected metadata with no future client wake. Only
         // mounted visible chats are inspected by this bounded handoff.
-        let limit_usage = self.refresh_chat_limit_accounts();
-        Task::batch([task, activation, visibility, keyboard, preview, limit_usage])
+        let limit_usage =
+            projection_stage!("chat_limit_accounts", self.refresh_chat_limit_accounts());
+        Task::batch([
+            settled_projection,
+            task,
+            activation,
+            visibility,
+            keyboard,
+            preview,
+            limit_usage,
+        ])
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -27056,7 +27266,7 @@ mod tests {
     }
 
     /// A channel and a repository with two worktrees, each holding a terminal.
-    fn alt_tab_test_app() -> (Cagents, crate::model::ChannelId) {
+    pub(super) fn alt_tab_test_app() -> (Cagents, crate::model::ChannelId) {
         use crate::model::{ChannelId, ProjectChannel, WorktreeId};
         use crate::sidebar::{SidebarProject, SidebarWorktree};
 
@@ -31641,6 +31851,8 @@ mod tests {
             channel_offsets: HashMap::new(),
             worktree_offsets: HashMap::new(),
             worktree_owners: HashMap::new(),
+            #[cfg(any(test, feature = "development"))]
+            projected_protections: Default::default(),
             known_worktree_roots: worktree_ui::KnownWorktreeRoots::default(),
             worktree_paths: worktree_ui::WorktreePathIndex::default(),
             pull_request_board: chat_ui::PullRequestBoard::default(),

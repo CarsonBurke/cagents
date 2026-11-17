@@ -26,24 +26,45 @@ thread_local! {
     static PERSISTS: Cell<usize> = const { Cell::new(0) };
 }
 pub(super) fn record_projection() {
+    if super::projection_oracle::verifying() {
+        return;
+    }
     PROJECTIONS.set(PROJECTIONS.get() + 1);
 }
 pub(super) fn record_protection() {
+    if super::projection_oracle::verifying() {
+        return;
+    }
     PROTECTIONS.set(PROTECTIONS.get() + 1);
 }
 pub(super) fn record_owner_resolution() {
+    if super::projection_oracle::verifying() {
+        return;
+    }
     OWNER_RESOLUTIONS.set(OWNER_RESOLUTIONS.get() + 1);
 }
 pub(super) fn record_folder_root_refresh() {
+    if super::projection_oracle::verifying() {
+        return;
+    }
     FOLDER_ROOT_REFRESHES.set(FOLDER_ROOT_REFRESHES.get() + 1);
 }
 pub(super) fn record_chrome() {
+    if super::projection_oracle::verifying() {
+        return;
+    }
     CHROME_SYNCS.set(CHROME_SYNCS.get() + 1);
 }
 pub(super) fn record_card_index() {
+    if super::projection_oracle::verifying() {
+        return;
+    }
     CARD_INDEXES.set(CARD_INDEXES.get() + 1);
 }
 pub(super) fn record_persist() {
+    if super::projection_oracle::verifying() {
+        return;
+    }
     PERSISTS.set(PERSISTS.get() + 1);
 }
 /// How many times this thread has handed the workspace to the writer.

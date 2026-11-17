@@ -16,11 +16,13 @@ existing `--fail-new-daemon` archive wrapper remains a separate persistent fault
 Run native retries from a genuine shell on fw16; compilation of the C shim and
 native execution belong there. Python-only tests can run elsewhere.
 
-Run the pure contracts with `python3 -B tests/rehearse_update_retry.py`. Run
-`python3 -B tests/rehearse_update_retry_bind.py` from the supervised fw16 shell
-to prove repeated armed refusal, source/unrelated-socket pass-through, disarmed
-success and byte stability using a copied Python executable. This C check does
-not qualify the installed app.
+Both suites run in CI as part of the `update rehearsal` script-contract job.
+Run the pure contracts with `/usr/bin/python3 -I -B tests/rehearse_update_retry.py`.
+`/usr/bin/python3 -I -B tests/rehearse_update_retry_bind.py` compiles the shim in a
+private temporary root and preloads it into a copied Python executable. It proves
+repeated armed refusal, source and unrelated-socket pass-through, disarmed success
+and byte stability. It needs only a C compiler, and it skips without `cc`. This C
+check does not qualify the installed app.
 
 For each native retry, use a new root and run the standalone orchestrator from
 the frozen checkout:

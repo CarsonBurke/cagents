@@ -12,6 +12,8 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOL = ROOT / "scripts/memory-capped"
+# Bounds only a hang: every wait it guards returns as soon as what it waits for happens.
+HANG_GUARD = 60
 # The unified hierarchy's line; a host may mount v1 controllers such as net_cls too.
 LEAF = "sed -n 's|^0::.*/||p' /proc/self/cgroup"
 
@@ -42,7 +44,7 @@ class UnderAMovedHome(unittest.TestCase):
             shim = Path(directory) / "python3"
             shim.write_text('#!/bin/sh\nexec "$0" "$@"\n')
             shim.chmod(0o755)
-            result = subprocess.run([TOOL, "--help"], capture_output=True, text=True, timeout=20,
+            result = subprocess.run([TOOL, "--help"], capture_output=True, text=True, timeout=HANG_GUARD,
                                     env=os.environ | {"PATH": f"{directory}:{os.defpath}"})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("usage:", result.stdout)
@@ -110,7 +112,7 @@ class InARealScope(unittest.TestCase):
         return subprocess.run([str(TOOL), *command], env=self.env, capture_output=True, text=True,
                               timeout=120, **options)
 
-    def wait_for(self, predicate, what, seconds=20):
+    def wait_for(self, predicate, what, seconds=HANG_GUARD):
         deadline = time.monotonic() + seconds
         while not predicate():
             self.assertLess(time.monotonic(), deadline, what)
@@ -127,19 +129,19 @@ class InARealScope(unittest.TestCase):
             import pathlib, subprocess
             cgroup = pathlib.Path("/proc/self/cgroup").read_text().strip()
             pathlib.Path("{unit}").write_text(cgroup.rsplit("/", 1)[1])
+            # Outlasting run_tool's timeout, so that its returning at all shows
+            # the scope ended this child and its open output.
             child = subprocess.Popen(["sh", "-c", 'echo $$ >{survivor}; exec sleep 300'])
             # A ceiling, so that a mutant without the limit fails the test
             # instead of filling the host's memory and swap.
             chunks = [bytearray(b"x") * (16 * 2**20) for _ in range(64)]
         """)
-        started = time.monotonic()
         result = self.run_tool(sys.executable, "-I", "-c", script)
         self.assertEqual(result.returncode, 137, result.stderr)
         self.assertIn(f"stopped {Path(sys.executable).name} because it and the processes "
                       "it started went over the limit of 256 MiB", result.stderr)
         self.assertIn("not a crash", result.stderr)
         self.assertIn("CAGENTS_MEMORY_MAX=512M", result.stderr)
-        self.assertLess(time.monotonic() - started, 60)
         pid = int(survivor.read_text())
         self.wait_for(lambda: not Path(f"/proc/{pid}").exists(), "a child outlived the scope")
         self.assert_not_left_failed(unit.read_text())
@@ -173,7 +175,7 @@ class InARealScope(unittest.TestCase):
         pid = int(marker.read_text())
         self.addCleanup(lambda: subprocess.run(["kill", "-KILL", str(pid)], capture_output=True))
         wrapper.terminate()
-        _, errors = wrapper.communicate(timeout=20)
+        _, errors = wrapper.communicate(timeout=HANG_GUARD)
         self.wait_for(lambda: not Path(f"/proc/{pid}").exists(), "it outlived the scope")
         self.assertNotIn("over the limit", errors)
         self.assert_not_left_failed(unit.read_text().strip())
@@ -187,7 +189,7 @@ class InARealScope(unittest.TestCase):
         self.wait_for(lambda: marker.exists() and marker.read_text().strip(), "never started")
         # As a terminal delivers Ctrl-C: to the whole foreground group.
         os.killpg(script.pid, signal.SIGINT)
-        output, errors = script.communicate(timeout=30)
+        output, errors = script.communicate(timeout=HANG_GUARD)
         self.assertEqual((script.returncode, output), (-signal.SIGINT, ""), errors)
 
     def test_a_stricter_limit_of_the_callers_stays_in_force(self):
@@ -219,7 +221,7 @@ class InARealScope(unittest.TestCase):
         self.env["CAGENTS_MEMORY_MAX"] = "0"
         result = subprocess.run(
             ["bash", "-c", f'"{TOOL}" sh -c "while echo x; do :; done" | head -n 1; echo "${{PIPESTATUS[0]}}"'],
-            env=self.env, capture_output=True, text=True, timeout=30)
+            env=self.env, capture_output=True, text=True, timeout=HANG_GUARD)
         self.assertEqual(result.stdout.split(), ["x", "141"], result.stderr)
 
     def test_a_command_in_a_limited_scope_stays_in_it_and_one_outside_gets_its_own(self):
@@ -314,7 +316,7 @@ class InARealScope(unittest.TestCase):
                                                              capture_output=True))
                 wrapper.send_signal(number)
                 self.wait_for(lambda: not Path(f"/proc/{pid}").exists(), "the command outlived its wrapper")
-                wrapper.wait(10)
+                wrapper.wait(HANG_GUARD)
 
 
 if __name__ == "__main__":

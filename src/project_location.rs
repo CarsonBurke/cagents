@@ -185,29 +185,43 @@ fn placed(directory: &Path, opened: &dyn Fn(&Path) -> bool) -> Placement {
 /// The working tree that contains `directory` and its Git common directory.
 fn checkout(directory: &Path) -> Option<(PathBuf, PathBuf)> {
     directory.ancestors().find_map(|ancestor| {
-        let marker = ancestor.join(".git");
-        let metadata = fs::metadata(&marker).ok()?;
-        if metadata.is_dir() {
-            return Some((ancestor.to_path_buf(), fs::canonicalize(&marker).ok()?));
-        }
-        // A linked worktree or submodule names its private Git directory, and
-        // that directory names the shared one it borrows objects and refs from.
-        // A marker that names nothing readable is skipped, not trusted.
-        let content = fs::read_to_string(&marker).ok()?;
-        let private = ancestor.join(
-            content
-                .strip_prefix("gitdir: ")?
-                .trim_end_matches(['\r', '\n']),
-        );
-        let private = fs::canonicalize(private).ok()?;
-        let common = match fs::read_to_string(private.join("commondir")) {
-            Ok(common) => {
-                fs::canonicalize(private.join(common.trim_end_matches(['\r', '\n']))).ok()?
-            }
-            Err(_) => private,
-        };
-        Some((ancestor.to_path_buf(), common))
+        git_directories(ancestor).map(|directories| (ancestor.to_path_buf(), directories.common))
     })
+}
+
+/// Where Git keeps a checkout's metadata: its private directory, which holds
+/// its index and `HEAD`, and the common directory it shares objects and refs
+/// with every other worktree of the repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GitDirectories {
+    pub private: PathBuf,
+    pub common: PathBuf,
+}
+
+/// Reads `checkout`'s `.git` marker as Git's own discovery does, without a
+/// Git process. A linked worktree or submodule names its private Git
+/// directory, and that directory names the shared one it borrows objects and
+/// refs from. `None` when the checkout has no marker, or one that names
+/// nothing readable; such a marker is skipped, not trusted.
+pub(crate) fn git_directories(checkout: &Path) -> Option<GitDirectories> {
+    let marker = checkout.join(".git");
+    let private = if fs::metadata(&marker).ok()?.is_dir() {
+        fs::canonicalize(&marker).ok()?
+    } else {
+        let content = fs::read_to_string(&marker).ok()?;
+        fs::canonicalize(checkout.join(line(content.strip_prefix("gitdir: ")?))).ok()?
+    };
+    let common = match fs::read_to_string(private.join("commondir")) {
+        Ok(common) => fs::canonicalize(private.join(line(&common))).ok()?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => private.clone(),
+        Err(_) => return None,
+    };
+    Some(GitDirectories { private, common })
+}
+
+/// One line of a Git metadata file, which Git accepts with CRLF too.
+fn line(content: &str) -> &str {
+    content.trim_end_matches(['\r', '\n'])
 }
 
 #[cfg(test)]
@@ -512,5 +526,67 @@ mod tests {
                 project: Some(key),
             }
         );
+    }
+
+    #[test]
+    fn git_directories_follow_markers_and_commondir_as_git_does() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let common = root.join("repository/.git");
+        let private = common.join("worktrees/linked");
+        fs::create_dir_all(&private).unwrap();
+
+        // A linked worktree: a `gitdir: ` file naming its private directory
+        // relative to the checkout, whose `commondir` is relative to it.
+        let linked = root.join("linked");
+        fs::create_dir_all(&linked).unwrap();
+        fs::write(
+            linked.join(".git"),
+            "gitdir: ../repository/.git/worktrees/linked\r\n",
+        )
+        .unwrap();
+        fs::write(private.join("commondir"), "../..\n").unwrap();
+        assert_eq!(
+            git_directories(&linked),
+            Some(GitDirectories {
+                private: private.clone(),
+                common: common.clone(),
+            })
+        );
+
+        // Without `commondir`, the private directory is the common one.
+        assert_eq!(
+            git_directories(&root.join("repository")),
+            Some(GitDirectories {
+                private: common.clone(),
+                common: common.clone(),
+            })
+        );
+
+        // A `.git` directory may name its common directory too, absolutely.
+        let shared = root.join("shared");
+        fs::create_dir_all(shared.join(".git")).unwrap();
+        fs::write(
+            shared.join(".git/commondir"),
+            format!("{}\n", common.display()),
+        )
+        .unwrap();
+        assert_eq!(
+            git_directories(&shared),
+            Some(GitDirectories {
+                private: shared.join(".git"),
+                common: common.clone(),
+            })
+        );
+
+        // A `commondir` that exists but cannot be read leaves the answer to
+        // Git rather than guessing the private directory is the common one.
+        fs::remove_file(private.join("commondir")).unwrap();
+        fs::create_dir(private.join("commondir")).unwrap();
+        assert_eq!(git_directories(&linked), None);
+
+        // Git requires the prefix exactly.
+        fs::write(linked.join(".git"), "gitdir:../repository/.git\n").unwrap();
+        assert_eq!(git_directories(&linked), None);
     }
 }

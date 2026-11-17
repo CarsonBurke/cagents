@@ -19,6 +19,8 @@ from unittest import mock
 
 
 FIXTURE = runpy.run_path(str(Path(__file__).resolve().parent / "fixtures/codex-resume-history.py"))
+# Bounds only a hang; a passing wait returns as soon as Codex answers.
+HANG_GUARD = 60
 
 
 class CodexResumeHistory(unittest.TestCase):
@@ -138,7 +140,7 @@ requires_openai_auth = false
 
                     def call(identifier, method, params):
                         send({"id": identifier, "method": method, "params": params})
-                        deadline = time.monotonic() + 15
+                        deadline = time.monotonic() + HANG_GUARD
                         while True:
                             remaining = deadline - time.monotonic()
                             self.assertGreater(remaining, 0, "Codex did not reply before the deadline")
@@ -189,7 +191,7 @@ requires_openai_auth = false
                             except ProcessLookupError:
                                 pass
                             child.wait(timeout=5)
-                        reader.join(timeout=5)
+                        reader.join(timeout=HANG_GUARD)
                         self.assertFalse(reader.is_alive())
                         child.stdin.close()
                         child.stdout.close()

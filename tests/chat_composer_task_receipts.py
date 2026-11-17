@@ -15,6 +15,8 @@ from unittest import mock
 SCRIPT = Path(__file__).resolve().parent / "fixtures/chat-composer-claude.sh"
 SESSION = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 DIAGNOSTIC = "Invalid fixture-agent-task-receipt.json\n"
+# Bounds only a hang; a passing run returns as soon as the provider exits.
+HANG_GUARD = 60
 
 
 def prompt(number):
@@ -115,10 +117,10 @@ class PrivateFixture:
             argv, cwd=self.project, env=None, stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
-        ownership = {"child": child, "deadline": time.monotonic() + 10, "drained": False}
+        ownership = {"child": child, "deadline": time.monotonic() + HANG_GUARD, "drained": False}
         self.children.append(ownership)
         payload = "".join(json.dumps(frame) + "\n" for frame in frames)
-        stdout, stderr = child.communicate(payload, timeout=5)
+        stdout, stderr = child.communicate(payload, timeout=HANG_GUARD)
         ownership["drained"] = True
         status = child.wait(timeout=1)  # Original Child wait, even on a nonzero result.
         return status, stdout, stderr

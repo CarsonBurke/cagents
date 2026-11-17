@@ -3,6 +3,7 @@
 import argparse
 import contextlib
 import email.utils
+import errno
 import fcntl
 import fnmatch
 import hashlib
@@ -24,6 +25,10 @@ from cargo_artifacts import CargoArtifactError, CargoArtifacts
 MAX_BYTES = 4 * 1024 * 1024
 REFRESH = 120
 BUILD_RETRY = 600
+HEAD_NOT_SHOWN = 5  # A readable snapshot that does not yet show --expect-head.
+# Launch errors that mean the cached binary itself is unusable, rather than
+# that this host could not start a process just now (EAGAIN, ENOMEM).
+UNUSABLE_BINARY = {errno.ENOEXEC, errno.EACCES, errno.ELIBBAD}
 DEFAULT_SOURCE = "refs/remotes/origin/main"
 # Cache the status implementation, not every unrelated change to the app.
 BUILD_INPUTS = ["src/github*", "src/control/gh.rs", "src/control.rs", "src/modules.rs",
@@ -450,7 +455,55 @@ def reported_check(check):
     return {field: value for field, value in check.items() if field not in dropped}
 
 
-def output(saved, key, as_json):
+def expect_head(document, head):
+    """Label DOCUMENT stale unless its snapshot shows HEAD.
+
+    The exit status the check calls for: 0 when the snapshot shows HEAD,
+    HEAD_NOT_SHOWN when it shows another head, and 4 when it shows none.
+
+    A read made in the seconds after a push can still see the previous head,
+    and the cache then serves that snapshot as fresh for its whole interval.
+    Only the caller knows which head it pushed, so it says so; this makes no
+    request of its own and leaves the shared cache as it is.
+    """
+    data = document.get("data") if isinstance(document, dict) else None
+    if not isinstance(data, dict):
+        return 4
+    data["expected_head"] = head
+    pr = (data.get("snapshot") or {}).get("pull_request") or {}
+    shown = pr.get("headRefOid")
+    if isinstance(shown, str) and shown.lower() == head:
+        return 0
+    data["stale"] = True
+    limitations = data.setdefault("limitations", [])
+    if not isinstance(shown, str) or not shown:
+        limitations.append(f"This report shows no head, so it cannot confirm {head}. Read again"
+                           + (" after retry_at." if data.get("retry_at") else "."))
+        return 4
+    limitations.append(
+        f"This snapshot shows head {shown}, not {head}: GitHub may not show that push yet. "
+        + ("Read again after retry_at." if data.get("retry_at") else "Read again."))
+    return HEAD_NOT_SHOWN
+
+
+def checked_cli(result, head):
+    """The exit status for the cached CLI's RESULT, printed with --expect-head checked."""
+    # A shell reports a signal death this way; execv let it show directly.
+    status = 128 - result.returncode if result.returncode < 0 else result.returncode
+    try:
+        document = json.loads(result.stdout)
+    except ValueError:
+        sys.stdout.buffer.write(result.stdout)
+        if not status:
+            print("gh-pr-status: the cached CLI printed no JSON report, so the head is unchecked",
+                  file=sys.stderr)
+        return status or 4
+    checked = expect_head(document, head)
+    print(json.dumps(document, separators=(",", ":"), ensure_ascii=False))
+    return status or checked
+
+
+def output(saved, key, as_json, head=None):
     at = int(time.time())
     fetched = saved.get("fetched_at")
     failed = bool(saved.get("error")) or not saved.get("snapshot")
@@ -471,8 +524,12 @@ def output(saved, key, as_json):
               "outcome": "failed" if failed else "succeeded",
               "limitations": [bootstrap] if partial else known}
     if as_json:
-        print(json.dumps({"ok": True, "command": "gh.pr_status", "data": report,
-                          "limitations": [bootstrap] if partial else []}))
+        document = {"ok": True, "command": "gh.pr_status", "data": report,
+                    "limitations": [bootstrap] if partial else []}
+        checked = expect_head(document, head) if head is not None else 0
+        print(json.dumps(document))
+        if not failed:
+            return checked
     else:
         pr = (report["snapshot"] or {}).get("pull_request", {})
         print(f'{authority(key)}/{key["repository"]["owner"]}/{key["repository"]["name"]} #{key["number"]}: '
@@ -491,9 +548,17 @@ def main():
     parser.add_argument("-R", "--repo", required=True)
     parser.add_argument("--hostname", default="github.com")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--expect-head", metavar="SHA", type=str.lower,
+                        help="the full head commit just pushed: with --json, label the report "
+                             f"stale and exit {HEAD_NOT_SHOWN} until GitHub shows it")
     parser.add_argument("--source-ref", default=DEFAULT_SOURCE,
                         help="local source revision (default: origin/main; HEAD to qualify a candidate)")
     args = parser.parse_args()
+    if args.expect_head is not None:
+        if not args.json:
+            parser.error("--expect-head requires --json")
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", args.expect_head):
+            parser.error("--expect-head takes a full commit SHA")
     key = target(args.repo, args.hostname, args.number)
     # A second look finds main's new CLI when its build removed the earlier
     # one between choosing and starting it.
@@ -511,17 +576,23 @@ def main():
                    "--hostname", args.hostname] + (["--json"] if args.json else [])
         try:
             identity = binary.stat()
-            os.execv(binary, command)
+            if args.expect_head is None:
+                os.execv(binary, command)
+            # Its stderr passes straight through.
+            result = subprocess.run(command, stdout=subprocess.PIPE)
         except FileNotFoundError:
             continue
         except OSError as error:
             print(f"gh-pr-status: cached CLI cannot start ({error}); using shared REST cache", file=sys.stderr)
             current = binary.stat() if binary.exists() else None
-            if current and (current.st_dev, current.st_ino, current.st_mtime_ns, current.st_size) == (
+            if error.errno in UNUSABLE_BINARY and current and (
+                    current.st_dev, current.st_ino, current.st_mtime_ns, current.st_size) == (
                     identity.st_dev, identity.st_ino, identity.st_mtime_ns, identity.st_size):
                 binary.unlink()
             break
-    return output(rest(key), key, args.json)
+        # Outside the launch: an output error is no reason to discard the CLI.
+        return checked_cli(result, args.expect_head)
+    return output(rest(key), key, args.json, args.expect_head)
 
 
 if __name__ == "__main__":

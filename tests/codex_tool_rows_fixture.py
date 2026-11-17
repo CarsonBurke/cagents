@@ -12,6 +12,8 @@ from unittest import mock
 
 
 PEER = runpy.run_path(str(Path(__file__).resolve().parent / "fixtures/codex-tool-rows.py"))
+# Bounds only a hang; a passing wait returns as soon as its event arrives.
+HANG_GUARD = 60
 
 
 class CodexToolRowsFixture(unittest.TestCase):
@@ -21,8 +23,8 @@ class CodexToolRowsFixture(unittest.TestCase):
                 "CAGENTS_TOOL_ROWS_NEVER_CONFIRM_CLOSE": "1" if never_confirm_close else "0"}):
             scenario = PEER["Scenario"]()
         server, client = socket.socketpair()
-        server.settimeout(2)
-        client.settimeout(2)
+        server.settimeout(HANG_GUARD)
+        client.settimeout(HANG_GUARD)
         done, failures = threading.Event(), []
 
         def serve():
@@ -48,7 +50,7 @@ class CodexToolRowsFixture(unittest.TestCase):
             yield client, done
         finally:
             client.close()
-            worker.join(2)
+            worker.join(HANG_GUARD)
             self.assertFalse(worker.is_alive(), "fixture worker survived its peer's disconnect")
             if failures:
                 raise failures[0]
@@ -338,7 +340,7 @@ class CodexToolRowsFixture(unittest.TestCase):
 
             def record(index):
                 scenario = PEER["Scenario"]()
-                barrier.wait(5)
+                barrier.wait(HANG_GUARD)
                 scenario.request({"id": index, "method": "turn/start", "params": {
                     "threadId": scenario.thread, "model": f"offline-{index}", "effort": "high"}}, home)
 
@@ -347,13 +349,13 @@ class CodexToolRowsFixture(unittest.TestCase):
                 for worker in workers:
                     worker.start()
                 for worker in workers:
-                    worker.join(5)
+                    worker.join(HANG_GUARD)
                     self.assertEqual(worker.exitcode, 0, "audit writer did not finish successfully")
             finally:
                 for worker in workers:
                     if worker.is_alive():
                         worker.terminate()
-                    worker.join(2)
+                    worker.join(HANG_GUARD)
             records = json.loads(audit.read_text())
             self.assertEqual(len(records), 8)
             self.assertEqual({row["model"] for row in records}, {f"offline-{index}" for index in range(8)})
@@ -476,18 +478,18 @@ class CodexToolRowsFixture(unittest.TestCase):
             worker = threading.Thread(target=scenario.play, args=(replies, sent.append, lock, generations))
             worker.start()
             try:
-                self.assertTrue(paused.wait(5), "fixture did not reach its delayed turn")
+                self.assertTrue(paused.wait(HANG_GUARD), "fixture did not reach its delayed turn")
                 self.confirm_interrupt(scenario, scenario.thread, lock)
                 self.assertTrue(worker.is_alive(), "the untouched child still owns delayed work")
                 self.confirm_interrupt(scenario, scenario.child, lock)
-                worker.join(5)
+                worker.join(HANG_GUARD)
                 self.assertFalse(worker.is_alive(), "cancelled playback slept for its original 600 seconds")
             finally:
                 # Keep failures bounded without leaving a delayed fixture thread.
                 with lock:
                     scenario.restore({"thread": scenario.thread, "child": scenario.child,
                                       "latest": None, "child_latest": None})
-                worker.join(5)
+                worker.join(HANG_GUARD)
         self.assertFalse(any(frame.get("method") == "turn/completed" for frame in sent),
                          "the cancelled original playback must publish no success")
 
@@ -520,7 +522,7 @@ class CodexToolRowsFixture(unittest.TestCase):
         scenario.play(followup[:pause_at], lambda _: None, lock, parent_generation)
 
         def enter_pause(*args):
-            paused.wait(5)
+            paused.wait(HANG_GUARD)
             return pause(*args)
 
         batches = [([{"_sleep": 600}, *child_remaining], child_generation),
@@ -531,19 +533,19 @@ class CodexToolRowsFixture(unittest.TestCase):
             for worker in workers:
                 worker.start()
             try:
-                paused.wait(5)
+                paused.wait(HANG_GUARD)
                 self.confirm_interrupt(scenario, scenario.thread, lock)
-                workers[1].join(5)
+                workers[1].join(HANG_GUARD)
                 self.assertFalse(workers[1].is_alive(), "followup cancellation must not lose its wakeup")
                 self.assertTrue(workers[0].is_alive(), "the background child has not been interrupted")
                 self.confirm_interrupt(scenario, scenario.child, lock)
-                workers[0].join(5)
+                workers[0].join(HANG_GUARD)
                 self.assertFalse(workers[0].is_alive(), "background cancellation must not lose its wakeup")
             finally:
                 scenario.restore({"thread": scenario.thread, "child": scenario.child,
                                   "latest": None, "child_latest": None})
                 for worker in workers:
-                    worker.join(5)
+                    worker.join(HANG_GUARD)
     def test_wrong_interrupt_scope_and_unsubscribe_do_not_end_work(self):
         scenario, _, _ = self.start_paused()
         for thread, turn in ((scenario.thread, "stale-turn"), ("unknown-thread", scenario.latest["id"])):
@@ -675,7 +677,7 @@ class CodexToolRowsFixture(unittest.TestCase):
 
         def wait(_duration, _generations):
             paused.set()
-            if not release.wait(2):
+            if not release.wait(HANG_GUARD):
                 raise TimeoutError("test did not release the scripted turn")
             return True
 
@@ -690,7 +692,7 @@ class CodexToolRowsFixture(unittest.TestCase):
         patch.start()
         worker.start()
         try:
-            self.assertTrue(paused.wait(2))
+            self.assertTrue(paused.wait(HANG_GUARD))
             with lock:
                 interrupt = self.interrupt(scenario, scenario.thread, origin)
             scenario.play(interrupt, sent.append, lock, scenario.playback(interrupt))
@@ -703,7 +705,7 @@ class CodexToolRowsFixture(unittest.TestCase):
             confirmed = len(sent)
         finally:
             release.set()
-            worker.join(2)
+            worker.join(HANG_GUARD)
             patch.stop()
         self.assertFalse(worker.is_alive())
         if failures:
@@ -721,13 +723,13 @@ class CodexToolRowsFixture(unittest.TestCase):
                         client.recv(1)
                     self.assertFalse(done.is_set(), "a WebSocket close frame is not a transport disconnect")
                 else:
-                    self.assertTrue(done.wait(2), "the default peer did not close its connection")
+                    self.assertTrue(done.wait(HANG_GUARD), "the default peer did not close its connection")
                     self.assertEqual(client.recv(1), b"")
 
     def test_never_confirm_close_does_not_hold_a_disconnected_peer(self):
         with self.connected_peer(True) as (client, done):
             client.shutdown(socket.SHUT_WR)
-            self.assertTrue(done.wait(2), "transport EOF left the fixture worker waiting")
+            self.assertTrue(done.wait(HANG_GUARD), "transport EOF left the fixture worker waiting")
             self.assertEqual(client.recv(1), b"")
 
 

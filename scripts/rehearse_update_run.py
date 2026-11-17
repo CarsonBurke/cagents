@@ -876,6 +876,14 @@ class Rehearsal:
             slots[slot] = window
         return slots
 
+    def open_windows(self, slots):
+        # Open each window once the previous one has mapped. With an
+        # incompatible update staged, `cagents ui` launches milliseconds apart
+        # race each other's startup, and the later one refuses to start.
+        for index, slot in enumerate(slots):
+            self.call('launch', slot)
+            self.wait_windows(slots[:index+1])
+
     def wait_windows(self, required, timeout=60, version=None):
         deadline = time.monotonic()+timeout
         while time.monotonic() < deadline:
@@ -1704,9 +1712,7 @@ class Rehearsal:
             if not args.fail_new_daemon:
                 self.call('stage',args.new_dir,args.new_version,args.new_installer,timeout=180)
             self.call('desktop','start','--limit','900', timeout=None)
-            self.call('launch','main')
-            self.call('launch','second')
-            self.wait_windows(['main','second'])
+            self.open_windows(['main','second'])
             code, _ = self.call('seed', *seed_flags(args), timeout=180+6*args.scale_chats, check=False)
             if code:
                 self.errors.append('seed verification failed; see seeds.json')

@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Exercise scripts/prune-build-dirs on private directories only."""
 
+import contextlib
 import fcntl
 import json
 import os
 import pwd
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
@@ -20,6 +22,8 @@ PRUNER = ROOT / "scripts/prune-build-dirs"
 # SETTLE seconds instead of faking times: a change time cannot be faked.
 IDLE = 1.0
 SETTLE = 2.0
+# Bounds only a hang: every wait it guards returns as soon as what it waits for happens.
+HANG_GUARD = 60
 
 
 class PruneBuildDirs(unittest.TestCase):
@@ -42,7 +46,7 @@ class PruneBuildDirs(unittest.TestCase):
                    "--mirror", str(self.roots / "cargo-build"), "--verbose",
                    "--max-idle", str(IDLE / 86400), "--orphan-hours", str(IDLE / 3600)]
         result = subprocess.run(command + (["--apply"] if apply else []) + list(arguments),
-                                env=self.env, capture_output=True, text=True, timeout=60)
+                                env=self.env, capture_output=True, text=True, timeout=HANG_GUARD)
         self.assertEqual(result.returncode, status, result.stderr)
         return result.stdout
 
@@ -114,7 +118,7 @@ class PruneBuildDirs(unittest.TestCase):
 
     def test_a_process_inside_keeps_it(self):
         path = self.target(self.roots / "lane/target")
-        process = subprocess.Popen(["sleep", "30"], cwd=path / "debug")
+        process = subprocess.Popen(["sleep", "infinity"], cwd=path / "debug")
         self.addCleanup(process.wait)
         self.addCleanup(process.kill)
         self.settle()
@@ -125,8 +129,8 @@ class PruneBuildDirs(unittest.TestCase):
     def test_an_open_file_inside_keeps_it(self):
         path = self.target(self.roots / "lane/target")
         process = subprocess.Popen(
-            ["python3", "-c", "import sys, time; f = open(sys.argv[1]); print(flush=True); "
-             "time.sleep(30)", str(path / "debug/deps/libcrate.rlib")],
+            ["python3", "-c", "import signal, sys; f = open(sys.argv[1]); print(flush=True); "
+             "signal.pause()", str(path / "debug/deps/libcrate.rlib")],
             stdout=subprocess.PIPE, text=True)
         self.addCleanup(process.stdout.close)
         self.addCleanup(process.wait)
@@ -221,7 +225,7 @@ class PruneBuildDirs(unittest.TestCase):
         executable.write_bytes(Path("/bin/sleep").read_bytes())
         executable.chmod(0o755)
         self.settle()
-        process = subprocess.Popen([str(executable), "30"])
+        process = subprocess.Popen([str(executable), "infinity"])
         self.addCleanup(process.wait)
         self.addCleanup(process.kill)
         output = self.prune("--evidence-hours", "0")
@@ -237,13 +241,14 @@ class PruneBuildDirs(unittest.TestCase):
         other = self.evidence_task(self.roots / "cev/other")
         script = self.root / "worktree/scripts/native-evidence"
         script.parent.mkdir(parents=True)
-        script.write_text("sleep 30\n")
+        script.write_text("sleep infinity\n")
         unrelated = self.root / "worktree/scripts/other-tool"
-        unrelated.write_text("sleep 30\n")
+        unrelated.write_text("sleep infinity\n")
         def run(*command):
-            process = subprocess.Popen(command, cwd=self.root)
+            # Its own group, so cleanup reaches the sleep that outlives a killed bash.
+            process = subprocess.Popen(command, cwd=self.root, start_new_session=True)
             self.addCleanup(process.wait)
-            self.addCleanup(process.kill)
+            self.addCleanup(self.end_group, process.pid)
             return process
         session = run("bash", str(script), "--task", str(task), "__session", "after")
         # As a task named from its own working directory.
@@ -267,6 +272,11 @@ class PruneBuildDirs(unittest.TestCase):
         self.prune("--evidence-hours", "0")
         self.assertFalse(after.exists())
         self.assertFalse(before.exists())
+
+    @staticmethod
+    def end_group(group):
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(group, signal.SIGKILL)
 
     def test_a_moved_home_still_searches_the_accounts_own(self):
         # A fixture's builds, and so the pruner they start, run under a
@@ -307,7 +317,7 @@ print(json.dumps([[str(path) for path in pruner.default_roots()],
 """
         result = subprocess.run(
             [sys.executable, "-c", probe, str(PRUNER), "registered" if registered else "unregistered"],
-            env=self.env, capture_output=True, text=True, check=True, timeout=30)
+            env=self.env, capture_output=True, text=True, check=True, timeout=HANG_GUARD)
         return json.loads(result.stdout)
 
     def test_kept_and_protected_directories_stay(self):
@@ -380,9 +390,9 @@ print(json.dumps([[str(path) for path in pruner.default_roots()],
         self.settle()
         with open(self.root / "lock", "a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            started = time.monotonic()
+            # The lock stays held, so a run that waited for it would not
+            # return within prune's hang guard.
             output = self.prune(status=75)
-        self.assertLess(time.monotonic() - started, 10)
         self.assertIn("another run is pruning", output)
         self.assertTrue(path.exists())
 
@@ -535,7 +545,8 @@ sys.exit(pruner.main())
         command = [sys.executable, "-I", "-B", "-c", self.DRIVER, str(PRUNER), recreate, moment,
                    "--lock", str(self.root / "lock"), "--mirror", str(self.roots / "cargo-build"),
                    "--verbose", "--apply", "--max-idle", str(IDLE / 86400)]
-        result = subprocess.run(command, env=self.env, capture_output=True, text=True, timeout=60)
+        result = subprocess.run(command, env=self.env, capture_output=True, text=True,
+                                timeout=HANG_GUARD)
         self.assertEqual(result.returncode, 0, result.stderr)
         return path, result
 

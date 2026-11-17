@@ -15,6 +15,8 @@ from unittest import mock
 
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
+# Bounds only a hang; a passing run returns as soon as its process exits.
+HANG_GUARD = 60
 
 
 def module(name, filename):
@@ -298,7 +300,7 @@ class StdioProbeTests(unittest.TestCase):
 
                                          "CODEX_HOME": str(home), "XDG_RUNTIME_DIR": str(runtime)},
                                     input="".join(json.dumps(frame) + "\n" for frame in frames),
-                                    text=True, capture_output=True, timeout=5)
+                                    text=True, capture_output=True, timeout=HANG_GUARD)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stderr, "")
             responses = {frame["id"]: frame["result"] for frame in map(json.loads, result.stdout.splitlines())}

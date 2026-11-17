@@ -162,6 +162,13 @@ A nested `update` counts toward the outermost one. Overlays' own layout and
 drawing, the libcosmic chrome around the application view, and the renderer's
 presentation run outside the measured root, so the thread's CPU time exceeds
 the traced total.
+The `Projection` phase breaks out the share of `update` spent on its
+projection tail, without adding to any total. A label such as
+`Full Sidebar(OpenChannel` or `Unchanged ChatUi(Wake` names the projection an
+update took and its message; `Camera` is the full projection's panning path,
+and `Postlude` the work every update ends with. `stage chrome`,
+`stage sidebar_channels` and the other `stage` labels time the tail's stages
+across all updates.
 Each five-second report also covers the frames the shell presented, on any of
 its surfaces: how many, the p50/p95/p99/max **work** of each, and the same
 quantiles of the **interval** between consecutive presentations, as
@@ -429,6 +436,67 @@ change is a reported terminal title (OSC 0/2) runs only chrome, which includes
 the window title. Reported titles on their own cause at most one save, and
 one publication to shared views, every three seconds. The unit tests in `crates/cagents-ui/src/app/terminal_output_tests.rs`
 count the tail passes, chrome syncs and saves each message causes.
+
+The full projection is the default. An update projects less only where the
+handler for its message declares what it changed, by returning a narrower
+`Projection` beside its task, so a new handler is correct before it is fast.
+A handler that returns before the projection makes the same claim. Typing is
+the busiest case: a key that a text field took, a key release and a
+modifier change answer nothing in the workspace and project nothing, and the
+pointer crossing the tab strip changes only which tab is drawn hovered. A key
+that does something, such as Ctrl+Tab moving the focus or Escape closing a
+dialog, projects everything in its own update rather than leaving the
+projection to whatever message comes next.
+
+`app/projection_oracle.rs` checks each narrower declaration. After an update
+whose projection was narrower than `Full`, it runs the full projection and
+compares what the workspace derives: the sidebar model and state, card chrome
+and indices, terminal ordinals, pane and window titles, inspectors, transcript
+probes, worktree owners and protections, the panes whose working directory
+and find bar are kept, and which source control, branch comparison and
+history reads are current. It does not compare the tasks the projection
+returns. Every unit test built with debug assertions runs it and fails,
+naming the message and the stale part. Before an outermost update whose
+message can project narrowly it first brings that state up to date, because
+tests often arrange state directly and leave its projection to the next
+update. An update whose handler returned before projecting is checked when
+it returns if its state was brought up to date first. Otherwise the next
+update that brings the state up to date reports what it found stale against
+that earlier update, rather than repairing it silently; stale state found
+after an update that did project is put down to a test's own arrangement.
+
+Set `CAGENTS_PROJECTION_ORACLE` for a development build to run the same
+check natively. It logs to the `cagents::projection_oracle` target, both a
+stale declaration and state found stale before an update, with the update
+before it. Each check keeps what its full projection repaired and runs the
+tasks it returned, so such a session behaves as though every update
+projected everything: it cannot show a stale title or sidebar, and only its
+log shows whether a declaration was wrong. The check adds full projections
+to narrower updates, so the timing tests turn it off and native measurements
+run without the variable.
+
+The workload for these declarations is the `realistic` native evidence seed
+(18 projects, 76 channels, 1769 cards) at 1600x1000 under `--ui-trace`, with
+three fixture Claude agents streaming long replies, one shown. The run
+records idle streaming for 15 s, then types four 77-character sentences into
+the shown conversation's composer with `drive type`. It then hovers 14
+sidebar rows and 4 tabs twice, scrolls the sidebar, and switches channels 8
+times. One run per side on fw16 (`dev-runtime`) compares `a831f307a`, which
+traces the stages and projects everything for every key, with the change for
+issue #2954:
+
+| Phase | Before | After |
+| --- | --- | --- |
+| Typing, full projections | 336 `KeyEvent`, 2304 ms | none from keys (2 `RefreshUi` ticks) |
+| Typing, worst window's frame work p95 / p99 | 557 / 877 ms | 24 / 57 ms |
+| Typing, busy per second of trace | 643 ms | 302 ms |
+| Hover, `ChromeUi(HoverTab)` updates | 16, 165 ms | 12, 1.6 ms |
+| Whole run, traced busy time | 30.5 s over 146 s | 15.7 s over 136 s |
+
+Before, about two thirds of each key's projection was `stage chrome`, which
+rebuilds every card's chrome. A visible streaming conversation's
+`ChatUi(Wake)` costs about 2 ms of update each, outside the projection, and is
+the largest remaining cost while typing.
 
 The native workload has no script. In the browserless development runner,
 inside a nested niri session with fresh private HOME and XDG directories, open
@@ -747,14 +815,21 @@ window is read every 15 s, and any other every 120 s; reads due within the
 next 15 s share one scan. Previously one recent edit anywhere made the whole
 project re-read every worktree every 15 s.
 
-`scripts/measure-work-polling BIN_DIR [WORKTREES] [SECONDS] [ACTIVE]` builds a
-private fixture from a matched `cagents` and `cagentsd`: a project of
-WORKTREES worktrees (default 250) with 40 tracked directories each, which it
-checks exceeds the watch budget, and ACTIVE (default 3) freshly edited
-worktrees. After the board has read every checkout once, it counts the
-`git status` reads the daemon starts and the CPU of its exited children over
-SECONDS (default 300). It removes everything it created on exit and refuses
-agent authority; run it from `ssh fw16`.
+`scripts/measure-work-polling BIN_DIR [WORKTREES] [SECONDS] [ACTIVE]
+[DIRECTORIES]` builds a private fixture from a matched `cagents` and
+`cagentsd`: a project of WORKTREES worktrees (default 250) with DIRECTORIES
+tracked directories each (default 40), which it checks exceeds the watch
+budget, and ACTIVE (default 3) freshly edited worktrees. It first reports the
+load: when every checkout had a status, when the daemon held all the watches
+it then kept, and the Git commands and CPU until the daemon settled. Then it
+counts the Git commands and `git status` reads the daemon starts and the CPU
+it and its exited children use over SECONDS (default 300). Commands are
+counted from Git's own trace2 records, which every fixture process writes, so
+even the shortest are seen; each is attributed to the process that started
+it, and the CLI's are reported apart from the daemon's. The fixture's
+processes and setup commits read no Git configuration outside it. It removes
+everything it created on exit and refuses agent authority; run it from
+`ssh fw16`.
 
 Reference on fw16 (Ryzen 7 7840HS), `dev-runtime`, 250 worktrees, 3 active,
 300 s, `0ac78d249` (before) against `9b8523e9a` (after):
@@ -768,6 +843,53 @@ Reference on fw16 (Ryzen 7 7840HS), `dev-runtime`, 250 worktrees, 3 active,
 A fixture checkout holds 40 files. A real checkout costs more per read: on a
 347-worktree repository with 8 active worktrees, the scanner's Git processes
 took at least half a core before this change.
+
+### Watch planning
+
+A watch plan needs each worktree's Git directories and the paths its index
+tracks. It read the directories with two `git rev-parse` processes per
+worktree and the paths with `git ls-files`, and the window's fallback scan,
+which names every worktree, repeated all three each minute. The directories
+now come from the checkout's `.git` marker and `commondir`, as Git's own
+discovery reads them. On a local filesystem whose attributes show every
+write, such as ext4, btrfs, XFS or tmpfs, a census is kept while its index
+file keeps the inode, size and times it had when read: Git renames a new index
+over the old one, and an in-place writer is missed only if it keeps the same
+size within one timestamp tick. On any other filesystem the index is read
+again each time.
+
+The daemon's first load on fw16, `dev-runtime`, 3 active worktrees,
+`c82fe6d5c` (before) against `eb04813f3` (after), a build of this change
+before review made it find shared censuses lazily and keep none on a
+filesystem it does not know; neither changes what a local fixture runs. The
+host was shared with other work:
+
+| Worktrees | Daemon load Git commands, before | After | `git rev-parse`, before | After |
+| --- | --- | --- | --- | --- |
+| 250 | 1,263 | 761 | 502 | 0 |
+| 1,000 | 5,013 | 3,011 | 2,002 | 0 |
+| 3,000 | 15,020 | 9,018 | 6,002 | 0 |
+
+Those runs counted every fixture process's commands as the daemon's. The one
+other, which the counts above leave out, is the `git rev-parse` of the CLI's
+`cagents project open`, as a later run at 250 worktrees that attributes each
+command showed (761 for the daemon, that one for the CLI); before, the
+daemon's are exactly two per checkout. At 3,000 worktrees the daemon's first
+watch was registered about 49 s after the project opened rather than 57 s;
+those runs timed the first watch rather than the last, so both are
+approximate. The load used 3.7 s of daemon CPU rather than 6.2 s, and 25.2 s
+of Git CPU rather than 32.9 s. Polling over the 180 s after the load is
+unchanged: 1.58, 5.74 and 16.86 `git status` reads per second at 250, 1,000
+and 3,000 worktrees, because the watch budget leaves each project uncovered.
+The load still reads every status twice: once in the scan that builds the
+plan, and once after its watches are registered.
+
+The window gains most. With a 1,000-worktree project open in the native app
+on the same host, and counted from trace2 over 180 s once the load had
+settled, the window started 11,473 Git commands (63.7 per second) before and
+4,006 (22.3 per second) after: one `git status` and one `git config` per
+worktree per fallback scan. Its own CPU fell from 3.7% to 1.3% of a core, and
+its Git children's from 18.6% to 6.1%.
 
 ## Git watcher during builds
 
