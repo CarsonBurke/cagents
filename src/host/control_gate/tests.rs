@@ -121,7 +121,8 @@ fn an_expired_exclusive_request_refuses_and_lets_ordinary_requests_continue() {
     let (entered_sender, entered) = mpsc::channel();
     let ordinary = Arc::clone(&gate);
     thread::spawn(move || {
-        let _shared = ordinary.shared();
+        // Released before reporting, so the caller's later checks see it gone.
+        drop(ordinary.shared());
         let _ = entered_sender.send(());
     });
 
@@ -240,7 +241,8 @@ fn an_unqueued_exclusive_request_refuses_at_its_deadline() {
     assert!(gate.try_shared().is_some());
 }
 
-/// A writer that records how many writers are inside at once.
+/// A writer that records how many writers are inside at once. It reports
+/// only after releasing, so a caller that has every report sees a free gate.
 fn writer(
     gate: &Arc<ControlGate>,
     inside: &Arc<std::sync::atomic::AtomicUsize>,
@@ -256,13 +258,14 @@ fn writer(
         } else {
             gate.exclusive_when_free_until(deadline)
         };
-        let Some(_admission) = admission else {
+        let Some(admission) = admission else {
             let _ = sender.send(false);
             return;
         };
         let alone = inside.fetch_add(1, Ordering::SeqCst) == 0 && gate.counts().shared == 0;
         thread::sleep(Duration::from_millis(10));
         inside.fetch_sub(1, Ordering::SeqCst);
+        drop(admission);
         let _ = sender.send(alone);
     });
     receiver
