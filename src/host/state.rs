@@ -5450,7 +5450,14 @@ fn plan_redraw(
     let capture = worker.snapshot();
     let mut planned = Vec::new();
     for client_id in visible {
-        let Some(delivery) = state.clients.get(&client_id).cloned() else {
+        // A closed connection refuses every frame. Building one for it would
+        // only free it under the commit's hold.
+        let Some(delivery) = state
+            .clients
+            .get(&client_id)
+            .filter(|delivery| !delivery.is_closed())
+            .cloned()
+        else {
             continue;
         };
         let key = (client_id, terminal_id);
@@ -5557,7 +5564,8 @@ fn commit_redraw(
             == Some(&TerminalVisibility::Visible);
         let same_connection = clients
             .get(&planned.client_id)
-            .is_some_and(|current| Arc::ptr_eq(current, &planned.delivery));
+            .is_some_and(|current| Arc::ptr_eq(current, &planned.delivery))
+            && !planned.delivery.is_closed();
         let unchanged_base = match (subscriptions.sent.get(&key), &planned.recorded) {
             (Some(sent), Some(recorded)) => Arc::ptr_eq(&sent.snapshot, recorded),
             (None, None) => true,

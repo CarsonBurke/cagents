@@ -441,10 +441,13 @@ fn a_broadcast_racing_a_snapshot_reply_still_applies_and_releases_credit() {
             text(&grid(0, &fixture.lines))
         );
         fixture.acknowledgement_releases_credit(&replay);
-        // The broadcast's frame is a base the client now holds in order.
-        let next = fixture.change(2, "next");
-        let planned = fixture.plan(next);
-        assert!(planned[0].delta);
+        // The broadcast's frame is a base the client now holds in order, so
+        // the next frame is planned as a delta against it. (The replay closed
+        // the connection, so read the recorded base rather than plan.)
+        assert!(
+            fixture.shared.lock().unwrap().subscriptions.sent[&(1, fixture.id)].queued,
+            "the next frame would not be a delta"
+        );
     }
 }
 
@@ -690,6 +693,83 @@ fn a_full_command_queue_refuses_no_visibility_change() {
     fill_commands(&fixture.stream);
     state.detach(2, fixture.id).unwrap();
     assert_eq!(fixture.stream.drain_visibility(), Some(false), "detach");
+}
+
+/// A redraw pushes its frames under the host lock. When that overflows a slow
+/// client's queue, what the queue discards, frames included, must be freed by
+/// the client's writer, not inside the broadcast's hold.
+#[test]
+fn a_redraw_overflowing_a_slow_client_frees_nothing_under_the_host_lock() {
+    let mut fixture = Fixture::new();
+    let proof = fixture.shared.lock().unwrap().proof_handle();
+    while fixture.delivery.queued() < DEFAULT_CLIENT_QUEUE_CAPACITY {
+        fixture
+            .delivery
+            .push(Outbound::broadcast(
+                &proof,
+                ServerMessage::TerminalObserved {
+                    terminal_id: TerminalId::new(),
+                    epoch: 0,
+                },
+            ))
+            .unwrap();
+    }
+    let queued = Arc::strong_count(&proof);
+    let generation = fixture.change(0, "over");
+    broadcast_redraw(
+        &Arc::downgrade(&fixture.shared),
+        fixture.id,
+        generation,
+        &fixture.stream.handle,
+    );
+    // The refused frame and the QueueFull notice joined the discarded queue.
+    assert_eq!(Arc::strong_count(&proof), queued + 2);
+    let next = fixture.change(1, "gone");
+    assert!(
+        fixture.plan(next).is_empty(),
+        "a frame was built for a closed connection"
+    );
+    let notice = fixture.delivery.pop().unwrap();
+    assert!(matches!(
+        notice.message,
+        ServerMessage::Error(ref error) if error.code == ProtocolErrorCode::QueueFull
+    ));
+    drop(notice);
+    assert!(fixture.delivery.pop().is_none());
+    assert_eq!(
+        Arc::strong_count(&proof),
+        queued - DEFAULT_CLIENT_QUEUE_CAPACITY
+    );
+}
+
+/// A connection that closes between the holds refuses the frame. It is
+/// neither recorded as sent nor freed under the commit's hold.
+#[test]
+fn a_frame_for_a_connection_closed_after_planning_is_refused() {
+    let mut fixture = Fixture::new();
+    let generation = fixture.change(0, "late");
+    let planned = fixture.plan(generation);
+    assert_eq!(planned.len(), 1);
+    let recorded = |fixture: &Fixture| {
+        Arc::clone(
+            fixture
+                .shared
+                .lock()
+                .unwrap()
+                .subscriptions
+                .last_sent(1, fixture.id)
+                .unwrap(),
+        )
+    };
+    let sent = recorded(&fixture);
+    let before = fixture.acknowledged_source();
+    fixture.delivery.close_after_drain();
+    fixture.commit(planned);
+    assert!(
+        Arc::ptr_eq(&recorded(&fixture), &sent),
+        "a refused frame was recorded as sent"
+    );
+    assert_eq!(fixture.acknowledged_source(), before);
 }
 
 /// The same property with real threads: two broadcasts race for every
