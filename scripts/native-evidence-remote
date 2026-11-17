@@ -158,6 +158,7 @@ set +m
 end_with_connection "\$main"
 status=0
 wait "\$main" || status=\$?
+stop_watching
 exit "\$status"
 SCRIPT
 }
@@ -166,8 +167,10 @@ SCRIPT
 # sshd's session process exits but nothing tells what it started, which would
 # build or hold the native lock for nobody; a watcher sends that work's
 # process group TERM instead. A session that `start` detached on purpose
-# outlives it, which is why pair stops its own on TERM.
+# outlives it, which is why pair stops its own on TERM. The watcher ends with
+# the script, so what a connection started is gone once it closes.
 remote_lifetime=$(cat <<'LIFETIME'
+watcher=
 end_with_connection() {
     local main=$1 connection=$$
     while [ "$connection" -gt 1 ]; do
@@ -179,10 +182,25 @@ end_with_connection() {
     done
     [ "$connection" -gt 1 ] || return 0
     (
-        while kill -0 "$connection" 2>/dev/null && kill -0 "$main" 2>/dev/null; do sleep 2; done
+        # Told to stop, it ends its pause and waits for it, leaving nothing
+        # for whoever adopts the orphans here.
+        nap=
+        trap '[ -z "$nap" ] || kill "$nap" 2>/dev/null; wait; exit 0' TERM
+        while kill -0 "$connection" 2>/dev/null && kill -0 "$main" 2>/dev/null; do
+            sleep 2 &
+            nap=$!
+            wait "$nap" || :
+            nap=
+        done
         kill -0 "$main" 2>/dev/null || exit 0
         kill -TERM -- "-$main" 2>/dev/null || :
     ) </dev/null >/dev/null 2>&1 &
+    watcher=$!
+}
+stop_watching() {
+    [ -n "$watcher" ] || return 0
+    kill "$watcher" 2>/dev/null || :
+    wait "$watcher" 2>/dev/null || :
 }
 LIFETIME
 )
