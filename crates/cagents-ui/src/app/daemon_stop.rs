@@ -16,9 +16,19 @@ pub enum StopMessage {
     Key(keyboard::Event),
 }
 
-/// What the dialog says after a busy refusal; nothing was requested of the
-/// daemon's sessions, so the dialog stays as it was.
-const BUSY_DETAIL: &str = "The cagents daemon was busy finishing another operation, so nothing was stopped. Try again in a moment.";
+/// What a stop confirmation does, which the dialog keeps saying whenever
+/// Confirm is offered.
+const CONSEQUENCE: &str = "Confirming stops these hosted terminal/chat sessions and all their background subagents. Background work will not resume automatically. Cancel makes no shutdown request.";
+
+/// What the dialog says when a busy daemon refused to count again; the
+/// earlier result and its Refresh stay as they were.
+const REFRESH_REFUSED_BUSY: &str = "The cagents daemon was busy finishing another operation, so the count was not refreshed. Try again in a moment.";
+
+/// What the dialog says after a busy refusal: nothing was stopped, the count
+/// and its capability still stand, and Confirm still does what it did.
+fn busy_detail() -> String {
+    format!("{}\n\n{CONSEQUENCE}", crate::control::STOP_REFUSED_BUSY)
+}
 
 pub struct DaemonStop {
     core: Core,
@@ -37,7 +47,19 @@ impl Application for DaemonStop {
     type Message = StopMessage;
     const APP_ID: &'static str = "dev.cagents.Cagents.StopConfirmation";
     fn init(core: Core, (capability, failed): Self::Flags) -> (Self, Task<StopMessage>) {
-        (Self { core, capability, pending: false, settled: false, detail: "Confirming stops these hosted terminal/chat sessions and all their background subagents. Background work will not resume automatically. Cancel makes no shutdown request.".into(), report: None, failed }, iced::widget::operation::focus(widget::Id::new("daemon-stop.cancel")).map(cosmic::Action::App))
+        (
+            Self {
+                core,
+                capability,
+                pending: false,
+                settled: false,
+                detail: CONSEQUENCE.into(),
+                report: None,
+                failed,
+            },
+            iced::widget::operation::focus(widget::Id::new("daemon-stop.cancel"))
+                .map(cosmic::Action::App),
+        )
     }
     fn core(&self) -> &Core {
         &self.core
@@ -95,9 +117,11 @@ impl Application for DaemonStop {
                         // count and its capability still stand, so Confirm
                         // stays available. A capability that expires
                         // meanwhile is answered as Expired.
-                        self.detail = BUSY_DETAIL.into();
+                        // Focus stays on the safe choice, as when the
+                        // dialog opened; Confirm is one press away.
+                        self.detail = busy_detail();
                         return iced::widget::operation::focus(widget::Id::new(
-                            "daemon-stop.confirm",
+                            "daemon-stop.cancel",
                         ))
                         .map(cosmic::Action::App);
                     }
@@ -111,7 +135,7 @@ impl Application for DaemonStop {
                     }
                     Err(RequestError::Failed(error)) => {
                         self.failed.store(true, Ordering::Release);
-                        self.detail = format!("Could not stop the daemon: {error}");
+                        self.detail = format!("Could not stop the cagents daemon: {error}");
                         StopReport::Failed { error }
                     }
                 };
@@ -131,11 +155,11 @@ impl Application for DaemonStop {
                     }
                     // The refresh issued nothing, so the dialog stays as it
                     // was, Refresh included.
-                    Err(RequestError::Busy) => self.detail = BUSY_DETAIL.into(),
+                    Err(RequestError::Busy) => self.detail = REFRESH_REFUSED_BUSY.into(),
                     Err(RequestError::Failed(error)) => {
                         self.settled = true;
                         self.failed.store(true, Ordering::Release);
-                        self.detail = format!("Could not refresh the daemon: {error}");
+                        self.detail = format!("Could not refresh the cagents daemon: {error}");
                         self.report = Some(StopReport::Failed { error });
                     }
                 }
@@ -358,7 +382,7 @@ mod tests {
         assert!(!app.failed.load(Ordering::Acquire));
         assert_eq!(app.report, None, "closing now reports a cancellation");
         assert_eq!(app.capability, capability);
-        assert_eq!(app.detail, BUSY_DETAIL);
+        assert_eq!(app.detail, busy_detail());
         let _unpolled = app.update(StopMessage::Confirm);
         assert!(app.pending, "the same stop is asked again");
 
@@ -373,7 +397,7 @@ mod tests {
         assert!(!app.pending && app.settled);
         assert_eq!(app.report, report);
         assert_eq!(app.capability, capability);
-        assert_eq!(app.detail, BUSY_DETAIL);
+        assert_eq!(app.detail, REFRESH_REFUSED_BUSY);
         let _unpolled = app.update(StopMessage::Refresh);
         assert!(app.pending, "Refresh can be asked again");
     }

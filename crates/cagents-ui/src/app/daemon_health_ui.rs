@@ -410,7 +410,7 @@ fn health_detail_in(
             reply_wait(*timeout),
         ),
         daemon_health::State::Incompatible { actual, .. } => format!(
-            "This window requires cagents daemon protocol {}, but the cagents daemon's last reply used protocol {actual}. The window and the cagents daemon cannot communicate.",
+            "This window requires protocol {} of the cagents daemon, but its last reply used protocol {actual}, so the two cannot communicate.",
             crate::terminal_ipc::PROTOCOL_VERSION,
         ),
         daemon_health::State::Unreachable { since } => format!(

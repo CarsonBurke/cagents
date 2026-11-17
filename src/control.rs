@@ -4749,6 +4749,11 @@ pub fn shutdown_outcome_message(outcome: &ShutdownOutcome) -> String {
     }
 }
 
+/// What the tray and the stop confirmation say when the daemon refused a
+/// stop, or the count before it, because it was busy: nothing was stopped
+/// and the same stop may be asked again.
+pub const STOP_REFUSED_BUSY: &str = "The cagents daemon was busy finishing another operation, so nothing was stopped. Try again in a moment.";
+
 /// One plain line about a shutdown outcome, for the tray menu and the stop
 /// confirmation, which have room for a sentence rather than the CLI's full
 /// account of what was and was not requested.

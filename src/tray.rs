@@ -11,7 +11,9 @@ mod service {
     use tokio::sync::{mpsc, oneshot};
 
     use crate::{
-        control::{ControlClient, StopReport, shutdown_outcome_summary},
+        control::{
+            ControlClient, ControlError, STOP_REFUSED_BUSY, StopReport, shutdown_outcome_summary,
+        },
         instance,
         terminal_ipc::{ShutdownOutcome, daemon_socket_path},
     };
@@ -241,23 +243,27 @@ mod service {
     }
 
     fn stop_from_tray() -> ActionResult {
-        let failed = |error: String| format!("Could not stop the daemon: {error}");
+        let failed = |error: String| format!("Could not stop the cagents daemon: {error}");
+        // A busy daemon refused before doing anything; asking again is all
+        // that is needed.
+        let refused = |error: ControlError| {
+            if error.is_daemon_busy() {
+                STOP_REFUSED_BUSY.to_owned()
+            } else {
+                failed(error.to_string())
+            }
+        };
         let socket = daemon_socket_path().map_err(|error| failed(error.to_string()))?;
         let mut client =
             ControlClient::connect(&socket).map_err(|error| failed(error.to_string()))?;
-        match client
-            .shutdown_with_policy(true, None)
-            .map_err(|error| failed(error.to_string()))?
-        {
+        match client.shutdown_with_policy(true, None).map_err(refused)? {
             // Stopping would close terminals or interrupt agents, which only
             // the counted confirmation may do.
             ShutdownOutcome::EmptyRequired { .. }
             | ShutdownOutcome::ConfirmationRequired { .. } => {}
             outcome => return stop_result(&outcome),
         }
-        let preflight = client
-            .shutdown_preflight()
-            .map_err(|error| failed(error.to_string()))?;
+        let preflight = client.shutdown_preflight().map_err(refused)?;
         let capability = serde_json::to_string(&preflight.capability)
             .map_err(|error| failed(error.to_string()))?;
         let output = spawn_child(
@@ -278,7 +284,7 @@ mod service {
             let detail = child_outcome(false, stdout, stderr)
                 .err()
                 .unwrap_or_default();
-            return Err(format!("Could not stop the daemon: {detail}"));
+            return Err(format!("Could not stop the cagents daemon: {detail}"));
         }
         confirmation_result(&report)
     }
@@ -307,7 +313,7 @@ mod service {
             Some(StopReport::Cancelled) => Ok("Stop cancelled; nothing was closed".into()),
             Some(StopReport::Finished { outcome }) => stop_result(&outcome),
             Some(StopReport::Failed { error }) => {
-                Err(format!("Could not stop the daemon: {error}"))
+                Err(format!("Could not stop the cagents daemon: {error}"))
             }
             // A crashed or mismatched dialog must not read as a stop.
             None => Err("The stop confirmation closed without reporting a result".into()),
@@ -351,7 +357,7 @@ mod service {
             // With no report, the streams explain the failure.
             assert_eq!(
                 confirmation_outcome(false, b"", b"dialog crashed\n"),
-                Err("Could not stop the daemon: dialog crashed".into())
+                Err("Could not stop the cagents daemon: dialog crashed".into())
             );
             assert!(confirmation_outcome(true, b"", b"").is_err());
         }
