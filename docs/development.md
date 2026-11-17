@@ -1759,6 +1759,25 @@ for the rest of its two-minute interval, labeled `source: "rest-bootstrap"`.
 GitHub's REST answer has `mergeable: null` while it computes mergeability
 after a push, which the snapshot reports as `UNKNOWN`. No reported checks means unknown, not passing. Enterprise repositories also accept `--hostname HOST`.
 
+GitHub takes a few seconds after a push to show the new head. A read in that
+window, yours or another agent's, publishes the previous head, and every
+caller is then served that snapshot as fresh (`stale: false`) until its
+`retry_at`: two minutes after that read, not after the read before it. After
+pushing, name the head you pushed:
+
+```sh
+scripts/gh-pr-status 1234 -R CarsonBurke/cagents --json --expect-head "$(git rev-parse HEAD)"
+```
+
+While the snapshot shows another head, the report has `stale: true`,
+`expected_head` and a `data.limitations` entry naming both heads, and the
+command exits 5; read again after `retry_at`. If a read after `retry_at`
+still shows another head, the PR has moved past your push, for example
+through someone else's push; check that head rather than reading again. A
+failed refresh still exits 4.
+The check is local: it sends no request and leaves the shared cache as it is.
+`--expect-head` needs `--json` and a full commit SHA.
+
 While GraphQL is in a primary cooldown of its own and REST (`core`) is not,
 the CLI reads through REST instead of waiting for the GraphQL reset: `pulls/N`
 for head and merge state, then `check-runs`, `check-suites` and `status` for

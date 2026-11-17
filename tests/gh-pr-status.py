@@ -77,7 +77,8 @@ if (r/'response').exists():
 print('HTTP/2.0 200 OK\\nX-RateLimit-Remaining: 4999\\nX-RateLimit-Resource: core\\n')
 print(json.dumps(dict(number=int(sys.argv[-1].split('/')[-1]),title='Fixture PR',
     html_url='https://github.com/o/r/pull/7',state='open',merged=False,draft=False,
-    head=dict(ref='branch',sha='a'*40),base=dict(ref='main'),mergeable=True,
+    head=dict(ref='branch',sha=(r/'head').read_text() if (r/'head').exists() else 'a'*40),
+    base=dict(ref='main'),mergeable=True,
     mergeable_state='clean',updated_at='2026-11-10T00:00:00Z')))
 ''')
         self.install("scripts/cargo-gate", '''#!/usr/bin/python3
@@ -93,7 +94,7 @@ while (r/'hold-build').exists() and not (r/'release-build').exists():
 if (r/'fail-build').exists(): sys.exit(8)
 p=Path('target/custom/cagents').absolute()
 p.parent.mkdir(parents=True,exist_ok=True)
-p.write_text("#!/usr/bin/python3\\nimport os,sys\\nfrom pathlib import Path\\nif '--help' in sys.argv: sys.exit(0)\\nr=Path(os.environ['FIXTURE_ROOT'])\\nwith (r/'cli-calls').open('a') as f: f.write(Path(sys.argv[0]).parent.name+'\\\\n')\\nprint('cached-new-cli')\\nsys.exit(int(os.environ.get('FIXTURE_CLI_EXIT','0')))\\n")
+p.write_text("#!/usr/bin/python3\\nimport os,sys\\nfrom pathlib import Path\\nif '--help' in sys.argv: sys.exit(0)\\nr=Path(os.environ['FIXTURE_ROOT'])\\nwith (r/'cli-calls').open('a') as f: f.write(Path(sys.argv[0]).parent.name+'\\\\n')\\no=r/'cli-output'\\nprint(o.read_text() if o.exists() else 'cached-new-cli')\\nsys.exit(int(os.environ.get('FIXTURE_CLI_EXIT','0')))\\n")
 p.chmod(0o700)
 print(json.dumps(dict(reason='compiler-artifact',target=dict(name='cagents',kind=['bin']),executable=str(p))))
 ''')
@@ -114,8 +115,8 @@ print(json.dumps(dict(reason='compiler-artifact',target=dict(name='cagents',kind
     def git(self, *args):
         return subprocess.check_output(["git", "-C", str(self.repo), *args], stderr=subprocess.PIPE)
 
-    def invoke(self, number=7, env=None):
-        return subprocess.run([str(self.script), str(number), "-R", "o/r", "--json"],
+    def invoke(self, number=7, env=None, args=()):
+        return subprocess.run([str(self.script), str(number), "-R", "o/r", "--json", *args],
                               env=env or self.env, capture_output=True, text=True, timeout=HANG_GUARD)
 
     def lines(self, name):
@@ -368,6 +369,75 @@ print(json.dumps(dict(reason='compiler-artifact',target=dict(name='cagents',kind
         self.assertEqual(self.invoke().stdout.strip(), "cached-new-cli")
         self.assertEqual(len(self.lines("builds")), 2)
         self.assertEqual(len(self.lines("requests")), 1)
+
+    def test_a_read_racing_a_push_is_stale_for_the_pushed_head_without_another_request(self):
+        pushed = "b" * 40
+        self.root.joinpath("hold-build").touch()  # Keep this on the REST fallback.
+        self.assertEqual(self.invoke().returncode, 0)  # GitHub has not seen the push yet.
+        self.root.joinpath("head").write_text(pushed)
+        result = self.invoke(args=("--expect-head", pushed.upper()))
+        self.assertEqual(result.returncode, status.HEAD_NOT_SHOWN, result.stderr)
+        data = json.loads(result.stdout)["data"]
+        self.assertEqual(data["snapshot"]["pull_request"]["headRefOid"], "a" * 40)
+        self.assertTrue(data["stale"])
+        self.assertEqual(data["expected_head"], pushed)
+        self.assertIsNotNone(data["retry_at"])
+        self.assertIn(f"shows head {'a' * 40}, not {pushed}", data["limitations"][-1])
+        self.assertEqual(len(self.lines("requests")), 1, "naming a head must not refresh the cache")
+        # The same snapshot still answers a caller that expects the head it shows.
+        result = self.invoke(args=("--expect-head", "a" * 40))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["data"]["expected_head"], "a" * 40)
+        self.finish_builder()
+
+    def test_the_cached_cli_report_is_checked_against_the_pushed_head(self):
+        self.invoke()
+        self.finish_builder()
+        report = {"ok": True, "command": "gh.pr_status", "data": {
+            "stale": False, "error": None, "retry_at": int(time.time()) + 60, "limitations": [],
+            "snapshot": {"pull_request": {"headRefOid": "a" * 40}, "checks_state": "SUCCESS"}}}
+        self.root.joinpath("cli-output").write_text(json.dumps(report))
+        result = self.invoke(args=("--expect-head", "b" * 40))
+        self.assertEqual(result.returncode, status.HEAD_NOT_SHOWN, result.stderr)
+        data = json.loads(result.stdout)["data"]
+        self.assertTrue(data["stale"])
+        self.assertIn("Read again after retry_at", data["limitations"][0])
+        result = self.invoke(args=("--expect-head", "a" * 40))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(json.loads(result.stdout)["data"]["stale"])
+        # A failed refresh keeps the CLI's own exit status.
+        result = self.invoke(env=dict(self.env, FIXTURE_CLI_EXIT="4"), args=("--expect-head", "b" * 40))
+        self.assertEqual(result.returncode, 4, result.stderr)
+        self.assertTrue(json.loads(result.stdout)["data"]["stale"])
+        # A CLI that prints no report confirms nothing, and keeps its binary.
+        self.root.joinpath("cli-output").write_text("not a report")
+        result = self.invoke(args=("--expect-head", "a" * 40))
+        self.assertEqual(result.returncode, 4, result.stderr)
+        self.assertIn("head is unchecked", result.stderr)
+        common, _, key = status.build_context(self.repo, "origin/main")
+        self.assertTrue((common / "gh-pr-status" / key / "cagents").exists())
+        self.assertEqual(len(self.lines("requests")), 1, "only the cold start used REST")
+
+    def test_a_failed_refresh_keeps_its_status_when_the_head_also_differs(self):
+        key = status.target("o/r", "github.com", 7)
+        saved = {"fetched_at": int(time.time()) - 300, "error": "GitHub REST request failed",
+                 "next_attempt": int(time.time()) + 60,
+                 "snapshot": {"pull_request": {"headRefOid": "a" * 40}, "checks_state": None,
+                              "checks": [], "checks_complete": False, "primary_cost": None}}
+        with patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.assertEqual(status.output(saved, key, True, "b" * 40), 4)
+        data = json.loads(out.getvalue())["data"]
+        self.assertTrue(data["stale"])
+        self.assertEqual(data["expected_head"], "b" * 40)
+
+    def test_an_expected_head_needs_json_and_a_full_sha(self):
+        for args in (["--expect-head", "a" * 40], ["--json", "--expect-head", "abc123"]):
+            with self.subTest(args=args):
+                result = subprocess.run([str(self.script), "7", "-R", "o/r", *args], env=self.env,
+                                        capture_output=True, text=True, timeout=HANG_GUARD)
+                self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertFalse(self.lines("requests"))
+        self.assertFalse(self.lines("builds"))
 
     def test_invalid_target_is_rejected_before_any_build_or_request(self):
         for repository, hostname, number in [("o/.git", "github.com", 7),
