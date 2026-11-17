@@ -1180,6 +1180,26 @@ enum Projection {
     Full,
 }
 
+impl Projection {
+    /// The variant's name, which the UI thread trace reports.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Unchanged => "Unchanged",
+            Self::Chrome => "Chrome",
+            Self::ScopedChrome(_) => "ScopedChrome",
+            Self::Full => "Full",
+        }
+    }
+}
+
+/// Evaluates a stage of an update's projection, timed in the UI thread trace.
+macro_rules! projection_stage {
+    ($stage:literal, $work:expr) => {{
+        let _stage = crate::performance::ui_trace::projection_stage($stage);
+        $work
+    }};
+}
+
 /// Runtime-reported terminal titles can animate several times a second
 /// (spinners, step counters). The durable card follows each one at once, so
 /// chrome stays current, but saving it, and publishing it to shared views,
@@ -19081,11 +19101,18 @@ impl Application for Cagents {
         if scoped_source.is_some_and(|source| source.as_ptr() != Arc::as_ptr(&self.durable)) {
             projection = Projection::Full;
         }
+        let _projection_trace = crate::performance::ui_trace::projection(
+            if camera_only && projection == Projection::Full {
+                "Camera"
+            } else {
+                projection.name()
+            },
+        );
         if model_update && matches!(projection, Projection::Full | Projection::Chrome) {
-            self.materialize_replica_snapshot();
+            projection_stage!("replica_snapshot", self.materialize_replica_snapshot());
         }
         if projection == Projection::Full {
-            self.sync_worktree_protections();
+            projection_stage!("worktree_protections", self.sync_worktree_protections());
         }
         self.sync_popup_keyboard_nav();
         // The transport wording the health banner replaces may sit in either
@@ -19120,12 +19147,14 @@ impl Application for Cagents {
                 if model_update {
                     self.shared_views.chrome_tail_count += 1;
                 }
-                self.refresh_attention_card_rows();
+                projection_stage!("attention_card_rows", self.refresh_attention_card_rows());
                 let notices = self.reconcile_notice_popup();
                 let mut phase = WorkspaceProjectionTiming::new(_workspace_timing.is_some());
                 let chrome = match &projection {
-                    Projection::ScopedChrome(cards) => self.sync_scoped_chrome(cards),
-                    _ => self.sync_chrome(),
+                    Projection::ScopedChrome(cards) => {
+                        projection_stage!("scoped_chrome", self.sync_scoped_chrome(cards))
+                    }
+                    _ => projection_stage!("chrome", self.sync_chrome()),
                 };
                 phase.mark("selected_chrome");
                 let snapshot = if matches!(projection, Projection::ScopedChrome(_)) {
@@ -19152,21 +19181,21 @@ impl Application for Cagents {
         if model_update {
             self.shared_views.structural_tail_count += 1;
         }
-        let notices = self.reconcile_notice_popup();
-        self.synchronize_sidebar_selection();
-        self.refresh_sidebar_channels();
-        self.sidebar_state
-            .prune_retained_attention(&self.sidebar_model);
+        let notices = projection_stage!("notice_popup", self.reconcile_notice_popup());
+        projection_stage!("sidebar_selection", self.synchronize_sidebar_selection());
+        projection_stage!("sidebar_channels", self.refresh_sidebar_channels());
+        projection_stage!("retained_attention", self.sidebar_state
+            .prune_retained_attention(&self.sidebar_model));
         if reconcile_row_selection {
-            self.prune_sidebar_row_selection();
+            projection_stage!("row_selection", self.prune_sidebar_row_selection());
         }
-        self.refresh_sidebar_worktree_panes();
+        projection_stage!("worktree_panes", self.refresh_sidebar_worktree_panes());
         // Ahead of the rebind, which pins what the inspector drawing source
         // control chose: a pane that has just arrived, closed or taken focus
         // must not show the last binding for a frame.
-        self.sync_pane_inspectors();
-        self.sync_pull_request_inspector();
-        let binding = self.rebind_source_control();
+        projection_stage!("pane_inspectors", self.sync_pane_inspectors());
+        projection_stage!("pull_request_inspector", self.sync_pull_request_inspector());
+        let binding = projection_stage!("source_control", self.rebind_source_control());
         if let Some(source) = self.sidebar_model.source_control.as_ref() {
             let selected = self
                 .workspace
@@ -19182,11 +19211,13 @@ impl Application for Cagents {
             self.sidebar_state.select_file(&source.key, selected);
         }
         // `view` cannot rebuild the chrome cache itself, so refresh it here.
-        let chrome = self.sync_chrome();
+        let chrome = projection_stage!("chrome", self.sync_chrome());
         let deferred = self.release_deferred_navigation_if_unblocked();
-        let terminal_probes = self.terminal_transcript_probes();
+        let terminal_probes =
+            projection_stage!("transcript_probes", self.terminal_transcript_probes());
         // Another project shown, or a review or the workspace switcher closed.
-        let approval = self.read_owed_automation_requests();
+        let approval =
+            projection_stage!("automation_requests", self.read_owed_automation_requests());
         Task::batch([
             task,
             binding,
@@ -19197,20 +19228,22 @@ impl Application for Cagents {
             approval,
         ])
             })();
-        self.reconcile_chat_failure_presentations();
+        let _postlude_trace = crate::performance::ui_trace::projection("Postlude");
+        projection_stage!("chat_failures", self.reconcile_chat_failure_presentations());
         if attention_scope_changed {
             self.notification_ui.scope_changed();
         }
-        self.sync_pull_request_labels();
+        projection_stage!("pull_request_labels", self.sync_pull_request_labels());
         let activation = self.retry_notification_activation();
-        let visibility = self.sync_visible_attention();
-        self.sync_notification_presence();
+        let visibility = projection_stage!("visible_attention", self.sync_visible_attention());
+        projection_stage!("notification_presence", self.sync_notification_presence());
         let keyboard = self.settle_owed_keyboard();
         let preview = self.settle_workspace_switcher_preview();
         // Showing a cold chat can classify a current rejection synchronously,
         // including disconnected metadata with no future client wake. Only
         // mounted visible chats are inspected by this bounded handoff.
-        let limit_usage = self.refresh_chat_limit_accounts();
+        let limit_usage =
+            projection_stage!("chat_limit_accounts", self.refresh_chat_limit_accounts());
         Task::batch([task, activation, visibility, keyboard, preview, limit_usage])
     }
 
