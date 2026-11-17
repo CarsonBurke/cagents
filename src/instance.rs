@@ -429,10 +429,7 @@ impl WindowLease {
             ));
         }
         mark_lease_capable_process()?;
-        let legacy = owned_lock(
-            &runtime.join(APPLICATION_LOCK_FILE),
-            libc::LOCK_SH | libc::LOCK_NB,
-        )?;
+        let legacy = share_application_lock(runtime)?;
         if !IS_DEVELOPMENT && legacy_ui_process_running(Path::new("/proc"))? {
             return Err(io::Error::other(ApplicationLeaseError::AlreadyRunning));
         }
@@ -1120,10 +1117,7 @@ pub(crate) fn verified_windows_for_daemon(
     executable: &Path,
 ) -> io::Result<(Vec<VerifiedWindow>, OwnedLock)> {
     let runtime = runtime_directory()?;
-    let legacy = owned_lock(
-        &runtime.join(APPLICATION_LOCK_FILE),
-        libc::LOCK_SH | libc::LOCK_NB,
-    )?;
+    let legacy = share_application_lock(&runtime)?;
     let windows = verified_window_lease_owners_in(&runtime, Path::new("/proc"))?;
     if crate::daemon::running_executable()
         .map_err(io::Error::other)?
@@ -1137,18 +1131,81 @@ pub(crate) fn verified_windows_for_daemon(
     Ok((windows, legacy))
 }
 
+/// How long a check for running windows waits for a holder of the
+/// application lock that has no window lease yet to become a window, or to
+/// let go. A window that another launch is starting holds it for the few
+/// milliseconds before it takes its slot.
+const UNLEASED_OWNER_PATIENCE: Duration = Duration::from_secs(2);
+const UNLEASED_OWNER_POLL: Duration = Duration::from_millis(25);
+/// How long a modern holder waits out a peer's exclusive probe of the
+/// application lock, which lasts no longer than one flock call.
+const PEER_PROBE_ALLOWANCE: Duration = Duration::from_millis(250);
+const PEER_PROBE_POLL: Duration = Duration::from_millis(5);
+
 fn verified_windows_in(runtime: &Path, proc_root: &Path) -> io::Result<Vec<VerifiedWindow>> {
-    let owners = verified_window_lease_owners_in(runtime, proc_root)?;
-    // A legacy exclusive owner cannot be interpreted as absence. Stage-only
-    // callers use their authenticated inherited guard instead of this probe.
-    if owners.is_empty() {
-        owned_lock(
-            &runtime.join(APPLICATION_LOCK_FILE),
-            libc::LOCK_EX | libc::LOCK_NB,
-        )
-        .map_err(|error| io::Error::new(error.kind(), "cannot authenticate legacy UI ownership"))?;
+    verified_windows_within(runtime, proc_root, UNLEASED_OWNER_PATIENCE)
+}
+
+/// Only an exclusive probe proves that no process holds the application lock
+/// without a window lease, but contention alone is not a legacy UI. Modern
+/// code shares that lock: a window from before it takes its slot until it
+/// closes, an older coordinator until its reopened window handshakes, and a
+/// launcher checking a candidate daemon's windows. So contention waits, up to
+/// `patience`, for its holder either to take a slot, which is then
+/// authenticated like any window, or to let go (#2979).
+fn verified_windows_within(
+    runtime: &Path,
+    proc_root: &Path,
+    patience: Duration,
+) -> io::Result<Vec<VerifiedWindow>> {
+    let path = runtime.join(APPLICATION_LOCK_FILE);
+    let deadline = std::time::Instant::now() + patience;
+    loop {
+        let owners = verified_window_lease_owners_in(runtime, proc_root)?;
+        if !owners.is_empty() {
+            return Ok(owners);
+        }
+        // A legacy exclusive owner cannot be interpreted as absence. Stage-only
+        // callers use their authenticated inherited guard instead of this probe.
+        match owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB) {
+            Ok(_probe) => return Ok(owners),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error),
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            // Only a legacy UI holds the lock exclusively for longer than a
+            // probe; anything else that outlasts the wait is still opening.
+            let message = match owned_lock(&path, libc::LOCK_SH | libc::LOCK_NB) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    "an older cagents window is running; close it and try again"
+                }
+                Err(error) => return Err(error),
+                Ok(_probe) => "another cagents window is still opening; try again in a moment",
+            };
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, message));
+        }
+        std::thread::sleep(UNLEASED_OWNER_POLL.min(remaining));
     }
-    Ok(owners)
+}
+
+/// Share the application lock, as every modern holder does. A peer's probe
+/// for legacy owners holds it exclusively for a moment; wait that out rather
+/// than fail, while a legacy UI's lifelong exclusive lease still refuses.
+fn share_application_lock(runtime: &Path) -> io::Result<OwnedLock> {
+    let path = runtime.join(APPLICATION_LOCK_FILE);
+    let deadline = std::time::Instant::now() + PEER_PROBE_ALLOWANCE;
+    loop {
+        match owned_lock(&path, libc::LOCK_SH | libc::LOCK_NB) {
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(PEER_PROBE_POLL);
+            }
+            result => return result,
+        }
+    }
 }
 
 fn verified_window_lease_owners_in(
@@ -3787,8 +3844,10 @@ mod tests {
             restore_policy: WindowRestorePolicy::Ordinary,
         };
         // A daemon-only update has no windows; the generic probe cannot tell
-        // the guard's own shared fence from a legacy UI.
-        assert!(verified_windows_in(runtime.path(), Path::new("/proc")).is_err());
+        // the guard's own shared fence from a window that is still opening.
+        assert!(
+            verified_windows_within(runtime.path(), Path::new("/proc"), Duration::ZERO).is_err()
+        );
         assert!(guard.verified_windows().unwrap().is_empty());
     }
 
@@ -3877,15 +3936,101 @@ mod tests {
     }
 
     #[test]
+    fn a_check_for_windows_waits_for_a_window_another_launch_is_starting() {
+        let runtime = tempfile::tempdir().unwrap();
+        let path = runtime.path().to_path_buf();
+        // A starting window shares the application lock before it takes its
+        // slot, so for a moment it has no lease owner to verify (#2979).
+        let (shared, lock_shared) = std::sync::mpsc::channel();
+        let starting = std::thread::spawn(move || {
+            let (lease, slot) = WindowLease::acquire_in(&path, true, Some("second")).unwrap();
+            drop(lease._slot);
+            shared.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            let mut slot_lock = owned_lock(
+                &path.join(slot_lock_name(&slot)),
+                libc::LOCK_EX | libc::LOCK_NB,
+            )
+            .unwrap();
+            daemon_admission::publish_capability(slot_lock.file_mut()).unwrap();
+            (lease._legacy_fence, slot_lock)
+        });
+        lock_shared.recv().unwrap();
+        // The check joins that window once it holds its slot.
+        let owners =
+            verified_windows_within(runtime.path(), Path::new("/proc"), Duration::from_secs(10))
+                .unwrap();
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0].pid(), std::process::id());
+        let (legacy_fence, slot) = starting.join().unwrap();
+        drop(owners);
+        drop(slot);
+
+        // A holder that lets go without opening a window leaves no owner.
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(legacy_fence);
+        });
+        assert!(
+            verified_windows_within(runtime.path(), Path::new("/proc"), Duration::from_secs(10))
+                .unwrap()
+                .is_empty()
+        );
+        release.join().unwrap();
+    }
+
+    #[test]
+    fn a_starting_window_waits_out_a_peer_probe_for_legacy_owners() {
+        let runtime = tempfile::tempdir().unwrap();
+        // A peer launcher's probe holds the application lock exclusively for
+        // as long as one flock call; a window starting meanwhile still opens.
+        let probe = owned_lock(
+            &runtime.path().join(APPLICATION_LOCK_FILE),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+        .unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            drop(probe);
+        });
+        let (lease, slot) = WindowLease::acquire_in(runtime.path(), false, None).unwrap();
+        assert_eq!(slot, PRIMARY_WINDOW);
+        release.join().unwrap();
+        drop(lease);
+        // A legacy UI's exclusive lease outlasts that allowance.
+        let legacy = ApplicationLease::acquire_in(runtime.path()).unwrap();
+        assert!(WindowLease::acquire_in(runtime.path(), false, None).is_err());
+        drop(legacy);
+    }
+
+    #[test]
     fn recovery_rejects_unknown_legacy_ownership_and_pending_handoff() {
         let runtime = tempfile::tempdir().unwrap();
-        let legacy = owned_lock(
+        let refusal = || {
+            let Err(refused) =
+                verified_windows_within(runtime.path(), Path::new("/proc"), Duration::ZERO)
+            else {
+                panic!("unleased application ownership was read as absence");
+            };
+            assert_eq!(refused.kind(), io::ErrorKind::WouldBlock);
+            refused.to_string()
+        };
+        let legacy = ApplicationLease::acquire_in(runtime.path()).unwrap();
+        assert_eq!(
+            refusal(),
+            "an older cagents window is running; close it and try again"
+        );
+        drop(legacy);
+        let unleased = owned_lock(
             &runtime.path().join(APPLICATION_LOCK_FILE),
             libc::LOCK_SH | libc::LOCK_NB,
         )
         .unwrap();
-        assert!(verified_windows_in(runtime.path(), Path::new("/proc")).is_err());
-        drop(legacy);
+        assert_eq!(
+            refusal(),
+            "another cagents window is still opening; try again in a moment"
+        );
+        drop(unleased);
         let update = runtime
             .path()
             .join(format!("{APPLICATION_LOCK_FILE}.update"));
