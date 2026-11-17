@@ -83,7 +83,9 @@ local_packages() {
 # Whether $1 is a profile Cargo has compiled in, in either layout.
 compiled() {
     [ -d "$1/.fingerprint" ] && return 0
-    for unit in "$1"/build/*/*/fingerprint; do
+    # A unit is named by a 16-digit hash, as forget_local requires too.
+    x='[0-9a-f]'
+    for unit in "$1"/build/*/$x$x$x$x$x$x$x$x$x$x$x$x$x$x$x$x/fingerprint; do
         [ -d "$unit" ] && return 0
     done
     return 1
