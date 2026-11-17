@@ -5,13 +5,12 @@
 //! Held exclusively, as a long operation such as an update is, even a new
 //! connection's handshake waits.
 //!
-//! It acts only in a debug build whose `HOME` lies inside a native-evidence
-//! task (an ancestor holds the task's `.native-evidence` marker) and holds the
+//! It is compiled only into debug builds, and acts only when `HOME` lies
+//! inside a native-evidence task (an ancestor holds the task's `.native-evidence` marker) and holds the
 //! [`MARKER`] file. A preflight that arrives while the marker exists holds
 //! ordinary admission, or exclusive admission when the marker reads
 //! `exclusive`, until the marker is removed, at most [`LIMIT`], then proceeds
-//! as usual. A release build, any other home, or a home without the
-//! marker is unaffected.
+//! as usual. Any other home, or a home without the marker, is unaffected.
 use super::control_gate::ControlGate;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -23,12 +22,15 @@ pub(super) const MARKER: &str = ".cagents-fixture-hold-preflight";
 const LIMIT: Duration = Duration::from_secs(120);
 const POLL: Duration = Duration::from_millis(100);
 
-/// Holds ordinary admission at `gate` while the fixture asks for it.
+/// Holds admission at `gate` while the fixture in this daemon's `HOME` asks.
 pub(super) fn hold_preflight(gate: &ControlGate) {
-    if !cfg!(debug_assertions) {
-        return;
+    if let Some(home) = std::env::var_os("HOME") {
+        hold_preflight_in(gate, Path::new(&home));
     }
-    let Some(marker) = std::env::var_os("HOME").and_then(|home| marker(Path::new(&home))) else {
+}
+
+fn hold_preflight_in(gate: &ControlGate, home: &Path) {
+    let Some(marker) = marker(home) else {
         return;
     };
     tracing::warn!(path = %marker.display(), "native-evidence fixture is holding a shutdown preflight in the control gate");
@@ -117,6 +119,31 @@ mod tests {
             gate.try_shared().is_some(),
             "removing the marker frees the gate"
         );
+    }
+
+    #[test]
+    fn a_preflight_holds_only_in_a_task_home_that_asks() {
+        let task = tempfile::tempdir().unwrap();
+        let home = task.path().join("fixture/home");
+        std::fs::create_dir_all(&home).unwrap();
+        let gate = ControlGate::default();
+        // Outside a native-evidence task, the marker is ignored and the
+        // preflight passes straight through.
+        std::fs::write(home.join(MARKER), "exclusive").unwrap();
+        hold_preflight_in(&gate, &home);
+        assert!(gate.try_shared().is_some());
+        std::fs::write(task.path().join(".native-evidence"), "").unwrap();
+        std::thread::scope(|scope| {
+            let held = scope.spawn(|| hold_preflight_in(&gate, &home));
+            while gate.try_shared().is_some() {
+                std::thread::yield_now();
+            }
+            std::fs::remove_file(home.join(MARKER)).unwrap();
+            held.join().unwrap();
+        });
+        assert!(gate.try_shared().is_some(), "released with the marker");
+        // With the marker gone, it passes straight through again.
+        hold_preflight_in(&gate, &home);
     }
 
     #[test]
