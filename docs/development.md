@@ -224,6 +224,18 @@ browserless UI lanes' tests (`scripts/cargo-gate test ... --all-targets`,
 about to run them, skip that check. The integrated UI has no test lane; keep
 its check.
 
+A test lane narrowed with arguments, such as `mise run test:ui -- --lib`,
+builds the lane's code only under `cfg(test)`, where an item only tests use
+looks used. So once its tests pass, the task also checks the lane's library,
+binaries and examples (`--lib --bins --examples`), as main's build check does
+with every target, and fails on what that finds. A method only tests called
+reached main that way (#2920), its author having run a narrowed test lane. On
+fw16 that check took about 20 s of compiling after a narrowed UI test build of
+about 3 minutes, and up to 95 s where the slot had no earlier check to reuse,
+besides its own wait in the queue. `scripts/cargo-gate check --features ui`
+without `--package cagents-ui` checks only the shared library, not the
+application; `mise run check:ui` checks both.
+
 Changes to ceditor or shared UI, editor, or notification public contracts also
 require the standalone editor check above. The workspace's
 `default-members = ["."]` selects only cagents: a command without `-p` builds

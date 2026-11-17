@@ -114,21 +114,30 @@ run = [
 # Tests ----------------------------------------------------------------------
 # The gate builds each lane's tests in a slot and runs them afterwards under a
 # memory limit. HOST tests get their matched daemon helper automatically.
+# A lane narrowed to some of its tests builds its code only under cfg(test),
+# where an item only tests use looks used. Once those tests pass, it checks the
+# lane's other targets as main's build check does, so that warning shows here.
 
 [tasks."test:cli"]
 description = "Test the control CLI lane"
 usage = "{{vars.all_targets}}"
-run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-lane test {{vars.cli}} "$@"'
+run = '''eval "set -- $usage_cargo_args"
+scripts/cargo-lane test {{vars.cli}} "$@" || exit
+case " $* " in *" --all-targets "*) ;; *) exec scripts/cargo-lane check {{vars.cli}} --lib --bins --examples ;; esac'''
 
 [tasks."test:host"]
 description = "Test the terminal daemon lane"
 usage = "{{vars.all_targets}}"
-run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-lane test {{vars.host}} "$@"'
+run = '''eval "set -- $usage_cargo_args"
+scripts/cargo-lane test {{vars.host}} "$@" || exit
+case " $* " in *" --all-targets "*) ;; *) exec scripts/cargo-lane check {{vars.host}} --lib --bins --examples ;; esac'''
 
 [tasks."test:ui"]
 description = "Test the browserless UI lane"
 usage = "{{vars.all_targets}}"
-run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-lane test {{vars.ui}} "$@"'
+run = '''eval "set -- $usage_cargo_args"
+scripts/cargo-lane test {{vars.ui}} "$@" || exit
+case " $* " in *" --all-targets "*) ;; *) exec scripts/cargo-lane check {{vars.ui}} --lib --bins --examples ;; esac'''
 
 [tasks.test]
 description = "Test every target of the CLI, host and UI lanes, one lane after another"
