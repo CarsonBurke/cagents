@@ -558,7 +558,7 @@ fn history_delete_failure_rolls_back_but_startup_and_tick_keep_both_outboxes_liv
 
         if startup {
             let gate = host.lock().unwrap().control_gate.clone();
-            let exclusive = gate.write().unwrap();
+            let exclusive = gate.exclusive();
             let broker =
                 Broker::start(&host, root).expect("optional prune failure cannot prevent startup");
             drop(broker); // Normal scheduler stop/join, even while control is held.

@@ -5,7 +5,7 @@ use crate::{model::TerminalId, terminal::TerminalRetirement};
 use std::{
     collections::BTreeSet,
     fs::File,
-    sync::{Arc, Mutex, RwLock, RwLockWriteGuard, TryLockError},
+    sync::{Arc, Mutex, TryLockError},
     time::{Duration, Instant},
 };
 
@@ -75,7 +75,11 @@ impl Lifecycle {
         let idle = if candidate {
             // Empty ownership is checked under the existing admission writer;
             // no new launch may slip between that check and shutdown's latch.
-            let _admission = gate.write().unwrap_or_else(|p| p.into_inner());
+            // Waiting for it would stop the accept loop, so look again soon
+            // and keep the idle deadline.
+            let Some(_admission) = gate.try_exclusive() else {
+                return earliest(retention, Some(now + RETENTION_RETRY));
+            };
             let quiescent = registry.is_some_and(|registry| {
                 let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
                 matches!(registry.cleanup_execution_is_quiescent(), Ok(true))
@@ -158,7 +162,7 @@ impl Lifecycle {
         if ready.is_empty() {
             return;
         }
-        let Some(admission) = try_admission(&gate) else {
+        let Some(admission) = gate.try_exclusive() else {
             self.settlement_retry = Some(Instant::now() + RETENTION_RETRY);
             return;
         };
@@ -254,9 +258,9 @@ impl Lifecycle {
                 .collect::<BTreeSet<TerminalId>>()
         };
         // Any wake reaches here while a saved pane's expired terminal exists.
-        // A writer queued at the gate holds back every new reader, including
-        // terminal input, until the slowest shared request ends. So settle
-        // pinned candidates without it, and never queue for the rest.
+        // A writer waiting at the gate holds back every new ordinary request
+        // until the slowest shared request ends. So settle pinned candidates
+        // without it, and never wait for it for the rest.
         let unfenced = expired();
         if let Census::Pinned(pinned) = pin_census(registry.as_ref(), &unfenced)
             && unfenced.is_subset(&pinned)
@@ -267,7 +271,7 @@ impl Lifecycle {
                 .unwrap_or_else(|p| p.into_inner())
                 .terminal_retention_deadline(self.retention, &pinned);
         }
-        let Some(admission) = try_admission(&gate) else {
+        let Some(admission) = gate.try_exclusive() else {
             return Some(Instant::now() + RETENTION_RETRY);
         };
         let pinned = match pin_census(registry.as_ref(), &expired()) {
@@ -340,14 +344,6 @@ fn pin_census(
     match registry.pinned_terminals(candidates) {
         Ok(pinned) => Census::Pinned(pinned),
         Err(error) => Census::Failed(error),
-    }
-}
-
-fn try_admission(gate: &RwLock<()>) -> Option<RwLockWriteGuard<'_, ()>> {
-    match gate.try_write() {
-        Ok(admission) => Some(admission),
-        Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
-        Err(TryLockError::WouldBlock) => None,
     }
 }
 
@@ -1037,7 +1033,7 @@ mod tests {
             .unwrap()
             .pin_window_terminals(&[source.id])
             .unwrap();
-        let slow_request = gate.read().unwrap();
+        let slow_request = gate.shared();
         let lifecycle = Lifecycle::testing(Duration::ZERO);
 
         // A saved pane's expired terminal needs no writer at all.
@@ -1068,7 +1064,10 @@ mod tests {
         let (mut lifecycle, deadline) = maintain_unblocked(lifecycle, &host);
         assert!(deadline.is_some_and(|deadline| deadline > Instant::now()));
         assert!(host.lock().unwrap().terminal_retirements.is_empty());
-        assert!(gate.try_write().is_ok(), "no writer outlives maintenance");
+        assert!(
+            gate.try_exclusive().is_some(),
+            "no writer outlives maintenance"
+        );
         drop(slow_commit);
 
         lifecycle.maintain(&host, true);
@@ -1085,7 +1084,10 @@ mod tests {
         let (mut lifecycle, deadline) = maintain_unblocked(lifecycle, &host);
         assert!(deadline.is_some_and(|deadline| deadline > Instant::now()));
         assert_eq!(host.lock().unwrap().list(1).len(), 1);
-        assert!(gate.try_write().is_ok(), "no writer outlives settlement");
+        assert!(
+            gate.try_exclusive().is_some(),
+            "no writer outlives settlement"
+        );
         drop(slow_commit);
 
         wait_until(|| {

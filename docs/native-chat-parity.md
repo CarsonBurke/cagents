@@ -37,7 +37,8 @@ lifecycle state, Codex's `thread/queue/delete` result), since an entry leaving
 the queue is also what delivery looks like. Codex's in-place
 `thread/queue/update` is therefore not used.
 Background child work does not keep the parent composer busy after its result.
-Older versions retain local follow-up delivery after the current turn: each
+Older versions, pre-releases of 2.1.286 and versions that do not parse as
+semver retain local follow-up delivery after the current turn: each
 follow-up is its own queue entry, and they are sent together as one prompt.
 
 Codex retains additional typed APIs without corresponding native UI controls:

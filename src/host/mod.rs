@@ -7,6 +7,7 @@ mod agent_execution;
 mod automations;
 mod chat;
 mod client;
+mod control_gate;
 mod delivery;
 pub(crate) mod descriptor_limit;
 #[cfg(all(test, target_os = "linux"))]
@@ -256,49 +257,93 @@ pub unsafe fn prepare_daemon_admission() -> Result<DaemonAdmission, HostError> {
 /// daemon start lets a long-running daemon hold it for days.
 const RUNTIME_COLLECT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
+/// How often the daemon stops session scopes that are empty but still loaded.
+const SCOPE_COLLECT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// An empty session scope stays loaded in the user manager until it exits.
+/// Enrollment withdraws its own, but a manager too slow to answer can outlast
+/// that, and earlier versions left them too. Collecting them waits on the
+/// manager, so it runs beside the daemon, for as long as the process lives.
+fn start_scope_collection() -> io::Result<()> {
+    service::periodic("cagents-scope-collect", SCOPE_COLLECT_INTERVAL, || {
+        match crate::daemon::process_scope::collect_empty_scopes() {
+            Ok(0) => {}
+            Ok(stopped) => tracing::info!(stopped, "stopped empty session scopes"),
+            Err(error) => tracing::warn!(%error, "empty session scopes were not collected"),
+        }
+        service::Next::Continue
+    })
+    .map(drop)
+}
+
 /// Reclaims transcript caches whose owners have ended and the transcripts that
 /// retired actors' final receipts no longer need: now, then every interval,
 /// until the daemon is gone. The startup sweep has already run.
-fn collect_runtime_directory(
+fn start_runtime_collection(
     host: std::sync::Weak<state::HostLock>,
     root: std::path::PathBuf,
     model: Option<model::Registry>,
-) {
+) -> io::Result<()> {
+    runtime_collector(host, RUNTIME_COLLECT_INTERVAL, move |host, first| {
+        collect_runtime_directory(host, &root, model.as_ref(), first)
+    })
+    .map(drop)
+}
+
+/// Runs `pass` with the host every `interval` until the host is gone. Only the
+/// first pass is told it is first. A panicking pass is retried.
+fn runtime_collector(
+    host: std::sync::Weak<state::HostLock>,
+    interval: std::time::Duration,
+    mut pass: impl FnMut(SharedHost, bool) + Send + 'static,
+) -> io::Result<JoinHandle<()>> {
     let mut first = true;
-    loop {
-        if !first {
-            std::thread::sleep(RUNTIME_COLLECT_INTERVAL);
-        }
+    service::periodic("cagents-runtime-collect", interval, move || {
         let Some(host) = host.upgrade() else {
-            return;
+            return service::Next::Stop;
         };
-        if !first {
-            match crate::transcript_cache::sweep(&root) {
-                Ok(usage) if usage.count > 0 => tracing::info!(
-                    caches = usage.count,
-                    bytes = usage.bytes,
-                    "reclaimed transcript caches"
-                ),
-                Ok(_) => {}
-                Err(error) => {
-                    tracing::warn!(%error, "transcript cache cleanup was refused; evidence preserved")
-                }
+        pass(host, std::mem::replace(&mut first, false));
+        service::Next::Continue
+    })
+}
+
+/// One collection pass. Each chore is contained on its own, so one that keeps
+/// panicking does not keep the others from running.
+fn collect_runtime_directory(
+    host: SharedHost,
+    root: &std::path::Path,
+    model: Option<&model::Registry>,
+    first: bool,
+) {
+    if !first {
+        match service::attempt("transcript cache cleanup", || {
+            crate::transcript_cache::sweep(root).map_err(|error| error.to_string())
+        }) {
+            Ok(usage) if usage.count > 0 => tracing::info!(
+                caches = usage.count,
+                bytes = usage.bytes,
+                "reclaimed transcript caches"
+            ),
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%error, "transcript cache cleanup was refused; evidence preserved")
             }
         }
-        first = false;
-        match chat::retained_actor::compact_retired_receipts(&host) {
+    }
+    match service::attempt("retired actor receipt compaction", || {
+        chat::retained_actor::compact_retired_receipts(&host)
+    }) {
+        Ok(0) => {}
+        Ok(bytes) => tracing::info!(bytes, "released retired actors' final transcripts"),
+        Err(error) => tracing::warn!(%error, "retired actor receipts were not compacted"),
+    }
+    drop(host);
+    // Its own connection, so a batch never waits on or holds the host lock.
+    if let Some(model) = model {
+        match service::attempt("pane change collection", || model.collect_view_operations()) {
             Ok(0) => {}
-            Ok(bytes) => tracing::info!(bytes, "released retired actors' final transcripts"),
-            Err(error) => tracing::warn!(%error, "retired actor receipts were not compacted"),
-        }
-        drop(host);
-        // Its own connection, so a batch never waits on or holds the host lock.
-        if let Some(model) = &model {
-            match model.collect_view_operations() {
-                Ok(0) => {}
-                Ok(rows) => tracing::info!(rows, "forgot pane changes applied over a week ago"),
-                Err(error) => tracing::warn!(%error, "applied pane changes were not collected"),
-            }
+            Ok(rows) => tracing::info!(rows, "forgot pane changes applied over a week ago"),
+            Err(error) => tracing::warn!(%error, "applied pane changes were not collected"),
         }
     }
 }
@@ -433,25 +478,7 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     if let Err(error) = crate::transcript_cache::sweep(&paths.directory) {
         tracing::warn!(%error, "transcript cache cleanup was refused; evidence preserved");
     }
-    // An empty session scope stays loaded in the user manager until it
-    // exits. Enrollment withdraws its own, but a manager too slow to answer
-    // can outlast that, and earlier versions left them too. Collecting them
-    // waits on the manager, so it runs beside the daemon.
-    if let Err(error) = std::thread::Builder::new()
-        .name("cagents-scope-collect".into())
-        .spawn(|| {
-            loop {
-                match crate::daemon::process_scope::collect_empty_scopes() {
-                    Ok(0) => {}
-                    Ok(stopped) => tracing::info!(stopped, "stopped empty session scopes"),
-                    Err(error) => {
-                        tracing::warn!(%error, "empty session scopes were not collected")
-                    }
-                }
-                std::thread::sleep(std::time::Duration::from_secs(600));
-            }
-        })
-    {
+    if let Err(error) = start_scope_collection() {
         tracing::warn!(%error, "empty session scopes were not collected");
     }
     // This mandatory thread service must be available before any adoption
@@ -530,11 +557,7 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
             .startup_recovery()
             .is_some();
     if !recovery_only {
-        let restore_host = Arc::downgrade(&host);
-        if let Err(error) = std::thread::Builder::new()
-            .name("cagents-account-restore".into())
-            .spawn(move || account_lifecycle::restore_unregistered_homes(restore_host))
-        {
+        if let Err(error) = account_lifecycle::restore_unregistered_homes(Arc::downgrade(&host)) {
             tracing::warn!(%error, "lost accounts will not be restored automatically");
         }
     }
@@ -552,10 +575,7 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
                     None
                 }
             });
-        if let Err(error) = std::thread::Builder::new()
-            .name("cagents-runtime-collect".into())
-            .spawn(move || collect_runtime_directory(collect_host, runtime_root, collect_model))
-        {
+        if let Err(error) = start_runtime_collection(collect_host, runtime_root, collect_model) {
             tracing::warn!(%error, "runtime directory caches will be reclaimed only at startup");
         }
     }
@@ -827,7 +847,7 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
 /// invoking any producer Drop, provider cleanup, child wait or client work.
 fn begin_ordinary_exit(host: &SharedHost) -> Option<crate::daemon::child_reaper::ExitDrain> {
     let gate = Arc::clone(&host.lock().unwrap_or_else(|p| p.into_inner()).control_gate);
-    let _control = gate.write().unwrap_or_else(|p| p.into_inner());
+    let _control = gate.exclusive();
     // Save intentional successor transfer BEFORE finish_upgrade takes its
     // state. Such a handoff is not a claim of original-child absence.
     if host
@@ -975,6 +995,33 @@ fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A panicking pass must not end collection: the next pass still runs,
+    /// and the collector stops only once the host is gone.
+    #[test]
+    fn a_panicking_runtime_collection_pass_runs_again() {
+        let host = service::test_host();
+        let (passes, passed) = std::sync::mpsc::channel();
+        let collector = runtime_collector(
+            Arc::downgrade(&host),
+            std::time::Duration::from_millis(1),
+            move |_host, first| {
+                passes.send(first).unwrap();
+                if first {
+                    panic!("first collection pass fails");
+                }
+            },
+        )
+        .unwrap();
+        let prompt = std::time::Duration::from_secs(10);
+        assert_eq!(passed.recv_timeout(prompt), Ok(true));
+        assert_eq!(passed.recv_timeout(prompt), Ok(false));
+        assert!(!collector.is_finished());
+        drop(host);
+        collector
+            .join()
+            .expect("the collector stops once the host is gone");
+    }
 
     #[test]
     fn client_capacity_is_atomic_and_released_by_permit_drop() {

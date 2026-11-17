@@ -430,7 +430,7 @@ impl Reservation {
         for home in &mut previous_homes {
             home.refresh_ancestors().map_err(refusal)?;
         }
-        let writer = super::client::try_scoped_control_write(&gate)?;
+        let writer = gate.try_exclusive().ok_or_else(super::control_gate::busy)?;
         super::client::ensure_control_open(host)?;
         let mut entries = map.lock().unwrap_or_else(|p| p.into_inner());
         if !same_basis(&previous_basis, &entries) {
@@ -743,8 +743,12 @@ impl Reservation {
             .unwrap_or_else(|p| p.into_inner())
             .control_gate
             .clone();
-        let writer = super::client::try_scoped_control_write(&gate)
-            .map_err(|error| io::Error::new(io::ErrorKind::WouldBlock, error.message))?;
+        let writer = gate.try_exclusive().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                super::control_gate::busy().message,
+            )
+        })?;
         super::client::ensure_control_open(&host)
             .map_err(|error| io::Error::other(error.message))?;
         let mut entries = self.map.lock().unwrap_or_else(|p| p.into_inner());
@@ -911,12 +915,20 @@ pub(super) fn reserve_restore(
 /// left alone - its provider reports no login, say - is not asked about again
 /// by this daemon; an explicit restore still can. One whose check did not
 /// finish is asked about again after a number of sweeps that doubles each
-/// time.
-pub(super) fn restore_unregistered_homes(host: std::sync::Weak<super::state::HostLock>) {
+/// time; so is one whose check panicked.
+pub(super) fn restore_unregistered_homes(
+    host: std::sync::Weak<super::state::HostLock>,
+) -> std::io::Result<()> {
+    use super::service::Next;
     let mut sweep = RestoreSweep::default();
-    while restore_pass(&host, &mut sweep) {
-        std::thread::sleep(RESTORE_SCAN);
-    }
+    super::service::periodic("cagents-account-restore", RESTORE_SCAN, move || {
+        if restore_pass(&host, &mut sweep) {
+            Next::Continue
+        } else {
+            Next::Stop
+        }
+    })
+    .map(drop)
 }
 
 /// What the sweep remembers between passes.
@@ -984,13 +996,34 @@ pub(super) fn restore_pass(
             let Some(strong) = host.upgrade() else {
                 return false;
             };
-            let reservation = Reservation::for_operation(&strong, &operation);
-            drop(strong);
-            let result = reservation
-                .map_err(|error| crate::account::remote::RestoreFailure::from(error.message))
-                .and_then(|reservation| {
-                    crate::account::remote::restore_installation_home(&reservation, provider, key)
-                });
+            // A home whose restore panics is passed over like one whose check
+            // did not finish, so it cannot keep the homes after it waiting.
+            let result = super::service::contain("account restore", || {
+                let reservation = Reservation::for_operation(&strong, &operation);
+                drop(strong);
+                reservation
+                    .map_err(|error| crate::account::remote::RestoreFailure::from(error.message))
+                    .and_then(|reservation| {
+                        crate::account::remote::restore_installation_home(
+                            &reservation,
+                            provider,
+                            key,
+                        )
+                    })
+            });
+            let result = match result {
+                Ok(result) => result,
+                Err(panicked) => {
+                    sweep.unfinished((provider, key));
+                    tracing::error!(
+                        provider = provider.executable(),
+                        %key,
+                        %panicked,
+                        "an unlisted account home could not be checked"
+                    );
+                    break;
+                }
+            };
             match result {
                 Ok(restored) => {
                     sweep.deferred.remove(&(provider, key));
@@ -1622,7 +1655,7 @@ pub(crate) mod tests {
         .contains("account home is being changed");
         let unrelated = ensure_paths(&host, [root.path().join("other")]).is_ok();
         let gate = host.lock().unwrap().control_gate.clone();
-        let reader = gate.try_read().is_ok();
+        let reader = gate.try_shared().is_some();
         let moved = root.path().join("moved");
         std::fs::rename(&target, &moved).unwrap();
         let moved_refused = ensure_paths(&host, [moved.clone()]).is_err();
@@ -1661,7 +1694,7 @@ pub(crate) mod tests {
         .unwrap();
         reservation.create = Some((Provider::Codex, key));
         let gate = host.lock().unwrap().control_gate.clone();
-        let held = gate.read().unwrap();
+        let held = gate.shared();
         assert!(
             store
                 .try_create_pending_reserved(&reservation, &homes, Provider::Codex, 1, || {
@@ -1840,7 +1873,7 @@ pub(crate) mod tests {
         );
         let reservation = Reservation::test_install(&host, &[account], store, &homes).unwrap();
         let gate = host.lock().unwrap().control_gate.clone();
-        let _writer = super::super::client::try_scoped_control_write(&gate).unwrap();
+        let _writer = gate.try_exclusive().unwrap();
         assert!(ensure_idle(&host).unwrap_err().retryable);
         let error = host
             .lock()

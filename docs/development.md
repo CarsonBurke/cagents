@@ -81,6 +81,27 @@ and its admission apply exactly as they do to the commands below. No task
 combines the `host` and `ui` features, and none is cached by mise: Cargo decides
 what is stale, and a native run is never a build artifact.
 
+The lane tasks (`check:cli`, `check:host`, `check:ui`, `check:browser`,
+`check:editor` and the three `test:*` lanes) run the gate through
+`scripts/cargo-lane`, which holds the workspace's crates to the rule [main's
+build check](#watching-main-after-merges) applies: a warning from one fails the
+task. It reads Cargo's JSON messages, which the gate relays from the build host,
+and prints diagnostics as Cargo renders them, with two differences. A workspace
+crate's warning shows once, however many targets report it, and a closing line
+counts them and names where the first ten are; when Cargo otherwise succeeded,
+the task then exits 1. The vendored `[patch]` crates' warnings, over two hundred
+in the UI lanes, are counted on one line and not shown;
+`CAGENTS_VENDORED_WARNINGS=1` shows them. Errors show from every crate, Cargo's
+own status wins, and a signal reaches the gate, which cancels its build as
+before. Requesting JSON messages makes no unit stale, and Cargo replays a fresh
+unit's warnings, so a check that compiles nothing still fails on a warning it
+reported before. An explicit JSON `--message-format` passes through unfiltered,
+as does a format Cargo would refuse; `short` stays short. The matched `cagentsd`
+a HOST test build first builds shows its errors but not its warnings, which the
+tests' own build reports for what it compiles; `check:host` covers the daemon's
+whole build. Both the task and the sentinel judge a warning with
+`scripts/cargo_warnings.py`.
+
 The scripts remain the lower-level entry points, documented in the sections
 below, for options a task does not forward, other build profiles, and callers
 that cannot run mise: GitHub CI, `scripts/native-evidence` sessions, and the
@@ -720,7 +741,9 @@ The sentinel neither merges nor modifies another checkout or native session.
 A lane fails when it does not compile or when a workspace crate prints a
 warning; it reads Cargo's JSON messages to tell the workspace's crates, the
 checked commit's `[workspace] members`, from vendored path dependencies, whose
-warnings do not count. Its logs hold Cargo's rendered diagnostics, and
+warnings do not count. The lane tasks apply the same rule with the same code,
+`scripts/cargo_warnings.py`, so the rule an author checks a branch against is
+the one main is held to. Its logs hold Cargo's rendered diagnostics, and
 `logs/SHA-LANE-warnings.log` the counted warnings, each once; for a lane that
 compiled, the issue shows those rather than the log's tail.
 
@@ -1562,8 +1585,9 @@ types or aliases, expand macros, evaluate enclosing-module `cfg` or numeric
 expressions, or inspect custom serializers, dependency changes
 and semantic compatibility rules. Changes outside these seven declarations
 still need protocol review and, where applicable, a version bump. Two divergent
-branches cannot detect one another before comparison or merge. The historical
-upgrade inspector's supported-version policy remains a separate decision.
+branches cannot detect one another before comparison or merge. Which
+protocols live updates start from is a separate decision, recorded in
+`RELEASED_SOURCES` and enforced by `scripts/check-update-sources`.
 
 The four named-tree reconciliation contracts share their cases between the root
 UI target and a focused workspace package. For edits confined to vendored
@@ -1735,6 +1759,28 @@ for the rest of its two-minute interval, labeled `source: "rest-bootstrap"`.
 GitHub's REST answer has `mergeable: null` while it computes mergeability
 after a push, which the snapshot reports as `UNKNOWN`. No reported checks means unknown, not passing. Enterprise repositories also accept `--hostname HOST`.
 
+While GraphQL is in a primary cooldown of its own and REST (`core`) is not,
+the CLI reads through REST instead of waiting for the GraphQL reset: `pulls/N`
+for head and merge state, then `check-runs`, `check-suites` and `status` for
+that head, one page of 100 each. That is still the PR's one shared read in its
+two-minute interval; a request that fails, or whose headers spend the quota or
+ask for a pause, ends it with nothing published and no retry. Its pause is
+recorded for its resource, so a GraphQL reset never delays REST, and a read
+with both paused waits for the earlier one. These snapshots carry
+`transport: "rest"`, and `data.limitations` says the review decision is
+unknown; `reviewDecision` is null. REST has no aggregate, so the CLI derives
+`checks_state` itself: `FAILURE` when any context failed, or a GitHub Actions
+workflow failed before creating any job; `SUCCESS` only when every list is complete, every listed context
+passed and every workflow has finished; `PENDING` otherwise, including when a
+list has more than 100 entries (`checks_complete=false`) or a workflow has not
+yet created its check runs; and null when nothing at all was reported. Suites
+that installed apps leave queued with no check runs are ignored, as GitHub's
+own pages ignore them. A finished suite with check runs is judged by its runs,
+each the latest of its name, so a cancelled run that was rerun does not fail
+CI. Cache entries an earlier CLI paused until the GraphQL reset give way to
+this choice once their two-minute interval has passed. `scripts/land-pr` reads these like GraphQL snapshots,
+since it decides on CI alone.
+
 To clear bootstrap artifacts, first ensure no status command or builder is
 running. Remove only inactive `gh-pr-status-*` worktrees with `git worktree
 remove`, then remove the `gh-pr-status/` directory under the Git common dir.
@@ -1860,6 +1906,12 @@ shared cache can refresh, about every two minutes, or later when `retry_at`
 says so. Unknown or missing checks count as not passed. A read from before the
 head was known, or one that has not yet caught up with the script's own push,
 cannot report that the head moved.
+When GitHub refuses the merge because `main` moved while it was merging
+(`Base branch was modified`, HTTP 405), it reads the PR again after a short
+pause: a conflict now takes the conflict path above, and otherwise it merges
+once more at the same head. If that merge finds the PR not mergeable, the
+conflict GitHub was still computing takes the conflict path too. A second
+`Base branch was modified` refusal stops the landing.
 
 Per the merge policy, it does not bring the branch up to date with `main`
 merely because `main` moved, and it compiles nothing. When the branch
@@ -2196,8 +2248,9 @@ code is recompiled. The script stages the archive with
 `install.sh --stage-only` and runs `cagents daemon upgrade`, which shows each
 affected session and asks before replacing anything. `--stage-only` stops
 after staging; finish later with `cagents daemon upgrade`. The staged build
-always supplies the updater. A source daemon whose protocol is too old needs
-an intermediate build first.
+always supplies the updater. A source daemon whose protocol live updates do
+not start from is refused before anything changes; follow the cold
+installation the refusal describes.
 
 The build runs in the repository's `.worktrees/.install-local`, a detached
 checkout the script owns, so its target directory stays warm and edits in your

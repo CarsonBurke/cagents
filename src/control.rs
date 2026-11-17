@@ -30,6 +30,7 @@ mod chat;
 #[cfg(test)]
 mod project_channel_authority_tests;
 pub use chat::ChatCommand;
+mod fields;
 mod format;
 mod gh;
 pub use agents::{AgentCommand, PlacedIn};
@@ -183,6 +184,26 @@ fn note_global_options(command: clap::Command) -> clap::Command {
         .mut_subcommands(note_global_options)
 }
 
+impl TopCommand {
+    /// Whether this is a listing given `--fields`.
+    fn selects_fields(&self) -> bool {
+        match self {
+            Self::Sessions(arguments) => arguments.selects_fields(),
+            Self::Whoami(fields) => fields.selected(),
+            Self::Transcript(arguments) => arguments.selects_fields(),
+            Self::Agent {
+                command: AgentCommand::List { fields },
+            } => !fields.is_empty(),
+            Self::Work { command, list } => match command {
+                Some(WorkCommand::List(list)) => list.selects_fields(),
+                Some(_) => false,
+                None => list.selects_fields(),
+            },
+            _ => false,
+        }
+    }
+}
+
 impl Cli {
     /// What the grammar alone cannot refuse. `work`'s list options sit beside
     /// its subcommands so `cagents work` lists, but mean nothing to one.
@@ -225,7 +246,7 @@ pub enum TopCommand {
     },
     /// Show this session and the sessions related to it.
     #[command(after_help = "Lists its parent and agents, and peers in its channel or checkout.")]
-    Whoami,
+    Whoami(sessions::FieldsArgs),
     /// Inspect account plan allowances and the calling session’s context.
     Account {
         #[command(subcommand)]
@@ -746,6 +767,14 @@ pub enum ControlError {
 }
 
 impl ControlError {
+    /// Whether the daemon refused an exclusive request only because another
+    /// operation held it past the request's deadline. Nothing was admitted,
+    /// so the same request may be sent again.
+    pub fn is_daemon_busy(&self) -> bool {
+        matches!(self, Self::Remote { retryable: true, message, .. }
+            if message == crate::terminal_ipc::DAEMON_BUSY)
+    }
+
     /// The daemon's own sentence for a person; every other failure as it stands.
     pub fn reason(self) -> String {
         match self {
@@ -3057,14 +3086,18 @@ where
     T: Into<OsString> + Clone,
 {
     let arguments = arguments.into_iter().map(Into::into).collect::<Vec<_>>();
-    let wants_json = arguments
-        .iter()
-        .any(|argument| argument.as_os_str() == OsStr::new("--json"));
+    // `--fields` implies `--json`, so its usage errors are JSON too.
+    let wants_json = arguments.iter().any(|argument| {
+        let argument = argument.as_os_str();
+        argument == OsStr::new("--json")
+            || argument == OsStr::new("--fields")
+            || argument.as_encoded_bytes().starts_with(b"--fields=")
+    });
     if let Err(error) = crate::daemon::lease_handoff::initialize_inherited_lease() {
         emit_error(wants_json, &AppError::new("daemon_startup", error));
         return ExitCode::FAILURE;
     }
-    let cli = match Cli::try_parse_from(arguments.clone()).and_then(Cli::validated) {
+    let mut cli = match Cli::try_parse_from(arguments.clone()).and_then(Cli::validated) {
         Ok(cli) => cli,
         Err(error)
             if matches!(
@@ -3080,6 +3113,8 @@ where
             return ExitCode::from(2);
         }
     };
+    // As with `gh --json FIELDS`, naming the fields asks for JSON.
+    cli.global.json |= cli.command.selects_fields();
 
     // Grammar-only output must work without device selection, installer routing,
     // daemon startup, or a reachable backend.
@@ -3440,7 +3475,7 @@ fn staged_command_requires_daemon(command: &TopCommand) -> bool {
         | TopCommand::Work { .. }
         | TopCommand::Account { .. }
         | TopCommand::Chat { .. }
-        | TopCommand::Whoami
+        | TopCommand::Whoami(_)
         | TopCommand::Sessions(_)
         | TopCommand::Transcript(_)
         | TopCommand::Send(_)
@@ -3545,7 +3580,7 @@ fn execute_with_model_context(
             Some(context) => agents::execute_with_context(command, &context),
             None => agents::execute(command),
         },
-        TopCommand::Whoami => sessions::whoami(),
+        TopCommand::Whoami(arguments) => sessions::whoami(arguments),
         TopCommand::Account { command } => accounts::execute(command),
         TopCommand::Chat { command } => chat::execute(command),
         TopCommand::Sessions(arguments) => sessions::list(arguments),
@@ -5919,6 +5954,40 @@ mod tests {
         let mut contradictory = argv.to_vec();
         contradictory.push("--validate-only");
         assert!(super::Cli::try_parse_from(contradictory).is_err());
+    }
+
+    #[test]
+    fn every_listing_that_selects_fields_implies_json() {
+        use clap::Parser;
+        let parsed = |argv: &[&str]| {
+            super::Cli::try_parse_from(std::iter::once("cagents").chain(argv.iter().copied()))
+                .and_then(super::Cli::validated)
+        };
+        for argv in [
+            &["ls", "--fields", "id,state"][..],
+            &["ls", "--channel", "--fields=channel"],
+            &["whoami", "--fields", "id"],
+            &["transcript", "abc", "--fields", "kind,text"],
+            &["work", "--fields", "card"],
+            &["work", "ls", "--all", "--fields", "card,column"],
+            &["agent", "list", "--fields", "id,state"],
+        ] {
+            assert!(parsed(argv).unwrap().command.selects_fields(), "{argv:?}");
+        }
+        for argv in [
+            &["ls"][..],
+            &["work"],
+            &["agent", "list"],
+            &["transcript", "abc"],
+        ] {
+            assert!(!parsed(argv).unwrap().command.selects_fields(), "{argv:?}");
+        }
+        // A field a listing does not report is refused, naming those it does.
+        let error = parsed(&["ls", "--fields", "id,bogus"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+        assert!(error.to_string().contains("active_at"), "{error}");
+        // Only the board's listing takes fields.
+        assert!(parsed(&["work", "--fields", "card", "ls"]).is_err());
     }
 
     #[test]

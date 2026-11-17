@@ -295,7 +295,7 @@ fn retained_upgrade_tail(fail_final_save: bool) {
         chat::NativeContinuity::RetainedClaudeActor { protocol: 2 }
     ));
     let control_gate = host.lock().unwrap().control_gate.clone();
-    let control = control_gate.write().unwrap();
+    let control = control_gate.exclusive();
     let capability = host
         .lock()
         .unwrap()

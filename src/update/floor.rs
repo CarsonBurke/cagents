@@ -820,6 +820,8 @@ fn quiesce_inner(
                 eprintln!("The source could not checkpoint its work: {error}");
                 service = true;
             }
+            // A source still busy after retrying has ended nothing either, but
+            // a later update can succeed without stopping sessions.
             Err(error) => return Err(error.into()),
         }
     }

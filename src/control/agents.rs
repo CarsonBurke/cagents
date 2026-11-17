@@ -3,8 +3,8 @@ use crate::{
     account::AccountId,
     agent::Provider,
     agent_execution::{
-        Accepted, Agent, Authority, Control, Destination, Operation, Reply, Run, Spec, Submit,
-        Summary, Surface, Target,
+        Accepted, Agent, Authority, Control, Destination, HostedSession, Operation, Placement,
+        Reply, Run, Spec, Submit, Summary, Surface, Target,
         directory::{Member, Scope, UsageLimit},
     },
     model::{AgentId, RunId},
@@ -107,7 +107,11 @@ pub enum AgentCommand {
         show: ShowArgs,
     },
     /// List this caller's open agents without their results.
-    List,
+    List {
+        #[arg(long, value_name = "FIELDS", value_delimiter = ',', help = super::fields::HELP,
+            value_parser = clap::builder::PossibleValuesParser::new(LIST_FIELDS))]
+        fields: Vec<String>,
+    },
     /// Wait for runs to settle or ask for input.
     #[command(
         after_help = "Exit codes: 0 succeeded; 3 timed out; 4 failed, cancelled or \
@@ -337,6 +341,64 @@ pub(super) fn state_label(state: crate::agent_execution::State) -> &'static str 
 /// tell their agent and run IDs apart. A project every agent works in is
 /// named once, after the rows, and their directories are shown relative to
 /// it; agents across projects each name theirs and show directories whole.
+/// The fields `agent list --fields` selects from.
+const LIST_FIELDS: &[&str] = &[
+    "id",
+    "name",
+    "provider",
+    "model",
+    "account",
+    "state",
+    "run",
+    "project",
+    "directory",
+    "channel",
+    "worktree",
+    "session",
+    "console",
+    "created_at",
+];
+
+/// An agent as `agent list --fields` reports it: a complete row, named by
+/// its project's name where the daemon's `projects` give one, and by its
+/// hosted session's ID rather than that session's launch record.
+/// `created_at` is in Unix seconds.
+fn summary_row(summary: &Summary, projects: &[ModelProject]) -> Value {
+    use super::fields::{Detail, Row, seconds, word};
+    let agent = &summary.agent;
+    let target = &agent.spec.target;
+    let worktree = match &agent.placement {
+        Placement::Worktree { path, .. } => Some(path),
+        Placement::Channel(_) => None,
+    };
+    let session = agent.session.as_ref().map(|session| match session {
+        HostedSession::Chat(chat) => json!(chat.id),
+        HostedSession::Terminal(terminal) => json!(terminal.id),
+    });
+    Row::new(Detail::Complete)
+        .put("id", agent.id)
+        .put("name", &agent.name)
+        .put("provider", agent.spec.provider.executable())
+        .put("model", &agent.spec.model)
+        .put("account", &agent.spec.account)
+        .put("state", word(summary.state))
+        .put("run", summary.run)
+        .put(
+            "project",
+            projects
+                .iter()
+                .find(|project| project.repository == target.repository)
+                .map(|project| &project.name),
+        )
+        .put("directory", &target.directory)
+        .put("channel", agent.channel())
+        .put("worktree", worktree)
+        .put("session", session)
+        .put("console", agent.console.as_ref().map(|console| console.id))
+        .put("created_at", seconds(agent.created_ms))
+        .into_value()
+}
+
 fn list_human(summaries: &[Summary], projects: &[ModelProject], program: &str) -> String {
     use super::format;
     // Handles name an agent or a run, so a prefix must tell both apart.
@@ -1372,11 +1434,11 @@ pub(super) fn execute_with_context(
                 human,
             })
         }
-        AgentCommand::List => {
+        AgentCommand::List { fields } => {
             let summaries = session.summaries()?.to_vec();
             // Names make the listing readable; without them it names each
             // project by its folder.
-            let projects = if summaries.is_empty() || !super::human_output() {
+            let projects = if summaries.is_empty() || !super::human_output() && fields.is_empty() {
                 Vec::new()
             } else {
                 session
@@ -1387,9 +1449,20 @@ pub(super) fn execute_with_context(
                     .unwrap_or_default()
             };
             let human = list_human(&summaries, &projects, &super::format::program());
+            // The documented envelope keeps each agent's whole record; named
+            // fields come from a compact row instead.
+            let data = if fields.is_empty() {
+                json!({"agents": summaries})
+            } else {
+                let rows = summaries
+                    .iter()
+                    .map(|summary| summary_row(summary, &projects))
+                    .collect();
+                json!({"agents": super::fields::select(rows, &fields)})
+            };
             Ok(CommandOutput {
                 command: "agent.list",
-                data: json!({"agents": summaries}),
+                data,
                 human,
             })
         }

@@ -218,10 +218,9 @@ protocol 156 (the `991daa43e` desktop build), 173 (`43678f2fb`), 175
 `f016f047b`) and 179 (`43f253ef8`), and the
 matched current protocol. A protocol bump never drops a pinned build; retiring
 one is a deliberate change that `scripts/check-update-sources` enforces.
-Protocols 180 from #2783, 181 from #2815 and 182 from #2801 are superseded
-by 183 without qualified installed update sources. Other source protocols,
-including 160, 165, 174, 176, 180, 181 and 182, are refused before preparation,
-shutdown or checkpoint changes. Use a cold installation instead: finish and close
+Every other source protocol, including 160, 165, 174, 176, the candidate
+line's 128, and the intermediate protocols 180 to 186 (superseded without
+qualified installed update sources), is refused before preparation, shutdown or checkpoint changes. Use a cold installation instead: finish and close
 hosted sessions, quit every window, then use the installed build's matching CLI
 to run `cagents --no-start daemon stop --require-empty`. Confirm that its
 `cagents --no-start daemon status` reports stopped, run the verified installer

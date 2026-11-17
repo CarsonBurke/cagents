@@ -236,7 +236,7 @@ pub(in crate::host) fn snapshot(
     after: u64,
 ) -> Result<Option<TerminalSnapshot>, ProtocolError> {
     for _ in 0..4 {
-        let (handle, offset, rows, epoch, shown) = {
+        let (handle, offset, rows, epoch, shown, gate) = {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             let handle = state.history_handle(client, id)?;
             let revision = state.presentation_revision(client, id);
@@ -250,10 +250,13 @@ pub(in crate::host) fn snapshot(
                 view.size.map(|size| size.rows),
                 view.epoch,
                 state.subscriptions.visibility(id) == TerminalVisibility::Visible,
+                Arc::clone(&state.control_gate),
             )
         };
+        // Queue the read as terminal I/O, so no read enters a worker while an
+        // exclusive request holds the gate; wait for its frame outside it.
         let capture = handle
-            .viewport_snapshot(offset, rows, shown)
+            .viewport_snapshot_admitted(offset, rows, shown, || gate.terminal_io())
             .map_err(|message| {
                 ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true)
             })?;

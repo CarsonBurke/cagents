@@ -3,15 +3,17 @@
 then build the newest one that compiles for native evidence to start from."""
 import argparse
 import fcntl
-import glob
 import json
 import os
 from pathlib import Path
 import shutil
 import socket
 import subprocess
+import sys
 import time
-import tomllib
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import cargo_warnings
 
 TITLE = "Main Rust build sentinel: compilation failure"
 # Each lane's selection after `check --locked --no-default-features --all-targets`.
@@ -48,66 +50,33 @@ def git(repository, *args):
 
 
 def workspace_packages(checkout):
-    """Names of the checked commit's workspace members. Cargo prints warnings
-    from every path package, the vendored dependencies included; only these
-    crates must compile without them. None when the manifests cannot be read:
-    Cargo then fails the lanes itself, and that failure is what is reported."""
+    """Names of the checked commit's workspace members, whose warnings fail
+    a lane. None when the manifests cannot be read: Cargo then fails the
+    lanes itself, and that failure is what is reported."""
     try:
-        manifest = tomllib.loads((checkout / "Cargo.toml").read_text())
-        names = set()
-        for member in manifest.get("workspace", {}).get("members", ["."]):
-            for directory in glob.glob(member, root_dir=checkout):
-                member_manifest = checkout / directory / "Cargo.toml"
-                if member_manifest.exists():
-                    names.add(tomllib.loads(member_manifest.read_text())["package"]["name"])
-        if "package" in manifest:
-            names.add(manifest["package"]["name"])
-        return names
-    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError, KeyError, TypeError) as error:
+        return cargo_warnings.workspace_packages(checkout)
+    except cargo_warnings.WorkspaceUnreadable as error:
         print(f"main-build-sentinel: workspace members unreadable, warnings not counted: {error}", flush=True)
         return None
-
-
-def package_name(package_id):
-    """The name in a Cargo package ID specification, such as
-    `path+file:///src#cagents@0.1.3` or `path+file:///src/cagents-ui#0.1.3`,
-    whose name is the directory's when omitted."""
-    source, separator, fragment = package_id.rpartition("#")
-    if not separator:
-        return package_id.split(" ", 1)[0]
-    name, at, _ = fragment.partition("@")
-    return name if at else source.rstrip("/").rsplit("/", 1)[-1]
 
 
 def check_lane(command, checkout, environment, log_path, warnings_path, packages):
     """Runs one lane's check, writing its diagnostics to the log as Cargo
     renders them, and the workspace's own warnings, once each, to their own
-    file; returns the exit status and how many such warnings there were.
-    Cargo reports a warning once per target it compiles, such as a library
-    and its tests; its human output folds those duplicates, and so does this."""
+    file; returns the exit status and how many such warnings there were."""
     log_path.write_text("")
-    counted = {}
+    warnings = cargo_warnings.Warnings(packages)
     with (log_path.open("a") as log,
           subprocess.Popen([*command, "--message-format=json"], cwd=checkout, env=environment,
                            stdout=subprocess.PIPE, stderr=log, text=True, errors="replace") as process):
         for line in process.stdout:
-            try:
-                message = json.loads(line)
-            except ValueError:
-                message = None
-            if not isinstance(message, dict):
-                log.write(line)
-            elif message.get("reason") == "compiler-message" and isinstance(message.get("message"), dict):
-                diagnostic = message["message"]
-                rendered = diagnostic.get("rendered") or f"{diagnostic.get('message', '')}\n"
-                log.write(rendered)
-                if (packages is not None and diagnostic.get("level") == "warning"
-                        and package_name(str(message.get("package_id", ""))) in packages):
-                    counted.setdefault((message["package_id"], rendered), rendered)
+            _, text = warnings.read(line)
+            if text is not None:
+                log.write(text)
             log.flush()
         status = process.wait()
-    warnings_path.write_text("".join(counted.values()))
-    return status, len(counted)
+    warnings_path.write_text(warnings.rendered())
+    return status, len(warnings.own)
 
 
 def report(repository, directory, state):

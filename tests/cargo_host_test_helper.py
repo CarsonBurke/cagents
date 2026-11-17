@@ -73,6 +73,11 @@ elif arguments[0] == "build":
         print("[]")
         print("fixture helper build failed", file=sys.stderr)
         sys.exit(101)
+    if mode == "diagnostics":
+        for level in ("warning", "error", "note"):
+            print(json.dumps({"reason": "compiler-message", "package_id": "cagents-id",
+                "message": {"level": level, "message": level, "rendered": f"{level}: side build\\n"}}))
+        print("plain wrapper line")
     if mode != "missing-artifact":
         print(json.dumps({"reason": "compiler-artifact", "target": {"name": "cagentsd",
             "kind": ["bin"]}, "executable": os.environ["FIXTURE_PRODUCT"]}))
@@ -143,6 +148,18 @@ elif arguments[0] in ("test", "t"):
             "--target-dir", "elsewhere", "--target=x86_64-unknown-linux-gnu", "--config",
             "build.jobs=2", "-Fhost", "--locked", "--package", "cagents-id", "--bin",
             "cagentsd", "--message-format=json-render-diagnostics"])
+
+    def test_a_json_caller_gets_the_side_builds_errors_but_not_its_warnings_twice(self):
+        # scripts/cargo-lane judges the warnings of what the tests compile.
+        arguments = ["test", "--message-format=json", "--features", "host", "--lib"]
+        result, events = self.invoke(arguments, extra={"FIXTURE_MODE": "diagnostics"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, str(self.product) + "\n")
+        self.assertEqual(events[1]["args"][-1], "--message-format=json")
+        self.assertIn("error: side build\n", result.stderr)
+        self.assertIn("note: side build\n", result.stderr)
+        self.assertIn("plain wrapper line\n", result.stderr)
+        self.assertNotIn("warning: side build", result.stderr)
 
     def test_transitive_host_feature_is_detected(self):
         result, events = self.invoke(["test", "--features=test-alias"])

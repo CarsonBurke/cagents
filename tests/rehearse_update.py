@@ -159,6 +159,15 @@ class Comparison(unittest.TestCase):
     def test_same_record_does_not_lose_items(self):
         self.assertEqual(records.compare(snapshot(), snapshot()), [])
 
+    def test_a_session_listed_in_compact_rows_after_the_update_is_the_same_session(self):
+        before, after = snapshot(), snapshot()
+        before["sessions"]["lineage"].update(provider="Claude", surface="Chat", state="Idle")
+        after["sessions"]["lineage"].update(provider="claude", state="idle")
+        self.assertEqual(records.compare(before, after), [])
+        after["sessions"]["lineage"]["surface"] = "terminal"
+        self.assertEqual([(row["change"], row["regression"]) for row in records.compare(before, after)],
+                         [("surface", True)])
+
     def test_window_compositor_id_and_focus_are_not_persistent_identity(self):
         before, after = snapshot(), snapshot()
         after["windows"]["main"].update(id=20, focused=True)

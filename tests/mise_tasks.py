@@ -94,6 +94,17 @@ class Structure(unittest.TestCase):
                 with self.subTest(task=name):
                     self.assertIsNone(re.search(r"(^|[;&|]\s*|\bexec\s+)cargo\s+(build|check|test|run)\b", command))
 
+    def test_every_lane_holds_the_workspace_to_main_build_checks_warning_rule(self):
+        # scripts/cargo-lane fails on the workspace's own warnings, as the
+        # main build sentinel does, and runs the gate itself.
+        for lane in LANES:
+            for kind in ("check", "test"):
+                task = self.tasks.get(f"{kind}:{lane}")
+                if task is None:
+                    continue
+                with self.subTest(task=f"{kind}:{lane}"):
+                    self.assertRegex(commands(task)[0], rf"\bexec scripts/cargo-lane {kind} \{{\{{vars\.{lane}\}}\}}")
+
     def test_aggregates_cover_exactly_the_three_isolated_lanes(self):
         groups = [entry["tasks"] for entry in self.tasks["check"]["run"] if isinstance(entry, dict)]
         self.assertEqual(groups, [["check:cli", "check:host", "check:ui"]])
@@ -151,7 +162,10 @@ class Behavior(unittest.TestCase):
         self.log = self.root / "calls.jsonl"
         # The real mise binary, not a shim, under private state that trusts only
         # this copy and installs nothing.
-        self.mise = str(Path(shutil.which("mise")).resolve())
+        found = shutil.which("mise")
+        if found is None:
+            self.skipTest("mise is not installed")
+        self.mise = str(Path(found).resolve())
         self.environment = {
             key: value for key, value in os.environ.items() if not key.startswith("MISE_")
         } | {
@@ -194,14 +208,14 @@ class Behavior(unittest.TestCase):
         result = self.mise_run("check:host")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.calls(), [
-            ["cargo-gate", "check", "--locked", "--no-default-features", "--features", "host", "--all-targets"],
+            ["cargo-lane", "check", "--locked", "--no-default-features", "--features", "host", "--all-targets"],
         ])
 
     def test_forwarded_arguments_replace_the_target_selection_and_keep_quoting(self):
         result = self.mise_run("test:ui", "--", "--lib", "app::chat ui", "--", "--exact")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.calls(), [
-            ["cargo-gate", "test", "--locked", "--no-default-features", "--package", "cagents",
+            ["cargo-lane", "test", "--locked", "--no-default-features", "--package", "cagents",
              "--package", "cagents-ui", "--features", "cagents/ui", "--lib", "app::chat ui", "--", "--exact"],
         ])
 
@@ -217,9 +231,9 @@ class Behavior(unittest.TestCase):
         self.assertEqual(self.mise_run("check:browser").returncode, 0)
         self.assertEqual(self.mise_run("check:editor").returncode, 0)
         self.assertEqual(self.calls(), [
-            ["cargo-gate", "check", "--locked", "--package", "cagents-ui", "--features", "integrated-browser",
+            ["cargo-lane", "check", "--locked", "--package", "cagents-ui", "--features", "integrated-browser",
              "--all-targets"],
-            ["cargo-gate", "check", "--locked", "--package", "ceditor", "--bin=ceditor"],
+            ["cargo-lane", "check", "--locked", "--package", "ceditor", "--bin=ceditor"],
         ])
 
     def test_a_failure_keeps_its_exit_status(self):

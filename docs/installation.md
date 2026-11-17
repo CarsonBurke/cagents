@@ -253,8 +253,9 @@ Newer matched sets already installed under the same managed installation,
 including local builds, use this same flow. Whichever window you update
 from, the newer build's own updater performs the update, so its checks decide
 what continues. Supported source protocols are wire-proven for the updater's
-lifecycle operations. If the running daemon is too old, update it to an
-intermediate build first. Source trees and OS packages retain their own update
+lifecycle operations. If the running daemon's protocol is not one of them, the
+update is refused before anything changes; follow the cold installation the
+refusal describes. Source trees and OS packages retain their own update
 method; browserless builds do not download full releases.
 
 The detached updater rechecks the selected release, verifies and seals the
