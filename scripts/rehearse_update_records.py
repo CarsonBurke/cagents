@@ -681,7 +681,10 @@ def agent_rows(out: Path, rows: list[dict], errors: list[str]) -> list[dict]:
         try:
             complete.append(agent_record(read_json(path)))
         except (OSError, ValueError, AttributeError) as error:
-            errors.append(f"{path.relative_to(out)}: {error}")
+            # The CLI reports a refusal on standard error.
+            stderr = path.with_suffix(".stderr")
+            detail = stderr.read_text(errors="replace").strip() if stderr.is_file() else ""
+            errors.append(f"{path.relative_to(out)}: {error}" + (f"; stderr: {detail}" if detail else ""))
             complete.append(row)
     return complete
 

@@ -636,10 +636,14 @@ class Comparison(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="rehearse-compact-") as temporary:
             out = Path(temporary)
             (out / "agents.json").write_text(records.dump({"ok": True, "data": {"agents": listed["running"]}}))
+            (out / "agents").mkdir()
+            (out / "agents" / f"{record['id']}.json").write_text("")
+            (out / "agents" / f"{record['id']}.stderr").write_text('{"ok":false,"error":"no such agent"}\n')
             errors = []
             self.assertEqual(records.agent_rows(out, listed["running"], errors), listed["running"])
             self.assertEqual(len(errors), 1)
             self.assertIn(f"agents/{record['id']}.json", errors[0])
+            self.assertIn("no such agent", errors[0])
 
     def test_child_pid_file_tracks_identity_without_terminal_environment(self):
         with tempfile.TemporaryDirectory(prefix="rehearse-process-") as temporary:
@@ -817,6 +821,25 @@ class ScaleSeed(unittest.TestCase):
             self.assertFalse((claude/'fixture-first-turn-seconds').exists())
             self.assertEqual((root/'codex-fixture.json').read_text(), original)
             self.assertEqual(json.loads((root/'scale-seed.json').read_text())['codex'], 2)
+
+
+class AgentRecords(unittest.TestCase):
+    def test_a_record_read_by_id_must_still_be_open(self):
+        spec = importlib.util.spec_from_file_location('rehearsal_agents', REPOSITORY/'scripts/rehearse_update_run.py')
+        scenario = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(scenario)
+        rehearsal = scenario.Rehearsal('/unused-root', str(SCRIPT))
+        for closed in (False, True):
+            status = {'ok': True, 'data': {'agent': {'id': 'a', 'closed': closed},
+                                           'run': {'id': 'r', 'state': 'Running'}}}
+            with self.subTest(closed=closed), patch.object(rehearsal, 'cli', return_value=(0, status)) as cli:
+                if closed:
+                    with self.assertRaisesRegex(ValueError, 'closed'):
+                        rehearsal.agent_record('a')
+                else:
+                    self.assertEqual(rehearsal.agent_record('a'),
+                                     {'agent': {'id': 'a', 'closed': False}, 'run': 'r', 'state': 'Running'})
+                self.assertEqual(cli.call_args.args, ('--no-start', 'agent', 'status', 'a'))
 
 
 class ChatViews(unittest.TestCase):

@@ -742,7 +742,11 @@ class Rehearsal:
         list` stopped printing records when its rows became compact (#2941).
         """
         _, status = self.cli(*(() if start else ('--no-start',)),'agent','status',agent_id,check=check)
-        return records.agent_record(status)
+        record = records.agent_record(status)
+        # `agent status` reads a closed agent too, which `agent list` left out.
+        if record['agent'].get('closed'):
+            raise ValueError(f'agent {agent_id} is closed')
+        return record
 
     def listed_agents(self, *, start=False):
         """Each open agent's `id`, `name` and lowercase `state`, as either CLI lists them."""
