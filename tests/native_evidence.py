@@ -2349,10 +2349,15 @@ REMOTE_STUBS = {
     """,
     # The connection as the host sees it: the parent of what it runs, never
     # replaced by it, alive while that is and gone once its client is, as an
-    # sshd whose client hangs up. What it ran is left running, as there.
+    # sshd whose client hangs up. What it ran is left running, as there. It
+    # passes its client's descriptors straight on rather than relaying them,
+    # so the client sees their end only once what it ran ends.
     "sshd-session": """
-        #!/usr/bin/python3
-        import os, select, signal, subprocess, sys
+        #!/usr/bin/python3 -I
+        import os
+        import select
+        import subprocess
+        import sys
         client = os.getppid()
         lost = os.pidfd_open(client)
         command = subprocess.Popen(sys.argv[1:])
@@ -2682,6 +2687,7 @@ class RemoteEvidence(unittest.TestCase):
                 [str(SCRIPT), "--remote", "buildhost", "--task", str(self.task), "status"],
                 env=self.env, stdin=subprocess.DEVNULL, stdout=output, stderr=output, start_new_session=True,
             )
+
         def wait_for(condition) -> None:
             deadline = time.monotonic() + HANG_GUARD
             while not condition() and time.monotonic() < deadline:
@@ -2696,18 +2702,27 @@ class RemoteEvidence(unittest.TestCase):
             def parent(pid: int) -> int:
                 return int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1])
 
+            # The host script started its work in a process group of its own,
+            # and beside it the watcher, its only other child.
+            main = os.getpgid(held)
+            host = parent(main)
+            others = set(map(int, Path(f"/proc/{host}/task/{host}/children").read_text().split())) - {main}
+            self.assertEqual(len(others), 1, others)
+            watcher = others.pop()
             # The connection is the stand-in sshd above it; its client, the
             # ssh this machine runs, goes as if the network had.
-            connection = held
+            connection = host
             while Path(f"/proc/{connection}/comm").read_text().strip() != "sshd-session":
                 connection = parent(connection)
+                self.assertGreater(connection, 1, "no stand-in sshd above the host's work")
             os.kill(parent(connection), signal.SIGKILL)
             self.assertNotEqual(process.wait(timeout=HANG_GUARD), 0)
-            # Nothing here ends it: the wrapper was not cancelled, so its
-            # supervisor drains nothing. The host's watcher does.
             wait_for(lambda: (self.logs / "held-ended").exists())
             self.assertTrue((self.logs / "held-ended").exists(), "the host's work outlived its connection")
-            self.assertNotEqual(int((self.logs / "held-ended").read_text()), process.pid)
+            # Ended by the watcher, for its connection's end, not by anything here.
+            self.assertEqual(int((self.logs / "held-ended").read_text()), watcher)
+            self.assertFalse(Path(f"/proc/{connection}").exists() and
+                             Path(f"/proc/{connection}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z")
         finally:
             if process.poll() is None:
                 process.kill()
