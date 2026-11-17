@@ -459,6 +459,29 @@ it, and keeps what the full projection repaired. The check doubles the
 projection work, so the timing tests turn it off and native measurements run
 without the variable.
 
+The workload for these declarations is the `realistic` native evidence seed
+(18 projects, 76 channels, 1769 cards) at 1600x1000 under `--ui-trace`, with
+three fixture Claude agents streaming long replies, one shown. The run
+records idle streaming for 15 s, then types four 77-character sentences into
+the shown conversation's composer with `drive type`. It then hovers 14
+sidebar rows and 4 tabs twice, scrolls the sidebar, and switches channels 8
+times. One run per side on fw16 (`dev-runtime`) compares `a831f307a`, which
+traces the stages and projects everything for every key, with the change for
+issue #2954:
+
+| Phase | Before | After |
+| --- | --- | --- |
+| Typing, full projections | 336 `KeyEvent`, 2304 ms | none from keys (2 `RefreshUi` ticks) |
+| Typing, worst window's frame work p95 / p99 | 557 / 877 ms | 24 / 57 ms |
+| Typing, busy per second of trace | 643 ms | 302 ms |
+| Hover, `ChromeUi(HoverTab)` updates | 16, 165 ms | 12, 1.6 ms |
+| Whole run, traced busy time | 30.5 s over 146 s | 15.7 s over 136 s |
+
+Before, about two thirds of each key's projection was `stage chrome`, which
+rebuilds every card's chrome. A visible streaming conversation's
+`ChatUi(Wake)` costs about 2 ms of update each, outside the projection, and is
+the largest remaining cost while typing.
+
 The native workload has no script. In the browserless development runner,
 inside a nested niri session with fresh private HOME and XDG directories, open
 20 terminals with Ctrl+Shift+T. Then use `cagents terminal write` to start one
