@@ -213,7 +213,7 @@ start() {
     if ! evidence cli agent spawn --provider claude --model haiku --surface chat \
         "$@" --prompt "Fixture: $state" >/dev/null; then
         # The daemon caps one caller's unsettled runs; say which are open.
-        cli_json agent list | jq -r '.data.agents[] | "open: \(.state) \(.agent.spec.target.directory | split("/") | last)"' >&2
+        cli_json agent list | jq -r '.data.agents[] | "open: \(.state) \(.directory | split("/") | last)"' >&2
         return 1
     fi
     # Each agent reads the frames as its first turn starts; give it that turn

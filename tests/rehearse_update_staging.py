@@ -168,8 +168,11 @@ class NaturalIdle(unittest.TestCase):
         (self.root/'logs/codex-provider.jsonl').write_text(''.join(json.dumps(row)+'\n' for row in (events or self.events)))
         rehearsal=scenario.Rehearsal(self.root,'/unused-shell')
         current=current or {**self.agent,'state':'Succeeded'}
-        with patch.object(rehearsal,'cli',side_effect=[(0,{'data':{'agents':[initial or self.agent]}}),
-                (0,{'data':{'proof':proof or self.proof}}),(0,{'data':{'agents':[current]}})]), \
+        def status(row):
+            # `agent status` prints the record and its latest run.
+            return 0,{'ok':True,'data':{'agent':row['agent'],'run':{'id':row['run'],'state':row['state']}}}
+        with patch.object(rehearsal,'cli',side_effect=[status(initial or self.agent),
+                (0,{'data':{'proof':proof or self.proof}}),status(current)]), \
              patch.object(scenario.time,'sleep',side_effect=AssertionError('unexpected provider wait')):
             rehearsal.wait_natural_idle(90)
         return json.loads((self.root/'natural-idle.json').read_text())

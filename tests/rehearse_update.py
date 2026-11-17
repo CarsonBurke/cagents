@@ -605,6 +605,42 @@ class Comparison(unittest.TestCase):
             self.assertEqual(captured["agents"]["a"]["agent"]["name"], "codex-alpha")
             self.assertIn("sessions.sqlite3:a", records.panes(captured))
 
+    def test_record_completes_compact_agent_rows_from_agent_status(self):
+        record = {"id": "00000000-0000-4000-8000-00000000000a", "name": "codex-alpha",
+                  "spec": {"provider": "Codex", "surface": "Chat"}, "placement": {"Channel": "c"}, "closed": False}
+        listed = {"Running": [{"agent": record, "state": "Running", "run": "r"}],
+                  "running": [{"id": record["id"], "name": "codex-alpha", "state": "running", "run": "r"}]}
+        captured = {}
+        for shape, rows in listed.items():
+            with self.subTest(shape=shape), tempfile.TemporaryDirectory(prefix="rehearse-compact-") as temporary:
+                root = Path(temporary)
+                out = root / "records/before"
+                out.mkdir(parents=True)
+                for name in records.COLLECTIONS:
+                    value = rows if name == "agents" else []
+                    (out / f"{name}.json").write_text(records.dump({"ok": True, "data": {name: value}}))
+                compact = subprocess.run([sys.executable, "-I", "-B", str(REPOSITORY / "scripts/rehearse_update_records.py"), "compact-agents", str(out)],
+                                         capture_output=True, text=True, check=True).stdout.split()
+                self.assertEqual(compact, [] if shape == "Running" else [record["id"]])
+                for agent in compact:
+                    (out / "agents").mkdir(exist_ok=True)
+                    (out / "agents" / f"{agent}.json").write_text(records.dump(
+                        {"ok": True, "command": "agent.status",
+                         "data": {"agent": record, "run": {"id": "r", "state": "Running"}, "timed_out": False}}))
+                captured[shape] = records.record(root, out, None)
+                self.assertFalse([error for error in captured[shape]["errors"] if "agent" in error])
+        # Both CLIs record the same agent, so an update across them loses nothing.
+        self.assertEqual(captured["Running"]["agents"], captured["running"]["agents"])
+        self.assertFalse([change for change in records.compare(captured["Running"], captured["running"])
+                          if change["kind"] == "agents"])
+        with tempfile.TemporaryDirectory(prefix="rehearse-compact-") as temporary:
+            out = Path(temporary)
+            (out / "agents.json").write_text(records.dump({"ok": True, "data": {"agents": listed["running"]}}))
+            errors = []
+            self.assertEqual(records.agent_rows(out, listed["running"], errors), listed["running"])
+            self.assertEqual(len(errors), 1)
+            self.assertIn(f"agents/{record['id']}.json", errors[0])
+
     def test_child_pid_file_tracks_identity_without_terminal_environment(self):
         with tempfile.TemporaryDirectory(prefix="rehearse-process-") as temporary:
             root = Path(temporary)
@@ -730,6 +766,14 @@ class ScaleSeed(unittest.TestCase):
         self.assertNotIn('--scale-chats', scenario.seed_flags(parser.parse_args([])))
 
     def test_scale_chats_open_long_and_idle_then_their_switches_are_removed(self):
+        # An older CLI lists whole records; a newer one compact rows.
+        for shape, row in (('records', lambda name, state: {'agent': {'name': name, 'origin': 'User'},
+                                                             'state': state}),
+                           ('compact', lambda name, state: {'name': name, 'state': state.lower()})):
+            with self.subTest(shape=shape):
+                self.scale_seed(row)
+
+    def scale_seed(self, row):
         scenario = self.module()
         with tempfile.TemporaryDirectory(prefix='ru-scale-') as temporary:
             root = Path(temporary)
@@ -752,8 +796,7 @@ class ScaleSeed(unittest.TestCase):
                 spawned.append((argv[argv.index('--provider')+1], project, argv[argv.index('--channel')+1]))
                 states[argv[argv.index('--name')+1]] = 'Running'
             def cli(*arguments, **options):
-                listing = {'data': {'agents': [{'agent': {'name': name, 'origin': 'User'}, 'state': state}
-                                               for name, state in states.items()]}}
+                listing = {'data': {'agents': [row(name, state) for name, state in states.items()]}}
                 # Each listing lets one scale run finish; the seed's own chats never do.
                 finished = next((name for name, state in states.items()
                                  if state == 'Running' and name.startswith('scale-')), None)
@@ -990,15 +1033,13 @@ class ChatViews(unittest.TestCase):
                 {'state':'named-chat','response':{'data':{'agent':seed}}}]}))
             rehearsal = scenario.Rehearsal(root,str(SCRIPT))
             calls = []
-            def cli(*args):
+            def cli(*args, **options):
                 calls.append(args)
-                if args[1:]==('agent','list'):
-                    foreign = {**current,'id':'foreign-agent','name':'old-name'}
-                    return 0, {'data':{'agents':[{'agent':foreign},{'agent':current}]}}
                 if args[1:]==('channel','list'):
                     return 0, {'data':{'channels':[{'id':'seed-channel','title':'Visible canonical channel'}]}}
+                # The seeded agent is read by its ID, never found by its name.
                 self.assertEqual(args,('--no-start','agent','status','seed-agent'))
-                return 0, {'data':{'agent':current}}
+                return 0, {'data':{'agent':current,'run':{'id':'seed-run','state':'Succeeded'}}}
             window = {'id':42}
             def call(*args,**kwargs):
                 calls.append(args)

@@ -1,3 +1,4 @@
+use super::fields::Detail;
 use super::*;
 use crate::{
     account::AccountId,
@@ -337,10 +338,6 @@ pub(super) fn state_label(state: crate::agent_execution::State) -> &'static str 
     }
 }
 
-/// The caller's agents, one row each, named by the shortest prefixes that
-/// tell their agent and run IDs apart. A project every agent works in is
-/// named once, after the rows, and their directories are shown relative to
-/// it; agents across projects each name theirs and show directories whole.
 /// The fields `agent list --fields` selects from.
 const LIST_FIELDS: &[&str] = &[
     "id",
@@ -359,12 +356,13 @@ const LIST_FIELDS: &[&str] = &[
     "created_at",
 ];
 
-/// An agent as `agent list --fields` reports it: a complete row, named by
-/// its project's name where the daemon's `projects` give one, and by its
-/// hosted session's ID rather than that session's launch record.
-/// `created_at` is in Unix seconds.
-fn summary_row(summary: &Summary, projects: &[ModelProject]) -> Value {
-    use super::fields::{Detail, Row, seconds, word};
+/// An agent as `agent list --json` reports it: a row with only the facts it
+/// has, or every field with `Detail::Complete`, as `--fields` selects from.
+/// It names its project by the name the daemon's `projects` give it, and its
+/// hosted session and console by their IDs rather than their launch
+/// records, which `agent status` prints. `created_at` is in Unix seconds.
+fn summary_row(summary: &Summary, projects: &[ModelProject], detail: Detail) -> Value {
+    use super::fields::{Row, seconds, word};
     let agent = &summary.agent;
     let target = &agent.spec.target;
     let worktree = match &agent.placement {
@@ -375,7 +373,7 @@ fn summary_row(summary: &Summary, projects: &[ModelProject]) -> Value {
         HostedSession::Chat(chat) => json!(chat.id),
         HostedSession::Terminal(terminal) => json!(terminal.id),
     });
-    Row::new(Detail::Complete)
+    Row::new(detail)
         .put("id", agent.id)
         .put("name", &agent.name)
         .put("provider", agent.spec.provider.executable())
@@ -399,6 +397,10 @@ fn summary_row(summary: &Summary, projects: &[ModelProject]) -> Value {
         .into_value()
 }
 
+/// The caller's agents, one row each, named by the shortest prefixes that
+/// tell their agent and run IDs apart. A project every agent works in is
+/// named once, after the rows, and their directories are shown relative to
+/// it; agents across projects each name theirs and show directories whole.
 fn list_human(summaries: &[Summary], projects: &[ModelProject], program: &str) -> String {
     use super::format;
     // Handles name an agent or a run, so a prefix must tell both apart.
@@ -1436,9 +1438,9 @@ pub(super) fn execute_with_context(
         }
         AgentCommand::List { fields } => {
             let summaries = session.summaries()?.to_vec();
-            // Names make the listing readable; without them it names each
-            // project by its folder.
-            let projects = if summaries.is_empty() || !super::human_output() && fields.is_empty() {
+            // Names make the listing readable; without them the text names
+            // each project by its folder, and rows leave it out.
+            let projects = if summaries.is_empty() {
                 Vec::new()
             } else {
                 session
@@ -1449,16 +1451,15 @@ pub(super) fn execute_with_context(
                     .unwrap_or_default()
             };
             let human = list_human(&summaries, &projects, &super::format::program());
-            // The documented envelope keeps each agent's whole record; named
-            // fields come from a compact row instead.
-            let data = if fields.is_empty() {
-                json!({"agents": summaries})
-            } else {
-                let rows = summaries
-                    .iter()
-                    .map(|summary| summary_row(summary, &projects))
-                    .collect();
-                json!({"agents": super::fields::select(rows, &fields)})
+            // Each agent's whole record is `agent status`'s to print.
+            let detail = Detail::of(&fields);
+            let rows = summaries
+                .iter()
+                .map(|summary| summary_row(summary, &projects, detail))
+                .collect();
+            let data = match detail {
+                Detail::Sparse => json!({ "agents": rows }),
+                Detail::Complete => json!({"agents": super::fields::select(rows, &fields)}),
             };
             Ok(CommandOutput {
                 command: "agent.list",

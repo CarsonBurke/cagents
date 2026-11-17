@@ -215,8 +215,8 @@ class ReviewEvidence(unittest.TestCase):
                 (root / 'records' / name).mkdir(parents=True)
                 retry.write_json(root / 'records' / name / 'snapshot.json', {'source': name})
             rehearsal = retry.scenario.Rehearsal(root, 'unused')
-            responses = [(0, {'data': {'agents': [{'agent': agent}]}}),
-                         (0, {'data': {'channels': [{'id': 'c', 'title': 'Chat'}]}})]
+            responses = [(0, {'data': {'channels': [{'id': 'c', 'title': 'Chat'}]}}),
+                         (0, {'data': {'agent': agent, 'run': {'id': 'r', 'state': 'Succeeded'}}})]
             with patch.object(rehearsal, 'cli', side_effect=responses), \
                     patch.object(rehearsal, 'mapped', side_effect=RuntimeError('native boundary reached')):
                 with self.assertRaisesRegex(RuntimeError, 'native boundary reached'):

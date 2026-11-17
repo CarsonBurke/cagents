@@ -642,10 +642,53 @@ def cli_rows(out: Path, name: str, errors: list[str]) -> list[dict]:
         return []
 
 
+# `agent list` printed each agent's whole record, beside its latest `run` and
+# `state`, until it printed compact rows (#2941); `agent status` prints the
+# record on both sides of that change. A rehearsal reads both CLIs.
+def agent_id(row: dict) -> str:
+    """The ID of an `agent list` row of either shape."""
+    agent = row.get("agent")
+    return str(agent.get("id", "")) if isinstance(agent, dict) else str(row.get("id", ""))
+
+
+def listed_agent(row: dict) -> dict:
+    """The `id`, `name` and lowercase `state` of an `agent list` row of either shape."""
+    agent = row.get("agent") if isinstance(row.get("agent"), dict) else row
+    return {"id": agent_id(row), "name": agent.get("name"), "state": str(row.get("state") or "").lower()}
+
+
+def compact_agents(rows: list[dict]) -> list[str]:
+    """The IDs of `agent list` rows that carry no record: those `agent status` completes."""
+    return [agent_id(row) for row in rows if not isinstance(row.get("agent"), dict)]
+
+
+def agent_record(status: dict) -> dict:
+    """An `agent status --json` envelope as the whole-record row `agent list` printed."""
+    data = status.get("data") if isinstance(status, dict) and status.get("ok") is not False else None
+    if not isinstance(data, dict) or not isinstance(data.get("agent"), dict) or not isinstance(data.get("run"), dict):
+        raise ValueError(f"agent status refused: {status}")
+    return {"agent": data["agent"], "run": data["run"].get("id"), "state": data["run"].get("state")}
+
+
+def agent_rows(out: Path, rows: list[dict], errors: list[str]) -> list[dict]:
+    """`rows` with each compact row replaced by the record in `agents/ID.json`."""
+    complete = []
+    for row in rows:
+        if isinstance(row.get("agent"), dict):
+            complete.append(row)
+            continue
+        path = out / "agents" / f"{agent_id(row)}.json"
+        try:
+            complete.append(agent_record(read_json(path)))
+        except (OSError, ValueError, AttributeError) as error:
+            errors.append(f"{path.relative_to(out)}: {error}")
+            complete.append(row)
+    return complete
+
+
 def identity(row: dict, name: str) -> str:
     if name == "agents":
-        agent = row.get("agent")
-        return str(agent.get("id", "")) if isinstance(agent, dict) else str(row.get("id", ""))
+        return agent_id(row)
     if name == "sessions":
         lineage = row.get("lineage") or row.get("id", "")
         return json.dumps(lineage, sort_keys=True) if isinstance(lineage, dict) else str(lineage)
@@ -844,6 +887,8 @@ def record(root: Path, out: Path, windows: Path | None) -> dict:
     snapshot = {"schema": 1, "root": str(root), "errors": errors}
     for name in COLLECTIONS:
         rows = cli_rows(out, name, errors)
+        if name == "agents":
+            rows = agent_rows(out, rows, errors)
         indexed = index_rows(rows, name)
         if "" in indexed or len(indexed) != len(rows):
             errors.append(f"{name}: missing or duplicate stable identity")
@@ -1326,6 +1371,8 @@ def main() -> int:
     process_capture = commands.add_parser("private-processes")
     process_capture.add_argument("root", type=Path)
     process_capture.add_argument("--after-intentional-stop", action="store_true")
+    listed = commands.add_parser("compact-agents", help="print the IDs of agents.json rows without records")
+    listed.add_argument("out", type=Path)
     comparison = commands.add_parser("compare")
     comparison.add_argument("before", type=Path)
     comparison.add_argument("after", type=Path)
@@ -1342,6 +1389,10 @@ def main() -> int:
             return int(bool(snapshot['errors']))
         if args.command == "prepare-recovery":
             return 0 if prepare_recovery(args.root.resolve(), args.out) else 1
+        if args.command == "compact-agents":
+            for agent in compact_agents(cli_rows(args.out, "agents", [])):
+                print(agent)
+            return 0
         if args.command == "record":
             snapshot = record(args.root.resolve(), args.out, args.windows)
             print(args.out / "snapshot.json")
