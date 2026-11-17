@@ -8,7 +8,7 @@ import copy
 import hashlib
 import json
 import fcntl
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, redirect_stdout
 import os
 from pathlib import Path
 import sqlite3
@@ -28,16 +28,36 @@ from unittest.mock import patch
 
 REPOSITORY = Path(__file__).resolve().parent.parent
 SCRIPT = REPOSITORY / "scripts/rehearse-update"
-spec = importlib.util.spec_from_file_location("rehearsal_records", REPOSITORY / "scripts/rehearse_update_records.py")
-records = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(records)
-sys.modules["rehearse_update_records"] = records
+# The harness modules import their siblings, as they do when run from
+# scripts/. Without this, an unisolated run finds tests/native_slots.py, the
+# slot suite, under that name instead, and an isolated run finds nothing.
+sys.path.insert(0, str(REPOSITORY / "scripts"))
+import rehearse_update_records as records
 AUTHORITY = ("CAGENTS_AGENT_AUTHORITY", "CAGENTS_AGENT_TOKEN", "CAGENTS_SESSION_TOKEN")
 # Bounds only a hang; a passing wait returns as soon as its event arrives.
 HANG_GUARD = 60
 # Lifetime of helper processes whose liveness a test asserts: longer than any
 # test, but finite, so a killed runner leaks nothing for long.
 HELPER_LIFETIME = str(10 * HANG_GUARD)
+
+
+def require_user_manager(test: unittest.TestCase) -> None:
+    """Skip TEST unless the real systemd user manager answers as `stop` asks it.
+
+    `stop` lists running scopes there to prove none it attributed survive, so
+    it fails, as it should, on a host whose user has no manager.
+    """
+    try:
+        listed = subprocess.run(
+            ["systemctl", "--user", "--plain", "--no-legend", "--no-pager",
+             "list-units", "--type=scope", "--state=running"],
+            env={"HOME": os.environ.get("HOME", "/"), "XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}",
+                 "PATH": "/usr/local/bin:/usr/bin:/bin"},
+            capture_output=True, text=True, timeout=HANG_GUARD)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        test.skipTest(f"stop needs the systemd user manager: {error}")
+    if listed.returncode:
+        test.skipTest("stop needs the systemd user manager: " + (listed.stderr.strip() or f"exit {listed.returncode}"))
 
 
 def snapshot() -> dict:
@@ -479,7 +499,12 @@ class Comparison(unittest.TestCase):
             (state / f"{job}.recovery.json").write_text(records.dump(evidence["issued"]))
             (state / f"{job}.census.json").chmod(0o600)
             (state / f"{job}.recovery.json").chmod(0o600)
-            self.assertTrue(records.prepare_recovery(root, out))
+            printed = io.StringIO()
+            with redirect_stdout(printed):
+                self.assertTrue(records.prepare_recovery(root, out))
+            # cmd_record runs the verifier this names: the target's own CLI.
+            self.assertEqual(printed.getvalue(),
+                             f"{root}/home/.local/share/cagents-install/versions/candidate/bin/cagents\n")
             self.assertEqual((out / "recovery-census.json").read_bytes(), raw)
             self.assertEqual((out / "recovery-census.json").stat().st_mode & 0o777, 0o600)
             self.assertEqual((out / "recovery-issued.json").stat().st_mode & 0o777, 0o600)
@@ -2001,6 +2026,7 @@ class Arguments(unittest.TestCase):
     @unittest.skipIf(any(name in os.environ for name in AUTHORITY),
                      "stop is tested in a genuine user shell; never strip authority")
     def test_stop_restores_only_its_private_preservation_fault(self):
+        require_user_manager(self)
         for fault in ("marker", "interrupted-rename", "unrelated-file", "unrelated-symlink"):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory(prefix="ru-stop-", dir="/var/tmp") as temporary:
                 root = Path(temporary)
@@ -2181,6 +2207,7 @@ else:sys.exit(2)
                         peer.wait()
 
     def test_stop_reports_surviving_attributed_scope_without_stopping_other_members(self):
+        require_user_manager(self)
         self.assertEqual(self.call("init").returncode, 0)
         unit = self.root.name+".scope"
         # The wrapper and second child retain the real environment. Only the
@@ -2403,8 +2430,10 @@ class FailedInitialization(unittest.TestCase):
                     raise RuntimeError("partly failed init")
                 return 1, "not initialized"
             args = type("Args", (), dict(old_version="old", new_version="new", ceditor=None))()
-            with patch.object(rehearsal, "call", side_effect=call):
+            printed = io.StringIO()
+            with patch.object(rehearsal, "call", side_effect=call), redirect_stdout(printed):
                 self.assertEqual(rehearsal.run(args), 1)
+            self.assertEqual(printed.getvalue(), f"Report: {root}/report.txt\n")
             self.assertEqual(commands, ["init", "record", "stop"])
             self.assertIn("Outcome: FAIL", (root / "report.txt").read_text())
             self.assertIn("partly failed init", (root / "report.txt").read_text())
@@ -2442,6 +2471,7 @@ time.sleep(float(hold))
             writer = subprocess.Popen([sys.executable, '-I', '-c', self.WRITER, str(log), str(lock), str(2 * HANG_GUARD)],
                                       stdin=subprocess.PIPE, text=True)
             self.addCleanup(writer.wait)
+            self.addCleanup(writer.stdin.close)
             self.addCleanup(writer.kill)
             descriptor = os.pidfd_open(writer.pid)
             self.addCleanup(os.close, descriptor)

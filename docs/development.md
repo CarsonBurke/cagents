@@ -2472,8 +2472,20 @@ scripts/rehearse-update --root /var/tmp/cr/u2 cleanup
 display. `ceditor start BIN_DIR`, `record NAME`, `shot NAME` and `update DIR
 VERSION INSTALLER --answer yes` are available separately. `stop` retains evidence;
 `cleanup` stops everything and removes the marked root. Copy reports and images
-elsewhere before cleanup. Run the pure checks with
-`/usr/bin/python3 tests/rehearse_update.py`; no compositor or Rust build is needed.
+elsewhere before cleanup.
+
+The harness's pure checks need no compositor, archive or Rust build, and CI
+runs them as the `update rehearsal` job of the script contracts (see [Testing](#testing)):
+
+```sh
+mise run test:scripts "update rehearsal"
+/usr/bin/python3 -I -B tests/rehearse_update.py -v   # one suite
+```
+
+From a hosted agent's shell, the nine tests that run the harness itself skip,
+since it refuses inherited authority; CI and a plain `ssh fw16` shell run them.
+The two that run `stop` also skip where the user has no systemd user manager,
+and the startup bind fixture's check skips without a C compiler.
 
 ## Troubleshooting
 
