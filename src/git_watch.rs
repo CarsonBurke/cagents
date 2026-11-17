@@ -3,7 +3,7 @@
 //! window's sidebar and the daemon's Work board each own one.
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ffi::OsStr,
     os::unix::{ffi::OsStrExt, fs::MetadataExt},
     path::{Path, PathBuf},
@@ -16,6 +16,8 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::{
     model::{ProjectId, WorktreeId},
+    process::ProcessExecutor,
+    project_location::{GitDirectories, git_directories},
     repository::{CancellationToken, RepositoryService, WorktreeRecord},
 };
 
@@ -28,7 +30,7 @@ const EVICTION_RETRY: Duration = Duration::from_secs(10 * 60);
 /// Paths relative to a worktree root, sorted and kept in one allocation. A
 /// large checkout tracks tens of thousands of paths, and each watcher owner
 /// holds them for every worktree.
-#[derive(Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
 struct PathSet {
     text: Box<[u8]>,
     /// Where each path ends in `text`.
@@ -90,7 +92,7 @@ impl std::fmt::Debug for PathSet {
 /// What a worktree's index tracks. Branches rarely add or remove files, so
 /// most worktrees of a repository track the same paths and share one census,
 /// which a re-plan that finds them unchanged keeps as well.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct Census {
     files: PathSet,
     /// Every directory on the way to a file; the root is the empty path.
@@ -125,14 +127,61 @@ enum Tracked {
     Directory,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Which index file a census was read from. Git, libgit2 and JGit replace the
+/// index by renaming a new file over it, so a write gives it an inode other
+/// than the one in place, and its size and times change with it. Only a writer
+/// that rewrote it in place, to the same size within one timestamp tick, could
+/// leave it looking unchanged. A network filesystem may report cached
+/// attributes, so a census read there is never kept by identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IndexIdentity {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+impl IndexIdentity {
+    /// `None` when there is no index to identify, or it cannot be read.
+    fn of(git_dir: &Path) -> Option<Self> {
+        let metadata = std::fs::symlink_metadata(git_dir.join("index")).ok()?;
+        metadata.is_file().then(|| Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.size(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Worktree {
     pub id: WorktreeId,
     pub root: PathBuf,
     pub git_dir: PathBuf,
     census: Arc<Census>,
+    /// The index `census` was read from, taken before reading it: a write
+    /// that lands during the read changes it, so the next plan reads again.
+    index: Option<IndexIdentity>,
     polling: Option<String>,
 }
+
+/// Equal worktrees ask for the same watches and polling. Which index file the
+/// census came from only saves its next read: an index rewritten with the same
+/// paths changes nothing a watcher must re-register or its owner re-read.
+impl PartialEq for Worktree {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.root == other.root
+            && self.git_dir == other.git_dir
+            && self.census == other.census
+            && self.polling == other.polling
+    }
+}
+
+impl Eq for Worktree {}
 
 impl Worktree {
     /// Whether `path` is a tracked file or a directory on the way to one.
@@ -167,6 +216,11 @@ pub struct Project {
 }
 
 impl Project {
+    /// The watch plan for `records`, re-reading only what may have moved: a
+    /// worktree `changed` names, or one `previous` does not hold at the same
+    /// root. A re-read runs Git only for an index that was rewritten since
+    /// `previous` read it, so polling every worktree costs no Git process
+    /// where nothing changed.
     pub fn read_changed(
         id: ProjectId,
         common_dir: PathBuf,
@@ -175,56 +229,108 @@ impl Project {
         previous: Option<&Self>,
         changed: &BTreeSet<WorktreeId>,
     ) -> Result<Self, String> {
-        let git = RepositoryService::system("git");
-        let mut worktrees = Vec::new();
+        Self::read_changed_with(
+            &RepositoryService::system("git"),
+            id,
+            common_dir,
+            records,
+            cancellation,
+            previous,
+            changed,
+        )
+    }
+
+    fn read_changed_with<E: ProcessExecutor>(
+        git: &RepositoryService<E>,
+        id: ProjectId,
+        common_dir: PathBuf,
+        records: &[WorktreeRecord],
+        cancellation: &CancellationToken,
+        previous: Option<&Self>,
+        changed: &BTreeSet<WorktreeId>,
+    ) -> Result<Self, String> {
         let polling = network_filesystem(&common_dir)
             .map_err(|error| error.to_string())?
             .then(|| "network or FUSE filesystem may omit native change events".to_owned());
+        let retained = previous
+            .into_iter()
+            .flat_map(|previous| &previous.worktrees)
+            .map(|worktree| (worktree.id, worktree))
+            .collect::<HashMap<_, _>>();
+        // Most worktrees of a repository track the same paths: one census
+        // serves them all, found by its contents rather than compared with
+        // every worktree's in turn. Hashing a census reads all of its paths,
+        // so the known ones are indexed only once an index is actually read.
+        let mut censuses: Option<HashSet<Arc<Census>>> = None;
+        let mut worktrees = Vec::new();
         for record in records.iter().filter(|record| !record.bare) {
-            if !changed.contains(&record.id)
-                && let Some(old) = previous.and_then(|previous| {
-                    previous
-                        .worktrees
-                        .iter()
-                        .find(|old| old.id == record.id && old.root == record.path)
-                })
+            let old = retained
+                .get(&record.id)
+                .copied()
+                .filter(|old| old.root == record.path);
+            if let Some(old) = old
+                && !changed.contains(&record.id)
             {
                 worktrees.push(old.clone());
                 continue;
             }
-            let actual_common = git
-                .common_dir(&record.path, cancellation)
-                .map_err(|error| error.to_string())?;
+            // The marker names both directories; Git answers only for a
+            // checkout whose marker cannot be read the way Git reads it.
+            let GitDirectories {
+                private: git_dir,
+                common: actual_common,
+            } = match git_directories(&record.path) {
+                Some(directories) => directories,
+                None => GitDirectories {
+                    common: git
+                        .common_dir(&record.path, cancellation)
+                        .map_err(|error| error.to_string())?,
+                    private: git
+                        .git_dir(&record.path, cancellation)
+                        .map_err(|error| error.to_string())?,
+                },
+            };
             if actual_common != common_dir {
                 return Err(format!(
                     "{} now belongs to another repository",
                     record.path.display()
                 ));
             }
-            let git_dir = git
-                .git_dir(&record.path, cancellation)
-                .map_err(|error| error.to_string())?;
-            let census = {
-                let index = git
-                    .index_paths(&record.path, cancellation)
-                    .map_err(|error| error.to_string())?;
-                Census::new(
-                    index.paths.iter().map(|path| path.as_os_str().as_bytes()),
-                    index.gitlinks,
-                )?
+            let remote = network_filesystem(&record.path).map_err(|error| error.to_string())?;
+            let index = IndexIdentity::of(&git_dir).filter(|_| !remote && polling.is_none());
+            let census = match old
+                .filter(|old| index.is_some() && old.index == index && old.git_dir == git_dir)
+            {
+                Some(old) => old.census.clone(),
+                None => {
+                    let paths = git
+                        .index_paths(&record.path, cancellation)
+                        .map_err(|error| error.to_string())?;
+                    let census = Arc::new(Census::new(
+                        paths.paths.iter().map(|path| path.as_os_str().as_bytes()),
+                        paths.gitlinks,
+                    )?);
+                    let censuses = censuses.get_or_insert_with(|| {
+                        let mut shared = HashSet::new();
+                        retained
+                            .values()
+                            .filter(|worktree| shared.insert(Arc::as_ptr(&worktree.census)))
+                            .map(|worktree| worktree.census.clone())
+                            .collect()
+                    });
+                    match censuses.get(&census) {
+                        Some(known) => known.clone(),
+                        None => {
+                            censuses.insert(census.clone());
+                            census
+                        }
+                    }
+                }
             };
-            let census = worktrees
-                .iter()
-                .chain(previous.iter().flat_map(|previous| &previous.worktrees))
-                .map(|worktree| &worktree.census)
-                .find(|known| ***known == census)
-                .cloned()
-                .unwrap_or_else(|| Arc::new(census));
             let worktree_polling = if census.submodules {
                 Some("submodule contents require a periodic local Git check".into())
             } else {
-                network_filesystem(&record.path)
-                    .map_err(|error| error.to_string())?
+                remote
                     .then(|| "network or FUSE filesystem may omit native change events".to_owned())
             };
             worktrees.push(Worktree {
@@ -232,6 +338,7 @@ impl Project {
                 root: record.path.clone(),
                 git_dir,
                 census,
+                index,
                 polling: worktree_polling,
             });
         }
@@ -885,14 +992,16 @@ impl Monitor {
                     pending.retain_failures(&mut failures);
                     for (&id, project) in &projects {
                         let coverage = !failures.contains_key(&id);
+                        let before = old
+                            .get(&id)
+                            .into_iter()
+                            .flat_map(|project| &project.worktrees)
+                            .map(|worktree| (worktree.id, worktree))
+                            .collect::<HashMap<_, _>>();
                         let changed = project
                             .worktrees
                             .iter()
-                            .filter(|worktree| {
-                                old.get(&id).and_then(|project| {
-                                    project.worktrees.iter().find(|old| old.id == worktree.id)
-                                }) != Some(*worktree)
-                            })
+                            .filter(|worktree| before.get(&worktree.id) != Some(worktree))
                             .map(|worktree| worktree.id)
                             .collect::<BTreeSet<_>>();
                         let worktrees = if changed.is_empty() && rearmed.contains(&id) {
@@ -1107,6 +1216,7 @@ mod tests {
                     root: first,
                     git_dir: common.clone(),
                     census: census.clone(),
+                    index: None,
                     polling: None,
                 },
                 Worktree {
@@ -1114,6 +1224,7 @@ mod tests {
                     root: linked,
                     git_dir: common.join("worktrees/linked"),
                     census,
+                    index: None,
                     polling: None,
                 },
             ],
@@ -1250,6 +1361,180 @@ mod tests {
         assert_eq!(main.tracks(&first.join("vendor")), Some(Tracked::Directory));
         assert!(submodule.polling.is_some());
         assert!(worktree(&submodule, &linked).polling.is_none());
+    }
+
+    /// Runs Git, recording each command's subcommand.
+    #[derive(Default)]
+    struct Recording(Mutex<Vec<String>>);
+
+    impl Recording {
+        fn take(&self) -> Vec<String> {
+            std::mem::take(&mut self.0.lock().unwrap())
+        }
+    }
+
+    impl ProcessExecutor for Recording {
+        fn execute(
+            &self,
+            command: &crate::process::CommandSpec,
+            cancellation: &CancellationToken,
+        ) -> Result<crate::process::ProcessOutput, crate::process::ProcessFailure> {
+            // Global options and their values precede the subcommand.
+            let mut arguments = command.arguments.iter().map(|argument| argument.to_str());
+            let subcommand = loop {
+                match arguments.next().flatten() {
+                    Some("-C" | "-c") => {
+                        arguments.next();
+                    }
+                    Some(option) if option.starts_with('-') => {}
+                    other => break other.unwrap_or_default().to_owned(),
+                }
+            };
+            self.0.lock().unwrap().push(subcommand);
+            crate::process::SystemProcessExecutor.execute(
+                &command
+                    .clone()
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_NOSYSTEM", "1"),
+                cancellation,
+            )
+        }
+    }
+
+    #[test]
+    fn replans_find_git_directories_without_git_and_read_only_rewritten_indexes() {
+        let directory = tempfile::tempdir().unwrap();
+        let directory = directory.path().canonicalize().unwrap();
+        let first = directory.join("first");
+        std::fs::create_dir_all(first.join("src")).unwrap();
+        std::fs::write(first.join("src/main.rs"), "").unwrap();
+        git(&first, &["init", "-q"]);
+        git(&first, &["add", "."]);
+        git(&first, &["commit", "-qm", "init"]);
+        git(&first, &["worktree", "add", "-q", "../linked"]);
+        git(&first, &["worktree", "add", "-q", "../other"]);
+        let (linked, other) = (directory.join("linked"), directory.join("other"));
+
+        let system = RepositoryService::system("git");
+        let cancellation = CancellationToken::default();
+        let common = system.common_dir(&first, &cancellation).unwrap();
+        let records = system.list_worktrees(&first, &cancellation).unwrap();
+        let every = records
+            .iter()
+            .map(|record| record.id)
+            .collect::<BTreeSet<_>>();
+        let recording = Arc::new(Recording::default());
+        let service = RepositoryService::new("git", recording.clone());
+        let id = ProjectId::new();
+        let read = |previous: Option<&Project>| {
+            Project::read_changed_with(
+                &service,
+                id,
+                common.clone(),
+                &records,
+                &cancellation,
+                previous,
+                &every,
+            )
+        };
+
+        let plan = read(None).unwrap();
+        assert_eq!(
+            recording.take(),
+            ["ls-files"; 3],
+            "one index read per checkout, and no Git process for its directories"
+        );
+        for (worktree, record) in plan.worktrees.iter().zip(&records) {
+            assert_eq!(worktree.root, record.path);
+            assert_eq!(
+                worktree.git_dir,
+                system.git_dir(&record.path, &cancellation).unwrap(),
+                "the marker names the directory Git does"
+            );
+            assert_eq!(
+                system.common_dir(&record.path, &cancellation).unwrap(),
+                common
+            );
+        }
+
+        // A poll naming every worktree finds every index as it was read.
+        let again = read(Some(&plan)).unwrap();
+        assert!(recording.take().is_empty(), "no index was rewritten");
+        for (worktree, old) in again.worktrees.iter().zip(&plan.worktrees) {
+            assert!(Arc::ptr_eq(&worktree.census, &old.census));
+        }
+
+        // Staging rewrites one index, and only that one is read again.
+        std::fs::write(other.join("README.md"), "").unwrap();
+        git(&other, &["add", "README.md"]);
+        let staged = read(Some(&again)).unwrap();
+        assert_eq!(recording.take(), ["ls-files"]);
+        let staged_other = staged
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.root == other)
+            .unwrap();
+        assert_eq!(
+            staged_other.tracks(&other.join("README.md")),
+            Some(Tracked::File)
+        );
+
+        // A marker Git would not follow either is left to Git to explain.
+        std::fs::write(linked.join(".git"), "not a marker\n").unwrap();
+        assert!(read(Some(&staged)).is_err());
+        assert!(recording.take().contains(&"rev-parse".to_owned()));
+    }
+
+    #[test]
+    fn a_rewritten_index_tracking_the_same_paths_needs_no_reread() {
+        struct Accepting;
+
+        impl Watcher for Accepting {
+            fn new<F: notify::EventHandler>(_: F, _: notify::Config) -> notify::Result<Self> {
+                unreachable!("the test constructs it directly")
+            }
+
+            fn watch(&mut self, _: &Path, _: RecursiveMode) -> notify::Result<()> {
+                Ok(())
+            }
+
+            fn unwatch(&mut self, _: &Path) -> notify::Result<()> {
+                Ok(())
+            }
+
+            fn kind() -> notify::WatcherKind {
+                RecommendedWatcher::kind()
+            }
+        }
+
+        let project = project(Path::new("/repo"));
+        let (wake, woken) = mpsc::channel();
+        let monitor = Monitor::with_watcher(
+            move || {
+                let _ = wake.send(());
+            },
+            |_| Ok(Accepting),
+        )
+        .unwrap();
+        let settle = |plan: Project| {
+            monitor.configure(vec![Arc::new(plan)]);
+            woken.recv_timeout(Duration::from_secs(5)).unwrap();
+            monitor.drain().remove(&project.id).unwrap()
+        };
+        assert_eq!(
+            settle(project.clone()).worktrees.len(),
+            2,
+            "a new plan's worktrees are read again once watched"
+        );
+        let mut rewritten = project.clone();
+        rewritten.worktrees[0].index = Some(IndexIdentity {
+            device: 1,
+            inode: 2,
+            size: 3,
+            modified: (4, 5),
+            changed: (6, 7),
+        });
+        assert!(settle(rewritten).worktrees.is_empty());
     }
 
     fn modified(path: PathBuf) -> Event {
