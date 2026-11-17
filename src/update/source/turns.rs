@@ -157,7 +157,7 @@ impl TurnReview {
             Some(source) => source,
             None => super::super::source_client_for(daemon)?,
         };
-        let Client { client, peer } = self.source.insert(source);
+        let Client { client, peer, .. } = self.source.insert(source);
         peer.verify(client.proof())?;
         if self.observations.is_empty() {
             let chats = client

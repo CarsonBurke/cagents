@@ -187,6 +187,49 @@ fn an_exclusive_request_refuses_retryably_at_its_deadline() {
     ));
 }
 
+/// A confirmed stop refused as busy was refused before the daemon read its
+/// capability, so the update can offer the same capability again: the daemon
+/// accepts it once the operation it was finishing ends.
+#[test]
+fn a_confirmed_stop_refused_as_busy_is_accepted_with_the_same_capability() {
+    let fixture = fixture("busy-confirm");
+    let Ok((ServerResponse::ShutdownPreflight(preflight), _, _)) =
+        process_request(&fixture.host, OPERATOR, self::preflight())
+    else {
+        panic!("the preflight was not issued");
+    };
+    let confirm = ClientRequest::ShutdownV1 {
+        version: SHUTDOWN_VERSION,
+        operation: ShutdownOperation::Confirm {
+            capability: preflight.capability,
+        },
+    };
+    let gate = control_gate(&fixture.host);
+    let operation = gate.shared();
+    let refusal = process_request(&fixture.host, OPERATOR, confirm.clone())
+        .map(|(response, _, _)| response)
+        .expect_err("a confirmed stop was admitted beside a shared holder");
+    assert_eq!(refusal.message, crate::terminal_ipc::DAEMON_BUSY);
+    assert!(refusal.retryable);
+
+    drop(operation);
+    let accepted = process_request(&fixture.host, OPERATOR, confirm);
+    assert!(
+        matches!(
+            accepted,
+            Ok((
+                ServerResponse::ShutdownOutcome(crate::terminal_ipc::ShutdownOutcome::Accepted {
+                    live_terminals_before: 1,
+                    termination_requested: true,
+                }),
+                _,
+                true,
+            ))
+        ),
+        "the same capability was not accepted after the busy refusal: {accepted:?}"
+    );
+}
+
 #[test]
 fn an_exclusive_request_is_admitted_under_steady_request_traffic() {
     let fixture = fixture("exclusive-under-traffic");

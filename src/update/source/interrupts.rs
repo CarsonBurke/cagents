@@ -308,7 +308,7 @@ impl Interrupts {
         let socket = crate::terminal_ipc::daemon_socket_path()?;
         let mut source =
             Client::connect_until(&socket, deadline).map_err(|error| invalid(error.to_string()))?;
-        let Client { client, peer } = &mut source;
+        let Client { client, peer, .. } = &mut source;
         if client.proof() != &consent.capability.proof {
             return Err(invalid("The source daemon changed before interruption"));
         }
@@ -333,7 +333,7 @@ impl Interrupts {
     /// Return the exact conversations still awaiting provider or run settlement.
     /// The caller owns cancellation, pacing and the overall deadline.
     pub(in crate::update) fn poll(&mut self) -> Result<Vec<TerminalId>, UpdateError> {
-        let Some(Client { client, peer }) = &mut self.source else {
+        let Some(Client { client, peer, .. }) = &mut self.source else {
             return Ok(Vec::new());
         };
         peer.verify(client.proof())?;

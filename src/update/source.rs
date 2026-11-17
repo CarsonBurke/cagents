@@ -26,6 +26,10 @@ use std::{
 pub(crate) struct Client {
     pub(super) client: ControlClient,
     pub(super) peer: Peer,
+    /// How long requests the source refuses as busy are asked again.
+    busy: BusyPatience,
+    busy_pause: Duration,
+    attempt_allowance: Duration,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -45,25 +49,117 @@ pub(crate) enum PrepareError {
 }
 
 /// How long a confirmed preparation keeps retrying a source that is busy with
-/// another operation, and how long it pauses between attempts. Each attempt
-/// keeps the full reply allowance, so a slow acceptance is never misread as an
-/// unconfirmed one.
+/// another operation. Each attempt keeps the full reply allowance, so a slow
+/// acceptance is never misread as an unconfirmed one.
 const PREPARE_BUSY_PATIENCE: Duration = Duration::from_secs(60);
-const PREPARE_BUSY_PAUSE: Duration = Duration::from_secs(1);
+/// How long any source request refused as busy waits before it is asked again.
+/// Each attempt first queues for exclusive admission, holding back other
+/// clients' ordinary requests, so the pause gives them room in between.
+const SOURCE_BUSY_PAUSE: Duration = Duration::from_secs(1);
 
-fn prepare_retrying_busy(
-    mut attempt: impl FnMut() -> Result<(u64, u64), PrepareError>,
-    patience: Duration,
+/// How long one exclusive source request can take even when it is admitted:
+/// the daemon queues a stop preflight or confirmation for exclusive admission
+/// for up to 2.5 s (`host::client::exclusive_patience`), and then answers.
+/// A request sharing a deadline is not sent with less than this left, so a run
+/// of such requests ends near its deadline however the source is loaded; only
+/// an admitted reply slower than the remaining half second can run past it.
+const SOURCE_ATTEMPT_ALLOWANCE: Duration = Duration::from_secs(3);
+
+/// How long one source request that the source refused while finishing another
+/// operation keeps being asked again, unless its caller shares one deadline
+/// across several requests. Such a refusal changed nothing, so asking again is
+/// safe; the caller is already waiting on the answer.
+const SOURCE_BUSY_PATIENCE: Duration = Duration::from_secs(30);
+
+/// How long source requests refused as busy keep being asked again.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum BusyPatience {
+    /// Each request may be asked again for this long.
+    PerRequest(Duration),
+    /// Every request shares this deadline, so a run of several requests ends
+    /// within a known time however busy the source stays: no attempt starts
+    /// unless its admission wait and a prompt reply fit before the deadline.
+    Until(Instant),
+}
+
+impl BusyPatience {
+    /// Each request is asked again for [`SOURCE_BUSY_PATIENCE`].
+    pub(crate) const PER_REQUEST: Self = Self::PerRequest(SOURCE_BUSY_PATIENCE);
+    /// Each request is asked once; a busy refusal is final.
+    #[cfg(any(feature = "host", test))]
+    pub(crate) const ONCE: Self = Self::PerRequest(Duration::ZERO);
+
+    /// One deadline, `patience` from now, for every request that uses it.
+    pub(crate) fn shared_for(patience: Duration) -> Self {
+        Self::Until(Instant::now() + patience)
+    }
+
+    /// One deadline, [`SOURCE_BUSY_PATIENCE`] from now, for a run of requests
+    /// that answers one question, such as a recovery check.
+    pub(crate) fn for_one_run() -> Self {
+        Self::shared_for(SOURCE_BUSY_PATIENCE)
+    }
+
+    fn give_up(self) -> Instant {
+        match self {
+            Self::PerRequest(patience) => Instant::now() + patience,
+            Self::Until(deadline) => deadline,
+        }
+    }
+}
+
+/// Asks `attempt` again, after `pause`, while its error is `busy` and the
+/// next attempt would start before `give_up`. Any other reply is final at once.
+fn retrying_busy<T, E>(
+    mut attempt: impl FnMut() -> Result<T, E>,
+    busy: impl Fn(&E) -> bool,
+    give_up: Instant,
     pause: Duration,
-) -> Result<(u64, u64), PrepareError> {
-    let give_up = Instant::now() + patience;
+) -> Result<T, E> {
     loop {
         match attempt() {
-            Err(PrepareError::Busy(_)) if Instant::now() + pause < give_up => {
+            Err(error) if busy(&error) && Instant::now() + pause < give_up => {
                 std::thread::sleep(pause);
             }
             reply => return reply,
         }
+    }
+}
+
+fn prepare_retrying_busy(
+    attempt: impl FnMut() -> Result<(u64, u64), PrepareError>,
+    patience: Duration,
+    pause: Duration,
+) -> Result<(u64, u64), PrepareError> {
+    retrying_busy(
+        attempt,
+        |error| matches!(error, PrepareError::Busy(_)),
+        Instant::now() + patience,
+        pause,
+    )
+}
+
+/// What an inventory fence still refused as busy when its patience ended says.
+/// The fence only issues an expiring capability, so the check changed nothing;
+/// each caller says what was kept and what to retry.
+pub(crate) const STILL_BUSY_TO_CHECK: &str = "The daemon was busy finishing other operations, so the inventory check could not finish in time; the check itself changed nothing";
+/// What a service stop's preflight or confirmation still refused as busy when
+/// its patience ended says. Neither changed anything.
+pub(crate) const STILL_BUSY_TO_STOP: &str = "The terminal service was busy finishing other operations and refused the stop, so nothing was stopped. Retry the update once it finishes.";
+
+/// One attempt of a request asked again while the source is busy.
+enum Asked {
+    /// The source's ownership no longer verifies; nothing was sent.
+    Unverified(UpdateError),
+    /// A shared deadline left too little time for another attempt, which
+    /// was not sent.
+    OutOfTime,
+    Replied(ControlError),
+}
+
+impl Asked {
+    fn is_busy(&self) -> bool {
+        matches!(self, Self::Replied(error) if error.is_daemon_busy())
     }
 }
 
@@ -222,13 +318,71 @@ impl Client {
         let client = ControlClient::from_stream_at_source_protocol(stream, deadline, protocol)?;
         peer.verify(client.proof())
             .map_err(|error| ControlError::Configure(io::Error::other(error.to_string())))?;
-        Ok(Self { client, peer })
+        Ok(Self {
+            client,
+            peer,
+            busy: BusyPatience::PER_REQUEST,
+            busy_pause: SOURCE_BUSY_PAUSE,
+            attempt_allowance: SOURCE_ATTEMPT_ALLOWANCE,
+        })
     }
 
     /// Recheck the authenticated peer before each source request.
     fn verified(&mut self) -> Result<&mut ControlClient, UpdateError> {
         self.peer.verify(self.client.proof())?;
         Ok(&mut self.client)
+    }
+
+    /// Sets how long this client asks again a request the source refuses as
+    /// busy, so a caller can share one deadline across several requests.
+    pub(crate) fn with_busy_patience(mut self, busy: BusyPatience) -> Self {
+        self.busy = busy;
+        self
+    }
+
+    /// Sends `request`, which the source refuses before admitting anything
+    /// while it finishes another operation, asking it again on the same
+    /// connection within this client's busy patience. Ownership is rechecked
+    /// before every attempt. Under a shared deadline, no attempt is sent
+    /// unless its admission wait and a prompt reply fit before that deadline. A source still busy when
+    /// patience ends is reported as [`UpdateError::SourceBusy`] with
+    /// `still_busy`, naming the authenticated daemon; any other reply is final
+    /// at once.
+    fn asked_while_busy<T>(
+        &mut self,
+        mut request: impl FnMut(&mut ControlClient) -> Result<T, ControlError>,
+        still_busy: &str,
+    ) -> Result<T, UpdateError> {
+        let (give_up, pause) = (self.busy.give_up(), self.busy_pause);
+        let shared = matches!(self.busy, BusyPatience::Until(_));
+        let allowance = self.attempt_allowance;
+        let reply = retrying_busy(
+            || {
+                // Rechecked even when no time is left, so a busy result only
+                // ever names a daemon that still owns the source.
+                let client = self.verified().map_err(Asked::Unverified)?;
+                if shared && Instant::now() + allowance > give_up {
+                    return Err(Asked::OutOfTime);
+                }
+                request(client).map_err(Asked::Replied)
+            },
+            Asked::is_busy,
+            give_up,
+            pause,
+        );
+        match reply {
+            Ok(reply) => Ok(reply),
+            Err(Asked::Unverified(error)) => Err(error),
+            Err(Asked::OutOfTime) => Err(UpdateError::SourceBusy {
+                serving: Box::new(self.proof().clone()),
+                message: still_busy.into(),
+            }),
+            Err(Asked::Replied(error)) if error.is_daemon_busy() => Err(UpdateError::SourceBusy {
+                serving: Box::new(self.proof().clone()),
+                message: still_busy.into(),
+            }),
+            Err(Asked::Replied(error)) => Err(invalid(error.to_string())),
+        }
     }
 
     /// The authenticated local socket peer, for a read-only shutdown survivor
@@ -274,13 +428,14 @@ impl Client {
                 "The source migration capability no longer matches its reviewed ownership",
             )));
         }
+        let pause = self.busy_pause;
         prepare_retrying_busy(
             || {
                 let client = self.verified().map_err(PrepareError::Invalid)?;
                 prepare_reply(client.prepare_confirmed_upgrade(impact.clone(), relaunch_agents))
             },
             PREPARE_BUSY_PATIENCE,
-            PREPARE_BUSY_PAUSE,
+            pause,
         )
     }
 }
@@ -294,13 +449,16 @@ impl Client {
             .map_err(|error| invalid(error.to_string()))
     }
 
+    /// The capability a service stop confirms. Preflight only issues an
+    /// expiring capability, and a busy source refuses it before issuing
+    /// anything, so it is asked again while busy.
     pub(crate) fn shutdown_preflight(
         &mut self,
     ) -> Result<crate::terminal_ipc::ShutdownCapability, UpdateError> {
-        self.verified()?
-            .shutdown_preflight()
-            .map(|preflight| preflight.capability)
-            .map_err(|error| invalid(error.to_string()))
+        let preflight =
+            self.asked_while_busy(ControlClient::shutdown_preflight, STILL_BUSY_TO_STOP)?;
+        self.peer.verify(self.client.proof())?;
+        Ok(preflight.capability)
     }
 
     pub(crate) fn confirm_shutdown(
@@ -310,9 +468,14 @@ impl Client {
         if &capability.proof != self.proof() {
             return Err(invalid("The source changed before its confirmed stop"));
         }
-        self.verified()?
-            .confirm_shutdown(capability)
-            .map_err(|error| invalid(error.to_string()))
+        // The gate refuses a busy stop before reading its capability, so the
+        // same capability is offered again; one that expires meanwhile is
+        // answered as Expired, and the review starts over. Ownership is not
+        // rechecked after the reply: an accepted stop lets the source exit.
+        self.asked_while_busy(
+            |client| client.confirm_shutdown(capability.clone()),
+            STILL_BUSY_TO_STOP,
+        )
     }
 
     /// The conversations the source lists, as it issued them.
@@ -326,10 +489,8 @@ impl Client {
     /// RPCs. Preflight only issues an ephemeral capability; it never stops,
     /// adopts or replays a session. No capability is confirmed by this reader.
     pub(crate) fn inventory_generation(&mut self) -> Result<u64, UpdateError> {
-        let preflight = self
-            .verified()?
-            .shutdown_preflight()
-            .map_err(|error| invalid(error.to_string()))?;
+        let preflight =
+            self.asked_while_busy(ControlClient::shutdown_preflight, STILL_BUSY_TO_CHECK)?;
         self.peer.verify(self.client.proof())?;
         if preflight.capability.proof != *self.client.proof() {
             return Err(invalid("The inventory fence belongs to another daemon"));
@@ -976,6 +1137,285 @@ mod prepare_receipt_tests {
         );
         assert!(matches!(reply, Err(PrepareError::Busy(_))));
         assert!((1..=5).contains(&attempts), "{attempts} attempts");
+    }
+
+    /// A source client over a socket pair whose peer is this test process,
+    /// which holds a private daemon lease recorded for the client's proof.
+    struct LeasedSource {
+        client: Client,
+        _lease: File,
+        /// Each request the source received, in order.
+        asked: std::sync::mpsc::Receiver<ClientRequest>,
+        server: std::thread::JoinHandle<()>,
+        _directory: tempfile::TempDir,
+    }
+
+    fn lease_proof() -> HostSessionProof {
+        HostSessionProof {
+            host_session_id: HostSessionId::new("busy-source"),
+            boot_id: crate::daemon::read_boot_id().unwrap(),
+            host_incarnation: HostIncarnation::new("daemon"),
+        }
+    }
+
+    fn write_lease(lease: &File, proof: &HostSessionProof) {
+        use std::io::{Seek, SeekFrom};
+        lease.set_len(0).unwrap();
+        (&*lease).seek(SeekFrom::Start(0)).unwrap();
+        serde_json::to_writer(
+            lease,
+            &serde_json::json!({"pid": std::process::id(), "proof": proof}),
+        )
+        .unwrap();
+    }
+
+    /// Answers each request with the next of `replies` on one connection.
+    /// `before_reply` runs on the lease just before the reply with its index
+    /// is written.
+    fn leased_source(
+        replies: Vec<ServerMessage>,
+        before_reply: Option<(usize, fn(&File))>,
+    ) -> LeasedSource {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let lease = fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(directory.path().join("cagentsd.lock"))
+            .unwrap();
+        // SAFETY: flock receives a live descriptor and no pointers.
+        assert_eq!(
+            unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let proof = lease_proof();
+        write_lease(&lease, &proof);
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let (sender, asked) = std::sync::mpsc::channel();
+        let served = proof.clone();
+        let held = lease.try_clone().unwrap();
+        let server = std::thread::spawn(move || {
+            let reply = |peer: &mut UnixStream, request_id, message| {
+                write_frame(
+                    peer,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(request_id),
+                        proof: served.clone(),
+                        message,
+                    },
+                )
+                .unwrap();
+            };
+            let connect: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+            reply(
+                &mut peer,
+                connect.request_id,
+                ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: served.clone(),
+                        resumed: Vec::new(),
+                    },
+                },
+            );
+            for (index, message) in replies.into_iter().enumerate() {
+                let Ok(Some(request)) = read_frame::<ClientEnvelope>(&mut peer) else {
+                    return;
+                };
+                let _ = sender.send(request.request);
+                if let Some((at, change)) = before_reply
+                    && at == index
+                {
+                    change(&held);
+                }
+                reply(&mut peer, request.request_id, message);
+            }
+        });
+        let socket = directory.path().join("cagentsd.sock");
+        let observed = Peer::observe(&stream, &socket).unwrap();
+        let client = Client {
+            client: ControlClient::from_stream(stream).unwrap(),
+            peer: observed,
+            busy: BusyPatience::PER_REQUEST,
+            busy_pause: Duration::from_millis(1),
+            attempt_allowance: Duration::ZERO,
+        };
+        assert_eq!(client.proof(), &proof);
+        LeasedSource {
+            client,
+            _lease: lease,
+            asked,
+            server,
+            _directory: directory,
+        }
+    }
+
+    impl LeasedSource {
+        /// Ends the connection and returns every request the source received.
+        fn finish(self) -> Vec<ClientRequest> {
+            drop(self.client);
+            self.server.join().unwrap();
+            self.asked.try_iter().collect()
+        }
+    }
+
+    fn busy() -> ServerMessage {
+        ServerMessage::Error(ProtocolError::new(
+            ProtocolErrorCode::Internal,
+            crate::terminal_ipc::DAEMON_BUSY,
+            true,
+        ))
+    }
+
+    fn capability(generation: u64) -> ShutdownCapability {
+        ShutdownCapability {
+            proof: lease_proof(),
+            token: "fence".into(),
+            inventory_generation: generation,
+            live_terminals: 0,
+            background_subagents: 0,
+            background_identity: String::new(),
+            expires_at_unix_ms: i64::MAX,
+        }
+    }
+
+    fn preflight(generation: u64) -> ServerMessage {
+        ServerMessage::Response {
+            response: ServerResponse::ShutdownPreflight(crate::terminal_ipc::ShutdownPreflight {
+                capability: capability(generation),
+            }),
+        }
+    }
+
+    /// The inventory fence is refused before anything is issued while the
+    /// daemon finishes another operation, so a recovery check asks again on
+    /// the same connection instead of reporting the daemon's terminals missing.
+    #[test]
+    fn a_busy_source_is_asked_again_for_its_inventory_fence() {
+        let mut source = leased_source(vec![busy(), busy(), preflight(7)], None);
+        assert_eq!(source.client.inventory_generation().unwrap(), 7);
+        assert_eq!(source.finish().len(), 3);
+    }
+
+    /// A confirmed stop refused as busy was refused before its capability was
+    /// read, so the same capability is offered again and can be accepted.
+    #[test]
+    fn a_busy_stop_offers_the_same_capability_again() {
+        let accepted = ServerMessage::Response {
+            response: ServerResponse::ShutdownOutcome(
+                crate::terminal_ipc::ShutdownOutcome::Accepted {
+                    live_terminals_before: 1,
+                    termination_requested: true,
+                },
+            ),
+        };
+        let mut source = leased_source(vec![busy(), accepted], None);
+        let outcome = source.client.confirm_shutdown(capability(3)).unwrap();
+        assert!(matches!(
+            outcome,
+            crate::terminal_ipc::ShutdownOutcome::Accepted { .. }
+        ));
+        let asked = source.finish();
+        assert_eq!(asked.len(), 2);
+        for request in asked {
+            assert!(matches!(
+                request,
+                ClientRequest::ShutdownV1 {
+                    operation: crate::terminal_ipc::ShutdownOperation::Confirm { capability: offered },
+                    ..
+                } if offered == capability(3)
+            ));
+        }
+    }
+
+    /// Ownership is rechecked before every attempt: a source whose lease
+    /// changed while it was busy is never asked again.
+    #[test]
+    fn a_busy_source_is_reauthenticated_before_it_is_asked_again() {
+        let mut source = leased_source(
+            vec![busy(), preflight(7)],
+            Some((0, |lease| {
+                let taken = HostSessionProof {
+                    host_incarnation: HostIncarnation::new("another-daemon"),
+                    ..lease_proof()
+                };
+                write_lease(lease, &taken);
+            })),
+        );
+        let error = source.client.inventory_generation().unwrap_err();
+        assert!(error.to_string().contains("ownership changed"), "{error}");
+        assert_eq!(source.finish().len(), 1);
+    }
+
+    /// A source still busy when patience ends names the daemon that refused
+    /// and says that nothing changed. A shared deadline bounds a whole run of
+    /// requests: once it has passed, the next request is not sent at all.
+    #[test]
+    fn a_source_still_busy_past_a_shared_deadline_says_nothing_changed() {
+        let mut source = leased_source(vec![busy(); 200], None);
+        source.client = source
+            .client
+            .with_busy_patience(BusyPatience::shared_for(Duration::from_millis(50)));
+        source.client.busy_pause = Duration::from_millis(10);
+        let started = Instant::now();
+        let error = source.client.inventory_generation().unwrap_err();
+        assert!(
+            matches!(&error, UpdateError::SourceBusy { serving, message }
+                if **serving == lease_proof() && message == STILL_BUSY_TO_CHECK),
+            "{error:?}"
+        );
+        let fenced = source.asked.try_iter().count();
+        assert!((2..=6).contains(&fenced), "{fenced} fences");
+        // The retry stops once a pause would cross the deadline, which may
+        // still be a few milliseconds ahead; be past it.
+        std::thread::sleep(Duration::from_millis(60));
+        let error = source.client.shutdown_preflight().unwrap_err();
+        assert!(
+            matches!(&error, UpdateError::SourceBusy { message, .. } if message == STILL_BUSY_TO_STOP)
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(source.finish().is_empty());
+    }
+
+    /// Under a shared deadline an attempt is sent only if it can finish,
+    /// admission wait included, before the deadline; a lone request with its
+    /// own patience is always asked at least once.
+    #[test]
+    fn a_shared_deadline_sends_no_attempt_it_cannot_finish() {
+        let mut source = leased_source(vec![preflight(7)], None);
+        source.client.attempt_allowance = SOURCE_ATTEMPT_ALLOWANCE;
+        source.client = source
+            .client
+            .with_busy_patience(BusyPatience::shared_for(Duration::from_secs(1)));
+        let error = source.client.inventory_generation().unwrap_err();
+        assert!(matches!(error, UpdateError::SourceBusy { .. }), "{error:?}");
+        assert!(source.finish().is_empty());
+
+        let mut source = leased_source(vec![preflight(7)], None);
+        source.client.attempt_allowance = SOURCE_ATTEMPT_ALLOWANCE;
+        source.client = source.client.with_busy_patience(BusyPatience::ONCE);
+        assert_eq!(source.client.inventory_generation().unwrap(), 7);
+        assert_eq!(source.finish().len(), 1);
+    }
+
+    /// Any refusal other than busy is final at once and keeps its own words.
+    #[test]
+    fn another_refusal_is_not_asked_again() {
+        let mut source = leased_source(
+            vec![ServerMessage::Error(ProtocolError::new(
+                ProtocolErrorCode::InvalidRequest,
+                "Not now",
+                false,
+            ))],
+            None,
+        );
+        let error = source.client.shutdown_preflight().unwrap_err();
+        assert!(matches!(&error, UpdateError::Invalid(message) if message.contains("Not now")));
+        assert_eq!(source.finish().len(), 1);
     }
 }
 
