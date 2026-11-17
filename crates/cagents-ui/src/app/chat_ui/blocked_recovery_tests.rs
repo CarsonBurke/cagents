@@ -1228,9 +1228,9 @@ fn a_pending_paste_disables_fresh_in_place() {
     );
 }
 
-/// While a chat closes, its unsent draft stays in the composer, read-only.
-/// It is the composer's own editor, which shapes only the rows it shows, not
-/// a text copy of the draft that shaped all of it at once (#2973).
+/// While a chat closes, its unsent draft stays in the composer, read-only but
+/// selectable. It is the composer's own editor, which shapes only the rows it
+/// shows, not a text copy of the draft that shaped all of it at once (#2973).
 #[test]
 fn a_closing_chat_keeps_its_draft_in_the_read_only_composer() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -1263,12 +1263,25 @@ fn a_closing_chat_keeps_its_draft_in_the_read_only_composer() {
         },
     );
     let (tree, _) = frame(app.card_view(card, true, false), 1200.0, None);
-    assert_eq!(composer(&tree), [(true, true)], "the same draft, read-only");
+    assert_eq!(
+        composer(&tree),
+        [(true, false)],
+        "the same draft, read-only"
+    );
     assert!(
         !labels(&tree)
             .iter()
             .any(|label| label.contains("A line of a long unsent draft.")),
         "no text copy of the draft"
     );
-    assert_eq!(chat_runtime(&app, card).composer.text(), draft);
+
+    // It can still be selected and copied, but not changed.
+    drop(app.handle_chat_ui(Action::ReadComposer(target, text_editor::Action::SelectAll)));
+    drop(app.handle_chat_ui(Action::ReadComposer(
+        target,
+        text_editor::Action::Edit(text_editor::Edit::Delete),
+    )));
+    let composer = &chat_runtime(&app, card).composer;
+    assert_eq!(composer.text(), draft);
+    assert_eq!(composer.selection().as_deref(), Some(draft.as_str()));
 }

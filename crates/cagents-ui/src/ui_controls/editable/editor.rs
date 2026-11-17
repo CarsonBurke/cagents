@@ -12,6 +12,7 @@ pub struct TextEditor<'a, Message> {
     id: Option<Id>,
     on_action: Option<Rc<dyn Fn(text_editor::Action) -> Message + 'a>>,
     on_cursor: Option<Rc<dyn Fn(text_editor::Cursor) -> Message + 'a>>,
+    read_only: bool,
 }
 struct EditorState {
     identity: State,
@@ -26,6 +27,7 @@ impl<'a, Message: Clone + 'static> TextEditor<'a, Message> {
             id: None,
             on_action: None,
             on_cursor: None,
+            read_only: false,
         }
     }
     pub fn id(mut self, id: Id) -> Self {
@@ -38,6 +40,14 @@ impl<'a, Message: Clone + 'static> TextEditor<'a, Message> {
         let action = callback.clone();
         self.inner = self.inner.on_action(move |value| action(value));
         self.on_action = Some(callback);
+        self
+    }
+    /// Text that can be scrolled, selected and copied but not changed. The
+    /// caller's `on_action` still receives the editor's actions, and must
+    /// perform only those that are not edits; assistive technology is told
+    /// the text is read-only and offered no way to replace it.
+    pub fn read_only(mut self) -> Self {
+        self.read_only = true;
         self
     }
     pub fn on_cursor(mut self, callback: impl Fn(text_editor::Cursor) -> Message + 'a) -> Self {
@@ -230,6 +240,9 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for TextEditor<'
         if self.on_action.is_none() {
             node.set_read_only();
             node.set_disabled();
+        } else if self.read_only {
+            node.set_read_only();
+            node.add_action(Action::Focus);
         } else {
             node.add_action(Action::Focus);
             node.add_action(Action::SetValue);
@@ -329,6 +342,7 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for TextEditor<'
                                 }
                             }
                         }
+                        (Action::SetValue | Action::ReplaceSelectedText, _) if self.read_only => {}
                         (Action::SetValue, Some(ActionData::Value(value))) => {
                             shell.publish(action(text_editor::Action::SelectAll));
                             shell.publish(action(text_editor::Action::Edit(
@@ -506,5 +520,52 @@ mod tests {
             }
         }
         assert_eq!(content.text(), "éX end");
+    }
+
+    #[test]
+    fn read_only_text_is_announced_read_only_and_refuses_replacement() {
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let content = text_editor::Content::with_text("kept draft");
+        let id = Id::new("test.form.read-only");
+        let mut messages = Vec::new();
+        let mut editor = TextEditor::new("Message", &content)
+            .id(id.clone())
+            .read_only()
+            .on_action(Message::Edit);
+        let mut tree = Tree::new(&editor as &dyn Widget<Message, Theme, Renderer>);
+        let node = editor.layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(400.0, 180.0)),
+        );
+        let layout = Layout::new(&node);
+        let accessible = editor.a11y_nodes(layout, &tree, mouse::Cursor::Unavailable);
+        let field = accessible.root()[0].node();
+        assert!(field.is_read_only());
+        assert!(!field.is_disabled(), "it can still be read and selected");
+        assert!(field.supports_action(Action::Focus));
+        assert!(!field.supports_action(Action::SetValue));
+        assert!(!field.supports_action(Action::ReplaceSelectedText));
+        for action in [Action::SetValue, Action::ReplaceSelectedText] {
+            editor.update(
+                &mut tree,
+                &Event::A11y(
+                    id.clone(),
+                    ActionRequest {
+                        action,
+                        target_tree: TreeId::ROOT,
+                        target_node: A11yId::from(id.clone()).into(),
+                        data: Some(ActionData::Value("replaced".into())),
+                    },
+                ),
+                layout,
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &layout.bounds(),
+            );
+        }
+        assert!(messages.is_empty(), "{messages:?}");
     }
 }

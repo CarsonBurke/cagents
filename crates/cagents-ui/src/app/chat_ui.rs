@@ -323,6 +323,9 @@ pub enum Action {
     /// that cannot resume offers both and does neither on its own.
     StartFresh(CardId),
     Composer(Target, text_editor::Action),
+    /// The composer's draft while its conversation changes hands: it can be
+    /// scrolled, selected and copied, but edits are dropped.
+    ReadComposer(Target, text_editor::Action),
     /// Lets the laid-out editor move Up before starting prompt history.
     ComposerUp(Target),
     ComposerCursor(Target, text_editor::Cursor),
@@ -703,6 +706,7 @@ impl Action {
             | Self::FindLocated(target, ..)
             // Typing, caret moves and scrolling arrive at input rate.
             | Self::Composer(target, ..)
+            | Self::ReadComposer(target, ..)
             | Self::ComposerCursor(target, ..)
             | Self::Scrolled(target, ..)
             | Self::CompletionScrolled(target, ..)
@@ -755,6 +759,7 @@ impl Action {
             Self::ToggleBlockedDetails(..) => "ToggleBlockedDetails",
             Self::CopyBlockedDetails(..) => "CopyBlockedDetails",
             Self::Composer(..) => "Composer",
+            Self::ReadComposer(..) => "ReadComposer",
             Self::ComposerUp(..) => "ComposerUp",
             Self::ComposerCursor(..) => "ComposerCursor",
             Self::Paste(..) => "Paste",
@@ -12919,6 +12924,13 @@ impl Cagents {
                     runtime.recall(true);
                 }
                 return task;
+            }
+            Action::ReadComposer(target, action) => {
+                if !action.is_edit()
+                    && let Some(runtime) = self.chat_runtime_mut(target)
+                {
+                    runtime.composer.perform(action);
+                }
             }
             Action::Composer(target, action) => {
                 let mut files = None;

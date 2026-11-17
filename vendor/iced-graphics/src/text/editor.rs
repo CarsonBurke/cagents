@@ -101,8 +101,9 @@ impl editor::Editor for Editor {
 
         // cagents: leave the lines unshaped. The buffer has no height yet, so
         // shaping here would cover every line, under the process-wide font
-        // lock, with attributes the first `update` replaces anyway. That
-        // `update` sizes the buffer and shapes only what its viewport shows.
+        // lock, usually with attributes the first `update` replaces anyway.
+        // That `update` sizes the buffer and shapes only what its viewport
+        // shows.
         let version = text::font_system()
             .read()
             .expect("Read font system")

@@ -3365,9 +3365,8 @@ impl Runtime {
         } else {
             iced::widget::Space::new().height(0).into()
         };
-        // The editor grows with the draft up to the ceiling, then scrolls,
-        // and its thumb floats over the text's right edge, so the gutter is
-        // reserved inside it.
+        // The editor grows with the draft up to the ceiling, then scrolls.
+        // The vertical rail stays reserved so the text keeps its measure.
         let editor = crate::ui_controls::field::editor("Message", &self.composer)
             .id(card_control_id(target.card, "chat-composer"))
             // Nothing can be typed while the conversation changes hands.
@@ -3383,11 +3382,15 @@ impl Runtime {
                 composer_editor_style,
             )));
         let editor: Element<'_, Message> = if transitioning {
-            // While the conversation changes hands the draft stays in place,
-            // read-only: an editor without actions takes no input. It is the
-            // same editor rather than a text copy of the draft, which would
-            // shape all of a long draft at once on the UI thread (#2973).
-            editor.into()
+            // While the conversation changes hands the draft stays in place
+            // and can still be scrolled, selected and copied, but not edited.
+            // It is the same editor rather than a text copy of the draft,
+            // which would shape all of a long draft at once on the UI thread
+            // (#2973).
+            editor
+                .read_only()
+                .on_action(move |event| action(Action::ReadComposer(target, event)))
+                .into()
         } else {
             // Up first asks the native editor to resolve its rendered rows.
             // While browsing, both arrows walk whole history entries so a
