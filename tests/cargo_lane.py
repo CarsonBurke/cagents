@@ -211,6 +211,18 @@ class Lane(unittest.TestCase):
         failed = self.lane("--allow-warnings", "build", status=101, messages=[own])
         self.assertEqual(failed.returncode, 101)
 
+    def test_another_gate_can_run_the_build(self):
+        other = self.root / "other-gate"
+        shutil.copy(self.root / "scripts/cargo-gate", other)
+        result = self.lane("--allow-warnings", "--gate", str(other), "build", "--bin", "cagents",
+                           messages=[diagnostic(VENDORED, "warning", "vendored")])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("warning: vendored", result.stderr)
+        self.assertEqual(self.recorded(), [["build", "--message-format=json", "--bin", "cagents"]])
+        (self.root / "scripts/cargo-gate").unlink()
+        self.assertEqual(self.lane("--gate", str(other), "check").returncode, 0)
+        self.assertEqual(self.lane("--gate").returncode, 2)
+
     def test_the_workspace_is_the_one_cargo_uses_from_the_current_directory(self):
         # Another checkout, as native-evidence builds a side with this one's tools.
         other = self.root / "other"

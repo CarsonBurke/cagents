@@ -69,7 +69,8 @@ REHEARSAL_FIXTURES = tuple(f"tests/fixtures/{fixture}" for fixture in (
 JOBS = (
     Job("native evidence", shards=3, suites=(
         Suite("native evidence", "tests/native_evidence.py",
-              sources=("scripts/native-evidence", "scripts/native-evidence-remote", "scripts/native_slots.py"),
+              sources=("scripts/native-evidence", "scripts/native-evidence-remote", "scripts/native_slots.py",
+                       "scripts/run-development", "scripts/cargo-lane", "scripts/cargo_warnings.py"),
               syntax=(("bash", "scripts/native-evidence"), ("bash", "scripts/native-evidence-remote"))),
     )),
     Job("build offload", shards=2, suites=(

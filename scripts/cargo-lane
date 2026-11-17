@@ -2,7 +2,7 @@
 """Run a lane's Cargo command through scripts/cargo-gate, holding the
 workspace's crates to the rule main's build check applies: no warnings.
 
-Usage: scripts/cargo-lane [--allow-warnings] SUBCOMMAND [CARGO ARGS...] [-- HARNESS ARGS...]
+Usage: scripts/cargo-lane [--allow-warnings] [--gate PATH] SUBCOMMAND [CARGO ARGS...] [-- HARNESS ARGS...]
 
 Cargo's messages are read as JSON, which the gate relays from the build host
 unchanged, so nothing about what compiles where, or what is fresh, differs
@@ -20,7 +20,9 @@ run. A --message-format other than `human` or `short`, such as JSON, is
 passed through untouched, with nothing filtered.
 
 The workspace is the one Cargo uses from the current directory, so a
-checkout other than this script's is judged by its own members.
+checkout other than this script's is judged by its own members. --gate runs
+that checkout's scripts/cargo-gate in place of this one's, as
+native-evidence does to build a side as the side's own runner would.
 
 Environment:
   CAGENTS_VENDORED_WARNINGS=1  Show the vendored crates' warnings too
@@ -105,13 +107,18 @@ def main(arguments):
     if arguments[:1] in (["-h"], ["--help"]):
         print(__doc__, end="")
         return 0
-    allow_warnings = arguments[:1] == ["--allow-warnings"]
-    if allow_warnings:
-        arguments = arguments[1:]
+    allow_warnings, gate = False, str(HERE / "cargo-gate")
+    while arguments[:1] in (["--allow-warnings"], ["--gate"]):
+        if arguments[0] == "--allow-warnings":
+            allow_warnings, arguments = True, arguments[1:]
+        elif len(arguments) > 1:
+            gate, arguments = arguments[1], arguments[2:]
+        else:
+            arguments = []
     if not arguments or arguments[0].startswith("-"):
         print(__doc__, end="", file=sys.stderr)
         return 2
-    gate = [str(HERE / "cargo-gate"), arguments[0]]
+    gate = [gate, arguments[0]]
     formats, rest = split_format(arguments[1:])
     parts = [part.strip() for value in formats for part in (value or "").split(",")]
     if None in formats or not set(parts) <= HUMAN:
