@@ -734,7 +734,10 @@ pub enum ControlError {
         expected: &'static str,
         actual: &'static str,
     },
-    #[error("daemon rejected the request ({code:?}): {message}")]
+    /// A busy refusal reads as the daemon's own sentence, without the
+    /// rejected-with-a-code framing that makes it look like a fault: it is
+    /// a wait-and-retry (`is_daemon_busy`), and nothing was admitted.
+    #[error("{}", remote_display(*.code, .message, *.retryable))]
     Remote {
         code: ProtocolErrorCode,
         message: String,
@@ -766,13 +769,21 @@ pub enum ControlError {
     ShutdownRejected(ShutdownOutcome),
 }
 
+fn remote_display(code: ProtocolErrorCode, message: &str, retryable: bool) -> String {
+    if crate::terminal_ipc::is_daemon_busy(message, retryable) {
+        message.to_owned()
+    } else {
+        format!("daemon rejected the request ({code:?}): {message}")
+    }
+}
+
 impl ControlError {
     /// Whether the daemon refused an exclusive request only because another
     /// operation held it past the request's deadline. Nothing was admitted,
     /// so the same request may be sent again.
     pub fn is_daemon_busy(&self) -> bool {
-        matches!(self, Self::Remote { retryable: true, message, .. }
-            if message == crate::terminal_ipc::DAEMON_BUSY)
+        matches!(self, Self::Remote { retryable, message, .. }
+            if crate::terminal_ipc::is_daemon_busy(message, *retryable))
     }
 
     /// The daemon's own sentence for a person; every other failure as it stands.
@@ -5934,6 +5945,34 @@ mod tests {
         );
         let other = ControlError::Connect(std::io::Error::other("refused"));
         assert_eq!(other.reason(), "could not connect to the daemon: refused");
+    }
+
+    /// Every caller that formats a refusal (CLI, tray, stop dialog, update)
+    /// shows a busy daemon as busy, not as a rejected request with an
+    /// internal-error code. Anything else keeps its code.
+    #[test]
+    fn a_busy_refusal_displays_as_the_daemons_wait_and_retry_sentence() {
+        use crate::terminal_ipc::{DAEMON_BUSY, ProtocolErrorCode};
+        let remote = |message: &str, retryable| ControlError::Remote {
+            code: ProtocolErrorCode::Internal,
+            message: message.into(),
+            retryable,
+        };
+        let busy = remote(DAEMON_BUSY, true);
+        assert!(busy.is_daemon_busy());
+        assert_eq!(busy.to_string(), DAEMON_BUSY);
+        for other in [
+            remote(DAEMON_BUSY, false),
+            remote("registry is unavailable", true),
+        ] {
+            assert!(!other.is_daemon_busy());
+            assert!(
+                other
+                    .to_string()
+                    .starts_with("daemon rejected the request (Internal): "),
+                "{other}"
+            );
+        }
     }
 
     /// The installed coordinator, not an older owner's updater, chooses who
