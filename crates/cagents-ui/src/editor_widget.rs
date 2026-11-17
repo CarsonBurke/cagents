@@ -3598,6 +3598,74 @@ mod tests {
             .collect()
     }
 
+    /// The vendored editor splices a multiline insertion in once and drains a
+    /// multiline deletion once (#3001). Both must keep every line, its ending,
+    /// their order and the caret, and record a change that undoes exactly.
+    #[test]
+    fn native_multiline_insert_and_delete_keep_lines_order_and_history() {
+        use cosmic::iced::advanced::graphics::text::cosmic_text::{
+            self, Attrs, Buffer, Cursor, Edit as _, LineEnding, Metrics, Shaping,
+        };
+        fn lines(editor: &cosmic_text::Editor<'static>) -> Vec<(String, LineEnding)> {
+            editor.with_buffer(|buffer| {
+                buffer
+                    .lines
+                    .iter()
+                    .map(|line| (line.text().to_owned(), line.ending()))
+                    .collect()
+            })
+        }
+        let source = "head tail\nnext\r\nlast";
+        let mut buffer = Buffer::new_empty(Metrics::new(14.0, 20.0));
+        buffer.set_text(source, &Attrs::new(), Shaping::Advanced, None);
+        let mut editor = cosmic_text::Editor::new(buffer);
+        let original = lines(&editor);
+        let numbered: String = (0..1000).map(|i| format!("{i:04}\n")).collect();
+        let data = format!("A\r\nB\n\rC\r{numbered}D");
+        editor.start_change();
+        let end = editor.insert_at(Cursor::new(0, 4), &data, None);
+        let mut insertion = editor.finish_change().unwrap();
+
+        let mut expected: Vec<(String, LineEnding)> = vec![
+            ("headA".into(), LineEnding::CrLf),
+            ("B".into(), LineEnding::LfCr),
+            ("C".into(), LineEnding::Cr),
+        ];
+        expected.extend((0..1000).map(|i| (format!("{i:04}"), LineEnding::Lf)));
+        expected.extend([
+            ("D tail".into(), LineEnding::Lf),
+            ("next".into(), LineEnding::CrLf),
+            ("last".into(), LineEnding::None),
+        ]);
+        assert_eq!(lines(&editor), expected);
+        assert_eq!((end.line, end.index), (1003, 1));
+        assert_eq!(insertion.items[0].text, data);
+
+        // Delete from inside the first inserted line to inside the last one.
+        editor.start_change();
+        editor.delete_range(Cursor::new(0, 2), Cursor::new(1003, 3));
+        let mut deletion = editor.finish_change().unwrap();
+        assert_eq!(
+            lines(&editor),
+            [
+                ("heail".to_owned(), LineEnding::Lf),
+                ("next".into(), LineEnding::CrLf),
+                ("last".into(), LineEnding::None),
+            ]
+        );
+        assert_eq!(
+            deletion.items[0].text,
+            format!("adA\r\nB\n\rC\r{numbered}D t")
+        );
+
+        deletion.reverse();
+        assert!(editor.apply_change(&deletion));
+        assert_eq!(lines(&editor), expected);
+        insertion.reverse();
+        assert!(editor.apply_change(&insertion));
+        assert_eq!(lines(&editor), original);
+    }
+
     #[test]
     fn large_splices_preserve_native_lines_endings_and_caret() {
         let source = "α token\r\nβ token\n\rγ token\rδ token\n".repeat(100) + "EOF";
