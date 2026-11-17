@@ -351,6 +351,24 @@ classify_daemon_status() {
     esac
 }
 
+# Validate every purge location before anything is removed.
+resolve_purge_directories() {
+    CACHE_HOME=${XDG_CACHE_HOME:-"$HOME/.cache"}
+    case $CACHE_HOME in
+        /*) ;;
+        *) fail 'XDG_CACHE_HOME must be an absolute path' ;;
+    esac
+    STATE_HOME=${XDG_STATE_HOME:-"$HOME/.local/state"}
+    case $STATE_HOME in
+        /*) ;;
+        *) fail 'XDG_STATE_HOME must be an absolute path' ;;
+    esac
+}
+
+purge_user_data() {
+    rm -rf "$CONFIG_HOME/cagents" "$DATA_HOME/cagents" "$CACHE_HOME/cagents" "$STATE_HOME/cagents"
+}
+
 # An in-app update keeps its job lock and logs in .update and holds the lock for
 # the job's lifetime. Take it, creating it as the updater would if no update has
 # run yet, and keep it until this process exits: an update cannot then start
@@ -496,14 +514,12 @@ prepare_daemon_upgrade() {
 }
 
 uninstall_cagents() {
+    if [ "$PURGE" -eq 1 ]; then
+        resolve_purge_directories
+    fi
     uninstall_installation
     if [ "$PURGE" -eq 1 ]; then
-        CACHE_HOME=${XDG_CACHE_HOME:-"$HOME/.cache"}
-        case $CACHE_HOME in
-            /*) ;;
-            *) fail 'XDG_CACHE_HOME must be an absolute path' ;;
-        esac
-        rm -rf "$CONFIG_HOME/cagents" "$DATA_HOME/cagents" "$CACHE_HOME/cagents"
+        purge_user_data
         printf 'cagents program files and user data have been removed.\n'
     else
         printf 'cagents program files have been removed; user data was preserved.\n'

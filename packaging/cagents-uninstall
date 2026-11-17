@@ -8,11 +8,11 @@ usage() {
 Usage: cagents-uninstall [--prefix PATH] [--purge] [--help]
 
 Remove cagents program files installed by install.sh. User configuration,
-data, and caches are preserved unless --purge is supplied.
+data, caches and state are preserved unless --purge is supplied.
 
 Options:
   --prefix PATH  Installation root (default: $XDG_DATA_HOME/cagents-install)
-  --purge        Also remove cagents user configuration, data, and caches
+  --purge        Also remove cagents user configuration, data, caches and state
   --help         Show this help
 EOF
 }
@@ -158,6 +158,24 @@ classify_daemon_status() {
     esac
 }
 
+# Validate every purge location before anything is removed.
+resolve_purge_directories() {
+    CACHE_HOME=${XDG_CACHE_HOME:-"$HOME/.cache"}
+    case $CACHE_HOME in
+        /*) ;;
+        *) fail 'XDG_CACHE_HOME must be an absolute path' ;;
+    esac
+    STATE_HOME=${XDG_STATE_HOME:-"$HOME/.local/state"}
+    case $STATE_HOME in
+        /*) ;;
+        *) fail 'XDG_STATE_HOME must be an absolute path' ;;
+    esac
+}
+
+purge_user_data() {
+    rm -rf "$CONFIG_HOME/cagents" "$DATA_HOME/cagents" "$CACHE_HOME/cagents" "$STATE_HOME/cagents"
+}
+
 # An in-app update keeps its job lock and logs in .update and holds the lock for
 # the job's lifetime. Take it, creating it as the updater would if no update has
 # run yet, and keep it until this process exits: an update cannot then start
@@ -233,15 +251,12 @@ uninstall_installation() {
 }
 # END shared uninstall
 
-uninstall_installation
-
 if [ "$PURGE" -eq 1 ]; then
-    CACHE_HOME=${XDG_CACHE_HOME:-"$HOME/.cache"}
-    case $CACHE_HOME in
-        /*) ;;
-        *) fail 'XDG_CACHE_HOME must be an absolute path' ;;
-    esac
-    rm -rf "$CONFIG_HOME/cagents" "$DATA_HOME/cagents" "$CACHE_HOME/cagents"
+    resolve_purge_directories
+fi
+uninstall_installation
+if [ "$PURGE" -eq 1 ]; then
+    purge_user_data
 fi
 
 if [ "$PURGE" -eq 1 ]; then

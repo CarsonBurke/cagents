@@ -1051,6 +1051,40 @@ os.execv({real_tar!r}, [{real_tar!r}, *args])
                 self.calls.unlink()
         self.assert_installed(self.install(), 'candidate')
 
+    def purge_environment(self):
+        environment = dict(self.environment, XDG_CACHE_HOME=str(self.home / "custom cache"),
+                           XDG_STATE_HOME=str(self.home / "custom state"))
+        for variable in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"):
+            for name in ("cagents", "cagents-development", "unrelated"):
+                self.write(Path(environment[variable]) / name / "saved", "private fixture\n")
+        return environment
+
+    def test_purge_removes_production_state_under_a_custom_xdg_state_home(self):
+        for uninstaller in self.UNINSTALLERS:
+            with self.subTest(uninstaller=uninstaller):
+                self.install_serving()
+                environment = self.purge_environment()
+                result = self.uninstall(uninstaller, "--purge", environment=environment)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertFalse(self.prefix.exists())
+                for variable in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"):
+                    base = Path(environment[variable])
+                    self.assertFalse((base / "cagents").exists(), variable)
+                    for name in ("cagents-development", "unrelated"):
+                        self.assertEqual((base / name / "saved").read_text(), "private fixture\n")
+                self.calls.unlink()
+
+    def test_purge_with_a_relative_xdg_state_home_changes_nothing(self):
+        self.install_serving()
+        environment = dict(self.purge_environment(), XDG_STATE_HOME="relative state")
+        for uninstaller in self.UNINSTALLERS:
+            with self.subTest(uninstaller=uninstaller):
+                result = self.uninstall(uninstaller, "--purge", environment=environment)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("XDG_STATE_HOME must be an absolute path", result.stderr)
+                self.assert_still_installed()
+                self.assertEqual((self.home / "data/cagents/saved").read_text(), "private fixture\n")
+                self.assertFalse(self.calls.exists())
 
 if __name__ == "__main__":
     unittest.main()

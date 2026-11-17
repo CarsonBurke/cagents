@@ -377,13 +377,15 @@ installations are described in [Daemon and upgrades](daemon.md#full-daemon-upgra
 ## Uninstall or purge
 
 For an `install.sh` installation, run the installed helper. A normal uninstall
-keeps settings, sessions, transcripts, and caches:
+keeps settings, sessions, transcripts, caches and diagnostics:
 
 ```sh
 "${XDG_DATA_HOME:-$HOME/.local/share}/cagents-install/current/bin/cagents-uninstall"
 ```
 
-To remove both program files and all cagents user data:
+To remove both program files and all cagents user data, meaning the `cagents`
+directories under `$XDG_CONFIG_HOME`, `$XDG_DATA_HOME`, `$XDG_CACHE_HOME` and
+`$XDG_STATE_HOME` (see [Files and directories](configuration.md#files-and-directories)):
 
 ```sh
 "${XDG_DATA_HOME:-$HOME/.local/share}/cagents-install/current/bin/cagents-uninstall" --purge

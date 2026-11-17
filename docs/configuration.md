@@ -26,6 +26,7 @@ cagents follows the XDG base-directory convention. Production paths are:
 - Agent attention journal: `${XDG_DATA_HOME:-$HOME/.local/share}/cagents/agent-attention.sqlite3`
 - Terminal transcripts: `${XDG_DATA_HOME:-$HOME/.local/share}/cagents/transcripts/`
 - Cache, when present: `${XDG_CACHE_HOME:-$HOME/.cache}/cagents/`
+- Diagnostics and the GitHub status cache: `${XDG_STATE_HOME:-$HOME/.local/state}/cagents/`
 - Daemon socket and lock: `$XDG_RUNTIME_DIR/cagents/` (shared by full and
   browserless builds; protocol changes do not create a second owner)
 
