@@ -616,9 +616,9 @@ impl Reservation {
     /// busy gate is waited out for up to [`ENROLLMENT_PATIENCE`]. Each busy
     /// attempt has already withdrawn its directory and released the registry
     /// and lifecycle leases, so the wait holds nothing a request admitted to
-    /// the gate could be blocked on. Past the deadline the error is still
-    /// [`EnrollmentBusy`](crate::account::home::EnrollmentBusy), with nothing
-    /// left behind.
+    /// the gate could be blocked on. A refusal that outlasts the patience is
+    /// still [`EnrollmentRefused::Busy`](crate::account::home::EnrollmentRefused),
+    /// with nothing left behind.
     pub(crate) fn create_pending_home(
         &self,
         store: &Store,
@@ -653,15 +653,35 @@ impl Reservation {
         config: crate::account::home::CodexConfig,
         patience: std::time::Duration,
     ) -> std::io::Result<(uuid::Uuid, PathBuf)> {
-        let deadline = std::time::Instant::now() + patience;
-        loop {
+        self.retry_busy_enrollment(std::time::Instant::now() + patience, || {
             self.verify().map_err(std::io::Error::other)?;
-            match store.try_create_pending_reserved(self, homes, provider, started_at, || {
+            store.try_create_pending_reserved(self, homes, provider, started_at, || {
                 self.create_home_initialized(homes, provider, system, config, |_| Ok(()))
-            }) {
+            })
+        })
+    }
+
+    /// Makes `attempt` again while its enrollment is refused as busy, at most
+    /// [`ENROLLMENT_ATTEMPTS`] times in all and never after `deadline`. The
+    /// gate can be free each time it is looked at and taken again before
+    /// enrollment asks, so neither bound alone ends the retries.
+    fn retry_busy_enrollment<T>(
+        &self,
+        deadline: std::time::Instant,
+        mut attempt: impl FnMut() -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
+        use crate::account::home::EnrollmentRefused;
+        let mut attempts = 1;
+        loop {
+            match attempt() {
                 Err(error)
-                    if crate::account::home::EnrollmentBusy::is(&error)
-                        && self.await_writer(deadline) => {}
+                    if matches!(EnrollmentRefused::of(&error), Some(EnrollmentRefused::Busy))
+                        && attempts < ENROLLMENT_ATTEMPTS
+                        && std::time::Instant::now() < deadline
+                        && self.await_writer(deadline) =>
+                {
+                    attempts += 1;
+                }
                 result => return result,
             }
         }
@@ -735,11 +755,12 @@ impl Reservation {
     /// Never load the registry here. Observe original FDs/maps off the control
     /// writer, then atomically replace this immutable roster under a brief
     /// try-write. It never waits for that writer: a request admitted to the
-    /// gate may be blocking on the very leases held here. A busy gate, or
-    /// reservations that changed meanwhile, is
-    /// [`EnrollmentBusy`](crate::account::home::EnrollmentBusy), on which
-    /// creation withdraws the untouched directory; any other failure retains
-    /// the fresh files. Neither publishes a row.
+    /// gate may be blocking on the very leases held here. A busy gate,
+    /// reservations that changed meanwhile, or a daemon that stopped
+    /// admitting changes is an
+    /// [`EnrollmentRefused`](crate::account::home::EnrollmentRefused), on
+    /// which creation withdraws the untouched directory; any other failure
+    /// retains the fresh files. Neither publishes a row.
     fn enroll_created_home(
         &self,
         created: &crate::account::home::NewHomeCreationReceipt,
@@ -815,14 +836,15 @@ impl Reservation {
             .clone();
         let writer = gate
             .try_exclusive()
-            .ok_or_else(crate::account::home::EnrollmentBusy::error)?;
-        super::client::ensure_control_open(&host)
-            .map_err(|error| io::Error::other(error.message))?;
+            .ok_or_else(|| crate::account::home::EnrollmentRefused::Busy.into_error())?;
+        super::client::ensure_control_open(&host).map_err(|error| {
+            crate::account::home::EnrollmentRefused::Closed(error.message).into_error()
+        })?;
         let mut entries = self.map.lock().unwrap_or_else(|p| p.into_inner());
         if !same_basis(&basis, &entries) {
             // Another operation reserved or released in the meantime. Like a
             // busy gate, that leaves this home untouched and worth another try.
-            return Err(crate::account::home::EnrollmentBusy::error());
+            return Err(crate::account::home::EnrollmentRefused::Busy.into_error());
         }
         entries.insert(self.token, Arc::new(updated));
         drop(entries);
@@ -930,6 +952,9 @@ const RESTORE_OVERLAP: std::time::Duration = std::time::Duration::from_secs(
 /// waiting for the answer either way; past this, they are told the daemon is
 /// busy and nothing was created.
 const ENROLLMENT_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
+/// How many times in all creating an account tries to enroll its new home
+/// while the daemon is busy. Each try makes and withdraws a directory.
+const ENROLLMENT_ATTEMPTS: usize = 3;
 
 /// The most sweeps a home whose check did not finish - its provider timed
 /// out, say - is passed over before it is asked about again.
@@ -1784,7 +1809,13 @@ pub(crate) mod tests {
                 std::time::Duration::from_millis(50),
             )
             .unwrap_err();
-        assert!(crate::account::home::EnrollmentBusy::is(&error), "{error}");
+        assert!(
+            matches!(
+                crate::account::home::EnrollmentRefused::of(&error),
+                Some(crate::account::home::EnrollmentRefused::Busy)
+            ),
+            "{error}"
+        );
         assert!(!target.exists(), "the busy attempt withdrew its directory");
         assert!(store.try_load().unwrap().pending().is_empty());
         assert!(
@@ -1807,6 +1838,46 @@ pub(crate) mod tests {
                 .unwrap(),
             (key, target)
         );
+    }
+    #[test]
+    fn busy_enrollment_retries_are_bounded_even_when_the_gate_looks_free() {
+        use crate::account::home::EnrollmentRefused;
+        let (_root, _homes, _store, _host, reservation) = creating(Provider::Codex);
+        let busy = || EnrollmentRefused::Busy.into_error();
+        // The gate is free at every look, yet each attempt is refused.
+        let mut attempts = 0;
+        let error = reservation
+            .retry_busy_enrollment(
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+                || -> std::io::Result<()> {
+                    attempts += 1;
+                    Err(busy())
+                },
+            )
+            .unwrap_err();
+        assert_eq!(attempts, ENROLLMENT_ATTEMPTS);
+        assert!(matches!(
+            EnrollmentRefused::of(&error),
+            Some(EnrollmentRefused::Busy)
+        ));
+        // Past the deadline nothing is tried again, and only busy is retried.
+        let far = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        for (deadline, refusal) in [
+            (std::time::Instant::now(), EnrollmentRefused::Busy),
+            (far, EnrollmentRefused::Closed("closing".into())),
+        ] {
+            let mut refusal = Some(refusal);
+            let mut attempts = 0;
+            let error = reservation
+                .retry_busy_enrollment(deadline, || -> std::io::Result<()> {
+                    attempts += 1;
+                    Err(refusal
+                        .take()
+                        .map_or_else(busy, EnrollmentRefused::into_error))
+                })
+                .unwrap_err();
+            assert_eq!(attempts, 1, "{error}");
+        }
     }
     #[test]
     fn a_creation_waits_out_a_busy_gate_holding_no_lease() {

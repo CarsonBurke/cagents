@@ -40,10 +40,13 @@ impl NewHomeCreationReceipt {
 
     /// Removes the directory this receipt proves was made, once nothing has
     /// been written into it. The name is examined and removed relative to the
-    /// parent descriptor held since `mkdirat`, so no path is resolved again:
-    /// only that name, still bound to that directory, is removed, and the
-    /// kernel refuses to remove it unless it is empty. Anything else is an
-    /// error and leaves every file in place.
+    /// parent descriptor held since `mkdirat`, so no path is resolved again,
+    /// and only while that name still leads to the directory made. The
+    /// kernel removes it only if it is empty. Between that check and the
+    /// removal, another process of this user could put a different, empty
+    /// directory under the name in the private parent; then that empty
+    /// directory is what is removed. Contents are never removed: anything
+    /// else is an error that leaves every file in place.
     #[cfg(any(test, feature = "host"))]
     pub(crate) fn withdraw(self) -> io::Result<()> {
         let name = std::ffi::CString::new(self.key.hyphenated().to_string())
@@ -75,7 +78,13 @@ impl NewHomeCreationReceipt {
         {
             return Err(io::Error::last_os_error());
         }
-        self.parent.sync_all()
+        // The directory is gone either way. A failed sync risks only that a
+        // crash brings back an empty, unlisted directory, which is no reason
+        // to report the removal as retained files.
+        if let Err(error) = self.parent.sync_all() {
+            tracing::warn!(%error, "the withdrawn account directory's removal was not synced");
+        }
+        Ok(())
     }
 }
 /// What host enrollment and initializers read from a fresh home.
@@ -279,17 +288,39 @@ mod tests {
                     CodexConfig::Shared,
                     |created| {
                         created_path = Some(created.home().to_owned());
-                        Err(EnrollmentBusy::error())
+                        Err(EnrollmentRefused::Busy.into_error())
                     },
                 )
             })
             .unwrap_err();
-        assert!(EnrollmentBusy::is(&error), "{error}");
+        assert!(
+            matches!(EnrollmentRefused::of(&error), Some(EnrollmentRefused::Busy)),
+            "{error}"
+        );
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
         let path = created_path.unwrap();
         assert!(!path.exists(), "an untouched busy home is withdrawn");
         assert!(path.parent().unwrap().is_dir());
         assert!(store.load().unwrap().pending().is_empty());
+
+        // A daemon that stopped admitting changes wrote nothing either.
+        let mut closed_path = None;
+        let error = homes
+            .create_with_config_initialized(
+                Provider::Claude,
+                None,
+                CodexConfig::Shared,
+                |created| {
+                    closed_path = Some(created.home().to_owned());
+                    Err(EnrollmentRefused::Closed("closing".into()).into_error())
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            EnrollmentRefused::of(&error),
+            Some(EnrollmentRefused::Closed(message)) if message == "closing"
+        ));
+        assert!(!closed_path.unwrap().exists());
 
         // A directory with anything in it stays for recovery, as does a name
         // that no longer leads to the directory this call made.
@@ -310,11 +341,11 @@ mod tests {
                             fs::write(created.home().join("written"), "keep")?;
                             kept.push(created.home().join("written"));
                         }
-                        Err(EnrollmentBusy::error())
+                        Err(EnrollmentRefused::Busy.into_error())
                     },
                 )
                 .unwrap_err();
-            assert!(!EnrollmentBusy::is(&error));
+            assert!(EnrollmentRefused::of(&error).is_none());
             assert!(error.to_string().contains("files were retained"), "{error}");
             assert!(kept.iter().all(|path| path.exists()), "{kept:?}");
         }

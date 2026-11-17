@@ -62,24 +62,34 @@ pub(crate) use creation::NewHomeCreationReceipt;
 const REMOVING_PREFIX: &str = ".removing-";
 const CONFIG_LIMIT: u64 = 8 * 1024 * 1024;
 
-/// An initializer's refusal because the daemon was too busy to enroll the
-/// new home. The initializer wrote nothing, so creation withdraws the empty
-/// directory it just made and returns this error as it is: the request
-/// changed nothing and can be sent again.
+/// The daemon declined to enroll a new home before anything was written
+/// into it. Creation withdraws the empty directory it just made and returns
+/// this error as it is, so the request leaves nothing behind.
 #[cfg(any(test, feature = "host"))]
 #[derive(Debug, thiserror::Error)]
-#[error("{}", crate::terminal_ipc::DAEMON_BUSY)]
-pub(crate) struct EnrollmentBusy;
+pub(crate) enum EnrollmentRefused {
+    /// The control gate was busy, or another account operation changed the
+    /// reservations meanwhile. The same request can be sent again.
+    #[error("{}", crate::terminal_ipc::DAEMON_BUSY)]
+    Busy,
+    /// The daemon stopped admitting changes.
+    #[error("{0}")]
+    Closed(String),
+}
 
 #[cfg(any(test, feature = "host"))]
-impl EnrollmentBusy {
-    pub(crate) fn error() -> io::Error {
-        io::Error::new(io::ErrorKind::WouldBlock, Self)
+impl EnrollmentRefused {
+    pub(crate) fn into_error(self) -> io::Error {
+        let kind = match self {
+            Self::Busy => io::ErrorKind::WouldBlock,
+            Self::Closed(_) => io::ErrorKind::Other,
+        };
+        io::Error::new(kind, self)
     }
 
-    /// Whether `error` is this refusal, unwrapped.
-    pub(crate) fn is(error: &io::Error) -> bool {
-        error.get_ref().is_some_and(|inner| inner.is::<Self>())
+    /// This refusal, if `error` is one, unwrapped.
+    pub(crate) fn of(error: &io::Error) -> Option<&Self> {
+        error.get_ref()?.downcast_ref()
     }
 }
 
@@ -288,12 +298,11 @@ impl Homes {
         let path = self.path(provider, key);
         let created = creation::create(&parent, provider, key)?;
         if let Err(error) = initialize(&created).and_then(|()| created.revalidate()) {
-            // Busy enrollment changed nothing, so the empty directory this
-            // call made is withdrawn and the caller may simply ask again.
-            // Anything else, or a directory that is no longer exactly that,
-            // stays for explicit recovery.
+            // A refused enrollment changed nothing, so the empty directory
+            // this call made is withdrawn. Anything else, or a directory
+            // that is no longer exactly that, stays for explicit recovery.
             #[cfg(any(test, feature = "host"))]
-            if EnrollmentBusy::is(&error) && created.withdraw().is_ok() {
+            if EnrollmentRefused::of(&error).is_some() && created.withdraw().is_ok() {
                 return Err(error);
             }
             return Err(io::Error::new(
