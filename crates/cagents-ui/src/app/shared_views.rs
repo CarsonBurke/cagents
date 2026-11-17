@@ -262,6 +262,9 @@ pub(super) struct State {
     held_descriptor_clones: std::cell::Cell<usize>,
     /// The daemon answered this window without a shared model to give.
     pub(super) registry_unavailable: bool,
+    /// This window joined the registry and has not yet told it which projects
+    /// it has open; the next complete reconciliation does.
+    pub(super) unintroduced_projects: bool,
     baseline: settlement::ScopeMap<Vec<Pane>>,
     initialized: settlement::ScopeSet,
     seeding: HashSet<Scope>,
@@ -4354,6 +4357,7 @@ mod tests {
     mod removal_tests;
     #[cfg(not(feature = "integrated-browser"))]
     mod replica_capture;
+    mod repository_loads;
     mod seed_refusal;
     mod startup_admission;
     mod startup_terminals;

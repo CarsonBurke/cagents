@@ -200,6 +200,23 @@ pub struct EdgeChanges {
 /// A title edge may use the metadata-only projector only when its canonical
 /// effects contain no other work. Scoped recovery or lifecycle effects still
 /// need the complete reconciliation, even when the original edit was a title.
+/// Whether `model` is a registry's and holds this project row as a window
+/// would open it.
+///
+/// `OpenProject` is an upsert of the name and kind: against a row the registry
+/// holds identically it commits nothing, and its receipt changes nothing
+/// either. Every repository load publishes the project it opened, so a window
+/// restoring a workspace would otherwise send one such edit per project and
+/// reconcile each receipt. A tombstoned or unknown project, a renamed one, or
+/// one whose registry has not answered yet still publishes: there the edit (or
+/// its refusal) is the news.
+fn holds_project(model: &WorkspaceModel, repository: &Path, name: &str, kind: ProjectKind) -> bool {
+    model.identity != NO_REGISTRY
+        && model
+            .project(repository)
+            .is_some_and(|held| held.name == name && held.kind == kind)
+}
+
 fn channel_title_only(
     edit: &ModelEdit,
     effects: &EditEffects,
@@ -2151,6 +2168,9 @@ impl Cagents {
     /// exists. Clearing them is what keeps the next reconciliation from reading
     /// a fresh registry's silence as a deletion and tombstoning the cards in
     /// every channel the user has.
+    ///
+    /// Nor has this window told that registry which projects it has open: the
+    /// next complete reconciliation does (see [`Self::introduce_open_projects`]).
     fn join_workspace_model(&mut self, identity: uuid::Uuid) {
         if self.durable.workspace_model_identity == Some(identity) {
             return;
@@ -2171,6 +2191,7 @@ impl Cagents {
         }
         self.persist();
         self.shared_views.seed_failures = failed_seeds;
+        self.shared_views.unintroduced_projects = true;
     }
 
     /// Mirrors the cached shared model into this window's own store.
@@ -2208,10 +2229,18 @@ impl Cagents {
     /// loads, such as every project restored at startup, reconciles and saves
     /// once rather than once per project. The deferred pass is the one each
     /// load would have run, over all of them together. It runs on
-    /// [`Message::RepositoryReconciliationDue`], or before any other message
-    /// the window handles first, so nothing else observes the loads
-    /// unreconciled.
+    /// [`Message::RepositoryReconciliationDue`], or before the window handles
+    /// any message other than another background load. Until then a frame may
+    /// draw a loaded project before the channels and panes the shared model
+    /// holds for it, which the deferred pass then adds.
+    ///
+    /// Without a registry there is nothing to reconcile against, as in
+    /// [`Self::reconcile_workspace_model`]; connecting to one reconciles
+    /// everything.
     pub(super) fn defer_repository_reconciliation(&mut self, repository: PathBuf) -> Task<Message> {
+        if self.workspace_model.identity == NO_REGISTRY {
+            return Task::none();
+        }
         let armed = !self.pending_repository_reconciliation.is_empty();
         if !self.pending_repository_reconciliation.contains(&repository) {
             self.pending_repository_reconciliation.push(repository);
@@ -2320,8 +2349,13 @@ impl Cagents {
         // the registry learned of a channel, not the order a user made one, and
         // that is the only order two windows can agree on without a clock they
         // share.
+        // Each project is opened at most once in a pass, before its channels.
+        let mut opened = HashSet::new();
+        if repositories.is_none() && std::mem::take(&mut self.shared_views.unintroduced_projects) {
+            self.introduce_open_projects(&model, &mut opened);
+        }
         for id in republished {
-            self.publish_shared_channel(id);
+            self.publish_shared_channel(id, &model, &mut opened);
         }
         // Admission uses this incoming snapshot, not fences left by a previous
         // projection. A stale sibling pane is fenced by itself: it must not
@@ -2997,7 +3031,16 @@ impl Cagents {
     /// Publishes a channel this window holds and the registry has never heard
     /// of, which is how a window that predates the registry - or that was open
     /// while a replacement one was created - introduces what it already has.
-    fn publish_shared_channel(&mut self, id: ChannelId) {
+    ///
+    /// `model` is the registry's model, which a reconciliation holds apart
+    /// from the window while it runs; `opened` holds the repositories this
+    /// pass has already opened.
+    fn publish_shared_channel(
+        &mut self,
+        id: ChannelId,
+        model: &WorkspaceModel,
+        opened: &mut HashSet<PathBuf>,
+    ) {
         let Some(channel) = self.durable.channels.iter().find(|local| local.id == id) else {
             return;
         };
@@ -3011,9 +3054,15 @@ impl Cagents {
         if self.project_ui.closed.contains(&repository) {
             return;
         }
-        let name = project.name.clone();
-        let kind = project.kind;
-        self.publish_project_open(repository.clone(), name, kind);
+        if !holds_project(model, &repository, &project.name, project.kind)
+            && opened.insert(repository.clone())
+        {
+            self.publish_model_edit(ModelEdit::OpenProject {
+                repository: repository.clone(),
+                name: project.name.clone(),
+                kind: project.kind,
+            });
+        }
         // Carrying the title this window already derived, unlike a fresh
         // creation: a channel being reintroduced has a name the user has seen,
         // and publishing it empty would blank it in every other window.
@@ -3042,35 +3091,45 @@ impl Cagents {
                 name,
                 kind,
             });
-        } else {
-            self.publish_project_open(repository, name, kind);
+        } else if !holds_project(&self.workspace_model, &repository, &name, kind) {
+            self.publish_model_edit(ModelEdit::OpenProject {
+                repository,
+                name,
+                kind,
+            });
         }
     }
 
-    /// Publishes `OpenProject` unless the registry already holds this exact
-    /// project row.
+    /// Tells a registry this window has just joined about the projects it has
+    /// open and the registry lacks, adding each to `opened`.
     ///
-    /// `OpenProject` is an upsert of the name and kind: against a row the
-    /// registry holds identically it commits nothing, and its receipt changes
-    /// nothing either. Every repository load publishes it, so a window
-    /// restoring a workspace would otherwise send one such edit per project
-    /// and reconcile each receipt. A tombstoned or unknown project, a renamed
-    /// one, or one whose registry is not connected yet still publishes: there
-    /// the edit (or its refusal) is the news.
-    fn publish_project_open(&mut self, repository: PathBuf, name: String, kind: ProjectKind) {
-        if self.workspace_model.identity != NO_REGISTRY
-            && self
-                .workspace_model
-                .project(&repository)
-                .is_some_and(|held| held.name == name && held.kind == kind)
-        {
-            return;
+    /// A repository load skips `OpenProject` for a project the registry it
+    /// last heard from holds (see [`holds_project`]). When that registry is
+    /// replaced, its successor never received those opens, so they are sent
+    /// here: except for a project the successor tombstoned, which closes
+    /// instead, and one whose repository could not be read, which no load
+    /// opened.
+    fn introduce_open_projects(&mut self, model: &WorkspaceModel, opened: &mut HashSet<PathBuf>) {
+        let unknown = self
+            .sidebar_model
+            .projects
+            .iter()
+            .filter(|project| {
+                project.unreachable.is_none()
+                    && !self.project_ui.closed.contains(&project.repository)
+                    && !model.closed_projects.contains(&project.repository)
+                    && !holds_project(model, &project.repository, &project.name, project.kind)
+                    && opened.insert(project.repository.clone())
+            })
+            .map(|project| ModelEdit::OpenProject {
+                repository: project.repository.clone(),
+                name: project.name.clone(),
+                kind: project.kind,
+            })
+            .collect::<Vec<_>>();
+        for edit in unknown {
+            self.publish_model_edit(edit);
         }
-        self.publish_model_edit(ModelEdit::OpenProject {
-            repository,
-            name,
-            kind,
-        });
     }
 
     /// Queues one shared-model edit without waiting for it.
@@ -8859,8 +8918,8 @@ mod tests {
     }
 
     /// Background repository loads that finish together reconcile together;
-    /// any other message reconciles them first, so it never sees a loaded
-    /// repository unreconciled.
+    /// any other message reconciles them first, so no other handler sees a
+    /// loaded repository unreconciled.
     #[test]
     fn a_deferred_repository_reconciliation_runs_before_any_other_message() {
         let (mut app, _project, repository) = app_with_project();
@@ -8878,6 +8937,181 @@ mod tests {
         // The armed message finds nothing left to do.
         drop(app.update(Message::RepositoryReconciliationDue));
         assert_eq!(app.shared_views.topology_build_count.get(), 1);
+    }
+
+    /// A connection that delivers the registry's model is a message like any
+    /// other: the loads waiting for their reconciliation get it first, against
+    /// the model they loaded under, and the connection then reconciles all.
+    #[test]
+    fn a_connection_while_loads_wait_reconciles_them_first() {
+        let (mut app, _project, repository) = app_with_project();
+        app.workspace_model = registry(Vec::new());
+        app.workspace_model.projects.push(held_project(&repository));
+        Arc::make_mut(&mut app.durable).workspace_model_identity =
+            Some(app.workspace_model.identity);
+        drop(app.defer_repository_reconciliation(repository.clone()));
+        app.shared_views.topology_build_count.set(0);
+        let mut model = app.workspace_model.clone();
+        model.sequence += 1;
+
+        drop(app.update(Message::WorkspaceModelObserved(
+            ModelUpdate::ConnectedClosed {
+                model,
+                closed: Vec::new(),
+            },
+        )));
+
+        assert!(app.pending_repository_reconciliation.is_empty());
+        assert_eq!(
+            app.shared_views.topology_build_count.get(),
+            2,
+            "the waiting repository pass, then the connection's complete one"
+        );
+        drop(app.update(Message::RepositoryReconciliationDue));
+        assert_eq!(app.shared_views.topology_build_count.get(), 2);
+    }
+
+    /// Without a registry a repository load has nothing to reconcile against,
+    /// so it schedules nothing: connecting reconciles every project.
+    #[test]
+    fn a_load_before_the_registry_answers_defers_nothing() {
+        let (mut app, _project, repository) = app_with_project();
+        assert_eq!(app.workspace_model.identity, NO_REGISTRY);
+        drop(app.defer_repository_reconciliation(repository));
+        assert!(app.pending_repository_reconciliation.is_empty());
+    }
+
+    /// The registry can commit other windows' edits between this window's last
+    /// observed edge and its open: the confirming receipt then carries a later
+    /// sequence. The row is still the one held, so nothing is projected, but
+    /// the model's clock and the row's fence move to that sequence.
+    #[test]
+    fn a_confirming_receipt_ahead_of_the_model_advances_only_its_clocks() {
+        let (mut app, _project, repository) = app_with_project();
+        app.workspace_model = registry(Vec::new());
+        app.workspace_model.sequence = 7;
+        app.workspace_model.projects.push(held_project(&repository));
+        let held = app.workspace_model.clone();
+        app.shared_views.topology_build_count.set(0);
+
+        drop(
+            app.update(Message::WorkspaceModelObserved(ModelUpdate::Committed {
+                receipt: EditReceipt {
+                    identity: held.identity,
+                    sequence: 12,
+                    effects: EditEffects {
+                        projects: vec![held_project(&repository)],
+                        ..Default::default()
+                    },
+                },
+                edit: ModelEdit::OpenProject {
+                    repository: repository.clone(),
+                    name: "repo".into(),
+                    kind: ProjectKind::Git,
+                },
+                views: ViewChanges::default(),
+            })),
+        );
+
+        assert_eq!(app.shared_views.topology_build_count.get(), 0);
+        assert_eq!(app.workspace_model.sequence, 12);
+        assert_eq!(
+            app.shared_views.metadata_revisions[&MetadataKey::Project(repository.clone())],
+            12
+        );
+        assert_eq!(
+            WorkspaceModel {
+                sequence: held.sequence,
+                ..app.workspace_model.clone()
+            },
+            held
+        );
+    }
+
+    /// A channel this window introduces names its project. When the registry
+    /// already holds that project as this window has it, the channel alone is
+    /// sent; when it does not, the project is opened first.
+    #[test]
+    fn introducing_a_channel_opens_its_project_only_when_the_registry_lacks_it() {
+        let (mut app, project, repository) = app_with_project();
+        app.sidebar_model.projects[0] = app.sidebar_model.projects[0]
+            .clone()
+            .with_kind(ProjectKind::Git);
+        let id = ChannelId::new();
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .push(local(id, project, "mine", 4));
+        app.workspace_model = registry(Vec::new());
+        app.workspace_model.projects.push(held_project(&repository));
+        Arc::make_mut(&mut app.durable).workspace_model_identity =
+            Some(app.workspace_model.identity);
+        let published = intercept_publishes(&mut app);
+
+        // Seeding the channel's view is the same either way.
+        let introduced = |published: &TestModelRequests| {
+            drain(published)
+                .into_iter()
+                .filter(|edit| !matches!(edit, ModelEdit::SeedView { .. }))
+                .collect::<Vec<_>>()
+        };
+        drop(app.reconcile_workspace_model());
+        assert!(matches!(
+            introduced(&published).as_slice(),
+            [ModelEdit::CreateChannel { id: created, .. }] if *created == id
+        ));
+
+        app.workspace_model.projects.clear();
+        drop(app.reconcile_workspace_model());
+        assert!(matches!(
+            introduced(&published).as_slice(),
+            [
+                ModelEdit::OpenProject { repository: opened, .. },
+                ModelEdit::CreateChannel { id: created, .. },
+            ] if *opened == repository && *created == id
+        ));
+    }
+
+    /// A load skips opening a project the registry it knows holds. If that
+    /// registry is then replaced, its successor was never told; joining it
+    /// sends the open the load skipped. Reconnecting to the same registry, or
+    /// joining one that holds the project, sends nothing.
+    #[test]
+    fn joining_a_replacement_registry_reopens_projects_it_lacks() {
+        let (mut app, project, repository) = app_with_project();
+        app.sidebar_model.projects[0] = app.sidebar_model.projects[0]
+            .clone()
+            .with_kind(ProjectKind::Git);
+        app.workspace_model = registry(Vec::new());
+        app.workspace_model.projects.push(held_project(&repository));
+        let first = app.workspace_model.clone();
+        Arc::make_mut(&mut app.durable).workspace_model_identity = Some(first.identity);
+        let published = intercept_publishes(&mut app);
+        app.publish_project_opened(project);
+        assert!(drain(&published).is_empty());
+
+        let open = ModelEdit::OpenProject {
+            repository: repository.clone(),
+            name: "repo".into(),
+            kind: ProjectKind::Git,
+        };
+        let opens = |edits: Vec<ModelEdit>| edits.into_iter().filter(|edit| *edit == open).count();
+        let mut reconnected = first.clone();
+        reconnected.projects.clear();
+        reconnected.sequence += 1;
+        drop(app.apply_workspace_model_update(ModelUpdate::Connected(reconnected)));
+        assert_eq!(
+            opens(drain(&published)),
+            0,
+            "the same registry already answered for its own project rows"
+        );
+
+        drop(app.apply_workspace_model_update(ModelUpdate::Connected(registry(Vec::new()))));
+        assert_eq!(opens(drain(&published)), 1);
+
+        let mut holding = registry(Vec::new());
+        holding.projects.push(held_project(&repository));
+        drop(app.apply_workspace_model_update(ModelUpdate::Connected(holding)));
+        assert_eq!(opens(drain(&published)), 0);
     }
 
     /// Before a window has shared a channel, the registry's silence about that

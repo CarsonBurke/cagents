@@ -716,7 +716,7 @@ fn presentation_replica_capture_trace_smoke_matches_deferred_work_accounting_tag
 }
 
 #[test]
-fn presentation_replica_capture_repository_load_is_a_structural_barrier() {
+fn presentation_replica_capture_repository_reconciliation_is_a_structural_barrier() {
     let directory = tempfile::tempdir().unwrap();
     let (mut app, source, _, pane) = presentation_fixture();
     install_writer(&mut app, &directory);
@@ -764,6 +764,10 @@ fn presentation_replica_capture_repository_load_is_a_structural_barrier() {
         generation: 1,
         result: Ok(Box::new(loaded)),
     }));
+    // A background load waits for the reconciliation it shares with any
+    // other loads; that pass, not the load, is the barrier.
+    assert!(app.replica_capture.pending.is_some());
+    assert_eq!(app.replica_capture.captures, captures);
     drop(app.update(Message::RepositoryReconciliationDue));
     assert!(app.replica_capture.pending.is_none());
     assert_eq!(app.replica_capture.captures, captures + 1);

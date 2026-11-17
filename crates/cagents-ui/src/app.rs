@@ -5539,7 +5539,8 @@ pub struct Cagents {
     navigation_save_generation: u64,
     /// Repositories whose background load finished and whose shared model
     /// reconciliation waits for [`Message::RepositoryReconciliationDue`], in
-    /// load order. Any other message reconciles them first.
+    /// load order. Any message other than another background load reconciles
+    /// them first.
     pending_repository_reconciliation: Vec<PathBuf>,
     /// Where editors were when a save last dropped them from durable: a
     /// closed editor, or one still loading. A shared view reopening the same
