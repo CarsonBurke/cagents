@@ -93,14 +93,17 @@ compiled() {
 # in every profile however deep: Cargo adds a directory for a target triple.
 # Without a fingerprint Cargo rebuilds a package, and then whatever depends on
 # it; in the newer layout the package's units go whole. A directory holding no
-# fingerprints but compiled crates is in a layout this does not know, and fails,
-# as does one that can't be searched or cleaned. One holding neither has
-# nothing stale.
+# fingerprints but Cargo's intermediate crates, named <crate>-<hash>, is in a
+# layout this does not know, and fails, as does one that can't be searched or
+# cleaned. One holding neither has nothing stale, such as a target whose
+# intermediates are in a separate build directory: the crates Cargo copies up
+# into it carry no hash.
 forget_local() {
     found=$(find "$2/" -regextype posix-extended -type d \( -name .fingerprint -prune -print -o \
-        -regex '.*/build/[^/]+/[^/]+/fingerprint' -prune -print \)) || return 1
+        -regex '.*/build/[^/]+/[0-9a-f]{16}/fingerprint' -prune -print \)) || return 1
     if [ -z "$found" ]; then
-        compiled=$(find "$2/" -type f \( -name '*.rlib' -o -name '*.rmeta' \) -print -quit) || return 1
+        compiled=$(find "$2/" -regextype posix-extended -type f \
+            -regex '.*/lib[^/]*-[0-9a-f]{16}\.(rlib|rmeta)' -print -quit) || return 1
         if [ -n "$compiled" ]; then
             note "$2 holds compiled crates but no fingerprints this understands"
             return 1

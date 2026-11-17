@@ -1049,9 +1049,12 @@ without reflinks, when the main checkout has no build or this checkout has no
 `CAGENTS_BUILD_SEED=0`; run `scripts/seed-build-dir` by hand to seed a
 directory a plain `cargo` would create. After copying a target by hand, run
 `scripts/seed-build-dir --forget-local TARGET` from the checkout that will build
-there, before its first build. It fails when it can't find this checkout's
-crates in `Cargo.lock`, or can't search or clean `TARGET`; a `TARGET` with no
-fingerprints has nothing to forget. Seeded directories carry Cargo's
+there, before its first build. It understands both Cargo's layout up to 1.99,
+with a profile's fingerprints in `.fingerprint/`, and that of 1.100 on, with
+each unit in `build/<package>/<hash>/`. It fails when it can't find this
+checkout's crates in `Cargo.lock`, can't search or clean `TARGET`, or finds
+Cargo's intermediate crates there but no fingerprints it understands; a
+`TARGET` with neither has nothing to forget. Seeded directories carry Cargo's
 markers, so `scripts/prune-build-dirs` reclaims them once they go unused.
 
 The gate's helpers run from the gate's own directory. Install a changed gate

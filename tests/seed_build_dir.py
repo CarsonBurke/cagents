@@ -251,6 +251,9 @@ class CopiedFingerprints(unittest.TestCase):
         worktree = self.worktree("worktree")
         (worktree / "executables/debug").mkdir(parents=True)
         (worktree / "executables/debug/probe").write_text("program")
+        # As Cargo copies a library up into a target whose intermediates are
+        # in a separate build directory.
+        (worktree / "executables/debug/libprobe.rlib").write_text("library")
         result = subprocess.run([SEED, "--forget-local", "executables"], cwd=worktree, env=self.env,
                                 check=True, capture_output=True, text=True)
         # It says so, as this may be the wrong path.
@@ -480,7 +483,7 @@ class SeedBuildDir(unittest.TestCase):
     def test_compiled_crates_in_a_layout_it_does_not_know_are_not_called_forgotten(self):
         build = self.checkout / "copied/debug/units/zstd-sys"
         build.mkdir(parents=True)
-        (build / "libzstd-sys.rlib").write_bytes(b"rlib")
+        (build / "libzstd_sys-0a1b2c3d4e5f6a7b.rlib").write_bytes(b"rlib")
         result = subprocess.run([str(SEED), "--forget-local", "copied"], cwd=self.checkout, env=self.env,
                                 capture_output=True, text=True, timeout=HANG_GUARD)
         self.assertEqual(result.returncode, 1, result.stderr)
