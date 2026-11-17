@@ -115,29 +115,41 @@ pub(crate) fn scrolling_surface_with_actions<'a, M: 'a>(
     max_width: f32,
     max_height: f32,
 ) -> Element<'a, M> {
-    crate::interaction::opaque(
-        widget::container(scrolling_with_actions(
-            content,
-            actions,
-            Padding {
-                top: space::L - design::BORDER_WIDTH,
-                bottom: space::M,
-                ..Padding::ZERO
-            },
-            design::dialog_base,
-        ))
-        .class(cosmic::theme::Container::Dialog(false))
-        .padding(Padding {
-            top: design::BORDER_WIDTH,
-            bottom: space::L,
-            left: space::L,
-            right: space::L,
-        })
-        .width(Length::Fill)
-        .max_width(max_width)
-        .max_height(max_height),
-    )
-    .into()
+    surface_with_actions(content, actions, max_width, max_height, None)
+}
+
+/// A [`scrolling_surface_with_actions`] whose surface carries `id`.
+fn surface_with_actions<'a, M: 'a>(
+    content: impl Into<Element<'a, M>>,
+    actions: impl Into<Element<'a, M>>,
+    max_width: f32,
+    max_height: f32,
+    id: Option<widget::Id>,
+) -> Element<'a, M> {
+    let surface = widget::container(scrolling_with_actions(
+        content,
+        actions,
+        Padding {
+            top: space::L - design::BORDER_WIDTH,
+            bottom: space::M,
+            ..Padding::ZERO
+        },
+        design::dialog_base,
+    ))
+    .class(cosmic::theme::Container::Dialog(false))
+    .padding(Padding {
+        top: design::BORDER_WIDTH,
+        bottom: space::L,
+        left: space::L,
+        right: space::L,
+    })
+    .width(Length::Fill)
+    .max_width(max_width)
+    .max_height(max_height);
+    crate::interaction::opaque(match id {
+        Some(id) => surface.id(id),
+        None => surface,
+    })
 }
 
 /// `content` above the `actions` that close it, which stay whole and in
@@ -181,6 +193,9 @@ pub(crate) enum Consequence {
     /// keeps everything as it is. The committing action is one Tab, Shift+Tab
     /// or arrow away, and the question is always asked.
     Irreversible,
+    /// Nothing to answer: the dialog reports an outcome, and its one way out
+    /// takes focus.
+    Report,
 }
 
 impl Consequence {
@@ -188,13 +203,118 @@ impl Consequence {
     pub(crate) fn initial_focus(self, dismiss: widget::Id, confirm: widget::Id) -> widget::Id {
         match self {
             Self::Routine(_) => confirm,
-            Self::Irreversible => dismiss,
+            Self::Irreversible | Self::Report => dismiss,
+        }
+    }
+}
+
+/// Every question the application asks in a [`confirmation_surface`]. Each
+/// names what its committing action costs, so where the keyboard starts is
+/// decided here, once, rather than by whichever code opens the dialog: a
+/// dialog that loses work can't open with Enter on its destructive button
+/// because its opener reused a routine question's focus.
+///
+/// Only questions whose action is common and recoverable, and which the
+/// person may choose not to be asked again, are routine (#2711).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Question {
+    /// Closing a chat that may still be working; its conversation stays in
+    /// history.
+    StopWorkingChat,
+    /// Closing a tab whose first message couldn't start: the unsent message
+    /// is gone for good.
+    DiscardUnsentMessage,
+    /// Closing a terminal whose processes are still running; the pane can be
+    /// opened again.
+    CloseActiveTerminal,
+    /// Closing a terminal pane beside processes Close couldn't rule out,
+    /// which then keep running unseen.
+    LeaveTerminalProcessesRunning,
+    /// Why a terminal pane was kept rather than closed.
+    TerminalPaneKept,
+    /// Resetting every setting to its default.
+    ResetSettings,
+    /// Discarding uncommitted changes, which Git can't bring back.
+    DiscardChanges,
+    /// Deleting several sidebar rows at once.
+    DeleteSidebarSelection,
+    /// Removing a project, its channels and their sessions.
+    RemoveProject,
+    /// Deleting a worktree from disk.
+    DeleteWorktree,
+    /// Deleting a channel and its panes.
+    DeleteChannel,
+    /// Closing the window with unsaved work.
+    CloseWithUnsavedWork,
+    /// Discarding an automation's unsaved changes.
+    DiscardAutomationDraft,
+    /// Pasting lines a program without bracketed paste may each run at once.
+    PasteMultipleLines,
+}
+
+impl Question {
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 14] = [
+        Self::StopWorkingChat,
+        Self::DiscardUnsentMessage,
+        Self::CloseActiveTerminal,
+        Self::LeaveTerminalProcessesRunning,
+        Self::TerminalPaneKept,
+        Self::ResetSettings,
+        Self::DiscardChanges,
+        Self::DeleteSidebarSelection,
+        Self::RemoveProject,
+        Self::DeleteWorktree,
+        Self::DeleteChannel,
+        Self::CloseWithUnsavedWork,
+        Self::DiscardAutomationDraft,
+        Self::PasteMultipleLines,
+    ];
+
+    pub(crate) const fn consequence(self) -> Consequence {
+        match self {
+            Self::StopWorkingChat => Consequence::Routine(settings::Confirmation::StopWorkingChat),
+            Self::CloseActiveTerminal => {
+                Consequence::Routine(settings::Confirmation::CloseActiveTerminal)
+            }
+            Self::TerminalPaneKept => Consequence::Report,
+            Self::DiscardUnsentMessage
+            | Self::LeaveTerminalProcessesRunning
+            | Self::ResetSettings
+            | Self::DiscardChanges
+            | Self::DeleteSidebarSelection
+            | Self::RemoveProject
+            | Self::DeleteWorktree
+            | Self::DeleteChannel
+            | Self::CloseWithUnsavedWork
+            | Self::DiscardAutomationDraft
+            | Self::PasteMultipleLines => Consequence::Irreversible,
         }
     }
 
+    /// The setting that skips this question, if the person may skip it.
+    pub(crate) const fn skippable(self) -> Option<settings::Confirmation> {
+        match self.consequence() {
+            Consequence::Routine(confirmation) => Some(confirmation),
+            Consequence::Irreversible | Consequence::Report => None,
+        }
+    }
+
+    /// The control this question opens with keyboard focus on.
+    pub(crate) fn initial_focus(self, dismiss: widget::Id, confirm: widget::Id) -> widget::Id {
+        self.consequence().initial_focus(dismiss, confirm)
+    }
+
+    /// Moves keyboard focus to where this question opens.
     pub(crate) fn focus(self, dismiss: widget::Id, confirm: widget::Id) -> Task<Message> {
         iced::widget::operation::focus(self.initial_focus(dismiss, confirm))
             .map(cosmic::Action::App)
+    }
+
+    /// The id of the surface asking it, by which a test finds which question
+    /// is on screen.
+    pub(crate) fn surface_id(self) -> widget::Id {
+        widget::Id::new(format!("dialog.question.{self:?}"))
     }
 }
 
@@ -202,18 +322,24 @@ impl Consequence {
 /// in a window with room for it.
 pub(crate) const MAX_HEIGHT: f32 = 640.0;
 
-/// A dialog that asks a question: its `content` above the `actions` that
+/// A dialog that asks `question`: its `content` above the `actions` that
 /// answer it, which stay whole and in reach however long the content is
 /// (see [`scrolling_surface_with_actions`]). Tab, Shift+Tab and the arrows
 /// cycle through its controls without leaving it. Escape and the backdrop
-/// dismiss it as every dialog does.
+/// dismiss it as every dialog does. Its opener focuses where
+/// [`Question::focus`] says.
 pub(crate) fn confirmation_surface<'a, M: 'a>(
+    question: Question,
     content: impl Into<Element<'a, M>>,
     actions: impl Into<Element<'a, M>>,
     max_width: f32,
 ) -> Element<'a, M> {
-    crate::interaction::focus_scope(scrolling_surface_with_actions(
-        content, actions, max_width, MAX_HEIGHT,
+    crate::interaction::focus_scope(surface_with_actions(
+        content,
+        actions,
+        max_width,
+        MAX_HEIGHT,
+        Some(question.surface_id()),
     ))
 }
 
@@ -227,16 +353,18 @@ impl Cagents {
         self.settings.asks(confirmation)
     }
 
-    /// Opens a routine question: unticked, with focus on its committing
-    /// action.
-    pub(super) fn open_confirmation(
+    /// Opens `question`, with focus where it decides and any "Don't ask
+    /// again" unticked.
+    pub(super) fn open_question(
         &mut self,
-        confirmation: settings::Confirmation,
+        question: Question,
         dismiss: widget::Id,
         confirm: widget::Id,
     ) -> Task<Message> {
-        self.dont_ask_again.remove(&confirmation);
-        Consequence::Routine(confirmation).focus(dismiss, confirm)
+        if let Some(confirmation) = question.skippable() {
+            self.dont_ask_again.remove(&confirmation);
+        }
+        question.focus(dismiss, confirm)
     }
 
     /// The question was dismissed: a tick in "Don't ask again" is only
@@ -381,6 +509,7 @@ pub(super) mod tests {
         let ids = ["first", "disabled", "last"].map(widget::Id::new);
         let dialog = || {
             confirmation_surface(
+                Question::DeleteChannel,
                 widget::text("Choose one"),
                 widget::row::with_children(
                     ids.iter()
@@ -844,6 +973,7 @@ pub(super) mod tests {
             || {
                 overlay(
                     confirmation_surface(
+                        Question::DeleteChannel,
                         widget::column::with_children(vec![
                             design::title("Delete it?").into(),
                             design::body(long_message()).into(),

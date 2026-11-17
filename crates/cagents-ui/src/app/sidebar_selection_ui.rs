@@ -8,11 +8,11 @@ pub(super) struct State {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::app) mod tests {
     use super::*;
     use crate::model::{ChannelId, ProjectChannel};
 
-    fn fixture() -> (Cagents, ProjectId, [ChannelId; 3]) {
+    pub(in crate::app) fn fixture() -> (Cagents, ProjectId, [ChannelId; 3]) {
         let mut app = super::super::tests::context_inspector_test_app(true);
         let project = ProjectId::new();
         app.sidebar_model.projects.push(SidebarProject::new(
@@ -42,7 +42,7 @@ mod tests {
         (app, project, channels)
     }
 
-    fn select(app: &mut Cagents, ids: &[ChannelId]) {
+    pub(in crate::app) fn select(app: &mut Cagents, ids: &[ChannelId]) {
         for id in ids {
             app.select_sidebar_rows(SelectionRow::Channel(*id), SelectionIntent::Toggle);
         }
@@ -496,7 +496,7 @@ impl Dialog {
 
     /// Every group deletion opens on its non-destructive dismissal.
     pub(super) fn focus_target(&self) -> widget::Id {
-        close_focus_id()
+        dialog_ui::Question::DeleteSidebarSelection.initial_focus(close_focus_id(), focus_id())
     }
 
     fn blocked(&self) -> usize {
@@ -919,6 +919,7 @@ impl Cagents {
         // A short window scrolls the members and notes; Cancel and the
         // deletion stay in reach.
         Some(dialog_ui::confirmation_surface(
+            dialog_ui::Question::DeleteSidebarSelection,
             widget::column::with_children(rows).spacing(space::M),
             actions,
             500.0,

@@ -792,6 +792,7 @@ impl State {
     pub fn draft_dialog(&self) -> Option<Element<'_, Action>> {
         let (generation, _) = self.discard_draft.as_ref()?;
         Some(crate::app::dialog_ui::confirmation_surface(
+            crate::app::dialog_ui::Question::DiscardAutomationDraft,
             widget::column::with_children(vec![
                 crate::design::title("Discard automation changes?").into(),
                 crate::design::body("Your unsaved changes will be lost.").into(),
@@ -799,10 +800,11 @@ impl State {
             .spacing(space::M),
             widget::row::with_children(vec![
                 crate::ui_controls::button::secondary("Keep editing")
-                    .id(draft_dialog_focus_id())
+                    .id(draft_dialog_keep_id())
                     .on_press(Action::KeepDraft(*generation))
                     .into(),
                 crate::ui_controls::button::destructive("Discard changes")
+                    .id(draft_dialog_discard_id())
                     .on_press(Action::DiscardDraft(*generation))
                     .into(),
             ])
@@ -3414,8 +3416,17 @@ fn button_owned(label: String, action: Action, enabled: bool) -> Element<'static
 fn refresh_id() -> widget::Id {
     widget::Id::new("automation.refresh")
 }
+/// Where the discard question opens: on keeping the draft, since
+/// discarding it loses the changes for good.
 pub fn draft_dialog_focus_id() -> widget::Id {
+    crate::app::dialog_ui::Question::DiscardAutomationDraft
+        .initial_focus(draft_dialog_keep_id(), draft_dialog_discard_id())
+}
+pub(crate) fn draft_dialog_keep_id() -> widget::Id {
     widget::Id::new("dialog.automation-draft.keep")
+}
+pub(crate) fn draft_dialog_discard_id() -> widget::Id {
+    widget::Id::new("dialog.automation-draft.discard")
 }
 pub fn draft_editor_focus_id() -> widget::Id {
     widget::Id::new("automation-draft.name")

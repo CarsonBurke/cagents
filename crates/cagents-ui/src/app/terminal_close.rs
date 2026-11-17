@@ -42,6 +42,18 @@ impl CloseIntent {
     fn offers_leaving(&self) -> bool {
         self.detail.is_some() && !self.unreadable.is_empty()
     }
+
+    /// What the dialog asks: whether to close beside processes left running,
+    /// a report of why the pane was kept, or whether to stop the processes.
+    fn question(&self) -> dialog_ui::Question {
+        if self.offers_leaving() {
+            dialog_ui::Question::LeaveTerminalProcessesRunning
+        } else if self.detail.is_some() {
+            dialog_ui::Question::TerminalPaneKept
+        } else {
+            dialog_ui::Question::CloseActiveTerminal
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -563,7 +575,7 @@ impl Cagents {
             });
             if self.terminal_close.as_ref().unwrap().detail.is_some() {
                 self.core.set_keyboard_nav(false);
-                return close_focus();
+                return self.open_terminal_close_question();
             }
             return self.start_terminal_close(allow_active);
         }
@@ -637,7 +649,7 @@ impl Cagents {
                     leave: Vec::new(),
                 });
                 self.core.set_keyboard_nav(false);
-                self.open_confirmation(QUESTION, cancel_id(), confirm_id())
+                self.open_terminal_close_question()
             }
             Err(error) => {
                 self.status = Some(TransientNotice::error(format!(
@@ -950,7 +962,7 @@ impl Cagents {
             self.terminal_close.as_mut().unwrap().detail =
                 Some("This terminal changed before it could close, so nothing was closed. Try closing the pane again.".into());
             self.core.set_keyboard_nav(false);
-            return close_focus();
+            return self.open_terminal_close_question();
         }
         if !self.terminal_close_attempts.insert(intent.terminal) {
             self.terminal_close.as_mut().unwrap().detail = Some(
@@ -958,7 +970,7 @@ impl Cagents {
                     .into(),
             );
             self.core.set_keyboard_nav(false);
-            return close_focus();
+            return self.open_terminal_close_question();
         }
         self.terminal_close_generation = self.terminal_close_generation.wrapping_add(1);
         let intent = self.terminal_close.as_mut().unwrap();
@@ -1069,7 +1081,7 @@ impl Cagents {
                 intent.pending = false;
                 intent.active = true;
                 self.core.set_keyboard_nav(false);
-                self.open_confirmation(QUESTION, cancel_id(), confirm_id())
+                self.open_terminal_close_question()
             }
             outcome => {
                 let source_changed = matches!(&outcome, CloseOutcome::SourceChanged);
@@ -1108,7 +1120,7 @@ impl Cagents {
                 });
                 self.core.set_keyboard_nav(false);
                 Task::batch([
-                    close_focus(),
+                    self.open_terminal_close_question(),
                     if source_changed {
                         self.readmit_shared_terminal_after_source_refusal(card)
                     } else {
@@ -1117,6 +1129,15 @@ impl Cagents {
                 ])
             }
         }
+    }
+
+    /// Focuses where the terminal close question on screen opens: the
+    /// routine one on Close, a report or Close anyway on keeping the pane.
+    fn open_terminal_close_question(&mut self) -> Task<Message> {
+        let Some(question) = self.terminal_close.as_ref().map(CloseIntent::question) else {
+            return Task::none();
+        };
+        self.open_question(question, cancel_id(), confirm_id())
     }
 
     pub(super) fn terminal_close_dialog(&self) -> Option<Element<'_, Message>> {
@@ -1199,6 +1220,7 @@ impl Cagents {
         // A long reason the daemon kept the pane scrolls; the answers stay
         // in reach.
         Some(super::dialog_ui::confirmation_surface(
+            intent.question(),
             widget::column::with_children(rows).spacing(space::M),
             widget::row::with_children(buttons).spacing(space::S),
             560.0,
@@ -1234,13 +1256,8 @@ fn confirm_id() -> widget::Id {
     widget::Id::new("dialog.terminal-close.confirm")
 }
 
-/// A report, or Close anyway, opens on keeping the pane.
-fn close_focus() -> Task<Message> {
-    iced::widget::operation::focus(cancel_id()).map(cosmic::Action::App)
-}
-
 #[cfg(test)]
-mod tests {
+pub(in crate::app) mod tests {
     use super::*;
     use crate::model::{BootId, HostIncarnation, HostSessionId};
 
@@ -1469,7 +1486,7 @@ mod tests {
         assert_deferred_home_close(&mut app, card, home);
     }
 
-    fn retry_close_fixture() -> (Cagents, CardId) {
+    pub(in crate::app) fn retry_close_fixture() -> (Cagents, CardId) {
         let mut app = super::super::tests::context_inspector_test_app(true);
         let card = app.workspace.focused().unwrap();
         app.set_residency(card, Residency::Hot);

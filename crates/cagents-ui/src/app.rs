@@ -37,6 +37,8 @@ mod pane_inspector;
 mod pr_checkout_ui;
 mod project_ui;
 mod pull_request_ui;
+#[cfg(test)]
+mod question_tests;
 mod refresh_ui;
 mod request_failure;
 mod resume_ui;
@@ -13986,7 +13988,10 @@ impl Cagents {
         if let Some(dialog) = &self.sidebar_selection_ui.dialog {
             Some(dialog.focus_target())
         } else if self.sidebar_state.pending_discard().is_some() {
-            Some(sidebar::discard_cancel_id())
+            Some(
+                dialog_ui::Question::DiscardChanges
+                    .initial_focus(sidebar::discard_cancel_id(), sidebar::discard_confirm_id()),
+            )
         } else if self.project_ui.modal_open() {
             Some(self.project_ui.focus_target())
         } else if self.channel_ui.modal_open() {
@@ -16809,8 +16814,10 @@ impl Application for Cagents {
                     | SidebarAction::CancelDiscard => Task::none(),
                     SidebarAction::RequestDiscard { .. } => {
                         if self.sidebar_state.pending_discard().is_some() {
-                            iced::widget::operation::focus(sidebar::discard_cancel_id())
-                                .map(cosmic::Action::App)
+                            dialog_ui::Question::DiscardChanges.focus(
+                                sidebar::discard_cancel_id(),
+                                sidebar::discard_confirm_id(),
+                            )
                         } else {
                             Task::none()
                         }
@@ -17407,10 +17414,10 @@ impl Application for Cagents {
                     self.automation_close_generation =
                         self.automation_close_generation.wrapping_add(1);
                     self.transient_work_close = Some(window);
-                    return iced::widget::operation::focus(widget::Id::new(
-                        "dialog.transient-close.cancel",
-                    ))
-                    .map(cosmic::Action::App);
+                    return dialog_ui::Question::CloseWithUnsavedWork.focus(
+                        widget::Id::new(TRANSIENT_CLOSE_CANCEL),
+                        widget::Id::new(TRANSIENT_CLOSE_DISCARD),
+                    );
                 }
                 self.transient_work_close = None;
                 let dirty = self
@@ -18751,7 +18758,7 @@ impl Application for Cagents {
                 self.settings_reset_confirm = true;
                 self.settings_reset_keyboard_nav = Some(self.core.keyboard_nav());
                 self.core.set_keyboard_nav(false);
-                dialog_ui::Consequence::Irreversible.focus(
+                dialog_ui::Question::ResetSettings.focus(
                     widget::Id::new("dialog.reset-settings.cancel"),
                     widget::Id::new("dialog.reset-settings.confirm"),
                 )
@@ -19361,7 +19368,7 @@ impl Application for Cagents {
         if self.transient_work_close.is_some() {
             let mut controls: Vec<Element<'_, Message>> = vec![
                 crate::ui_controls::button::secondary("Cancel close")
-                    .id(widget::Id::new("dialog.transient-close.cancel"))
+                    .id(widget::Id::new(TRANSIENT_CLOSE_CANCEL))
                     .on_press(Message::CancelTransientWorkClose)
                     .into(),
             ];
@@ -19381,6 +19388,7 @@ impl Application for Cagents {
                 if self.automation_ui.draft_dirty() && self.automation_ui.can_discard_draft() {
                     controls.push(
                         crate::ui_controls::button::destructive("Discard automation changes")
+                            .id(widget::Id::new(TRANSIENT_CLOSE_DISCARD))
                             .on_press(Message::DiscardAutomationAndClose(
                                 self.automation_close_generation,
                             ))
@@ -19390,6 +19398,7 @@ impl Application for Cagents {
             }
             return Some(dialog_ui::overlay(
                 dialog_ui::confirmation_surface(
+                    dialog_ui::Question::CloseWithUnsavedWork,
                     widget::column::with_children(vec![
                         design::title("Keep unsaved work before closing").into(),
                         notice_detail(self.window_close_transient_blocker().unwrap_or(
@@ -19463,6 +19472,7 @@ impl Application for Cagents {
         if self.settings_reset_confirm {
             return Some(dialog_ui::overlay(
                 dialog_ui::confirmation_surface(
+                    dialog_ui::Question::ResetSettings,
                     widget::column::with_children(vec![
                         design::title("Reset all settings?").into(),
                         notice_body(
@@ -20021,6 +20031,10 @@ impl Drop for Cagents {
         }
     }
 }
+
+/// The window-close question's dismissal, and its discard when it offers one.
+const TRANSIENT_CLOSE_CANCEL: &str = "dialog.transient-close.cancel";
+const TRANSIENT_CLOSE_DISCARD: &str = "dialog.transient-close.discard";
 
 fn dirty_close_control_id(card: CardId, control: DirtyCloseControl) -> widget::Id {
     let control = match control {
@@ -34395,7 +34409,7 @@ mod tests {
         }
     }
 
-    fn discard_key() -> ActiveWorktreeKey {
+    pub(super) fn discard_key() -> ActiveWorktreeKey {
         ActiveWorktreeKey {
             project_id: ProjectId::default(),
             worktree_id: crate::model::WorktreeId::new(),
@@ -34403,7 +34417,7 @@ mod tests {
         }
     }
 
-    fn discard_request(confirmed: bool) -> crate::repository::DiscardRequest {
+    pub(super) fn discard_request(confirmed: bool) -> crate::repository::DiscardRequest {
         crate::repository::DiscardRequest {
             worktree: PathBuf::from("/repo/main"),
             tracked: Vec::new(),

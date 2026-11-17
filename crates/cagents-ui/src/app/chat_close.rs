@@ -2,13 +2,19 @@
 //! that is still working asks first, as a terminal running a process does. The
 //! window may not be the one that started it, or know how far it has got.
 //! The conversation stays in history, so this is a routine question: Enter
-//! answers it, and the person may choose not to be asked again.
+//! answers it, and the person may choose not to be asked again. A tab whose
+//! first message couldn't start asks instead whether to discard that unsent
+//! message, which nothing brings back: that question opens on Cancel.
 
 use super::*;
 
 const CANCEL: &str = "dialog.chat-close.cancel";
 const CONFIRM: &str = "dialog.chat-close.confirm";
 const QUESTION: settings::Confirmation = settings::Confirmation::StopWorkingChat;
+const _: () = assert!(matches!(
+    dialog_ui::Question::StopWorkingChat.skippable(),
+    Some(QUESTION)
+));
 /// How much of a first message can stand in for a conversation's name.
 const FIRST_MESSAGE_NAME_CHARS: usize = 60;
 
@@ -22,6 +28,18 @@ pub(super) struct ChatCloseConfirm {
     discard_draft: bool,
     restore_card: Option<CardId>,
     restore_keyboard_nav: bool,
+}
+
+impl ChatCloseConfirm {
+    /// Which question this close asks: discarding an unsent message, or
+    /// stopping a conversation that stays in history.
+    fn question(&self) -> dialog_ui::Question {
+        if self.discard_draft {
+            dialog_ui::Question::DiscardUnsentMessage
+        } else {
+            dialog_ui::Question::StopWorkingChat
+        }
+    }
 }
 
 impl Cagents {
@@ -81,16 +99,18 @@ impl Cagents {
             return Some(Task::none());
         }
         let restore_keyboard_nav = self.core.keyboard_nav();
-        self.chat_close_confirm = Some(ChatCloseConfirm {
+        let intent = ChatCloseConfirm {
             card,
             session,
             certain,
             discard_draft: draft.is_some(),
             restore_card: self.workspace.focused(),
             restore_keyboard_nav,
-        });
+        };
+        let question = intent.question();
+        self.chat_close_confirm = Some(intent);
         self.core.set_keyboard_nav(false);
-        Some(self.open_confirmation(QUESTION, widget::Id::new(CANCEL), widget::Id::new(CONFIRM)))
+        Some(self.open_question(question, widget::Id::new(CANCEL), widget::Id::new(CONFIRM)))
     }
 
     /// Whether the conversation asked about is still the one on the card. One
@@ -168,11 +188,11 @@ impl Cagents {
             // Only a close that goes ahead keeps a tick in "Don't ask again";
             // one whose conversation changed meanwhile answered nothing.
             // The discard question has no "Don't ask again" of its own.
-            let remember = if intent.discard_draft {
+            let remember = if intent.question().skippable().is_some() {
+                self.commit_confirmation(QUESTION)
+            } else {
                 self.dismiss_confirmation(QUESTION);
                 Task::none()
-            } else {
-                self.commit_confirmation(QUESTION)
             };
             Task::batch([remember, self.begin_chat_close(intent.card)])
         } else {
@@ -202,7 +222,10 @@ impl Cagents {
                     .and_then(|intent| self.card_chrome.get(&intent.card))
                     .map(|chrome| chrome.title.to_string())
             });
-        let discard_draft = intent.is_some_and(|intent| intent.discard_draft);
+        let question = intent.map_or(dialog_ui::Question::StopWorkingChat, |intent| {
+            intent.question()
+        });
+        let discard_draft = question == dialog_ui::Question::DiscardUnsentMessage;
         let title = if discard_draft {
             "Discard this message?".to_owned()
         } else {
@@ -222,13 +245,13 @@ impl Cagents {
         };
         dialog_ui::overlay(
             dialog_ui::confirmation_surface(
+                question,
                 widget::column::with_children(vec![
                     crate::design::title(title).into(),
                     crate::design::body(body).into(),
-                    if discard_draft {
-                        iced::widget::Space::new().into()
-                    } else {
-                        self.dont_ask_again_control(QUESTION, true)
+                    match question.skippable() {
+                        Some(confirmation) => self.dont_ask_again_control(confirmation, true),
+                        None => iced::widget::Space::new().into(),
                     },
                 ])
                 .spacing(space::M),

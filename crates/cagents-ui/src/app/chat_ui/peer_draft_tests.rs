@@ -909,17 +909,7 @@ fn closes_waiting_on_a_question_go_on_when_it_ends_elsewhere() {
 #[test]
 fn an_answer_to_a_question_that_ended_does_not_answer_the_next() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
-    let mut working = |thread| {
-        let card = super::tests::live_chat_for_provider(&mut app, Provider::Claude, Some(thread));
-        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
-            panic!("expected a chat runtime");
-        };
-        let handle = runtime.handle().unwrap();
-        let mut snapshot = (*handle.snapshot()).clone();
-        snapshot.busy = true;
-        handle.publish_snapshot_for_test(snapshot);
-        card
-    };
+    let mut working = |thread| super::tests::working_chat(&mut app, thread);
     let asked = working("asked-thread");
     let next = working("next-thread");
 

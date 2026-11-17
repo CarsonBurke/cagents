@@ -648,7 +648,10 @@ impl State {
     }
 
     pub(super) fn focus_target() -> widget::Id {
-        widget::Id::new("dialog.channel.close")
+        super::dialog_ui::Question::DeleteChannel.initial_focus(
+            widget::Id::new("dialog.channel.close"),
+            widget::Id::new("dialog.channel.confirm"),
+        )
     }
 }
 
@@ -2318,6 +2321,7 @@ impl Cagents {
         // A long failure or list of unsaved editors scrolls; the answers stay
         // in reach.
         Some(super::dialog_ui::confirmation_surface(
+            super::dialog_ui::Question::DeleteChannel,
             widget::column::with_children(rows).spacing(space::M),
             actions,
             480.0,
@@ -2653,7 +2657,7 @@ fn default_channel_title(project: Option<&SidebarProject>) -> Cow<'static, str> 
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::app) mod tests {
     use super::*;
     use crate::sidebar::RowDeletion;
 
@@ -3799,7 +3803,7 @@ mod tests {
     /// A window whose active channel, "Investigation", holds a live
     /// conversation, beside an empty "Migration": (window, doomed, survivor,
     /// conversation).
-    fn channel_with_a_conversation() -> (Cagents, ChannelId, ChannelId, CardId) {
+    pub(in crate::app) fn channel_with_a_conversation() -> (Cagents, ChannelId, ChannelId, CardId) {
         let mut app = super::super::tests::context_inspector_test_app(true);
         let project = ProjectId::new();
         let doomed = ChannelId::new();

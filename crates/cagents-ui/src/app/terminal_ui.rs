@@ -1,5 +1,9 @@
 use super::*;
 
+/// The multiline paste question's answers.
+const PASTE_CANCEL: &str = "terminal-paste-cancel";
+const PASTE_CONFIRM: &str = "terminal-paste-confirm";
+
 #[derive(Clone, Debug)]
 pub enum Action {
     Open(CardId),
@@ -673,10 +677,10 @@ impl Cagents {
                     && text.contains(['\n', '\r'])
                 {
                     self.terminal_paste = Some((card, text));
-                    return iced::widget::operation::focus(iced::widget::Id::from(
-                        "terminal-paste-cancel",
-                    ))
-                    .map(cosmic::Action::App);
+                    return dialog_ui::Question::PasteMultipleLines.focus(
+                        widget::Id::from(PASTE_CANCEL),
+                        widget::Id::from(PASTE_CONFIRM),
+                    );
                 }
                 if let Err(error) = handle.paste(&text, crate::terminal::PasteOrigin::Clipboard) {
                     return cosmic::task::message(Message::TerminalError {
@@ -963,14 +967,14 @@ impl Cagents {
     pub(super) fn terminal_paste_dialog(&self) -> Option<Element<'_, Message>> {
         let (card, text) = self.terminal_paste.as_ref()?;
         let card = *card;
-        Some(dialog_ui::overlay(dialog_ui::confirmation_surface(widget::column::with_children(vec![
+        Some(dialog_ui::overlay(dialog_ui::confirmation_surface(dialog_ui::Question::PasteMultipleLines, widget::column::with_children(vec![
             crate::design::title("Paste multiple lines?").into(),
             notice_body("This program does not use bracketed paste. Each newline may run a command immediately."),
             widget::text(format!("{} lines · {} characters", text.lines().count(), text.chars().count())).into(),
         ]).spacing(space::M), widget::row::with_children(vec![
-            crate::ui_controls::button::secondary("Cancel").id(widget::Id::from("terminal-paste-cancel"))
+            crate::ui_controls::button::secondary("Cancel").id(widget::Id::from(PASTE_CANCEL))
                 .on_press(Message::TerminalFind(Action::ConfirmPaste(card, false))).into(),
-            crate::ui_controls::button::primary("Paste").on_press(Message::TerminalFind(Action::ConfirmPaste(card, true))).into(),
+            crate::ui_controls::button::primary("Paste").id(widget::Id::from(PASTE_CONFIRM)).on_press(Message::TerminalFind(Action::ConfirmPaste(card, true))).into(),
         ]).spacing(space::S), 480.0), Some(Message::TerminalFind(Action::ConfirmPaste(card, false))), 1.0))
     }
 }
