@@ -1147,8 +1147,8 @@ impl State {
 pub(super) struct Prepared {
     request: Request,
     pub(super) parsed: Parsed,
-    /// The pull requests the prepared text links to.
-    links: Box<[crate::github_identity::PullRequestKey]>,
+    /// The pull requests the prepared text links to or mentions by number.
+    links: Box<[pull_request_links::Named]>,
     document: prose_document::Data,
     reasoning: Option<super::reasoning::Preview>,
     prompt: Option<Box<prompt::Prepared>>,
@@ -4360,6 +4360,66 @@ mod tests {
         runtime.cache.insert("card".into(), toggled);
         runtime.set_pull_request_labels(Arc::new(pull_request_links::Labels::default()));
         assert!(runtime.cache["card"].preparing);
+        runtime.show(false);
+        retirement_barrier();
+    }
+
+    #[test]
+    fn a_number_the_window_comes_to_know_relabels_only_the_messages_naming_it() {
+        let message = |id: &str, body: &str| chat::Item {
+            id: id.into(),
+            ..(*item(body)).clone()
+        };
+        let (mut runtime, _handle) = view::prepared_runtime_for_test(&[
+            message("known", "Fixed by #20."),
+            message("later", "Tracked in #99."),
+            message("other", "Nothing to name here."),
+        ]);
+        drain_fixture(&mut runtime);
+        retirement_barrier();
+        let shown = |runtime: &Runtime, id: &str| {
+            let markdown::Item::Paragraph(text) = &runtime.cache[id].markdown.items()[0] else {
+                panic!("a paragraph");
+            };
+            text.plain()
+        };
+        // Before the chat's repository is known, no number names anything.
+        assert_eq!(&*shown(&runtime, "known"), "Fixed by #20.");
+        let other_revision = runtime.cache["other"].revision;
+        let mut list = pull_request_links::fixture::fixture_list();
+        runtime.set_pull_request_labels(Arc::new(pull_request_links::fixture::of(&list)));
+        assert!(runtime.cache["known"].preparing);
+        // #99 is still unknown, so it reads as written either way.
+        assert!(!runtime.cache["later"].preparing);
+        assert!(!runtime.cache["other"].preparing);
+        drain_fixture(&mut runtime);
+        retirement_barrier();
+        assert!(
+            shown(&runtime, "known").contains("#20\u{a0}Retry stalled"),
+            "{:?}",
+            shown(&runtime, "known")
+        );
+        assert_eq!(&*shown(&runtime, "later"), "Tracked in #99.");
+        // A poll that comes to know #99 relabels the message that mentioned
+        // it while it was unknown, and no other.
+        list.pull_requests.push(pull_request_links::fixture::row(
+            "acme",
+            "widgets",
+            99,
+            Some(("Count brokers", crate::work::PullRequestState::Open, false)),
+        ));
+        runtime.set_pull_request_labels(Arc::new(pull_request_links::fixture::of(&list)));
+        assert!(runtime.cache["later"].preparing);
+        assert!(!runtime.cache["known"].preparing);
+        assert!(!runtime.cache["other"].preparing);
+        drain_fixture(&mut runtime);
+        retirement_barrier();
+        assert!(
+            shown(&runtime, "later").contains("#99\u{a0}Count brokers"),
+            "{:?}",
+            shown(&runtime, "later")
+        );
+        assert_eq!(runtime.cache["other"].revision, other_revision);
         runtime.show(false);
         retirement_barrier();
     }

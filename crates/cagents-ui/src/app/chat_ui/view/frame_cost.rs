@@ -1939,6 +1939,31 @@ pub(super) fn linked_transcript(turns: usize) -> Vec<chat::Item> {
     items
 }
 
+/// The full window, each answer ending with the pull requests it made named
+/// by number, as agents name them in prose: forty-eight references across
+/// sixteen exchanges, and a number no pull request has.
+fn referenced_transcript(turns: usize) -> Vec<chat::Item> {
+    let mut items = transcript(turns);
+    for (turn, item) in items
+        .iter_mut()
+        .filter(|item| item.id.ends_with("-answer"))
+        .enumerate()
+    {
+        let ItemContent::Text { text, .. } = &mut item.content else {
+            unreachable!("an answer is prose");
+        };
+        let first = 1_000 + turn as u64 * LINKS_PER_ANSWER;
+        text.push_str(&format!(
+            "\nOpened #{first}, rebased #{} onto it, and closed #{} as \
+             superseded by issue #{}.\n",
+            first + 1,
+            first + 2,
+            first + 9_000,
+        ));
+    }
+    items
+}
+
 /// What the window knows of the transcript's pull requests, with the state of
 /// `flipped` changed, as a poll that saw it merge would report it.
 fn known_links(turns: usize, flipped: Option<u64>) -> Arc<pull_request_links::Labels> {
@@ -1978,10 +2003,21 @@ fn known_links(turns: usize, flipped: Option<u64>) -> Arc<pull_request_links::La
 #[test]
 #[ignore = "a measurement, not a check; see the module documentation"]
 fn a_frame_of_a_window_of_pull_request_links() {
+    measure_pull_request_labels(linked_transcript, "links");
+}
+
+/// The same with each pull request named by number rather than linked.
+#[test]
+#[ignore = "a measurement, not a check; see the module documentation"]
+fn a_frame_of_a_window_of_pull_request_references() {
+    measure_pull_request_labels(referenced_transcript, "references");
+}
+
+fn measure_pull_request_labels(transcript: fn(usize) -> Vec<chat::Item>, named: &str) {
     const TURNS: usize = 16;
-    let mut pane = Pane::new(linked_transcript(TURNS));
+    let mut pane = Pane::new(transcript(TURNS));
     println!(
-        "{} items, {} pull request links:",
+        "{} items, {} pull request {named}:",
         pane.items.len(),
         TURNS as u64 * LINKS_PER_ANSWER
     );
