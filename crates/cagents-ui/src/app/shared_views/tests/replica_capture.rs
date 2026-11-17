@@ -764,6 +764,7 @@ fn presentation_replica_capture_repository_load_is_a_structural_barrier() {
         generation: 1,
         result: Ok(Box::new(loaded)),
     }));
+    drop(app.update(Message::RepositoryReconciliationDue));
     assert!(app.replica_capture.pending.is_none());
     assert_eq!(app.replica_capture.captures, captures + 1);
     assert_eq!(app.replica_capture.offers, offers + 1);
