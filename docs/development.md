@@ -650,6 +650,21 @@ not passed over by builds that need one. The shares are the lock files
 `/var/tmp/cagents-cargo.lock`, `.1`, `.2`, ... (`CAGENTS_BUILD_LOCK` names
 the first), and builds offloaded to the host take them too.
 
+A build with nothing to compile does not wait in that queue. When its shares
+are not free at once, a `build`, `check`, `clippy`, `--no-run` or the build
+phase of `test`, `bench` or `run` first runs as a probe: Cargo with one job,
+its output held back, under a compiler wrapper (`scripts/cargo-gate-rustc-guard`)
+that passes the compiler's queries and ends the probe at the first compile.
+If Cargo finds everything fresh, or fails, the probe was the build: its output
+is shown and no shares are taken. Otherwise it is discarded and the build waits
+for its shares as before, so every compile still runs within them. A probe
+takes one of four slots (`/var/tmp/cagents-cargo.lock.probe.0` to `.3`) that
+together set aside one share; with none free, the build queues without one.
+A probe is also stopped, and the build queued, if its processes outgrow
+1 GiB, as a build script rerunning without a compile might. Cargo alone needs
+about 180 MiB to find this workspace fresh. Doctests, `doc` and `exec` scripts
+are not probed. `CAGENTS_BUILD_PROBE=0` turns probing off.
+
 Once admitted, a build runs in its own systemd scope in
 `background-cagents.slice`, inside the user manager's `background.slice`.
 systemd gives that a `CPUWeight` of 30, below the 100 of `app.slice`, where

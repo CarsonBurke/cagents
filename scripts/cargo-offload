@@ -601,9 +601,9 @@ def real_cargo(environment):
 # command ends with what it started when its standard input closes: the
 # connection to this host dropped or the gate here was cancelled.
 # What runs a build on the build host, sent with each command: build-host and
-# the helpers beside it. The host test helper and its artifact reader travel
+# the helpers beside it, including the compiler wrapper of its probes. The host test helper and its artifact reader travel
 # when this checkout has them.
-TOOLS = ("build-host", "memory-capped")
+TOOLS = ("build-host", "memory-capped", "cargo-gate-rustc-guard")
 OPTIONAL_TOOLS = ("cargo-host-test-helper.py", "cargo_artifacts.py")
 
 

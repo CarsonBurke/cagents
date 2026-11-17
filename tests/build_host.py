@@ -62,9 +62,24 @@ entry = dict(program=Path(sys.argv[0]).name, arguments=sys.argv[1:], held=held, 
              parent=os.getppid(),
              environment={name: os.environ.get(name) for name in (
                  "CAGENTS_BUILD_SLOT_HELD", "CARGO_BUILD_JOBS", "MAKEFLAGS",
-                 "CAGENTS_TEST_RETAINED_ACTOR_HELPER")})
+                 "CAGENTS_TEST_RETAINED_ACTOR_HELPER", "CAGENTS_BUILD_PROBE_DIRECTORY", "RUSTC_WRAPPER")})
 with (root / "calls.jsonl").open("a") as calls:
     calls.write(json.dumps(entry) + "\n")
+# As Cargo would: says something, asks the compiler its version and compiles,
+# each through the compiler wrapper.
+if os.environ.get("FIXTURE_SAY"):
+    print(f"out {os.environ['FIXTURE_SAY']}", flush=True)
+    print(f"err {os.environ['FIXTURE_SAY']}", file=sys.stderr, flush=True)
+wrapper = [os.environ["RUSTC_WRAPPER"]] if os.environ.get("RUSTC_WRAPPER") else []
+if os.environ.get("FIXTURE_QUERY"):
+    import subprocess
+    answer = subprocess.run([*wrapper, sys.executable, "-c", "print('rustc 0.0.0')", "-vV"],
+                            capture_output=True, text=True)
+    print(f"asked {answer.returncode} {answer.stdout.strip()}", file=sys.stderr, flush=True)
+if os.environ.get("FIXTURE_COMPILE") and entry["program"] == "cargo":
+    import subprocess
+    if subprocess.run([*wrapper, sys.executable, "-c", "pass", "--crate-name", "fixture"]).returncode:
+        raise SystemExit(101)
 if entry["program"] == "memory-capped":
     command = sys.argv[1:]
     while command[:1] in (["--name"], ["--slice"], ["--stop-leftovers"]):
@@ -507,6 +522,157 @@ class CargoPhases(BuildHostFixture):
         # A zero limit runs the command as it is, without a scope.
         calls = self.phases("test", "--lib", env=self.env | {"CAGENTS_MEMORY_MAX": "0"})
         self.assertEqual(calls[-1], ("cargo", ["test", "--lib"], []))
+
+
+class Probing(BuildHostFixture):
+    """A build whose shares are taken first asks Cargo whether it compiles
+    anything, and waits for them only if it does."""
+
+    slots = 2
+
+    def setUp(self):
+        super().setUp()
+        shutil.copy2(ROOT / "scripts/cargo-gate-rustc-guard", self.root / "scripts")
+        # Every share is taken by other builds.
+        self.others = [self.hold(self.share(index)) for index in range(self.slots)]
+
+    def queued(self, build):
+        """Waits until `build` is in the queue for shares and has stayed
+        there, past the moment a probe would have run."""
+        queue = f"{self.lock}.queue"
+        self.wait_for(lambda: self.is_locked(queue), "the build to queue")
+        time.sleep(0.5)
+        self.assertTrue(self.is_locked(queue) and build.poll() is None, "the build left the queue")
+
+    def free_shares(self):
+        for holder in self.others:
+            holder.close()
+
+    def test_a_build_with_nothing_to_compile_takes_no_shares(self):
+        for arguments in (("build", "--lib"), ("check",), ("c",), ("clippy",), ("test", "--no-run"),
+                          ("+nightly", "build")):
+            with self.subTest(arguments):
+                (self.root / "calls.jsonl").unlink(missing_ok=True)
+                result = self.run_host("cargo", "--", str(self.cargo), *arguments,
+                                       env=self.env | {"FIXTURE_SAY": "fresh"})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("waiting", result.stderr)
+                [call] = self.calls()
+                self.assertEqual(call["arguments"], list(arguments))
+                self.assertEqual(call["environment"]["CARGO_BUILD_JOBS"], "1")
+                self.assertEqual(Path(call["environment"]["RUSTC_WRAPPER"]).name, "cargo-gate-rustc-guard")
+                self.assertIsNotNone(call["environment"]["CAGENTS_BUILD_PROBE_DIRECTORY"])
+                # Its output, kept while it ran, is the build's.
+                self.assertEqual(result.stdout, "out fresh\n")
+                self.assertEqual(result.stderr, "err fresh\n")
+                self.assertFalse(Path(call["environment"]["CAGENTS_BUILD_PROBE_DIRECTORY"]).exists())
+
+    def test_tests_and_programs_run_after_a_probe_found_them_built(self):
+        result = self.run_host("cargo", "--", str(self.cargo), "test", "--lib")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([(call["program"], call["environment"]["CAGENTS_BUILD_PROBE_DIRECTORY"] is not None)
+                          for call in self.calls()],
+                         [("cargo", True), ("memory-capped", False), ("cargo", False)])
+
+    def test_a_build_that_compiles_waits_for_its_shares_and_builds_again(self):
+        build = self.start("cargo", "--", str(self.cargo), "build",
+                           env=self.env | {"FIXTURE_COMPILE": "1", "FIXTURE_SAY": "built"})
+        self.wait_for(lambda: len(self.calls()) == 1, "the probe")
+        self.queued(build)
+        [probe] = self.calls()
+        self.assertIsNotNone(probe["environment"]["CAGENTS_BUILD_PROBE_DIRECTORY"])
+        self.free_shares()
+        status, stdout, stderr = self.finish(build)
+        self.assertEqual(status, 0, stderr)
+        [_, admitted] = self.calls()
+        self.assertEqual(admitted["held"], [0])
+        self.assertIsNone(admitted["environment"]["CAGENTS_BUILD_PROBE_DIRECTORY"])
+        self.assertIsNone(admitted["environment"]["RUSTC_WRAPPER"])
+        # Only the admitted build's output shows.
+        self.assertEqual(stdout, "out built\n")
+        self.assertIn("waiting for 1 of the 2 build memory shares", stderr)
+        self.assertEqual(stderr.count("err built"), 1)
+
+    def test_queries_reach_the_compiler_through_the_callers_wrapper(self):
+        caller = self.root / "bin/caller-wrapper"
+        caller.write_text("#!/bin/sh\nprintf 'caller '\nexec \"$@\"\n")
+        caller.chmod(0o755)
+        for env, expected in (({}, "asked 0 rustc 0.0.0"),
+                              ({"RUSTC_WRAPPER": str(caller)}, "asked 0 caller rustc 0.0.0")):
+            with self.subTest(env=env):
+                result = self.run_host("cargo", "--", str(self.cargo), "check",
+                                       env=self.env | env | {"FIXTURE_QUERY": "1"})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, expected + "\n")
+
+    def test_a_failed_probe_is_the_builds_failure(self):
+        result = self.run_host("cargo", "--", str(self.cargo), "test", "--lib",
+                               env=self.env | {"FIXTURE_EXIT": "101", "FIXTURE_SAY": "broken"})
+        self.assertEqual(result.returncode, 101)
+        self.assertEqual(result.stderr, "err broken\n")
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_what_runs_or_documents_is_not_probed(self):
+        for arguments in (("test", "--doc"), ("doc",), ("test", "--doc", "--no-run"), ("metadata",)):
+            with self.subTest(arguments):
+                (self.root / "calls.jsonl").unlink(missing_ok=True)
+                build = self.start("cargo", "--", str(self.cargo), *arguments)
+                self.queued(build)
+                self.assertEqual(self.calls(), [])
+                build.kill()
+                build.wait()
+
+    def test_with_every_probe_slot_taken_a_build_waits_for_its_shares(self):
+        for index in range(4):
+            self.hold(f"{self.lock}.probe.{index}")
+        build = self.start("cargo", "--", str(self.cargo), "check")
+        self.queued(build)
+        self.assertEqual(self.calls(), [])
+        self.free_shares()
+        status, _stdout, stderr = self.finish(build)
+        self.assertEqual(status, 0, stderr)
+        self.assertEqual(self.calls()[0]["held"], [0])
+
+    def test_probing_can_be_turned_off(self):
+        build = self.start("cargo", "--", str(self.cargo), "check", env=self.env | {"CAGENTS_BUILD_PROBE": "0"})
+        self.queued(build)
+        self.assertEqual(self.calls(), [])
+        self.free_shares()
+        self.assertEqual(self.finish(build)[0], 0)
+
+    def test_free_shares_are_taken_without_a_probe(self):
+        self.free_shares()
+        result = self.run_host("cargo", "--", str(self.cargo), "check")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        [call] = self.calls()
+        self.assertEqual(call["held"], [0])
+        self.assertIsNone(call["environment"]["CAGENTS_BUILD_PROBE_DIRECTORY"])
+
+    def test_a_probe_outgrowing_its_slot_ends_with_what_it_started(self):
+        script = (r"import os, subprocess, sys, time; "
+                  r"child = subprocess.Popen([sys.executable, '-c', "
+                  r"'x = bytearray(64 << 20); import time; time.sleep(60)']); "
+                  r"print(child.pid, flush=True); time.sleep(60)")
+        with tempfile.TemporaryDirectory(dir=self.root) as directory, \
+                unittest.mock.patch.object(build_host, "PROBE_MEMORY", 32 << 20):
+            probe = build_host.Probe(directory)
+            started = time.monotonic()
+            with self.assertRaises(build_host.Stale):
+                probe.run([sys.executable, "-c", script], dict(self.env))
+            self.assertLess(time.monotonic() - started, HANG_GUARD)
+
+    def test_the_guard_ends_a_probe_at_its_first_compile_only(self):
+        guard = self.root / "scripts/cargo-gate-rustc-guard"
+        with tempfile.TemporaryDirectory(dir=self.root) as directory:
+            env = self.env | {"CAGENTS_BUILD_PROBE_DIRECTORY": directory}
+            asked = subprocess.run([str(guard), "/bin/echo", "--print=cfg"], env=env,
+                                   capture_output=True, text=True)
+            self.assertEqual((asked.returncode, asked.stdout), (0, "--print=cfg\n"))
+            self.assertFalse((Path(directory) / "compiles").exists())
+            compiled = subprocess.run([str(guard), "/bin/echo", "src/lib.rs"], env=env,
+                                      capture_output=True, text=True)
+            self.assertEqual((compiled.returncode, compiled.stdout), (1, ""))
+            self.assertTrue((Path(directory) / "compiles").exists())
 
 
 class Interruption(BuildHostFixture):
