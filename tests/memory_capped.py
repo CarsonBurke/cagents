@@ -229,6 +229,22 @@ class InARealScope(unittest.TestCase):
         self.assertNotIn("over the limit", errors)
         self.assert_not_left_failed(unit.read_text().strip())
 
+    def test_an_interrupted_command_that_went_over_the_limit_says_so(self):
+        marker = self.root / "pid"
+        interrupted = self.root / "interrupted"
+        # Like Ctrl-C on `cargo test` while one of its tests is killed for its memory.
+        script = (f'trap \': >"{interrupted}"\' INT; echo $$ >"{marker}"; '
+                  f'while [ ! -e "{interrupted}" ]; do sleep 0.01; done; '
+                  f'{sys.executable} -I -c \'c = [bytearray(b"x") * (16 * 2**20) for _ in range(64)]\'')
+        wrapper = subprocess.Popen([str(TOOL), "sh", "-c", script], env=self.env,
+                                   stderr=subprocess.PIPE, text=True)
+        self.addCleanup(wrapper.communicate)
+        self.wait_for(lambda: marker.exists() and marker.read_text().strip(), "never started")
+        wrapper.send_signal(signal.SIGINT)
+        _, errors = wrapper.communicate(timeout=HANG_GUARD)
+        self.assertEqual(wrapper.returncode, 137, errors)
+        self.assertIn("stopped sh because it and the processes it started went over the limit", errors)
+
     def test_an_interrupted_command_ends_a_calling_script_too(self):
         marker = self.root / "pid"
         script = subprocess.Popen(

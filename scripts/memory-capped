@@ -147,8 +147,9 @@ def went_over(unit, failed):
     command that failed asks the kernel while the scope's group remains, and
     otherwise waits, for a moment at most, until the manager has settled the
     unit: it records a kill before it finds the scope empty. Once a kill is
-    known, the scope is stopped before its failure is reset, since what
-    ignores SIGTERM in it can keep it stopping until the stop times out."""
+    known, the scope is first stopped, since what ignores SIGTERM in it can
+    keep it stopping until the stop times out; either way, its failure is then
+    reset."""
     deadline = time.monotonic() + (2 if failed else 0)
     over = False
     try:
@@ -174,8 +175,7 @@ def went_over(unit, failed):
         pass
     if over:
         stop(unit)
-    else:
-        forget(unit)
+    forget(unit)
     return over
 
 
@@ -190,15 +190,15 @@ def forget(unit):
 
 
 def stop(unit):
-    """Stops the unit and forgets it. Anything in it that ignores SIGTERM is
-    killed once the stop times out, which fails the unit, so the stop is waited
-    for before its failure is reset."""
+    """Stops the unit, waiting for the stop to finish. Anything in it that
+    ignores SIGTERM is killed once the stop times out, which fails the unit, so
+    a caller that has said why it stopped forgets the unit afterwards, but not
+    before what it says is known: the failure is what records a memory kill."""
     try:
         subprocess.run(["systemctl", "--user", "stop", unit], stdin=subprocess.DEVNULL,
                        capture_output=True, timeout=30, env=manager_environment())
     except (OSError, subprocess.SubprocessError):
         pass
-    forget(unit)
 
 
 def leftovers(unit):
@@ -257,6 +257,7 @@ def stop_leftovers(unit, name):
     except OSError:
         pass
     stop(unit)
+    forget(unit)
 
 
 def amount(size):
@@ -328,7 +329,8 @@ def main():
         signal.signal(number, forward)
     status = child.wait()
     if interrupted:
-        # Whatever ignored the signal, such as a compositor, goes with the scope.
+        # Whatever ignored the signal, such as a compositor, goes with the scope,
+        # whose failure went_over reads before it forgets the unit.
         stop(unit)
     if went_over(unit, status != 0):
         print(over_limit_notice(name or os.path.basename(command[0]), limit, swap), file=sys.stderr)
