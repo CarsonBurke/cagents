@@ -127,12 +127,12 @@ enum Tracked {
     Directory,
 }
 
-/// Which index file a census was read from. Git, libgit2 and JGit replace the
-/// index by renaming a new file over it, so a write gives it an inode other
-/// than the one in place, and its size and times change with it. Only a writer
-/// that rewrote it in place, to the same size within one timestamp tick, could
-/// leave it looking unchanged. A network filesystem may report cached
-/// attributes, so a census read there is never kept by identity.
+/// Which index file a census was read from. Git writes the index to a new
+/// file and renames it over the old one, so each of its writes gives the index
+/// another inode, as well as new times. A writer that rewrote the file in place
+/// would still change its size or times, unless it kept the same size within
+/// one timestamp tick. Only a filesystem that `reports_rewrites` keeps a
+/// census by this identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct IndexIdentity {
     device: u64,
@@ -231,6 +231,7 @@ impl Project {
     ) -> Result<Self, String> {
         Self::read_changed_with(
             &RepositoryService::system("git"),
+            &Filesystem::of,
             id,
             common_dir,
             records,
@@ -242,6 +243,7 @@ impl Project {
 
     fn read_changed_with<E: ProcessExecutor>(
         git: &RepositoryService<E>,
+        filesystem: &dyn Fn(&Path) -> std::io::Result<Filesystem>,
         id: ProjectId,
         common_dir: PathBuf,
         records: &[WorktreeRecord],
@@ -249,9 +251,10 @@ impl Project {
         previous: Option<&Self>,
         changed: &BTreeSet<WorktreeId>,
     ) -> Result<Self, String> {
-        let polling = network_filesystem(&common_dir)
+        let polling = filesystem(&common_dir)
             .map_err(|error| error.to_string())?
-            .then(|| "network or FUSE filesystem may omit native change events".to_owned());
+            .omits_events()
+            .then(|| REMOTE_EVENTS.to_owned());
         let retained = previous
             .into_iter()
             .flat_map(|previous| &previous.worktrees)
@@ -296,8 +299,17 @@ impl Project {
                     record.path.display()
                 ));
             }
-            let remote = network_filesystem(&record.path).map_err(|error| error.to_string())?;
-            let index = IndexIdentity::of(&git_dir).filter(|_| !remote && polling.is_none());
+            let remote = filesystem(&record.path)
+                .map_err(|error| error.to_string())?
+                .omits_events();
+            let index = if filesystem(&git_dir)
+                .map_err(|error| error.to_string())?
+                .reports_rewrites()
+            {
+                IndexIdentity::of(&git_dir)
+            } else {
+                None
+            };
             let census = match old
                 .filter(|old| index.is_some() && old.index == index && old.git_dir == git_dir)
             {
@@ -330,8 +342,7 @@ impl Project {
             let worktree_polling = if census.submodules {
                 Some("submodule contents require a periodic local Git check".into())
             } else {
-                remote
-                    .then(|| "network or FUSE filesystem may omit native change events".to_owned())
+                remote.then(|| REMOTE_EVENTS.to_owned())
             };
             worktrees.push(Worktree {
                 id: record.id,
@@ -1173,23 +1184,107 @@ impl Drop for Monitor {
     }
 }
 
-/// Inotify cannot see changes performed by another machine/server. FUSE can
-/// have the same limitation, so keep local polling alongside available edges.
-fn network_filesystem(path: &Path) -> std::io::Result<bool> {
-    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
-    // SAFETY: path is NUL-terminated and stat points to a writable statfs.
-    if unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: successful statfs initialized the complete structure.
-    let magic = unsafe { stat.assume_init() }.f_type as u64;
-    Ok(matches!(
-        magic,
-        0x6969 | 0x517b | 0xff534d42 | 0xfe534d42 | 0x65735546
-    ))
+/// A filesystem, as `statfs` names it by its superblock magic. It decides two
+/// things that want different defaults for a filesystem it does not name:
+///
+/// - Whether it is watched. Inotify sees every change made through this
+///   kernel, so only changes made elsewhere escape it: by another machine, a
+///   cluster node, a hypervisor host or a FUSE server. Those are named, and an
+///   unknown filesystem is watched, as one that misses events would be at
+///   worst caught by the daemon's periodic re-read of a covered project,
+///   while polling it would cost a Git process per worktree each round.
+/// - Whether an index census is kept by the index file's identity. A stale
+///   census silently drops watches, while reading the index again costs one
+///   `git ls-files`, so only local filesystems whose attributes come from the
+///   kernel's own inode qualify, and an unknown one never does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Filesystem(u64);
+
+/// Superblock magic numbers, from the kernel's `include/uapi/linux/magic.h`
+/// unless noted.
+mod magic {
+    pub const EXT4: u64 = 0xef53; // also ext2 and ext3
+    pub const BTRFS: u64 = 0x9123_683e;
+    pub const XFS: u64 = 0x5846_5342;
+    pub const F2FS: u64 = 0xf2f5_2010;
+    pub const TMPFS: u64 = 0x0102_1994;
+    pub const BCACHEFS: u64 = 0xca45_1a4e;
+    pub const OVERLAYFS: u64 = 0x794c_7630;
+    /// OpenZFS `include/os/linux/zfs/sys/zfs_vfsops_os.h`.
+    pub const ZFS: u64 = 0x2fc1_2fc1;
+
+    pub const NFS: u64 = 0x6969;
+    pub const SMB: u64 = 0x517b;
+    pub const CIFS: u64 = 0xff53_4d42;
+    pub const SMB2: u64 = 0xfe53_4d42;
+    /// Also virtiofs, which is FUSE underneath.
+    pub const FUSE: u64 = 0x6573_5546;
+    /// 9p: WSL2's Windows drives and virtual machine shares.
+    pub const V9FS: u64 = 0x0102_1997;
+    pub const CEPH: u64 = 0x00c3_6400;
+    pub const AFS: u64 = 0x5346_414f;
+    pub const AFS_FS: u64 = 0x6b41_4653;
+    pub const CODA: u64 = 0x7375_7245;
+    pub const OCFS2: u64 = 0x7461_636f;
+    /// `include/uapi/linux/gfs2_ondisk.h`.
+    pub const GFS2: u64 = 0x0116_1970;
+    /// Lustre's `LL_SUPER_MAGIC`, as in its `lustre_user.h`.
+    pub const LUSTRE: u64 = 0x0bd0_0bd0;
+    /// VirtualBox shared folders, `fs/vboxsf/super.c`.
+    pub const VBOXSF: u64 = 0x786f_4256;
+    /// User-mode Linux's view of its host.
+    pub const HOSTFS: u64 = 0x00c0_ffee;
 }
+
+impl Filesystem {
+    fn of(path: &Path) -> std::io::Result<Self> {
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+        let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: path is NUL-terminated and stat points to a writable statfs.
+        if unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: successful statfs initialized the complete structure.
+        let magic = unsafe { stat.assume_init() }.f_type;
+        // `f_type` is signed on some targets; the magic is its low 32 bits.
+        Ok(Self(magic as u64 & 0xffff_ffff))
+    }
+
+    /// Whether changes may arrive without this kernel seeing them.
+    fn omits_events(self) -> bool {
+        use magic::*;
+        matches!(
+            self.0,
+            NFS | SMB
+                | CIFS
+                | SMB2
+                | FUSE
+                | V9FS
+                | CEPH
+                | AFS
+                | AFS_FS
+                | CODA
+                | OCFS2
+                | GFS2
+                | LUSTRE
+                | VBOXSF
+                | HOSTFS
+        )
+    }
+
+    /// Whether every write to a file shows in its attributes as this kernel
+    /// reports them, so an unchanged identity means an unchanged index.
+    fn reports_rewrites(self) -> bool {
+        use magic::*;
+        matches!(
+            self.0,
+            EXT4 | BTRFS | XFS | F2FS | TMPFS | BCACHEFS | OVERLAYFS | ZFS
+        )
+    }
+}
+
+const REMOTE_EVENTS: &str = "a shared, network or FUSE filesystem may omit native change events";
 
 #[cfg(test)]
 mod tests {
@@ -1401,10 +1496,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn replans_find_git_directories_without_git_and_read_only_rewritten_indexes() {
-        let directory = tempfile::tempdir().unwrap();
-        let directory = directory.path().canonicalize().unwrap();
+    /// A repository at `first` with linked worktrees `linked` and `other`.
+    fn repository(directory: &Path) -> (PathBuf, Vec<WorktreeRecord>) {
         let first = directory.join("first");
         std::fs::create_dir_all(first.join("src")).unwrap();
         std::fs::write(first.join("src/main.rs"), "").unwrap();
@@ -1413,30 +1506,52 @@ mod tests {
         git(&first, &["commit", "-qm", "init"]);
         git(&first, &["worktree", "add", "-q", "../linked"]);
         git(&first, &["worktree", "add", "-q", "../other"]);
-        let (linked, other) = (directory.join("linked"), directory.join("other"));
-
         let system = RepositoryService::system("git");
         let cancellation = CancellationToken::default();
-        let common = system.common_dir(&first, &cancellation).unwrap();
-        let records = system.list_worktrees(&first, &cancellation).unwrap();
+        (
+            system.common_dir(&first, &cancellation).unwrap(),
+            system.list_worktrees(&first, &cancellation).unwrap(),
+        )
+    }
+
+    /// Plans every worktree of `records` as changed, on a filesystem `magic`
+    /// names, whatever the test's own directory is on.
+    fn reader<'a>(
+        service: &'a RepositoryService<Recording>,
+        magic: u64,
+        common: &'a Path,
+        records: &'a [WorktreeRecord],
+    ) -> impl Fn(Option<&Project>) -> Result<Project, String> + 'a {
         let every = records
             .iter()
             .map(|record| record.id)
             .collect::<BTreeSet<_>>();
-        let recording = Arc::new(Recording::default());
-        let service = RepositoryService::new("git", recording.clone());
         let id = ProjectId::new();
-        let read = |previous: Option<&Project>| {
+        move |previous| {
             Project::read_changed_with(
-                &service,
+                service,
+                &|_| Ok(Filesystem(magic)),
                 id,
-                common.clone(),
-                &records,
-                &cancellation,
+                common.to_path_buf(),
+                records,
+                &CancellationToken::default(),
                 previous,
                 &every,
             )
-        };
+        }
+    }
+
+    #[test]
+    fn replans_find_git_directories_without_git_and_read_only_rewritten_indexes() {
+        let directory = tempfile::tempdir().unwrap();
+        let directory = directory.path().canonicalize().unwrap();
+        let (common, records) = repository(&directory);
+        let (linked, other) = (directory.join("linked"), directory.join("other"));
+        let system = RepositoryService::system("git");
+        let cancellation = CancellationToken::default();
+        let recording = Arc::new(Recording::default());
+        let service = RepositoryService::new("git", recording.clone());
+        let read = reader(&service, magic::EXT4, &common, &records);
 
         let plan = read(None).unwrap();
         assert_eq!(
@@ -1483,6 +1598,36 @@ mod tests {
         std::fs::write(linked.join(".git"), "not a marker\n").unwrap();
         assert!(read(Some(&staged)).is_err());
         assert!(recording.take().contains(&"rev-parse".to_owned()));
+    }
+
+    #[test]
+    fn indexes_on_shared_or_unknown_filesystems_are_read_on_every_replan() {
+        let directory = tempfile::tempdir().unwrap();
+        let directory = directory.path().canonicalize().unwrap();
+        let (common, records) = repository(&directory);
+        let recording = Arc::new(Recording::default());
+        let service = RepositoryService::new("git", recording.clone());
+        for (magic, polled) in [
+            (magic::NFS, true),
+            (magic::V9FS, true),
+            (magic::FUSE, true),
+            // Watched, as local writes reach inotify, but its attributes are
+            // not known to show every rewrite.
+            (0x1234_5678, false),
+        ] {
+            let read = reader(&service, magic, &common, &records);
+            let plan = read(None).unwrap();
+            assert_eq!(plan.polling.is_some(), polled, "{magic:#x}");
+            assert!(
+                plan.worktrees.iter().all(
+                    |worktree| worktree.index.is_none() && worktree.polling.is_some() == polled
+                ),
+                "{magic:#x}"
+            );
+            recording.take();
+            read(Some(&plan)).unwrap();
+            assert_eq!(recording.take(), ["ls-files"; 3], "{magic:#x}");
+        }
     }
 
     #[test]

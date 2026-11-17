@@ -527,4 +527,66 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn git_directories_follow_markers_and_commondir_as_git_does() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let common = root.join("repository/.git");
+        let private = common.join("worktrees/linked");
+        fs::create_dir_all(&private).unwrap();
+
+        // A linked worktree: a `gitdir: ` file naming its private directory
+        // relative to the checkout, whose `commondir` is relative to it.
+        let linked = root.join("linked");
+        fs::create_dir_all(&linked).unwrap();
+        fs::write(
+            linked.join(".git"),
+            "gitdir: ../repository/.git/worktrees/linked\r\n",
+        )
+        .unwrap();
+        fs::write(private.join("commondir"), "../..\n").unwrap();
+        assert_eq!(
+            git_directories(&linked),
+            Some(GitDirectories {
+                private: private.clone(),
+                common: common.clone(),
+            })
+        );
+
+        // Without `commondir`, the private directory is the common one.
+        assert_eq!(
+            git_directories(&root.join("repository")),
+            Some(GitDirectories {
+                private: common.clone(),
+                common: common.clone(),
+            })
+        );
+
+        // A `.git` directory may name its common directory too, absolutely.
+        let shared = root.join("shared");
+        fs::create_dir_all(shared.join(".git")).unwrap();
+        fs::write(
+            shared.join(".git/commondir"),
+            format!("{}\n", common.display()),
+        )
+        .unwrap();
+        assert_eq!(
+            git_directories(&shared),
+            Some(GitDirectories {
+                private: shared.join(".git"),
+                common: common.clone(),
+            })
+        );
+
+        // A `commondir` that exists but cannot be read leaves the answer to
+        // Git rather than guessing the private directory is the common one.
+        fs::remove_file(private.join("commondir")).unwrap();
+        fs::create_dir(private.join("commondir")).unwrap();
+        assert_eq!(git_directories(&linked), None);
+
+        // Git requires the prefix exactly.
+        fs::write(linked.join(".git"), "gitdir:../repository/.git\n").unwrap();
+        assert_eq!(git_directories(&linked), None);
+    }
 }
