@@ -67,13 +67,15 @@ impl Cagents {
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return None;
         };
-        let launch = runtime.session.launch.clone();
+        let launch = &runtime.session.launch;
         let Some(conversation) = launch.session_id.clone() else {
             return None;
         };
         if launch.provider == Provider::Omp {
             return None;
         }
+        // Cloned only when a read starts: the recipe carries its environment.
+        let launch = launch.clone();
         let key = (target.card, conversation);
         match self.chat_ui.opening_names.get(&key) {
             Some(Some(Some(title))) => {
@@ -423,7 +425,7 @@ mod tests {
         assert!(suggested(&requests));
 
         // So does a new view of the channel, as when the pane becomes its
-        // primary chat or its name is cleared elsewhere.
+        // primary chat.
         Arc::make_mut(&mut app.durable).channels[0].title = String::new();
         app.chat_ui.channel_names.insert(
             target,
