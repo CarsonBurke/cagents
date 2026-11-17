@@ -102,6 +102,19 @@ tests' own build reports for what it compiles; `check:host` covers the daemon's
 whole build. Both the task and the sentinel judge a warning with
 `scripts/cargo_warnings.py`.
 
+The development runner (`mise run dev`) and `scripts/native-evidence build`,
+on the build host or in your checkout with `--remote`, run their three
+builds through `scripts/cargo-lane --allow-warnings`: the same rule for
+what shows, but a workspace warning, still named on the closing line, does
+not fail a build that has to start the app. Without it,
+each build of the UI replayed the vendored crates' warnings, about 17,000
+tokens, even when it compiled only `cagents`. The policy is applied to
+what Cargo reports rather than by capping the vendored crates' lints when
+they compile: lints capped at compile time would leave a unit already
+built replaying its old warnings until it was rebuilt, and
+`CAGENTS_VENDORED_WARNINGS=1` could not show them again without rebuilding
+the UI's dependencies.
+
 The scripts remain the lower-level entry points, documented in the sections
 below, for options a task does not forward, other build profiles, and callers
 that cannot run mise: GitHub CI, `scripts/native-evidence` sessions, and the
@@ -837,11 +850,19 @@ between its builds would keep the slot leased while it ran, so leave `--hold`
 off for such a script. A Cargo
 reached any other way inside COMMAND, by path, through `$CARGO`, `rustup run`
 or `mise exec`, would compile here, so `exec` also sets `RUSTC_WRAPPER` to
-`scripts/cargo-gate-rustc-guard`, which refuses to compile a crate and says
-why; Cargo's queries of rustc pass, and a wrapper the caller set still runs.
-Programs launched by `cargo run` inside that `exec` inherit the same Cargo
-shim and guard. Their named `cargo` reenters the gate after the program's
-build releases its slot; their absolute `$CARGO` cannot compile here.
+`scripts/cargo-gate-rustc-guard`, which refuses to compile and says why;
+Cargo's queries of rustc pass, and a wrapper the caller set still runs. The
+same guard is the `rustc`, `rustdoc` and `clippy-driver` beside the shim's
+`cargo` on `PATH`: a compiler run by name gets through only to answer what it
+is asked (its version, help, or a print it makes without compiling), from the
+next one on `PATH`.
+Programs launched by `cargo run` inside that `exec` inherit the same shims and
+guard. Their named `cargo` reenters the gate after the program's build
+releases its slot; their absolute `$CARGO` cannot compile here. Outside the
+guard's reach are a compiler run by its path, as `rustup run TOOLCHAIN rustc`
+does, or found on a `PATH` that puts a toolchain's directory ahead of the
+shims, any other driver, and a compiler run by anything the command leaves
+running after the shims are removed.
 On the build host itself, or with
 `CAGENTS_BUILD_REMOTE=local`, commands build here through the local slots
 above. With `CAGENTS_BUILD_REMOTE_LOOPBACK=1`, the build host's own commands
@@ -933,12 +954,14 @@ included, and moves the rest out of the target; with `0` it keeps none. Every
 6 hours it also moves out compiled units no build has looked at for 3 days,
 such as old versions after a dependency update. Cargo reads the fingerprint
 of every unit in a build's graph, even one it doesn't compile, so a unit is
-dated by its `.fingerprint/<package>-<hash>` directory and its outputs: a
-build dependency's rlib or a compiled build script is read only when it is
-rebuilt, so judged alone it would look unused in a lane that builds daily.
-A stale unit's fingerprint goes first, then its `deps/<crate>-<hash>` files
-and `build/<package>-<hash>` directory, so a unit moved out only in part is
-rebuilt. It skips this where the file system keeps no access times. Below twice the host's floor, the larger of
+dated by its fingerprint and its outputs: a build dependency's rlib or a
+compiled build script is read only when it is rebuilt, so judged alone it
+would look unused in a lane that builds daily. In Cargo's layout up to 1.99,
+a stale unit's `.fingerprint/<package>-<hash>` goes first, then its
+`deps/<crate>-<hash>` files and `build/<package>-<hash>` directory, so a unit
+moved out only in part is rebuilt. From 1.100, a unit is one
+`build/<package>/<hash>/` directory holding its fingerprint and outputs, and
+goes in one rename. It skips this where the file system keeps no access times. Below twice the host's floor, the larger of
 `CAGENTS_BUILD_REMOTE_FREE_FLOOR_GIB` and the [guard's](#compilation-jobs-and-shared-build-directories)
 default, a slot keeps a quarter of the budget, its dependencies are looked
 through at once, and the lease does the same to every other slot no lease
@@ -1075,7 +1098,7 @@ local build, removes them with `scripts/prune-build-dirs` in two ways:
 
 The pruner searches the repository's main checkout first, then the mirrored `/var/tmp/cargo-build`, then `~/.cache`, `~/.local/state` and `/var/tmp`, six levels deep. `CAGENTS_BUILD_PRUNE_ROOTS` replaces the last three. `~` is the account's home from the password database, because a test fixture's builds run under a private `HOME` that holds none of the account's build output, and a search of only that would find nothing yet count as a complete run. When `HOME` differs, its `~/.cache` and `~/.local/state` are searched as well, for a user who keeps builds under a `HOME` of their own. `~/.local/share` and the offload slots are never touched under either: their leases bound them, as [described above](#building-on-another-host), and before each of the guard's background runs and its run below the floor, `scripts/cargo-offload --trim-slots` beside it bounds the slots under the account's `~/.cache/cagents-offload` (`CAGENTS_BUILD_OFFLOAD_SLOTS`; empty for none) that no lease holds, under their leases' locks, as a lease would. A background run's account of it is in `/var/tmp/cagents-prune-build-dirs-UID.slots.log`. Below the floor the build waits for that trim and its removals beside the pruner, within the same budget. A `CAGENTS_BUILD_PRUNE` command replaces both. It skips a checkout's committed directories, which hold only sources.
 
-It recognizes build output by Cargo's own markers, not by name or place: a root `.rustc_info.json`, or a `CACHEDIR.TAG` beside a profile's `.fingerprint`. A [native-evidence](#native-evidence) task's `target-before` and `target-after`, beside the task's `.native-evidence` marker, are build output too. It removes a build directory only when all of these hold:
+It recognizes build output by Cargo's own markers, not by name or place: a root `.rustc_info.json`, or a `CACHEDIR.TAG` beside a profile's fingerprints, in `.fingerprint/` up to Cargo 1.99 or in `build/<package>/<hash>/fingerprint/` from 1.100. A [native-evidence](#native-evidence) task's `target-before` and `target-after`, beside the task's `.native-evidence` marker, are build output too. It removes a build directory only when all of these hold:
 
 - nothing inside it has been written or changed for `CAGENTS_BUILD_PRUNE_IDLE_DAYS` (default 7), or four times that for another main checkout's own build, which seeds that checkout's worktrees, or 12 hours for a native-evidence task's, 1 hour while running low;
 - every Cargo lock in it is free;
@@ -1753,10 +1776,11 @@ Exit zero confirms a readable snapshot; inspect `checks_state` to decide
 whether CI passed, failed or is pending.
 For GraphQL snapshots, the aggregate check state covers all contexts;
 `checks_complete=false` means the displayed context list stops at 100.
-Each context in `checks` keeps its name and state; only one that has not
-passed keeps its link (`detailsUrl`, or `targetUrl` and `description`), and
-none carries timestamps. Without `--json`, passing checks are counted on the
-`Checks:` line and only the others are listed, a finished one with its link.
+Passing checks are counted in `checks_passed` rather than listed: `checks`
+holds only the contexts that are running or have not passed, each with its
+name, state and link (`detailsUrl`, or `targetUrl` and `description`), and
+none with timestamps. Without `--json`, the `Checks:` line gives the same count
+and the other checks are listed, a finished one with its link.
 REST bootstrap snapshots have no check aggregate. The CLI keeps serving one
 for the rest of its two-minute interval, labeled `source: "rest-bootstrap"`.
 GitHub's REST answer has `mergeable: null` while it computes mergeability
@@ -2174,6 +2198,12 @@ scripts/native-evidence --remote fw16 --task ~/.local/state/cev/pr1234-prs clean
 a native slot while other sessions hold them all. Run it in the background,
 or with a command timeout of at least an hour. A command killed by a short
 tool timeout drops the SSH connection, and that ends the work on the host too.
+TERM, HUP or INT sent to the wrapper alone also ends and reaps its SSH
+connections, Git's and rsync's included, and then the wrapper dies by that
+signal; the host ends the build or comparison they started. A signal its
+caller ignores stays ignored, so `nohup` keeps a run through a closed
+terminal. A session detached by an explicit `start` keeps running until
+`stop`.
 
 `pair` builds both sides, then for each starts a session, runs the steps file
 on the host with `SIDE` set and `evidence` standing for `native-evidence` there,

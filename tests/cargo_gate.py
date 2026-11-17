@@ -468,6 +468,174 @@ class InstalledGateSync(unittest.TestCase):
         self.assertEqual(self.recorded(), self.first)
 
 
+class OwnedCommandSupervisor(unittest.TestCase):
+    """scripts/cargo-gate-command.py on its own, with a command that reports
+    which signals it ignores and waits."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory(prefix="cagents-supervisor-", dir="/var/tmp")
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.ignored = self.root / "ignored"
+        self.command = [sys.executable, "-I", "-c", textwrap.dedent(f"""
+            import pathlib, signal
+            status = pathlib.Path("/proc/self/status").read_text().splitlines()
+            mask = next(line.split()[1] for line in status if line.startswith("SigIgn:"))
+            pathlib.Path({str(self.ignored)!r}).write_text(mask)
+            signal.pause()
+        """)]
+
+    def supervise(self, *options, ignore=()):
+        def ignoring():
+            for number in ignore:
+                signal.signal(number, signal.SIG_IGN)
+        process = subprocess.Popen(
+            [sys.executable, "-I", str(ROOT / "scripts/cargo-gate-command.py"), *options, "/dev/null",
+             *self.command], stdin=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+            preexec_fn=ignoring)
+        self.addCleanup(lambda: process.poll() is None and (process.kill(), process.wait()))
+        deadline = time.monotonic() + HANG_GUARD
+        while not self.ignored.exists():
+            self.assertLess(time.monotonic(), deadline, "the command never started")
+            if process.poll() is not None:
+                self.fail(process.stderr.read())
+            time.sleep(0.02)
+        return process
+
+    def test_a_signal_the_caller_ignores_cancels_nothing_and_stays_ignored(self):
+        # As under nohup.
+        process = self.supervise(ignore=(signal.SIGHUP,))
+        self.assertTrue(int(self.ignored.read_text(), 16) & (1 << (signal.SIGHUP - 1)))
+        process.send_signal(signal.SIGHUP)
+        time.sleep(0.3)
+        self.assertIsNone(process.poll())
+        process.terminate()
+        self.assertEqual(process.wait(timeout=HANG_GUARD), 128 + signal.SIGTERM)
+
+    def test_a_wrapper_dies_by_the_signal_that_cancelled_it_and_names_itself(self):
+        process = self.supervise("--wrapper", "some-wrapper")
+        process.send_signal(signal.SIGINT)
+        self.assertEqual(process.wait(timeout=HANG_GUARD), -signal.SIGINT)
+        failed = subprocess.run(
+            [sys.executable, "-I", str(ROOT / "scripts/cargo-gate-command.py"), "--wrapper", "some-wrapper",
+             "/dev/null", str(self.root / "missing")], capture_output=True, text=True, timeout=HANG_GUARD)
+        self.assertEqual(failed.returncode, 127)
+        self.assertTrue(failed.stderr.startswith("some-wrapper: "), failed.stderr)
+
+
+class CompilerGuard(unittest.TestCase):
+    """scripts/cargo-gate-rustc-guard on its own, with stand-in compilers that
+    record what reaches them: what only asks the compiler something passes,
+    and anything that would compile here is refused."""
+
+    QUERIES = ([], ["-vV"], ["-V"], ["--version"], ["-h"], ["--help"], ["--explain", "E0382"],
+               ["--explain=E0382"], ["-Chelp"], ["-C", "help"], ["-Zhelp"], ["-Whelp"],
+               ["--print", "sysroot"], ["--print=cfg"], ["--print=file-names=names.txt"],
+               # Cargo's query of the target: it prints and stops.
+               ["-", "--crate-name", "___", "--print=file-names", "--crate-type", "bin"],
+               # Any print but those made while linking stops before compiling.
+               ["--print=native-static-libs", "--print=cfg", "main.rs"])
+    COMPILES = (["main.rs"], ["-v", "main.rs"], ["-C", "opt-level=3", "main.rs"],
+                ["--crate-name", "probe", "--edition=2021", "src/main.rs"],
+                # Printed while linking, after compiling.
+                ["--crate-name", "probe", "--print=native-static-libs", "src/lib.rs"],
+                ["--print", "native-static-libs", "main.rs"], ["--print=link-args", "main.rs"],
+                ["--print=link-args=args.txt", "main.rs"])
+
+    TOOLS = ("rustc", "rustdoc", "clippy-driver")
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory(prefix="cagents-compiler-guard-", dir="/var/tmp")
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.log = self.root / "log"
+        self.guard = ROOT / "scripts/cargo-gate-rustc-guard"
+        # An outer `exec` command's gate can be another copy of the guard.
+        copy = self.root / "copy"
+        copy.mkdir()
+        shutil.copy2(self.guard, copy / self.guard.name)
+        self.real = self.root / "real"
+        self.shims = [self.root / "shims", self.root / "outer-shims"]
+        # Like mise's shim for a tool it does not manage here: it runs the
+        # first one on PATH outside its own directory, and gives up when that
+        # keeps coming back to it.
+        mise = self.root / "mise"
+        for directory in (self.real, *self.shims, mise):
+            directory.mkdir()
+        for tool in self.TOOLS:
+            (self.real / tool).write_text(
+                f'#!/bin/sh\nprintf "{tool} %s\\n" "$*" >>"{self.log}"\n')
+            (self.real / tool).chmod(0o755)
+            (self.shims[0] / tool).symlink_to(self.guard)
+            (self.shims[1] / tool).symlink_to(copy / self.guard.name)
+            (mise / tool).write_text(textwrap.dedent(f"""\
+                #!/bin/sh
+                [ "${{MISE_DEPTH:-0}}" -lt 3 ] || {{ echo "mise: shim fallback recursion detected" >&2; exit 1; }}
+                export MISE_DEPTH=$((${{MISE_DEPTH:-0}} + 1))
+                here=$(dirname "$0")
+                IFS=:
+                for entry in $PATH; do
+                    [ "$entry" != "$here" ] && [ -x "$entry/{tool}" ] && exec "$entry/{tool}" "$@"
+                done
+                exit 127
+            """))
+            (mise / tool).chmod(0o755)
+        self.env = {"PATH": os.pathsep.join([*map(str, self.shims), str(mise), str(self.real),
+                                             "/usr/bin", "/bin"])}
+
+    def run_guard(self, command, **env):
+        self.log.unlink(missing_ok=True)
+        result = subprocess.run(command, env=self.env | env, cwd=self.root, capture_output=True,
+                                text=True, timeout=HANG_GUARD)
+        ran = [line.rstrip() for line in self.log.read_text().splitlines()] if self.log.exists() else []
+        return result, ran
+
+    def test_a_compiler_run_directly_only_answers_queries(self):
+        for tool in self.TOOLS:
+            for arguments in self.QUERIES:
+                with self.subTest(tool=tool, arguments=arguments):
+                    result, ran = self.run_guard([str(self.shims[0] / tool), *arguments])
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(ran, [" ".join([tool, *arguments])])
+            for arguments in self.COMPILES:
+                with self.subTest(tool=tool, arguments=arguments):
+                    result, ran = self.run_guard([str(self.shims[0] / tool), *arguments])
+                    self.assertEqual(result.returncode, 1)
+                    self.assertEqual(ran, [])
+                    self.assertIn(f"`{tool}` run directly inside `cargo-gate exec` would compile on this host",
+                                  result.stderr)
+
+    def test_as_cargos_wrapper_it_only_passes_queries_to_the_callers_wrapper(self):
+        wrapper = self.root / "callers-wrapper"
+        wrapper.write_text(f'#!/bin/sh\nprintf "wrapper %s\\n" "$*" >>"{self.log}"\nexec "$@"\n')
+        wrapper.chmod(0o755)
+        rustc = str(self.real / "rustc")
+        for given in ({}, {"CAGENTS_BUILD_EXEC_RUSTC_WRAPPER": str(wrapper)}):
+            for arguments in self.QUERIES[1:]:
+                with self.subTest(given=given, arguments=arguments):
+                    result, ran = self.run_guard(
+                        [str(self.guard), rustc, *arguments], **given)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    expected = [" ".join(["rustc", *arguments])]
+                    if given:
+                        expected.insert(0, " ".join(["wrapper", rustc, *arguments]))
+                    self.assertEqual(ran, expected)
+            for arguments in self.COMPILES:
+                with self.subTest(given=given, arguments=arguments):
+                    result, ran = self.run_guard(
+                        [str(self.guard), rustc, *arguments], **given)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertEqual(ran, [])
+                    self.assertIn("would compile on this host", result.stderr)
+                    self.assertIn("CAGENTS_BUILD_REMOTE=local", result.stderr)
+
+    def test_a_compiler_missing_beyond_the_guard_is_named(self):
+        self.env["PATH"] = os.pathsep.join([str(self.shims[0]), "/nonexistent"])
+        result, ran = self.run_guard([str(self.shims[0] / "rustc"), "-vV"])
+        self.assertEqual(result.returncode, 127)
+        self.assertIn("no rustc on PATH besides cargo-gate's guard", result.stderr)
+
+
 class HeldCommand(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

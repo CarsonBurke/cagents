@@ -442,8 +442,10 @@ run_build() {
         export PATH=${zig%/*}:$PATH
         local arguments
         while IFS= read -r arguments; do
+            # As the runner does: the vendored crates' warnings are counted,
+            # not shown, and the workspace's show without failing the build.
             # shellcheck disable=SC2086 # Deliberately one word per argument.
-            cargo build $arguments 8<&-
+            "$tool_root/scripts/cargo-lane" --allow-warnings build $arguments 8<&-
         done < <(build_arguments "$lane" "$checkout")
     )
     [ "$(source_state "$checkout")" = "$revision" ] ||
@@ -1025,7 +1027,13 @@ while [ "$#" -gt 0 ]; do
         shift
         break
     fi
-    [ "$1" = --quiet ] || arguments+=("$1")
+    # How Cargo reports, which scripts/cargo-lane chooses, is no request to
+    # compile anything: this replay compiles nothing and reports nothing.
+    case $1 in
+        --quiet | --message-format=*) ;;
+        --message-format) shift ;;
+        *) arguments+=("$1") ;;
+    esac
     shift
 done
 request=${arguments[*]:-}

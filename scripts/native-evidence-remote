@@ -16,6 +16,24 @@ set -euo pipefail
 self=$(readlink -f "$0")
 tool_root=${self%/scripts/*}
 
+# A signal sent to this wrapper alone, such as a tool timeout's TERM, would end
+# only this shell. Its SSH connections, Git's and rsync's among them, would run
+# on, and the host would go on building or comparing for nobody: Bash runs no
+# trap until the command it waits for ends, and command substitutions hold
+# most of them. So the wrapper runs under the supervisor of the gate's owned
+# commands. On TERM, HUP or INT it ends this shell, then every connection the
+# shell left, and reaps them before it dies by that signal; the host sees each
+# connection go and ends its work. A signal the caller ignores, as nohup
+# ignores HUP, stays ignored. Otherwise it passes the exit status on.
+if [ "${CAGENTS_EVIDENCE_REMOTE_SUPERVISOR:-}" = "$PPID" ]; then
+    unset CAGENTS_EVIDENCE_REMOTE_SUPERVISOR
+else
+    export CAGENTS_EVIDENCE_REMOTE_SUPERVISOR=$$
+    # It reads cancellation from a file too, which this never writes.
+    exec /usr/bin/python3 -I "$tool_root/scripts/cargo-gate-command.py" --wrapper native-evidence-remote \
+        /dev/null "$self" "$@"
+fi
+
 usage() {
     cat <<'USAGE'
 Usage: scripts/native-evidence --remote HOST --task DIR COMMAND
@@ -105,7 +123,11 @@ fi
 # tool and synthetic provider, as they do locally.
 tool_source=${CAGENTS_EVIDENCE_REMOTE_TOOL:-$tool_root}
 
-ssh_command=(ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30)
+# Its own connection, never a channel of a user's multiplexing master: the
+# host ends what a connection started when that connection's sshd goes, and a
+# master's outlives this command.
+ssh_command=(ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30
+    -o ControlMaster=no -o ControlPath=none)
 # Git's own SSH connection, the first contact in a build, gets the same
 # options, so an unreachable host fails in seconds rather than prompting.
 git_ssh="${ssh_command[*]}"
@@ -136,6 +158,7 @@ set +m
 end_with_connection "\$main"
 status=0
 wait "\$main" || status=\$?
+stop_watching
 exit "\$status"
 SCRIPT
 }
@@ -144,8 +167,10 @@ SCRIPT
 # sshd's session process exits but nothing tells what it started, which would
 # build or hold the native lock for nobody; a watcher sends that work's
 # process group TERM instead. A session that `start` detached on purpose
-# outlives it, which is why pair stops its own on TERM.
+# outlives it, which is why pair stops its own on TERM. The watcher ends with
+# the script, so what a connection started is gone once it closes.
 remote_lifetime=$(cat <<'LIFETIME'
+watcher=
 end_with_connection() {
     local main=$1 connection=$$
     while [ "$connection" -gt 1 ]; do
@@ -157,10 +182,25 @@ end_with_connection() {
     done
     [ "$connection" -gt 1 ] || return 0
     (
-        while kill -0 "$connection" 2>/dev/null && kill -0 "$main" 2>/dev/null; do sleep 2; done
+        # Told to stop, it ends its pause and waits for it, leaving nothing
+        # for whoever adopts the orphans here.
+        nap=
+        trap '[ -z "$nap" ] || kill "$nap" 2>/dev/null; wait; exit 0' TERM
+        while kill -0 "$connection" 2>/dev/null && kill -0 "$main" 2>/dev/null; do
+            sleep 2 &
+            nap=$!
+            wait "$nap" || :
+            nap=
+        done
         kill -0 "$main" 2>/dev/null || exit 0
         kill -TERM -- "-$main" 2>/dev/null || :
     ) </dev/null >/dev/null 2>&1 &
+    watcher=$!
+}
+stop_watching() {
+    [ -n "$watcher" ] || return 0
+    kill "$watcher" 2>/dev/null || :
+    wait "$watcher" 2>/dev/null || :
 }
 LIFETIME
 )
@@ -314,15 +354,17 @@ build_in_checkout() {
     evidence_arguments=$(build_arguments) && [ -n "$evidence_arguments" ] ||
         die "could not ask $tool_source what native-evidence builds"
     [ "$(tree_of "$checkout")" = "$tree" ] || die "$checkout changed while it was copied; build it again"
-    # One slot for the three, as scripts/run-development holds it.
+    # One slot for the three, as scripts/run-development holds it. This
+    # tool's scripts/cargo-lane runs the checkout's gate, so its vendored
+    # crates' warnings are counted, not shown, as the runner's are.
     # shellcheck disable=SC2016 # Expanded by the inner shell.
     (cd -- "$checkout" && scripts/cargo-gate exec --hold bash -ec '
-        gate=$1
+        lane=$1 gate=$2
         while IFS= read -r arguments; do
             # Deliberately one word per argument.
-            "$gate" build $arguments
-        done <<<"$2"
-    ' build-evidence "$checkout/scripts/cargo-gate" "$evidence_arguments") ||
+            "$lane" --allow-warnings --gate "$gate" build $arguments
+        done <<<"$3"
+    ' build-evidence "$tool_root/scripts/cargo-lane" "$checkout/scripts/cargo-gate" "$evidence_arguments") ||
         die "could not build $checkout; see the build's messages above"
     [ "$(tree_of "$checkout")" = "$tree" ] || die "$checkout changed during its build; build it again"
     # Where the gate brought them, which Cargo's configuration may move.

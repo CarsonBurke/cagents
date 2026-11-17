@@ -137,28 +137,12 @@ impl core::text::Paragraph for Paragraph {
 
         buffer.set_rich_text(
             text.content.iter().enumerate().map(|(i, span)| {
-                let attrs = text::to_attributes(span.font.unwrap_or(text.font));
-
-                let attrs = match (span.size, span.line_height) {
-                    (None, None) => attrs,
-                    _ => {
-                        let size = span.size.unwrap_or(text.size);
-
-                        attrs.metrics(cosmic_text::Metrics::new(
-                            size.into(),
-                            span.line_height
-                                .unwrap_or(text.line_height)
-                                .to_absolute(size)
-                                .into(),
-                        ))
-                    }
-                };
-
-                let attrs = if let Some(color) = span.color {
-                    attrs.color(text::to_color(color))
-                } else {
-                    attrs
-                };
+                let attrs = text::to_span_attributes(
+                    span,
+                    text.font,
+                    text.size,
+                    text.line_height,
+                );
                 (span.text.as_ref(), attrs.metadata(i))
             }),
             &text::to_attributes(text.font),

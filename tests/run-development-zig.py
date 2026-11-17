@@ -46,7 +46,7 @@ class ZigDiscovery(unittest.TestCase):
         self.runner = checkout / "scripts/run-development"
         shutil.copy2(SOURCE, self.runner)
         shutil.copy2(GATE, checkout / "scripts/cargo-gate")
-        for helper in ("cargo-gate-command.py", "build-host"):
+        for helper in ("cargo-gate-command.py", "build-host", "cargo-lane", "cargo_warnings.py"):
             shutil.copy2(GATE.with_name(helper), checkout / "scripts" / helper)
         (checkout / "mise.toml").write_text('[tools]\nzig = "0.15.2"\n')
 
@@ -132,7 +132,8 @@ exit 83
                 result, calls = self.run_runner(FAKE_ZIG_FORMAT=format_name)
                 self.assertEqual(result.returncode, 83, result.stderr)
                 self.assertEqual(len(calls), 1)
-                self.assertIn("build --locked --profile dev-runtime --no-default-features", calls[0])
+                self.assertIn("build --message-format=json --locked --profile dev-runtime --no-default-features",
+                              calls[0])
                 self.assertIn(f"zig={self.real}", calls[0])
                 self.assertIn(f"home={self.home}|xdg={self.xdg}|mise={self.data}", calls[0])
                 self.cargo_calls.unlink()
@@ -268,15 +269,25 @@ case $1 in
         done
         for argument do binary=$argument; done
         if [ "$binary" = "${FAKE_FAIL_BINARY:-}" ]; then exit 101; fi
-        mkdir -p "$FAKE_TARGET/dev-runtime" "$FAKE_BUILD/dev-runtime/build/script-1" \\
-            "$FAKE_BUILD/dev-runtime/deps"
-        printf '# env-dep:FAKE_COMPILED=\\n' > "$FAKE_BUILD/dev-runtime/deps/unit.d"
+        # Where Cargo keeps rustc's dependency lists and build-script output:
+        # up to 1.99 in deps/ and build/<package>-<hash>/, and from 1.100 in
+        # each unit's build/<package>/<hash>/.
+        profile=$FAKE_BUILD/dev-runtime
+        if [ "${FAKE_CARGO_LAYOUT:-}" = units ]; then
+            compiled=$profile/build/probe/0123456789abcdef/out
+            script_output=$profile/build/probe/fedcba9876543210/run/stdout
+        else
+            compiled=$profile/deps
+            script_output=$profile/build/probe-fedcba9876543210/output
+        fi
+        mkdir -p "$FAKE_TARGET/dev-runtime" "$compiled" "${script_output%/*}"
+        printf '# env-dep:FAKE_COMPILED=\\n' > "$compiled/probe-0123456789abcdef.d"
         printf '#!/bin/sh\\nexit 0\\n' > "$FAKE_TARGET/dev-runtime/$binary"
         chmod +x "$FAKE_TARGET/dev-runtime/$binary"
         printf '%s: %s %s\\n' "$FAKE_TARGET/dev-runtime/$binary" "$FAKE_SOURCE" "$FAKE_VENDORED" \\
             > "$FAKE_TARGET/dev-runtime/$binary.d"
         printf 'cargo:rerun-if-changed=%s\\ncargo:rerun-if-changed=%s\\ncargo::rerun-if-changed=build.rs\\ncargo:rerun-if-env-changed=FAKE_WATCHED\\ncargo:rerun-if-env-changed=AR_x86_64-unknown-linux-gnu\\n' \\
-            "$FAKE_GIT_INDEX" "$FAKE_WATCHED_DIRECTORY" > "$FAKE_BUILD/dev-runtime/build/script-1/output"
+            "$FAKE_GIT_INDEX" "$FAKE_WATCHED_DIRECTORY" > "$script_output"
         exit 0 ;;
 esac
 exit 83
@@ -302,7 +313,8 @@ exit 83
             FAKE_WATCHED_DIRECTORY=str(self.root / "shared/assets"),
             FAKE_BUILD_BOUND=str(2 * HANG_GUARD * 20),
         )
-        for name in ("FAKE_WATCHED", "FAKE_COMPILED", "FAKE_BUILD_SECONDS", "FAKE_BUILD_RELEASE"):
+        for name in ("FAKE_WATCHED", "FAKE_COMPILED", "FAKE_BUILD_SECONDS", "FAKE_BUILD_RELEASE",
+                     "FAKE_CARGO_LAYOUT"):
             self.env.pop(name, None)
 
     def launch(self, *arguments, **changes):
@@ -801,8 +813,6 @@ exit 83
             ("executable replaced", lambda: (self.target / "dev-runtime/cagentsd").write_text("#!/bin/sh\n")),
             ("record removed", lambda: (self.target / "dev-runtime/.run-development-ui").unlink()),
             ("dependency outside the checkout", lambda: self.vendored.write_text("//\n")),
-            ("path a build script watches", lambda: self.git_index.write_text("staged")),
-            ("file in a directory a build script watches", lambda: self.watched_asset.write_text("<svg/>")),
             ("dependency list removed", lambda: (self.target / "dev-runtime/cagents.d").unlink()),
             ("Cargo configuration in a parent directory", self.write_ancestor_config),
         ):
@@ -813,6 +823,35 @@ exit 83
         for name, changes in (
             ("toolchain", {"FAKE_RUSTC": "1.94.0"}),
             ("compiler flags", {"RUSTFLAGS": "-Ctarget-cpu=native"}),
+        ):
+            with self.subTest(change=name):
+                self.assert_built("--browserless", **changes)
+                self.assert_skipped("--browserless", **changes)
+                self.assert_built("--browserless")
+        self.assert_what_the_build_watches_sends_the_launch_through_the_build()
+
+    def test_cargo_1_100s_layout_is_read_for_what_the_build_watches(self):
+        """From Cargo 1.100 each unit keeps rustc's dependency list in
+        build/<package>/<hash>/out/ and what a build script printed in
+        build/<package>/<hash>/run/stdout."""
+        self.env["FAKE_CARGO_LAYOUT"] = "units"
+        self.assert_built("--browserless")
+        self.assertFalse((self.root / "build/dev-runtime/deps").exists())
+        self.assert_what_the_build_watches_sends_the_launch_through_the_build()
+
+    def assert_what_the_build_watches_sends_the_launch_through_the_build(self):
+        """After a build: the files and variables its build scripts asked
+        Cargo to watch, and the variables rustc read, each count."""
+        self.assert_skipped("--browserless")
+        for name, change in (
+            ("path a build script watches", lambda: self.git_index.write_text("staged")),
+            ("file in a directory a build script watches", lambda: self.watched_asset.write_text("<svg/>")),
+        ):
+            with self.subTest(change=name):
+                change()
+                self.assert_built("--browserless")
+                self.assert_skipped("--browserless")
+        for name, changes in (
             ("variable a build script watches", {"FAKE_WATCHED": "1"}),
             ("variable read at compile time", {"FAKE_COMPILED": "1"}),
         ):
@@ -1133,7 +1172,8 @@ exit 1
     def test_both_lanes_build_one_cli_and_daemon_and_differ_only_in_the_ui(self):
         _, browserless = self.launch("--browserless")
         _, integrated = self.launch()
-        common = "build --locked --profile dev-runtime"
+        # Through scripts/cargo-lane, which reads Cargo's messages as JSON.
+        common = "build --message-format=json --locked --profile dev-runtime"
         self.assertEqual(browserless[:2], [
             f"{common} --no-default-features --features development --bin cagents",
             f"{common} --no-default-features --features development,host --bin cagentsd",

@@ -1480,6 +1480,23 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
     }
 }
 
+/// The answer #3002 reported inline code on, styled as chat prose is in
+/// `theme`: three code spans among prose, one with spaces inside it.
+#[cfg(test)]
+pub(super) fn inline_code_answer_spans(
+    theme: &cosmic::Theme,
+) -> Arc<[Span<'static, markdown::Uri>]> {
+    let content = markdown::Content::parse(
+        "`[features].multi_agent` is deprecated. It still controls the V1 fallback. \
+         `[agents].enabled = false` disables subagent tools even when the model selects a \
+         subagent version, unless `[features].multi_agent_v2` is enabled.",
+    );
+    let markdown::Item::Paragraph(text) = &content.items()[0] else {
+        panic!("the answer is one paragraph");
+    };
+    text.spans(design::markdown_settings(theme, design::TEXT_PROSE).style)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2330,6 +2347,203 @@ mod tests {
                 .collect::<String>(),
             "needle"
         );
+    }
+
+    fn shaped(spans: Arc<[Span<'static, markdown::Uri>]>, width: f32) -> State {
+        State {
+            plain: spans
+                .iter()
+                .map(|span| span.text.as_ref())
+                .collect::<String>()
+                .into(),
+            spans: Some(spans),
+            shape: Some(Shape {
+                bounds: Size::new(width, f32::INFINITY),
+                size: design::TEXT_PROSE.into(),
+                font: iced::Font::default(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn inline_code_is_smaller_but_keeps_the_prose_line_pitch_and_baseline() {
+        let spans = inline_code_answer_spans(&cosmic::Theme::dark());
+        let size = design::TEXT_PROSE;
+        let pitch = iced::widget::text::LineHeight::default()
+            .to_absolute(size.into())
+            .0;
+        let code = |index: usize| spans[index].highlight.is_some();
+        // From one long line to a pane narrow enough that code fills lines.
+        for width in [700.0, 260.0, 150.0] {
+            let state = shaped(spans.clone(), width);
+            let paragraph = state.paragraph();
+            let mut shared_baseline = None;
+            let (mut mixed, mut code_only, mut lines) = (0, 0, 0);
+            for (line, run) in paragraph.buffer().layout_runs().enumerate() {
+                lines += 1;
+                assert_eq!(run.line_height, pitch, "line {line} at {width}");
+                assert!(
+                    (run.line_top - line as f32 * pitch).abs() < 0.01,
+                    "line {line} at {width} starts off the prose pitch"
+                );
+                for glyph in run.glyphs {
+                    let expected = if code(glyph.metadata) {
+                        size * design::INLINE_CODE_RELATIVE_SIZE
+                    } else {
+                        size
+                    };
+                    assert_eq!(glyph.font_size, expected);
+                }
+                let coded = run
+                    .glyphs
+                    .iter()
+                    .filter(|glyph| code(glyph.metadata))
+                    .count();
+                if coded == run.glyphs.len() {
+                    code_only += 1;
+                } else if coded > 0 {
+                    mixed += 1;
+                }
+                // Prose lines, lines with code among the prose and lines of
+                // nothing but the smaller code share one baseline.
+                let baseline = run.line_y - run.line_top;
+                let shared = *shared_baseline.get_or_insert(baseline);
+                assert!(
+                    (baseline - shared).abs() < 0.01,
+                    "line {line} at {width}: baseline {baseline} against {shared}"
+                );
+            }
+            // Each code span lays out room at both ends, inside its glyph
+            // boxes, so the chip keeps clear of the letters beside it.
+            let room = design::inline_code_inline_padding(size);
+            for (index, span) in spans.iter().enumerate().filter(|(index, _)| code(*index)) {
+                let glyphs = paragraph
+                    .buffer()
+                    .layout_runs()
+                    .flat_map(|run| run.glyphs.iter())
+                    .filter(|glyph| glyph.metadata == index)
+                    .collect::<Vec<_>>();
+                let first = glyphs.first().expect("shaped code");
+                assert!((first.x_offset * first.font_size - room).abs() < 0.01);
+                // Monospace letters share one advance; the edges add the room.
+                // A space the span wraps at is not laid out, so count glyphs.
+                let advance = glyphs[1].w;
+                let span_width = glyphs.iter().map(|glyph| glyph.w).sum::<f32>();
+                let letters = glyphs.len() as f32;
+                assert!(
+                    (span_width - (letters * advance + 2.0 * room)).abs() < 0.01,
+                    "{:?} at {width}",
+                    span.text
+                );
+            }
+            assert!(mixed > 0, "{width} has lines with code beside prose");
+            if width < 200.0 {
+                assert!(code_only > 0, "{width} has lines of nothing but code");
+            }
+            assert!((paragraph.min_height() - lines as f32 * pitch).abs() < 0.01);
+        }
+    }
+
+    #[test]
+    fn inline_code_chip_reaches_the_frame_inside_its_line_on_both_themes() {
+        use iced::advanced::renderer::{Headless, Renderer};
+        for theme in [cosmic::Theme::dark(), cosmic::Theme::light()] {
+            let spans = inline_code_answer_spans(&theme);
+            let base = design::base(&theme);
+            let chip = design::code_chip(&theme);
+            let distinct = |a: [u8; 4], b: [u8; 4]| {
+                a.iter()
+                    .zip(b)
+                    .take(3)
+                    .map(|(a, b)| a.abs_diff(b))
+                    .max()
+                    .unwrap()
+            };
+            assert!(
+                distinct(chip.into_rgba8(), base.into_rgba8()) >= 16,
+                "the chip must be visible on the surface, dark={}",
+                theme.theme_type.is_dark()
+            );
+            let mut renderer = crate::app::tests::headless_renderer();
+            let mut selectable = Selectable {
+                inlines: None,
+                find_enabled: false,
+                plain: spans
+                    .iter()
+                    .map(|span| span.text.as_ref())
+                    .collect::<String>()
+                    .into(),
+                spans: spans.clone(),
+                matches: vec![].into(),
+                size: design::TEXT_PROSE.into(),
+                font: iced::Font::default(),
+                target: Target {
+                    card: CardId::new(),
+                    generation: 0,
+                },
+                logical: None,
+                flow: None,
+                _flow_ready: None,
+            };
+            let mut tree =
+                Tree::new(&selectable as &dyn Widget<Message, cosmic::Theme, cosmic::Renderer>);
+            let (width, height) = (700_u32, 80_u32);
+            let node = selectable.layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(width as f32, height as f32)),
+            );
+            // The second code span starts inside the first line, so the
+            // chip's side is in the frame rather than left of it.
+            let state = tree.state.downcast_ref::<State>();
+            let (left, top, line_height) = state
+                .paragraph()
+                .buffer()
+                .layout_runs()
+                .find_map(|run| {
+                    run.glyphs
+                        .iter()
+                        .find(|glyph| {
+                            glyph.metadata > 0 && spans[glyph.metadata].highlight.is_some()
+                        })
+                        .map(|glyph| (glyph.x, run.line_top, run.line_height))
+                })
+                .expect("a second code span");
+            let viewport = Rectangle::with_size(Size::new(width as f32, height as f32));
+            renderer.reset(viewport);
+            selectable.draw(
+                &tree,
+                &mut renderer,
+                &theme,
+                &renderer::Style::default(),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &viewport,
+            );
+            let pixels = renderer.screenshot(Size::new(width, height), 1.0, base);
+            let at = |x: f32, y: f32| -> [u8; 4] {
+                let index = (y as usize * width as usize + x as usize) * 4;
+                pixels[index..index + 4].try_into().unwrap()
+            };
+            // In the room before the first letter, halfway down: the chip.
+            let x = left + design::inline_code_inline_padding(design::TEXT_PROSE) / 2.0;
+            assert!(
+                distinct(at(x, top + line_height * 0.6), chip.into_rgba8()) <= 2,
+                "the chip is painted beside its code"
+            );
+            // The space before the code stays the surface.
+            assert!(
+                distinct(at(left - 1.0, top + line_height * 0.6), base.into_rgba8()) <= 2,
+                "the chip stays within its code's room"
+            );
+            // The top of the line box stays the surface, so the chip on
+            // the line above never meets this one.
+            assert!(
+                distinct(at(x, top + 1.0), base.into_rgba8()) <= 2,
+                "the chip is inset from the top of its line"
+            );
+        }
     }
 }
 

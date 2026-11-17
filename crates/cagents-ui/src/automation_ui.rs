@@ -1,6 +1,7 @@
 //! Window-local drafts and paged views of daemon-owned automations. Every
 //! mutation carries the revision shown to the reader; confirmation retains an
 //! immutable launch description, never a reference to a changing editor.
+use crate::app::dialog_ui::Question;
 use crate::{
     account::AccountId,
     agent::Provider,
@@ -248,7 +249,7 @@ struct Confirmation {
     generation: u64,
     automation: Automation,
     request: Request,
-    title: &'static str,
+    question: Question,
 }
 
 #[derive(PartialEq, Eq)]
@@ -780,6 +781,13 @@ impl State {
         self.draft = None;
         self.discard_draft = None;
         true
+    }
+    /// The question the pane asks in place of its content, and which asking
+    /// of it this is.
+    pub(crate) fn question(&self) -> Option<(u64, Question)> {
+        self.confirmation
+            .as_ref()
+            .map(|confirmation| (confirmation.generation, confirmation.question))
     }
     pub fn draft_dialog_open(&self) -> bool {
         self.discard_draft.is_some()
@@ -1850,7 +1858,7 @@ impl State {
             Action::Enable | Action::RunNow | Action::Remove => {
                 if let Some(automation) = &self.selected {
                     self.sequence = self.sequence.wrapping_add(1);
-                    let (request, title) = match action {
+                    let (request, question) = match action {
                         Action::Enable => (
                             Request::SetEnabled {
                                 id: automation.id,
@@ -1858,7 +1866,7 @@ impl State {
                                 enabled: true,
                                 confirmed: true,
                             },
-                            "Enable scheduled execution?",
+                            Question::EnableAutomation,
                         ),
                         Action::RunNow => (
                             Request::RunNow {
@@ -1874,21 +1882,21 @@ impl State {
                                     .unwrap_or_else(Uuid::new_v4),
                                 confirmed: true,
                             },
-                            "Run this automation now?",
+                            Question::RunAutomationNow,
                         ),
                         _ => (
                             Request::Remove {
                                 id: automation.id,
                                 revision: automation.revision,
                             },
-                            "Remove this automation?",
+                            Question::RemoveAutomation,
                         ),
                     };
                     self.confirmation = Some(Confirmation {
                         generation: self.sequence,
                         automation: automation.clone(),
                         request,
-                        title,
+                        question,
                     });
                 }
             }
@@ -2329,34 +2337,51 @@ impl State {
             content = content.push(crate::design::body(notice));
         }
         if let Some(confirmation) = &self.confirmation {
-            content =
-                content
-                    .push(crate::design::title(confirmation.title))
-                    .push(launch_description(
+            let question = confirmation.question;
+            let remove = question == Question::RemoveAutomation;
+            let confirm = if remove {
+                crate::ui_controls::button::destructive("Remove automation")
+            } else {
+                crate::ui_controls::button::secondary("Confirm")
+            };
+            content = content.push(crate::app::dialog_ui::inline_question(
+                question,
+                widget::column::with_children(vec![
+                    crate::design::title(match question {
+                        Question::EnableAutomation => "Enable scheduled execution?",
+                        Question::RunAutomationNow => "Run this automation now?",
+                        _ => "Remove this automation?",
+                    })
+                    .into(),
+                    launch_description(
                         &confirmation.automation,
                         self.accounts.iter().chain(&self.archived_accounts),
-                    ));
-            content = content.push(crate::design::body(if matches!(confirmation.request, Request::Remove { .. }) {
-                "Past runs remain in history. Active or uncertain work must be closed before removal."
-            } else {
-                "The agent may change files and use tools allowed by these permissions. Confirm only this displayed launch configuration."
-            }));
-            content = content.push(
-                widget::row::with_children(vec![
-                    button("Cancel", Action::CancelConfirmation, !busy),
-                    if matches!(confirmation.request, Request::Remove { .. }) {
-                        crate::ui_controls::button::destructive("Remove automation")
+                    ),
+                    crate::design::body(if remove {
+                        "Past runs remain in history. Active or uncertain work must be closed before removal."
+                    } else {
+                        "The agent may change files and use tools allowed by these permissions. Confirm only this displayed launch configuration."
+                    })
+                    .into(),
+                    widget::row::with_children(vec![
+                        crate::ui_controls::button::secondary("Cancel")
+                            .id(confirmation_cancel_id())
+                            .on_press_maybe((!busy).then_some(Action::CancelConfirmation))
+                            .into(),
+                        confirm
+                            .id(confirmation_confirm_id())
                             .on_press_maybe(
                                 (!busy).then_some(Action::Confirm(confirmation.generation)),
                             )
-                            .into()
-                    } else {
-                        button("Confirm", Action::Confirm(confirmation.generation), !busy)
-                    },
+                            .into(),
+                    ])
+                    .spacing(space::S)
+                    .wrap()
+                    .into(),
                 ])
-                .spacing(space::S)
-                .wrap(),
-            );
+                .spacing(space::M)
+                .width(Length::Fill),
+            ));
         } else if let Some(draft) = &self.draft {
             content = content.push(draft.view(busy, &self.models, self.error.as_deref(), width));
         } else {
@@ -2509,6 +2534,7 @@ impl State {
                                 // button; the buttons after it stay put.
                                 crate::ui_controls::button::secondary("Pause")
                                     .instead("Enable…", !selected.enabled)
+                                    .id(question_opener_id(Question::EnableAutomation))
                                     .on_press_maybe(if selected.enabled {
                                         (!busy).then_some(Action::Pause)
                                     } else {
@@ -2517,6 +2543,7 @@ impl State {
                                     })
                                     .into(),
                                 crate::ui_controls::button::secondary("Run now…")
+                                    .id(question_opener_id(Question::RunAutomationNow))
                                     .instead(
                                         "Retry run…",
                                         self.manual_requests.get(&selected.id).is_some_and(
@@ -2532,13 +2559,15 @@ impl State {
                                         .then_some(Action::RunNow),
                                     )
                                     .into(),
-                                button(
-                                    "Remove…",
-                                    Action::Remove,
-                                    !busy
-                                        && selected.active_firing.is_none()
-                                        && selected.blocked.is_none(),
-                                ),
+                                crate::ui_controls::button::secondary("Remove…")
+                                    .id(question_opener_id(Question::RemoveAutomation))
+                                    .on_press_maybe(
+                                        (!busy
+                                            && selected.active_firing.is_none()
+                                            && selected.blocked.is_none())
+                                        .then_some(Action::Remove),
+                                    )
+                                    .into(),
                             ])
                             .spacing(space::S)
                             .wrap(),
@@ -3422,6 +3451,21 @@ pub fn draft_dialog_focus_id() -> widget::Id {
     crate::app::dialog_ui::Question::DiscardAutomationDraft
         .initial_focus(draft_dialog_keep_id(), draft_dialog_discard_id())
 }
+/// The control that asks `question`, where the keyboard returns when it is
+/// dismissed.
+pub(crate) fn question_opener_id(question: Question) -> widget::Id {
+    widget::Id::new(match question {
+        Question::EnableAutomation => "automation.enable",
+        Question::RunAutomationNow => "automation.run-now",
+        _ => "automation.remove",
+    })
+}
+pub(crate) fn confirmation_cancel_id() -> widget::Id {
+    widget::Id::new("automation.confirmation.cancel")
+}
+pub(crate) fn confirmation_confirm_id() -> widget::Id {
+    widget::Id::new("automation.confirmation.confirm")
+}
 pub(crate) fn draft_dialog_keep_id() -> widget::Id {
     widget::Id::new("dialog.automation-draft.keep")
 }
@@ -3537,10 +3581,20 @@ fn optional(value: &str) -> Option<String> {
 }
 
 #[cfg(test)]
+impl State {
+    /// Shows an automation, as selecting one in the list does once it has
+    /// loaded.
+    pub(crate) fn show_automation_for_test(&mut self) {
+        self.pending = None;
+        self.selected = Some(tests::automation());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    fn automation() -> Automation {
+    pub(super) fn automation() -> Automation {
         Automation {
             id: Uuid::new_v4(),
             revision: 4,

@@ -62,6 +62,37 @@ pub(crate) use creation::NewHomeCreationReceipt;
 const REMOVING_PREFIX: &str = ".removing-";
 const CONFIG_LIMIT: u64 = 8 * 1024 * 1024;
 
+/// The daemon declined to enroll a new home before anything was written
+/// into it. Creation withdraws the empty directory it just made and returns
+/// this error as it is, so the request leaves nothing behind.
+#[cfg(any(test, feature = "host"))]
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum EnrollmentRefused {
+    /// The control gate was busy, or another account operation changed the
+    /// reservations meanwhile. The same request can be sent again.
+    #[error("{}", crate::terminal_ipc::DAEMON_BUSY)]
+    Busy,
+    /// The daemon stopped admitting changes.
+    #[error("{0}")]
+    Closed(String),
+}
+
+#[cfg(any(test, feature = "host"))]
+impl EnrollmentRefused {
+    pub(crate) fn into_error(self) -> io::Error {
+        let kind = match self {
+            Self::Busy => io::ErrorKind::WouldBlock,
+            Self::Closed(_) => io::ErrorKind::Other,
+        };
+        io::Error::new(kind, self)
+    }
+
+    /// This refusal, if `error` is one, unwrapped.
+    pub(crate) fn of(error: &io::Error) -> Option<&Self> {
+        error.get_ref()?.downcast_ref()
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CodexConfig {
     #[default]
@@ -267,6 +298,13 @@ impl Homes {
         let path = self.path(provider, key);
         let created = creation::create(&parent, provider, key)?;
         if let Err(error) = initialize(&created).and_then(|()| created.revalidate()) {
+            // A refused enrollment changed nothing, so the empty directory
+            // this call made is withdrawn. Anything else, or a directory
+            // that is no longer exactly that, stays for explicit recovery.
+            #[cfg(any(test, feature = "host"))]
+            if EnrollmentRefused::of(&error).is_some() && created.withdraw().is_ok() {
+                return Err(error);
+            }
             return Err(io::Error::new(
                 error.kind(),
                 format!(

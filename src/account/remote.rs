@@ -170,20 +170,102 @@ pub(crate) fn execute(_operation: Operation) -> Result<serde_json::Value, String
     Err("Account lifecycle requires the selected daemon's scoped admission reservation".into())
 }
 
+/// Why an account lifecycle operation did not complete.
+#[cfg(feature = "host")]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum LifecycleError {
+    /// The daemon stayed too busy to admit the change. Nothing changed, so
+    /// the same request can be sent again.
+    #[error("{}", crate::terminal_ipc::DAEMON_BUSY)]
+    Busy,
+    #[error("{0}")]
+    Failed(String),
+}
+
 /// The opaque host reservation remains borrowed throughout provider I/O.
 #[cfg(feature = "host")]
 pub(crate) fn execute_reserved(
     operation: Operation,
     reservation: &crate::host::AccountReservation,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, LifecycleError> {
     use super::{home::Homes, registry::Store};
-    let homes = Homes::installation().ok_or("The device has no account data directory")?;
-    let store = Store::installation().ok_or("The device has no account registry")?;
+    let homes = Homes::installation()
+        .ok_or_else(|| LifecycleError::Failed("The device has no account data directory".into()))?;
+    let store = Store::installation()
+        .ok_or_else(|| LifecycleError::Failed("The device has no account registry".into()))?;
     execute_at(operation, reservation, homes, store)
 }
 
+/// Only creation can be refused as busy: it alone waits for the control
+/// gate's writer. Every other operation fails in its own words.
 #[cfg(feature = "host")]
 fn execute_at(
+    operation: Operation,
+    reservation: &crate::host::AccountReservation,
+    homes: super::home::Homes,
+    store: super::registry::Store,
+) -> Result<serde_json::Value, LifecycleError> {
+    match operation {
+        Operation::Create {
+            provider,
+            copy_codex_config,
+        } => create(provider, copy_codex_config, reservation, &homes, &store),
+        operation => change(operation, reservation, homes, store).map_err(LifecycleError::Failed),
+    }
+}
+
+#[cfg(feature = "host")]
+fn create(
+    provider: Provider,
+    copy_codex_config: bool,
+    reservation: &crate::host::AccountReservation,
+    homes: &super::home::Homes,
+    store: &super::registry::Store,
+) -> Result<serde_json::Value, LifecycleError> {
+    use super::{Account, home::CodexConfig, home::EnrollmentRefused, probe};
+    use LifecycleError::Failed;
+    let now = crate::chat::now_ms().unwrap_or_default();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| Failed(error.to_string()))?;
+    reservation.verify().map_err(Failed)?;
+    if !Account::PROVIDERS.contains(&provider) {
+        return Err(Failed("Omp manages its own logins".into()));
+    }
+    let search = runtime.block_on(probe::search_path());
+    let program = probe::find_executable(provider.executable(), search.as_deref())
+        .ok_or_else(|| Failed("The provider CLI is not installed on this device".into()))?;
+    let system = Account::system(provider).resolved_home();
+    let (key, home) = reservation
+        .create_pending_home(
+            store,
+            homes,
+            provider,
+            now,
+            system.as_deref(),
+            if copy_codex_config {
+                CodexConfig::Copy
+            } else {
+                CodexConfig::Shared
+            },
+        )
+        .map_err(|error| match EnrollmentRefused::of(&error) {
+            Some(EnrollmentRefused::Busy) => LifecycleError::Busy,
+            _ => Failed(error.to_string()),
+        })?;
+    let account = Account::managed(provider, key, home.clone());
+    let recipe = login_recipe_with_path(&account, program, search.as_deref()).map_err(|error| {
+        Failed(format!(
+            "{error}; the new account home and pending registration were retained at {}. Retry sign-in after fixing the launch configuration.",
+            home.display()
+        ))
+    })?;
+    serde_json::to_value(Created { key, home, recipe }).map_err(|error| Failed(error.to_string()))
+}
+
+#[cfg(feature = "host")]
+fn change(
     operation: Operation,
     reservation: &crate::host::AccountReservation,
     homes: super::home::Homes,
@@ -191,7 +273,6 @@ fn execute_at(
 ) -> Result<serde_json::Value, String> {
     use super::{
         Account, UsageStatus,
-        home::CodexConfig,
         probe::{self, Outcome},
         registry::Registered,
     };
@@ -202,43 +283,7 @@ fn execute_at(
         .map_err(|error| error.to_string())?;
     reservation.verify()?;
     match operation {
-        Operation::Create {
-            provider,
-            copy_codex_config,
-        } => {
-            if !Account::PROVIDERS.contains(&provider) {
-                return Err("Omp manages its own logins".into());
-            }
-            let search = runtime.block_on(probe::search_path());
-            let program = probe::find_executable(provider.executable(), search.as_deref())
-                .ok_or("The provider CLI is not installed on this device")?;
-            let system = Account::system(provider).resolved_home();
-            let (key, home) = reservation.commit(|| {
-                store.try_create_pending_reserved(reservation, &homes, provider, now, || {
-                    reservation.create_home(
-                        &homes,
-                        provider,
-                        system.as_deref(),
-                        if copy_codex_config {
-                            CodexConfig::Copy
-                        } else {
-                            CodexConfig::Shared
-                        },
-                    )
-                })
-            })?;
-            let account = Account::managed(provider, key, home.clone());
-            let recipe = match login_recipe_with_path(&account, program, search.as_deref()) {
-                Ok(recipe) => recipe,
-                Err(error) => {
-                    return Err(format!(
-                        "{error}; the new account home and pending registration were retained at {}. Retry sign-in after fixing the launch configuration.",
-                        home.display()
-                    ));
-                }
-            };
-            serde_json::to_value(Created { key, home, recipe }).map_err(|error| error.to_string())
-        }
+        Operation::Create { .. } => unreachable!("execute_at creates accounts itself"),
         Operation::Link {
             provider,
             key,
@@ -708,7 +753,11 @@ mod tests {
             store.clone(),
         )
         .unwrap_err();
-        assert!(error.contains("Your account and its files were kept"));
+        assert!(
+            error
+                .to_string()
+                .contains("Your account and its files were kept")
+        );
         assert_eq!(before, store.load().unwrap());
         assert_eq!(inode, home.metadata().unwrap().ino());
         assert_eq!(

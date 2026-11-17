@@ -33,3 +33,21 @@ Coverage: vendor/iced-core's text::blink tests cover the schedule. The app's
 terminal tests cover the rest and its restart, and docs/performance.md records
 the native measurement ("Idle UI wakeups"). Remove this copy when the pinned
 upstream widgets stop blinking on their own.
+
+Local change: inline code styling (src/markdown.rs)
+
+`Style::inline_code` styles a span as inline code. The app's own Markdown
+renderer and this one share it, so chat prose and every `markdown::view`
+surface draw inline code the same way. `Style` gains
+`inline_code_relative_size`, the size of inline code relative to the text
+around it, set through `Span::relative_size`, and
+`inline_code_inline_padding`, room laid out before and after inline code
+inside its background, set through `Span::inline_padding`. The defaults of
+1.0 and 0.0 keep upstream's size and layout. `inline_code_color` becomes an `Option`, where `None`
+leaves inline code in the color of the text around it. The default stays
+upstream's white.
+
+Why: monospace letters at the prose's size read larger and heavier than
+the sentence around them, and full-strength ink made code brighter than the
+prose (cagents#3002). The app's regressions are in
+crates/cagents-ui/src/app/chat_ui/selectable_prose.rs and flow_layout.rs.

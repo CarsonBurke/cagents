@@ -1212,11 +1212,7 @@ impl SpanRef<'_> {
         let span = span(text[range].to_owned()).strikethrough(*strikethrough);
 
         let span = if *code {
-            span.font(style.inline_code_font)
-                .color(style.inline_code_color)
-                .background(style.inline_code_highlight.background)
-                .border(style.inline_code_highlight.border)
-                .padding(style.inline_code_padding)
+            style.inline_code(span)
         } else if *strong || *emphasis {
             span.font(Font {
                 weight: if *strong {

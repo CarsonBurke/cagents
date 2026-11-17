@@ -1015,23 +1015,26 @@ under_lock=false
 # product is a separate Cargo invocation: features are package-wide, so a
 # single --bins invocation would reunify the UI and host graphs and make the
 # UI compile Ghostty while making the daemon compile libcosmic.
+# Each goes through scripts/cargo-lane, which hides the vendored crates'
+# warnings, as the lane tasks do, and shows the workspace's own without
+# failing the build on them; CAGENTS_VENDORED_WARNINGS=1 shows them all.
 build_products() {
     if [ "$under_lock" = true ]; then
         set -- without_compiling "$@"
     fi
     # shellcheck disable=SC2016 # expanded by the inner shell
     "$@" "$root/scripts/cargo-gate" exec --hold sh -ec '
-        gate=$1
+        lane=$1
         shift
-        "$gate" build --locked --profile dev-runtime --no-default-features --features development --bin cagents
-        "$gate" build --locked --profile dev-runtime --no-default-features --features development,host --bin cagentsd
-        "$gate" build --locked --profile dev-runtime $1 --bin cagents-ui
+        "$lane" --allow-warnings build --locked --profile dev-runtime --no-default-features --features development --bin cagents
+        "$lane" --allow-warnings build --locked --profile dev-runtime --no-default-features --features development,host --bin cagentsd
+        "$lane" --allow-warnings build --locked --profile dev-runtime $1 --bin cagents-ui
         if [ -n "$2" ]; then
             for executable in cagents cagentsd cagents-ui; do
                 stat -c "%n %i %s %.9Y" "$3/$executable"
             done >"$2"
         fi
-    ' build-products "$root/scripts/cargo-gate" "$ui_features" "${built:-}" "$products"
+    ' build-products "$root/scripts/cargo-lane" "$ui_features" "${built:-}" "$products"
 }
 
 # A launch with nothing to build skips the build gate, whose queue can be long
@@ -1051,7 +1054,12 @@ build_identity_inputs() {
     # compile time through env! or option_env!.
     watched=$({
         build_script_watches env-changed
-        sed -n 's/^# env-dep:\([^=]*\).*/\1/p' "$build_dir"/dev-runtime/deps/*.d 2>/dev/null
+        # Cargo up to 1.99 keeps rustc's dependency lists in deps/, and from
+        # 1.100 in each unit's build/<package>/<hash>/out/. There this also
+        # reads the lists of compiled build scripts and any .d file a build
+        # script writes to its OUT_DIR, which only makes the check stricter.
+        sed -n 's/^# env-dep:\([^=]*\).*/\1/p' "$build_dir"/dev-runtime/deps/*.d \
+            "$build_dir"/dev-runtime/build/*/*/out/*.d 2>/dev/null
     } | LC_ALL=C sort -u)
     env | awk -v watched="$watched" '
         BEGIN { count = split(watched, names, "\n"); for (i = 1; i <= count; i++) seen[names[i]] }
@@ -1070,9 +1078,12 @@ build_identity() {
 }
 # What the dev-runtime build scripts asked Cargo to watch: env-changed for
 # variable names, or changed for paths. Outputs of earlier builds count too,
-# which only makes the check stricter.
+# which only makes the check stricter. Cargo up to 1.99 keeps what a build
+# script printed in build/<package>-<hash>/output, and from 1.100 in
+# build/<package>/<hash>/run/stdout.
 build_script_watches() {
-    sed -n "s/^cargo::\{0,1\}rerun-if-$1=//p" "$build_dir"/dev-runtime/build/*/output 2>/dev/null |
+    sed -n "s/^cargo::\{0,1\}rerun-if-$1=//p" "$build_dir"/dev-runtime/build/*/output \
+        "$build_dir"/dev-runtime/build/*/*/run/stdout 2>/dev/null |
         LC_ALL=C sort -u
 }
 # Files the build read outside the checkout scan: the executables' dependency

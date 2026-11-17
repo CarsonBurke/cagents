@@ -10154,6 +10154,11 @@ impl Cagents {
         if let Some(answer) = self.chrome_key_event(&event) {
             return answer;
         }
+        if is_escape_press(&event)
+            && let Some(dismiss) = self.account_question_escape(captured)
+        {
+            return (self.update(dismiss), Projection::Full);
+        }
         if let Some(task) = self.account_key_event(&event) {
             return (task, Projection::Full);
         }
@@ -10311,6 +10316,10 @@ impl Cagents {
                 && self.pane_inspector_layout(card) == Some(InspectorLayout::Overlay)
             {
                 return (self.close_pane_inspector_overlay(card), Projection::Full);
+            }
+            // Last, behind everything drawn in front of the pane.
+            if let Some(dismiss) = self.pane_escape() {
+                return (self.update(dismiss), Projection::Full);
             }
         }
         if let Some(backwards) = is_tab_press(&event)
@@ -35033,7 +35042,7 @@ mod tests {
 
     /// An app with one project whose GitHub state lists the given open pull
     /// requests, so a sidebar row can be resolved to a review target.
-    fn pull_request_test_app(numbers: &[u64]) -> (Cagents, ProjectId) {
+    pub(super) fn pull_request_test_app(numbers: &[u64]) -> (Cagents, ProjectId) {
         let mut app = context_inspector_test_app(false);
         let project = ProjectId::new();
         app.sidebar_model.projects.push(SidebarProject::new(

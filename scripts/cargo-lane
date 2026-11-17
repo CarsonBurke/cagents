@@ -2,7 +2,7 @@
 """Run a lane's Cargo command through scripts/cargo-gate, holding the
 workspace's crates to the rule main's build check applies: no warnings.
 
-Usage: scripts/cargo-lane SUBCOMMAND [CARGO ARGS...] [-- HARNESS ARGS...]
+Usage: scripts/cargo-lane [--allow-warnings] [--gate PATH] SUBCOMMAND [CARGO ARGS...] [-- HARNESS ARGS...]
 
 Cargo's messages are read as JSON, which the gate relays from the build host
 unchanged, so nothing about what compiles where, or what is fresh, differs
@@ -13,9 +13,16 @@ however many targets report it. Errors show from every crate. Cargo replays
 a fresh unit's warnings, so a check that compiles nothing still reports them.
 
 The command exits with Cargo's status; when Cargo succeeded but a workspace
-crate warned, it ends with one line naming where, and exits 1. A
---message-format other than `human` or `short`, such as JSON, is passed
-through untouched, with nothing filtered.
+crate warned, it ends with one line naming where, and exits 1. With
+--allow-warnings, as the development runner and native-evidence build, it
+names them the same way but keeps Cargo's status: those builds must still
+run. A --message-format other than `human` or `short`, such as JSON, is
+passed through untouched, with nothing filtered.
+
+The workspace is the one Cargo uses from the current directory, so a
+checkout other than this script's is judged by its own members. --gate runs
+that checkout's scripts/cargo-gate in place of this one's, as
+native-evidence does to build a side as the side's own runner would.
 
 Environment:
   CAGENTS_VENDORED_WARNINGS=1  Show the vendored crates' warnings too
@@ -28,6 +35,10 @@ import sys
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+# Builds run through this, and a bytecode cache written into scripts/ would
+# change the checkout: the runner's freshness check would then see an edit and
+# rebuild on the next launch.
+sys.dont_write_bytecode = True
 import cargo_warnings
 
 PROGRAM = "cargo-lane"
@@ -100,10 +111,18 @@ def main(arguments):
     if arguments[:1] in (["-h"], ["--help"]):
         print(__doc__, end="")
         return 0
+    allow_warnings, gate = False, str(HERE / "cargo-gate")
+    while arguments[:1] in (["--allow-warnings"], ["--gate"]):
+        if arguments[0] == "--allow-warnings":
+            allow_warnings, arguments = True, arguments[1:]
+        elif len(arguments) > 1:
+            gate, arguments = arguments[1], arguments[2:]
+        else:
+            arguments = []
     if not arguments or arguments[0].startswith("-"):
         print(__doc__, end="", file=sys.stderr)
         return 2
-    gate = [str(HERE / "cargo-gate"), arguments[0]]
+    gate = [gate, arguments[0]]
     formats, rest = split_format(arguments[1:])
     parts = [part.strip() for value in formats for part in (value or "").split(",")]
     if None in formats or not set(parts) <= HUMAN:
@@ -118,7 +137,8 @@ def main(arguments):
     command = [*gate, "--message-format=" + ",".join(chosen), *rest]
 
     try:
-        packages = cargo_warnings.workspace_packages(HERE.parent)
+        packages = cargo_warnings.workspace_packages(
+            cargo_warnings.workspace_root(Path.cwd()) or HERE.parent)
     except cargo_warnings.WorkspaceUnreadable as error:
         print(f"{PROGRAM}: the workspace's members are unreadable, so every warning shows "
               f"and none fails the command: {error}", file=sys.stderr)
@@ -135,7 +155,7 @@ def main(arguments):
             f", and {len(places) - LOCATIONS_SHOWN} more" if len(places) > LOCATIONS_SHOWN else "")
         print(f"{PROGRAM}: {plural(len(warnings.own), 'warning')} from the workspace's crates"
               f"{f' ({where})' if where else ''}; main's build check fails on them", file=sys.stderr)
-        if status == 0:
+        if status == 0 and not allow_warnings:
             status = 1
     return status
 

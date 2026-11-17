@@ -390,3 +390,22 @@ mod pipelined {
         assert!(matches!(admitted, Ok(ServerResponse::ShutdownPreflight(_))));
     }
 }
+
+#[test]
+fn a_busy_account_operation_refuses_as_the_gate_does() {
+    use crate::account::remote::LifecycleError;
+    let busy = super::lifecycle_refusal(LifecycleError::Busy);
+    assert_eq!(busy, super::control_gate::busy());
+    assert!(
+        crate::control::ControlError::Remote {
+            code: busy.code,
+            message: busy.message,
+            retryable: busy.retryable,
+        }
+        .is_daemon_busy()
+    );
+    let failed = super::lifecycle_refusal(LifecycleError::Failed("no CLI".into()));
+    assert_eq!(failed.code, ProtocolErrorCode::InvalidRequest);
+    assert_eq!(failed.message, "no CLI");
+    assert!(!failed.retryable);
+}

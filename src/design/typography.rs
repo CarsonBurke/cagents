@@ -34,7 +34,7 @@ use cosmic::{
     widget::text::Text,
 };
 
-use super::{GRID_UNIT, RADIUS_XS, accent_color, muted_text, raised, space};
+use super::{GRID_UNIT, RADIUS_XS, accent_color, code_chip, muted_text, space};
 
 /// The size of nearly everything in the shell: rows, controls, labels.
 pub const TEXT_BODY: f32 = 13.0;
@@ -172,6 +172,39 @@ pub fn display<'a>(text: impl Into<Cow<'a, str>> + 'a) -> ShellText<'a> {
         .font(weighted(Weight::Bold))
 }
 
+/// The size of inline code relative to the prose it sits in.
+///
+/// A monospace face's letters are wider and denser than proportional ones:
+/// with the default faces the two share an x-height, but the monospace
+/// lowercase advances 15% further, so code at the prose's size read larger
+/// and heavier than the sentence around it. At nine tenths its letters take
+/// the prose's room and weight. The line height stays the prose's, so lines
+/// with code keep the same pitch as lines without.
+pub const INLINE_CODE_RELATIVE_SIZE: f32 = 0.9;
+
+/// How far the chip behind inline code comes into the line box of prose
+/// set at `size`.
+///
+/// The highlight starts as the whole line box, and a chip that tall touched
+/// the chip on the next line. The chip drops the half-leading and a little
+/// more from the top, which leaves about a pixel above inline code's
+/// capitals and brackets. Its descenders reach the bottom of the box, so
+/// the bottom stays where it is.
+pub fn inline_code_padding(size: f32) -> cosmic::iced::Padding {
+    let half_leading = (LineHeight::default().to_absolute(size.into()).0 - size) / 2.0;
+    cosmic::iced::Padding {
+        top: -(half_leading + size * 0.08),
+        ..cosmic::iced::Padding::ZERO
+    }
+}
+
+/// The room laid out before and after inline code in prose set at `size`,
+/// which the chip covers. Being laid out, it keeps the chip clear of the
+/// letters and punctuation beside the code.
+pub fn inline_code_inline_padding(size: f32) -> f32 {
+    size * 0.2
+}
+
 /// Markdown shares the shell's semantic palette and a compact heading scale.
 pub fn markdown_settings(theme: &Theme, size: f32) -> cosmic::widget::markdown::Settings {
     use cosmic::{iced, widget::markdown};
@@ -181,9 +214,15 @@ pub fn markdown_settings(theme: &Theme, size: f32) -> cosmic::widget::markdown::
         iced::Theme::Light
     });
     style.link_color = accent_color(theme);
-    style.inline_code_color = theme.cosmic().background(false).on.into();
-    style.inline_code_highlight.background = raised(theme).into();
+    // Code reads in the color of the sentence it is part of; the chip is
+    // what sets it apart. Full-strength ink made it brighter than the
+    // prose around it.
+    style.inline_code_color = None;
+    style.inline_code_highlight.background = code_chip(theme).into();
     style.inline_code_highlight.border.radius = RADIUS_XS.into();
+    style.inline_code_relative_size = INLINE_CODE_RELATIVE_SIZE;
+    style.inline_code_padding = inline_code_padding(size);
+    style.inline_code_inline_padding = inline_code_inline_padding(size);
     markdown::Settings {
         h1_size: (size + GRID_UNIT).into(),
         h2_size: (size + GRID_UNIT / 2.0).into(),

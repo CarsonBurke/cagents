@@ -549,15 +549,23 @@ impl State {
             }
             Action::CancelSubmit if !self.discussion.submitting || !self.discussion.busy => {
                 self.discussion.confirmation = None;
+                // Back on the control that asked, not nowhere.
+                return iced::widget::operation::focus(self.question_ids.submit.clone());
             }
             Action::ToggleReview if !self.discussion.submitting || !self.discussion.busy => {
                 self.discussion.review_open = !self.discussion.review_open;
                 self.discussion.confirmation = None;
+                self.discussion.discard_confirmation = None;
+                self.discussion.discard_from_composer = false;
                 self.discussion.submit_error = None;
             }
             Action::CloseReview if !self.discussion.submitting || !self.discussion.busy => {
                 self.discussion.review_open = false;
                 self.discussion.confirmation = None;
+                // A question closed with its popover is not asked again the
+                // next time the popover opens.
+                self.discussion.discard_confirmation = None;
+                self.discussion.discard_from_composer = false;
                 self.discussion.submit_error = None;
             }
             Action::BeginFile(path) if self.drafting_file(&path) => {
@@ -625,9 +633,14 @@ impl State {
             }
             Action::CancelDiscard => {
                 self.discussion.discard_confirmation = None;
-                if std::mem::take(&mut self.discussion.discard_from_composer) {
+                // Back on the control that asked, not nowhere.
+                let opener = if std::mem::take(&mut self.discussion.discard_from_composer) {
                     self.discussion.review_open = false;
-                }
+                    &self.question_ids.discard_in_composer
+                } else {
+                    &self.question_ids.discard_in_review
+                };
+                return iced::widget::operation::focus(opener.clone());
             }
             _ if !self.can_mutate_discussion() => return ActionTask::none(),
             Action::Begin(anchor) => {
@@ -796,6 +809,7 @@ impl State {
                     // in the review popover, and Keep review leads back.
                     self.discussion.discard_from_composer = !self.discussion.review_open;
                     self.discussion.review_open = true;
+                    return self.focus_question(Question::DiscardPendingReview);
                 }
             }
             Action::ConfirmDiscard => {
@@ -918,6 +932,7 @@ impl State {
                         Err(Outcome::Applied) => unreachable!(),
                     };
                     self.discussion.confirmation = Some((authority, request, comments));
+                    return self.focus_question(Question::SubmitReview);
                 }
             }
             Action::ConfirmSubmit => {
@@ -1010,8 +1025,10 @@ impl State {
             rows.push(design::body(format!("This deletes the pending review and {} from GitHub. Your local composer is kept.", match authority.context.pending.as_ref().map_or(0, |pending| pending.comment_count) { 1 => "its draft comment".to_owned(), count => format!("all {count} draft comments") })).into());
             rows.push(popup_actions(
                 crate::ui_controls::button::secondary("Keep review")
+                    .id(self.question_ids.dismiss.clone())
                     .on_press(Action::CancelDiscard),
-                crate::ui_controls::button::primary("Discard review")
+                crate::ui_controls::button::destructive("Discard review")
+                    .id(self.question_ids.confirm.clone())
                     .on_press_maybe(enabled.then_some(Action::ConfirmDiscard)),
             ));
         } else if let Some((authority, request, _)) = &self.discussion.confirmation {
@@ -1061,9 +1078,11 @@ impl State {
             }
             rows.push(popup_actions(
                 crate::ui_controls::button::secondary("Back")
+                    .id(self.question_ids.dismiss.clone())
                     .on_press_maybe((!self.discussion.busy).then_some(Action::CancelSubmit)),
                 crate::ui_controls::button::primary("Submit review")
                     .instead("Submitting…", self.discussion.busy)
+                    .id(self.question_ids.confirm.clone())
                     .on_press_maybe(enabled.then_some(Action::ConfirmSubmit)),
             ));
         } else {
@@ -1078,6 +1097,7 @@ impl State {
                 rows.push(design::body(format!("You have a pending review with {} on {}.{}", comment_count(pending.comment_count), commit.get(..7).unwrap_or(commit), if old_head { " This review belongs to an old head. Discard it to start a review on the current head." } else { "" })).into());
                 rows.push(
                     crate::ui_controls::button::secondary("Discard pending review…")
+                        .id(self.question_ids.discard_in_review.clone())
                         .on_press_maybe(enabled.then_some(Action::PrepareDiscard))
                         .into(),
                 );
@@ -1189,6 +1209,7 @@ impl State {
                 crate::interaction::tooltip(
                     crate::ui_controls::button::primary("Submit review")
                         .instead("Saving…", self.discussion.busy)
+                        .id(self.question_ids.submit.clone())
                         .on_press_maybe(
                             (enabled && !drafting && !empty_comment && !old_head)
                                 .then_some(Action::PrepareSubmit),
@@ -1213,10 +1234,75 @@ impl State {
                     .into(),
             );
         }
-        widget::container(widget::column::with_children(rows).spacing(space::M))
+        let rows = widget::column::with_children(rows).spacing(space::M);
+        let rows = match self.review_question() {
+            Some(question) => crate::app::dialog_ui::inline_question(question, rows),
+            None => rows.into(),
+        };
+        widget::container(rows)
             .padding(space::S)
             .width(Length::Fixed(REVIEW_POPUP_WIDTH))
             .into()
+    }
+
+    /// The review popover's content, as the pane's actions.
+    #[cfg(test)]
+    pub(crate) fn review_popup_for_test(&self) -> Element<'_, super::Action> {
+        self.review_popup().map(|action| self.review_action(action))
+    }
+
+    /// The question the review popover asks, while it is open.
+    pub(crate) fn review_question(&self) -> Option<Question> {
+        if !self.discussion.review_open {
+            None
+        } else if self.discussion.discard_confirmation.is_some() {
+            Some(Question::DiscardPendingReview)
+        } else if self.discussion.confirmation.is_some() {
+            Some(Question::SubmitReview)
+        } else {
+            None
+        }
+    }
+
+    /// What Escape does to the review popover: answers its question with
+    /// the question's dismissal, and otherwise closes it.
+    pub(crate) fn review_escape(&self) -> Option<super::Action> {
+        if !self.discussion.review_open {
+            return None;
+        }
+        let action = match self.review_question() {
+            Some(Question::DiscardPendingReview) => Action::CancelDiscard,
+            Some(_) => Action::CancelSubmit,
+            None => Action::CloseReview,
+        };
+        Some(self.review_action(action))
+    }
+
+    /// The controls that ask the review popover's questions: Discard pending
+    /// review and Submit review.
+    #[cfg(test)]
+    pub(crate) fn review_opener_ids(&self) -> (widget::Id, widget::Id) {
+        (
+            self.question_ids.discard_in_review.clone(),
+            self.question_ids.submit.clone(),
+        )
+    }
+
+    /// The review popover's question's dismissal and committing action.
+    #[cfg(test)]
+    pub(crate) fn review_question_ids(&self) -> (widget::Id, widget::Id) {
+        (
+            self.question_ids.dismiss.clone(),
+            self.question_ids.confirm.clone(),
+        )
+    }
+
+    /// Moves the keyboard to where `question` opens.
+    fn focus_question(&self, question: Question) -> ActionTask {
+        question.focus_task(
+            self.question_ids.dismiss.clone(),
+            self.question_ids.confirm.clone(),
+        )
     }
 
     /// Starts a discussion on the selected file as a whole. Line comments
@@ -1798,6 +1884,7 @@ impl State {
                 );
                 rows.push(
                     crate::ui_controls::button::secondary("Discard pending review…")
+                        .id(self.question_ids.discard_in_composer.clone())
                         .on_press_maybe(enabled.then_some(Action::PrepareDiscard))
                         .into(),
                 );
@@ -1866,12 +1953,12 @@ impl State {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::github::ReviewDiffSide;
     use crate::pull_request_review::tests::{entry, loaded, target};
 
-    fn ready() -> State {
+    pub(crate) fn ready() -> State {
         let mut state = State::new(
             Arc::new(ScriptedApi::new()),
             RepositoryService::system("git"),
@@ -2557,7 +2644,7 @@ mod tests {
         assert!(matches!(&composer.destination, Destination::Line(a) if a.line == 10));
     }
 
-    fn with_old_head_review(state: &mut State) {
+    pub(crate) fn with_old_head_review(state: &mut State) {
         let mut next = loaded(vec![entry("file.rs", ChangeKind::Modified)], vec![]);
         next.context.pending = Some(crate::github::PendingReview {
             id: "REVIEW_old".into(),

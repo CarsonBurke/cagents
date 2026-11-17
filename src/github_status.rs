@@ -337,7 +337,7 @@ pub struct Snapshot {
 }
 
 /// Whether a check context has passed, by the rule `scripts/land-pr` applies.
-pub fn check_passed(check: &serde_json::Value) -> bool {
+fn check_passed(check: &serde_json::Value) -> bool {
     if check["__typename"] == "StatusContext" {
         return check["state"] == "SUCCESS";
     }
@@ -359,22 +359,57 @@ fn check_failed(check: &serde_json::Value) -> bool {
     )
 }
 
-/// A check context as a report shows it. Callers decide on its name and state;
-/// they follow a link only to a check that has not passed, so a passing
-/// check's link and description are left out, as are the timestamps that
-/// snapshots saved before the query stopped asking for them still carry.
+/// A check context that has not passed, as a report shows it, without the
+/// timestamps that snapshots saved before the query stopped asking for them
+/// still carry. Callers decide on its name and state, and follow its link.
 fn reported_check(mut check: serde_json::Value) -> serde_json::Value {
-    let passed = check_passed(&check);
     if let Some(fields) = check.as_object_mut() {
         fields.remove("startedAt");
         fields.remove("completedAt");
-        if passed {
-            for field in ["detailsUrl", "targetUrl", "description"] {
-                fields.remove(field);
-            }
-        }
     }
     check
+}
+
+/// A snapshot as a report shows it. A passing check needs nothing from its
+/// reader, so passing checks are counted rather than listed; `checks` holds
+/// those still running or not passed, which is all `scripts/land-pr` and an
+/// agent act on. The aggregate, `checks_state`, still covers every check.
+#[derive(Debug, Serialize)]
+pub struct ReportedSnapshot {
+    #[serde(flatten)]
+    snapshot: Snapshot,
+    pub checks_passed: usize,
+}
+
+impl ReportedSnapshot {
+    pub fn new(mut snapshot: Snapshot) -> Self {
+        let listed = snapshot.checks.len();
+        snapshot.checks = std::mem::take(&mut snapshot.checks)
+            .into_iter()
+            .filter(|check| !check_passed(check))
+            .map(reported_check)
+            .collect();
+        Self {
+            checks_passed: listed - snapshot.checks.len(),
+            snapshot,
+        }
+    }
+
+    /// Whether the bootstrap script's REST read wrote this snapshot, as
+    /// [`Snapshot::is_rest_bootstrap`] decides from every check it listed.
+    pub fn is_rest_bootstrap(&self) -> bool {
+        self.checks_passed == 0 && self.snapshot.is_rest_bootstrap()
+    }
+}
+
+/// Reads see the snapshot's fields, with `checks` already filtered; judge a
+/// whole snapshot, as [`Snapshot::is_rest_bootstrap`] does, before filtering.
+impl std::ops::Deref for ReportedSnapshot {
+    type Target = Snapshot;
+
+    fn deref(&self) -> &Snapshot {
+        &self.snapshot
+    }
 }
 
 impl Snapshot {
@@ -413,7 +448,7 @@ pub struct Report {
     pub age_seconds: Option<u64>,
     pub stale: bool,
     pub source: &'static str,
-    pub snapshot: Option<Snapshot>,
+    pub snapshot: Option<ReportedSnapshot>,
     pub error: Option<String>,
     pub retry_at: Option<u64>,
     pub outcome: &'static str,
@@ -457,10 +492,7 @@ impl Cached {
                     .fetched_at
                     .is_none_or(|at| now.saturating_sub(at) >= MAX_AGE),
             source,
-            snapshot: self.snapshot.map(|mut snapshot| {
-                snapshot.checks = snapshot.checks.into_iter().map(reported_check).collect();
-                snapshot
-            }),
+            snapshot: self.snapshot.map(ReportedSnapshot::new),
             limitations,
             error: self.error,
             retry_at: (self.next_attempt > now).then_some(self.next_attempt),
@@ -1498,13 +1530,10 @@ mod tests {
         assert_eq!(snapshot.transport, Transport::Rest);
         assert_eq!(snapshot.checks_state.as_deref(), Some("SUCCESS"));
         assert!(snapshot.checks_complete);
-        assert_eq!(snapshot.checks.len(), 11);
-        assert!(snapshot.checks.iter().all(check_passed));
-        assert_eq!(
-            snapshot.checks[0],
-            serde_json::json!({"__typename":"CheckRun","name":"check 0","status":"COMPLETED","conclusion":"SUCCESS"})
-        );
-        let pr = snapshot.pull_request;
+        // Every REST run reads as a passing check, so the report counts them all.
+        assert_eq!(snapshot.checks_passed, 11);
+        assert!(snapshot.checks.is_empty());
+        let pr = &snapshot.pull_request;
         assert_eq!(
             (pr.state.as_str(), pr.head_ref_oid.as_str()),
             ("OPEN", HEAD)
@@ -2081,7 +2110,7 @@ mod tests {
     }
 
     #[test]
-    fn reports_keep_links_only_for_checks_that_have_not_passed() {
+    fn reports_count_passing_checks_and_list_the_rest_with_links() {
         let mut snapshot = parse(&data(), &key()).unwrap();
         let link = "https://status-test.invalid/Owner/Repo/actions/runs/1/job/2";
         let run = |name: &str, status: &str, conclusion: Option<&str>| {
@@ -2105,16 +2134,20 @@ mod tests {
             next_attempt: 0,
         }
         .report(&key(), "cache", now());
-        let checks = report.snapshot.unwrap().checks;
-        let passed = |name: &str| serde_json::json!({"__typename":"CheckRun","name":name,"status":"COMPLETED","conclusion":if name == "passed" {"SUCCESS"} else {"SKIPPED"}});
+        let snapshot = report.snapshot.unwrap();
+        assert_eq!(snapshot.checks_passed, 3);
+        let shown = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(shown["checks_passed"], 3);
+        assert_eq!(shown["checks"].as_array().map(Vec::len), Some(3));
         assert_eq!(
-            checks,
+            shown["pull_request"]["headRefOid"],
+            snapshot.pull_request.head_ref_oid
+        );
+        assert_eq!(
+            snapshot.checks,
             vec![
-                passed("passed"),
-                passed("skipped"),
                 serde_json::json!({"__typename":"CheckRun","name":"failed","status":"COMPLETED","conclusion":"FAILURE","detailsUrl":link}),
                 serde_json::json!({"__typename":"CheckRun","name":"running","status":"IN_PROGRESS","conclusion":null,"detailsUrl":link}),
-                serde_json::json!({"__typename":"StatusContext","context":"deploy","state":"SUCCESS"}),
                 serde_json::json!({"__typename":"StatusContext","context":"lint","state":"ERROR","targetUrl":link,"description":"Lint crashed"}),
             ]
         );

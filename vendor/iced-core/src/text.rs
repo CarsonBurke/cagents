@@ -438,6 +438,16 @@ pub struct Span<'a, Link = (), Font = crate::Font> {
     pub size: Option<Pixels>,
     /// The [`LineHeight`] of the [`Span`].
     pub line_height: Option<LineHeight>,
+    /// A factor applied to the [`Span`]'s [`size`], or to the paragraph's
+    /// size when it has none.
+    ///
+    /// Unlike [`size`], it keeps the paragraph's line height when
+    /// [`line_height`] is unset, so a span set smaller than the text around
+    /// it does not change the height of the lines it falls on.
+    ///
+    /// [`size`]: Self::size
+    /// [`line_height`]: Self::line_height
+    pub relative_size: Option<f32>,
     /// The font of the [`Span`].
     pub font: Option<Font>,
     /// The [`Color`] of the [`Span`].
@@ -450,6 +460,14 @@ pub struct Span<'a, Link = (), Font = crate::Font> {
     ///
     /// Currently, it only affects the bounds of the [`Highlight`].
     pub padding: Padding,
+    /// Horizontal room in logical pixels laid out at the [`Span`]'s start
+    /// and end, like CSS inline padding.
+    ///
+    /// Unlike [`padding`], it moves the text around the [`Span`] and lies
+    /// inside its bounds, so the [`Highlight`] covers it.
+    ///
+    /// [`padding`]: Self::padding
+    pub inline_padding: f32,
     /// Whether the [`Span`] should be underlined or not.
     pub underline: bool,
     /// Whether the [`Span`] should be struck through or not.
@@ -484,6 +502,38 @@ impl<'a, Link, Font> Span<'a, Link, Font> {
     pub fn line_height(mut self, line_height: impl Into<LineHeight>) -> Self {
         self.line_height = Some(line_height.into());
         self
+    }
+
+    /// Sets the [`relative_size`] of the [`Span`].
+    ///
+    /// [`relative_size`]: Self::relative_size
+    pub fn relative_size(mut self, factor: f32) -> Self {
+        self.relative_size = Some(factor);
+        self
+    }
+
+    /// The font size and absolute line height this [`Span`] is shaped with
+    /// in a paragraph of `size` and `line_height`, or `None` when it is
+    /// shaped with the paragraph's own.
+    pub fn metrics(
+        &self,
+        size: Pixels,
+        line_height: LineHeight,
+    ) -> Option<(Pixels, Pixels)> {
+        if self.size.is_none()
+            && self.line_height.is_none()
+            && self.relative_size.is_none()
+        {
+            return None;
+        }
+        let base = self.size.unwrap_or(size);
+        let span_size = Pixels(base.0 * self.relative_size.unwrap_or(1.0));
+        let line_height = match self.line_height {
+            Some(line_height) => line_height.to_absolute(span_size),
+            // A relative size scales the glyphs, not the line they sit on.
+            None => line_height.to_absolute(base),
+        };
+        Some((span_size, line_height))
     }
 
     /// Sets the font of the [`Span`].
@@ -589,6 +639,14 @@ impl<'a, Link, Font> Span<'a, Link, Font> {
         self
     }
 
+    /// Sets the [`inline_padding`] of the [`Span`].
+    ///
+    /// [`inline_padding`]: Self::inline_padding
+    pub fn inline_padding(mut self, inline_padding: f32) -> Self {
+        self.inline_padding = inline_padding;
+        self
+    }
+
     /// Sets whether the [`Span`] should be underlined or not.
     pub fn underline(mut self, underline: bool) -> Self {
         self.underline = underline;
@@ -607,11 +665,13 @@ impl<'a, Link, Font> Span<'a, Link, Font> {
             text: Cow::Owned(self.text.into_owned()),
             size: self.size,
             line_height: self.line_height,
+            relative_size: self.relative_size,
             font: self.font,
             color: self.color,
             link: self.link,
             highlight: self.highlight,
             padding: self.padding,
+            inline_padding: self.inline_padding,
             underline: self.underline,
             strikethrough: self.strikethrough,
         }
@@ -624,11 +684,13 @@ impl<Link, Font> Default for Span<'_, Link, Font> {
             text: Cow::default(),
             size: None,
             line_height: None,
+            relative_size: None,
             font: None,
             color: None,
             link: None,
             highlight: None,
             padding: Padding::default(),
+            inline_padding: 0.0,
             underline: false,
             strikethrough: false,
         }
@@ -646,6 +708,8 @@ impl<Link, Font: PartialEq> PartialEq for Span<'_, Link, Font> {
         self.text == other.text
             && self.size == other.size
             && self.line_height == other.line_height
+            && self.relative_size == other.relative_size
+            && self.inline_padding == other.inline_padding
             && self.font == other.font
             && self.color == other.color
     }
@@ -728,3 +792,41 @@ into_fragment!(isize);
 
 into_fragment!(f32);
 into_fragment!(f64);
+
+#[cfg(test)]
+mod span_metrics_tests {
+    use super::*;
+
+    #[test]
+    fn a_relative_size_scales_the_glyphs_but_keeps_the_paragraph_line() {
+        let size = Pixels(14.0);
+        let line_height = LineHeight::Relative(1.4);
+        let plain: Span<'_> = Span::new("prose");
+        assert_eq!(plain.metrics(size, line_height), None);
+
+        let code: Span<'_> = Span::new("code").relative_size(0.9);
+        let (glyphs, line) = code.metrics(size, line_height).unwrap();
+        assert!((glyphs.0 - 12.6).abs() < 1e-4);
+        assert!((line.0 - 19.6).abs() < 1e-4);
+
+        // An absolute size still sets its own line, as upstream.
+        let large: Span<'_> = Span::new("large").size(20.0);
+        assert_eq!(
+            large.metrics(size, line_height),
+            Some((Pixels(20.0), Pixels(28.0)))
+        );
+        // A relative size of an absolute one scales from it, and an
+        // explicit line height wins over both.
+        let (glyphs, line) = large
+            .clone()
+            .relative_size(0.5)
+            .metrics(size, line_height)
+            .unwrap();
+        assert_eq!((glyphs, line), (Pixels(10.0), Pixels(28.0)));
+        let fixed = code.line_height(LineHeight::Absolute(Pixels(30.0)));
+        assert_eq!(fixed.metrics(size, line_height).unwrap().1, Pixels(30.0));
+
+        let x: Span<'_> = Span::new("x");
+        assert_ne!(x.clone(), x.relative_size(0.9));
+    }
+}
