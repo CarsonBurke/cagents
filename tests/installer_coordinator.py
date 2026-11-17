@@ -128,6 +128,9 @@ elif args[:2] in (['daemon', 'verify-update-census'], ['daemon', 'inspect-update
         sys.exit(1)
 elif args == ['--json', 'daemon', 'status']:
     record('status')
+    if 'FIXTURE_STATUS_REPLY' in os.environ:
+        print(os.environ['FIXTURE_STATUS_REPLY'])
+        sys.exit(0)
     rewrite = os.environ.get('FIXTURE_STATUS_REWRITES')
     rewritten = log.with_suffix('.status-rewritten')
     if rewrite and not rewritten.exists():
@@ -139,6 +142,9 @@ elif args == ['--json', 'daemon', 'status']:
         rewritten.write_text('done\n')
     print(json.dumps({'ok': True, 'command': 'daemon.status', 'data': {'running': pathlib.Path(os.environ['FIXTURE_DAEMON_STATE']).exists()}},
                      separators=(',', ':')))
+elif args == ['daemon', 'stop', '--require-empty']:
+    record('daemon-stop')
+    pathlib.Path(os.environ['FIXTURE_DAEMON_STATE']).unlink()
 elif args == ['daemon', 'start']:
     record('daemon-start-fixture', executable=str(pathlib.Path(sys.argv[0]).resolve()))
     starts = sum(json.loads(line)['event'] == 'daemon-start-fixture' for line in log.read_text().splitlines())
@@ -230,8 +236,8 @@ class InstallerCoordinator(unittest.TestCase):
         self.payload = self.directory / TOP
         self.python(self.payload / "bin/cagents", COORDINATOR)
         self.python(self.payload / "bin/cagentsd", "SOURCE = 'candidate'\n" + INSPECTOR)
-        for name in ("cagents-ui", "cagents-uninstall"):
-            self.executable(self.payload / "bin" / name, '#!/bin/sh\nexit 98\n')
+        self.executable(self.payload / "bin/cagents-ui", '#!/bin/sh\nexit 98\n')
+        self.executable(self.payload / "bin/cagents-uninstall", (ROOT / "packaging/cagents-uninstall").read_text())
         self.write(self.payload / "bin/.cagents-ui-lease-v1", "1\n")
         for name in ("applications/dev.cagents.Cagents.desktop",
                      "autostart/dev.cagents.Cagents.Daemon.desktop",
@@ -898,6 +904,59 @@ os.execv({real_tar!r}, [{real_tar!r}, *args])
         self.assertEqual(finished.returncode, 0, finished.stdout + finished.stderr)
         self.assertEqual(os.readlink(self.prefix / 'current'), f'versions/{VERSION}')
         self.assertEqual((candidate / 'bin/cagents').stat().st_ino, original_inode)
+
+    # Uninstall --------------------------------------------------------------
+    # Both entry points run here: the packaged helper from the installation it
+    # removes, as the documentation tells people to run it, and install.sh.
+    UNINSTALLERS = ("packaged helper", "install.sh")
+    # The status producer's reply for a daemon process that holds the runtime
+    # lock without serving yet, or any longer, in both envelope key orders.
+    TRANSITIONING_STATUS = (
+        '{"command":"daemon.status","data":{"cli_version":"9.9.9","daemon_present":true,'
+        '"daemon_version":null,"inherited_lease":false,"instance":"production","running":false,'
+        '"socket":"/run/user/1000/cagents/cagentsd.sock"},"ok":true}',
+        '{"ok":true,"command":"daemon.status","data":{"instance":"production","running":false,'
+        '"daemon_present":true,"socket":"/run/user/1000/cagents/cagentsd.sock","daemon_version":null}}',
+    )
+
+    def uninstall(self, uninstaller, *options, environment=None):
+        if uninstaller == "packaged helper":
+            command = ["/bin/sh", str(self.prefix / "current/bin/cagents-uninstall"), "--prefix", str(self.prefix)]
+        else:
+            command = ["/bin/sh", str(ROOT / "install.sh"), "--prefix", str(self.prefix),
+                       *(() if "--purge" in options else ("--uninstall",))]
+        return subprocess.run([*command, *options], env=environment or self.environment, cwd=self.directory,
+                              capture_output=True, text=True, timeout=INSTALL_TIMEOUT_SECONDS)
+
+    def install_serving(self):
+        self.assert_installed(self.install(), 'candidate')
+        self.assertTrue(Path(self.environment["FIXTURE_DAEMON_STATE"]).exists())
+        self.calls.unlink()
+
+    def assert_still_installed(self):
+        self.assertEqual(os.readlink(self.prefix / "current"), f"versions/{VERSION}")
+        self.assertTrue((self.prefix / "current/bin/cagents").is_file())
+        self.assertTrue((self.prefix / ".cagents-install-root").is_file())
+        self.assertTrue(self.managed_link("bin/cagents").is_symlink())
+
+    def test_uninstall_entry_points_share_one_removal_procedure(self):
+        def shared(path):
+            text = path.read_text()
+            begin, end = "# BEGIN shared uninstall\n", "# END shared uninstall\n"
+            self.assertEqual((text.count(begin), text.count(end)), (1, 1), path)
+            return text[text.index(begin):text.index(end) + len(end)]
+        self.assertEqual(shared(ROOT / "install.sh"), shared(ROOT / "packaging/cagents-uninstall"))
+
+    def test_uninstall_keeps_an_installation_whose_daemon_is_starting_or_draining(self):
+        self.install_serving()
+        for uninstaller in self.UNINSTALLERS:
+            for reply in self.TRANSITIONING_STATUS:
+                with self.subTest(uninstaller=uninstaller, reply=reply):
+                    result = self.uninstall(uninstaller, environment=dict(self.environment, FIXTURE_STATUS_REPLY=reply))
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("the daemon is starting or stopping; retry once it has settled", result.stderr)
+                    self.assert_still_installed()
+                    self.assertNotIn("daemon-stop", [e["event"] for e in self.events()])
 
 
 if __name__ == "__main__":

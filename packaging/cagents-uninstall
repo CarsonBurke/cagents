@@ -84,32 +84,10 @@ while [ "$PREFIX" != / ] && [ "${PREFIX%/}" != "$PREFIX" ]; do
 done
 [ "$PREFIX" != / ] || fail 'refusing to use / as the installation root'
 
-remove_owned_link() {
-    link=$1
-    if [ -L "$link" ]; then
-        target=$(readlink "$link") || fail "cannot inspect $link"
-        case $target in
-            "$PREFIX/current"/*) rm -f "$link" ;;
-        esac
-    fi
-}
-
 read_daemon_status() {
     daemon_cli=$1
     if daemon_output=$("$daemon_cli" --json daemon status 2>/dev/null); then
-        case $daemon_output in
-            *'
-'*) DAEMON_STATUS=unknown ;;
-            '{"ok":true,"command":"daemon.status","data":{'*'"running":true'*|\
-            '{"command":"daemon.status","data":{'*'"running":true,'*'},"ok":true}')
-                DAEMON_STATUS=running
-                ;;
-            '{"ok":true,"command":"daemon.status","data":{'*'"running":false'*|\
-            '{"command":"daemon.status","data":{'*'"running":false,'*'},"ok":true}')
-                DAEMON_STATUS=stopped
-                ;;
-            *) DAEMON_STATUS=unknown ;;
-        esac
+        classify_daemon_status "$daemon_output"
     else
         DAEMON_STATUS=unknown
     fi
@@ -121,6 +99,7 @@ stop_daemon_and_wait() {
     case $DAEMON_STATUS in
         stopped) return 0 ;;
         running) ;;
+        transitioning) fail 'the daemon is starting or stopping; retry once it has settled; cagents was not removed' ;;
         *) fail 'cannot verify daemon status; cagents was not removed' ;;
     esac
 
@@ -137,7 +116,53 @@ stop_daemon_and_wait() {
     fail 'could not verify that the daemon stopped; cagents was not removed'
 }
 
-if [ -e "$PREFIX/.cagents-install-root" ]; then
+# BEGIN shared uninstall
+# install.sh and packaging/cagents-uninstall carry this block byte for byte, so
+# both entry points remove an installation the same way; the installer
+# coordinator contract compares the copies. The including script defines fail,
+# read_daemon_status and stop_daemon_and_wait, and sets PROGRAM, PREFIX, HOME,
+# DATA_HOME and CONFIG_HOME.
+
+remove_owned_link() {
+    link=$1
+    if [ -L "$link" ]; then
+        target=$(readlink "$link") || fail "cannot inspect $link"
+        case $target in
+            "$PREFIX/current"/*) rm -f "$link" ;;
+        esac
+    fi
+}
+
+# Interpret one `cagents --json daemon status` reply. A daemon process that is
+# present but not serving is starting or draining and can still own terminals,
+# so it is neither running nor stopped.
+classify_daemon_status() {
+    case $1 in
+        *'
+'*) DAEMON_STATUS=unknown ;;
+        '{"ok":true,"command":"daemon.status","data":{'*'"running":false'*'"daemon_present":true'*|\
+        '{"ok":true,"command":"daemon.status","data":{'*'"daemon_present":true'*'"running":false'*|\
+        '{"command":"daemon.status","data":{'*'"running":false,'*'"daemon_present":true'*'},"ok":true}'|\
+        '{"command":"daemon.status","data":{'*'"daemon_present":true'*'"running":false,'*'},"ok":true}')
+            DAEMON_STATUS=transitioning
+            ;;
+        '{"ok":true,"command":"daemon.status","data":{'*'"running":true'*|\
+        '{"command":"daemon.status","data":{'*'"running":true,'*'},"ok":true}')
+            DAEMON_STATUS=running
+            ;;
+        '{"ok":true,"command":"daemon.status","data":{'*'"running":false'*|\
+        '{"command":"daemon.status","data":{'*'"running":false,'*'},"ok":true}')
+            DAEMON_STATUS=stopped
+            ;;
+        *) DAEMON_STATUS=unknown ;;
+    esac
+}
+
+uninstall_installation() {
+    if [ ! -e "$PREFIX/.cagents-install-root" ]; then
+        printf '%s: no install.sh installation found at %s\n' "$PROGRAM" "$PREFIX" >&2
+        return 0
+    fi
     [ -f "$PREFIX/.cagents-install-root" ] && [ ! -L "$PREFIX/.cagents-install-root" ] \
         || fail "unsafe installation marker at $PREFIX"
     [ "$(cat "$PREFIX/.cagents-install-root")" = 'cagents install root' ] \
@@ -166,9 +191,10 @@ if [ -e "$PREFIX/.cagents-install-root" ]; then
     if command -v update-desktop-database >/dev/null 2>&1; then
         update-desktop-database "$DATA_HOME/applications" >/dev/null 2>&1 || :
     fi
-else
-    printf '%s: no install.sh installation found at %s\n' "$PROGRAM" "$PREFIX" >&2
-fi
+}
+# END shared uninstall
+
+uninstall_installation
 
 if [ "$PURGE" -eq 1 ]; then
     CACHE_HOME=${XDG_CACHE_HOME:-"$HOME/.cache"}

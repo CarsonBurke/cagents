@@ -397,7 +397,8 @@ options, and both scripts refuse to run as root. If you installed with a custom
 Both entry points shut the daemon down only if it is empty, atomically. If live
 terminals or spawn reservations remain, removal fails without terminating them
 or removing program files. Finish them, or run `cagents daemon stop --confirm`
-first.
+first. Removal also refuses, without removing anything, while the daemon is
+still starting or stopping; retry once it settles.
 
 Remove a Debian installation with:
 
