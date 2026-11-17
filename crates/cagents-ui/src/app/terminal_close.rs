@@ -779,6 +779,11 @@ impl Cagents {
         }
         self.retire_lsp_card(id);
         self.sidebar_state.forget_card_attention(id);
+        // A closed chat's conversation can be reopened; what it had not sent
+        // waits for that.
+        if !replacing {
+            self.keep_closed_chat_draft(id);
+        }
         self.chat_discard(id);
         // A draft still waiting out its debounce is the last thing
         // typed into the pane; closing it is not discarding it.

@@ -1,7 +1,8 @@
 //! Closing a pane closes it in every window and stops what it runs, so a chat
 //! that is still working asks first, as a terminal running a process does. The
 //! window may not be the one that started it, or know how far it has got.
-//! The conversation stays in history, so this is a routine question: Enter
+//! The conversation stays in history, and so does anything it had not sent
+//! (see `chat_ui::kept_draft`), so this is a routine question: Enter
 //! answers it, and the person may choose not to be asked again. Closing a
 //! chat whose first message hasn't arrived discards that message, which
 //! nothing brings back, so those questions are always asked and open on
@@ -37,6 +38,9 @@ impl Cagents {
     /// A close the reader asked for, from anywhere a chat pane can be closed.
     pub(super) fn request_chat_close(&mut self, card: CardId) -> Task<Message> {
         self.reset_shared_removal_for_new_close(card);
+        // A discard confirmed for an earlier close that didn't go ahead
+        // answers nothing about this one.
+        self.discard_draft_on_close(card, false);
         self.continue_chat_close(card)
     }
 
@@ -192,6 +196,17 @@ impl Cagents {
                 self.dismiss_confirmation(QUESTION);
                 Task::none()
             };
+            // The reader chose to discard the message, so the close keeps
+            // nothing of it for a reopened conversation. Stopping a working
+            // chat keeps what it had not sent.
+            self.discard_draft_on_close(
+                intent.card,
+                matches!(
+                    intent.question,
+                    dialog_ui::Question::DiscardUnsentMessage
+                        | dialog_ui::Question::StopSendingFirstMessage
+                ),
+            );
             Task::batch([remember, self.begin_chat_close(intent.card)])
         } else {
             self.dismiss_confirmation(QUESTION);
@@ -241,17 +256,27 @@ impl Cagents {
         } else {
             "It may still be working. Closing it stops it and closes it in every window."
         };
+        // Nothing unsent is lost, but the reader should know where it goes.
+        let kept = (question == dialog_ui::Question::StopWorkingChat
+            && intent.is_some_and(|intent| !self.closed_chat_draft(intent.card).is_empty()))
+        .then_some("What you haven't sent yet comes back when you reopen it.");
         dialog_ui::overlay(
             dialog_ui::confirmation_surface(
                 question,
-                widget::column::with_children(vec![
-                    crate::design::title(title).into(),
-                    crate::design::body(body).into(),
-                    match question.skippable() {
-                        Some(confirmation) => self.dont_ask_again_control(confirmation, true),
-                        None => iced::widget::Space::new().into(),
-                    },
-                ])
+                widget::column::with_children(
+                    [
+                        Some(crate::design::title(title).into()),
+                        Some(crate::design::body(body).into()),
+                        kept.map(|kept| crate::design::body(kept).into()),
+                        Some(match question.skippable() {
+                            Some(confirmation) => self.dont_ask_again_control(confirmation, true),
+                            None => iced::widget::Space::new().into(),
+                        }),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>(),
+                )
                 .spacing(space::M),
                 dialog_ui::confirmation_actions(
                     crate::ui_controls::button::secondary(if discard_draft {

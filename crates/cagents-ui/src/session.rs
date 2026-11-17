@@ -3563,6 +3563,7 @@ mod tests {
             chat_drafts: HashMap::new(),
             chat_draft_attachments: HashMap::new(),
             chat_waiting_messages: HashMap::new(),
+            closed_chat_drafts: HashMap::new(),
             agent_updates: BTreeMap::new(),
             workspace_history: Vec::new(),
             repository_navigation: HashMap::new(),
