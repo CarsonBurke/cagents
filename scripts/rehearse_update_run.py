@@ -551,13 +551,30 @@ def existing_only_contract(before, after, activity_before, activity_after, versi
             'activity_before':activity_before,'activity_after':activity_after}
 
 
+def sidebar_labels(text):
+    """What a sidebar row's text may name, with or without its leading icon.
+
+    OCR reads a row's provider icon as punctuation, such as `@` or `©`, or
+    as a letter or two, such as `S` for Codex's knot or `é` for Claude's
+    star, depending on how it rasterizes. The row is named by the rest.
+    So a title that is another one plus a word of one or two characters
+    reads as that title; callers confirm the selected card by identity.
+    """
+    text = re.sub(r'^\W+','',text).strip().casefold()
+    return {text, re.sub(r'^\S{1,2}\s+','',text)}
+
+
 def sidebar_channel_ref(observation, title):
     """Resolve the visible sidebar row, excluding headers and hover tooltips."""
     candidates = [run['ref'] for run in observation.get('runs',[])
                   if run.get('x',260)<260 and run.get('y',0)>80
-                  and re.sub(r'^\W+','',run.get('text','')).strip().casefold()==title.casefold()]
+                  and title.casefold() in sidebar_labels(run.get('text',''))]
     if len(candidates) != 1:
-        raise RuntimeError(f'canonical channel label has no unique sidebar reference: {title}')
+        # Say what the sidebar read, so a misread label can be told from a missing one.
+        sidebar = [run.get('text','') for run in observation.get('runs',[])
+                   if run.get('x',260)<260 and run.get('y',0)>80]
+        raise RuntimeError(f'canonical channel label has no unique sidebar reference: {title}; '
+                           f'sidebar read {json.dumps(sidebar, ensure_ascii=False)}')
     return candidates[0]
 
 

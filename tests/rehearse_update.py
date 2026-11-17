@@ -856,6 +856,16 @@ class ChatViews(unittest.TestCase):
             {'ref':'row','text':'© Codex rehearsal','x':12,'y':134},
             {'ref':'tooltip','text':'Codex rehearsal - 1 chat','x':40,'y':168}]}
         self.assertEqual(scenario.sidebar_channel_ref(observation,'Codex rehearsal'),'row')
+        # OCR may read the provider icon as a letter (#3003): the rest names the row.
+        for icon in ('S','é','B®','@'):
+            with self.subTest(icon=icon):
+                observation['runs'][1]['text'] = f'{icon} Codex rehearsal'
+                self.assertEqual(scenario.sidebar_channel_ref(observation,'Codex rehearsal'),'row')
+        # A longer word is part of another label, not an icon.
+        observation['runs'][1]['text'] = 'Old Codex rehearsal'
+        with self.assertRaisesRegex(RuntimeError,r'no unique sidebar reference.*"Old Codex rehearsal"'):
+            scenario.sidebar_channel_ref(observation,'Codex rehearsal')
+        observation['runs'][1]['text'] = 'S Codex rehearsal'
         observation['runs'].append({'ref':'other','text':'Codex rehearsal','x':33,'y':200})
         with self.assertRaisesRegex(RuntimeError,'no unique sidebar reference'):
             scenario.sidebar_channel_ref(observation,'Codex rehearsal')
