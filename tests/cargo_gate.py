@@ -562,7 +562,7 @@ class CompilerGuard(unittest.TestCase):
         mise = self.root / "mise"
         for directory in (self.real, *self.shims, mise):
             directory.mkdir()
-        for tool in (*self.TOOLS, "rustup"):
+        for tool in self.TOOLS:
             (self.real / tool).write_text(
                 f'#!/bin/sh\nprintf "{tool} %s\\n" "$*" >>"{self.log}"\n')
             (self.real / tool).chmod(0o755)
@@ -628,26 +628,6 @@ class CompilerGuard(unittest.TestCase):
                     self.assertEqual(ran, [])
                     self.assertIn("would compile on this host", result.stderr)
                     self.assertIn("CAGENTS_BUILD_REMOTE=local", result.stderr)
-
-    def test_rustup_runs_a_toolchains_compiler_only_for_queries(self):
-        rustup = str(self.shims[0] / "rustup")
-        for arguments in (["show"], ["run", "stable", "cargo", "build"], ["run", "stable", "sh", "-c", "true"],
-                          ["run", "stable"], *(["run", "stable", "rustc", *query] for query in self.QUERIES),
-                          ["run", "--install", "1.93.0", "rustdoc", "--version"]):
-            with self.subTest(arguments=arguments):
-                result, ran = self.run_guard([rustup, *arguments])
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(ran, [" ".join(["rustup", *arguments])])
-        for tool in self.TOOLS:
-            for arguments in (["run", "stable", tool, "main.rs"],
-                              ["run", "--install", "nightly", f"/toolchain/bin/{tool}", "--crate-name", "probe",
-                               "--print=native-static-libs", "src/lib.rs"]):
-                with self.subTest(arguments=arguments):
-                    result, ran = self.run_guard([rustup, *arguments])
-                    self.assertEqual(result.returncode, 1)
-                    self.assertEqual(ran, [])
-                    self.assertIn(f"`rustup run … {tool}` inside `cargo-gate exec` would compile on this host",
-                                  result.stderr)
 
     def test_a_compiler_missing_beyond_the_guard_is_named(self):
         self.env["PATH"] = os.pathsep.join([str(self.shims[0]), "/nonexistent"])

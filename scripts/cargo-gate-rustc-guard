@@ -6,13 +6,15 @@
 # - RUSTC_WRAPPER, for a Cargo reached other than by that name (by path,
 #   $CARGO, `rustup run` or `mise exec`). The wrapper the caller had, if any,
 #   still runs.
-# - `rustc`, `rustdoc`, `clippy-driver` and `rustup` beside the gate's `cargo`
-#   on PATH, for a compiler run by name, or by `rustup run`. Each runs the
-#   next one on PATH.
+# - `rustc`, `rustdoc` and `clippy-driver` beside the gate's `cargo` on PATH,
+#   for a compiler run by name. Each runs the next one on PATH.
 #
 # Either way, it passes what only asks the compiler something, which Cargo's
 # queries and `rustc -vV` do, and refuses anything else. A compiler run by
-# its path, or found on PATH ahead of the gate's `cargo`, is beyond its reach.
+# its path, as `rustup run TOOLCHAIN rustc` does, or found on PATH ahead of
+# the gate's `cargo`, is beyond its reach. No `rustup` stands beside it to
+# catch the former: beside a `rustc` that is the same file, Cargo takes both
+# for rustup's proxies and runs the toolchain's rustc and rustdoc by path.
 tool=${0##*/}
 refusal="would compile on this host, where Rust compiles only through the gate"
 
@@ -67,34 +69,10 @@ next() {
     exec "$tool" "$@"
 }
 
-# Whether a `rustup` command line may go ahead: anything but `rustup run`
-# of a compiler that would compile.
-runs_compiler() {
-    [ "${1-}" = run ] || return 0
-    shift
-    [ "${1-}" != --install ] || shift
-    [ "$#" -ge 2 ] || return 0
-    compiler=${2##*/}
-    case $compiler in
-        rustc|rustdoc|clippy-driver) ;;
-        *) return 0 ;;
-    esac
-    shift 2
-    asks "$@" && return 0
-    printf '%s\n' "cargo-gate: \`rustup run … $compiler\` inside \`cargo-gate exec\` $refusal; build with \`cargo\` by name, which builds on the build host" >&2
-    return 1
-}
-
 case $tool in
     rustc|rustdoc|clippy-driver)
         asks "$@" && next "$@"
         printf '%s\n' "cargo-gate: \`$tool\` run directly inside \`cargo-gate exec\` $refusal; build with \`cargo\` by name, which builds on the build host" >&2
-        exit 1
-        ;;
-    rustup)
-        # `rustup run [--install] TOOLCHAIN COMMAND...` runs the toolchain's
-        # own compiler, not the one on PATH.
-        runs_compiler "$@" && next "$@"
         exit 1
         ;;
 esac

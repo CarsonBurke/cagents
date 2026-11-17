@@ -1463,6 +1463,15 @@ fn bounded_allocation() {
                 self.assertIn("would compile on this host", result.stderr)
                 # Neither `main` nor `doc` was made.
                 self.assertEqual(sorted(self.crate.iterdir()), before)
+        # Cargo reached by path documents through the `rustdoc` on PATH,
+        # which no RUSTC_WRAPPER covers: rustup's own, were it beside the
+        # guard's `rustc`, would have Cargo run the toolchain's by path.
+        cargo = str(self.cargo_bin / "cargo")
+        result = self.gate_run("exec", "sh", "-ec", f"PATH=\"$PATH:{self.cargo_bin}\" '{cargo}' doc --no-deps",
+                               env=self.remote_env(), timeout=60)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("`rustdoc` run directly inside `cargo-gate exec` would compile on this host", result.stderr)
+        self.assertEqual(list(self.root.rglob("probe/index.html")), [])
         # What only asks the compiler something still answers, from the
         # compiler that would have run.
         result = self.gate_run("exec", "sh", "-ec", "rustc -vV; rustdoc --version; rustc --print sysroot",

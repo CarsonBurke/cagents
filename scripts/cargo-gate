@@ -464,7 +464,7 @@ if [ "$where" -eq 0 ]; then
     # compile here; see the guard, which answers for both.
     CAGENTS_BUILD_EXEC_RUSTC_WRAPPER=${RUSTC_WRAPPER-}
     cargo_shim
-    for tool in rustc rustdoc clippy-driver rustup; do
+    for tool in rustc rustdoc clippy-driver; do
         ln -s -- "$here/cargo-gate-rustc-guard" "$shims/$tool"
     done
     RUSTC_WRAPPER=$here/cargo-gate-rustc-guard
