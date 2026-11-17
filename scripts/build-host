@@ -636,7 +636,12 @@ class Probe:
     PROBE_MEMORY, runs PROBE_SECONDS or reaches the admission deadline."""
 
     def __init__(self, directory, deadline):
-        self.directory, self.deadline = directory, deadline
+        self.directory = directory
+        # One limit for all of the probe's commands, such as the host test
+        # helper and the build after it.
+        self.until = time.monotonic_ns() + PROBE_SECONDS * 10**9
+        if deadline is not None:
+            self.until = min(self.until, deadline)
         self.compiled = os.path.join(directory, "compiles")
         self.output = []
         self.scoped = prepare_slice()
@@ -679,19 +684,20 @@ class Probe:
             environment = {key: value for key, value in environment.items()
                            if key not in MANAGER_VARIABLES} | manager_environment_only()
         parent = os.getpid()
-        child = subprocess.Popen(command, env=environment,
-                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                 stderr=subprocess.PIPE, process_group=0,
-                                 preexec_fn=lambda: follow_parent(parent))
+        try:
+            child = subprocess.Popen(command, env=environment,
+                                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, process_group=0,
+                                     preexec_fn=lambda: follow_parent(parent))
+        except OSError:
+            # The build with its shares reports it, as it would have.
+            raise Stale
         streams = {}
         readers = [threading.Thread(target=lambda name=name, stream=stream:
                                     streams.__setitem__(name, stream.read()), daemon=True)
                    for name, stream in (("stdout", child.stdout), ("stderr", child.stderr))]
         for reader in readers:
             reader.start()
-        until = time.monotonic_ns() + PROBE_SECONDS * 10**9
-        if self.deadline is not None:
-            until = min(until, self.deadline)
         try:
             while True:
                 try:
@@ -699,14 +705,17 @@ class Probe:
                     break
                 except subprocess.TimeoutExpired:
                     pass
-                if (os.path.exists(self.compiled) or time.monotonic_ns() >= until
+                if (os.path.exists(self.compiled) or time.monotonic_ns() >= self.until
                         or tree_memory(child.pid) > PROBE_MEMORY):
                     raise Stale
         finally:
             # What it started, still running or left behind, ends with it.
-            with contextlib.suppress(ProcessLookupError):
+            leftovers = True
+            try:
                 os.killpg(child.pid, signal.SIGKILL)
-            if self.scoped:
+            except ProcessLookupError:
+                leftovers = child.returncode is None
+            if self.scoped and leftovers:
                 with contextlib.suppress(OSError, subprocess.SubprocessError):
                     systemctl("kill", "--signal=SIGKILL", unit)
             child.wait()

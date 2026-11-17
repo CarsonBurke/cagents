@@ -672,6 +672,14 @@ class Probing(BuildHostFixture):
             return True
         self.wait_for(ended, "the probe's child to end")
 
+    def test_a_cargo_the_probe_cannot_start_is_reported_by_the_build(self):
+        build = self.start("cargo", "--", str(self.root / "missing-cargo"), "check")
+        self.queued(build)
+        self.free_shares()
+        status, _stdout, stderr = self.finish(build)
+        self.assertEqual(status, 127, stderr)
+        self.assertNotIn("Traceback", stderr)
+
     def test_a_probe_ends_at_the_admission_deadline(self):
         build = self.start("cargo", "--wait-seconds", "1", "--", str(self.cargo), "check",
                            env=self.env | {"FIXTURE_HOLD": "never"})
