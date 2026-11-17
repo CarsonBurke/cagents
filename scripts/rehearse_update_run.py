@@ -876,6 +876,13 @@ class Rehearsal:
             slots[slot] = window
         return slots
 
+    def open_windows(self, slots, *options, version=None):
+        # A person opens the second window once the first is on screen. Two
+        # launches milliseconds apart race each other's startup instead.
+        for index, slot in enumerate(slots):
+            self.call('launch', *options, slot)
+            self.wait_windows(slots[:index+1], version=version)
+
     def wait_windows(self, required, timeout=60, version=None):
         deadline = time.monotonic()+timeout
         while time.monotonic() < deadline:
@@ -1156,9 +1163,7 @@ class Rehearsal:
             time.sleep(.1)
         else:
             raise RuntimeError('ordinary UI processes did not close before existing-only relaunch')
-        for slot in ('main','second'):
-            self.call('launch','--restore-existing-only',slot)
-        self.wait_windows(['main','second'],version=version)
+        self.open_windows(['main','second'],'--restore-existing-only',version=version)
         self.capture_chats('existing-only')
         self.call('record','existing-only-after',timeout=150)
         after=json.loads((self.root/'records/existing-only-after/snapshot.json').read_text())
@@ -1704,9 +1709,7 @@ class Rehearsal:
             if not args.fail_new_daemon:
                 self.call('stage',args.new_dir,args.new_version,args.new_installer,timeout=180)
             self.call('desktop','start','--limit','900', timeout=None)
-            self.call('launch','main')
-            self.call('launch','second')
-            self.wait_windows(['main','second'])
+            self.open_windows(['main','second'])
             code, _ = self.call('seed', *seed_flags(args), timeout=180+6*args.scale_chats, check=False)
             if code:
                 self.errors.append('seed verification failed; see seeds.json')
