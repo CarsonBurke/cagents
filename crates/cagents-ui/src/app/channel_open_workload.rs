@@ -830,10 +830,10 @@ fn pull_request_label_upkeep_timing() {
     summary("update after a poll", &mut polled);
 }
 
-/// What the projection that ends an update costs in the large workspace,
-/// stage by stage, and the whole update for messages that change nothing the
-/// projection reads: a modifier key's event, which every keystroke delivers
-/// beside the text it types, and an animation frame.
+/// What the projection that ends an update costs in the large workspace, in
+/// full and stage by stage, and the whole update for messages that change
+/// nothing the projection reads: a modifier key's event, which every keystroke
+/// delivers beside the text it types, and an animation frame.
 #[test]
 #[ignore = "timing workload; run optimized with --ignored --nocapture"]
 fn projection_tail_timing() {
@@ -873,6 +873,9 @@ fn projection_tail_timing() {
     });
     timed("update(ChatUi Tick)", &mut app, &mut |app| {
         drop(app.update(Message::ChatUi(chat_ui::Action::Tick)))
+    });
+    timed("project_workspace (Full)", &mut app, &mut |app| {
+        drop(app.project_workspace(false))
     });
     timed("  worktree_protections", &mut app, &mut |app| {
         app.sync_worktree_protections()

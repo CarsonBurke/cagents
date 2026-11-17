@@ -405,6 +405,63 @@ mod tests {
         );
         assert_eq!(app.card_chrome[&survivor].title, before);
     }
+
+    #[test]
+    fn closed_panes_wear_no_chrome_and_keep_their_numbers() {
+        let mut app = tab_fixture(3, 1600.0);
+        let closed = app.durable.cards[0].id;
+        let survivor = app.durable.cards[2].id;
+        let before = app.card_chrome[&survivor].title.clone();
+        // A long-lived workspace holds many more closed cards than open ones.
+        let history = (0..40)
+            .map(|_| {
+                let mut card = super::super::tests::terminal_card_state();
+                card.existence = super::super::project_ui::removed_existence("history");
+                card
+            })
+            .collect::<Vec<_>>();
+        Arc::make_mut(&mut app.durable).cards.extend(history);
+        app.card_state_mut(closed).unwrap().existence =
+            super::super::project_ui::removed_existence("closed by the test");
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.shared_views.chrome_cards_visited.set(0);
+        drop(app.sync_chrome());
+        assert_eq!(
+            app.shared_views.chrome_cards_visited.get(),
+            2,
+            "only the open panes are dressed"
+        );
+        assert_eq!(app.card_chrome.len(), 2);
+        assert!(!app.card_chrome.contains_key(&closed));
+        assert_eq!(app.card_chrome[&survivor].title, before);
+        assert_eq!(app.chrome_ui.terminal_ordinals[&closed], 1);
+        assert_eq!(app.chrome_ui.terminal_ordinals.len(), 43);
+        let added = super::super::tests::terminal_card_state();
+        let added_id = added.id;
+        Arc::make_mut(&mut app.durable).cards.push(added);
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        drop(app.sync_chrome());
+        assert!(
+            app.card_chrome[&added_id].title.ends_with("(44)"),
+            "closed terminals keep their numbers: {}",
+            app.card_chrome[&added_id].title
+        );
+    }
+
+    #[test]
+    fn a_closed_card_the_strip_still_holds_keeps_its_chrome() {
+        let mut app = tab_fixture(2, 1600.0);
+        let card = app.durable.cards[1].id;
+        let chrome = app.card_chrome[&card].title.clone();
+        app.card_state_mut(card).unwrap().existence =
+            super::super::project_ui::removed_existence("closed by the test");
+        drop(app.sync_chrome());
+        assert_eq!(app.card_chrome[&card].title, chrome);
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        drop(app.sync_chrome());
+        assert!(!app.card_chrome.contains_key(&card));
+        assert_eq!(app.chrome_ui.terminal_ordinals[&card], 2);
+    }
     use super::*;
 
     #[test]

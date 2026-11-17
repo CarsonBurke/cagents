@@ -5483,6 +5483,9 @@ pub struct Cagents {
     /// The workspace `card_indices` was built from. Holding it weakly pins
     /// its allocation, so a changed workspace always has a different address.
     card_indices_source: std::sync::Weak<WorkspaceState>,
+    /// The workspace `sync_chrome` last dropped departed cards' terminal
+    /// numbers against, pinned as `card_indices_source` is.
+    terminal_ordinals_source: std::sync::Weak<WorkspaceState>,
     navigation_cache: sidebar::NavigationCache,
     palette: palette_ui::State,
     recently_closed: Vec<(CardState, Option<WorkspaceDestination>)>,
@@ -9002,7 +9005,9 @@ impl Cagents {
     }
 
     /// Builds chrome for cards that appeared or were renamed, drops entries for
-    /// cards the workspace no longer holds, and renames the window.
+    /// cards that closed or the workspace no longer holds, and renames the
+    /// window. It visits only cards that wear chrome (`wears_chrome`), so it
+    /// costs what the window can show rather than every card it ever held.
     fn sync_chrome(&mut self) -> Task<Message> {
         #[cfg(test)]
         terminal_output_tests::record_chrome();
@@ -9063,8 +9068,14 @@ impl Cagents {
                 titled_channels.entry(*card).or_insert(channel);
             }
         }
+        let held_closed = self.closed_cards_on_the_strip();
         let mut presentation_updates = Vec::new();
+        let mut dressed = 0;
         for card in &self.durable.cards {
+            if !Self::wears_chrome(card, &held_closed) {
+                continue;
+            }
+            dressed += 1;
             let (chrome, title) =
                 self.project_card_chrome(card, titled_channels.get(&card.id).copied());
             if let Some(chrome) = chrome {
@@ -9077,14 +9088,49 @@ impl Cagents {
         for (id, title) in presentation_updates {
             let _ = self.workspace.rename_card(id, title);
         }
-        if self.card_chrome.len() != self.durable.cards.len() {
-            self.card_chrome
-                .retain(|id, _| self.card_indices.contains_key(id));
+        // Every card that wears chrome now has an entry, so any other entry is
+        // for a card that closed or left the workspace.
+        if self.card_chrome.len() != dressed {
+            let durable = &self.durable;
+            let indices = &self.card_indices;
+            self.card_chrome.retain(|id, _| {
+                indices
+                    .get(id)
+                    .and_then(|index| durable.cards.get(*index))
+                    .is_some_and(|card| Self::wears_chrome(card, &held_closed))
+            });
+        }
+        // A closed terminal keeps its number, so the ones opened after it
+        // keep theirs; only a card gone from the durable workspace gives its
+        // number up, and that changes the workspace's address.
+        if self.terminal_ordinals_source.as_ptr() != Arc::as_ptr(&self.durable) {
+            self.terminal_ordinals_source = Arc::downgrade(&self.durable);
             self.chrome_ui
                 .terminal_ordinals
                 .retain(|id, _| self.card_indices.contains_key(id));
         }
         self.sync_window_title()
+    }
+
+    /// Whether `card` gets chrome, the tab, title and accessible names drawn
+    /// for a pane. A closed card is drawn nowhere, and a long-lived workspace
+    /// holds far more closed cards than open ones, so they get none unless
+    /// the workspace strip still holds one (`held_closed`).
+    fn wears_chrome(card: &CardState, held_closed: &[CardId]) -> bool {
+        !matches!(card.existence, Existence::Closed { .. }) || held_closed.contains(&card.id)
+    }
+
+    /// Closed durable cards the workspace strip still holds. The strip is
+    /// rebuilt from open cards and a close leaves it before the card closes,
+    /// so this is normally empty; it keeps chrome for anything that does not.
+    fn closed_cards_on_the_strip(&self) -> Vec<CardId> {
+        self.workspace
+            .order()
+            .filter(|id| {
+                self.card_state(*id)
+                    .is_some_and(|card| matches!(card.existence, Existence::Closed { .. }))
+            })
+            .collect()
     }
 
     /// Both projection paths share title precedence, caching, accessibility and
@@ -9168,11 +9214,13 @@ impl Cagents {
     }
 
     fn sync_scoped_chrome(&mut self, cards: &[CardId]) -> Task<Message> {
+        self.index_cards();
+        let held_closed = self.closed_cards_on_the_strip();
         // Ordinals require a global counter reconciliation; missing chrome can
         // also mean this is the first projection after restoration.
         if cards.iter().any(|id| {
             self.card_state(*id).is_none_or(|card| {
-                !self.card_chrome.contains_key(id)
+                (Self::wears_chrome(card, &held_closed) && !self.card_chrome.contains_key(id))
                     || (matches!(card.kind, CardKind::Terminal(_))
                         && !self.chrome_ui.terminal_ordinals.contains_key(id))
             })
@@ -9185,11 +9233,20 @@ impl Cagents {
             .retain(|card, _| self.cards.contains_key(card));
         self.terminal_find
             .retain(|card, _| self.cards.contains_key(card));
-        self.index_cards();
+        for id in cards {
+            if self
+                .card_state(*id)
+                .is_some_and(|card| !Self::wears_chrome(card, &held_closed))
+            {
+                self.card_chrome.remove(id);
+            }
+        }
         let updates = cards
             .iter()
             .filter_map(|id| {
-                let card = self.card_state(*id)?;
+                let card = self
+                    .card_state(*id)
+                    .filter(|card| Self::wears_chrome(card, &held_closed))?;
                 let channel = self
                     .durable
                     .channels
@@ -11562,8 +11619,9 @@ impl Cagents {
         let card = self.card_state(id);
         let attention = self.sidebar_state.has_card_update(id) && !focused;
         let labels = card_kind_labels(card.map(|card| &card.kind));
-        // `sync_chrome` keeps an entry for every durable card; a miss can
-        // only be a card that is not durable, which renders degenerate chrome.
+        // `sync_chrome` keeps an entry for every durable card the strip can
+        // show; a miss can only be a card that is not durable, which renders
+        // degenerate chrome.
         let chrome = self.card_chrome.get(&id);
         #[cfg(feature = "integrated-browser")]
         let browser_runtime = match self.cards.get(&id) {
@@ -15544,6 +15602,7 @@ impl Application for Cagents {
             card_chrome: HashMap::new(),
             card_indices: HashMap::new(),
             card_indices_source: std::sync::Weak::new(),
+            terminal_ordinals_source: std::sync::Weak::new(),
             navigation_cache: sidebar::NavigationCache::default(),
             palette: palette_ui::State::default(),
             recently_closed: Vec::new(),
@@ -20119,9 +20178,9 @@ impl Application for Cagents {
                 move |context| {
                     self.workspace_card_view(context.id, context.focused, has_multiple_panes)
                 },
-                // `sync_chrome` keeps an entry for every durable card, so
-                // the fallback is only reachable for a card the workspace holds
-                // but the durable model does not.
+                // `sync_chrome` keeps an entry for every durable card the
+                // strip holds, so the fallback is only reachable for a card
+                // the workspace holds but the durable model does not.
                 |id| {
                     self.card_chrome.get(&id).map_or_else(
                         || workspace_widget::card_widget_id(id),
@@ -31739,6 +31798,7 @@ mod tests {
             card_chrome: HashMap::new(),
             card_indices: HashMap::new(),
             card_indices_source: std::sync::Weak::new(),
+            terminal_ordinals_source: std::sync::Weak::new(),
             navigation_cache: sidebar::NavigationCache::default(),
             palette: palette_ui::State::default(),
             recently_closed: Vec::new(),
