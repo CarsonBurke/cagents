@@ -2,6 +2,7 @@
 """Exercise Zig discovery before any Cargo build, and the decision to skip an
 up-to-date build, without building the app."""
 
+import importlib.util
 import os
 from pathlib import Path
 import shutil
@@ -20,6 +21,10 @@ HANG_GUARD = 60
 # A fake build no passing test waits out: a launch that returns within the guard
 # while one runs has ended it.
 OUTLASTING_BUILD = str(2 * HANG_GUARD)
+# Isolated Python (-I) leaves this directory off sys.path.
+_cargo_spec = importlib.util.spec_from_file_location("cargo_fixture", Path(__file__).with_name("cargo_fixture.py"))
+cargo_fixture = importlib.util.module_from_spec(_cargo_spec)
+_cargo_spec.loader.exec_module(cargo_fixture)
 
 
 def wait_until(predicate, message):
@@ -190,14 +195,17 @@ class RefuseCompile(unittest.TestCase):
     def cargo(self, *arguments, **changes):
         return subprocess.run(
             ["cargo", "build", "--quiet", *arguments], cwd=self.crate,
-            env=os.environ | changes, capture_output=True, text=True, timeout=120,
+            env=self.env | changes, capture_output=True, text=True, timeout=120,
         )
 
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory(prefix="cagents-refuse-compile-")
+        temporary = tempfile.TemporaryDirectory(prefix="cagents-refuse-compile-", dir="/var/tmp")
         self.addCleanup(temporary.cleanup)
-        self.crate = Path(temporary.name)
-        (self.crate / "src").mkdir()
+        self.crate = Path(temporary.name) / "probe"
+        # Its own Cargo home, so the build stays in its target/ and never
+        # waits on the package-cache lock of the builds around it.
+        self.env = cargo_fixture.private_cargo_environment(Path(temporary.name) / "cargo-home")
+        (self.crate / "src").mkdir(parents=True)
         (self.crate / "Cargo.toml").write_text(
             '[package]\nname = "probe"\nversion = "0.0.0"\nedition = "2021"\n')
         (self.crate / "src/main.rs").write_text("fn main() {}\n")

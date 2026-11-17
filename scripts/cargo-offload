@@ -432,6 +432,15 @@ def uncommitted(top, workspace, environment):
     return dirty, staged
 
 
+def user_cargo_config(environment):
+    """The user-wide Cargo configuration this host's Cargo reads, which is the
+    legacy extensionless file whenever that exists."""
+    home = environment.get("CARGO_HOME") or os.path.join(
+        environment.get("HOME") or os.path.expanduser("~"), ".cargo")
+    legacy = os.path.join(home, "config")
+    return legacy if os.path.isfile(legacy) else os.path.join(home, "config.toml")
+
+
 def profile_config(path):
     """This user's Cargo profile settings as TOML for the build host, which
     builds the same profiles. Build settings such as jobs and build-dir
@@ -1991,7 +2000,7 @@ class Offload:
         ("status"/"cancelled", exit status) when the command ends."""
         lease = self.lease = self.spawn(
             self.remote("lease", base, self.slots, f"{os.uname().nodename}:{top}", self.floor,
-                        profile_config(os.path.expanduser("~/.cargo/config.toml")),
+                        profile_config(user_cargo_config(self.environment)),
                         self.build_identity(os.path.relpath(os.path.realpath(os.getcwd()), top)),
                         self.incremental),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,

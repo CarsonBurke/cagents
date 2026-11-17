@@ -19,6 +19,10 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 CHECKER = ROOT / "scripts/check-format"
 CACHE_HELPER = ROOT / "scripts/check-format-cache.py"
+# Isolated Python (-I) leaves this directory off sys.path.
+_cargo_spec = importlib.util.spec_from_file_location("cargo_fixture", ROOT / "tests/cargo_fixture.py")
+cargo_fixture = importlib.util.module_from_spec(_cargo_spec)
+_cargo_spec.loader.exec_module(cargo_fixture)
 # Bounds only a hang; a passing run returns as soon as the checker exits.
 HANG_GUARD = 60
 INCLUDED = (
@@ -622,7 +626,11 @@ sys.exit({status})
         "opt in with CHECK_FORMAT_CARGO_FIXTURE=1 for the tiny Cargo fixture",
     )
     def test_actual_cargo_root_omission_and_explicit_include_checks(self):
-        self.exercise_included_sources(os.environ)
+        # Its own Cargo home, apart from the user's configuration and from the
+        # package-cache lock the builds around it take.
+        home = tempfile.TemporaryDirectory(prefix="cagents-format-cargo-home-", dir="/var/tmp")
+        self.addCleanup(home.cleanup)
+        self.exercise_included_sources(cargo_fixture.private_cargo_environment(home.name))
 
     def exercise_included_sources(self, env):
         self.write("Cargo.toml", """[workspace]

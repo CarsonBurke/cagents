@@ -2,6 +2,7 @@
 """Exercise scripts/seed-build-dir on private directories."""
 
 import fcntl
+import importlib.util
 import os
 from pathlib import Path
 import shutil
@@ -25,6 +26,10 @@ SEED = REPOSITORY / "scripts/seed-build-dir"
 HANG_GUARD = 60
 # The probes live outside the repository, beyond its rust-toolchain.toml.
 TOOLCHAIN = tomllib.loads((REPOSITORY / "rust-toolchain.toml").read_text())["toolchain"]["channel"]
+# Isolated Python (-I) leaves this directory off sys.path.
+_cargo_spec = importlib.util.spec_from_file_location("cargo_fixture", Path(__file__).with_name("cargo_fixture.py"))
+cargo_fixture = importlib.util.module_from_spec(_cargo_spec)
+_cargo_spec.loader.exec_module(cargo_fixture)
 
 
 class CopiedFingerprints(unittest.TestCase):
@@ -82,9 +87,8 @@ class CopiedFingerprints(unittest.TestCase):
         # layout differs between versions, and a user's Cargo home can move
         # intermediates out of target/ with `build-dir`, so the probe uses the
         # pinned toolchain and a private Cargo home; it needs no registry.
-        self.env = {key: value for key, value in os.environ.items()
-                    if not key.startswith(("CAGENTS_BUILD_", "CARGO_"))}
-        self.env["CARGO_HOME"] = str(self.root / "cargo-home")
+        self.env = cargo_fixture.private_cargo_environment(self.root / "cargo-home", {
+            key: value for key, value in os.environ.items() if not key.startswith("CAGENTS_BUILD_")})
         self.env["RUSTUP_TOOLCHAIN"] = TOOLCHAIN
         self.cargo(self.main)
 
