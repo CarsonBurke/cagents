@@ -6,6 +6,8 @@ against a copy of it whose scripts record how they were called, so no task
 builds, tests or runs anything; they are skipped when mise is not installed.
 """
 
+import importlib.machinery
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -19,11 +21,22 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "mise.toml"
 SCRIPT = re.compile(r"\bscripts/[A-Za-z0-9_.-]+")
-LANES = {"cli": set(), "host": {"host"}, "ui": {"ui"}, "browser": {"integrated-browser"}, "editor": set()}
+LANES = {"cli": set(), "host": {"host"}, "ui": {"ui"}, "browser": {"browser-protocol-fixture"}, "editor": set()}
 # The application is its own package; the UI lanes select it, and `ui` the
 # shared library with it. No packages means the root's default member.
 PACKAGES = {"cli": set(), "host": set(), "ui": {"cagents", "cagents-ui"}, "browser": {"cagents-ui"},
             "editor": {"ceditor"}}
+
+
+# Which lane task checks each lane of main's build check.
+SENTINEL_LANES = {"cli": "cli", "host": "host", "ui": "ui", "app": "ui", "browser": "browser"}
+
+
+def sentinel_lanes():
+    loader = importlib.machinery.SourceFileLoader("main_build_sentinel", str(ROOT / "scripts/main-build-sentinel"))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(module)
+    return module.LANES
 
 
 def load():
@@ -77,16 +90,34 @@ class Structure(unittest.TestCase):
                 if lane in {"cli", "host", "ui"}:
                     self.assertIn("--no-default-features", arguments)
 
+    def test_the_check_lanes_cover_every_lane_of_mains_build_check(self):
+        # What main's build check compiles, an author's lane checks first.
+        lanes = sentinel_lanes()
+        self.assertEqual(set(SENTINEL_LANES), set(lanes))
+        variables = self.config["vars"]
+        for sentinel, lane in SENTINEL_LANES.items():
+            with self.subTest(sentinel=sentinel, lane=lane):
+                arguments = variables[lane].split()
+                self.assertIn("--no-default-features", arguments)
+                self.assertLessEqual(packages(lanes[sentinel]) or {"cagents"}, packages(arguments) or {"cagents"})
+                self.assertLessEqual(features(lanes[sentinel]), features(arguments))
+                task = self.tasks[f"check:{lane}"]
+                self.assertIn('default="--all-targets"', self.config["vars"]["all_targets"])
+                self.assertEqual(task.get("usage"), "{{vars.all_targets}}")
+
     def test_no_task_reunifies_host_and_ui(self):
         variables = self.config["vars"]
         for name, task in self.tasks.items():
             for command in commands(task):
                 expanded = re.sub(r"\{\{\s*vars\.(\w+)\s*\}\}", lambda m: variables[m.group(1)], command)
                 with self.subTest(task=name):
-                    self.assertLessEqual(len(re.findall(r"\{\{\s*vars\.(?:cli|host|ui|browser|editor)\b", command)), 1)
+                    # One lane, however often the command names it.
+                    self.assertLessEqual(
+                        len(set(re.findall(r"\{\{\s*vars\.(cli|host|ui|browser|editor)\b", command))), 1)
                     selected = features(expanded.split())
                     self.assertFalse({"host", "ui"} <= selected, command)
                     self.assertFalse({"host", "integrated-browser"} <= selected, command)
+                    self.assertFalse({"host", "browser-protocol-fixture"} <= selected, command)
 
     def test_every_compiling_task_goes_through_the_gate(self):
         for name, task in self.tasks.items():
@@ -104,6 +135,12 @@ class Structure(unittest.TestCase):
                     continue
                 with self.subTest(task=f"{kind}:{lane}"):
                     self.assertRegex(commands(task)[0], rf"\bexec scripts/cargo-lane {kind} \{{\{{vars\.{lane}\}}\}}")
+                    for command in commands(task):
+                        # Each step execs it, so mise's TERM, sent to the step
+                        # alone, reaches the gate; and stays in its own lane.
+                        self.assertNotRegex(command, r"(?<!exec )scripts/cargo-lane")
+                        self.assertEqual(set(re.findall(r"\bscripts/cargo-lane \w+ \{\{vars\.(\w+)\}\}", command)),
+                                         {lane})
 
     def test_aggregates_cover_exactly_the_three_isolated_lanes(self):
         groups = [entry["tasks"] for entry in self.tasks["check"]["run"] if isinstance(entry, dict)]
@@ -130,7 +167,9 @@ import json, os, sys
 from pathlib import Path
 with open(os.environ["MISE_TASKS_LOG"], "a") as log:
     log.write(json.dumps([Path(sys.argv[0]).name, *sys.argv[1:]]) + "\\n")
-sys.exit(int(os.environ.get("MISE_TASKS_STATUS", "0")))
+# A subcommand's own status, such as MISE_TASKS_STATUS_check, wins.
+sys.exit(int(os.environ.get(f"MISE_TASKS_STATUS_{sys.argv[1] if len(sys.argv) > 1 else ''}",
+                            os.environ.get("MISE_TASKS_STATUS", "0"))))
 """
 
 
@@ -188,8 +227,9 @@ class Behavior(unittest.TestCase):
                         "-c", "user.email=fixture@example.invalid", *arguments],
                        check=True, capture_output=True)
 
-    def mise_run(self, *arguments, status=0):
-        environment = self.environment | {"MISE_TASKS_STATUS": str(status)}
+    def mise_run(self, *arguments, status=0, **statuses):
+        environment = self.environment | {"MISE_TASKS_STATUS": str(status)} | {
+            f"MISE_TASKS_STATUS_{subcommand}": str(code) for subcommand, code in statuses.items()}
         return subprocess.run([self.mise, "run", *arguments], cwd=self.checkout, env=environment,
                               stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
 
@@ -214,9 +254,30 @@ class Behavior(unittest.TestCase):
     def test_forwarded_arguments_replace_the_target_selection_and_keep_quoting(self):
         result = self.mise_run("test:ui", "--", "--lib", "app::chat ui", "--", "--exact")
         self.assertEqual(result.returncode, 0, result.stderr)
+        lane = ["--locked", "--no-default-features", "--package", "cagents", "--package", "cagents-ui",
+                "--features", "cagents/ui"]
         self.assertEqual(self.calls(), [
-            ["cargo-lane", "test", "--locked", "--no-default-features", "--package", "cagents",
-             "--package", "cagents-ui", "--features", "cagents/ui", "--lib", "app::chat ui", "--", "--exact"],
+            ["cargo-lane", "test", *lane, "--lib", "app::chat ui", "--", "--exact"],
+            # Narrowed, it then checks what its tests' build may have hidden.
+            ["cargo-lane", "check", *lane, "--lib", "--bins", "--examples"],
+        ])
+
+    def test_a_narrowed_test_lane_checks_the_lanes_other_targets_once_its_tests_pass(self):
+        # Built only under cfg(test), an item only tests use looks used; main's
+        # build check, of every target, says otherwise.
+        self.assertEqual(self.mise_run("test:host").returncode, 0)
+        self.assertEqual(self.calls(), [
+            ["cargo-lane", "test", "--locked", "--no-default-features", "--features", "host", "--all-targets"],
+        ])
+        self.log.unlink()
+        # Failing tests are the news; the check waits for them.
+        self.assertEqual(self.mise_run("test:cli", "--", "--lib", status=4).returncode, 4)
+        self.assertEqual([call[1] for call in self.calls()], ["test"])
+        self.log.unlink()
+        self.assertEqual(self.mise_run("test:cli", "--", "--test", "cli", check=1).returncode, 1)
+        self.assertEqual(self.calls(), [
+            ["cargo-lane", "test", "--locked", "--no-default-features", "--test", "cli"],
+            ["cargo-lane", "check", "--locked", "--no-default-features", "--lib", "--bins", "--examples"],
         ])
 
     def test_lane_arguments_without_the_separator_are_refused_before_anything_runs(self):
@@ -231,8 +292,8 @@ class Behavior(unittest.TestCase):
         self.assertEqual(self.mise_run("check:browser").returncode, 0)
         self.assertEqual(self.mise_run("check:editor").returncode, 0)
         self.assertEqual(self.calls(), [
-            ["cargo-lane", "check", "--locked", "--package", "cagents-ui", "--features", "integrated-browser",
-             "--all-targets"],
+            ["cargo-lane", "check", "--locked", "--no-default-features", "--package", "cagents-ui",
+             "--features", "browser-protocol-fixture", "--all-targets"],
             ["cargo-lane", "check", "--locked", "--package", "ceditor", "--bin=ceditor"],
         ])
 

@@ -199,7 +199,9 @@ Each task runs one `scripts/cargo-gate check --locked` command with its lane's
 features, `--no-default-features --features host` for the daemon for example;
 `mise.toml` defines the lanes once. The `ui` lane selects both packages,
 `--package cagents --package cagents-ui --features cagents/ui`, and `browser`
-selects `--package cagents-ui --features integrated-browser`.
+selects `--package cagents-ui --features browser-protocol-fixture`: the
+integrated browser with the Wayland registry test server its tests use, as main's
+build check selects it.
 
 Every lane compiles the workspace's crates without warnings, tests included,
 and a new warning is a regression to fix in the change that adds it. An item
@@ -223,6 +225,20 @@ browserless UI lanes' tests (`scripts/cargo-gate test ... --all-targets`,
 [below](#testing)) type-check everything the lane's check does, so when you are
 about to run them, skip that check. The integrated UI has no test lane; keep
 its check.
+
+A test lane narrowed with arguments, such as `mise run test:ui -- --lib`, and
+`mise run test:lib` may build the lane's library only under `cfg(test)`,
+where an item only tests use looks used. So once their tests pass, these tasks
+also check the lane's library, binaries and examples, as main's build check
+does, and their status is that check's. A method only tests called reached
+main that way (#3006, fixed by #3035): its author ran a narrowed test lane and
+no check. On fw16 this check took about 20 s to compile where the slot had
+checked before and 70 to 95 s where it had not, after a narrowed UI test build
+of about 3 minutes, and it waits for its own build slot. It does not check the
+test targets the narrowed run skipped, so before review still run the lane's
+check, or its tests with every target. `scripts/cargo-gate check --features ui`
+without `--package cagents-ui` checks only the shared library, not the
+application; `mise run check:ui` checks both.
 
 Changes to ceditor or shared UI, editor, or notification public contracts also
 require the standalone editor check above. The workspace's
@@ -1512,6 +1528,21 @@ scripts/test-lib host --prefix terminal:: --test-threads 1
 scripts/test-lib ui --profile dev-runtime --prefix app::chat_ui::
 scripts/test-lib shared-ui --prefix settings::
 ```
+
+Prefer `test-lib` while iterating on UI library tests.
+`mise run test:ui -- --lib MODULE::` builds both the `cagents-ui` and the shared library's test harnesses on
+every edit, whatever the filter matches, so an edit to the shared library
+recompiles roughly twice as much as `scripts/test-lib ui` does
+([#2319](https://github.com/CarsonBurke/cagents/issues/2319)). The two commands
+unify the shared library's dependency features differently, because `test:ui`
+also selects `cagents` and its dev-dependencies, so the shared library and the
+dependencies whose features differ are built once for each command: the first
+switch builds that second set, and alternating rebuilds the shared library
+both ways. The same holds between `test:ui` and `scripts/test-lib shared-ui`,
+which builds the shared library's harness without `test-support`. Keep to one
+while iterating.
+`test-lib` runs Cargo without the lane tasks' warnings check, so finish with the
+lane task.
 
 Use actual full test names, or repeat `--prefix MODULE::` for literal module
 groups. Prefixes expand to ordinary full names and overlapping selections run

@@ -2347,13 +2347,31 @@ REMOTE_STUBS = {
         # What travels to the host: its arguments, above, and its input.
         tee -a "$STUB_LOG/ssh-input" | "${login[@]}" sh -c "$*"
     """,
-    # The connection as the host sees it: alive while what it runs is, and the
-    # parent of that, never replaced by it.
+    # The connection as the host sees it: the parent of what it runs, never
+    # replaced by it, alive while that is and gone once its client is, as an
+    # sshd whose client hangs up. What it ran is left running, as there. It
+    # passes its client's descriptors straight on rather than relaying them,
+    # so the client sees their end only once what it ran ends.
     "sshd-session": """
-        #!/bin/bash
-        status=0
-        "$@" || status=$?
-        exit "$status"
+        #!/usr/bin/python3 -I
+        import os
+        import select
+        import subprocess
+        import sys
+        client = os.getppid()
+        lost = os.pidfd_open(client)
+        command = subprocess.Popen(sys.argv[1:])
+        ended = os.pidfd_open(command.pid)
+        if os.getppid() != client:
+            sys.exit(255)
+        watch = select.poll()
+        watch.register(lost, select.POLLIN)
+        watch.register(ended, select.POLLIN)
+        ready = {descriptor for descriptor, _ in watch.poll()}
+        if ended not in ready:
+            sys.exit(255)
+        status = command.wait()
+        sys.exit(status if status >= 0 else 128 - status)
     """,
     # Only to say where a checkout's builds go, as Cargo would.
     "cargo": """
@@ -2402,7 +2420,8 @@ REMOTE_TOOL = """
         stop) [ ! -e "$task/stop-fails" ] || exit 1; rm -f "$task/side"; echo stopped ;;
         # More than one line, written apart, as the real status is: a reader
         # that stops at the first ends it with SIGPIPE.
-        status) [ -e "$task/side" ] && echo "session: $(cat "$task/side"), pid 1, ready" || echo 'session: none'
+        status) [ ! -e "$STUB_LOG/status-holds" ] || exec /usr/bin/python3 "$STUB_LOG/hold.py"
+                [ -e "$task/side" ] && echo "session: $(cat "$task/side"), pid 1, ready" || echo 'session: none'
                 sleep 0.2; echo "native slots: 3 free of 3" ;;
         shot) printf 'webp' > "$task/shots/$(cat "$task/side")-$2.webp"
               printf '%s\\tREV\\n' "$(cat "$task/side")-$2.webp" >> "$task/shots/manifest.tsv" ;;
@@ -2644,6 +2663,93 @@ class RemoteEvidence(unittest.TestCase):
                         if process.poll() is None:
                             process.kill()
                         process.wait(timeout=HANG_GUARD)
+
+    def test_a_lost_connection_ends_what_it_started_on_the_host(self) -> None:
+        # What the host runs for a connection, holding until a signal ends it,
+        # and naming who sent that.
+        (self.logs / "hold.py").write_text(textwrap.dedent("""\
+            import os
+            import signal
+            from pathlib import Path
+            root = Path(os.environ["STUB_LOG"])
+            signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+            (root / "held").write_text(str(os.getpid()))
+            sent = signal.sigwaitinfo({signal.SIGTERM})
+            (root / "held-ended").write_text(str(sent.si_pid))
+            raise SystemExit(128 + signal.SIGTERM)
+        """))
+        checkout = self.checkout("after", {"src.rs": "fn main() {}\n"})
+        self.run_tool("build", "after", str(checkout))
+        self.run_tool("start", "after")
+        (self.logs / "status-holds").touch()
+        with (self.logs / "lost-output").open("w") as output:
+            process = subprocess.Popen(
+                [str(SCRIPT), "--remote", "buildhost", "--task", str(self.task), "status"],
+                env=self.env, stdin=subprocess.DEVNULL, stdout=output, stderr=output, start_new_session=True,
+            )
+
+        def wait_for(condition) -> None:
+            deadline = time.monotonic() + HANG_GUARD
+            while not condition() and time.monotonic() < deadline:
+                time.sleep(0.02)
+
+        held = None
+        try:
+            wait_for(lambda: (self.logs / "held").exists() or process.poll() is not None)
+            self.assertTrue((self.logs / "held").exists(), (self.logs / "lost-output").read_text())
+            held = int((self.logs / "held").read_text())
+
+            def parent(pid: int) -> int:
+                return int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1])
+
+            # The host script started its work in a process group of its own,
+            # and beside it the watcher: the child pausing in a `sleep`. Until
+            # then its other children may be its search for the connection.
+            main = os.getpgid(held)
+            host = parent(main)
+
+            def children(pid: int) -> set[int]:
+                try:
+                    return set(map(int, Path(f"/proc/{pid}/task/{pid}/children").read_text().split()))
+                except FileNotFoundError:
+                    return set()
+
+            def comm(pid: int) -> str:
+                try:
+                    return Path(f"/proc/{pid}/comm").read_text().strip()
+                except FileNotFoundError:
+                    return ""
+
+            def watchers() -> list[int]:
+                return [pid for pid in children(host) - {main}
+                        if any(comm(nap) == "sleep" for nap in children(pid))]
+
+            wait_for(lambda: len(watchers()) == 1)
+            self.assertEqual(len(watchers()), 1, children(host))
+            watcher = watchers()[0]
+            # The connection is the stand-in sshd above it; its client, the
+            # ssh this machine runs, goes as if the network had.
+            connection = host
+            while Path(f"/proc/{connection}/comm").read_text().strip() != "sshd-session":
+                connection = parent(connection)
+                self.assertGreater(connection, 1, "no stand-in sshd above the host's work")
+            os.kill(parent(connection), signal.SIGKILL)
+            self.assertNotEqual(process.wait(timeout=HANG_GUARD), 0)
+            wait_for(lambda: (self.logs / "held-ended").exists())
+            self.assertTrue((self.logs / "held-ended").exists(), "the host's work outlived its connection")
+            # Ended by the watcher, for its connection's end, not by anything here.
+            self.assertEqual(int((self.logs / "held-ended").read_text()), watcher)
+            self.assertFalse(Path(f"/proc/{connection}").exists() and
+                             Path(f"/proc/{connection}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z")
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=HANG_GUARD)
+            if held is not None and not (self.logs / "held-ended").exists():
+                try:
+                    os.kill(held, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
     def test_a_signal_its_caller_ignores_ends_nothing(self) -> None:
         # As under `nohup … &`, which a long pair or build is run with.

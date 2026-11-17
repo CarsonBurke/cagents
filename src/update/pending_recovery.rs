@@ -50,17 +50,35 @@ pub(crate) fn run(
     let before = candidate_stamp(&layout.version_root)?;
     // Re-observe AFTER taking the real fences. A settled recovery can be
     // verified without restarting or stopping the recognized serving owner.
-    if verify(&pending, &daemon).is_ok() {
+    let settled = match verify(&pending, &daemon) {
+        Ok(_) => true,
+        // A daemon is serving but would not answer the check. Nothing has
+        // been closed or started yet, so this recovery can simply be repeated.
+        Err(error @ UpdateError::SourceBusy { .. }) => {
+            return Err(invalid(format!(
+                "{error}. Nothing was closed or started; repeat this recovery once the daemon finishes"
+            )));
+        }
+        Err(_) => false,
+    };
+    if settled {
         // A pre-existing UI may have ordinary restore policy. Close and reopen
         // it under the same guarded policy instead of merely activating it.
         let current_windows = guard.prepare_windows(Duration::from_secs(45))?;
         let windows = recovery_window_slots(&pending.windows, &current_windows);
         guard.close_prepared_windows(&current_windows, Duration::from_secs(45))?;
         guard.relaunch_windows(&windows, &ui)?;
-        verify(&pending, &daemon)?;
-        recovery::retire_current_service()?;
-        let outcome = verify(&pending, &daemon)?;
-        return Ok(report(&outcome));
+        let outcome = verify(&pending, &daemon).and_then(|_| {
+            recovery::retire_current_service(source::BusyPatience::for_one_run())?;
+            verify(&pending, &daemon)
+        });
+        return match outcome {
+            Ok(outcome) => Ok(report(&outcome)),
+            Err(error @ UpdateError::SourceBusy { .. }) => Err(invalid(format!(
+                "Recovery could not be verified: {error}. The serving daemon was kept and its windows were reopened; repeat this recovery once the daemon finishes"
+            ))),
+            Err(error) => Err(error),
+        };
     }
     let paths = crate::daemon::RuntimePaths::discover().map_err(|e| invalid(e.to_string()))?;
     let handoff = LeaseHandoff::try_acquire(&paths).map_err(|e| invalid(e.to_string()))?
@@ -143,7 +161,7 @@ pub(crate) fn run(
             .map_err(invalid)?
             .ok_or_else(|| invalid("The recovery checkpoint disappeared while reopening panes"))?;
         verify(&pending, &daemon)?;
-        recovery::retire_current_service()?;
+        recovery::retire_current_service(source::BusyPatience::for_one_run())?;
         verify(&pending, &daemon)
     });
     match result {
@@ -155,11 +173,19 @@ pub(crate) fn run(
         }
         Err(error) => {
             job.phase = UpdatePhase::Failed;
-            job.message = format!(
-                "Recovery failed: {error}. Retained checkpoint {checkpoint} and its exact owner evidence were kept. No provider was replayed or started. Inspect {} and run '{} --no-start daemon status' to see what is serving",
-                job.log_path.display(),
-                cli.display()
-            );
+            job.message = match &error {
+                // Only the check was refused. Recovery may already serve the
+                // target daemon and its windows; repeating it verifies them.
+                UpdateError::SourceBusy { .. } => format!(
+                    "Recovery could not be verified: {error}. Retained checkpoint {checkpoint} and its exact owner evidence were kept. No provider was replayed or started. Run '{} --no-start daemon status' to see what is serving, then repeat this recovery once the daemon finishes",
+                    cli.display()
+                ),
+                _ => format!(
+                    "Recovery failed: {error}. Retained checkpoint {checkpoint} and its exact owner evidence were kept. No provider was replayed or started. Inspect {} and run '{} --no-start daemon status' to see what is serving",
+                    job.log_path.display(),
+                    cli.display()
+                ),
+            };
             let _ = write_job(&state, &job);
             Err(invalid(job.message))
         }
@@ -176,51 +202,46 @@ fn recovery_window_slots(pending: &[String], current: &[String]) -> Vec<String> 
     windows
 }
 
+/// One recovery check. Its fences and census share one busy patience, so a
+/// busy daemon delays the check, and the windows it may keep closed, at most
+/// that long.
 fn verify(pending: &PendingRecovery, daemon: &Path) -> Result<recovery::Receipt, UpdateError> {
+    let busy = source::BusyPatience::for_one_run();
     let socket = crate::terminal_ipc::daemon_socket_path()?;
-    let source::Client { mut client, peer } =
-        source::Client::connect(&socket).map_err(|e| invalid(e.to_string()))?;
-    peer.verify(client.proof())?;
-    if peer.executable()? != daemon
+    let mut client = source::Client::connect(&socket)
+        .map_err(|e| invalid(e.to_string()))?
+        .with_busy_patience(busy);
+    if client.serving_executable()? != daemon
         || client.protocol() != crate::terminal_ipc::PROTOCOL_VERSION
-        || client.startup_state().map_err(|e| invalid(e.to_string()))?
-            != crate::terminal_ipc::StartupState::Ready
+        || client.startup_state()? != crate::terminal_ipc::StartupState::Ready
     {
         return Err(invalid("The selected target daemon is not Ready"));
     }
-    let generation = client
-        .shutdown_preflight()
-        .map_err(|e| invalid(e.to_string()))?
-        .capability
-        .inventory_generation;
+    // The fence is asked again while the daemon finishes another operation,
+    // which refuses it before issuing anything, rather than failing recovery.
+    let generation = client.inventory_generation()?;
     let original = recovery::Census::from_pending(uuid::Uuid::new_v4().to_string(), pending)?;
-    let receipt = original.verify()?;
+    let receipt = original.verify(busy)?;
+    if let Some(error) = receipt.still_busy() {
+        return Err(error);
+    }
     if !receipt.usable() {
         return Err(invalid(format!(
             "The shared update census did not verify usable recovery: {:?}",
             receipt.outcome
         )));
     }
-    if client
-        .shutdown_preflight()
-        .map_err(|e| invalid(e.to_string()))?
-        .capability
-        .inventory_generation
-        != generation
-    {
+    if client.inventory_generation()? != generation {
         return Err(invalid(
             "Recovery inventory changed during verification; no success was reported",
         ));
     }
-    if client.startup_state().map_err(|e| invalid(e.to_string()))?
-        != crate::terminal_ipc::StartupState::Ready
-    {
+    if client.startup_state()? != crate::terminal_ipc::StartupState::Ready {
         return Err(invalid(
             "The recovery service ceased to be Ready during verification",
         ));
     }
-    peer.verify(client.proof())?;
-    if peer.executable()? != daemon {
+    if client.serving_executable()? != daemon {
         return Err(invalid("The serving recovery executable changed"));
     }
     Ok(receipt)
