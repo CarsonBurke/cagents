@@ -598,8 +598,9 @@ case $command in
     clean) cmd_clean ;;
     build) cmd_build "$@" ;;
     shot)
-        [ "$#" -eq 1 ] || die 'shot needs a name' 2
-        forward shot "$1" >/dev/null
+        [ "$#" -ge 1 ] || die 'shot needs a name' 2
+        # The host's native-evidence checks the name and any options.
+        forward shot "$@" >/dev/null
         fetch_shots
         side=$(forward status | sed -n 's/^session: \(before\|after\),.*/\1/p') || side=
         if [ -n "$side" ]; then

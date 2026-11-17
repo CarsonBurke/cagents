@@ -2411,7 +2411,8 @@ REMOTE_TOOL = """
         # that stops at the first ends it with SIGPIPE.
         status) [ -e "$task/side" ] && echo "session: $(cat "$task/side"), pid 1, ready" || echo 'session: none'
                 sleep 0.2; echo "native slots: 3 free of 3" ;;
-        shot) printf 'webp' > "$task/shots/$(cat "$task/side")-$2.webp"
+        shot) printf '%s\\n' "$*" > "$task/shot-arguments"
+              printf 'webp' > "$task/shots/$(cat "$task/side")-$2.webp"
               printf '%s\\tREV\\n' "$(cat "$task/side")-$2.webp" >> "$task/shots/manifest.tsv" ;;
         build) [ ! -e "$task/build-fails" ] || exit 1
                printf '%s\\n' "$3" > "$task/built-$2"; ls "$3" > "$task/files-$2"
@@ -2826,6 +2827,11 @@ class RemoteEvidence(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), str(self.task / "shots" / "after-home.webp"))
         self.assertEqual((self.task / "shots" / "after-home.webp").read_text(), "webp")
         self.assertIn("after-home.webp", (self.task / "shots" / "manifest.tsv").read_text())
+        # Options reach the host's native-evidence, which checks them.
+        result = self.run_tool("shot", "edges", "--lossless")
+        self.assertEqual(result.stdout.strip(), str(self.task / "shots" / "after-edges.webp"))
+        self.assertEqual((self.remote_task / "shot-arguments").read_text().strip(),
+                         "shot edges --lossless")
 
     def test_cli_arguments_name_the_fixture_on_the_host(self) -> None:
         checkout = self.checkout("after", {"src.rs": "\n"})
