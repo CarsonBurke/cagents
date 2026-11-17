@@ -1026,26 +1026,36 @@ impl HostState {
                 .handle
                 .set_visible(record.subscribers.values().any(|visible| *visible));
         }
-        let terminal_ids = self
+        // With each terminal's visibility before the disconnect: only a change
+        // is sent, as every other writer does. Re-sending Visible while
+        // another client still shows the terminal would force a full capture.
+        let terminals = self
             .subscriptions
             .by_client
             .get(&client_id)
-            .map(|terminals| terminals.keys().copied().collect::<Vec<_>>())
+            .map(|terminals| {
+                terminals
+                    .keys()
+                    .map(|terminal_id| (*terminal_id, self.subscriptions.visibility(*terminal_id)))
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
-        let handles = terminal_ids
+        let handles = terminals
             .iter()
-            .filter_map(|terminal_id| {
+            .filter_map(|(terminal_id, _)| {
                 self.terminals
                     .get(terminal_id)
                     .map(|record| record.handle.clone())
             })
             .collect::<Vec<_>>();
         self.subscriptions.disconnect(client_id);
-        for terminal_id in terminal_ids {
+        for (terminal_id, old_visibility) in terminals {
             self.refresh_presentation_owner(terminal_id);
-            let visibility = self.subscriptions.visibility(terminal_id);
-            if let Some(record) = self.terminals.get(&terminal_id) {
-                let _ = apply_visibility(&record.handle, visibility);
+            let new_visibility = self.subscriptions.visibility(terminal_id);
+            if old_visibility != new_visibility
+                && let Some(record) = self.terminals.get(&terminal_id)
+            {
+                record.handle.set_host_visibility(new_visibility);
             }
             self.disarm_output_if_observed(terminal_id);
         }
@@ -1076,11 +1086,8 @@ impl HostState {
         self.subscriptions
             .attach(client_id, terminal_id, TerminalVisibility::Hidden);
         let new_visibility = self.subscriptions.visibility(terminal_id);
-        if old_visibility != new_visibility
-            && let Err(error) = apply_visibility(&record.handle, new_visibility)
-        {
-            self.subscriptions.detach(client_id, terminal_id);
-            return Err(send_error(error));
+        if old_visibility != new_visibility {
+            record.handle.set_host_visibility(new_visibility);
         }
         self.rearm_output(client_id, terminal_id);
         self.descriptor(client_id, terminal_id)
@@ -1095,24 +1102,14 @@ impl HostState {
             .terminals
             .get(&terminal_id)
             .ok_or_else(|| not_found(terminal_id))?;
-        let Some(old_requested) = self
-            .subscriptions
-            .by_client
-            .get(&client_id)
-            .and_then(|terminals| terminals.get(&terminal_id))
-            .copied()
-        else {
+        if !self.subscriptions.attached(client_id, terminal_id) {
             return Ok(());
-        };
+        }
         let old_visibility = self.subscriptions.visibility(terminal_id);
         self.subscriptions.detach(client_id, terminal_id);
         let new_visibility = self.subscriptions.visibility(terminal_id);
-        if old_visibility != new_visibility
-            && let Err(error) = apply_visibility(&record.handle, new_visibility)
-        {
-            self.subscriptions
-                .attach(client_id, terminal_id, old_requested);
-            return Err(send_error(error));
+        if old_visibility != new_visibility {
+            record.handle.set_host_visibility(new_visibility);
         }
         self.refresh_presentation_owner(terminal_id);
         self.disarm_output_if_observed(terminal_id);
@@ -1146,12 +1143,8 @@ impl HostState {
         self.subscriptions
             .set_visibility(client_id, terminal_id, requested);
         let new_visibility = self.subscriptions.visibility(terminal_id);
-        if old_visibility != new_visibility
-            && let Err(error) = apply_visibility(&record.handle, new_visibility)
-        {
-            self.subscriptions
-                .set_visibility(client_id, terminal_id, old_requested);
-            return Err(send_error(error));
+        if old_visibility != new_visibility {
+            record.handle.set_host_visibility(new_visibility);
         }
         self.refresh_presentation_owner(terminal_id);
         if requested == TerminalVisibility::Visible {
@@ -5135,8 +5128,7 @@ fn publish_installed_terminal(
         // Until now the spawning client was attached hidden, so a redraw or
         // another client may have hidden the worker meanwhile. Apply the
         // published visibility as `attach` does, or a hidden worker captures
-        // nothing more until it exits. The publication above has committed,
-        // so a refused command cannot undo it.
+        // nothing more until it exits.
         let old_visibility = state.subscriptions.visibility(id);
         state.subscriptions.attach(
             client,
@@ -5148,10 +5140,8 @@ fn publish_installed_terminal(
             },
         );
         let new_visibility = state.subscriptions.visibility(id);
-        if old_visibility != new_visibility
-            && let Err(error) = apply_visibility(expected, new_visibility)
-        {
-            tracing::warn!(terminal_id = %id, %error, "a published terminal kept its startup visibility");
+        if old_visibility != new_visibility {
+            expected.set_host_visibility(new_visibility);
         }
         state.rearm_output(client, id);
         state.publish_worker(client, id);
@@ -5168,20 +5158,6 @@ fn publish_installed_terminal(
         expected.acknowledge_redraw(expected.generation());
     }
     Ok(descriptor)
-}
-
-fn apply_visibility(
-    handle: &TerminalHandle,
-    visibility: TerminalVisibility,
-) -> Result<(), TerminalSendError> {
-    handle
-        .set_host_visibility(visibility)
-        .or_else(|error| match error {
-            // Visibility is presentation-only. A completed worker retains its
-            // final snapshot and must not require restarting its process to view it.
-            TerminalSendError::Closed => Ok(()),
-            error => Err(error),
-        })
 }
 
 pub(crate) fn send_error(error: TerminalSendError) -> ProtocolError {
@@ -5472,10 +5448,10 @@ fn plan_redraw(
         .map(|(client_id, _)| *client_id)
         .collect::<Vec<_>>();
     if visible.is_empty() {
-        // Serialize visibility commands with attachment/reveal changes.
-        // Otherwise this Hide could overtake a newly attached UI's Reveal.
+        // Requested under the lock, as attachment and reveal changes are, so
+        // a newer request from either always replaces this one.
         if state.subscriptions.visibility(terminal_id) == TerminalVisibility::Hidden {
-            let _ = worker.hide();
+            worker.set_host_visibility(TerminalVisibility::Hidden);
         }
         return Vec::new();
     }
@@ -5484,7 +5460,14 @@ fn plan_redraw(
     let capture = worker.snapshot();
     let mut planned = Vec::new();
     for client_id in visible {
-        let Some(delivery) = state.clients.get(&client_id).cloned() else {
+        // A closed connection refuses every frame. Building one for it would
+        // only free it under the commit's hold.
+        let Some(delivery) = state
+            .clients
+            .get(&client_id)
+            .filter(|delivery| !delivery.is_closed())
+            .cloned()
+        else {
             continue;
         };
         let key = (client_id, terminal_id);
@@ -5591,7 +5574,8 @@ fn commit_redraw(
             == Some(&TerminalVisibility::Visible);
         let same_connection = clients
             .get(&planned.client_id)
-            .is_some_and(|current| Arc::ptr_eq(current, &planned.delivery));
+            .is_some_and(|current| Arc::ptr_eq(current, &planned.delivery))
+            && !planned.delivery.is_closed();
         let unchanged_base = match (subscriptions.sent.get(&key), &planned.recorded) {
             (Some(sent), Some(recorded)) => Arc::ptr_eq(&sent.snapshot, recorded),
             (None, None) => true,

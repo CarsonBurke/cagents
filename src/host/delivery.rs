@@ -195,6 +195,10 @@ struct QueueState {
     slots: BTreeMap<SlotKey, u64>,
     popped: u64,
     queued_bulk_pages: usize,
+    /// What a backpressure disconnect discarded, left for the writer to
+    /// free. Pushes come from threads holding the host lock, and the
+    /// discarded messages can be full terminal frames.
+    discarded: VecDeque<Outbound>,
     close_after_drain: bool,
     aborted: bool,
 }
@@ -239,11 +243,14 @@ impl QueueState {
         Some(message)
     }
 
-    fn discard(&mut self) {
+    /// Empties the queue, returning its messages for the caller to free
+    /// once no lock is held.
+    #[must_use = "the discarded messages are to be freed outside the lock"]
+    fn discard(&mut self) -> VecDeque<Outbound> {
         self.popped += self.messages.len() as u64;
-        self.messages.clear();
         self.slots.clear();
         self.queued_bulk_pages = 0;
+        std::mem::take(&mut self.messages)
     }
 }
 
@@ -268,6 +275,7 @@ impl DeliveryQueue {
                 slots: BTreeMap::new(),
                 popped: 0,
                 queued_bulk_pages: 0,
+                discarded: VecDeque::new(),
                 close_after_drain: false,
                 aborted: false,
             }),
@@ -295,7 +303,9 @@ impl DeliveryQueue {
     /// A disconnection is reported on the wire: the queue is replaced by a
     /// single retryable [`ProtocolErrorCode::QueueFull`] frame and closed after
     /// draining it, so the peer can tell "I fell behind" from "the daemon
-    /// died" instead of observing a bare EOF.
+    /// died" instead of observing a bare EOF. The discarded messages, and the
+    /// one refused, are freed by the writer's next [`Self::pop`], not here:
+    /// callers push while holding the host lock.
     pub(crate) fn push(&self, message: impl Into<Outbound>) -> Result<(), DeliveryError> {
         let message = message.into();
         let mut state = self
@@ -388,12 +398,19 @@ impl DeliveryQueue {
                 bulk_pages = state.queued_bulk_pages,
                 "disconnecting a cagents daemon client that fell behind its delivery queue"
             );
-            state.discard();
+            let proof = Arc::clone(&message.proof);
+            let mut discarded = state.discard();
+            discarded.push_back(message);
+            debug_assert!(
+                state.discarded.is_empty(),
+                "a queue closes when it overflows, so it overflows once"
+            );
+            state.discarded = discarded;
             state.enqueue(Outbound {
                 encoded_response: None,
                 version: PROTOCOL_VERSION,
                 request_id: None,
-                proof: Arc::clone(&message.proof),
+                proof,
                 message: ServerMessage::Error(ProtocolError::new(
                     ProtocolErrorCode::QueueFull,
                     format!(
@@ -412,12 +429,26 @@ impl DeliveryQueue {
         Ok(())
     }
 
+    /// The next message to write, waiting for one. Run by the connection's
+    /// writer, which holds no other lock, so it also frees what an overflow
+    /// discarded.
     pub(crate) fn pop(&self) -> Option<Outbound> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         loop {
+            if !state.discarded.is_empty() {
+                let discarded = std::mem::take(&mut state.discarded);
+                // Not under the queue lock either: a push waits for that.
+                drop(state);
+                drop(discarded);
+                state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                continue;
+            }
             if state.aborted {
                 return None;
             }
@@ -440,6 +471,25 @@ impl DeliveryQueue {
         }
     }
 
+    /// Whether every later push is refused: the queue overflowed, was asked to
+    /// close, or its writer failed.
+    pub(crate) fn is_closed(&self) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.aborted || state.close_after_drain
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queued(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .messages
+            .len()
+    }
+
     pub(crate) fn close_after_drain(&self) {
         let mut state = self
             .state
@@ -456,6 +506,7 @@ impl DeliveryQueue {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut discarded = std::mem::take(&mut state.discarded);
         if !state.aborted {
             tracing::warn!(
                 client = self.client_id,
@@ -465,8 +516,11 @@ impl DeliveryQueue {
             );
         }
         state.aborted = true;
-        state.discard();
+        discarded.append(&mut state.discard());
         self.available.notify_all();
+        // A pop after this returns at once, so nothing is left for it to free.
+        drop(state);
+        drop(discarded);
     }
 }
 
@@ -1016,6 +1070,46 @@ mod tests {
         assert_eq!(error.code, ProtocolErrorCode::QueueFull);
         assert!(error.retryable);
         assert!(queue.pop().is_none());
+    }
+
+    /// Pushes come from threads holding the host lock. An overflow discards
+    /// a queue that can hold full terminal frames, so the writer frees them.
+    #[test]
+    fn overflow_leaves_freeing_the_discarded_messages_to_the_writer() {
+        let proof = Arc::new(redraw(TerminalId::new(), 0).proof);
+        let observed = || {
+            Outbound::broadcast(
+                &proof,
+                ServerMessage::TerminalObserved {
+                    terminal_id: TerminalId::new(),
+                    epoch: 0,
+                },
+            )
+        };
+        for writer_aborts in [false, true] {
+            let queue = DeliveryQueue::new(7, 2);
+            queue.push(observed()).unwrap();
+            queue.push(observed()).unwrap();
+            assert_eq!(queue.push(observed()), Err(DeliveryError::Full));
+            // Two discarded, the refused one, and the QueueFull notice.
+            assert_eq!(
+                Arc::strong_count(&proof),
+                1 + 2 + 1 + 1,
+                "the overflowing push freed what it discarded"
+            );
+            if writer_aborts {
+                queue.abort("the writer failed");
+                assert_eq!(Arc::strong_count(&proof), 1);
+                assert!(queue.pop().is_none());
+                continue;
+            }
+            let notice = queue.pop().unwrap();
+            assert!(matches!(notice.message, ServerMessage::Error(_)));
+            assert_eq!(Arc::strong_count(&proof), 1 + 1);
+            drop(notice);
+            assert!(queue.pop().is_none());
+            assert_eq!(Arc::strong_count(&proof), 1);
+        }
     }
 
     #[test]
