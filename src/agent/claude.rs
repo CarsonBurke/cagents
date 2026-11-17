@@ -1,5 +1,5 @@
 use super::{Provider, ProviderAdapter};
-#[cfg(feature = "host")]
+#[cfg(any(feature = "ui", feature = "host"))]
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -83,12 +83,12 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
 /// Claude Code's project-key and candidate-directory rules, shared by the
 /// presence probe and the stricter reader. They intentionally apply different
 /// file policies: presence includes unreadable or symlinked transcripts.
-#[cfg(feature = "host")]
+#[cfg(any(feature = "ui", feature = "host"))]
 struct TranscriptLookup {
     project: String,
     filename: String,
 }
-#[cfg(feature = "host")]
+#[cfg(any(feature = "ui", feature = "host"))]
 impl TranscriptLookup {
     fn new(cwd: &Path, id: &str) -> Result<Self, String> {
         if id.len() != 36 || uuid::Uuid::parse_str(id).is_err() {
@@ -152,22 +152,22 @@ pub(crate) fn transcript_exists(config: &Path, cwd: &Path, id: &str) -> bool {
 /// character but ASCII alphanumerics replaced, and cuts a long name at 200
 /// characters followed by a hash this does not reproduce. Such a name is found
 /// by the transcript it holds and refused when more than one does.
-#[cfg(feature = "host")]
-pub(crate) fn transcript(config: &Path, cwd: &Path, id: &str) -> Result<PathBuf, String> {
+#[cfg(any(feature = "ui", feature = "host"))]
+pub fn transcript(config: &Path, cwd: &Path, id: &str) -> Result<PathBuf, String> {
     transcript_for_start(config, cwd, id).map_err(|error| error.to_string())
 }
 
 /// Invalid identity/path evidence cannot be repaired by repeating this exact
 /// lookup. Missing or inaccessible history can become available without
 /// changing the selected conversation.
-#[cfg(feature = "host")]
+#[cfg(any(feature = "ui", feature = "host"))]
 #[derive(Debug)]
 pub(crate) enum TranscriptError {
     Invalid(String),
     Unavailable(String),
 }
 
-#[cfg(feature = "host")]
+#[cfg(any(feature = "ui", feature = "host"))]
 impl std::fmt::Display for TranscriptError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -176,7 +176,7 @@ impl std::fmt::Display for TranscriptError {
     }
 }
 
-#[cfg(feature = "host")]
+#[cfg(any(feature = "ui", feature = "host"))]
 pub(crate) fn transcript_for_start(
     config: &Path,
     cwd: &Path,

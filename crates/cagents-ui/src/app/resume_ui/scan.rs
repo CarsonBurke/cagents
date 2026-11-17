@@ -122,11 +122,44 @@ pub fn scan(
     }
     file.seek(SeekFrom::Start(scan.offset)).ok()?;
     let mut reader = Records::new(provider, path, &mut scan);
-    let mut buffer = vec![0; READ_CHUNK];
+    let position = reader.scan.offset;
+    if read_records(
+        &mut file,
+        &mut reader,
+        (position, len),
+        READ_CHUNK,
+        cancel,
+        |reader| reader.scan.settled_negative(),
+    )? {
+        return Some(scan);
+    }
+    reader.finish();
+    // An unfinished last record is read again, whole, next time.
+    scan.boundary = boundary(&mut file, scan.offset).unwrap_or(0);
+    if len >= UNCACHE_BYTES {
+        uncache(&file);
+    }
+    Some(scan)
+}
+
+/// Feeds `reader` each whole record of `file` from `position`, where the file
+/// is positioned, up to `end`, `chunk` bytes at a time, keeping the scan's
+/// offset after the last one.
+/// A record longer than [`MAX_LINE_BYTES`] is skipped, and one cut off at
+/// `end` is left for a later read. Answers whether `stop` ended the read
+/// early, or `None` when `cancel` was set or the file could not be read.
+fn read_records(
+    file: &mut std::fs::File,
+    reader: &mut Records<'_>,
+    (mut position, end): (u64, u64),
+    chunk: usize,
+    cancel: &AtomicBool,
+    mut stop: impl FnMut(&mut Records<'_>) -> bool,
+) -> Option<bool> {
+    let mut buffer = vec![0; chunk.min(end.saturating_sub(position) as usize)];
     let mut pending = Vec::new();
     let mut oversized = false;
-    let mut position = reader.scan.offset;
-    let mut remaining = len.saturating_sub(position);
+    let mut remaining = end.saturating_sub(position);
     while remaining > 0 {
         if cancel.load(Ordering::Relaxed) {
             return None;
@@ -153,8 +186,8 @@ pub fn scan(
             position += (newline + 1 - start) as u64;
             reader.scan.offset = position;
             start = newline + 1;
-            if reader.scan.settled_negative() {
-                return Some(scan);
+            if stop(reader) {
+                return Some(true);
             }
         }
         let rest = &buffer[start..read];
@@ -168,13 +201,59 @@ pub fn scan(
             }
         }
     }
-    reader.finish();
-    // An unfinished last record is read again, whole, next time.
-    scan.boundary = boundary(&mut file, scan.offset).unwrap_or(0);
-    if len >= UNCACHE_BYTES {
-        uncache(&file);
+    Some(false)
+}
+
+/// How much of a transcript's opening [`first_prompt`] reads. The first
+/// prompt usually ends within the first 15 KiB, after a session header,
+/// injected instructions and a file snapshot. A conversation started by a
+/// command can run a few agent turns first; the latest seen ended at 1.5 MiB.
+/// One that starts later than this is left unnamed.
+pub const HEAD_BYTES: u64 = 2 << 20;
+/// A head read's reads, small because its prompt is usually in the first.
+const HEAD_CHUNK: usize = 64 << 10;
+
+/// The first prompt of the conversation at `path` that `accept` takes, read
+/// from no more than the first `limit` bytes and with the picker's rules for
+/// what the user wrote. Reading stops at that prompt, so a long history costs
+/// no more than a short one. `None` when no prompt in that opening is
+/// accepted, the transcript is not a resumable conversation, the read was
+/// cancelled or the file is missing, unreadable or a link.
+pub fn first_prompt<T>(
+    provider: Provider,
+    path: &Path,
+    limit: u64,
+    cancel: &AtomicBool,
+    mut accept: impl FnMut(&str) -> Option<T>,
+) -> Option<T> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::File::options()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() {
+        return None;
     }
-    Some(scan)
+    let mut scan = Scan::default();
+    let mut reader = Records::new(provider, path, &mut scan);
+    reader.newest_prompt = Some(None);
+    let mut accepted = None;
+    read_records(
+        &mut file,
+        &mut reader,
+        (0, metadata.len().min(limit)),
+        HEAD_CHUNK,
+        cancel,
+        |reader| {
+            if let Some(prompt) = reader.newest_prompt.as_mut().and_then(Option::take) {
+                accepted = accept(&prompt);
+            }
+            accepted.is_some() || reader.scan.settled_negative()
+        },
+    )?;
+    accepted
 }
 
 /// Whether `file` still holds what `previous` read, and possibly more.
@@ -211,6 +290,9 @@ struct Records<'a> {
     scan: &'a mut Scan,
     /// The newest reply record, parsed only once the scan ends.
     reply: Option<Vec<u8>>,
+    /// The whole text of the prompt the last record held, when a reader
+    /// wants each prompt as it is found rather than only the excerpts.
+    newest_prompt: Option<Option<String>>,
     finder: Finders,
 }
 
@@ -295,6 +377,7 @@ impl<'a> Records<'a> {
             claude,
             scan,
             reply: None,
+            newest_prompt: None,
             finder: Finders::new(),
         }
     }
@@ -564,6 +647,9 @@ impl<'a> Records<'a> {
     }
 
     fn prompt(&mut self, prompt: String) {
+        if let Some(newest) = &mut self.newest_prompt {
+            *newest = Some(prompt.clone());
+        }
         let found = &mut self.scan.found;
         found.prompts += 1;
         let excerpt = excerpt(&prompt);
@@ -836,6 +922,60 @@ mod tests {
         assert_eq!(
             summary.title().as_deref(),
             Some("Fix the token refresh race")
+        );
+    }
+
+    /// The head read stops at the first prompt `accept` takes, passing over
+    /// context and prompts it refuses, and reads nothing past its limit.
+    #[test]
+    fn a_head_read_stops_at_the_first_accepted_prompt() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(format!("{ID}.jsonl"));
+        write(
+            &path,
+            &[
+                claude_user(json!("<system-reminder>ctx</system-reminder>")),
+                claude_user(json!("hi")),
+                claude_user(json!("Fix the token refresh race")),
+                claude_user(json!("Add a regression test too")),
+            ],
+        );
+        let mut offered = Vec::new();
+        let first = first_prompt(
+            Provider::Claude,
+            &path,
+            HEAD_BYTES,
+            &AtomicBool::new(false),
+            |prompt| {
+                offered.push(prompt.to_owned());
+                (prompt != "hi").then(|| prompt.to_owned())
+            },
+        );
+        assert_eq!(first.as_deref(), Some("Fix the token refresh race"));
+        assert_eq!(offered, ["hi", "Fix the token refresh race"]);
+        let second = std::fs::read(&path).unwrap();
+        let limit = second.iter().position(|&byte| byte == b'\n').unwrap() as u64 + 1;
+        assert_eq!(
+            first_prompt(
+                Provider::Claude,
+                &path,
+                limit,
+                &AtomicBool::new(false),
+                |prompt| Some(prompt.to_owned())
+            ),
+            None,
+            "the first record holds only context"
+        );
+        assert_eq!(
+            first_prompt(
+                Provider::Claude,
+                &path,
+                HEAD_BYTES,
+                &AtomicBool::new(true),
+                |prompt| Some(prompt.to_owned())
+            ),
+            None,
+            "cancelled"
         );
     }
 

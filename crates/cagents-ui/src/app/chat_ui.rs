@@ -104,6 +104,7 @@ mod logical_prose;
 mod markdown;
 mod markdown_source;
 mod monospace;
+mod opening_name;
 mod pending_admission;
 mod permissions;
 mod preparation;
@@ -305,6 +306,9 @@ pub enum Action {
     /// a terminal can take its place.
     ReturnedLocally(Target, Result<(), ReturnRefused>),
     Wake(Target, Wake),
+    /// What the opening of a pane's conversation names its channel, read
+    /// once because the chat's loaded window starts after it.
+    OpeningName(Target, String, Option<String>),
     UpdatesAcknowledged(Target, Result<(), String>),
     Reconnect(Target),
     DraftStartCheckpointed(Target, uuid::Uuid, Result<(), String>),
@@ -742,6 +746,7 @@ impl Action {
             Self::Retired(..) => "Retired",
             Self::ReturnedLocally(..) => "ReturnedLocally",
             Self::Wake(..) => "Wake",
+            Self::OpeningName(..) => "OpeningName",
             Self::UpdatesAcknowledged(..) => "UpdatesAcknowledged",
             Self::Reconnect(..) => "Reconnect",
             Self::DraftStartCheckpointed(..) => "DraftStartCheckpointed",
@@ -1170,6 +1175,9 @@ impl Resend {
 
 pub(super) struct State {
     channel_names: HashMap<Target, ChannelNameObservation>,
+    /// Panes and conversations whose opening was read for a channel name,
+    /// so each is read at most once while the window runs.
+    opening_names: HashSet<(CardId, String)>,
     pub(super) image_viewer: Option<images::Gallery>,
     files: HashMap<PathBuf, Arc<Vec<String>>>,
     sender: async_channel::Sender<(Target, Wake)>,
@@ -1246,6 +1254,7 @@ impl Default for State {
         Self {
             image_viewer: None,
             channel_names: HashMap::new(),
+            opening_names: HashSet::new(),
             files: HashMap::new(),
             sender,
             receiver,
@@ -11561,6 +11570,9 @@ impl Cagents {
             Action::AccountRestored(card, result) => {
                 return self.chat_account_restored(card, result);
             }
+            Action::OpeningName(target, conversation, title) => {
+                self.opening_name_read(target, conversation, title);
+            }
             Action::DraftSkills(target, launch, skills) => {
                 if let Some(runtime) = self.chat_card_runtime_mut(target)
                     && runtime.is_draft()
@@ -12260,6 +12272,7 @@ impl Cagents {
                         if let Some((name, source)) = channel_name {
                             self.publish_observed_channel_name(target, name, source);
                         }
+                        let opening_name = self.request_opening_name(target);
                         self.observe_agent_activity_for_card(target.card, Some(activity));
                         // A new request can reject before its first Changed
                         // wake reaches this window. Historical reopen alone
@@ -12303,6 +12316,7 @@ impl Cagents {
                             submitted,
                             usage,
                             limits,
+                            opening_name,
                             self.list_chat_models(target.card),
                             self.dispatch_queued(target),
                         ]);

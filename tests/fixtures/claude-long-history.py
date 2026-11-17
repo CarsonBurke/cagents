@@ -20,6 +20,10 @@ parser.add_argument("--scale", type=int, default=1,
                     help="paragraph multiplier; 64 also exceeds Claude's provider history page")
 parser.add_argument("--tool-bytes", type=int, default=0,
                     help="insert a collapsed Bash result of this size every 32 exchanges")
+parser.add_argument("--first-prompt",
+                    help="what the reader first asked, in place of the first checkpoint")
+parser.add_argument("--untitled", action="store_true",
+                    help="leave out the conversation's name, so only its first prompt names it")
 args = parser.parse_args()
 if args.turns < 129:
     parser.error("use at least 129 turns to exercise history eviction")
@@ -43,7 +47,10 @@ with (directory / f"{session}.jsonl").open("w") as transcript:
             "can check that paging preserves their position and restores every newer turn."
             for check in range(args.scale * (1 + (turn - 1) // 64))
         )
-        messages = [("user", [{"type": "text", "text": f"Review checkpoint {turn:03d}"}])]
+        prompt = f"Review checkpoint {turn:03d}"
+        if turn == 1 and args.first_prompt:
+            prompt = args.first_prompt
+        messages = [("user", [{"type": "text", "text": prompt}])]
         if args.tool_bytes and turn % 32 == 0:
             call = f"toolu_checkpoint_{turn}"
             messages.extend([
@@ -71,6 +78,7 @@ with (directory / f"{session}.jsonl").open("w") as transcript:
             }) + "\n")
             clock += 45
             parent = uid
-    transcript.write(json.dumps({"type": "custom-title", "sessionId": session,
-                                 "customTitle": "History paging checkpoints"}) + "\n")
+    if not args.untitled:
+        transcript.write(json.dumps({"type": "custom-title", "sessionId": session,
+                                     "customTitle": "History paging checkpoints"}) + "\n")
 print(session)

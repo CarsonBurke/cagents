@@ -2341,6 +2341,17 @@ impl Cagents {
         })
     }
 
+    /// Whether `card` is the primary chat of a channel with no name, which
+    /// its conversation may fill: the automatic name is empty and the reader
+    /// has not named the channel.
+    pub(super) fn channel_lacks_name(&self, card: CardId) -> bool {
+        self.durable.channels.iter().any(|channel| {
+            channel.title.is_empty()
+                && channel.title_source != crate::model::ChannelTitleSource::Manual
+                && self.channel_primary_chat(channel) == Some(card)
+        })
+    }
+
     /// Names a new channel from its first submitted prompt or conversation name.
     ///
     /// Prompt fallbacks may later improve to provider titles. Manual and legacy

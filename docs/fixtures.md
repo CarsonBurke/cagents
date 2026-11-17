@@ -81,6 +81,9 @@ anchored when the next page arrives. No provider command is executed.
 
 Omit `--tool-bytes` for ordinary completed prose. `--scale 64` increases the
 paragraph count enough to exercise provider history paging with prose alone.
+`--untitled` leaves out the conversation's name and `--first-prompt TEXT`
+replaces the first checkpoint, for a channel that only its first prompt can
+name, which lies outside the loaded window.
 The generator writes under `HOME/.claude`; always run it through
 `native-evidence env`, which supplies the private fixture HOME. Stop and
 `save-seed` after setup to reuse exactly the same conversation on both sides.
