@@ -147,8 +147,8 @@ def went_over(unit, failed):
     command that failed asks the kernel while the scope's group remains, and
     otherwise waits, for a moment at most, until the manager has settled the
     unit: it records a kill before it finds the scope empty. Once a kill is
-    known, the wait is for the manager to record it, so the failed unit it
-    leaves can be reset."""
+    known, the scope is stopped before its failure is reset, since what
+    ignores SIGTERM in it can keep it stopping until the stop times out."""
     deadline = time.monotonic() + (2 if failed else 0)
     over = False
     try:
@@ -170,11 +170,35 @@ def went_over(unit, failed):
             if recorded or settled or time.monotonic() >= deadline:
                 break
             time.sleep(0.05)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if over:
+        stop(unit)
+    else:
+        forget(unit)
+    return over
+
+
+def forget(unit):
+    """Resets the unit's failure: the caller says what happened, and a failed
+    unit would be left for no one to read."""
+    try:
         subprocess.run(["systemctl", "--user", "reset-failed", unit], stdin=subprocess.DEVNULL,
                        capture_output=True, timeout=30, env=manager_environment())
     except (OSError, subprocess.SubprocessError):
-        return over
-    return over
+        pass
+
+
+def stop(unit):
+    """Stops the unit and forgets it. Anything in it that ignores SIGTERM is
+    killed once the stop times out, which fails the unit, so the stop is waited
+    for before its failure is reset."""
+    try:
+        subprocess.run(["systemctl", "--user", "stop", unit], stdin=subprocess.DEVNULL,
+                       capture_output=True, timeout=30, env=manager_environment())
+    except (OSError, subprocess.SubprocessError):
+        pass
+    forget(unit)
 
 
 def leftovers(unit):
@@ -232,11 +256,7 @@ def stop_leftovers(unit, name):
             log.writelines(f"  {line}\n" for line in lines)
     except OSError:
         pass
-    try:
-        subprocess.run(["systemctl", "--user", "stop", unit], stdin=subprocess.DEVNULL,
-                       capture_output=True, timeout=30, env=manager_environment())
-    except (OSError, subprocess.SubprocessError):
-        pass
+    stop(unit)
 
 
 def amount(size):
@@ -309,11 +329,7 @@ def main():
     status = child.wait()
     if interrupted:
         # Whatever ignored the signal, such as a compositor, goes with the scope.
-        try:
-            subprocess.run(["systemctl", "--user", "stop", unit], stdin=subprocess.DEVNULL,
-                           capture_output=True, timeout=30, env=manager_environment())
-        except (OSError, subprocess.SubprocessError):
-            pass
+        stop(unit)
     if went_over(unit, status != 0):
         print(over_limit_notice(name or os.path.basename(command[0]), limit, swap), file=sys.stderr)
         return 137
