@@ -1194,6 +1194,15 @@ pub struct ShapeLine {
     pub rtl: bool,
     pub spans: Vec<ShapeSpan>,
     pub metrics_opt: Option<Metrics>,
+    /// The ascent and descent of the line's default font, per unit of font
+    /// size: the least every visual line of it reserves around its baseline,
+    /// like CSS's strut.
+    ///
+    /// A line is centred on the tallest glyphs it holds. Without a strut, a
+    /// visual line set only in smaller or fallback glyphs, such as a wrapped
+    /// line of smaller inline code, was centred on those and its baseline
+    /// moved off the pitch of the lines around it.
+    strut: Option<(f32, f32)>,
     ellipsis_span: Option<ShapeSpan>,
 }
 
@@ -1296,6 +1305,7 @@ impl ShapeLine {
             rtl: false,
             spans: Vec::default(),
             metrics_opt: None,
+            strut: None,
             ellipsis_span: None,
         }
     }
@@ -1422,6 +1432,18 @@ impl ShapeLine {
         self.rtl = rtl;
         self.spans = spans;
         self.metrics_opt = attrs_list.defaults().metrics_opt.map(Into::into);
+        self.strut = {
+            let defaults = attrs_list.defaults();
+            let fonts = font_system.get_font_matches(&defaults);
+            let families = [&defaults.family];
+            FontFallbackIter::new(font_system, &fonts, &families, &[], "", defaults.weight)
+                .next()
+                .map(|font| {
+                    let metrics = font.metrics();
+                    let scale = metrics.units_per_em as f32;
+                    (metrics.ascent / scale, -metrics.descent / scale)
+                })
+        };
 
         self.ellipsis_span.get_or_insert_with(|| {
             let attrs = if attrs_list.spans.is_empty() {
@@ -3015,6 +3037,18 @@ impl ShapeLine {
                         .map_or(Some(glyph_line_height), |line_height| {
                             Some(line_height.max(glyph_line_height))
                         });
+                }
+            }
+
+            if let Some((ascent, descent)) = self.strut {
+                let size = self.metrics_opt.map_or(font_size, |m| m.font_size);
+                let (ascent, descent) = (size * ascent, size * descent);
+                // A line whose own spans set it shorter than the default
+                // font's glyphs could not hold the strut without pushing its
+                // glyphs out of it, so it keeps centring on its own.
+                if line_height_opt.is_none_or(|height| ascent + descent <= height) {
+                    max_ascent = max_ascent.max(ascent);
+                    max_descent = max_descent.max(descent);
                 }
             }
 

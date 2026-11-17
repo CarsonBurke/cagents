@@ -71,3 +71,23 @@ src/font/system/weight_match_tests.rs checks that matching reads no font file,
 and src/font/system/fallback_choice_tests.rs that every fallback choice over
 the repository fonts, for each family, weight, style and script, is the one
 upstream made.
+
+Line strut
+
+Every visual line reserves at least the ascent and descent of its line's
+default font, like CSS's strut. Upstream centres each line in its line height
+on the tallest glyphs it holds. A line holding only smaller or fallback
+glyphs was therefore centred on those, and its baseline moved off the pitch
+of the lines around it. The visible case was a wrapped line of nothing but
+inline code, set a step below the prose but on the prose's line height. That
+line sat half a pixel higher than its neighbours (cagents#3002).
+ShapeLine::build looks up the default attrs' first font, which shaping
+would choose for them, once per line through the cached font matches.
+Layout raises each visual line's maximum ascent and descent to that font's at
+the line's font size. A line that contains the default font's glyphs is
+unchanged, because they already reach those maxima. The strut is skipped on
+a line whose own spans set a line height shorter than the default font's
+glyphs, since it could not hold them without pushing its glyphs out of it.
+Such a line still centres on its own glyphs. tests/richtext_layout.rs
+a_line_of_only_smaller_text_keeps_the_paragraph_baseline fails without the
+strut. All upstream targets and reference images still pass.

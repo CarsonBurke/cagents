@@ -70,3 +70,46 @@ fn empty_lines_use_span_metrics() {
         line_heights[5]
     );
 }
+
+// A visual line holding only smaller text, such as a line of inline code set
+// a size below the prose around it but on the prose's line height, keeps the
+// baseline of the lines around it: every line reserves the default font's
+// ascent and descent, like CSS's strut (cagents#3002).
+#[test]
+fn a_line_of_only_smaller_text_keeps_the_paragraph_baseline() {
+    use cosmic_text::Family;
+
+    let mut font_system = FontSystem::new();
+    let mut buffer = Buffer::new(&mut font_system, Metrics::new(14.0, 19.6));
+    let mut buffer = buffer.borrow_with(&mut font_system);
+    let attrs = Attrs::new();
+    let code = attrs
+        .clone()
+        .family(Family::Monospace)
+        .metrics(Metrics::new(12.6, 19.6));
+    buffer.set_rich_text(
+        [
+            ("Prose before\n", attrs.clone()),
+            ("[features].multi_agent_v2", code.clone()),
+            ("\nprose with ", attrs.clone()),
+            ("code", code),
+            (" after", attrs.clone()),
+        ],
+        &attrs,
+        Shaping::Advanced,
+        None,
+    );
+    buffer.set_size(Some(500.0), None);
+
+    let baselines: Vec<f32> = buffer
+        .layout_runs()
+        .map(|run| run.line_y - run.line_top)
+        .collect();
+    assert_eq!(baselines.len(), 3);
+    for baseline in &baselines {
+        assert!(
+            (baseline - baselines[0]).abs() < 0.01,
+            "every line shares the prose baseline: {baselines:?}"
+        );
+    }
+}
