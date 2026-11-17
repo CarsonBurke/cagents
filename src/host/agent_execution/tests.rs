@@ -2957,7 +2957,7 @@ fn updated_codex_agent_answers_through_its_relaunched_server() {
         let entry = processes.join(provider.pid.to_string());
         std::os::unix::fs::symlink(format!("/proc/{}", provider.pid), &entry).unwrap();
         let control_gate = host.lock().unwrap().control_gate.clone();
-        let control = control_gate.write().unwrap();
+        let control = control_gate.exclusive();
         let capability = host
             .lock()
             .unwrap()

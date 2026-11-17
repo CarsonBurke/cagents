@@ -12,7 +12,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
     path::PathBuf,
-    sync::{Arc, Mutex, OnceLock, RwLock, Weak, atomic::AtomicBool},
+    sync::{Arc, Mutex, OnceLock, Weak, atomic::AtomicBool},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -385,7 +385,7 @@ pub(crate) struct HostState {
     /// Provider listings running outside the control gate.
     pub(super) agent_probes: Arc<super::activity::Probes>,
     /// Exclusive upgrade barrier; ordinary client operations remain concurrent.
-    pub(super) control_gate: Arc<RwLock<()>>,
+    pub(super) control_gate: Arc<super::control_gate::ControlGate>,
     pub(super) account_lifecycle: super::account_lifecycle::Reservations,
     pub(super) worktree_removals: super::worktree_removal::Reservations,
     upgrade: Option<PreparedUpgrade>,
@@ -522,7 +522,7 @@ impl HostState {
             agent_observer: Arc::new(crate::agent::observe::Observer::new()),
             agent_activity_wake: Arc::new(super::activity::Wake::default()),
             agent_probes: Arc::default(),
-            control_gate: Arc::new(RwLock::new(())),
+            control_gate: Arc::default(),
             upgrade: None,
             upgrade_chats: BTreeMap::new(),
             chat_resolutions: BTreeMap::new(),

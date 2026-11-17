@@ -1298,16 +1298,29 @@ impl TerminalHandle {
         }
     }
 
-    /// `shown` says the host has asked this worker to show the terminal.
-    /// Until the worker has published a screen since, what it published is a
-    /// hibernation marker, nothing, or the screen from before it was hidden.
-    /// Such a read is answered on the worker, after the reveal queued ahead
-    /// of it.
+    /// A viewport read needing no admission.
+    #[cfg(test)]
     pub(crate) fn viewport_snapshot(
         &self,
         offset: Option<u64>,
         rows: Option<u16>,
         shown: bool,
+    ) -> Result<Arc<RenderSnapshot>, String> {
+        self.viewport_snapshot_admitted(offset, rows, shown, || ())
+    }
+
+    /// `shown` says the host has asked this worker to show the terminal.
+    /// Until the worker has published a screen since, what it published is a
+    /// hibernation marker, nothing, or the screen from before it was hidden.
+    /// Such a read is answered on the worker, after the reveal queued ahead
+    /// of it. What `admit` returns is held only while the read is queued to
+    /// the worker, not while it waits for the frame.
+    pub(crate) fn viewport_snapshot_admitted<A>(
+        &self,
+        offset: Option<u64>,
+        rows: Option<u16>,
+        shown: bool,
+        admit: impl FnOnce() -> A,
     ) -> Result<Arc<RenderSnapshot>, String> {
         let published = self.snapshot();
         let drawn = !published.detached && published.rows > 0;
@@ -1326,11 +1339,14 @@ impl TerminalHandle {
             return Ok(published);
         }
         let (reply, receive) = crossbeam_channel::bounded(1);
-        match self.try_command(Command::ReadViewport {
+        let admission = admit();
+        let queued = self.try_command(Command::ReadViewport {
             offset,
             rows,
             reply,
-        }) {
+        });
+        drop(admission);
+        match queued {
             Ok(()) => {}
             // A closed worker shows nothing new: what it left is its screen.
             Err(TerminalSendError::Closed) if !drawn || default_view => {
@@ -4008,6 +4024,7 @@ impl Worker {
                 let result = if !token.load(Ordering::Acquire) {
                     Err("Terminal input preparation was cancelled".into())
                 } else {
+                    self.settle_viewport_reads_for_handoff();
                     self.input_drained_for_handoff()
                         .and_then(|()| self.stop_reading())
                         .and_then(|()| self.input_drained_for_handoff())
@@ -4025,6 +4042,7 @@ impl Worker {
                 let _ = reply.send(result);
             }
             Command::PrepareUpgrade(reply) => {
+                self.settle_viewport_reads_for_handoff();
                 let result = self.input_drained_for_handoff().and_then(|()| self
                     .inspect_close(std::time::Instant::now() + std::time::Duration::from_secs(3)))
                     .and_then(|(active, family)| {
@@ -4061,6 +4079,7 @@ impl Worker {
                     ));
                     return false;
                 }
+                self.settle_viewport_reads_for_handoff();
                 let result = self
                     .input_drained_for_handoff()
                     .and_then(|()| self.stop_reading())
@@ -4748,6 +4767,7 @@ impl Worker {
     /// cannot be detached is read again; one whose reader would not stop is
     /// left to that reader.
     fn carry(&mut self, socket: &std::path::Path) -> Result<Carried, String> {
+        self.settle_viewport_reads_for_handoff();
         let result = (|| {
             self.input_drained_for_handoff()?;
             self.refresh_resume_hint(true);
@@ -4960,6 +4980,26 @@ impl Worker {
             return Err("Terminal reply is still pending; reader cut remains unconfirmed".into());
         }
         Ok(())
+    }
+
+    /// A viewport read waits for the next complete frame, which a handoff may
+    /// never draw here. The daemon admits a snapshot only while its read is
+    /// queued, so a read queued just before a handoff can still be waiting
+    /// here, inside a synchronized update, when ownership starts to change.
+    /// Draw the frame now, inside a synchronized update if need be, and refuse
+    /// any read that still cannot be answered; a read changes nothing a
+    /// handoff must preserve.
+    fn settle_viewport_reads_for_handoff(&mut self) {
+        if self.viewport_reads.is_empty() {
+            return;
+        }
+        self.capture_when_ready(false);
+        self.finish_viewport_reads();
+        for (_, _, reply, _permit) in std::mem::take(&mut self.viewport_reads) {
+            let _ = reply.send(Err(
+                "Terminal ownership is changing; read its screen again".into()
+            ));
+        }
     }
 
     fn input_drained_for_handoff(&self) -> Result<(), String> {
@@ -9315,6 +9355,67 @@ os._exit(0)
             .collect::<String>();
         assert!(text.starts_with("partial frame"));
         worker.run();
+    }
+
+    /// A snapshot is admitted only while its read is queued, so the read a
+    /// redraw asked for can still be waiting inside a synchronized update when
+    /// a handoff reaches this worker. `handoff` sends the handoff command and
+    /// returns its error, if any.
+    fn assert_waiting_read_settled_by(handoff: impl FnOnce(&mut Worker) -> Option<String>) {
+        let (mut worker, _) = capture_worker();
+        worker.process_output(b"old frame".to_vec());
+        worker.publish_snapshot(true);
+        present(&worker);
+        worker.process_output(b"\x1b[?2026h\x1b[H\x1b[2Jpartial".to_vec());
+        let (read, answer) = crossbeam_channel::bounded(1);
+        worker.handle_command(Command::ReadViewport {
+            offset: Some(0),
+            rows: Some(10),
+            reply: read,
+        });
+        assert!(answer.try_recv().is_err(), "the read did not wait");
+
+        let error = handoff(&mut worker);
+        let capture = answer
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the waiting read was left unanswered")
+            .unwrap();
+        let text = capture.lines[0]
+            .cells
+            .iter()
+            .map(|cell| cell.text.as_str())
+            .collect::<String>();
+        assert!(text.starts_with("partial"), "{text:?}");
+        if let Some(error) = error {
+            assert!(
+                !error.contains("still pending"),
+                "a viewport read held back the handoff: {error}"
+            );
+        }
+        worker.run();
+    }
+
+    #[test]
+    fn a_viewport_read_waiting_for_a_synchronized_frame_does_not_hold_back_upgrade_preparation() {
+        assert_waiting_read_settled_by(|worker| {
+            let (reply, prepared) = crossbeam_channel::bounded(1);
+            worker.handle_command(Command::PrepareUpgrade(reply));
+            prepared.recv_timeout(Duration::from_secs(5)).unwrap().err()
+        });
+    }
+
+    #[test]
+    fn a_viewport_read_waiting_for_a_synchronized_frame_does_not_hold_back_a_carry() {
+        // This worker has no holder to detach into, so the carry still fails,
+        // but only after its drain checks have passed.
+        assert_waiting_read_settled_by(|worker| {
+            let (reply, carried) = crossbeam_channel::bounded(1);
+            worker.handle_command(Command::Carry {
+                socket: PathBuf::from("/nonexistent/carry.sock"),
+                reply,
+            });
+            carried.recv_timeout(Duration::from_secs(5)).unwrap().err()
+        });
     }
 
     #[test]

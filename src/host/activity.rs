@@ -485,7 +485,7 @@ fn observe(host: &Weak<HostLock>, candidate: &Candidate) -> Outcome {
     // owner.
     let observation = {
         let lease = {
-            let _control = gate.read().unwrap_or_else(|p| p.into_inner());
+            let _control = gate.shared();
             if !current() {
                 return Outcome::Failed;
             }
@@ -502,7 +502,7 @@ fn observe(host: &Weak<HostLock>, candidate: &Candidate) -> Outcome {
         drop(lease);
         observation
     };
-    let _control = gate.read().unwrap_or_else(|p| p.into_inner());
+    let _control = gate.shared();
     if !current() {
         return Outcome::Failed;
     }

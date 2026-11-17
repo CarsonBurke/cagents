@@ -430,7 +430,7 @@ impl Reservation {
         for home in &mut previous_homes {
             home.refresh_ancestors().map_err(refusal)?;
         }
-        let writer = super::client::try_scoped_control_write(&gate)?;
+        let writer = gate.try_exclusive().ok_or_else(super::control_gate::busy)?;
         super::client::ensure_control_open(host)?;
         let mut entries = map.lock().unwrap_or_else(|p| p.into_inner());
         if !same_basis(&previous_basis, &entries) {
@@ -743,8 +743,12 @@ impl Reservation {
             .unwrap_or_else(|p| p.into_inner())
             .control_gate
             .clone();
-        let writer = super::client::try_scoped_control_write(&gate)
-            .map_err(|error| io::Error::new(io::ErrorKind::WouldBlock, error.message))?;
+        let writer = gate.try_exclusive().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                super::control_gate::busy().message,
+            )
+        })?;
         super::client::ensure_control_open(&host)
             .map_err(|error| io::Error::other(error.message))?;
         let mut entries = self.map.lock().unwrap_or_else(|p| p.into_inner());
@@ -1651,7 +1655,7 @@ pub(crate) mod tests {
         .contains("account home is being changed");
         let unrelated = ensure_paths(&host, [root.path().join("other")]).is_ok();
         let gate = host.lock().unwrap().control_gate.clone();
-        let reader = gate.try_read().is_ok();
+        let reader = gate.try_shared().is_some();
         let moved = root.path().join("moved");
         std::fs::rename(&target, &moved).unwrap();
         let moved_refused = ensure_paths(&host, [moved.clone()]).is_err();
@@ -1690,7 +1694,7 @@ pub(crate) mod tests {
         .unwrap();
         reservation.create = Some((Provider::Codex, key));
         let gate = host.lock().unwrap().control_gate.clone();
-        let held = gate.read().unwrap();
+        let held = gate.shared();
         assert!(
             store
                 .try_create_pending_reserved(&reservation, &homes, Provider::Codex, 1, || {
@@ -1869,7 +1873,7 @@ pub(crate) mod tests {
         );
         let reservation = Reservation::test_install(&host, &[account], store, &homes).unwrap();
         let gate = host.lock().unwrap().control_gate.clone();
-        let _writer = super::super::client::try_scoped_control_write(&gate).unwrap();
+        let _writer = gate.try_exclusive().unwrap();
         assert!(ensure_idle(&host).unwrap_err().retryable);
         let error = host
             .lock()

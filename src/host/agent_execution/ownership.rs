@@ -102,7 +102,7 @@ pub(in crate::host) fn reconcile_agent_run(
         .unwrap_or_else(|p| p.into_inner())
         .control_gate
         .clone();
-    let _control = control.read().unwrap_or_else(|p| p.into_inner());
+    let _control = control.shared();
     reconcile_agent_run_under_control(host, expected, retire)
 }
 
@@ -290,12 +290,12 @@ pub(in crate::host) fn cancel_agent_run(host: &SharedHost, expected: &Run) -> Re
         .unwrap_or_else(|p| p.into_inner())
         .control_gate
         .clone();
-    let _control = control.read().unwrap_or_else(|p| p.into_inner());
+    let _control = control.shared();
     cancel_agent_run_under_control(host, expected)
 }
 
-/// The RPC dispatcher already owns control.read(). Do not acquire it again:
-/// a queued shutdown writer can make recursive read acquisition deadlock.
+/// The RPC dispatcher already holds shared control admission. Do not acquire it
+/// again: a waiting shutdown makes a recursive shared acquisition deadlock.
 pub(in crate::host) fn cancel_agent_run_under_control(
     host: &SharedHost,
     expected: &Run,

@@ -269,6 +269,14 @@ pub const PROTOCOL_VERSION: u16 = 187;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";
+/// The retryable refusal of an exclusive request the daemon could not admit
+/// before its deadline. It admitted nothing, so the same request may be sent
+/// again. Clients recognise it by this exact sentence
+/// (`ControlError::is_daemon_busy`), and the update retries a busy source's
+/// preparation only when it matches; rewording it here or in a daemon still in
+/// service turns that retry off for every client that compares against the
+/// other wording.
+pub const DAEMON_BUSY: &str = "The daemon is finishing another operation. Wait for it and retry.";
 /// A correlated refusal issued before source-checked cleanup has any effect.
 pub const TERMINAL_CLOSE_SOURCE_CONFLICT: &str =
     "The terminal changed or still owns work; nothing was closed";
