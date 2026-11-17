@@ -170,14 +170,9 @@ impl OriginalProcesses {
         pins
     }
     fn settle(&mut self) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while self.fds.iter().any(|fd| !exited(fd)) {
-            assert!(
-                Instant::now() < deadline,
-                "original root/holder retirement remains unconfirmed"
-            );
-            thread::sleep(Duration::from_millis(5));
-        }
+        crate::test_timing::eventually("the original root and holder's exit", || {
+            self.fds.iter().all(exited)
+        });
         self.armed = false;
     }
 }
@@ -250,19 +245,17 @@ fn spawn(host: &SharedHost, source: &TerminalSession) -> TerminalHandle {
     host.lock().unwrap().attach(0, source.id).unwrap();
     host.lock().unwrap().terminals[&source.id].handle.clone()
 }
+#[track_caller]
 fn wait_file(path: &std::path::Path) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !path.exists() {
-        assert!(
-            Instant::now() < deadline,
-            "child marker missing: {}",
-            path.display()
-        );
-        thread::sleep(Duration::from_millis(5));
-    }
+    crate::test_timing::eventually(&format!("child marker {}", path.display()), || {
+        path.exists()
+    });
 }
+/// Waits for the child's output to reach the parsed grid. Startup and
+/// parsing are not what these tests bound, so a loaded host only waits longer.
+#[track_caller]
 fn wait_text(handle: &TerminalHandle, expected: &str) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + crate::test_timing::EVENTUALLY;
     loop {
         let snapshot = handle.snapshot();
         handle.acknowledge_redraw(snapshot.generation);
