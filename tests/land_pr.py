@@ -85,10 +85,11 @@ head = subprocess.check_output(["git", "-C", str(root / "origin.git"), "rev-pars
                                 "refs/heads/" + branch], text=True).strip()
 pr = {"state": answer.get("state", "OPEN"), "isDraft": False, "headRefOid": answer.get("head", head),
       "mergeable": answer.get("mergeable", "MERGEABLE")}
-checks = answer.get("checks", [{"__typename": "CheckRun", "name": "contracts",
-                                "status": "COMPLETED", "conclusion": "SUCCESS"}])
+# As gh-pr-status reports them: passing checks counted, the rest listed.
+checks = answer.get("checks", [])
 print(json.dumps({"ok": True, "data": {
     "snapshot": {"pull_request": pr, "checks_state": answer.get("ci", "SUCCESS"), "checks": checks,
+                 "checks_passed": answer.get("passed", 1),
                  "checks_complete": answer.get("complete", True),
                  "transport": answer.get("transport", "graphql")},
     "fetched_at": int(os.environ.get("FAKE_STATUS_NOW") or time.time()) + answer.get("age", 0), "retry_at": answer.get("retry_at"),

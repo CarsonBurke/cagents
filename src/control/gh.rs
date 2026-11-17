@@ -85,10 +85,6 @@ fn human(report: &pr_status::Report) -> String {
         return format!("{target}: status unavailable");
     };
     let pr = &snapshot.pull_request;
-    let (passed, attention): (Vec<_>, Vec<_>) = snapshot
-        .checks
-        .iter()
-        .partition(|check| pr_status::check_passed(check));
     let mut result = format!(
         "{target}: {}{}\n{}\nHead: {}\nChecks: {}{}{}\nReview: {} · Merge: {}\n{} ({}, {age})",
         pr.state,
@@ -100,10 +96,9 @@ fn human(report: &pr_status::Report) -> String {
         } else {
             snapshot.checks_state.as_deref().unwrap_or("none reported")
         },
-        if passed.is_empty() {
-            String::new()
-        } else {
-            format!(", {} passed", passed.len())
+        match snapshot.checks_passed {
+            0 => String::new(),
+            passed => format!(", {passed} passed"),
         },
         match (snapshot.checks_complete, snapshot.transport) {
             _ if snapshot.is_rest_bootstrap() => "",
@@ -124,9 +119,9 @@ fn human(report: &pr_status::Report) -> String {
         pr.url,
         report.source
     );
-    // Passing checks are counted above; only the rest need a line, and a
-    // finished one its link, where its log is.
-    for check in attention {
+    // The report counts passing checks and lists only the rest; each needs a
+    // line, and a finished one its link, where its log is.
+    for check in &snapshot.checks {
         let name = check["name"]
             .as_str()
             .or_else(|| check["context"].as_str())
@@ -215,14 +210,14 @@ mod tests {
             age_seconds: Some(5),
             stale: false,
             source: "cache",
-            snapshot: Some(pr_status::Snapshot {
+            snapshot: Some(pr_status::ReportedSnapshot::new(pr_status::Snapshot {
                 pull_request,
                 checks_state: Some("FAILURE".into()),
                 checks,
                 checks_complete: true,
                 primary_cost: Some(1),
                 transport: pr_status::Transport::Graphql,
-            }),
+            })),
             error: None,
             retry_at: None,
             outcome: "succeeded",

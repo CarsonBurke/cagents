@@ -510,10 +510,9 @@ print(json.dumps(dict(reason='compiler-artifact',target=dict(name='cagents',kind
             self.assertEqual(status.output(saved, key, True), 0)
         report = json.loads(out.getvalue())
         self.assertEqual(report["data"]["snapshot"]["checks"], [
-            {"__typename": "CheckRun", "name": "passed", "status": "COMPLETED", "conclusion": "SUCCESS"},
             {"__typename": "CheckRun", "name": "failed", "status": "COMPLETED", "conclusion": "FAILURE",
-             "detailsUrl": link},
-            {"__typename": "StatusContext", "context": "deploy", "state": "SUCCESS"}])
+             "detailsUrl": link}])
+        self.assertEqual(report["data"]["snapshot"]["checks_passed"], 2)
         self.assertEqual(report["limitations"], [])
         self.assertIn("startedAt", saved["snapshot"]["checks"][0], "the cache itself is left as it was")
         self.assertEqual(report["data"]["limitations"], [])
