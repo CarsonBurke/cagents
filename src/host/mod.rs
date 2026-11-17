@@ -12,6 +12,7 @@ mod delivery;
 pub(crate) mod descriptor_limit;
 #[cfg(all(test, target_os = "linux"))]
 mod exit_drain_tests;
+mod fixture_hold;
 mod lifecycle;
 mod lock;
 mod model;

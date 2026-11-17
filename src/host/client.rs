@@ -1235,6 +1235,16 @@ fn process_wire_request(
             false,
         ));
     }
+    if matches!(
+        &request,
+        ClientRequest::ShutdownV1 {
+            operation: ShutdownOperation::Preflight,
+            ..
+        }
+    ) {
+        // Inert outside a debug native-evidence fixture that asks for it.
+        super::fixture_hold::hold_preflight(&gate);
+    }
     // Inventory decisions and commit must wait for all previously admitted
     // effects, including provider closes that finish outside HostState.
     let (_exclusive, _shared) = match exclusive_patience(&request) {

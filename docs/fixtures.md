@@ -338,6 +338,30 @@ This exercises the app's recovery controls and login-terminal lifecycle without
 authenticating an account or contacting a provider. It does not verify provider
 credentials or account changes.
 
+### An automatic account switch
+
+The `tool-rows` peer can play a second Codex account. A home's
+`fixture-account-email` names the login its account check reports, so a
+second linked home is a different account rather than a login conflict. With
+`fixture-rollouts` in a home, a new thread writes a minimal rollout under
+`sessions/`, as Codex keeps one; a peer asked to resume a thread it doesn't
+know takes it over when its own home has that rollout, as it does once an
+account switch has copied it there. Give each home its own
+`fixture-rate-limits.json`, with `{"ordinaryUsageAllowed": false}` on the
+account that should send its conversations elsewhere, and choose automatic
+routing with `cli account default codex automatic`.
+
+To make that switch meet a busy daemon, create `.cagents-fixture-hold-preflight`
+in the fixture `HOME` and run `cli daemon preflight`; its client gives up
+after a few seconds. A debug daemon whose `HOME` is inside a native-evidence
+task keeps that preflight in ordinary admission while the file exists, for at
+most two minutes, as a slow request would, so a switch sent meanwhile waits at
+the control gate for its deadline and is refused there. Remove the file to
+free the daemon. Release builds and any other home ignore it.
+[`tests/fixtures/account-switch-busy-scene.sh`](../tests/fixtures/account-switch-busy-scene.sh)
+prepares both accounts and plays the refused switch, sending again once the
+daemon is free; see the script for its seed and the exit variant.
+
 ## Usage reset evidence
 
 `tests/fixtures/usage-reset-scene.sh` prepares invented Claude and Codex
