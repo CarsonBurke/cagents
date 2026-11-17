@@ -12,7 +12,7 @@ The application regression compares native plain/rich paragraph bounds at narrow
 
 `editor_widget::tests::native_constructor_defers_shaping_to_the_viewport` checks that a long draft stays unshaped until the editor is laid out, and that laying it out shapes only its viewport. Remove this patch when the pinned upstream constructor stops shaping before it has bounds.
 
-## Relative span size
+# Relative span size
 
 `text::to_span_attributes` converts a span to the cosmic-text attributes it
 is shaped with. It takes the span's font size and line height from
