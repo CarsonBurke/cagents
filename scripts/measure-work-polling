@@ -3,18 +3,20 @@
 # the watcher cannot cover, in a private fixture. See "Work board polling" in
 # docs/performance.md.
 #
-#   scripts/measure-work-polling BIN_DIR [WORKTREES] [SECONDS] [ACTIVE] [DIRECTORIES]
+#   scripts/measure-work-polling BIN_DIR [WORKTREES] [SECONDS] [ACTIVE]
+#       [DIRECTORIES]
 #
 # BIN_DIR holds a matched `cagents` and `cagentsd`. The fixture project has
 # WORKTREES (default 250) worktrees of DIRECTORIES (default 40) tracked
 # directories each, more than the watcher's directory budget. ACTIVE (default
 # 3) of them have a fresh edit and ten more an edit outside the active window.
 # It reports the first load: how long the board took to read every worktree,
-# plan and register its watches and settle, and which Git commands it ran. Then it counts the
-# Git commands and `git status` reads the daemon starts and the CPU it and its
-# exited children used over SECONDS (default 300). Git's own trace2 records
-# every command, so even the shortest are counted. Nothing outside the fixture
-# is touched.
+# plan and register all of its watches and settle, and which Git commands the
+# daemon ran. Then it counts the Git commands and `git status` reads the
+# daemon starts and the CPU it and its exited children used over SECONDS
+# (default 300). Git's own trace2 records every command, so even the shortest
+# are counted; the CLI's own commands are reported apart. The fixture's
+# processes, setup commits included, read no Git configuration outside it.
 set -euo pipefail
 
 if [ "${CAGENTS_AGENT_AUTHORITY+x}" ]; then
@@ -22,7 +24,7 @@ if [ "${CAGENTS_AGENT_AUTHORITY+x}" ]; then
     exit 77
 fi
 if [ $# -lt 1 ] || [ $# -gt 5 ]; then
-    sed -n '2,17p' "$0" >&2
+    sed -n '2,19p' "$0" >&2
     exit 2
 fi
 bin=$(realpath "$1")
@@ -30,6 +32,19 @@ worktrees=${2:-250}
 seconds=${3:-300}
 active=${4:-3}
 tracked=${5:-40}
+for count in "$worktrees" "$seconds" "$tracked"; do
+    [[ $count =~ ^[1-9][0-9]*$ ]] || {
+        printf 'WORKTREES, SECONDS and DIRECTORIES must be positive integers, not %s\n' "$count" >&2
+        exit 2
+    }
+done
+[[ $active =~ ^[0-9]+$ ]] || {
+    printf 'ACTIVE must be a whole number, not %s\n' "$active" >&2
+    exit 2
+}
+# The setup commits and every fixture process ignore the caller's Git
+# configuration: its hooks, signing and fsmonitor would change what is measured.
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 [ -x "$bin/cagents" ] && [ -x "$bin/cagentsd" ] || {
     printf 'No matched cagents and cagentsd in %s\n' "$bin" >&2
     exit 2
@@ -114,8 +129,11 @@ daemon, seconds, checkouts, trace = sys.argv[1], float(sys.argv[2]), int(sys.arg
 ticks = os.sysconf("SC_CLK_TCK")
 # Watch planning's own commands: a worktree's Git paths and its index.
 PLAN = {"rev-parse", "ls-files"}
-# Trace session file: (subcommand, wall-clock start, elapsed seconds).
+# Trace session file: (subcommand, wall-clock start, elapsed seconds) of the
+# commands the daemon started; `others` counts the rest, the CLI's, by starter.
 known = {}
+others = collections.Counter()
+seen = set()
 
 
 def times():
@@ -138,25 +156,35 @@ def watches():
 def collect():
     """Reads the trace sessions of every Git command that has exited."""
     for name in os.listdir(trace):
-        if name in known:
+        if name in seen:
             continue
         path = os.path.join(trace, name)
-        command = elapsed = None
+        parent = command = elapsed = None
         try:
             with open(path) as session:
                 for line in session:
                     fields = line.split()
                     if len(fields) < 4:
                         continue
-                    if fields[2] == "cmd_name":
+                    if fields[2] == "cmd_ancestry":
+                        # Nearest ancestor that is not Git itself, so a Git
+                        # command another one started counts as its starter's.
+                        parent = next((field for field in fields[3:]
+                                       if field not in ("<-", "git")), None)
+                    elif fields[2] == "cmd_name":
                         command = fields[3]
                     elif fields[2] == "exit":
                         elapsed = float(fields[3].split(":", 1)[1])
             ended = os.stat(path).st_mtime
         except (OSError, ValueError):
             continue
-        if command is not None and elapsed is not None:
+        if command is None or elapsed is None:
+            continue
+        seen.add(name)
+        if parent == "cagentsd":
             known[name] = (command, ended - elapsed, elapsed)
+        else:
+            others[(parent, command)] += 1
 
 
 def report(label, names, duration):
@@ -169,11 +197,13 @@ def report(label, names, duration):
 
 # The board learns of the project within a model refresh, then reads every
 # checkout, plans and registers its watches, and reads again what they now
-# cover. The load ends once every checkout has a status, the watches are in
-# place and the daemon has started no Git command for 10 s.
+# cover. The load ends once every checkout has a status, the daemon holds
+# watches and it has started no Git command for 10 s. Watches are registered
+# when the count reaches the one it then holds.
 started = time.time()
 own, children = times()
-read_every = registered = None
+read_every = None
+counts = []
 while True:
     time.sleep(1)
     if time.time() - started > 1800:
@@ -182,11 +212,12 @@ while True:
     statuses = sum(entry[0] == "status" for entry in known.values())
     if read_every is None and statuses >= checkouts:
         read_every = time.time() - started
-    if registered is None and watches():
-        registered = time.time() - started
+    counts.append((time.time() - started, watches()))
     latest = max((entry[1] + entry[2] for entry in known.values()), default=started)
-    if read_every is not None and registered is not None and time.time() - latest > 10:
+    if read_every is not None and counts[-1][1] and time.time() - latest > 10:
         break
+held = counts[-1][1]
+registered = next(at for at, count in counts if count == held)
 planned = max((entry[1] for entry in known.values() if entry[0] in PLAN), default=started)
 load = set(known)
 now_own, now_children = times()
@@ -195,7 +226,9 @@ print(f"last planning command started after {planned - started:.0f} s")
 print(f"watches registered after {registered:.0f} s")
 report("load", load, time.time() - started)
 print(f"load cpu s: daemon {(now_own - own) / ticks:.1f}, exited children {(now_children - children) / ticks:.1f}")
-print(f"native watches {watches()}")
+print(f"native watches {held}")
+print("not the daemon's: " + (", ".join(
+    f"{command} {count} ({parent})" for (parent, command), count in others.most_common()) or "none"))
 
 own, children = times()
 time.sleep(seconds)
