@@ -344,7 +344,8 @@ impl Cagents {
             .flat_map(|channel| channel.cards.iter().copied())
             .collect::<HashSet<_>>();
         let topology = discovery.topology.as_ref().expect("refreshed above");
-        self.refresh_card_worktrees(&mut discovery.cards, topology, &channel_cards);
+        let (shown, channeled) =
+            self.refresh_card_worktrees(&mut discovery.cards, topology, &channel_cards);
         let followed = match discovery.worktrees.as_mut() {
             Some(worktrees) => {
                 self.follow_worktrees(worktrees, topology, &mut discovery.cards, &settlement)
@@ -376,10 +377,9 @@ impl Cagents {
         else {
             unreachable!("derived above");
         };
-        let worktree_cards = self
-            .durable
-            .cards
-            .iter()
+        // Only the cards a worktree shows: the rest are no pane of one.
+        let worktree_cards = shown
+            .into_iter()
             .filter_map(|card| {
                 let worktree = cards.cards.get(&card.id)?.worktree.as_deref()?;
                 Some((card, worktree))
@@ -442,7 +442,9 @@ impl Cagents {
             ScopeDiscovery {
                 scopes,
                 worktree_cards,
+                channeled,
             },
+            true,
             phase,
         );
         #[cfg(test)]
@@ -497,62 +499,90 @@ impl Cagents {
     }
 
     /// Resolves again each card whose directory, owner, filing or channel
-    /// changed, or that is new, and forgets the cards that are gone.
-    fn refresh_card_worktrees(
-        &self,
+    /// changed, or that is new, and forgets the cards that are gone. Returns
+    /// the cards a worktree shows that resolve to one, and every card a
+    /// channel lists, by identity.
+    fn refresh_card_worktrees<'a>(
+        &'a self,
         cards: &mut CardWorktrees,
         kept: &Topology,
         channel_cards: &HashSet<CardId>,
-    ) {
+    ) -> (Vec<&'a CardState>, HashMap<CardId, &'a CardState>) {
         let topology = kept.revision;
         cards.pass = cards.pass.wrapping_add(1);
         let pass = cards.pass;
         let mut roots = None;
-        for card in &self.durable.cards {
-            let channeled = channel_cards.contains(&card.id);
+        let mut shown = Vec::new();
+        let mut channeled = HashMap::with_capacity(channel_cards.len());
+        // Distinct cards seen this pass: when that is every one kept, none
+        // is gone.
+        let mut seen = 0;
+        for card in self.durable.cards.iter() {
+            let listed = channel_cards.contains(&card.id);
+            if listed {
+                channeled.insert(card.id, card);
+            }
             let owner = self.worktree_owners.get(&card.id).map(PathBuf::as_path);
             let filed = self.durable.card_scopes.get(&card.id).map(PathBuf::as_path);
             let directory = worktree_ui::card_directory(card);
             if let Some(entry) = cards.cards.get_mut(&card.id)
-                && entry.resolved_from(topology, channeled, owner, filed, directory)
+                && entry.resolved_from(topology, listed, owner, filed, directory)
             {
-                entry.pass = pass;
+                if entry.pass != pass {
+                    entry.pass = pass;
+                    seen += 1;
+                }
+                if entry.worktree.is_some() && shows_in_worktree(card) {
+                    shown.push(card);
+                }
                 continue;
             }
             let roots =
                 roots.get_or_insert_with(|| worktree_ui::WorktreeRoots::indexed(&kept.roots));
-            let worktree = (!channeled)
+            let worktree = (!listed)
                 .then(|| self.unchanneled_card_worktree_indexed(card, roots))
                 .flatten()
                 .map(Path::to_owned);
             cards.count(worktree.as_deref(), true);
+            if worktree.is_some() && shows_in_worktree(card) {
+                shown.push(card);
+            }
             let previous = cards.cards.insert(
                 card.id,
                 CardWorktree {
                     pass,
                     topology,
-                    channeled,
+                    channeled: listed,
                     owner: owner.map(Path::to_owned),
                     filed: filed.map(Path::to_owned),
                     directory: directory.map(Path::to_owned),
                     worktree,
                 },
             );
+            if previous
+                .as_ref()
+                .is_none_or(|previous| previous.pass != pass)
+            {
+                seen += 1;
+            }
             if let Some(previous) = previous {
                 cards.count(previous.worktree.as_deref(), false);
             }
         }
-        let gone = cards
-            .cards
-            .iter()
-            .filter(|(_, entry)| entry.pass != pass)
-            .map(|(id, _)| *id)
-            .collect::<Vec<_>>();
-        for id in gone {
-            if let Some(entry) = cards.cards.remove(&id) {
-                cards.count(entry.worktree.as_deref(), false);
+        if seen != cards.cards.len() {
+            let gone = cards
+                .cards
+                .iter()
+                .filter(|(_, entry)| entry.pass != pass)
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>();
+            for id in gone {
+                if let Some(entry) = cards.cards.remove(&id) {
+                    cards.count(entry.worktree.as_deref(), false);
+                }
             }
         }
+        (shown, channeled)
     }
 
     /// Brings the kept worktree scopes up to date with what changed since
@@ -734,7 +764,31 @@ impl Cagents {
         assert_eq!(scopes(projected), scopes(&complete), "kept scopes");
         assert_eq!(channels(projected), channels(&complete), "channel order");
         assert_eq!(projected.cards, complete.cards, "scope members");
-        assert_eq!(projected.panes, complete.panes, "scope panes");
+        // A scope is settled exactly when it is seeded and its complete panes
+        // are its baseline, which then stands for them.
+        let settled = complete
+            .panes
+            .iter()
+            .filter(|(scope, panes)| {
+                counters.initialized.contains(*scope)
+                    && counters.baseline.get(*scope) == Some(panes)
+            })
+            .map(|(scope, _)| scope.clone())
+            .collect::<HashSet<_>>();
+        assert_eq!(projected.settled, settled, "settled scopes");
+        assert!(
+            complete.settled.is_empty(),
+            "a complete projection settles none"
+        );
+        let mut panes = projected.panes.clone();
+        for scope in &projected.settled {
+            assert!(
+                !panes.contains_key(scope),
+                "{scope:?} is settled and projected"
+            );
+            panes.insert(scope.clone(), counters.baseline[scope].clone());
+        }
+        assert_eq!(panes, complete.panes, "scope panes");
     }
 }
 
@@ -1210,6 +1264,198 @@ mod tests {
         eprintln!("{followed} of {passes} passes followed the kept scopes");
         // Most edits leave the topology and both key sets in place.
         assert!(followed * 2 > passes, "{followed} of {passes}");
+    }
+
+    /// One edit of what a scope's panes are made of, chosen by `rng`.
+    fn pane_edit(app: &mut Cagents, rng: &mut Rng) -> &'static str {
+        let open = app
+            .durable
+            .cards
+            .iter()
+            .filter(|card| card.existence.is_open())
+            .map(|card| card.id)
+            .collect::<Vec<_>>();
+        let Some(&id) = rng.pick(&open) else {
+            return "none";
+        };
+        let toggle = |set: &mut HashSet<CardId>| {
+            if !set.remove(&id) {
+                set.insert(id);
+            }
+        };
+        match rng.below(9) {
+            0 => {
+                app.card_state_mut(id).unwrap().title = format!("title {}", rng.below(3));
+                "retitle a card"
+            }
+            1 => {
+                let titles = &mut app.chrome_ui.user_titles;
+                if titles.remove(&id).is_none() {
+                    titles.insert(id, format!("named {}", rng.below(3)));
+                }
+                "name or unname a pane"
+            }
+            2 => {
+                app.card_state_mut(id).unwrap().width_fraction = [0.3, 0.5, 0.7][rng.below(3)];
+                "resize a pane"
+            }
+            3 => {
+                toggle(&mut Arc::make_mut(&mut app.durable).pending_terminal_creations);
+                "start or settle a terminal creation"
+            }
+            4 => {
+                toggle(&mut app.shared_views.retained);
+                "keep a pane local or share it"
+            }
+            5 => {
+                app.reported_title_save.cards.insert(id);
+                app.card_state_mut(id).unwrap().title = format!("reported {}", rng.below(3));
+                "report a title before its save"
+            }
+            6 => {
+                toggle(&mut app.shared_views.quarantined);
+                "fence or unfence a pane"
+            }
+            7 => {
+                let channels = &mut Arc::make_mut(&mut app.durable).channels;
+                let Some(channel) = channels.iter_mut().find(|channel| channel.cards.len() > 1)
+                else {
+                    return "none";
+                };
+                let (a, b) = (
+                    rng.below(channel.cards.len()),
+                    rng.below(channel.cards.len()),
+                );
+                channel.cards.swap(a, b);
+                "reorder a channel's panes"
+            }
+            _ => {
+                app.reported_title_save.cards.clear();
+                "save reported titles"
+            }
+        }
+    }
+
+    /// Model edits as a publication sends them, without their random
+    /// operation identities: seeds and each scope's changes in order, and
+    /// transfers, which go out in map order, as a sorted list.
+    #[derive(Debug, PartialEq)]
+    struct Published {
+        seeds: HashMap<Scope, ModelEdit>,
+        changes: HashMap<Scope, Vec<(u64, Change)>>,
+        transfers: Vec<String>,
+    }
+
+    fn published(requests: &crate::app::workspace_model_sync::TestModelRequests) -> Published {
+        let mut published = Published {
+            seeds: HashMap::new(),
+            changes: HashMap::new(),
+            transfers: Vec::new(),
+        };
+        while let Ok(edit) = requests.try_recv() {
+            match edit {
+                ModelEdit::SeedView { ref scope, .. } => {
+                    assert!(published.seeds.insert(scope.clone(), edit).is_none());
+                }
+                ModelEdit::ChangeView {
+                    scope,
+                    expected_revision,
+                    change: change @ Change::Transfer { .. },
+                    ..
+                } => published
+                    .transfers
+                    .push(format!("{scope:?} {expected_revision} {change:?}")),
+                ModelEdit::ChangeView {
+                    scope,
+                    expected_revision,
+                    change,
+                    ..
+                } => published
+                    .changes
+                    .entry(scope)
+                    .or_default()
+                    .push((expected_revision, change)),
+                other => panic!("a publication sent {other:?}"),
+            }
+        }
+        published.transfers.sort();
+        published
+    }
+
+    /// What a publication leaves of the state it writes, without operation
+    /// identities.
+    fn publication_state(views: &State) -> impl PartialEq + std::fmt::Debug {
+        let mut pending = views
+            .pending
+            .iter()
+            .map(|(_, scope, change)| format!("{scope:?} {change:?}"))
+            .collect::<Vec<_>>();
+        pending.sort();
+        (
+            (*views.baseline).clone(),
+            pending,
+            views.attached.clone(),
+            views.seeding.clone(),
+            views.seed_attempts.keys().cloned().collect::<HashSet<_>>(),
+            views.default_requests.clone(),
+            views.fenced_closes.clone(),
+            views.removals.keys().copied().collect::<HashSet<_>>(),
+        )
+    }
+
+    /// A complete save publishes, from the kept discovery and with its
+    /// settled scopes left out, exactly what a complete projection of every
+    /// scope publishes from the same state, across randomized edits of what
+    /// discovery reads and of what panes are made of.
+    #[test]
+    fn settled_publication_agrees_with_a_complete_projection_across_random_edits() {
+        let (mut compared, mut settled) = (0, 0);
+        for seed in 0..10 {
+            let (mut app, _, _directory) = large_workspace(&SMALL);
+            let (tx, requests) = crate::app::workspace_model_sync::test_model_channel();
+            app.workspace_model_tx = tx;
+            let mut rng = Rng(1_000 + seed);
+            for step in 0..120 {
+                let edit = if rng.below(2) == 0 {
+                    edit(&mut app, &mut rng)
+                } else {
+                    pane_edit(&mut app, &mut rng)
+                };
+                if rng.below(4) == 0 {
+                    settle_seeds(&mut app);
+                }
+                // What the edits published themselves.
+                while requests.try_recv().is_ok() {}
+                let run = || {
+                    // The complete projection publishes from a copy.
+                    let copy = app.shared_views.publication_copy();
+                    let original = std::mem::replace(&mut app.shared_views, copy);
+                    let complete = app.local_views();
+                    app.publish_projected_view_changes(complete, ViewProjection::All);
+                    let expected = published(&requests);
+                    let complete = std::mem::replace(&mut app.shared_views, original);
+                    let before = app.shared_views.settled_publications;
+                    app.publish_view_changes();
+                    assert_eq!(published(&requests), expected, "published edits");
+                    assert_eq!(
+                        publication_state(&app.shared_views),
+                        publication_state(&complete),
+                        "publication state"
+                    );
+                    app.shared_views.settled_publications - before
+                };
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+                    Ok(count) => settled += count,
+                    Err(panic) => {
+                        eprintln!("seed {seed}, step {step}: after {edit}");
+                        std::panic::resume_unwind(panic);
+                    }
+                }
+                compared += 1;
+            }
+        }
+        eprintln!("{settled} scopes settled over {compared} publications");
+        assert!(settled > compared, "{settled} over {compared}");
     }
 
     /// Settles every seed as the daemon would, acknowledging it and listing

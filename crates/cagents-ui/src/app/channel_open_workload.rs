@@ -547,32 +547,99 @@ fn navigation_save_timing() {
         }
     }
     summary("update(NavigationSaveDue)", &mut updates);
+    let phases = save_phases(&directory, || {
+        for index in 0..targets.len() {
+            click(&mut app, 2, index);
+            save_due(&mut app);
+        }
+    });
+    report_phases(phases);
+}
 
+/// The save a terminal's start makes once its surface attaches: the start
+/// changes the terminal's saved session, and `persist()` publishes that
+/// change before the handoff is committed. Each round opens a channel with a
+/// terminal, lets its navigation save run, then records a new session for
+/// the terminal and saves, as `terminal_started` does.
+#[test]
+#[ignore = "timing workload; run optimized with --ignored --nocapture"]
+fn terminal_started_save_timing() {
+    super::projection_oracle::disable();
+    let (mut app, channels, directory) = large_workspace(&Scale::LARGE);
+    app.shared_views.skip_rediscovery_check();
+    // The channels whose conversation came with a terminal.
+    let targets = channels[..Scale::LARGE.chats]
+        .iter()
+        .step_by(3)
+        .copied()
+        .collect::<Vec<_>>();
+    let mut starts = 0usize;
+    let mut start = |app: &mut Cagents, index: usize| {
+        let channel_id = targets[index % targets.len()];
+        drop(app.update(Message::Sidebar(SidebarAction::OpenChannel { channel_id })));
+        drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
+        let terminal = app
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == channel_id)
+            .and_then(|channel| {
+                channel.cards.iter().copied().find(|id| {
+                    matches!(
+                        app.card_state(*id).map(|card| &card.kind),
+                        Some(CardKind::Terminal(_))
+                    )
+                })
+            })
+            .expect("the channel holds a terminal");
+        starts += 1;
+        let CardKind::Terminal(session) = &mut app.card_state_mut(terminal).unwrap().kind else {
+            unreachable!();
+        };
+        session.resume_hint = Some(format!("started {starts}"));
+        let started = Instant::now();
+        app.persist();
+        started.elapsed()
+    };
+    for index in 0..5 {
+        start(&mut app, index);
+    }
+    let mut saves = (0..targets.len() * 2)
+        .map(|index| start(&mut app, index))
+        .collect::<Vec<_>>();
+    summary("persist() as a terminal starts", &mut saves);
+    let phases = save_phases(&directory, || {
+        for index in 0..targets.len() {
+            start(&mut app, index);
+        }
+    });
+    report_phases(phases);
+}
+
+/// The save phases `run` traces, by stage. Phases report microseconds since
+/// the previous mark; the snapshot capture after them reports its own
+/// nanoseconds.
+fn save_phases(
+    directory: &tempfile::TempDir,
+    run: impl FnOnce(),
+) -> BTreeMap<String, Vec<Duration>> {
     let log_path = directory.path().join("save-phases.log");
     let log = std::fs::File::create(&log_path).unwrap();
-    let traced = || {
-        let log = log.try_clone().unwrap();
-        tracing_subscriber::fmt()
-            .with_ansi(false)
-            .without_time()
-            .with_env_filter(tracing_subscriber::EnvFilter::new(
-                "cagents::workspace_pipeline=debug",
-            ))
-            .with_writer(move || log.try_clone().unwrap())
-            .finish()
-    };
-    for index in 0..targets.len() {
-        click(&mut app, 2, index);
-        crate::test_tracing::with_thread_subscriber(traced(), || save_due(&mut app));
-    }
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "cagents::workspace_pipeline=debug",
+        ))
+        .with_writer(move || log.try_clone().unwrap())
+        .finish();
+    crate::test_tracing::with_thread_subscriber(subscriber, run);
     let logged = std::fs::read_to_string(log_path).unwrap();
     let field = |line: &str, prefix: &str| {
         line.split_whitespace()
             .find_map(|token| token.strip_prefix(prefix))
             .map(|value| value.trim_matches('"').to_owned())
     };
-    // Phases report microseconds since the previous mark; the snapshot
-    // capture after them reports its own nanoseconds.
     let mut phases = BTreeMap::<String, Vec<Duration>>::new();
     for line in logged.lines() {
         let Some(stage) = field(line, "stage=") else {
@@ -589,6 +656,10 @@ fn navigation_save_timing() {
             phases.entry(stage).or_default().push(duration);
         }
     }
+    phases
+}
+
+fn report_phases(mut phases: BTreeMap<String, Vec<Duration>>) {
     for (stage, durations) in &mut phases {
         summary(&format!("  {stage}"), durations);
     }

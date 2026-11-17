@@ -869,6 +869,15 @@ pub fn shared_kind(kind: &CardKind) -> CardKind {
     kind
 }
 
+/// Whether `shared_kind(local) == *shared`, without copying `local`.
+pub fn is_shared_kind(local: &CardKind, shared: &CardKind) -> bool {
+    match local {
+        // The kinds `shared_kind` rewrites are compared as it rewrites them.
+        CardKind::Browser(_) | CardKind::Repository(_) => shared_kind(local) == *shared,
+        _ => local == shared,
+    }
+}
+
 /// Apply an optimistic transfer across projections before its host reply.
 pub fn transfer(
     views: &mut [View],
@@ -1018,6 +1027,27 @@ mod wire_tests {
             !later.follows_captured(None),
             "a replacement that finished before the delayed probe is still a replacement"
         );
+    }
+
+    #[test]
+    fn shared_kind_comparison_reads_kinds_as_they_are_shared() {
+        let scrolled = CardKind::Browser(BrowserSession {
+            id: BrowserId::new(),
+            current_url: "https://example.com".parse().unwrap(),
+            history: vec![],
+            history_index: 0,
+            scroll_x: 12.,
+            scroll_y: 40.,
+            fidelity: BrowserRestoreFidelity::UrlOnly,
+        });
+        let shared = shared_kind(&scrolled);
+        assert!(is_shared_kind(&scrolled, &shared));
+        assert!(
+            !is_shared_kind(&scrolled, &scrolled),
+            "scroll is not shared"
+        );
+        assert!(is_shared_kind(&CardKind::Work, &CardKind::Work));
+        assert!(!is_shared_kind(&CardKind::Work, &shared));
     }
 
     #[test]
