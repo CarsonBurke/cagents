@@ -6,7 +6,7 @@ use crate::fallback::FontFallbackIter;
 use crate::{
     math, Align, Attrs, AttrsList, CacheKeyFlags, Color, DecorationMetrics, DecorationSpan,
     Ellipsize, EllipsizeHeightLimit, Family, Font, FontSystem, GlyphDecorationData, Hinting,
-    LayoutGlyph, LayoutLine, Metrics, Wrap,
+    InlinePadding, LayoutGlyph, LayoutLine, Metrics, Wrap,
 };
 #[cfg(not(feature = "std"))]
 use alloc::{format, vec, vec::Vec};
@@ -683,6 +683,17 @@ impl ShapeGlyph {
     }
 }
 
+/// Whether text in `other` can be shaped in one run with text in `attrs`.
+///
+/// Beyond [`Attrs::compatible`], a run breaks at the edges of a span with inline
+/// padding, so no ligature or cluster crosses them and the room lands on the span's
+/// own edge glyphs.
+fn shapes_with(attrs: &Attrs, other: &Attrs) -> bool {
+    attrs.compatible(other)
+        && (attrs == other
+            || (attrs.inline_padding_opt.is_none() && other.inline_padding_opt.is_none()))
+}
+
 fn decoration_metrics(font: &Font) -> (DecorationMetrics, DecorationMetrics, f32) {
     let metrics = font.metrics();
     let upem = metrics.units_per_em as f32;
@@ -826,7 +837,7 @@ impl ShapeWord {
             attrs_list.spans_iter().all(|(other_range, other_attrs)| {
                 word_range.end <= other_range.start
                     || other_range.end <= word_range.start
-                    || attrs_start.compatible(&other_attrs.as_attrs())
+                    || shapes_with(&attrs_start, &other_attrs.as_attrs())
             })
         } {
             shaping.run(
@@ -845,7 +856,7 @@ impl ShapeWord {
             for (egc_i, _egc) in word.grapheme_indices(true) {
                 let start_egc = word_range.start + egc_i;
                 let attrs_egc = attrs_list.get_span(start_egc);
-                if !attrs.compatible(&attrs_egc) {
+                if !shapes_with(&attrs, &attrs_egc) {
                     shaping.run(
                         &mut glyphs,
                         font_system,
@@ -1194,6 +1205,15 @@ pub struct ShapeLine {
     pub rtl: bool,
     pub spans: Vec<ShapeSpan>,
     pub metrics_opt: Option<Metrics>,
+    /// The ascent and descent of the line's default font, per unit of font
+    /// size: the least every visual line of it reserves around its baseline,
+    /// like CSS's strut.
+    ///
+    /// A line is centred on the tallest glyphs it holds. Without a strut, a
+    /// visual line set only in smaller or fallback glyphs, such as a wrapped
+    /// line of smaller inline code, was centred on those and its baseline
+    /// moved off the pitch of the lines around it.
+    strut: Option<(f32, f32)>,
     ellipsis_span: Option<ShapeSpan>,
 }
 
@@ -1288,6 +1308,64 @@ impl VisualLine {
 }
 
 impl ShapeLine {
+    /// Widen the glyphs at the logical start and end of each padded attrs span by its
+    /// inline padding in EM, like CSS inline padding: the room is laid out, wraps with
+    /// the span's edge glyphs and lies inside their boxes. The glyph on the visual left
+    /// draws past its room. Runs break at padded spans' edges (see [`shapes_with`]),
+    /// so their edges are glyph boundaries. One pass over the glyphs; each glyph looks
+    /// its edges up among the sorted padded ranges.
+    fn pad_span_edges(spans: &mut [ShapeSpan], attrs_list: &AttrsList) {
+        let padded = attrs_list
+            .spans_iter()
+            .filter_map(|(range, attrs)| {
+                attrs
+                    .inline_padding_opt
+                    .map(|InlinePadding(padding)| (range.clone(), padding))
+            })
+            .collect::<Vec<_>>();
+        if padded.is_empty() {
+            return;
+        }
+        let find = |at: usize, edge: fn(&Range<usize>) -> usize| {
+            padded
+                .binary_search_by_key(&at, |(range, _)| edge(range))
+                .ok()
+        };
+        let mut started = vec![false; padded.len()];
+        // The last glyph seen ending each padded range: (span, word, glyph).
+        let mut ends = vec![None; padded.len()];
+        for (span_index, span) in spans.iter_mut().enumerate() {
+            let rtl = span.level.is_rtl();
+            for (word_index, word) in span.words.iter_mut().enumerate() {
+                for (glyph_index, glyph) in word.glyphs.iter_mut().enumerate() {
+                    if let Some(index) = find(glyph.start, |range| range.start) {
+                        if !started[index] {
+                            started[index] = true;
+                            glyph.x_advance += padded[index].1;
+                            if !rtl {
+                                glyph.x_offset += padded[index].1;
+                            }
+                        }
+                    }
+                    if let Some(index) = find(glyph.end, |range| range.end) {
+                        ends[index] = Some((span_index, word_index, glyph_index));
+                    }
+                }
+            }
+        }
+        for (end, (_, padding)) in ends.into_iter().zip(&padded) {
+            if let Some((span_index, word_index, glyph_index)) = end {
+                let span = &mut spans[span_index];
+                let rtl = span.level.is_rtl();
+                let glyph = &mut span.words[word_index].glyphs[glyph_index];
+                glyph.x_advance += padding;
+                if rtl {
+                    glyph.x_offset += padding;
+                }
+            }
+        }
+    }
+
     /// Creates an empty line.
     ///
     /// The returned line is in an invalid state until [`Self::build_in_buffer`] is called.
@@ -1296,6 +1374,7 @@ impl ShapeLine {
             rtl: false,
             spans: Vec::default(),
             metrics_opt: None,
+            strut: None,
             ellipsis_span: None,
         }
     }
@@ -1403,6 +1482,8 @@ impl ShapeLine {
             spans.push(span);
         }
 
+        Self::pad_span_edges(&mut spans, attrs_list);
+
         // Adjust for tabs
         let mut x = 0.0;
         for span in &mut spans {
@@ -1422,6 +1503,18 @@ impl ShapeLine {
         self.rtl = rtl;
         self.spans = spans;
         self.metrics_opt = attrs_list.defaults().metrics_opt.map(Into::into);
+        self.strut = {
+            let defaults = attrs_list.defaults();
+            let fonts = font_system.get_font_matches(&defaults);
+            let families = [&defaults.family];
+            FontFallbackIter::new(font_system, &fonts, &families, &[], "", defaults.weight)
+                .next()
+                .map(|font| {
+                    let metrics = font.metrics();
+                    let scale = metrics.units_per_em as f32;
+                    (metrics.ascent / scale, -metrics.descent / scale)
+                })
+        };
 
         self.ellipsis_span.get_or_insert_with(|| {
             let attrs = if attrs_list.spans.is_empty() {
@@ -3015,6 +3108,22 @@ impl ShapeLine {
                         .map_or(Some(glyph_line_height), |line_height| {
                             Some(line_height.max(glyph_line_height))
                         });
+                }
+            }
+
+            if let Some((ascent, descent)) = self.strut {
+                let size = self.metrics_opt.map_or(font_size, |m| m.font_size);
+                let (ascent, descent) = (size * ascent, size * descent);
+                // A line whose spans set it shorter than the default font's
+                // glyphs is sized by those spans rather than by the default,
+                // as when every span of a rich text sets a smaller size; a
+                // strut would push its glyphs out of the box, so it keeps
+                // centring on its own. A line sized by the buffer's metrics
+                // is set in the default font, so it takes the strut like
+                // every other line.
+                if line_height_opt.is_none_or(|height| ascent + descent <= height) {
+                    max_ascent = max_ascent.max(ascent);
+                    max_descent = max_descent.max(descent);
                 }
             }
 
