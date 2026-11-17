@@ -447,7 +447,11 @@ impl Cagents {
     /// dismissal sends, in the order Escape reaches them. A dialog over the
     /// window is in front of all of them; then an account menu's or the
     /// account popover's; then the focused pane's; then a usage reset's
-    /// asked anywhere else, as Escape has always withdrawn one.
+    /// asked anywhere else, as Escape has always withdrawn one. Escape
+    /// itself reaches them layer by layer, through
+    /// [`Self::account_question_escape`] and [`Self::pane_escape`]; this
+    /// names the one in front for the tests that check that order.
+    #[cfg(test)]
     pub(super) fn inline_question(&self) -> Option<(Question, Message)> {
         if self.modal_is_open() {
             return None;
