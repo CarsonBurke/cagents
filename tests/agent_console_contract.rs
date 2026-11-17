@@ -544,7 +544,7 @@ fn retained_agent_closes_during_a_delayed_fixture_stream() {
         return;
     }
     use cagents::{
-        agent_execution::{Agent, HostedSession, Run},
+        agent_execution::{Agent, Run},
         chat::{ItemContent, NativeContinuity},
         control::ControlClient,
         terminal::ipc::{
@@ -585,7 +585,11 @@ fn retained_agent_closes_during_a_delayed_fixture_stream() {
         assert!(output.status.success(), "agent status: {output:?}");
         let status: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(status["ok"], true, "{status}");
-        let current: Agent = serde_json::from_value(status["data"]["agent"].clone()).unwrap();
+        // The CLI prints the record without its launch environments, so the
+        // hosted session is read as printed and compared with the daemon's.
+        let mut printed = status["data"]["agent"].clone();
+        let printed_session = printed["session"].take();
+        let current: Agent = serde_json::from_value(printed).unwrap();
         let run: Run = serde_json::from_value(status["data"]["run"].clone()).unwrap();
         assert_eq!(current.id.to_string(), agent);
         assert_eq!(run.id.to_string(), accepted["run"]["id"].as_str().unwrap());
@@ -594,13 +598,16 @@ fn retained_agent_closes_during_a_delayed_fixture_stream() {
             !current.closed && !run.state.is_terminal(),
             "agent ended before the streaming close contract: {status}"
         );
-        if let Some(source) = current.session {
-            let HostedSession::Chat(source) = source else {
+        if !printed_session.is_null() {
+            let Some(source) = printed_session.get("Chat").cloned() else {
                 panic!("the accepted chat agent bound another surface: {status}");
             };
-            assert!(source.has_valid_native_continuity(), "{source:?}");
+            assert!(
+                source["launch"]["recipe"].get("environment").is_none(),
+                "{status}"
+            );
             assert!(matches!(
-                &source.native_continuity,
+                serde_json::from_value(source["native_continuity"].clone()).unwrap(),
                 NativeContinuity::RetainedClaudeActor { .. }
             ));
             break source;
@@ -618,11 +625,16 @@ fn retained_agent_closes_during_a_delayed_fixture_stream() {
         .list_chats()
         .unwrap()
         .into_iter()
-        .find(|session| session.id == installed_source.id)
+        .find(|session| serde_json::json!(session.id) == installed_source["id"])
         .expect("the installed agent's exact chat must remain in inventory");
-    assert_eq!(session.launch.provider, installed_source.launch.provider);
-    assert_eq!(session.launch.recipe, installed_source.launch.recipe);
-    assert_eq!(session.proof, installed_source.proof);
+    assert_eq!(
+        serde_json::json!(session.launch.provider),
+        installed_source["launch"]["provider"]
+    );
+    let mut recipe = serde_json::json!(session.launch.recipe);
+    recipe.as_object_mut().unwrap().remove("environment");
+    assert_eq!(recipe, installed_source["launch"]["recipe"]);
+    assert_eq!(serde_json::json!(session.proof), installed_source["proof"]);
     assert!(session.has_valid_native_continuity(), "{session:?}");
     assert!(
         matches!(
@@ -1107,7 +1119,13 @@ fn active_native_chat_moves_without_restarting_and_accepts_followups() {
         moved["placement"],
         serde_json::to_value(Scope::Channel(destination.parse().unwrap())).unwrap()
     );
-    assert_eq!(moved["pane"], serde_json::to_value(&pane).unwrap());
+    // The CLI prints the pane without its launch environment.
+    let mut printed_pane = serde_json::to_value(&pane).unwrap();
+    printed_pane["kind"]["launch"]["recipe"]
+        .as_object_mut()
+        .unwrap()
+        .remove("environment");
+    assert_eq!(moved["pane"], printed_pane);
     let no_op = fixture.cli(&[
         "channel",
         "move",

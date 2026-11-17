@@ -365,6 +365,19 @@ class Comparison(unittest.TestCase):
         projection = records.paused_history_projection(before,after,source)
         self.assertEqual(projection['launch']['recipe']['arguments'],arguments)
 
+    def test_a_cli_without_launch_environments_is_compared_without_the_stores(self):
+        recipe = {'program':'claude','arguments':[],'working_directory':'/repo'}
+        stored = {'id':'chat','launch':{'recipe':{**recipe,'environment':{'TOKEN':'value'}}}}
+        printed = {'id':'chat','launch':{'recipe':recipe}}
+        self.assertEqual(records.as_printed(stored,printed),printed)
+        # An older CLI that printed the environment is compared with all of it.
+        self.assertEqual(records.as_printed(stored,stored),stored)
+        other = {'id':'chat','launch':{'recipe':{**recipe,'environment':{'TOKEN':'other'}}}}
+        self.assertNotEqual(records.as_printed(stored,other),other)
+        # Only a recipe's environment goes, not another object's.
+        settings = {'environment':{'KEEP':'1'},'program':'x'}
+        self.assertEqual(records.without_launch_environments(settings),settings)
+
     def test_console_program_change_requires_exact_target_same_run_and_pane(self):
         before, after = self.paused_replacement()
         before['root'] = after['root'] = '/var/tmp/cr/test'
@@ -878,6 +891,10 @@ class ChatViews(unittest.TestCase):
                                  stored)
                 self.assertIsNone(scenario.selected_chat(root,'main','exact-card','exact-channel',
                     {**printed,'launch':{**printed['launch'],'recipe':{**recipe,'program':'foreign'}}}))
+                # A copy that states its environment is still compared whole.
+                self.assertIsNotNone(scenario.selected_chat(root,'main','exact-card','exact-channel',stored))
+                self.assertIsNone(scenario.selected_chat(root,'main','exact-card','exact-channel',
+                    {**stored,'launch':{**stored['launch'],'recipe':{**recipe,'environment':{'TOKEN':'other'}}}}))
                 db.execute('UPDATE cards SET content_json=?',[json.dumps(descriptor)])
                 db.commit()
                 for expected in ({**descriptor,'id':'foreign'},

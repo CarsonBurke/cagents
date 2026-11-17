@@ -920,6 +920,15 @@ def without_launch_environments(value: Any) -> Any:
     return value
 
 
+def as_printed(stored: Any, printed: Any) -> Any:
+    """`stored` as a CLI's `printed` copy of it states it.
+
+    A CLI that leaves launch environments out prints none, and `stored` is
+    compared without its own; a CLI that printed them is compared whole.
+    """
+    return without_launch_environments(stored) if without_launch_environments(printed) == printed else stored
+
+
 def project(row: dict, name: str) -> dict:
     if name == "agents":
         agent = row.get("agent", {})
@@ -1073,8 +1082,8 @@ def console_relaunch(before: dict, after: dict, terminal_id: str) -> bool:
             continue
         current = after["agents"].get(key, {})
         replacement = current.get("agent", {}).get("console") or {}
-        old_recipe, new_recipe = (without_launch_environments(console.get("launch", {})),
-                                  without_launch_environments(replacement.get("launch", {})))
+        new_recipe = replacement.get("launch", {})
+        old_recipe = as_printed(console.get("launch", {}), new_recipe)
         if (not row.get("run") or current.get("run") != row["run"]
                 or row.get("state") != "Running" or current.get("state") != "Running"
                 or replacement.get("id") != terminal_id or new_recipe.get("program") != program
