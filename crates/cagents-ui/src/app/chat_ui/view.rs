@@ -131,43 +131,11 @@ const NARROW_FOOTER_LABEL: usize = 20;
 const TIGHT_FOOTER_LABEL: usize = 14;
 const MESSAGE_ACTION_FOOTER: f32 = MESSAGE_ACTION_HEIGHT + step::GAP_XS;
 
+/// The loaded transcript keeps row descriptions; only its visible rows create
+/// widget trees, and a visible row is kept between frames by retained::kept.
+///
 /// Existing action footers provide separation. Count that space toward the
 /// next semantic boundary instead of adding another gap after an invisible row.
-struct TranscriptRows<'a> {
-    children: Vec<Element<'a, Message>>,
-    gap: f32,
-    trailing_footer: f32,
-}
-impl<'a> TranscriptRows<'a> {
-    fn new(gap: f32) -> Self {
-        Self {
-            children: Vec::new(),
-            gap,
-            trailing_footer: 0.0,
-        }
-    }
-    fn push(&mut self, row: Element<'a, Message>) -> usize {
-        self.push_with_gap(row, self.gap, 0.0)
-    }
-    fn message(&mut self, row: Element<'a, Message>, footer: f32) -> usize {
-        self.push_with_gap(row, self.gap, footer)
-    }
-    fn push_with_gap(&mut self, row: Element<'a, Message>, gap: f32, footer: f32) -> usize {
-        if !self.children.is_empty() {
-            let gap = (gap - self.trailing_footer).max(0.0);
-            if gap > 0.0 {
-                self.children.push(widget::Space::new().height(gap).into());
-            }
-        }
-        let index = self.children.len();
-        self.children.push(row);
-        self.trailing_footer = footer;
-        index
-    }
-}
-
-/// The loaded transcript keeps row descriptions; only its visible exchanges
-/// create widget trees. Finished visible exchanges still use retained::kept.
 struct VirtualRows<'a> {
     children: Vec<virtualized::Row<'a>>,
     gap: f32,
@@ -209,11 +177,19 @@ impl<'a> VirtualRows<'a> {
         if !self.children.is_empty() {
             let gap = (gap - self.trailing_footer).max(0.0);
             if gap > 0.0 {
-                let key = self.children.len() as u64;
-                self.children
-                    .push(virtualized::Row::new(key, 0, gap, None, move || {
-                        widget::Space::new().height(gap).into()
-                    }));
+                // A gap is keyed by the row it precedes, so history loaded
+                // above it does not hand it another gap's measured height.
+                let key = match row.key {
+                    0 => self.children.len() as u64,
+                    key => key.rotate_left(1) ^ GAP_KEY,
+                };
+                self.children.push(virtualized::Row::new(
+                    key,
+                    u64::from(gap.to_bits()),
+                    gap,
+                    None,
+                    move || widget::Space::new().height(gap).into(),
+                ));
             }
         }
         let index = self.children.len();
@@ -224,6 +200,31 @@ impl<'a> VirtualRows<'a> {
         self.trailing_footer = footer;
         index
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many text messages this thread has built a view of.
+    pub(super) static TEXT_VIEWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Sets a gap's key apart from the key of the row it precedes.
+const GAP_KEY: u64 = 0x9e37_79b9_7f4a_7c15;
+
+/// One row an exchange contributes to the transcript.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TurnPart {
+    /// What was asked: the reader's prompt or a message delivered to the
+    /// agent, at this index of the transcript's items.
+    Prompt(usize),
+    /// The strip that folds the exchange's steps.
+    Steps,
+    /// A message to, or launch of, another agent, at this position of the
+    /// exchange's prose.
+    Card(usize),
+    /// An answer, a thought, an image or a step the grouping did not
+    /// recognize, at this position of the exchange's prose.
+    Prose(usize),
 }
 
 /// Reserve an external action row so hovering never shifts the transcript.
@@ -2687,7 +2688,7 @@ impl Runtime {
                 );
             }
             for turn in &self.turns {
-                self.push_turn_row(
+                self.push_turn_rows(
                     &mut transcript,
                     turn,
                     content_width,
@@ -4708,61 +4709,146 @@ impl Runtime {
         )
     }
 
-    /// One exchange's row in a virtual transcript: its key, fingerprint,
-    /// height estimate and the item anchors find and scrolling address.
-    fn push_turn_row<'a>(
+    /// One exchange's rows in a virtual transcript: each prompt, the step
+    /// strip and each message is a row of its own, with its own key,
+    /// fingerprint, height estimate and the item anchors find and scrolling
+    /// address.
+    ///
+    /// A row is kept between frames, and built and laid out again only when
+    /// something it draws changes, which is what stops a streaming answer
+    /// from paying for every exchange above it twenty times a second. Rows
+    /// are kept per message rather than per exchange, so an exchange that
+    /// gains a message, or whose answer streams, pays for that message alone
+    /// rather than for every message the exchange already holds.
+    fn push_turn_rows<'a>(
         &'a self,
         transcript: &mut VirtualRows<'a>,
         turn: &'a turn::Turn,
         content_width: f32,
-        markdown_settings: markdown::Settings,
+        settings: markdown::Settings,
         dark: bool,
     ) {
-        let snapshot = &self.snapshot;
         use std::hash::{Hash, Hasher};
-        let mut key = std::hash::DefaultHasher::new();
-        turn.key.hash(&mut key);
-        let estimate = turn
-            .prompt
-            .iter()
-            .chain(turn.prose.iter().map(|placed| &placed.index))
-            .filter_map(|index| snapshot.items.get(*index))
-            .map(|item| {
-                CachedItem::prose(&item.content).map_or(60.0, |body| {
-                    ((body.len() as f32 / (content_width / 8.0).max(20.0))
-                        .ceil()
-                        .max(1.0)
-                        * 22.0)
-                        + 40.0
-                })
+        let items = &self.snapshot.items;
+        let now = self.source_now_ms();
+        let common = self.turn_common_hasher(turn, dark);
+        let (parts, unplaced) = self.turn_parts(turn);
+        let estimate = |item: &chat::Item| {
+            CachedItem::prose(&item.content).map_or(60.0, |body| {
+                ((body.len() as f32 / (content_width / 8.0).max(20.0))
+                    .ceil()
+                    .max(1.0)
+                    * 22.0)
+                    + 40.0
             })
-            .sum::<f32>()
-            + if turn.steps.is_empty() { 0.0 } else { 48.0 };
-        let aliases = turn
-            .prompt
-            .iter()
-            .chain(
-                turn.prose
-                    .iter()
-                    .chain(&turn.steps)
-                    .map(|placed| &placed.index),
-            )
-            .filter_map(|index| snapshot.items.get(*index))
+        };
+        // An item that draws no row of its own, such as one still being
+        // prepared, is addressed by the exchange's first row.
+        let mut unplaced: Vec<_> = unplaced
+            .into_iter()
+            .filter_map(|index| items.get(index))
             .map(|item| scroll::item_id(&item.id))
             .collect();
-        transcript.lazy(
-            key.finish(),
-            self.turn_fingerprint(turn, dark),
-            estimate,
-            aliases,
-            if turn.prompt.is_empty() {
-                step::GAP_M
-            } else {
-                step::GAP_L
-            },
-            self.turn_trailing_footer(turn),
-            move || self.turn_view(turn, markdown_settings, dark),
-        );
+        let opening_gap = if turn.prompt.is_empty() {
+            step::GAP_M
+        } else {
+            step::GAP_L
+        };
+        if parts.is_empty() {
+            let mut key = std::hash::DefaultHasher::new();
+            (0u8, &turn.key).hash(&mut key);
+            transcript.lazy(
+                key.finish(),
+                common.clone().finish(),
+                0.0,
+                unplaced,
+                opening_gap,
+                0.0,
+                move || self.turn_anchor(turn, widget::Space::new().into()),
+            );
+            return;
+        }
+        let mut after_card = false;
+        for (position, part) in parts.into_iter().enumerate() {
+            let mut key = std::hash::DefaultHasher::new();
+            let mut aliases = std::mem::take(&mut unplaced);
+            let (estimate, footer) = match part {
+                TurnPart::Steps => {
+                    (1u8, &turn.key).hash(&mut key);
+                    aliases.extend(
+                        turn.steps
+                            .iter()
+                            .filter_map(|placed| items.get(placed.index))
+                            .map(|item| scroll::item_id(&item.id)),
+                    );
+                    (48.0, 0.0)
+                }
+                TurnPart::Prompt(index) => {
+                    let item = &items[index];
+                    (2u8, &item.id).hash(&mut key);
+                    aliases.push(scroll::item_id(&item.id));
+                    (estimate(item), MESSAGE_ACTION_FOOTER)
+                }
+                TurnPart::Card(prose) | TurnPart::Prose(prose) => {
+                    let placed = &turn.prose[prose];
+                    let item = &items[placed.index];
+                    (3u8, &item.id).hash(&mut key);
+                    aliases.push(scroll::item_id(&item.id));
+                    let footer = match (part, self.cache.get(&item.id)) {
+                        (TurnPart::Prose(_), Some(cached)) => {
+                            self.prose_action_footer(item, cached, placed.slot)
+                        }
+                        _ => 0.0,
+                    };
+                    (estimate(item), footer)
+                }
+            };
+            // A run of coordination rows reads as one list, as the step
+            // strip's rows do, rather than as blocks set apart from one
+            // another.
+            let card = matches!(part, TurnPart::Card(_));
+            let gap = match position {
+                0 => opening_gap,
+                _ if card && after_card => step::GAP_XS,
+                _ => step::GAP_M,
+            };
+            after_card = card;
+            let fingerprint = self.turn_part_fingerprint(turn, part, &common, now);
+            let first = position == 0;
+            transcript.lazy(
+                key.finish(),
+                fingerprint,
+                estimate,
+                aliases,
+                gap,
+                footer,
+                move || {
+                    retained::kept(fingerprint, move || {
+                        let row = self.turn_part_view(turn, part, settings);
+                        if first {
+                            self.turn_anchor(turn, row)
+                        } else {
+                            row
+                        }
+                    })
+                },
+            );
+        }
+    }
+
+    /// Find reaches an exchange through its first row.
+    fn turn_anchor(
+        &self,
+        turn: &turn::Turn,
+        row: Element<'static, Message>,
+    ) -> Element<'static, Message> {
+        widget::container(row)
+            .width(Length::Fill)
+            .id(iced::advanced::widget::Id::new(format!(
+                "chat-turn-{}-{}",
+                self.target.card, turn.key
+            )))
+            .into()
     }
 
     /// The newest exchanges, read-only, for a glance from outside the pane:
@@ -4781,7 +4867,7 @@ impl Runtime {
         // exchanges fill however long it has run.
         let tail = self.turns.len().saturating_sub(PREVIEW_TURNS);
         for turn in &self.turns[tail..] {
-            self.push_turn_row(
+            self.push_turn_rows(
                 &mut transcript,
                 turn,
                 super::layout::READING_COLUMN,
@@ -4797,32 +4883,29 @@ impl Runtime {
         Some(virtualized::column(transcript.children, Default::default()))
     }
 
-    /// One exchange: what was asked, what was done, and what came back.
-    ///
-    /// An exchange is kept between frames, and built and laid out again only
-    /// when something it draws changes, which is what stops a streaming
-    /// answer from paying for every exchange above it twenty times a second.
-    /// Open details own their text and share the same retained path. A
-    /// disclosure or changed item only invalidates its own exchange.
+    /// One exchange alone, every row of it mounted, as the transcript draws
+    /// it.
+    #[cfg(test)]
     fn turn_view<'a>(
         &'a self,
         turn: &'a turn::Turn,
         settings: markdown::Settings,
         dark: bool,
     ) -> Element<'a, Message> {
-        retained::kept(self.turn_fingerprint(turn, dark), move || {
-            self.turn_rows(
-                turn,
-                |item, cached| self.step_view(item, cached, settings),
-                |item, cached, coordinated| {
-                    let raw = self
-                        .item_expanded(&item.id)
-                        .then(|| self.step_detail(item, cached, settings));
-                    self.coordination_card(item, coordinated, raw)
-                },
-                settings,
-            )
-        })
+        let mut rows = VirtualRows::new(step::GAP_L);
+        self.push_turn_rows(
+            &mut rows,
+            turn,
+            super::layout::READING_COLUMN,
+            settings,
+            dark,
+        );
+        let window = std::rc::Rc::new(std::cell::Cell::new(Some(virtualized::Viewport {
+            top: 0.0,
+            height: 1.0e9,
+            bottom: false,
+        })));
+        virtualized::column(rows.children, window)
     }
 
     #[cfg(test)]
@@ -4831,21 +4914,80 @@ impl Runtime {
         self.turn_view(&self.turns[0], settings, cosmic::theme::is_dark())
     }
 
-    /// Everything a retained exchange draws, folded into the value that
-    /// decides whether it is drawn again.
-    ///
-    /// It reads the items' change tokens rather than their bodies, so it
-    /// costs the same for a one-line answer as for a long one.
     pub(super) fn find_turn_matches(&self, key: &str) -> bool {
         self.find_matches.iter().any(|candidate| candidate == key)
     }
 
+    /// Everything an exchange draws, as one value: it changes when any of
+    /// the exchange's rows would be drawn again.
+    #[cfg(test)]
     fn turn_fingerprint(&self, turn: &turn::Turn, dark: bool) -> u64 {
         self.turn_fingerprint_at(turn, dark, self.source_now_ms())
     }
 
+    #[cfg(test)]
     fn turn_fingerprint_at(&self, turn: &turn::Turn, dark: bool, now: Option<u64>) -> u64 {
         use std::hash::{Hash, Hasher};
+        let common = self.turn_common_hasher(turn, dark);
+        let mut hasher = common.clone();
+        for part in self.turn_parts(turn).0 {
+            self.turn_part_fingerprint(turn, part, &common, now)
+                .hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    /// The rows an exchange draws, in order, and the items that draw none of
+    /// their own: a delivery or message still being prepared, and a step
+    /// shown as a failure rather than on the strip.
+    fn turn_parts(&self, turn: &turn::Turn) -> (Vec<TurnPart>, Vec<usize>) {
+        let items = &self.snapshot.items;
+        let mut parts = Vec::with_capacity(turn.prompt.len() + turn.prose.len() + 1);
+        let mut unplaced = Vec::new();
+        for &index in &turn.prompt {
+            let Some(item) = items.get(index) else {
+                continue;
+            };
+            // A delivery is drawn once its body is parsed, as an answer is.
+            if !matches!(item.content, ItemContent::Delivery { .. })
+                || self.cache.contains_key(&item.id)
+            {
+                parts.push(TurnPart::Prompt(index));
+            } else {
+                unplaced.push(index);
+            }
+        }
+        if turn.steps.iter().any(|placed| {
+            items
+                .get(placed.index)
+                .is_some_and(|item| self.failure_ui.item(&item.id).is_none())
+        }) {
+            parts.push(TurnPart::Steps);
+        } else {
+            unplaced.extend(turn.steps.iter().map(|placed| placed.index));
+        }
+        for (position, placed) in turn.prose.iter().enumerate() {
+            let cached = items
+                .get(placed.index)
+                .filter(|item| self.failure_ui.item(&item.id).is_none())
+                .and_then(|item| self.cache.get(&item.id));
+            match cached {
+                Some(cached)
+                    if placed.slot == turn::Slot::Card && cached.coordination.is_some() =>
+                {
+                    parts.push(TurnPart::Card(position));
+                }
+                Some(_) => parts.push(TurnPart::Prose(position)),
+                None => unplaced.push(placed.index),
+            }
+        }
+        (parts, unplaced)
+    }
+
+    /// What every row of an exchange draws alike, ready for each row to add
+    /// its own.
+    fn turn_common_hasher(&self, turn: &turn::Turn, dark: bool) -> std::hash::DefaultHasher {
+        use std::hash::Hash;
         let mut hasher = std::hash::DefaultHasher::new();
         (
             self.target,
@@ -4860,14 +5002,7 @@ impl Runtime {
                 .contains(&incident.key)
                 .hash(&mut hasher);
         }
-        (
-            &turn.key,
-            &turn.summary,
-            self.strip_status(turn).map(|status| status as u8),
-        )
-            .hash(&mut hasher);
-        self.opened.get(&turn.key).hash(&mut hasher);
-        self.tool_groups_expanded.hash(&mut hasher);
+        turn.key.hash(&mut hasher);
         self.find
             .as_ref()
             .filter(|_| self.find_turn_matches(&turn.key))
@@ -4878,114 +5013,56 @@ impl Runtime {
                 )
             })
             .hash(&mut hasher);
-        // A running group's duration counts up, so its strip changes with the
-        // clock; a finished one's is fixed at how long the work took.
-        if !turn.steps.is_empty() {
-            now.and_then(|now| turn.working_for(now))
-                .map(|millis| if turn.running { millis / 1_000 } else { millis })
-                .hash(&mut hasher);
-        }
-        let placed = turn.prompt.iter().map(|index| (*index, None)).chain(
-            turn.steps
-                .iter()
-                .chain(&turn.prose)
-                .map(|placed| (placed.index, Some(placed.slot))),
-        );
-        let mut coordinating = false;
-        for (index, slot) in placed {
-            let Some(item) = self.snapshot.items.get(index) else {
-                continue;
-            };
-            // The latest observation can change at provider heartbeat speed
-            // even when the rendered content and elapsed second are unchanged.
-            (
-                &item.id,
-                item.started_at.or(item.at),
-                slot,
-                self.item_expanded(&item.id),
-            )
-                .hash(&mut hasher);
-            if item.content.is_step() {
-                disclosure::item_duration_ms(item, now)
-                    .map(|millis| millis / 1_000)
-                    .hash(&mut hasher);
+        hasher
+    }
+
+    /// Everything one row of an exchange draws, folded into the value that
+    /// decides whether it is drawn again.
+    ///
+    /// It reads the items' change tokens rather than their bodies, so it
+    /// costs the same for a one-line answer as for a long one.
+    fn turn_part_fingerprint(
+        &self,
+        turn: &turn::Turn,
+        part: TurnPart,
+        common: &std::hash::DefaultHasher,
+        now: Option<u64>,
+    ) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = common.clone();
+        let coordinating = match part {
+            TurnPart::Prompt(index) => {
+                0u8.hash(&mut hasher);
+                self.hash_turn_item(index, None, now, &mut hasher)
             }
-            if slot == Some(turn::Slot::Thinking) {
-                // A newer turn starting does not revive old reasoning that
-                // already has another item after it.
-                let finished = reasoning_finished(
-                    &self.snapshot.items,
-                    self.snapshot.busy && !self.snapshot.has_later,
-                    &item.id,
-                );
+            TurnPart::Steps => {
+                1u8.hash(&mut hasher);
                 (
-                    finished,
-                    reasoning_elapsed(
-                        item,
-                        &self.snapshot.items,
-                        finished,
-                        self.snapshot
-                            .finished_at
-                            .filter(|_| !self.snapshot.has_later),
-                    ),
+                    &turn.summary,
+                    self.strip_status(turn).map(|status| status as u8),
                 )
                     .hash(&mut hasher);
+                self.opened.get(&turn.key).hash(&mut hasher);
+                self.tool_groups_expanded.hash(&mut hasher);
+                // A running group's duration counts up, so its strip changes
+                // with the clock; a finished one's is fixed at how long the
+                // work took.
+                now.and_then(|now| turn.working_for(now))
+                    .map(|millis| if turn.running { millis / 1_000 } else { millis })
+                    .hash(&mut hasher);
+                let mut coordinating = false;
+                for placed in &turn.steps {
+                    coordinating |=
+                        self.hash_turn_item(placed.index, Some(placed.slot), now, &mut hasher);
+                }
+                coordinating
             }
-            // Only this item's badge changes on copy. Its dismissal timer
-            // does not affect what the turn draws.
-            self.copied
-                .as_ref()
-                .is_some_and(|(id, _)| *id == item.id)
-                .hash(&mut hasher);
-            self.cache
-                .get(&item.id)
-                .map(|cached| {
-                    (
-                        cached.token,
-                        cached.revision,
-                        // Fixed footer strings change only when the displayed
-                        // minute/date changes, not on every provider heartbeat.
-                        cached.stamp.as_ref().map(|(_, label, full)| (label, full)),
-                        cached.image.as_ref().map(iced::widget::image::Handle::id),
-                        cached.image_source.is_some(),
-                        self.preview_request.as_deref() == Some(item.id.as_str()),
-                        cached.image_wait.is_some(),
-                        cached.image_unavailable,
-                    )
-                })
-                .hash(&mut hasher);
-            // What a Markdown image draws lives with the conversation, so a
-            // preview that finished decoding redraws the exchange showing it.
-            if self
-                .cache
-                .get(&item.id)
-                .is_some_and(CachedItem::shows_figures)
-            {
-                self.figures.version().hash(&mut hasher);
+            TurnPart::Card(prose) | TurnPart::Prose(prose) => {
+                2u8.hash(&mut hasher);
+                let placed = &turn.prose[prose];
+                self.hash_turn_item(placed.index, Some(placed.slot), now, &mut hasher)
             }
-            // A coordinating step names agents by what this conversation
-            // calls them, links their transcripts while it lists them, tells
-            // how those it left in the background are doing, and
-            // remembers which of its parts the reader unfolded.
-            if self
-                .cache
-                .get(&item.id)
-                .is_some_and(|cached| cached.coordination.is_some())
-            {
-                coordinating = true;
-                let mut unfolded: Vec<&str> = self
-                    .unfolded
-                    .iter()
-                    .filter(|key| {
-                        key.strip_prefix(item.id.as_str())
-                            .is_some_and(|part| part.starts_with('#'))
-                    })
-                    .map(String::as_str)
-                    .collect();
-                unfolded.sort_unstable();
-                unfolded.hash(&mut hasher);
-            }
-        }
+        };
         if coordinating {
             for agent in &self.snapshot.subagents {
                 (
@@ -5003,6 +5080,104 @@ impl Runtime {
             std::sync::Arc::as_ptr(&self.agent_addresses).hash(&mut hasher);
         }
         hasher.finish()
+    }
+
+    /// What one item of an exchange contributes to its row's fingerprint,
+    /// and whether it coordinates other agents, so that the row also tracks
+    /// them.
+    fn hash_turn_item(
+        &self,
+        index: usize,
+        slot: Option<turn::Slot>,
+        now: Option<u64>,
+        hasher: &mut std::hash::DefaultHasher,
+    ) -> bool {
+        use std::hash::Hash;
+        let Some(item) = self.snapshot.items.get(index) else {
+            return false;
+        };
+        // The latest observation can change at provider heartbeat speed even
+        // when the rendered content and elapsed second are unchanged.
+        (
+            &item.id,
+            item.started_at.or(item.at),
+            slot,
+            self.item_expanded(&item.id),
+        )
+            .hash(hasher);
+        if item.content.is_step() {
+            disclosure::item_duration_ms(item, now)
+                .map(|millis| millis / 1_000)
+                .hash(hasher);
+        }
+        if slot == Some(turn::Slot::Thinking) {
+            // A newer turn starting does not revive old reasoning that
+            // already has another item after it.
+            let finished = reasoning_finished(
+                &self.snapshot.items,
+                self.snapshot.busy && !self.snapshot.has_later,
+                &item.id,
+            );
+            (
+                finished,
+                reasoning_elapsed(
+                    item,
+                    &self.snapshot.items,
+                    finished,
+                    self.snapshot
+                        .finished_at
+                        .filter(|_| !self.snapshot.has_later),
+                ),
+            )
+                .hash(hasher);
+        }
+        // Only this item's badge changes on copy. Its dismissal timer does not
+        // affect what the row draws.
+        self.copied
+            .as_ref()
+            .is_some_and(|(id, _)| *id == item.id)
+            .hash(hasher);
+        let cached = self.cache.get(&item.id);
+        cached
+            .map(|cached| {
+                (
+                    cached.token,
+                    cached.revision,
+                    // Fixed footer strings change only when the displayed
+                    // minute/date changes, not on every provider heartbeat.
+                    cached.stamp.as_ref().map(|(_, label, full)| (label, full)),
+                    cached.image.as_ref().map(iced::widget::image::Handle::id),
+                    cached.image_source.is_some(),
+                    self.preview_request.as_deref() == Some(item.id.as_str()),
+                    cached.image_wait.is_some(),
+                    cached.image_unavailable,
+                )
+            })
+            .hash(hasher);
+        // What a Markdown image draws lives with the conversation, so a
+        // preview that finished decoding redraws the row showing it.
+        if cached.is_some_and(CachedItem::shows_figures) {
+            self.figures.version().hash(hasher);
+        }
+        // A coordinating step names agents by what this conversation calls
+        // them, links their transcripts while it lists them, tells how those
+        // it left in the background are doing, and remembers which of its
+        // parts the reader unfolded.
+        if !cached.is_some_and(|cached| cached.coordination.is_some()) {
+            return false;
+        }
+        let mut unfolded: Vec<&str> = self
+            .unfolded
+            .iter()
+            .filter(|key| {
+                key.strip_prefix(item.id.as_str())
+                    .is_some_and(|part| part.starts_with('#'))
+            })
+            .map(String::as_str)
+            .collect();
+        unfolded.sort_unstable();
+        unfolded.hash(hasher);
+        true
     }
 
     /// The room a prose row leaves under it for its hover actions. A
@@ -5024,152 +5199,93 @@ impl Runtime {
         }
     }
 
-    fn turn_trailing_footer(&self, turn: &turn::Turn) -> f32 {
-        // Match the last row actually rendered, including cache misses during
-        // parsing, using the same footer classification as turn_rows.
-        for placed in turn.prose.iter().rev() {
-            if let Some(item) = self.snapshot.items.get(placed.index)
-                && let Some(cached) = self.cache.get(&item.id)
-            {
-                return self.prose_action_footer(item, cached, placed.slot);
-            }
-        }
-        if !turn.steps.is_empty() {
-            return 0.0;
-        }
-        if turn.prompt.iter().rev().any(|index| {
-            self.snapshot.items.get(*index).is_some_and(|item| {
-                !matches!(item.content, ItemContent::Delivery { .. })
-                    || self.cache.contains_key(&item.id)
-            })
-        }) {
-            MESSAGE_ACTION_FOOTER
-        } else {
-            0.0
-        }
-    }
-
-    /// The rows of one exchange, with `step` drawing each of its steps and
-    /// `card` each of its messages to and launches of other agents.
-    fn turn_rows<'s, 'a>(
-        &'s self,
-        turn: &'s turn::Turn,
-        step: impl Fn(&'s chat::Item, &'s CachedItem) -> Element<'a, Message>,
-        card: impl Fn(&'s chat::Item, &'s CachedItem, &'s Coordinated) -> Element<'a, Message>,
+    /// One row of an exchange, drawing `part` of it.
+    fn turn_part_view(
+        &self,
+        turn: &turn::Turn,
+        part: TurnPart,
         settings: markdown::Settings,
-    ) -> Element<'a, Message> {
+    ) -> Element<'static, Message> {
         let _stage = chat_stage::scope(Stage::TurnBuild);
         let items = &self.snapshot.items;
         let placed = |index: usize| {
             let item = items.get(index)?;
             Some((item, self.cache.get(&item.id)?))
         };
-        let mut rows = TranscriptRows::new(step::GAP_M);
-        for index in &turn.prompt {
-            let Some(item) = items.get(*index) else {
-                continue;
-            };
-            if !matches!(item.content, ItemContent::Delivery { .. }) {
-                rows.message(
-                    scroll::item(&item.id, self.prompt_view(item)),
-                    MESSAGE_ACTION_FOOTER,
-                );
-            } else if let Some(cached) = self.cache.get(&item.id) {
-                // Drawn once its body is parsed, as an answer is; never in the
-                // user's own bubble.
-                rows.message(
-                    scroll::item(&item.id, self.delivery_view(item, cached, settings)),
-                    MESSAGE_ACTION_FOOTER,
-                );
+        match part {
+            TurnPart::Prompt(index) => {
+                let Some(item) = items.get(index) else {
+                    return widget::Space::new().into();
+                };
+                let body = match (&item.content, self.cache.get(&item.id)) {
+                    // Never in the user's own bubble.
+                    (ItemContent::Delivery { .. }, Some(cached)) => {
+                        self.delivery_view(item, cached, settings)
+                    }
+                    _ => self.prompt_view(item),
+                };
+                scroll::item(&item.id, body)
+            }
+            TurnPart::Steps => {
+                let strip = self.step_strip(turn, || {
+                    turn.steps
+                        .iter()
+                        .filter_map(|placed_step| placed(placed_step.index))
+                        .filter(|(item, _)| self.failure_ui.item(&item.id).is_none())
+                        .map(|(item, cached)| {
+                            let key = selection::logical_identity(&item.id, &[9]);
+                            let revision = cached.revision;
+                            // Header elements are cheap owned metadata; only a
+                            // mounted row creates their widget tree and geometry.
+                            let row = self.step_view(item, cached, settings);
+                            let id = item.id.clone();
+                            let mut row = virtualized::Row::once(
+                                key,
+                                revision,
+                                56.0 + step::GAP_XS,
+                                Some(scroll::item_id(&id)),
+                                move || {
+                                    widget::container(scroll::item(&id, row))
+                                        .padding(iced::Padding::ZERO.bottom(step::GAP_XS))
+                                        .into()
+                                },
+                            );
+                            row.anchor = true;
+                            row
+                        })
+                        .collect()
+                });
+                // One measured strip supplies aliases for folded steps;
+                // expanded rows below it supply their own, more precise item
+                // bounds.
+                match turn.steps.first().and_then(|step| items.get(step.index)) {
+                    Some(item) => widget::container(strip)
+                        .id(scroll::steps_id(&item.id))
+                        .into(),
+                    None => strip,
+                }
+            }
+            TurnPart::Card(prose) | TurnPart::Prose(prose) => {
+                let slot = turn.prose[prose].slot;
+                let Some((item, cached)) = placed(turn.prose[prose].index) else {
+                    return widget::Space::new().into();
+                };
+                let body = match (&cached.coordination, &item.content) {
+                    (Some(coordinated), _) if part == TurnPart::Card(prose) => {
+                        let raw = self
+                            .item_expanded(&item.id)
+                            .then(|| self.step_detail(item, cached, settings));
+                        self.coordination_card(item, coordinated, raw)
+                    }
+                    (_, ItemContent::Text { .. }) => self.text_view(item, cached, slot, settings),
+                    (_, ItemContent::Image { .. }) => self.image_preview(item, cached),
+                    // Anything else in the answer slot is a step the grouping
+                    // did not recognize, drawn the way a step is.
+                    _ => self.step_view(item, cached, settings),
+                };
+                scroll::item(&item.id, body)
             }
         }
-        if turn.steps.iter().any(|placed| {
-            items
-                .get(placed.index)
-                .is_some_and(|item| self.failure_ui.item(&item.id).is_none())
-        }) {
-            let mut strip = self.step_strip(turn, || {
-                turn.steps
-                    .iter()
-                    .filter_map(|placed_step| placed(placed_step.index))
-                    .filter(|(item, _)| self.failure_ui.item(&item.id).is_none())
-                    .map(|(item, cached)| {
-                        let key = selection::logical_identity(&item.id, &[9]);
-                        let revision = cached.revision;
-                        // Header elements are cheap owned metadata; only a
-                        // mounted row creates their widget tree and geometry.
-                        let row = step(item, cached);
-                        let id = item.id.clone();
-                        let mut row = virtualized::Row::once(
-                            key,
-                            revision,
-                            56.0 + step::GAP_XS,
-                            Some(scroll::item_id(&id)),
-                            move || {
-                                widget::container(scroll::item(&id, row))
-                                    .padding(iced::Padding::ZERO.bottom(step::GAP_XS))
-                                    .into()
-                            },
-                        );
-                        row.anchor = true;
-                        row
-                    })
-                    .collect()
-            });
-            // One measured strip supplies aliases for folded steps; expanded
-            // rows below it supply their own, more precise item bounds.
-            if let Some(item) = turn.steps.first().and_then(|step| items.get(step.index)) {
-                strip = widget::container(strip)
-                    .id(scroll::steps_id(&item.id))
-                    .into();
-            }
-            rows.push(strip);
-        }
-        // A run of coordination rows reads as one list, as the step strip's
-        // rows do, rather than as blocks set apart from one another.
-        let mut after_card = false;
-        for prose in &turn.prose {
-            let Some((item, cached)) = placed(prose.index) else {
-                continue;
-            };
-            if self.failure_ui.item(&item.id).is_some() {
-                continue;
-            }
-            if let Some(coordinated) = cached.coordination.as_deref()
-                && prose.slot == turn::Slot::Card
-            {
-                let gap = if after_card { step::GAP_XS } else { rows.gap };
-                rows.push_with_gap(
-                    scroll::item(&item.id, card(item, cached, coordinated)),
-                    gap,
-                    0.0,
-                );
-                after_card = true;
-                continue;
-            }
-            after_card = false;
-            rows.message(
-                scroll::item(
-                    &item.id,
-                    match &item.content {
-                        ItemContent::Text { .. } => {
-                            self.text_view(item, cached, prose.slot, settings)
-                        }
-                        ItemContent::Image { .. } => self.image_preview(item, cached),
-                        // Anything else in the answer slot is a step the grouping did
-                        // not recognize, drawn the way a step is.
-                        _ => step(item, cached),
-                    },
-                ),
-                self.prose_action_footer(item, cached, prose.slot),
-            );
-        }
-        widget::container(widget::column::with_children(rows.children).width(Length::Fill))
-            .id(iced::advanced::widget::Id::new(format!(
-                "chat-turn-{}-{}",
-                self.target.card, turn.key
-            )))
-            .into()
     }
 
     /// What to call an attachment the reader just sent.
@@ -5951,6 +6067,8 @@ impl Runtime {
         slot: turn::Slot,
         settings: markdown::Settings,
     ) -> Element<'static, Message> {
+        #[cfg(test)]
+        TEXT_VIEWS.with(|built| built.set(built.get() + 1));
         let target = self.target;
         if slot == turn::Slot::Commentary {
             return widget::container(message_actions(

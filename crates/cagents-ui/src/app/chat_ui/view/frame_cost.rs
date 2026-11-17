@@ -219,8 +219,9 @@ impl Stages {
 #[ignore = "a measurement, not a check; see the module documentation"]
 fn a_streaming_frame_of_a_full_window() {
     // One exchange is the pane's fixed cost; sixteen are the store's whole
-    // window. The difference is what the transcript's length costs a frame.
-    for turns in [1, 16] {
+    // window. The difference is what the transcript's length costs a frame;
+    // 64 and 128 stand for a window paged back through earlier history.
+    for turns in [1, 16, 64, 128] {
         let mut pane = Pane::new(transcript(turns));
         let mut stages = pane.stream_prose();
         println!(
@@ -229,6 +230,118 @@ fn a_streaming_frame_of_a_full_window() {
             FRAMES - WARMUP
         );
         stages.report();
+    }
+}
+
+/// A working turn that gains one short message a frame, as an agent
+/// narrating its work does, after sixteen finished exchanges. Each row is the
+/// frame cost once the working turn holds that many messages; it should not
+/// grow with them, since every message but the newest is unchanged.
+#[test]
+#[ignore = "a measurement, not a check; see the module documentation"]
+fn a_frame_of_a_turn_gaining_messages() {
+    const CHECKPOINTS: [usize; 4] = [8, 32, 64, 112];
+    let mut items = transcript(16);
+    items.push(item(
+        "working-prompt".into(),
+        chat::Role::User,
+        prose("Keep going.".into(), false, chat::Phase::Final),
+    ));
+    let mut pane = Pane::new(items);
+    pane.metadata.busy = true;
+    println!("16 finished exchanges, then a turn gaining one message a frame:");
+    let mut window: Vec<[Duration; 4]> = Vec::new();
+    let mut checkpoints = CHECKPOINTS.iter().copied().peekable();
+    for message in 1.. {
+        let Some(checkpoint) = checkpoints.peek().copied() else {
+            break;
+        };
+        pane.items.push(item(
+            format!("working-{message}"),
+            chat::Role::Assistant,
+            prose(
+                format!(
+                    "Step {message}: read `src/parser.rs` and checked the **cursor** \
+                     handling; nothing else needs to change here."
+                ),
+                false,
+                chat::Phase::Commentary,
+            ),
+        ));
+        pane.publish();
+        pane.prepare_publication();
+        if message + WARMUP + SAMPLES > checkpoint {
+            window.push(pane.frame());
+        }
+        if message == checkpoint {
+            let mut stages = Stages::default();
+            for stage in &window[window.len().saturating_sub(SAMPLES)..] {
+                stages.record(*stage);
+            }
+            stages.row(&format!("{checkpoint} messages in the turn"));
+            window.clear();
+            checkpoints.next();
+        }
+    }
+}
+
+/// A message joining a working exchange builds a view of that message alone,
+/// and of a message whose prepared body changed with it, such as the one it
+/// follows when that one is settled. The messages the exchange already shows
+/// keep their kept rows, so a long-running turn does not pay for all of them
+/// on every message.
+#[test]
+fn a_turn_gaining_a_message_builds_only_that_message() {
+    let working = |message: usize| {
+        item(
+            format!("working-{message}"),
+            chat::Role::Assistant,
+            prose(
+                format!("Step {message}: checked the **cursor** handling."),
+                false,
+                chat::Phase::Commentary,
+            ),
+        )
+    };
+    let mut items = transcript(2);
+    items.push(item(
+        "working-prompt".into(),
+        chat::Role::User,
+        prose("Keep going.".into(), false, chat::Phase::Final),
+    ));
+    items.extend((0..12).map(working));
+    let mut pane = Pane::new(items);
+    pane.metadata.busy = true;
+    pane.publish();
+    pane.prepare_publication();
+    pane.frame();
+    pane.frame();
+    let built = || super::TEXT_VIEWS.with(std::cell::Cell::get);
+    let revisions = |pane: &Pane| {
+        (0..12 + 8)
+            .map(|message| {
+                let cached = pane.runtime.cache.get(&format!("working-{message}"));
+                cached.map(|cached| cached.revision)
+            })
+            .collect::<Vec<_>>()
+    };
+    for message in 12..20 {
+        let before = (built(), revisions(&pane));
+        pane.items.push(working(message));
+        pane.publish();
+        pane.prepare_publication();
+        pane.frame();
+        let prepared = revisions(&pane)
+            .iter()
+            .zip(&before.1)
+            .filter(|(now, then)| now != then)
+            .count();
+        assert!(prepared <= 2, "message {message} prepared {prepared}");
+        assert_eq!(
+            built() - before.0,
+            prepared,
+            "only message {message} and a message prepared again are built"
+        );
     }
 }
 

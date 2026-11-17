@@ -34,7 +34,7 @@ pub(super) struct PlaceholderPolicy {
     pub visit: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub(super) struct LogicalRange {
     pub identity: u64,
     pub bytes: std::ops::Range<usize>,
@@ -63,6 +63,14 @@ impl LogicalRanges {
             range,
             chunk,
         }
+    }
+    /// Whether both name the same ranges of the same prepared outline.
+    fn same(&self, other: &Self) -> bool {
+        let source = match (&self.source, &other.source) {
+            (Some(left), Some(right)) => std::sync::Arc::ptr_eq(left, right),
+            (left, right) => left.is_none() && right.is_none(),
+        };
+        source && self.range == other.range && self.chunk == other.chunk
     }
     pub(super) fn iter(&self) -> impl Iterator<Item = LogicalRange> + '_ {
         self.source.as_deref().unwrap_or(&[])[self.range.clone()]
@@ -218,6 +226,39 @@ impl Height {
         }
     }
 }
+/// What a row last gave the column's indexes, so a column rebuilt with the
+/// same rows corrects only the offsets of rows that changed.
+struct Shape {
+    key: u64,
+    anchor: bool,
+    aliases: Vec<Id>,
+    logical: Option<LogicalRange>,
+    descendants: LogicalRanges,
+    revision: u64,
+    estimate: f32,
+}
+impl Shape {
+    fn of(row: &Row<'_>) -> Self {
+        Self {
+            key: row.key,
+            anchor: row.anchor,
+            aliases: row.aliases.clone(),
+            logical: row.logical.clone(),
+            descendants: row.descendants.clone(),
+            revision: row.revision,
+            estimate: row.estimate,
+        }
+    }
+    /// Whether `row` holds the same place in every index but the offsets.
+    fn indexes(&self, row: &Row<'_>) -> bool {
+        self.key == row.key
+            && self.anchor == row.anchor
+            && self.aliases == row.aliases
+            && self.logical == row.logical
+            && self.descendants.same(&row.descendants)
+    }
+}
+
 #[derive(Default)]
 struct State {
     axis: Axis,
@@ -229,6 +270,7 @@ struct State {
     realized: std::ops::Range<usize>,
     offsets: PrefixSums,
     descriptors: u64,
+    shapes: Vec<Shape>,
     observed: Option<Viewport>,
     positions: HashMap<u64, usize>,
     anchors: HashSet<u64>,
@@ -349,7 +391,36 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
             state.heights.clear();
             state.width = constraint;
         }
-        if width_changed || state.descriptors != self.revision {
+        // A transcript builds its column again for every frame, mostly with
+        // the same rows: a streaming answer changes one row's revision.
+        // Rebuilding every index for that is work in the length of the
+        // transcript on every frame, so only a changed row is corrected.
+        let reshaped = state.descriptors != self.revision
+            && (state.shapes.len() != self.rows.len()
+                || !self
+                    .rows
+                    .iter()
+                    .zip(&state.shapes)
+                    .all(|(row, shape)| shape.indexes(row)));
+        if !width_changed && !reshaped && state.descriptors != self.revision {
+            for (index, (row, shape)) in self.rows.iter().zip(&mut state.shapes).enumerate() {
+                if shape.revision != row.revision || shape.estimate != row.estimate {
+                    shape.revision = row.revision;
+                    shape.estimate = row.estimate;
+                    state.offsets.set(
+                        index,
+                        state
+                            .heights
+                            .get(&row.key)
+                            .map_or(row.estimate, |height| height.for_row(row))
+                            .max(0.0),
+                    );
+                }
+            }
+            state.descriptors = self.revision;
+        }
+        if width_changed || reshaped {
+            state.shapes = self.rows.iter().map(Shape::of).collect();
             state.positions = self
                 .rows
                 .iter()
@@ -1198,6 +1269,85 @@ mod tests {
                 && count == 301
                 && last == Some(0)));
         }
+    }
+
+    /// A transcript builds its column again for every frame. Rebuilt with the
+    /// same rows, it corrects the offsets of the rows that changed; with
+    /// different rows, it indexes them again. Either way an offscreen row's
+    /// placeholder sits where the rows above it end.
+    #[test]
+    fn a_column_rebuilt_each_frame_keeps_offsets_exact() {
+        #[derive(Default)]
+        struct Placeholders(HashMap<Id, Rectangle>);
+        impl Operation for Placeholders {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
+                if let Some(id) = id {
+                    self.0.insert(id.clone(), bounds);
+                }
+            }
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        let window = Rc::new(Cell::new(Some(Viewport {
+            top: 0.0,
+            height: 100.0,
+            bottom: false,
+        })));
+        let build = |rows: &[(u64, f32)]| {
+            column(
+                rows.iter()
+                    .map(|&(key, height)| {
+                        Row::new(
+                            key,
+                            u64::from(height.to_bits()),
+                            height,
+                            Some(Id::from(format!("row-{key}"))),
+                            move || widget::Space::new().height(height).into(),
+                        )
+                    })
+                    .collect(),
+                window.clone(),
+            )
+        };
+        let limits = layout::Limits::new(Size::ZERO, Size::new(600.0, f32::INFINITY));
+        let mut rows: Vec<(u64, f32)> = (1..=200)
+            .map(|key| (key, 20.0 + (key % 3) as f32))
+            .collect();
+        let mut tree = Tree::new(&build(&rows));
+        let mut check = |rows: &[(u64, f32)]| {
+            let mut element = build(rows);
+            tree.diff(element.as_widget_mut());
+            let node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            let mut placeholders = Placeholders::default();
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut placeholders,
+            );
+            let mut top = 0.0;
+            for &(key, height) in rows {
+                let bounds = placeholders.0[&Id::from(format!("row-{key}"))];
+                assert_eq!((bounds.y, bounds.height), (top, height), "row {key}");
+                top += height;
+            }
+            assert_eq!(node.size().height, top);
+        };
+        check(&rows);
+        check(&rows);
+        // An offscreen row grows, then a mounted one.
+        rows[150].1 = 64.0;
+        check(&rows);
+        rows[1].1 = 48.0;
+        check(&rows);
+        // Earlier history arrives above, and a row leaves.
+        rows.insert(0, (999, 33.0));
+        rows.remove(120);
+        check(&rows);
     }
 
     #[test]
