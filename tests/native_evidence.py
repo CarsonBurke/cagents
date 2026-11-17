@@ -152,6 +152,7 @@ STUBS = {
     "magick": """
         #!/bin/bash
         if [ "$1" = identify ]; then printf '1500x900'; exit 0; fi
+        printf '%s\\n' "$*" >> "$STUB_LOG/magick"
         cp "$1" "${@: -1}"
     """,
     "rustup": """
@@ -1615,6 +1616,12 @@ class Evidence(unittest.TestCase):
         self.assertEqual(self.run_tool("shot", "bad/name", check=False).returncode, 2)
         self.run_tool("shot", "empty-state")
         self.assertEqual(len((self.task / "shots" / "manifest.tsv").read_text().splitlines()), 1)
+        self.assertIn("-quality 92", (self.logs / "magick").read_text().splitlines()[-1])
+        self.run_tool("shot", "edges", "--lossless")
+        self.assertIn("-define webp:lossless=true",
+                      (self.logs / "magick").read_text().splitlines()[-1])
+        self.assertIn("after-edges.webp", (self.task / "shots" / "manifest.tsv").read_text())
+        self.assertEqual(self.run_tool("shot", "edges", "--lossy", check=False).returncode, 2)
 
         second = self.run_tool("start", "after", check=False)
         self.assertEqual(second.returncode, 1)
