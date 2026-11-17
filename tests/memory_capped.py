@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os
 from pathlib import Path
+import shlex
 import shutil
 import signal
 import subprocess
@@ -145,6 +146,36 @@ class InARealScope(unittest.TestCase):
         pid = int(survivor.read_text())
         self.wait_for(lambda: not Path(f"/proc/{pid}").exists(), "a child outlived the scope")
         self.assert_not_left_failed(unit.read_text())
+
+    def test_a_descendant_over_the_limit_is_reported_once_the_manager_hears_of_it(self):
+        # As `cargo test` does when the kernel kills a test binary: the command
+        # outlives the kill and fails on its own, and the manager has not yet
+        # recorded why when it ends. A stand-in systemctl lags that much.
+        real = shutil.which("systemctl")
+        bin_directory = self.root / "bin"
+        bin_directory.mkdir()
+        reads = self.root / "reads"
+        stand_in = bin_directory / "systemctl"
+        stand_in.write_text(textwrap.dedent(f"""\
+            #!/bin/sh
+            case "$*" in
+            *--property=Result*)
+                echo x >>"{reads}"
+                if [ "$(wc -l <"{reads}")" -le 3 ]; then
+                    printf 'Result=success\\nActiveState=active\\nLoadState=loaded\\n'
+                    exit 0
+                fi ;;
+            esac
+            exec "{real}" "$@"
+        """))
+        stand_in.chmod(0o755)
+        self.env["PATH"] = f"{bin_directory}:{self.env['PATH']}"
+        runaway = 'chunks = [bytearray(b"x") * (16 * 2**20) for _ in range(64)]'
+        result = self.run_tool("sh", "-c", f"{shlex.quote(sys.executable)} -I -c '{runaway}'; exit 101")
+        self.assertEqual(result.returncode, 137, result.stderr)
+        self.assertIn("stopped sh because it and the processes it started went over the limit",
+                      result.stderr)
+        self.assertGreater(len(reads.read_text().splitlines()), 3)
 
     def test_memory_under_the_limit_is_undisturbed(self):
         script = "data = bytearray(b'x') * (64 * 2**20); print(len(data))"
