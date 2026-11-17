@@ -2457,10 +2457,10 @@ class Trim(unittest.TestCase):
         # An output a build wrote since keeps its unit.
         rebuilt = unit("rebuilt", "4d4d4d4d4d4d4d4d", "lib-rebuilt",
                        ["out/librebuilt-4d4d4d4d4d4d4d4d.rlib"], looked=4, built=1)
-        # Nothing dates what no fingerprint names, and Cargo 1.99's build
-        # script directories are not units of this layout.
+        # Nothing dates what no fingerprint names, and a build script
+        # directory of Cargo up to 1.99 is no unit, whatever its OUT_DIR holds.
         unnamed = unit("loose", "5e5e5e5e5e5e5e5e", None, ["out/libloose-5e5e5e5e5e5e5e5e.rlib"], looked=4)
-        older = written(profile / "build/older-6f6f6f6f6f6f6f6f/output", 4).parent
+        older = written(profile / "build/older-6f6f6f6f6f6f6f6f/out/fingerprint/generated", 4).parents[1]
         moved = self.agent["sweep_dependencies"](str(self.slot), time.time() - 3 * 86400)
         self.assertEqual([path.exists() for path in (stale, ran, needed, rebuilt, unnamed, older)],
                          [False, False, True, True, True, True])
@@ -2527,10 +2527,12 @@ class SweptUnderCargo(unittest.TestCase):
     fingerprint a build looked at keeps its outputs."""
 
     toolchain = TOOLCHAIN
+    # The pinned toolchain's Cargo, which may be rustup's proxy or not.
+    command = ("cargo",)
 
     def setUp(self):
-        if shutil.which("cargo") is None:
-            self.skipTest("no cargo")
+        if shutil.which(self.command[0]) is None:
+            self.skipTest(f"no {self.command[0]}")
         # On disk: /tmp is often RAM-backed.
         temporary = tempfile.TemporaryDirectory(prefix="cagents-sweep-", dir="/var/tmp")
         self.addCleanup(temporary.cleanup)
@@ -2570,7 +2572,7 @@ class SweptUnderCargo(unittest.TestCase):
         self.profile = self.checkout / "target/debug"
 
     def cargo(self):
-        return subprocess.run(["cargo", "build"], cwd=self.checkout, env=self.env, capture_output=True,
+        return subprocess.run([*self.command, "build"], cwd=self.checkout, env=self.env, capture_output=True,
                               text=True, timeout=240, check=True).stderr
 
     def test_a_stale_unit_is_built_again_and_a_looked_at_one_is_kept(self):
@@ -2600,6 +2602,8 @@ class SweptUnderCargo1100(SweptUnderCargo):
     Runs where that toolchain is installed; it is never installed for this."""
 
     toolchain = "1.100.0"
+    # Through rustup, whatever Cargo comes first on PATH.
+    command = ("rustup", "run", toolchain, "cargo")
 
     def setUp(self):
         if TOOLCHAIN == self.toolchain:

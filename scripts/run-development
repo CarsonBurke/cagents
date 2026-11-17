@@ -1052,7 +1052,9 @@ build_identity_inputs() {
     watched=$({
         build_script_watches env-changed
         # Cargo up to 1.99 keeps rustc's dependency lists in deps/, and from
-        # 1.100 in each unit's build/<package>/<hash>/out/.
+        # 1.100 in each unit's build/<package>/<hash>/out/. There this also
+        # reads the lists of compiled build scripts and any .d file a build
+        # script writes to its OUT_DIR, which only makes the check stricter.
         sed -n 's/^# env-dep:\([^=]*\).*/\1/p' "$build_dir"/dev-runtime/deps/*.d \
             "$build_dir"/dev-runtime/build/*/*/out/*.d 2>/dev/null
     } | LC_ALL=C sort -u)
