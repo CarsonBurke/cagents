@@ -4043,6 +4043,66 @@ mod tests {
     }
 
     #[test]
+    fn a_check_for_windows_refuses_a_legacy_ui_once_its_lock_outlasts_a_probe() {
+        let runtime = tempfile::tempdir().unwrap();
+        let legacy = ApplicationLease::acquire_in(runtime.path()).unwrap();
+        let started = std::time::Instant::now();
+        let Err(refused) =
+            verified_windows_within(runtime.path(), Path::new("/proc"), UNLEASED_OWNER_PATIENCE)
+        else {
+            panic!("a legacy UI's lease was read as absence");
+        };
+        let waited = started.elapsed();
+        assert_eq!(refused.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(refused.to_string(), OLDER_WINDOW_RUNNING);
+        // Refused once the lease outlasts a peer's probe, not after the whole
+        // wait for a starting window.
+        assert!(
+            (PEER_PROBE_ALLOWANCE..UNLEASED_OWNER_PATIENCE).contains(&waited),
+            "refused after {waited:?}"
+        );
+        drop(legacy);
+    }
+
+    #[test]
+    fn a_check_for_windows_never_reads_peer_probes_as_a_legacy_ui() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let runtime = tempfile::tempdir().unwrap();
+        let shared_runtime = runtime.path().to_path_buf();
+        let path = runtime.path().join(APPLICATION_LOCK_FILE);
+        // A holder with no window lease keeps the lock shared, except for the
+        // moments a peer's probe holds it exclusively.
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let peer = std::thread::spawn({
+            let stop = stop.clone();
+            move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let probe = owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB);
+                    std::thread::sleep(Duration::from_millis(1));
+                    drop(probe);
+                    // The check's own probe may hold it for a moment too.
+                    let shared = share_application_lock(&shared_runtime).unwrap();
+                    std::thread::sleep(Duration::from_millis(9));
+                    drop(shared);
+                }
+            }
+        });
+        let result =
+            verified_windows_within(runtime.path(), Path::new("/proc"), Duration::from_secs(1));
+        stop.store(true, Ordering::Relaxed);
+        peer.join().unwrap();
+        // The check may slip between the holds and find no windows, or give
+        // up on a window that never opens, but never names an older one.
+        match result {
+            Ok(windows) => assert!(windows.is_empty()),
+            Err(error) => assert_eq!(
+                error.to_string(),
+                "another cagents window is still opening; try again in a moment"
+            ),
+        }
+    }
+
+    #[test]
     fn recovery_rejects_unknown_legacy_ownership_and_pending_handoff() {
         let runtime = tempfile::tempdir().unwrap();
         let refusal = || {
