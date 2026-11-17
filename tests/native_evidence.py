@@ -2703,12 +2703,30 @@ class RemoteEvidence(unittest.TestCase):
                 return int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1])
 
             # The host script started its work in a process group of its own,
-            # and beside it the watcher, its only other child.
+            # and beside it the watcher: the child pausing in a `sleep`. Until
+            # then its other children may be its search for the connection.
             main = os.getpgid(held)
             host = parent(main)
-            others = set(map(int, Path(f"/proc/{host}/task/{host}/children").read_text().split())) - {main}
-            self.assertEqual(len(others), 1, others)
-            watcher = others.pop()
+
+            def children(pid: int) -> set[int]:
+                try:
+                    return set(map(int, Path(f"/proc/{pid}/task/{pid}/children").read_text().split()))
+                except FileNotFoundError:
+                    return set()
+
+            def comm(pid: int) -> str:
+                try:
+                    return Path(f"/proc/{pid}/comm").read_text().strip()
+                except FileNotFoundError:
+                    return ""
+
+            def watchers() -> list[int]:
+                return [pid for pid in children(host) - {main}
+                        if any(comm(nap) == "sleep" for nap in children(pid))]
+
+            wait_for(lambda: len(watchers()) == 1)
+            self.assertEqual(len(watchers()), 1, children(host))
+            watcher = watchers()[0]
             # The connection is the stand-in sshd above it; its client, the
             # ssh this machine runs, goes as if the network had.
             connection = host
