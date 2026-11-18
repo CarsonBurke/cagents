@@ -803,6 +803,8 @@ fn raw_groups(runtime: &Runtime) -> Vec<(String, Vec<(usize, bool)>)> {
             .find(|agent| &agent.id == child)
             .into_iter()
             .flat_map(|agent| agent.items.iter().enumerate())
+            // As in the view, a thought with nothing to read has no row.
+            .filter(|(_, item)| !super::reasoning::contentless(&item.content))
             .map(|(index, item)| {
                 (
                     item.id.clone(),

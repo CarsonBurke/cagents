@@ -24,8 +24,8 @@
 # stop the evidence session afterward. Commands only describe synthetic output.
 set -euo pipefail
 
-scene=${1:?usage: reasoning-row-scene.sh wide|narrow|web|coordination|diagnostics|refresh-core|refresh-notices|activity|agents|plan}
-case "$scene" in wide|narrow|web|coordination|diagnostics|refresh-core|refresh-notices|activity|agents|plan) ;; *) exit 2 ;; esac
+scene=${1:?usage: reasoning-row-scene.sh wide|narrow|web|coordination|diagnostics|refresh-core|refresh-notices|activity|agents|plan|contentless}
+case "$scene" in wide|narrow|web|coordination|diagnostics|refresh-core|refresh-notices|activity|agents|plan|contentless) ;; *) exit 2 ;; esac
 transcript_right=810
 if [ "$scene" = narrow ]; then transcript_right=535; fi
 here=$(cd -- "$(dirname -- "$0")" && pwd)
@@ -322,6 +322,41 @@ if [ "$scene" = activity ]; then
     scroll_top
     shot activity-finished
     printf '%s\n' 'Captured a working turn at two points and the same turn finished.'
+    exit 0
+fi
+
+# A long agentic turn as Claude sends it: most thoughts are only a signature
+# (or redacted), between commands, with one summarized thought. Captured
+# while a signature-only thought is live, then finished, then with the first
+# command group open.
+if [ "$scene" = contentless ]; then
+    cp "$here/reasoning-row-scene/contentless.jsonl" "$config/fixture-frames.jsonl.next"
+    mv "$config/fixture-frames.jsonl.next" "$config/fixture-frames.jsonl"
+    evidence cli project open "$fixture/project" >/dev/null
+    spawn_scene claude haiku 'Fixture: run the probe and confirm the cleanup.' \
+        "$fixture/state/reasoning-contentless-spawn.json" 'Contentless thoughts'
+    ready=false
+    for _ in $(seq 40); do
+        if rg -q '"uuid":"contentless-cd-1-result"' "$config/projects"; then ready=true; break; fi
+        sleep 1
+    done
+    [ "$ready" = true ] || { printf '%s\n' 'reasoning-row-scene: the commands did not start' >&2; exit 1; }
+    sleep 2
+    scroll_top
+    shot contentless-working
+    finished=false
+    for _ in $(seq 90); do
+        if rg -q '"uuid":"contentless-answer-1"' "$config/projects"; then finished=true; break; fi
+        sleep 1
+    done
+    [ "$finished" = true ] || { printf '%s\n' 'reasoning-row-scene: the turn did not finish' >&2; exit 1; }
+    sleep 3
+    scroll_top
+    shot contentless-finished
+    click_row '\bcommands?\b'
+    scroll_top
+    shot contentless-finished-expanded
+    printf '%s\n' 'Captured a turn of signature-only thoughts working, finished and expanded.'
     exit 0
 fi
 
