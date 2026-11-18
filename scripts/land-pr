@@ -312,6 +312,13 @@ def assess(report, head, since, superseded=()):
     snapshot = data.get("snapshot")
     if not snapshot:
         return "wait", data.get("error") or report.get("error") or "no status yet"
+    # A failed refresh keeps the previous snapshot, however old. Checks can be
+    # rerun on the same head, so nothing is decided until a read succeeds.
+    if data.get("error") or data.get("stale"):
+        retry = data.get("retry_at")
+        return "wait", (f"status refresh failed ({data.get('error') or 'stale report'}); "
+                        + (f"reading again after {time.strftime('%H:%M:%S', time.localtime(retry))}"
+                           if retry else "reading again"))
     pr = snapshot["pull_request"]
     current = (data.get("fetched_at") or 0) >= since
     if pr["headRefOid"] != head:

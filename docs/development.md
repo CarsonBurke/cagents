@@ -2000,9 +2000,11 @@ the branch has uncommitted changes or a merge in progress, any worktree is
 rebasing the branch, or another landing of the same PR is running. It waits
 for CI on the head through `scripts/gh-pr-status`, reading again only when the
 shared cache can refresh, about every two minutes, or later when `retry_at`
-says so. Unknown or missing checks count as not passed. A read from before the
-head was known, or one that has not yet caught up with the script's own push,
-cannot report that the head moved.
+says so. Unknown or missing checks count as not passed. A stale or failed read
+decides nothing, even about the same head, because checks can be rerun on it;
+the script waits for a read that succeeds. A read from before the head was
+known, or one that has not yet caught up with the script's own push, cannot
+report that the head moved.
 When GitHub refuses the merge because `main` moved while it was merging
 (`Base branch was modified`, HTTP 405), it reads the PR again after a short
 pause: a conflict now takes the conflict path above, and otherwise it merges

@@ -93,7 +93,8 @@ print(json.dumps({"ok": True, "data": {
                  "checks_complete": answer.get("complete", True),
                  "transport": answer.get("transport", "graphql")},
     "fetched_at": int(os.environ.get("FAKE_STATUS_NOW") or time.time()) + answer.get("age", 0), "retry_at": answer.get("retry_at"),
-    "error": None, "limitations": answer.get("data_limitations", [])},
+    "error": answer.get("error"), "stale": answer.get("stale", bool(answer.get("error"))),
+    "limitations": answer.get("data_limitations", [])},
     "limitations": answer.get("limitations", [])}))
 '''
 
@@ -409,6 +410,46 @@ class LandTests(unittest.TestCase):
         self.assertIn("checks unknown", self.output)
         self.assertGreaterEqual(self.sleeps[0], land.REFRESH)  # No fetched_at: still the shared cadence.
         self.assertGreaterEqual(clock[0], self.retry_at)  # retry_at was honoured.
+
+    def test_a_failed_refresh_never_decides_from_the_snapshot_it_kept(self):
+        head = "c" * 40
+        kept = {"data": {"snapshot": {"pull_request": {"state": "OPEN", "isDraft": False, "headRefOid": head,
+                                                       "mergeable": "MERGEABLE"},
+                                      "checks_state": "SUCCESS", "checks": []},
+                         "fetched_at": 1_000, "stale": True, "retry_at": 1_000_000_000,
+                         "error": "GitHub GraphQL rate limit exceeded"}}
+        verdict, detail = land.assess(kept, head, since=2_000)
+        self.assertEqual(verdict, "wait")
+        self.assertIn("GitHub GraphQL rate limit exceeded", detail)
+        for snapshot in ({"checks_state": "FAILURE"}, {"pull_request": {**kept["data"]["snapshot"]["pull_request"],
+                                                                         "state": "CLOSED"}}):
+            changed = {"data": {**kept["data"], "snapshot": {**kept["data"]["snapshot"], **snapshot}}}
+            self.assertEqual(land.assess(changed, head, since=0)[0], "wait")
+        # A successful read that is past its refresh interval is no fresher.
+        aged = {"data": {**kept["data"], "error": None}}
+        self.assertEqual(land.assess(aged, head, since=0)[0], "wait")
+
+    def test_checks_rerun_on_the_same_head_after_a_failed_refresh_are_read_before_landing(self):
+        # The kept snapshot was green; the checks were rerun on the same head
+        # and failed while status reads were paused.
+        now = 1_800_000_000
+        retry_at = now + 900
+        self.enterContext(patch.dict(os.environ, {"FAKE_STATUS_NOW": str(now)}))
+        self.enterContext(patch.object(land.time, "time", lambda: now))
+        self.status({"age": -3_600, "error": "GitHub GraphQL rate limit exceeded", "retry_at": retry_at},
+                    {"ci": "FAILURE", "checks": [{"__typename": "CheckRun", "name": "contracts",
+                                                  "status": "COMPLETED", "conclusion": "FAILURE"}]})
+        self.assertEqual(self.run_land(), land.CI_FAILED, self.output)
+        self.assertIsNone(self.merged())
+        self.assertIn("status refresh failed (GitHub GraphQL rate limit exceeded)", self.output)
+        self.assertEqual(self.sleeps, [retry_at - now + 1])  # The advertised retry time was honoured.
+
+    def test_dry_run_does_not_report_a_kept_snapshot_as_its_verdict(self):
+        self.status({"age": -3_600, "error": "GitHub GraphQL rate limit exceeded",
+                     "ci": "FAILURE", "checks": [{"__typename": "CheckRun", "name": "contracts",
+                                                  "status": "COMPLETED", "conclusion": "FAILURE"}]})
+        self.assertEqual(self.run_land("--dry-run"), 0, self.output)
+        self.assertIn("status refresh failed", self.output)
 
     def test_timeout_reports_why_it_was_still_waiting(self):
         self.status({"fail": "gh-pr-status: GitHub is unavailable"})
