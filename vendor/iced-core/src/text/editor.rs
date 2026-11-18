@@ -70,8 +70,10 @@ pub trait Editor: Sized + Default {
     /// clicked. Scrolling and the cursor still keep to the bounds.
     fn set_overscan(&mut self, _above: f32, _below: f32) {}
 
-    /// cagents: how far the drawn text reaches past the top and the bottom
-    /// of the [`Editor`]'s bounds, into the overscan.
+    /// cagents: how far the text continues past the top and the bottom of
+    /// the [`Editor`]'s bounds, up to one line height at each end: what is
+    /// scrolled out of view above them and what is left below them, whether
+    /// or not an overscan draws any of it.
     fn overflow(&self) -> (f32, f32) {
         (0.0, 0.0)
     }

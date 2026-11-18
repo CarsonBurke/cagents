@@ -102,11 +102,11 @@ impl<'a, Message: Clone + 'static> TextEditor<'a, Message> {
     /// padding's inner edge.
     ///
     /// The fade takes the background of the editor's style in its current
-    /// status, which must be an opaque color; a gradient gets no fade. Its
-    /// depth is how far the text reaches into the padding, so it is absent
-    /// while that end of the text is in view and grows as it scrolls away,
-    /// up to the whole band. The editor still scrolls, and reveals its
-    /// caret, within the text area.
+    /// status, which must be an opaque color; a gradient gets no fade. An end
+    /// with text past it fades across the padding and up to a line height
+    /// into the text area, so the line at that edge shows that there is more
+    /// at every scroll position. An end with nothing past it has no fade.
+    /// The editor still scrolls, and reveals its caret, within the text area.
     ///
     /// The fade covers the text's columns, so it clears the border's
     /// rounded corners while the horizontal padding is at least the corner
@@ -182,12 +182,20 @@ impl<Message: Clone + 'static> TextEditor<'_, Message> {
     }
 }
 /// Where an editor with `padding`, `overscan` and a `border` this wide draws
-/// its text, and how deep the fade at each end of that area is when the drawn
-/// text reaches `overflow` past the text area. The area and its bands are the
-/// native editor's own (`overscan_bounds`), so the fade covers exactly what
-/// the editor drew there, in the text's columns, and stays off its border;
-/// it clears rounded corners no wider than the horizontal padding. Each fade
-/// is as deep as the text reaches, but no deeper than its band.
+/// its text, and how deep the fade at each end of that area is when the text
+/// continues `overflow` past that end of the text area. The area and its
+/// bands are the native editor's own (`overscan_bounds`), so the fade covers
+/// what the editor drew there, in the text's columns, and stays off its
+/// border; it clears rounded corners no wider than the horizontal padding.
+///
+/// An end the text continues past fades across its whole band and as far
+/// again into the text area as the text continues, which the editor reports
+/// up to a line height. So the line at that edge is visibly faded at any
+/// scroll position, even when the band holds only the gap between lines,
+/// while an end with nothing past it keeps its line crisp. As with a
+/// scrolling strip's fades, less than half a pixel past an end counts as
+/// nothing, so rounding never fades a line that is wholly in view. The two
+/// fades never take more than half the area each.
 pub(crate) fn padding_fade_geometry(
     bounds: Rectangle,
     padding: Padding,
@@ -202,9 +210,17 @@ pub(crate) fn padding_fade_geometry(
         text.y - drawn.y,
         (drawn.y + drawn.height) - (text.y + text.height),
     );
+    let half = drawn.height / 2.0;
+    let depth = |band: f32, overflow: f32| {
+        if overflow > 0.5 {
+            (band + overflow).min(half)
+        } else {
+            0.0
+        }
+    };
     (
         drawn,
-        (overflow.0.clamp(0.0, band.0), overflow.1.clamp(0.0, band.1)),
+        (depth(band.0, overflow.0), depth(band.1, overflow.1)),
     )
 }
 
@@ -528,9 +544,10 @@ mod tests {
     /// holds for a field drawing its own border, which `fade_into_padding`
     /// lets reach the whole padding, and for a borderless editor on a
     /// bordered surface, which `fade_into_surface` gives a reach short of
-    /// it. Each fade is as deep as the text reaches, within its band, and
-    /// covers only the text's own columns, clear of the border's sides and
-    /// rounded corners. The composer's own geometry is checked by
+    /// it. An end the text continues past fades across its band and as far
+    /// again into the text area, an end with nothing past it not at all, and
+    /// each covers only the text's own columns, clear of the border's sides
+    /// and rounded corners (#3077). The composer's own geometry is checked by
     /// `composer_text_reach_stops_inside_its_border`.
     #[test]
     fn padding_fade_stops_on_a_device_pixel_inside_the_border() {
@@ -553,7 +570,8 @@ mod tests {
                         height: 12.0 * 19.6 + 2.0 * inset,
                     };
                     let text = bounds.shrink(padding);
-                    let reach = (inset, inset);
+                    // The text continues a line past each end.
+                    let reach = (19.6, 19.6);
                     let (drawn, depth) =
                         padding_fade_geometry(bounds, padding, overscan, own_border, reach, scale);
                     let context =
@@ -575,15 +593,17 @@ mod tests {
                     assert!(border_bottom - drawn_bottom.round() <= 1.0, "{context}");
                     assert!(drawn.y <= text.y && drawn.y + drawn.height >= text.y + text.height);
                     assert_eq!((drawn.x, drawn.width), (text.x, text.width), "{context}");
-                    // The fades fill their bands exactly when the text reaches
-                    // across them.
-                    assert!((depth.0 - (text.y - drawn.y)).abs() < 1e-4, "{context}");
-                    assert!(
-                        (depth.1 - (drawn.y + drawn.height - text.y - text.height)).abs() < 1e-4,
-                        "{context}"
+                    // Each fade crosses its band and carries on a line into
+                    // the text area, so the edge line fades too.
+                    let band = (
+                        text.y - drawn.y,
+                        drawn.y + drawn.height - text.y - text.height,
                     );
-                    // Text reaching only part of the way fades only that far,
-                    // and none at an end with nothing past it.
+                    assert!((depth.0 - (band.0 + 19.6)).abs() < 1e-4, "{context}");
+                    assert!((depth.1 - (band.1 + 19.6)).abs() < 1e-4, "{context}");
+                    // Text continuing only a little way past an end fades only
+                    // that far into the text area, and an end with nothing
+                    // past it does not fade.
                     let (_, depth) = padding_fade_geometry(
                         bounds,
                         padding,
@@ -592,8 +612,20 @@ mod tests {
                         (3.0, 0.0),
                         scale,
                     );
-                    assert_eq!(depth, (3.0, 0.0), "{context}");
-                    // Without an overscan the text area is drawn as upstream.
+                    assert!((depth.0 - (band.0 + 3.0)).abs() < 1e-4, "{context}");
+                    assert_eq!(depth.1, 0.0, "{context}");
+                    // Rounding error past an end is not text past it.
+                    let (_, depth) = padding_fade_geometry(
+                        bounds,
+                        padding,
+                        overscan,
+                        own_border,
+                        (0.4, 1e-4),
+                        scale,
+                    );
+                    assert_eq!(depth, (0.0, 0.0), "{context}");
+                    // Without an overscan the text area is drawn as upstream,
+                    // and the fades lie wholly inside it.
                     let (drawn, depth) = padding_fade_geometry(
                         bounds,
                         padding,
@@ -603,11 +635,12 @@ mod tests {
                         scale,
                     );
                     assert_eq!(drawn, text, "{context}");
-                    assert_eq!(depth, (0.0, 0.0));
+                    assert_eq!(depth, reach, "{context}");
                 }
             }
         }
-        // A border as wide as the padding leaves no band.
+        // A border as wide as the padding leaves no band, so the fades lie
+        // inside the text area.
         let bounds = Rectangle::new(cosmic::iced::Point::new(0.0, 0.0), Size::new(200.0, 60.0));
         let padding = Padding::new(2.0);
         let (drawn, depth) = padding_fade_geometry(
@@ -619,7 +652,19 @@ mod tests {
             1.0,
         );
         assert_eq!(drawn, bounds.shrink(padding));
-        assert_eq!(depth, (0.0, 0.0));
+        assert_eq!(depth, (2.0, 2.0));
+        // In an area shorter than its two fades, each takes half of it.
+        let bounds = Rectangle::new(cosmic::iced::Point::new(0.0, 0.0), Size::new(200.0, 30.0));
+        let padding = Padding::new(5.0);
+        let (drawn, depth) = padding_fade_geometry(
+            bounds,
+            padding,
+            (f32::INFINITY, f32::INFINITY),
+            1.0,
+            (19.6, 19.6),
+            1.0,
+        );
+        assert_eq!(depth, (drawn.height / 2.0, drawn.height / 2.0));
     }
     #[test]
     fn multiline_selection_maps_unicode_bytes_and_replacement_uses_existing_edit_action() {

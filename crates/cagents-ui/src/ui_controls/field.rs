@@ -291,8 +291,9 @@ mod tests {
 /// and the same insets, rather than COSMIC's heavy border.
 ///
 /// Text scrolled past either end of a fixed height runs on through the
-/// vertical inset to the edge and fades into the field there, rather than
-/// being cut off at the inset (#3044). A caller that restyles the editor
+/// vertical inset to the edge rather than being cut off at the inset, and
+/// fades into the field across the inset and up to a line into the text, so
+/// the edge line shows there is more at every scroll position (#3044). A caller that restyles the editor
 /// keeps the fade into its own background, which must be opaque; a
 /// transparent editor on another surface names that surface with
 /// [`TextEditor::fade_into_surface`].
