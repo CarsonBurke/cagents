@@ -1806,6 +1806,15 @@ impl Claude {
             ]
             .iter()
             .any(|key| frame[*key].as_bool() == Some(true));
+        // Claude Code follows a Read of a large image with a note telling the
+        // model how it scaled the picture down. It belongs to that Read, and
+        // to the model alone: the saved transcript marks it meta, which only
+        // the wire folds into isSynthetic. Shown, it read as an unexplained
+        // "context" row splitting the Read from the next one.
+        if context && delivered.is_empty() && image_scaling_note(&frame["message"]["content"]) {
+            self.track_carrier(carrier, Vec::new(), child);
+            return Ok(());
+        }
         // The transcript names its compaction summary; the wire folds that
         // flag away, so there the summary is the context that follows a
         // compaction boundary.
@@ -2169,15 +2178,33 @@ impl Claude {
                             }
                         }
                         if let Some(content) = block["content"].as_array() {
+                            // The picture a Read returned is the file it read,
+                            // and is named for it.
+                            let read = match &item.content {
+                                ItemContent::Command {
+                                    action: CommandAction::Read,
+                                    command,
+                                    ..
+                                } => Path::new(command)
+                                    .file_name()
+                                    .map(|name| name.to_string_lossy().into_owned()),
+                                _ => None,
+                            };
                             for (index, attachment) in content
                                 .iter()
                                 .enumerate()
                                 .filter(|(_, value)| string(value, "type") == "image")
                             {
+                                let mut image = image_content(attachment);
+                                if let (ItemContent::Image { description, .. }, Some(name)) =
+                                    (&mut image, &read)
+                                {
+                                    description.clone_from(name);
+                                }
                                 step.events.push(Event::Item(Item {
                                     id: format!("{}:image:{index}", item.id),
                                     role: Role::Assistant,
-                                    content: image_content(attachment),
+                                    content: image,
                                     started_at: None,
                                     at: None,
                                 }));
@@ -4840,10 +4867,36 @@ fn model_only(frame: &Value) -> bool {
     frame["isMeta"].as_bool() == Some(true) && string(&frame["origin"], "kind") != "peer"
 }
 
+/// Whether `content` is nothing but Claude Code's notes on how it scaled an
+/// image a tool returned, such as `[Image: original 2600x1800, displayed at
+/// 2306x1596. Multiply coordinates by 1.13 to map to original image.]`.
+fn image_scaling_note(content: &Value) -> bool {
+    let note = |text: &str| {
+        text.trim()
+            .strip_prefix("[Image: original ")
+            .and_then(|rest| rest.strip_suffix(']'))
+            .is_some_and(|rest| rest.contains(", displayed at "))
+    };
+    match content {
+        Value::String(text) => note(text),
+        Value::Array(blocks) => {
+            !blocks.is_empty()
+                && blocks
+                    .iter()
+                    .all(|block| string(block, "type") == "text" && note(string(block, "text")))
+        }
+        _ => false,
+    }
+}
+
+/// What a reader is told provider context is: something Claude Code put in
+/// front of the model that neither they nor the agent wrote.
+const CONTEXT: &str = "Added to Claude's context";
+
 /// Preserve opaque provider context without attributing it to the user, a
 /// particular tool, or another agent. System notices are explicit disclosures.
 fn context_item(id: String, body: String) -> Item {
-    notice_item(id, "Claude context", body)
+    notice_item(id, CONTEXT, body)
 }
 
 /// Where compaction restarted the model's context, with the summary that
@@ -6186,7 +6239,7 @@ fn image_content(block: &Value) -> ItemContent {
     ItemContent::Image {
         reference: None,
         path,
-        description: "Claude image attachment".into(),
+        description: String::new(),
     }
 }
 fn content_text(value: &Value) -> String {

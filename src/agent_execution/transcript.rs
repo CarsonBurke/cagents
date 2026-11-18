@@ -271,10 +271,13 @@ fn tool(content: &ItemContent) -> Option<(Tool, Vec<String>)> {
             description, path, ..
         } => (
             "Image".to_owned(),
-            if description.is_empty() {
-                path.clone()
-            } else {
+            if !description.is_empty() {
                 description.clone()
+            } else if path.starts_with("data:") {
+                // The pixels themselves: nothing a reader could name it by.
+                "Inline image".to_owned()
+            } else {
+                path.clone()
             },
             ToolStatus::Succeeded,
             "",
@@ -826,7 +829,7 @@ mod tests {
                     kind: DeliveryKind::Notice,
                     from: String::new(),
                     sender: String::new(),
-                    summary: "Claude context".into(),
+                    summary: "Added to Claude's context".into(),
                     body: long.clone(),
                 },
             ),
