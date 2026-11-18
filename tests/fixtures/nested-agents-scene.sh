@@ -44,6 +44,7 @@ shot() {
 mkdir -p "$config"
 cp "$frames/launch.jsonl" "$config/fixture-frames.jsonl"
 : >"$config/fixture-reply.md"
+"$ne" cli project open "$fixture/project" >/dev/null || log "project open failed"
 "$ne" cli --json agent spawn --provider claude --model haiku --surface chat \
     --repository "$fixture/project" --prompt 'Review the release.' >/dev/null ||
     log "spawn failed"
