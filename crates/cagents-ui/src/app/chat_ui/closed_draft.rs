@@ -154,6 +154,7 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::chat_ui::tests::visible_text;
     use crate::workspace_model::views::{Pane, Scope, View};
     use cosmic::iced::futures::{FutureExt, StreamExt};
 
@@ -259,36 +260,6 @@ mod tests {
             result.push(action);
         }
         result
-    }
-
-    fn visible_text(app: &Cagents, card: CardId) -> Vec<String> {
-        use iced::advanced::{
-            Layout, layout,
-            widget::{Operation, Tree},
-        };
-        #[derive(Default)]
-        struct Texts(Vec<String>);
-        impl Operation for Texts {
-            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
-                visit(self);
-            }
-            fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, text: &str) {
-                self.0.push(text.to_owned());
-            }
-        }
-        let renderer = crate::app::tests::headless_renderer();
-        let mut element = app.chat_view(card);
-        let mut tree = Tree::new(element.as_widget());
-        let node = element.as_widget_mut().layout(
-            &mut tree,
-            &renderer,
-            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(900.0, 980.0)),
-        );
-        let mut text = Texts::default();
-        element
-            .as_widget_mut()
-            .operate(&mut tree, Layout::new(&node), &renderer, &mut text);
-        text.0
     }
 
     #[test]
