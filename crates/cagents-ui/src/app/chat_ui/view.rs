@@ -1011,6 +1011,9 @@ pub struct Scroll {
     from_top: f32,
     content: f32,
     window: f32,
+    /// The top and bottom of the item a page slides the window around,
+    /// where it was last laid out.
+    pivot: Option<(f32, f32)>,
 }
 
 impl Scroll {
@@ -1019,7 +1022,11 @@ impl Scroll {
             from_top,
             content,
             window,
+            pivot: None,
         }
+    }
+    pub(super) fn with_pivot(self, pivot: Option<(f32, f32)>) -> Self {
+        Self { pivot, ..self }
     }
     /// How far the transcript can be scrolled.
     fn travel(self) -> f32 {
@@ -1066,21 +1073,23 @@ impl Scroll {
     }
 
     /// Whether the next earlier page should be fetched now, ahead of the
-    /// reader. A page slides the window by half and keeps the older half, so
-    /// short of the very top this waits until the whole viewport is in that
-    /// half: what is on screen never leaves the window.
+    /// reader. A page slides the window around its middle item and keeps
+    /// the older half, through that item, so short of the very top this
+    /// waits until the whole viewport is in that half: what is on screen
+    /// never leaves the window. Items differ in height, so the half is
+    /// where the item is drawn, not half the height.
     pub(super) fn prefetch_earlier(self) -> bool {
+        let kept = self.pivot.map_or(self.content * 0.5, |(_, bottom)| bottom);
         self.at_top()
-            || (self.from_top <= self.prefetch_reach()
-                && self.from_top + self.window <= self.content * 0.5)
+            || (self.from_top <= self.prefetch_reach() && self.from_top + self.window <= kept)
     }
 
     /// Whether the next newer page should be fetched now, the mirror of
-    /// [`Self::prefetch_earlier`].
+    /// [`Self::prefetch_earlier`]: the newer half starts at the middle item.
     pub(super) fn prefetch_later(self) -> bool {
+        let kept = self.pivot.map_or(self.content * 0.5, |(top, _)| top);
         self.at_bottom()
-            || (self.travel() - self.from_top <= self.prefetch_reach()
-                && self.from_top >= self.content * 0.5)
+            || (self.travel() - self.from_top <= self.prefetch_reach() && self.from_top >= kept)
     }
 
     /// How far from a loaded edge a page is fetched: far enough that wheel
@@ -3023,6 +3032,20 @@ impl Runtime {
                         Default::default()
                     },
                     Some(self.find_navigation.guard()),
+                    if selected.is_none() {
+                        scroll::History {
+                            pages: scroll::Pages {
+                                earlier: snapshot.has_earlier,
+                                later: snapshot.has_later,
+                            },
+                            pivot: snapshot
+                                .items
+                                .get(snapshot.items.len() / 2)
+                                .map(|item| item.id.as_str()),
+                        }
+                    } else {
+                        scroll::History::default()
+                    },
                 ),
                 target,
                 self.selected_subagent.as_deref(),
