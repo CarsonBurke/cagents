@@ -1116,10 +1116,16 @@ impl ControlClient {
         &self.proof
     }
 
-    /// Whether the daemon has closed this connection, as a daemon replaced
-    /// since the handshake has. Asks nothing of the daemon and never blocks:
-    /// a pending notification or nothing to read both leave it open.
-    pub fn peer_closed(&self) -> bool {
+    /// Whether nothing has arrived on this connection since its last reply,
+    /// and the daemon still holds it open. Asks nothing of the daemon and
+    /// never blocks.
+    ///
+    /// A daemon that exits tells each connection it is shutting down before
+    /// closing it, and one that crashes just closes it, so neither leaves a
+    /// request-only connection quiet. Unsolicited input of any other kind
+    /// also ends quiet, so a caller that reconnects whenever a kept
+    /// connection isn't quiet never reads a replaced daemon through it.
+    pub fn is_quiet(&self) -> bool {
         let mut byte = 0_u8;
         // SAFETY: the descriptor belongs to this live stream, and the one-byte
         // buffer is valid for the call. MSG_PEEK leaves any byte queued.
@@ -1131,14 +1137,7 @@ impl ControlClient {
                 libc::MSG_PEEK | libc::MSG_DONTWAIT,
             )
         };
-        match read {
-            0 => true,
-            read if read > 0 => false,
-            _ => !matches!(
-                io::Error::last_os_error().kind(),
-                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-            ),
-        }
+        read < 0 && io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock
     }
 
     pub(crate) fn protocol(&self) -> u16 {
@@ -8154,31 +8153,53 @@ mod tests {
         }
     }
 
-    /// A connection kept across a wait reads as closed once its daemon is
-    /// gone, without asking it anything.
+    /// A connection kept across a wait stops reading as quiet once its daemon
+    /// announces its shutdown or closes it, without asking it anything.
     #[test]
-    fn peer_closed_tells_a_replaced_daemon_from_a_quiet_one() {
-        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
-        let proof = proof("session", "boot", "incarnation");
-        let server_proof = proof.clone();
-        let server = thread::spawn(move || {
-            let connect: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
-            write_frame(
-                &mut server_stream,
-                &connected_envelope(connect.request_id, server_proof.clone(), server_proof),
-            )
-            .unwrap();
-            server_stream
-        });
-        let client = ControlClient::from_stream(client_stream).unwrap();
-        let server_stream = server.join().unwrap();
-        assert!(!client.peer_closed(), "a quiet daemon keeps it open");
-        // Shut the socket itself down: a test process forking concurrently
-        // can briefly hold a duplicate of the descriptor, which would keep a
-        // bare drop from closing the connection.
+    fn a_kept_connection_is_quiet_only_while_its_daemon_serves_it() {
+        fn handshaken() -> (ControlClient, UnixStream) {
+            let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+            let server = thread::spawn(move || {
+                let connect: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                let proof = proof("session", "boot", "incarnation");
+                write_frame(
+                    &mut server_stream,
+                    &connected_envelope(connect.request_id, proof.clone(), proof),
+                )
+                .unwrap();
+                server_stream
+            });
+            let client = ControlClient::from_stream(client_stream).unwrap();
+            (client, server.join().unwrap())
+        }
+
+        // An ordinary exit queues its shutdown notice and closes only once
+        // that is delivered, so the connection is still open meanwhile.
+        let (client, mut server_stream) = handshaken();
+        assert!(client.is_quiet(), "a serving daemon keeps it quiet");
+        write_frame(
+            &mut server_stream,
+            &ServerEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: None,
+                proof: proof("session", "boot", "incarnation"),
+                message: ServerMessage::HostShuttingDown,
+            },
+        )
+        .unwrap();
+        assert!(!client.is_quiet(), "a shutting-down daemon");
+        server_stream.shutdown(std::net::Shutdown::Both).unwrap();
+        assert!(!client.is_quiet(), "a daemon that exited after its notice");
+
+        // A crash closes the connection with nothing said. Shut the socket
+        // itself down: a test process forking concurrently can briefly hold
+        // a duplicate of the descriptor, which would keep a bare drop from
+        // closing the connection.
+        let (client, server_stream) = handshaken();
+        assert!(client.is_quiet());
         server_stream.shutdown(std::net::Shutdown::Both).unwrap();
         drop(server_stream);
-        assert!(client.peer_closed());
+        assert!(!client.is_quiet(), "a crashed daemon");
     }
 
     #[test]

@@ -73,11 +73,7 @@ pub(super) fn assert_absent_routes(stderr: &str, expected: &[Route]) {
         .lines()
         .filter_map(|line| line.find('{').map(|start| &line[start..]))
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter(|error| {
-            error["error"]["kind"]
-                .as_str()
-                .is_some_and(|kind| kind.starts_with("daemon_"))
-        })
+        .filter(reports_absent_daemon)
         .collect::<Vec<_>>();
     let kinds = absent
         .iter()
@@ -102,4 +98,12 @@ pub(super) fn assert_absent_routes(stderr: &str, expected: &[Route]) {
             );
         }
     }
+}
+
+/// Whether the JSON error `error` is one [`assert_absent_routes`] reads, so
+/// a fixture can account for every other error itself.
+pub(super) fn reports_absent_daemon(error: &Value) -> bool {
+    error["error"]["kind"]
+        .as_str()
+        .is_some_and(|kind| kind.starts_with("daemon_"))
 }

@@ -141,11 +141,12 @@ enum Leased<'a> {
 
 impl Leased<'_> {
     /// Keeps a connection made before the lease, which can wait out another
-    /// recovery for seconds, only while its daemon still holds it open. A
-    /// daemon replaced meanwhile is read through a new connection, under its
-    /// own proof, as a recovery that connected after the lease would read it.
+    /// recovery for seconds, only while it is quiet: a daemon that shut down
+    /// or crashed meanwhile has said so or closed it. A replacement daemon is
+    /// read through a new connection, under its own proof, as a recovery
+    /// that connected after the lease would read it.
     fn or_reconnect(self, socket: &Path) -> Result<Self, String> {
-        if !self.client().peer_closed() {
+        if self.client().is_quiet() {
             return Ok(self);
         }
         ControlClient::connect(socket)

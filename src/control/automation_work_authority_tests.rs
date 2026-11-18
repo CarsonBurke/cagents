@@ -441,11 +441,7 @@ fn public_automation_and_work_keep_captured_scope_before_routing_and_readiness()
         let errors = stderr
             .lines()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .filter(|error| {
-                !error["error"]["kind"]
-                    .as_str()
-                    .is_some_and(|kind| kind.starts_with("daemon_"))
-            })
+            .filter(|error| !startup_route::reports_absent_daemon(error))
             .collect::<Vec<_>>();
         assert_eq!(
             errors.len(),

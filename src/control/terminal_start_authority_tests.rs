@@ -532,7 +532,7 @@ fn child(selector: &str, role: &str, remote_verb: Option<Business>) {
         startup_route::assert_absent_routes(&stderr, &routes);
         let errors = errors
             .into_iter()
-            .filter(|error| error["error"]["kind"] == "protocol")
+            .filter(|error| !startup_route::reports_absent_daemon(error))
             .collect::<Vec<_>>();
         assert_eq!(errors.len(), if scoped { 6 } else { 0 });
         for error in errors {

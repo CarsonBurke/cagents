@@ -368,7 +368,7 @@ fn public_agent_list_and_exact_submit_retry_keep_scope_before_staged_owner_and_r
         startup_route::assert_absent_routes(&stderr, &[route, route]);
         let errors = errors
             .into_iter()
-            .filter(|error| error["error"]["kind"] == "protocol")
+            .filter(|error| !startup_route::reports_absent_daemon(error))
             .collect::<Vec<_>>();
         assert_eq!(errors.len(), 1);
         let error = &errors[0];
