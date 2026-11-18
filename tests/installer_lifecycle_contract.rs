@@ -196,6 +196,9 @@ fn uninstall_preserves_installation_when_daemon_status_is_untrusted() {
             r#"{"command":"daemon.status","data":{"running":false,"socket":"/run/cagentsd.sock"},"ok":false}"#,
             r#"{"command":"terminal.list","data":{"running":false,"socket":"/run/cagentsd.sock"},"ok":true}"#,
             "not JSON",
+            // A daemon that is starting or draining can still own terminals.
+            r#"{"command":"daemon.status","data":{"daemon_present":true,"daemon_version":null,"instance":"production","running":false,"socket":"/run/cagentsd.sock"},"ok":true}"#,
+            r#"{"ok":true,"command":"daemon.status","data":{"running":false,"daemon_present":true,"socket":"/run/cagentsd.sock"}}"#,
         ] {
             uninstall_fixture(script, status, false);
         }
