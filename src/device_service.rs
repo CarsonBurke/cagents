@@ -755,8 +755,11 @@ mod tests {
         let system = Account::system(crate::agent::Provider::Claude);
         let directory = tempfile::tempdir().unwrap();
         let store = Store::at(directory.path());
-        let (current, ()) = store.update(|_| ()).unwrap();
-        let before = store.load().unwrap();
+        let (current, ()) = store
+            .update(|registry| registry.set_label(&system, Some("Home".into())))
+            .unwrap();
+        let file = directory.path().join("accounts.toml");
+        let before = std::fs::read(&file).unwrap();
         let mut proposed = current.clone();
         proposed.set_label(&system, Some("Work".into()));
         let held = store.lock().unwrap();
@@ -764,7 +767,7 @@ mod tests {
             update_accounts_in(&store, current.revision(), proposed.clone()).unwrap_err(),
             LifecycleError::ListHeld(ListHeld::Registry)
         );
-        assert_eq!(store.load().unwrap(), before);
+        assert_eq!(std::fs::read(&file).unwrap(), before);
         drop(held);
         let Reply::AccountRegistry(saved) =
             update_accounts_in(&store, current.revision(), proposed).unwrap()
