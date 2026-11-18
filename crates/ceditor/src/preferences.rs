@@ -158,7 +158,7 @@ fn save_atomic(path: &Path, contents: &[u8]) -> Result<(), String> {
         .and_then(|()| temporary.as_file().sync_all())
         .map_err(|error| error.to_string())?;
     temporary
-        .persist(&path)
+        .persist(path)
         .map_err(|error| error.to_string())?;
     std::fs::File::open(directory)
         .and_then(|directory| directory.sync_all())

@@ -267,8 +267,8 @@ impl Editor {
                 }
             }
             Action::OpenRecorded(id) => {
-                if self.checkout_history_open {
-                    if let Some(path) = self
+                if self.checkout_history_open
+                    && let Some(path) = self
                         .checkout_history
                         .iter()
                         .find(|r| {
@@ -281,7 +281,6 @@ impl Editor {
                         self.selection_epoch = self.selection_epoch.wrapping_add(1);
                         return Self::open(path, self.selection_epoch);
                     }
-                }
             }
             Action::Open(path) => {
                 if self.checkout_dialog.as_ref().is_some_and(|d| {
