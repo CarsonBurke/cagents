@@ -96,7 +96,7 @@ cargo test --manifest-path vendor/iced-core/Cargo.toml text::span_metrics_tests
 
 # Editor overscan (#2824)
 
-`text::Editor` has two default methods, `set_overscan` and `overflow`. They let the widget ask the renderer to lay out and draw lines into its padding, and report how far drawn text currently reaches past the text area. The defaults do nothing and report zero, so editors without overscan behave as upstream. See vendor/cosmic-text/LOCAL_CHANGES.md.
+`text::Editor` has two default methods, `set_overscan` and `overflow`. They let the widget ask the renderer to lay out and draw lines into its padding, and report how far the text continues past each end of the text area, up to one line height, whether or not the overscan draws it (cagents #3044). The defaults do nothing and report zero, so editors without overscan behave as upstream. See vendor/cosmic-text/LOCAL_CHANGES.md.
 
 ## Animation frames that only present (#3581)
 

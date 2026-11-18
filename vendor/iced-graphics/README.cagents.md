@@ -24,7 +24,7 @@ it, so they agree. Spans without these are shaped as upstream shapes them.
 
 # Editor overscan (#2824)
 
-`Editor::set_overscan` forwards to cosmic-text's `Buffer::set_overscan`, and `Editor::overflow` reports how far the drawn runs reach above and below the text area, clamped to the overscan. Selection regions, the caret and the highlighter window cover the overscan bands too, so a selection or highlight continues into the padding. See vendor/cosmic-text/LOCAL_CHANGES.md; the app regression is `editor_widget::tests::native_overscan_draws_text_past_the_viewport_and_reports_how_far`.
+`Editor::set_overscan` forwards to cosmic-text's `Buffer::set_overscan`, and `Editor::overflow` reports how far the text continues above and below the text area, up to the buffer's line height. It counts what is scrolled out of view above and what is left below from the scroll position and line layouts, counting a line that is not laid out as one line height, so it does not depend on what the overscan draws (cagents #3044). Selection regions, the caret and the highlighter window cover the overscan bands too, so a selection or highlight continues into the padding. See vendor/cosmic-text/LOCAL_CHANGES.md; the app regression is `editor_widget::tests::native_overscan_draws_text_past_the_viewport_and_reports_how_far`.
 
 # Drawn-text identity (#3564)
 

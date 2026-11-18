@@ -589,9 +589,9 @@ where
         self.0.borrow().editor.is_empty()
     }
 
-    /// cagents: how far the drawn text reaches past the top and the bottom
-    /// of the text area, into the overscan of the [`TextEditor`] that last
-    /// laid it out. See [`TextEditor::overscan`].
+    /// cagents: how far the text continues past the top and the bottom of
+    /// the text area of the [`TextEditor`] that last laid it out, up to one
+    /// line height at each end, whether or not its overscan draws any of it.
     pub fn overflow(&self) -> (f32, f32) {
         self.0.borrow().editor.overflow()
     }
