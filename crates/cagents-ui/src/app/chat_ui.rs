@@ -9659,6 +9659,18 @@ impl Cagents {
                 Phase::Closing { .. } => "The conversation is closing. Wait for it to finish.",
             }));
         }
+        // Returning it to a terminal would retire the actor the service is
+        // preparing, or reopen what nobody has confirmed can be reopened.
+        if self.reopen_preparing(card) {
+            return Some(Cow::Borrowed(
+                "This conversation is reopening. Wait for it to connect.",
+            ));
+        }
+        if self.reopen_failed(card) {
+            return Some(Cow::Borrowed(
+                "This conversation could not be reopened. Retry before changing views.",
+            ));
+        }
         let Some(state) = self
             .card_state(card)
             .filter(|state| state.existence.is_open())

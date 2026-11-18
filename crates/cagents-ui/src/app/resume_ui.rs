@@ -83,8 +83,19 @@ pub(super) struct Reopening {
     attempt: u64,
     /// The conversation as saved, which the pane holds meanwhile.
     entry: SavedConversation,
+    stage: ReopenStage,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReopenStage {
+    /// The service is preparing the conversation.
+    Preparing,
     /// Preparation failed: the pane says why, and Retry prepares it again.
-    failed: bool,
+    Failed,
+    /// Another pane opened the conversation meanwhile, so this one closes
+    /// as though it had never been put in place: it is not recorded as
+    /// closed, and leaves the kept draft where it was.
+    Superseded,
 }
 
 /// A conversation as the picker lists it.
@@ -335,6 +346,14 @@ pub enum Progress {
 
 pub(super) fn focus_id() -> widget::Id {
     widget::Id::new("conversation-resume.search")
+}
+
+/// Why `session` cannot resume: the folder it ran in is gone.
+fn missing_directory(session: &chat::Session) -> String {
+    format!(
+        "This conversation ran in {}, which no longer exists. Restore that folder to resume it.",
+        session.launch.recipe.working_directory.display()
+    )
 }
 
 fn same_conversation(a: &chat::Session, b: &chat::Session) -> bool {
@@ -1231,11 +1250,7 @@ impl Cagents {
         if !session.launch.recipe.working_directory.is_dir()
             && !session.launch.needs_read_only_history()
         {
-            let error = format!(
-                "This conversation ran in {}, which no longer exists. Restore that folder to resume it.",
-                session.launch.recipe.working_directory.display()
-            );
-            self.resume_error(&error);
+            self.resume_error(&missing_directory(session));
             return Task::none();
         }
         if session.native_continuity.retains_provider() || unstarted_successor(session) {
@@ -1319,10 +1334,14 @@ impl Cagents {
     /// Whether the pane `card` is reopening a conversation the service is
     /// still preparing.
     pub(super) fn reopen_preparing(&self, card: CardId) -> bool {
+        self.reopen_stage(card) == Some(ReopenStage::Preparing)
+    }
+
+    fn reopen_stage(&self, card: CardId) -> Option<ReopenStage> {
         self.resume_ui
             .reopening
             .get(&card)
-            .is_some_and(|reopening| !reopening.failed)
+            .map(|reopening| reopening.stage)
     }
 
     /// Whether the pane `card` holds a conversation that has not started
@@ -1334,10 +1353,13 @@ impl Cagents {
 
     /// Whether preparing the conversation the pane `card` reopens failed.
     pub(super) fn reopen_failed(&self, card: CardId) -> bool {
-        self.resume_ui
-            .reopening
-            .get(&card)
-            .is_some_and(|reopening| reopening.failed)
+        self.reopen_stage(card) == Some(ReopenStage::Failed)
+    }
+
+    /// Whether the pane `card` gives way to another pane holding the
+    /// conversation it was reopening, and closes without being recorded.
+    pub(super) fn reopen_superseded(&self, card: CardId) -> bool {
+        self.reopen_stage(card) == Some(ReopenStage::Superseded)
     }
 
     /// Applies the service's answer to the pane it was asked for. An answer
@@ -1349,12 +1371,9 @@ impl Cagents {
         attempt: u64,
         result: Result<Option<Box<chat::Session>>, String>,
     ) -> Task<Message> {
-        let Some(reopening) = self
-            .resume_ui
-            .reopening
-            .get(&card)
-            .filter(|reopening| reopening.attempt == attempt && !reopening.failed)
-        else {
+        let Some(reopening) = self.resume_ui.reopening.get(&card).filter(|reopening| {
+            reopening.attempt == attempt && reopening.stage == ReopenStage::Preparing
+        }) else {
             return Task::none();
         };
         let source = reopening.entry.session.clone();
@@ -1387,10 +1406,23 @@ impl Cagents {
         // placeholder still records its reopen while it closes, so its close
         // asks nothing of the conversation the other pane holds.
         if let Some(existing) = self.existing_conversation_card(&session, Some(card)) {
+            if let Some(reopening) = self.resume_ui.reopening.get_mut(&card) {
+                reopening.stage = ReopenStage::Superseded;
+            }
             return Task::batch([
                 self.close_card_unasked(card),
                 self.reveal_conversation_card(existing, &session),
             ]);
+        }
+        // What may have changed while the service answered.
+        if let Some(reason) = self.deleting_card_reason(card) {
+            return self.fail_reopening(card, reason);
+        }
+        if !session.launch.recipe.working_directory.is_dir()
+            && !session.launch.needs_read_only_history()
+        {
+            let error = missing_directory(&session);
+            return self.fail_reopening(card, &error);
         }
         self.start_reopened(card, session)
     }
@@ -1416,9 +1448,10 @@ impl Cagents {
     /// keeps the saved conversation, and Retry asks again.
     fn fail_reopening(&mut self, card: CardId, error: &str) -> Task<Message> {
         if let Some(reopening) = self.resume_ui.reopening.get_mut(&card) {
-            reopening.failed = true;
+            reopening.stage = ReopenStage::Failed;
         }
-        self.cards.insert(card, CardRuntime::Failed(error.into()));
+        self.cards
+            .insert(card, CardRuntime::Failed(super::sentence(error).into()));
         Task::none()
     }
 
@@ -1426,11 +1459,16 @@ impl Cagents {
     pub(super) fn retry_reopening(&mut self, card: CardId) -> Task<Message> {
         self.resume_ui.attempts = self.resume_ui.attempts.wrapping_add(1);
         let attempt = self.resume_ui.attempts;
-        let Some(reopening) = self.resume_ui.reopening.get_mut(&card) else {
+        let Some(reopening) = self
+            .resume_ui
+            .reopening
+            .get_mut(&card)
+            .filter(|reopening| reopening.stage == ReopenStage::Failed)
+        else {
             return Task::none();
         };
         reopening.attempt = attempt;
-        reopening.failed = false;
+        reopening.stage = ReopenStage::Preparing;
         self.cards.remove(&card);
         self.prepare_reopening(card)
     }
@@ -1439,7 +1477,12 @@ impl Cagents {
     /// pane it reopened is kept for this one instead, which a later reopen
     /// brings back.
     pub(super) fn forget_reopening(&mut self, card: CardId) {
-        let Some(reopening) = self.resume_ui.reopening.remove(&card) else {
+        let Some(reopening) = self
+            .resume_ui
+            .reopening
+            .remove(&card)
+            .filter(|reopening| reopening.stage != ReopenStage::Superseded)
+        else {
             return;
         };
         let source = reopening.entry.card;
@@ -1452,6 +1495,29 @@ impl Cagents {
                 .kept_chat_drafts
                 .insert(card, draft);
         }
+    }
+
+    /// Puts a pane in place beside `beside` for `session`, as a reopen does
+    /// while the service prepares it.
+    #[cfg(test)]
+    pub(super) fn place_reopening_beside(
+        &mut self,
+        beside: CardId,
+        session: chat::Session,
+    ) -> CardId {
+        let reopening = Reopening {
+            attempt: 0,
+            entry: SavedConversation {
+                card: CardId::new(),
+                title: "Reopened".into(),
+                session: session.clone(),
+                open: false,
+                updated_at_unix_ms: 0,
+            },
+            stage: ReopenStage::Preparing,
+        };
+        self.insert_resumed_chat_card(session, Some(beside), None, None, Some(reopening))
+            .0
     }
 
     /// Opens the conversation `session` in a new pane where it belongs,
@@ -1484,7 +1550,7 @@ impl Cagents {
         let reopening = attempt.map(|attempt| Reopening {
             attempt,
             entry,
-            failed: false,
+            stage: ReopenStage::Preparing,
         });
         let (card, insert) =
             self.insert_resumed_chat_card(session, replace, user_title, draft_from, reopening);
@@ -2280,6 +2346,8 @@ mod tests {
         assert!(!app.chat_start_began(card));
         assert!(app.chat_start_pending(card));
         assert!(!app.resume_ui.loading, "other conversations stay resumable");
+        // Returning it to a terminal now would retire the actor being prepared.
+        assert!(app.chat_switch_blocker(card).unwrap().contains("reopening"));
         // Its identity is not known yet, so it is neither saved nor shared.
         let saved = app.persistent_workspace();
         assert!(saved.cards.iter().all(|saved| saved.id != card));
@@ -2457,12 +2525,15 @@ mod tests {
         let source = entry.session.clone();
         drop(app.resume_saved_conversation(entry));
         let (card, attempt) = reopening(&app);
-        // A refusal, such as another pane still writing to the conversation,
-        // is shown where the pane is, and starts nothing.
-        let refusal = "Another pane may still be writing to this Claude conversation";
+        // A refusal, such as the daemon not answering in time, is shown where
+        // the pane is, as a sentence, and starts nothing.
+        let refusal = "the daemon did not answer within 5 s";
         drop(app.update_resume(Action::Prepared(card, attempt, Err(refusal.into()))));
         assert!(matches!(app.cards.get(&card),
-            Some(CardRuntime::Failed(failure)) if failure.message() == refusal));
+            Some(CardRuntime::Failed(failure))
+                if failure.message() == "The daemon did not answer within 5 s."));
+        // Switching it to a terminal would reopen what was refused.
+        assert!(app.chat_switch_blocker(card).unwrap().contains("Retry"));
         assert!(app.reopen_failed(card));
         assert!(!app.chat_start_pending(card), "Retry is offered");
         assert!(!app.chat_start_began(card));
@@ -2689,6 +2760,9 @@ mod tests {
         drop(app.update(Message::CommitClose(card)));
         assert!(!app.card_state(card).unwrap().existence.is_open());
         assert!(!app.reopen_pending(card));
+        // Its close asked nothing of the service: nothing closes, and no
+        // start is left to give up.
+        assert!(!app.chat_ui.transition_pending());
 
         drop(app.update_resume(Action::Prepared(
             card,
@@ -2751,6 +2825,15 @@ mod tests {
         // The conversation the daemon will answer with is opened in another
         // pane while the reopen waits.
         let entry = retained(directory.path());
+        let source = entry.card;
+        let kept = crate::model::KeptChatDraft {
+            text: "Unsent question".into(),
+            closed_at_unix_ms: unix_millis(),
+            ..Default::default()
+        };
+        Arc::make_mut(&mut app.durable)
+            .kept_chat_drafts
+            .insert(source, kept);
         let prepared = successor(&entry.session);
         drop(app.resume_saved_conversation(entry));
         let (card, attempt) = reopening(&app);
@@ -2770,6 +2853,42 @@ mod tests {
         assert!(app.card_state(existing).unwrap().existence.is_open());
         assert!(!app.chat_start_began(card));
         assert!(!app.chat_close_owned(existing));
+        // The placeholder was never the conversation's pane: there is nothing
+        // of it to reopen, and the kept draft stays where it was.
+        assert!(
+            app.recently_closed
+                .iter()
+                .all(|(closed, _)| closed.id != card)
+        );
+        assert!(!app.durable.kept_chat_drafts.contains_key(&card));
+        assert_eq!(
+            app.durable.kept_chat_drafts[&source].text,
+            "Unsent question"
+        );
+    }
+
+    #[test]
+    fn a_reopen_answered_after_its_folder_went_away_fails_in_place() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        // An unstarted successor with no saved transcript to show read-only
+        // in its place.
+        let mut entry = saved(directory.path());
+        entry.session.proof = None;
+        entry.session.launch.session_id = Some("unsaved-thread".into());
+        assert!(unstarted_successor(&entry.session));
+        assert!(!entry.session.launch.needs_read_only_history());
+        drop(app.resume_saved_conversation(entry));
+        let (card, attempt) = reopening(&app);
+        let path = directory.path().to_path_buf();
+        drop(directory);
+        // With no daemon to vouch for it, it would resume on its own.
+        drop(app.update_resume(Action::Prepared(card, attempt, Ok(None))));
+        assert!(app.reopen_failed(card));
+        assert!(!app.chat_start_began(card));
+        assert!(matches!(app.cards.get(&card),
+            Some(CardRuntime::Failed(failure))
+                if failure.message().contains(&path.display().to_string())));
     }
 
     #[test]

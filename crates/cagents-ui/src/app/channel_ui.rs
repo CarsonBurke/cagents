@@ -2167,6 +2167,9 @@ impl Cagents {
             self.sidebar_state.forget_card_attention(card);
             if passive {
                 self.shared_chat_detach(card);
+                // Nothing started in a pane still reopening; its late answer
+                // finds nothing to start.
+                self.forget_reopening(card);
             } else {
                 self.chat_discard(card);
             }

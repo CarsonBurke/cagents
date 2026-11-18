@@ -416,6 +416,7 @@ impl Cagents {
         let emptied = self.close_emptied_channels(&[card]);
         self.retire_lsp_card(card);
         self.sidebar_state.forget_card_attention(card);
+        self.forget_reopening(card);
         self.cards.remove(&card);
         self.lifecycle.remove(card);
         Arc::make_mut(&mut self.durable).card_scopes.remove(&card);
@@ -769,8 +770,11 @@ impl Cagents {
             self.close_emptied_channels(&[id])
         };
         // Nothing of a terminal proven gone is left to bring back. Reopening
-        // could only run its saved command again, unasked.
-        if let Some(card) = closed_descriptor.filter(|_| !self.proven_gone_cards.remove(&id)) {
+        // could only run its saved command again, unasked. Nor of a pane
+        // that gave way to another holding its conversation.
+        if let Some(card) = closed_descriptor
+            .filter(|_| !self.proven_gone_cards.remove(&id) && !self.reopen_superseded(id))
+        {
             self.recently_closed
                 .push((card, self.active_workspace_destination()));
             if self.recently_closed.len() > 32 {

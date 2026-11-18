@@ -8572,3 +8572,42 @@ fn unsent_text_survives_replaced_identity_and_transfer() {
         );
     }
 }
+
+#[test]
+fn a_pane_reopening_in_a_channel_keeps_its_place_until_it_starts() {
+    let (mut app, channel, _, first) = channel_move_fixture();
+    // The channel on screen, whose strip is the order its panes are in.
+    app.active_workspace = Some("/repo".into());
+    let mut last = first.clone();
+    last.id = CardId::new();
+    if let CardKind::Browser(browser) = &mut last.kind {
+        browser.id = BrowserId::new();
+    }
+    app.workspace_model.views[0].panes.push(last.clone());
+    drop(app.reconcile_shared_views());
+    let order = |app: &Cagents| app.workspace.order().collect::<Vec<_>>();
+    assert_eq!(order(&app), [first.id, last.id]);
+
+    let session = crate::chat::fresh_session(
+        crate::agent::Provider::Claude,
+        TerminalId::new(),
+        "/repo".into(),
+        &crate::account::Account::system(crate::agent::Provider::Claude),
+    )
+    .unwrap();
+    let held = app.place_reopening_beside(first.id, session);
+    assert_eq!(order(&app), [first.id, held, last.id]);
+
+    // The view does not list it until it starts, and it stays where it was
+    // put rather than moving to the end of the strip.
+    app.workspace_model.views[0].revision += 1;
+    drop(app.reconcile_shared_views());
+    assert_eq!(order(&app), [first.id, held, last.id]);
+    let channel = app
+        .durable
+        .channels
+        .iter()
+        .find(|candidate| candidate.id == channel)
+        .unwrap();
+    assert_eq!(channel.cards, [first.id, held, last.id]);
+}

@@ -4154,14 +4154,18 @@ impl Cagents {
             })
             .collect::<Vec<_>>();
         let mut visible = strip.iter().map(|pane| pane.id).collect::<Vec<_>>();
-        let mut fenced = Vec::new();
+        let mut held = Vec::new();
         for id in retained {
-            if !self.shared_views.quarantined.contains(&id) || shared.contains(&id) {
+            // A fenced card the view does not place keeps its local place:
+            // after the nearest card it followed here. So does a pane still
+            // reopening, which is not shared until it starts, rather than
+            // jumping to the end of the strip meanwhile.
+            if shared.contains(&id)
+                || !(self.shared_views.quarantined.contains(&id) || self.reopen_pending(id))
+            {
                 visible.push(id);
                 continue;
             }
-            // A fenced card the view does not place keeps its local place:
-            // after the nearest card it followed here.
             let before = local_order
                 .iter()
                 .position(|prior| *prior == id)
@@ -4172,10 +4176,10 @@ impl Cagents {
                 .find_map(|prior| visible.iter().position(|placed| placed == prior))
                 .map_or(0, |index| index + 1);
             visible.insert(place, id);
-            fenced.extend(local_pane(id));
+            held.extend(local_pane(id));
         }
-        // The strip shows fenced cards too, in their visible order.
-        for pane in fenced {
+        // The strip shows held cards too, in their visible order.
+        for pane in held {
             let place = visible
                 .iter()
                 .take(visible.iter().position(|id| *id == pane.id).unwrap_or(0))
