@@ -2396,7 +2396,7 @@ impl Cagents {
             // own seed/baseline and pending edits until their receipts arrive.
             let cards = self.local_view_cards(&scope);
             let panes = self.local_view_panes(&scope);
-            self.rebase_seeded_attachments(&scope, &panes);
+            self.rebase_seeded_panes(&scope, &panes);
             self.publish_projected_view_changes(
                 LocalViews {
                     scopes: vec![scope.clone()],
@@ -2409,11 +2409,19 @@ impl Cagents {
     }
 
     /// A seed's baseline is what this window saved, but the registry keeps the
-    /// panes it already holds. A terminal attached while the seed was in flight
-    /// has proved its same session under the running daemon, so that update is
-    /// based on the registry's record. Based on the saved one it is refused, and
-    /// the record then stays behind the attachment until another window writes.
-    fn rebase_seeded_attachments(&mut self, scope: &Scope, local: &[Pane]) {
+    /// panes it already holds. Two of this window's differences from such a
+    /// pane are based on the registry's record instead, so they are published:
+    ///
+    /// - A terminal attached while the seed was in flight has proved its same
+    ///   session under the running daemon. Based on the saved record the
+    ///   update is refused, and the record then stays behind the attachment
+    ///   until another window writes.
+    /// - A pane name the registry's pane lacks never reached it, as one given
+    ///   before the registry existed or whose publication failed: a person can
+    ///   change a pane's name but not remove it. Unpublished, the registry's
+    ///   pane differs from this window's on every start, which migrates the
+    ///   view again (#3032). A name the registry holds is newer and stays.
+    fn rebase_seeded_panes(&mut self, scope: &Scope, local: &[Pane]) {
         let Some(view) = self
             .workspace_model
             .views
@@ -2441,6 +2449,9 @@ impl Cagents {
                 seeded.kind = shared.kind.clone();
                 seeded.pending_terminal_start = shared.pending_terminal_start;
                 seeded.scope = shared.scope.clone();
+            }
+            if shared.user_title.is_none() && seeded.user_title == current.user_title {
+                seeded.user_title = None;
             }
         }
     }
@@ -3449,6 +3460,7 @@ impl Cagents {
             return Task::none();
         }
         let mut tasks = Vec::new();
+        let mut user_titles_changed = false;
         let mut retained_upgrades = Vec::new();
         let local_order = current.clone();
         let local_members = current.iter().copied().collect::<HashSet<_>>();
@@ -3616,6 +3628,8 @@ impl Cagents {
             }
             let keep_live = self.observe_terminal_save(pane);
             if !keep_live {
+                user_titles_changed |=
+                    self.chrome_ui.user_titles.get(&pane.id) != pane.user_title.as_ref();
                 match &pane.user_title {
                     Some(title) => {
                         // A user's name takes precedence over a reported title,
@@ -3909,6 +3923,12 @@ impl Cagents {
         }
         if !self.shared_views.applying {
             self.persist();
+        }
+        // Pane names live in the window's settings, not its workspace save.
+        // Unsaved, the next start reads the old names back, which no longer
+        // match the registry's, and migrates the view again (#3032).
+        if user_titles_changed {
+            tasks.push(self.save_settings_task(false));
         }
         Task::batch(tasks)
     }
@@ -11946,6 +11966,154 @@ mod tests {
         drop(app.reconcile_shared_views());
         assert!(app.durable.local_only_cards.contains(&card));
         assert!(receiver.try_recv().is_err());
+    }
+
+    /// Starts the window over on its saved state: its views are uninitialized
+    /// and it reconciles against the registry's. Returns the edits it sent.
+    fn restart_shared_views(app: &mut Cagents, scope: &Scope) -> Vec<ModelEdit> {
+        app.shared_views.initialized.remove(scope);
+        app.shared_views.baseline.remove(scope);
+        let (tx, rx) = test_model_channel();
+        app.workspace_model_tx = tx;
+        drop(app.reconcile_shared_views());
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    fn seeded(edits: &[ModelEdit], scope: &Scope) -> bool {
+        edits.iter().any(
+            |edit| matches!(edit, ModelEdit::SeedView { scope: seeded, .. } if seeded == scope),
+        )
+    }
+
+    #[test]
+    fn a_pane_name_the_registry_lacks_is_published_so_the_next_start_admits_its_view() {
+        // A window that saved a pane name the registry's pane does not hold,
+        // as one given before the registry existed or whose publication
+        // failed, cannot admit its view and migrates it. The migration is
+        // additive, so the registry keeps its unnamed pane.
+        let (mut app, source, _, pane) = channel_move_fixture();
+        app.active_workspace = Some("/repo".into());
+        let scope = Scope::Channel(source);
+        app.chrome_ui.user_titles.insert(pane.id, "Pinned".into());
+        assert!(seeded(&restart_shared_views(&mut app, &scope), &scope));
+
+        // Once the seed lands, the window publishes the name, which a person
+        // gave and cannot have removed, and keeps it meanwhile.
+        let (tx, rx) = test_model_channel();
+        app.workspace_model_tx = tx;
+        app.acknowledge_view_edit(scope.clone(), None);
+        drop(app.reconcile_shared_views());
+        let operation = std::iter::from_fn(|| rx.try_recv().ok())
+            .find_map(|edit| match edit {
+                ModelEdit::ChangeView {
+                    scope: changed,
+                    operation,
+                    change:
+                        Change::Update {
+                            before,
+                            pane: named,
+                        },
+                    ..
+                } if changed == scope
+                    && named.id == pane.id
+                    && before.user_title.is_none()
+                    && named.user_title.as_deref() == Some("Pinned") =>
+                {
+                    Some(operation)
+                }
+                _ => None,
+            })
+            .expect("the window publishes its pane name");
+        assert_eq!(
+            app.chrome_ui.user_titles.get(&pane.id).map(String::as_str),
+            Some("Pinned")
+        );
+
+        // The registry records it, so the next start admits the view.
+        let view = &mut app.workspace_model.views[0];
+        view.revision += 1;
+        view.panes[0].user_title = Some("Pinned".into());
+        app.acknowledge_view_edit(scope.clone(), Some(operation));
+        drop(app.reconcile_shared_views());
+        let edits = restart_shared_views(&mut app, &scope);
+        assert!(app.shared_views.initialized.contains(&scope));
+        assert!(!seeded(&edits, &scope), "{edits:?}");
+        assert_eq!(
+            app.chrome_ui.user_titles.get(&pane.id).map(String::as_str),
+            Some("Pinned")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_pane_name_the_registry_changed_is_saved_so_the_next_start_admits_its_view() {
+        use cosmic::iced::futures::StreamExt;
+        // Another window renamed the pane while this one was closed. The
+        // registry's name is newer, and the window takes it.
+        let (mut app, source, _, pane) = channel_move_fixture();
+        app.active_workspace = Some("/repo".into());
+        let scope = Scope::Channel(source);
+        app.workspace_model.views[0].panes[0].user_title = Some("Theirs".into());
+        app.chrome_ui.user_titles.insert(pane.id, "Pinned".into());
+        assert!(seeded(&restart_shared_views(&mut app, &scope), &scope));
+
+        let directory = tempfile::tempdir().unwrap();
+        let (session, _) = SessionRuntime::open(
+            &directory.path().join("window.sqlite3"),
+            crate::model::BootId::new("pane-name-test"),
+        )
+        .unwrap();
+        let store = session.operation_store();
+        app.session = Some(session);
+        app.settings_path = Some(directory.path().join("settings.toml"));
+        app.settings_write_blocked = false;
+        let (tx, rx) = test_model_channel();
+        app.workspace_model_tx = tx;
+        app.acknowledge_view_edit(scope.clone(), None);
+        let task = app.reconcile_shared_views();
+        assert!(
+            !std::iter::from_fn(|| rx.try_recv().ok()).any(|edit| matches!(
+                edit,
+                ModelEdit::ChangeView { change: Change::Update { before, pane: named }, .. }
+                    if before.user_title != named.user_title
+            )),
+            "the registry's newer name is not overwritten"
+        );
+        assert_eq!(
+            app.chrome_ui.user_titles.get(&pane.id).map(String::as_str),
+            Some("Theirs")
+        );
+
+        // Pane names live in the window's settings, not its workspace save.
+        // Unsaved, the next start reads the old name back and migrates the
+        // view again (#3032).
+        let mut stream = iced::runtime::task::into_stream(task).expect("projection saves");
+        let saved = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while let Some(action) = stream.next().await {
+                if let iced::runtime::Action::Output(cosmic::Action::App(
+                    Message::SettingsSaved { result, .. },
+                )) = action
+                {
+                    return result;
+                }
+            }
+            Err("projection did not save the window's settings".into())
+        })
+        .await
+        .expect("the settings save finishes");
+        saved.unwrap();
+        let view: WindowView =
+            serde_json::from_str(&store.load_window_view().unwrap().unwrap()).unwrap();
+        assert_eq!(
+            view.user_titles.get(&pane.id).map(String::as_str),
+            Some("Theirs")
+        );
+
+        // The next start reads those settings and admits the view.
+        app.chrome_ui =
+            super::super::chrome_ui::State::default().with_user_titles(view.user_titles);
+        let edits = restart_shared_views(&mut app, &scope);
+        assert!(app.shared_views.initialized.contains(&scope));
+        assert!(!seeded(&edits, &scope), "{edits:?}");
     }
 
     #[test]
