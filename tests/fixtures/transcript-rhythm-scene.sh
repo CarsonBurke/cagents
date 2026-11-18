@@ -25,7 +25,8 @@
 # with LABEL, when given, after "rhythm-":
 #
 #   wide    rhythm-working (the turn mid-way, its rows live) and
-#           rhythm-finished (the same turn answered)
+#           rhythm-finished (the same turn answered), then
+#           rhythm-report-open, one agent's report opened under the pointer
 #   narrow  rhythm-narrow-working and rhythm-narrow-finished: the same, at
 #           two thirds of the strip beside a draft, in a window started 920
 #           pixels wide; then rhythm-narrow-pane-finished, the conversation
@@ -85,12 +86,17 @@ wait_recorded() {
     return 1
 }
 
-# A session that has only just started can miss the first shortcut.
+# A session that has only just started can miss the first shortcut. The
+# palette is recognised by its placeholder or an entry, as text recognition
+# reads one or the other depending on the theme.
 open_channel() {
     local opened=false
     for _ in 1 2 3; do
         evidence drive key ctrl+shift+p >/dev/null
-        if evidence drive wait 'Search commands' --timeout 5 >/dev/null 2>&1; then opened=true; break; fi
+        for words in 'Search commands' 'Open settings'; do
+            if evidence drive wait "$words" --timeout 3 >/dev/null 2>&1; then opened=true; fi
+        done
+        [ "$opened" = true ] && break
         # Close a palette that opened too late to be seen before trying again.
         evidence drive key Escape >/dev/null
         sleep 1
@@ -165,6 +171,30 @@ case $scene in
 wide)
     start_turn
     working_and_finished ''
+    # The first agent's report opened, with the pointer over it. A report's
+    # outcome is the only lowercase "finished" in the turn.
+    evidence drive --json observe >"$fixture/state/transcript-rhythm-observed.json"
+    at=$(/usr/bin/python3 -c '
+import json, sys
+
+def runs(node):
+    if isinstance(node, dict):
+        if node.get("text") == "finished" and "x" in node and "y" in node:
+            yield node
+        for value in node.values():
+            yield from runs(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from runs(value)
+
+for run in sorted(runs(json.load(sys.stdin)), key=lambda run: run["y"]):
+    print(run["x"] + 4, run["y"] + 4, sep=",")
+    break
+' <"$fixture/state/transcript-rhythm-observed.json")
+    [ -n "$at" ] || { printf '%s\n' 'transcript-rhythm-scene: no report row' >&2; exit 1; }
+    evidence drive click "$at" >/dev/null
+    sleep 2
+    evidence shot "rhythm-${label}report-open"
     ;;
 narrow)
     start_turn
