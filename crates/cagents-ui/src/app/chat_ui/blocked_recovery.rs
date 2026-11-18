@@ -10,6 +10,8 @@ pub(super) const FRESH_EXPLANATION: &str = "Starts a new conversation in this ta
 pub(super) const RESTART_GUIDANCE: &str = "Leave this tab open and restart this computer when convenient. The next time cagents starts, it reopens the conversation here, with any unsent message.";
 pub(super) const RESTART_FRESH_TRADEOFF: &str = "Starting a new conversation keeps the message; closing the tab discards it. Either way, the old conversation won't reopen here, though it isn't deleted.";
 pub(super) const RESTART_CLOSE_TRADEOFF: &str = "Closing the tab discards the message, and the conversation won't reopen, though it isn't deleted.";
+pub(super) const UNNAMED_AGENT_HEADLINE: &str = "This agent's conversation can't be reopened.";
+pub(super) const UNNAMED_AGENT_GUIDANCE: &str = "The agent stays open until you close this tab. Closing ends the agent and discards any unsent message.";
 pub(super) const CLOSE_GUIDANCE: &str = "Details say why. Closing this tab discards any unsent message; the conversation itself isn't deleted.";
 
 /// When a permanently refused saved conversation can come back, as far as
@@ -24,6 +26,10 @@ pub(in crate::app) enum Reopen {
     /// A new boot proves the conversation's earlier process gone, and this
     /// card's own restore then prepares it again.
     AfterRestart,
+    /// An open agent's conversation whose provider never named it: nothing
+    /// can reopen it, and starting over here would give up the agent's card,
+    /// so Close, which ends the agent, is the only way on.
+    UnnamedAgent,
 }
 
 impl Reopen {
@@ -46,6 +52,7 @@ impl Reopen {
         match self {
             Self::Unproven => HEADLINE,
             Self::AfterRestart => RESTART_HEADLINE,
+            Self::UnnamedAgent => UNNAMED_AGENT_HEADLINE,
         }
     }
 
@@ -57,6 +64,7 @@ impl Reopen {
             (Self::Unproven, false) => CLOSE_GUIDANCE.to_owned(),
             (Self::AfterRestart, true) => [RESTART_GUIDANCE, RESTART_FRESH_TRADEOFF].join(" "),
             (Self::AfterRestart, false) => [RESTART_GUIDANCE, RESTART_CLOSE_TRADEOFF].join(" "),
+            (Self::UnnamedAgent, _) => UNNAMED_AGENT_GUIDANCE.to_owned(),
         }
     }
 

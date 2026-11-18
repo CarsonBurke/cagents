@@ -1123,10 +1123,10 @@ fn draft_start_backend() -> Option<(String, String, String)> {
 }
 
 /// Why an agent's card that never saved its provider's conversation ID can't
-/// reopen it. The agent stays open, so Close is how the reader ends it.
+/// reopen it; [`blocked_recovery::Reopen::UnnamedAgent`] says what to do.
 fn unnamed_agent_conversation(session: &chat::Session) -> String {
     format!(
-        "This agent's {} conversation can't be reopened because its ID was never saved. The agent is still open and nothing new was started. Close it to end the agent.",
+        "{} named this agent's conversation only after it was saved, and the ID was lost when its daemon stopped, so nothing can reconnect to it. Nothing new was started.",
         session.launch.provider.label()
     )
 }
@@ -12538,13 +12538,20 @@ impl Cagents {
                         ]);
                     }
                     Err(mut failure) => {
-                        if failure.recovery == chat::Recovery::Fresh
+                        // Starting over would give up the agent's card, so its
+                        // conversation is refused for good, with Close to end it.
+                        let unnamed_agent = failure.recovery == chat::Recovery::Fresh
                             && attempt.session.launch.session_id.is_none()
-                            && self.chat_runs_as_open_agent(target.card, &attempt.session)
-                        {
+                            && self.chat_runs_as_open_agent(target.card, &attempt.session);
+                        if unnamed_agent {
+                            failure.recovery = chat::Recovery::Blocked;
                             failure.message = unnamed_agent_conversation(&attempt.session);
                         }
-                        let blocked = blocked_recovery::Reopen::of(failure.recovery);
+                        let blocked = if unnamed_agent {
+                            Some(blocked_recovery::Reopen::UnnamedAgent)
+                        } else {
+                            blocked_recovery::Reopen::of(failure.recovery)
+                        };
                         if let Some(reopen) = blocked {
                             self.chat_ui.blocked_starts.insert(
                                 target.card,
