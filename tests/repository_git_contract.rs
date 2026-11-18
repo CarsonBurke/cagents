@@ -838,6 +838,53 @@ fn a_complete_rename_can_be_staged_unstaged_and_discarded() {
     assert!(!fixture.work().join("new-name.txt").exists());
 }
 
+/// With copy detection on, a staged copy is shown against its source, but
+/// the source stays a file of its own. Unstaging the copy must leave the
+/// source's index entry alone: it can hold a deliberately staged version that
+/// neither HEAD nor the working tree keeps.
+#[test]
+fn unstaging_a_copy_keeps_the_sources_own_staged_version() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    fixture.git_in_work(&["config", "status.renames", "copies"]);
+    let original = b"line1\nline2\nline3\nline4\nline5\n";
+    fixture.write("source.txt", original);
+    fixture.commit_all("initial");
+    fixture.write("copy.txt", original);
+    fixture.write("source.txt", b"line1\nline2\nline3\nline4\nstaged\n");
+    fixture.git_in_work(&["add", "source.txt", "copy.txt"]);
+    fixture.write("source.txt", b"line1\nline2\nline3\nline4\nworktree\n");
+
+    let snapshot = fixture.snapshot();
+    let copy = entry(&snapshot, ChangeArea::Staged, "copy.txt");
+    assert_eq!(copy.kind, ChangeKind::Copied);
+    assert_eq!(copy.old_path, Some(path("source.txt")));
+    let selection = vec![PathSelection::from_changed_path(copy)];
+
+    let outcome = fixture
+        .service()
+        .unstage(
+            &UnstageRequest {
+                worktree: fixture.work(),
+                selection,
+            },
+            &CancellationToken::new(),
+        )
+        .expect("unstage");
+    assert_eq!(
+        outcome,
+        MutationOutcome::Applied {
+            paths: vec![path("copy.txt")]
+        }
+    );
+    assert_eq!(
+        fixture.text(&["show", ":source.txt"]),
+        "line1\nline2\nline3\nline4\nstaged"
+    );
+    assert_eq!(fixture.porcelain(), "MM source.txt\n?? copy.txt");
+}
+
 /// A `pre-commit` hook can leave a process outside Git's process group holding
 /// the stdout and stderr the executor reads. The process group signalled at the
 /// deadline cannot reach it, so nothing will ever close those pipes — and the

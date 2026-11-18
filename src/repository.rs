@@ -1134,6 +1134,9 @@ pub enum DiffContent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PathSelection {
     pub path: RepoPath,
+    /// The rename source. Never a copy source: a copy leaves its source in
+    /// place as an independent file, whose own changes a mutation of the copy
+    /// must not stage, unstage or discard.
     pub old_path: Option<RepoPath>,
 }
 
@@ -1145,10 +1148,15 @@ impl PathSelection {
         }
     }
 
+    /// The selection that acts on exactly this row. A copy's source stays on
+    /// the row for its diff, but only a rename's source belongs to the change.
     pub fn from_changed_path(entry: &ChangedPath) -> Self {
         Self {
             path: entry.path.clone(),
-            old_path: entry.old_path.clone(),
+            old_path: entry
+                .old_path
+                .clone()
+                .filter(|_| entry.kind == ChangeKind::Renamed),
         }
     }
 }

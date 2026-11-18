@@ -17,8 +17,8 @@ use cagents_ui::{
     },
     pull_request_review::{self, ReviewSource},
     repository_widget::{
-        self, ClipboardOp, CompletionTarget, EditorAction, EditorEdit, LspIntent, RepositoryAction,
-        RepositoryFile, RepositoryRuntime,
+        self, ClipboardOp, CompletionTarget, EditorAction, EditorEdit, LspIntent, OldPath,
+        RepositoryAction, RepositoryFile, RepositoryRuntime,
     },
     sidebar::{
         self, ActiveWorktreeKey, FileCommand, FileSearch, MutationKind, SidebarAction,
@@ -1828,12 +1828,8 @@ impl Editor {
                 path: path.as_path().to_owned(),
                 staged: staged.is_some(),
                 unstaged: unstaged.is_some(),
-                staged_old_path: staged
-                    .and_then(|row| row.entry.old_path.as_ref())
-                    .map(|old| old.as_path().to_owned()),
-                unstaged_old_path: unstaged
-                    .and_then(|row| row.entry.old_path.as_ref())
-                    .map(|old| old.as_path().to_owned()),
+                staged_old_path: staged.and_then(|row| OldPath::from_changed_path(&row.entry)),
+                unstaged_old_path: unstaged.and_then(|row| OldPath::from_changed_path(&row.entry)),
                 ..Default::default()
             }
         };
