@@ -885,6 +885,99 @@ fn unstaging_a_copy_keeps_the_sources_own_staged_version() {
     assert_eq!(fixture.porcelain(), "MM source.txt\n?? copy.txt");
 }
 
+/// A copy recorded with intent to add, beside a source with a staged and a
+/// further unstaged version of its own: what the stage and discard tests act on.
+fn unstaged_copy_beside_an_edited_source() -> Option<Fixture> {
+    let fixture = Fixture::new()?;
+    fixture.git_in_work(&["config", "status.renames", "copies"]);
+    let original = b"line1\nline2\nline3\nline4\nline5\n";
+    fixture.write("source.txt", original);
+    fixture.commit_all("initial");
+    fixture.write("source.txt", b"line1\nline2\nline3\nline4\nstaged\n");
+    fixture.git_in_work(&["add", "source.txt"]);
+    fixture.write("source.txt", b"line1\nline2\nline3\nline4\nworktree\n");
+    fixture.write("copy.txt", original);
+    fixture.git_in_work(&["add", "--intent-to-add", "copy.txt"]);
+    Some(fixture)
+}
+
+fn unstaged_copy_selection(fixture: &Fixture) -> Vec<PathSelection> {
+    let snapshot = fixture.snapshot();
+    let copy = entry(&snapshot, ChangeArea::Unstaged, "copy.txt");
+    assert_eq!(copy.kind, ChangeKind::Copied);
+    assert_eq!(copy.old_path, Some(path("source.txt")));
+    vec![PathSelection::from_changed_path(copy)]
+}
+
+/// Staging a copy stages the copy, not the source's unrelated working edits.
+#[test]
+fn staging_a_copy_leaves_the_sources_working_edits_unstaged() {
+    let Some(fixture) = unstaged_copy_beside_an_edited_source() else {
+        return;
+    };
+    let selection = unstaged_copy_selection(&fixture);
+    let outcome = fixture
+        .service()
+        .stage(
+            &StageRequest {
+                worktree: fixture.work(),
+                selection,
+            },
+            &CancellationToken::new(),
+        )
+        .expect("stage");
+    assert_eq!(
+        outcome,
+        MutationOutcome::Applied {
+            paths: vec![path("copy.txt")]
+        }
+    );
+    assert_eq!(
+        fixture.text(&["show", ":source.txt"]),
+        "line1\nline2\nline3\nline4\nstaged"
+    );
+    assert_eq!(
+        fixture.text(&["show", ":copy.txt"]),
+        "line1\nline2\nline3\nline4\nline5"
+    );
+}
+
+/// Discarding a copy's working change must not throw away the source's own
+/// working edits, which exist nowhere else.
+#[test]
+fn discarding_a_copy_keeps_the_sources_working_edits() {
+    let Some(fixture) = unstaged_copy_beside_an_edited_source() else {
+        return;
+    };
+    let selection = unstaged_copy_selection(&fixture);
+    let outcome = fixture
+        .service()
+        .discard(
+            &DiscardRequest {
+                worktree: fixture.work(),
+                tracked: selection,
+                untracked: Vec::new(),
+                confirmed: true,
+            },
+            &CancellationToken::new(),
+        )
+        .expect("discard");
+    assert_eq!(
+        outcome,
+        MutationOutcome::Applied {
+            paths: vec![path("copy.txt")]
+        }
+    );
+    assert_eq!(
+        fs::read(fixture.work().join("source.txt")).unwrap(),
+        b"line1\nline2\nline3\nline4\nworktree\n"
+    );
+    assert_eq!(
+        fixture.text(&["show", ":source.txt"]),
+        "line1\nline2\nline3\nline4\nstaged"
+    );
+}
+
 /// A `pre-commit` hook can leave a process outside Git's process group holding
 /// the stdout and stderr the executor reads. The process group signalled at the
 /// deadline cannot reach it, so nothing will ever close those pipes — and the
