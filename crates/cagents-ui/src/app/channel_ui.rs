@@ -1436,7 +1436,7 @@ impl Cagents {
     ///
     /// A rename made here counts before the registry confirms it. Until
     /// then, a model the registry sent before the rename shows the old title.
-    fn channel_is_named(&self, id: ChannelId) -> bool {
+    pub(super) fn channel_is_named(&self, id: ChannelId) -> bool {
         self.channel_ui.named.contains(&id)
             || self.durable.channels.iter().any(|channel| {
                 channel.id == id
@@ -1448,6 +1448,11 @@ impl Cagents {
     /// Records that the person named channel `id` in this window.
     pub(super) fn note_channel_named(&mut self, id: ChannelId) {
         self.channel_ui.named.insert(id);
+    }
+
+    /// Records that channel `id` went back to its automatic name.
+    pub(super) fn note_channel_unnamed(&mut self, id: ChannelId) {
+        self.channel_ui.named.remove(&id);
     }
 
     /// Whether `id` holds nothing a person could lose with it, as this window

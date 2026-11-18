@@ -107,6 +107,13 @@ pub(super) fn verifying() -> bool {
     VERIFYING.get()
 }
 
+/// Whether the last outermost update reached its projection, rather than
+/// returning from its handler before it.
+#[cfg(test)]
+pub(super) fn projected() -> bool {
+    PROJECTED.get()
+}
+
 /// A map's entries as text, ordered by their text, so two maps holding the
 /// same entries read the same whatever order they iterate in.
 pub(super) fn sorted_entries<K: Debug, V: Debug>(map: impl IntoIterator<Item = (K, V)>) -> String {

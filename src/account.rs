@@ -2350,7 +2350,10 @@ mod credential_guard {
     // Only this complete boolean request expression is permitted. Reading
     // that field or supplying credential values remains forbidden.
     fn without_native_refresh_request(file: &std::path::Path, text: String) -> String {
-        if file.ends_with("src/chat/protocol/codex.rs") {
+        // The adapter sends the request, and its tests assert that it does.
+        if file.ends_with("src/chat/protocol/codex.rs")
+            || file.ends_with("src/chat/protocol/codex/tests.rs")
+        {
             let request = ["json!({\"refresh", "Token\":true})"].concat();
             text.replace(&request, "json!({\"provider-refresh-option\":true})")
         } else {
