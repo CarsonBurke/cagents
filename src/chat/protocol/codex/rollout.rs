@@ -7,7 +7,7 @@
 //! items, which carry exit codes and edited paths; turns written before Codex
 //! recorded turn items fall back to the raw calls. One rollout can hold both:
 //! a newer Codex appends to a conversation an older one began, and a forked
-//! thread replays its parent's raw calls before its first turn.
+//! thread replays its parent's turns with their raw calls alone.
 
 use std::{
     io::{BufRead, BufReader, Read},
@@ -181,6 +181,7 @@ pub(crate) fn parse(reader: impl Read) -> Vec<Item> {
 /// `exec` call can run several commands. A turn with any turn item is
 /// therefore read from its turn items alone, and a turn without one, written
 /// by an older Codex or replayed from a parent thread, from its raw calls.
+/// Turns begin at `task_started`; an interrupted turn ends at the next one.
 #[derive(Default)]
 struct RawTurn {
     calls: Vec<(usize, Item)>,
@@ -553,9 +554,12 @@ mod tests {
         let started = json!({"type":"event_msg","payload":{"type":"task_started"}});
         let raw = |name: &str| json!({"type":"response_item","payload":{"type":"custom_tool_call","name":name,"input":name}});
         let rollout = lines(&[
-            // A forked thread's replayed parent history, before its first turn.
+            // A forked thread's replayed parent turn, interrupted mid-call.
+            started.clone(),
             message("user", "Replayed request"),
             raw("replayed"),
+            raw("replayed again"),
+            json!({"type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted"}}),
             // A turn an older Codex wrote: raw calls alone.
             started.clone(),
             message("user", "Run the old checks"),
@@ -589,6 +593,7 @@ mod tests {
                 ItemContent::Text { text, .. } => text.clone(),
                 ItemContent::Tool { name, .. } => format!("tool {name}"),
                 ItemContent::Command { command, .. } => format!("command {command}"),
+                ItemContent::Delivery { summary, .. } => summary.clone(),
                 other => panic!("{other:?}"),
             })
             .collect();
@@ -597,6 +602,8 @@ mod tests {
             [
                 "Replayed request",
                 "tool replayed",
+                "tool replayed again",
+                "Turn interrupted",
                 "Run the old checks",
                 "tool older",
                 "Old checks pass.",
