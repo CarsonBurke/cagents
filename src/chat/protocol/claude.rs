@@ -488,34 +488,33 @@ impl ScopedId {
 }
 
 /// The tools whose call can start a conversation of its own, which Claude
-/// Code forwards under that call: an agent, by its current or former name,
-/// and a skill that forks.
-const SPAWNING_TOOLS: &[&str] = &["Agent", "Task", "Skill"];
+/// Code forwards under that call: an agent, by its current or former name, a
+/// message that resumes one, and a skill that forks.
+const SPAWNING_TOOLS: &[&str] = &["Agent", "Task", "SendMessage", "Skill"];
 
-/// How many nested spawning calls are remembered. They are agents and forked
+/// How many nested calls or tasks are remembered. They are agents and forked
 /// skills only, so this outlasts any team's helpers by far while bounding a
 /// conversation that runs for weeks.
-const MAX_NESTED_CALLS: usize = 8 * MAX_TOOLS;
+const MAX_NESTED: usize = 8 * MAX_TOOLS;
 
-/// The calls, oldest first, that started a conversation inside one of this
-/// conversation's agents.
+/// IDs, oldest first, of what runs inside one of this conversation's agents.
 #[derive(Default)]
-struct NestedCalls {
+struct NestedIds {
     known: HashSet<String>,
     order: VecDeque<String>,
 }
 
-impl NestedCalls {
-    fn contains(&self, call: &str) -> bool {
-        self.known.contains(call)
+impl NestedIds {
+    fn contains(&self, id: &str) -> bool {
+        self.known.contains(id)
     }
 
-    fn insert(&mut self, call: &str) {
-        if call.is_empty() || !self.known.insert(call.to_owned()) {
+    fn insert(&mut self, id: &str) {
+        if id.is_empty() || !self.known.insert(id.to_owned()) {
             return;
         }
-        self.order.push_back(call.to_owned());
-        if self.order.len() > MAX_NESTED_CALLS
+        self.order.push_back(id.to_owned());
+        if self.order.len() > MAX_NESTED
             && let Some(oldest) = self.order.pop_front()
         {
             self.known.remove(&oldest);
@@ -781,7 +780,13 @@ struct Claude {
     /// naming that call; they are a worker's helpers, never children of this
     /// conversation. Kept apart from the tool cache, which a busy team of
     /// workers turns over long before their helpers finish.
-    nested_calls: NestedCalls,
+    nested_calls: NestedIds,
+    /// The tasks of those helpers. Their lifecycle frames reach this
+    /// conversation too, the later ones naming only the task.
+    nested_tasks: NestedIds,
+    /// Agents the background level ended before their notice arrived. That
+    /// notice, when it comes, still says how they went.
+    unreported_agents: HashSet<String>,
     /// Every live background task, by task ID, as Claude Code's last
     /// `background_tasks_changed` level reported it in this process; `None`
     /// until the first one. A task that leaves it is no longer running,
@@ -2529,6 +2534,7 @@ impl Claude {
                         }
                     } else if ended.is_none() && !waiting && self.background_agents.contains(&owner)
                     {
+                        self.unreported_agents.insert(owner.clone());
                         self.update_task_agent(
                             &task,
                             Some(&owner),
@@ -2577,7 +2583,8 @@ impl Claude {
     /// Whether a call started a conversation inside one of this
     /// conversation's agents, rather than one of its own.
     fn nested_call(&self, tool: &str) -> bool {
-        self.nested_calls.contains(tool) || self.nested_agent_tool(tool)
+        !self.tools.contains_key(&ScopedId::new(None, tool))
+            && (self.nested_calls.contains(tool) || self.nested_agent_tool(tool))
     }
 
     fn nested_agent_tool(&self, tool: &str) -> bool {
@@ -2609,14 +2616,12 @@ impl Claude {
         started: bool,
     ) -> Result<Option<String>, ()> {
         if reported.is_some_and(|tool| {
-            self.nested_call(tool)
-                && !self.tools.contains_key(&ScopedId::new(None, tool))
-                && self.tools.keys().filter(|key| key.id == tool).count() <= 1
+            self.nested_call(tool) && self.tools.keys().filter(|key| key.id == tool).count() <= 1
         }) {
             // An unscoped lifecycle notice for a helper of a worker cannot
             // promote that helper into a direct child of the lead. The helper
-            // may have left the tool cache; a raw ID that the lead or more
-            // than one transcript also uses is ambiguous and resolves below.
+            // may have left the tool cache; a raw ID that more than one
+            // transcript uses is ambiguous and resolves below.
             return Err(());
         }
         let launched = self
@@ -2698,6 +2703,9 @@ impl Claude {
         step: &mut Step,
     ) -> ToolStatus {
         let Some(tool) = owner else { return status };
+        // The level ended this agent unseen; its notice now says how it went.
+        let reported = (started || ended.is_some_and(|ended| ended != ToolStatus::Ended))
+            && self.unreported_agents.remove(tool);
         let background = self.background_agents.contains(tool)
             || self
                 .agent_calls
@@ -2761,6 +2769,7 @@ impl Claude {
         // The child's own result already settled this Agent with its exact
         // diagnostic. Repeating the same terminal status would clear it.
         let settled = !started
+            && !reported
             && ended.is_some()
             && !self.background_agents.contains(tool)
             && !self.restarted_agents.iter().any(|known| known == tool)
@@ -2777,9 +2786,9 @@ impl Claude {
                 model: None,
                 waiting: None,
                 // A new run or a sign of life replaces what the last run said.
-                detail: detail
-                    .map(str::to_owned)
-                    .or_else(|| (started || self.waiting_agents.contains(tool)).then(String::new)),
+                detail: detail.map(str::to_owned).or_else(|| {
+                    (started || reported || self.waiting_agents.contains(tool)).then(String::new)
+                }),
                 id: tool.into(),
                 kind: String::new(),
                 description: String::new(),
@@ -6726,11 +6735,22 @@ impl Claude {
             "background_tasks_changed" => self.background_level(frame, step),
             "task_started" | "task_progress" | "task_notification" | "task_updated" => {
                 let task = required(frame, "task_id")?;
+                if self.nested_tasks.contains(task) {
+                    // A worker's helper: its own transcript shows it.
+                    return Ok(());
+                }
                 let started = string(frame, "subtype") == "task_started";
                 let Ok(known_tool) = self.task_agent(task, frame["tool_use_id"].as_str(), started)
                 else {
                     // Contradictory advisory identities do not retarget an
-                    // existing owner or make the conversation fail.
+                    // existing owner or make the conversation fail. A helper's
+                    // later frames name only its task, so remember that too.
+                    if frame["tool_use_id"]
+                        .as_str()
+                        .is_some_and(|tool| self.nested_call(tool))
+                    {
+                        self.nested_tasks.insert(task);
+                    }
                     return Ok(());
                 };
                 let known_tool = known_tool.or_else(|| {

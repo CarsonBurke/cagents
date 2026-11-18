@@ -12949,9 +12949,18 @@ fn nested_agents_at_every_depth_stay_out_of_the_lead_conversation() {
         !format!("{:?}", snapshot.items).contains(LEVEL_THREE),
         "level three's call belongs to level two's transcript"
     );
+    // Nor do the lifecycle frames of the helpers' tasks, which later name
+    // only the task, make rows of their own.
+    for helper in ["a98e0b22772b08ab9", "afe38f7adf887d7e3"] {
+        assert!(
+            !format!("{:?}", snapshot.items).contains(helper),
+            "{helper} is a helper's task"
+        );
+    }
     // The recording ends with level one's completion and an empty background
-    // level: nothing is still working.
+    // level: nothing is still working, and level one finished.
     assert_eq!(agent_counts(&snapshot), (0, 0, 0, 0));
+    assert_eq!(snapshot.subagents[0].status, ToolStatus::Succeeded);
     let command = snapshot
         .items
         .iter()
@@ -12997,7 +13006,8 @@ fn helpers_stay_nested_after_the_tool_cache_turns_over() {
     lead.receive(
         json!({"type":"assistant","uuid":"spawn","parent_tool_use_id":"worker","message":{"id":"m-spawn","role":"assistant",
         "content":[{"type":"tool_use","id":"helper","name":"Agent","input":{"description":"Helper","prompt":"Help"}},
-                   {"type":"tool_use","id":"fork","name":"Skill","input":{"skill":"review"}}]}}),
+                   {"type":"tool_use","id":"fork","name":"Skill","input":{"skill":"review"}},
+                   {"type":"tool_use","id":"resume","name":"SendMessage","input":{"to":"helper","message":"Go on"}}]}}),
     );
     // A busy worker makes far more calls than the tool cache keeps while
     // its helper and forked skill run.
@@ -13008,7 +13018,13 @@ fn helpers_stay_nested_after_the_tool_cache_turns_over() {
             "content":[{"type":"tool_use","id":format!("read-{index}"),"name":"Read","input":{"file_path":"/fixture/a"}}]}}),
         );
     }
-    for (carrier, deeper) in [("helper", "deep"), ("fork", "fork-deep")] {
+    // A worker resuming its helper by message: Claude Code forwards the
+    // helper's conversation under that message's call.
+    for (carrier, deeper) in [
+        ("helper", "deep"),
+        ("fork", "fork-deep"),
+        ("resume", "resume-deep"),
+    ] {
         lead.receive(
             json!({"type":"assistant","uuid":format!("{carrier}-text"),"parent_tool_use_id":carrier,
             "message":{"id":format!("m-{carrier}"),"role":"assistant",
@@ -13030,8 +13046,21 @@ fn helpers_stay_nested_after_the_tool_cache_turns_over() {
         json!({"type":"assistant","uuid":"late-text","parent_tool_use_id":"late",
         "message":{"id":"m-late","role":"assistant","content":[{"type":"text","text":"Late"}]}}),
     );
+    // Its later lifecycle frames name only the task.
+    lead.receive(
+        json!({"type":"system","subtype":"task_updated","uuid":"u","session_id":"00000000-0000-4000-8000-000000000001","task_id":"a-late",
+        "patch":{"status":"completed"}}),
+    );
     assert_eq!(subagent_ids(&lead.snapshot), ["worker"]);
     assert_eq!(agent_counts(&lead.snapshot), (1, 0, 0, 0));
+    assert!(
+        !lead
+            .snapshot
+            .items
+            .iter()
+            .any(|item| item.id.starts_with("claude-task:")),
+        "a helper's task has no row in the lead's transcript"
+    );
 }
 
 #[test]
@@ -13092,6 +13121,14 @@ fn work_that_leaves_the_background_level_without_a_notice_stops_running() {
         "summary":"Background command \"Wait\" completed (exit code 0)"}),
     );
     assert_eq!(command(&lead.snapshot), Some(ToolStatus::Succeeded));
+    // So does the agent's, and the note that nothing said how it went goes.
+    lead.receive(
+        json!({"type":"system","subtype":"task_notification","uuid":"n2","session_id":"00000000-0000-4000-8000-000000000001","task_id":"a-worker",
+        "tool_use_id":"agent","status":"completed","output_file":"/tmp/o2","summary":"Done"}),
+    );
+    let agent = &lead.snapshot.subagents[0];
+    assert_eq!(agent.status, ToolStatus::Succeeded);
+    assert_eq!(agent.detail, "");
 }
 
 #[test]
