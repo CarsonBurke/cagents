@@ -419,27 +419,42 @@ fn save_abandoned_identities(registry: &mut model::Registry) {
             return;
         }
     };
-    match registry.save_checkpoint_identities(&checkpoint.chats) {
-        Ok(saved) => {
-            if !saved.written.is_empty() {
-                tracing::info!(chats = ?saved.written, "saved conversation IDs only the abandoned update recorded");
-            }
-            for chat in saved.unrecoverable {
-                let conversation = checkpoint
-                    .chats
-                    .iter()
-                    .find(|entry| entry.source.id == chat)
-                    .and_then(|entry| entry.launch.session_id.as_deref());
-                tracing::warn!(
-                    %chat,
-                    conversation,
-                    "the chat's pane or agent now shows another process; resume its conversation manually"
-                );
-            }
-        }
+    // A conversation whose native holder still runs is the holder's to
+    // name: its reattachment saves the identity it confirmed, through the
+    // lineage it authenticates.
+    let held: std::collections::BTreeSet<_> = match crate::daemon::holder_registry::observed(
+        crate::daemon::holder_registry::Kind::Native,
+    ) {
+        Ok(records) => records.into_iter().map(|record| record.terminal).collect(),
         Err(error) => {
-            tracing::warn!(%error, "cannot save the abandoned update's conversation IDs");
+            tracing::warn!(%error, "cannot tell which abandoned conversations still have a holder; their IDs were not saved");
+            return;
         }
+    };
+    let unheld: Vec<_> = checkpoint
+        .chats
+        .iter()
+        .filter(|chat| !held.contains(&chat.source.id))
+        .cloned()
+        .collect();
+    let saved = registry.save_checkpoint_identities(&unheld);
+    if !saved.written.is_empty() {
+        tracing::info!(chats = ?saved.written, "saved conversation IDs only the abandoned update recorded");
+    }
+    for chat in saved.unrecoverable {
+        let conversation = checkpoint
+            .chats
+            .iter()
+            .find(|entry| entry.source.id == chat)
+            .and_then(|entry| entry.launch.session_id.as_deref());
+        tracing::warn!(
+            %chat,
+            conversation,
+            "the chat's pane or agent now shows another process; resume its conversation manually"
+        );
+    }
+    for (chat, error) in saved.failed {
+        tracing::warn!(%chat, %error, "cannot save the abandoned update's ID for this chat; the next start tries again");
     }
 }
 

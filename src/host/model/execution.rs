@@ -42,6 +42,9 @@ pub(in crate::host) struct IdentityWriteback {
     /// Chats an open agent or pane shows as another process without an ID,
     /// so the checkpoint's ID could not be attributed to it.
     pub unrecoverable: Vec<crate::model::TerminalId>,
+    /// Chats whose agent or pane could not be read or written; the next
+    /// start tries them again.
+    pub failed: Vec<(crate::model::TerminalId, String)>,
 }
 
 /// An identity-only projection: `replacement` is `source` with nothing changed
@@ -576,7 +579,7 @@ impl Registry {
     pub(in crate::host) fn save_checkpoint_identities(
         &mut self,
         chats: &[crate::upgrade::handoff::Chat],
-    ) -> Result<IdentityWriteback, String> {
+    ) -> IdentityWriteback {
         let mut outcome = IdentityWriteback::default();
         for chat in chats {
             let Some(confirmed) = chat.launch.session_id.as_deref() else {
@@ -595,13 +598,15 @@ impl Registry {
             if issued.is_empty() {
                 continue;
             }
-            match self.save_checkpoint_identity(chat.source.id, &issued, confirmed)? {
-                Some(true) => outcome.written.push(chat.source.id),
-                Some(false) => {}
-                None => outcome.unrecoverable.push(chat.source.id),
+            // One chat's failure leaves the others to be saved.
+            match self.save_checkpoint_identity(chat.source.id, &issued, confirmed) {
+                Ok(Some(true)) => outcome.written.push(chat.source.id),
+                Ok(Some(false)) => {}
+                Ok(None) => outcome.unrecoverable.push(chat.source.id),
+                Err(error) => outcome.failed.push((chat.source.id, error)),
             }
         }
-        Ok(outcome)
+        outcome
     }
 
     /// `Some(changed)` once every open agent and pane naming the chat holds an
@@ -618,6 +623,14 @@ impl Registry {
             (issued.contains(current) && confirmed_identity_update(current, &learned))
                 .then_some(learned)
         };
+        // A pane showing another process leaves the agent unnamed too, rather
+        // than saving an ID the chat is then reported unable to use.
+        if let Some(current) = super::views::chat_pane_session(&self.db, id)?
+            && current.launch.session_id.is_none()
+            && learn(&current).is_none()
+        {
+            return Ok(None);
+        }
         let mut changed = false;
         if let Some(agent) = self.agent_for_session(id)?
             && !agent.closed
@@ -5877,8 +5890,21 @@ mod tests {
         let known = owned_codex();
         // A chat no pane or agent shows any more.
         let closed = owned_codex();
+        // An agent whose own pane was reset to a draft.
+        request.idempotency_key = "second-request".into();
+        let reset = registry.submit_agent(&Origin::User, &request, 2).unwrap();
+        let reset_chat = owned_codex();
+        registry
+            .bind_agent(
+                reset.agent.id,
+                None,
+                HostedSession::Chat(reset_chat.clone()),
+            )
+            .unwrap();
+        let mut reset_draft = reset_chat.clone();
+        reset_draft.proof = None;
         let thread = |_| uuid::Uuid::new_v4().to_string();
-        let threads: Vec<String> = (0..5).map(thread).collect();
+        let threads: Vec<String> = (0..6).map(thread).collect();
         let pane = |id: CardId, chat: &crate::chat::Session| Pane {
             id,
             title: "Codex".into(),
@@ -5901,7 +5927,17 @@ mod tests {
                 closed: vec![],
             })
             .unwrap();
-        let checkpoint: Vec<_> = [&agent_chat, &plain, &drafted, &known, &closed]
+        registry
+            .apply(&ModelEdit::SeedView {
+                scope: Scope::Channel(reset.agent.channel().unwrap()),
+                panes: vec![pane(
+                    CardId::from_uuid(reset.agent.id.as_uuid()),
+                    &reset_draft,
+                )],
+                closed: vec![],
+            })
+            .unwrap();
+        let checkpoint: Vec<_> = [&agent_chat, &plain, &drafted, &known, &closed, &reset_chat]
             .into_iter()
             .zip(&threads)
             .map(|(source, thread)| handoff::Chat {
@@ -5911,12 +5947,13 @@ mod tests {
             })
             .collect();
 
-        let saved = registry.save_checkpoint_identities(&checkpoint).unwrap();
+        let saved = registry.save_checkpoint_identities(&checkpoint);
         assert_eq!(
             saved,
             IdentityWriteback {
                 written: vec![agent_chat.id, plain.id],
-                unrecoverable: vec![drafted.id],
+                unrecoverable: vec![drafted.id, reset_chat.id],
+                failed: Vec::new(),
             }
         );
         let learned = with_thread(&agent_chat, &threads[0]);
@@ -5929,12 +5966,19 @@ mod tests {
         assert_eq!(shown(plain.id), Some(with_thread(&plain, &threads[1])));
         assert_eq!(shown(drafted.id), Some(draft));
         assert_eq!(shown(known.id), Some(with_thread(&known, &threads[3])));
+        // Its agent is left as unnamed as the pane that reopens it.
+        assert_eq!(
+            registry.agent(reset.agent.id).unwrap().session,
+            Some(HostedSession::Chat(reset_chat.clone()))
+        );
+        assert_eq!(shown(reset_chat.id), Some(reset_draft));
         // Every later start reads the same archive and changes nothing.
         assert_eq!(
-            registry.save_checkpoint_identities(&checkpoint).unwrap(),
+            registry.save_checkpoint_identities(&checkpoint),
             IdentityWriteback {
                 written: Vec::new(),
-                unrecoverable: vec![drafted.id],
+                unrecoverable: vec![drafted.id, reset_chat.id],
+                failed: Vec::new(),
             }
         );
     }
