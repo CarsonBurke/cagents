@@ -16,6 +16,7 @@ person.
 | A chat that answers offline, with tools, subagents, errors or crashes | The synthetic Claude provider, [`tests/fixtures/chat-composer-claude.sh`](chat-composer-fixture.md) |
 | GitHub availability, project avatars or a worktree's pull request in the sidebar, offline | The fixture's forge, [`tests/fixtures/fixture-gh.sh`](#an-offline-github), switched on by `home/.config/fixture-forge` |
 | A saved Claude conversation damaged by a crash and a huge tool output, to resume | [`tests/fixtures/claude-damaged-history.py`](../tests/fixtures/claude-damaged-history.py)` PROJECT`, run in a session's fixture with `scripts/native-evidence env python3 ...`; it writes the transcript under the fixture HOME's `.claude` |
+| A chat whose inspector lists the pull requests and worktrees it worked on | [`tests/fixtures/conversation-work.py`](#conversation-work), run through `scripts/native-evidence env python3 ...` before starting a Claude chat |
 | A long saved chat for paging backward and forward | [`tests/fixtures/claude-long-history.py`](../tests/fixtures/claude-long-history.py)` PROJECT`, run through `scripts/native-evidence env python3 ...`; 260 numbered exchanges exceed the retained history window |
 | A Codex chat that answers offline, with tool rows, subagent errors or terminal escapes | A [Codex peer](#an-offline-codex), installed by `native-evidence start SIDE --codex PEER` |
 | Real Codex app-server ownership, saved-history loading or socket behaviour | [An isolated real executable](#a-real-codex-in-the-fixture), selected by `native-evidence start SIDE --codex-executable /absolute/path/to/codex` |
@@ -88,6 +89,120 @@ The generator writes under `HOME/.claude`; always run it through
 `native-evidence env`, which supplies the private fixture HOME. Stop and
 `save-seed` after setup to reuse exactly the same conversation on both sides.
 
+## Conversation work
+
+A chat pane's inspector lists the work its conversation did: the pull
+requests it created, pushed, edited or updated, the worktrees it edited, and
+the pull requests it only mentioned. The daemon reads these from the
+provider's own transcript and asks the forge about each.
+[`tests/fixtures/conversation-work.py`](../tests/fixtures/conversation-work.py)
+prepares a fixture so that the next Claude chat there has all of them. Run it
+in a session before starting the chat; it takes no arguments:
+
+```sh
+scripts/native-evidence env python3 "$PWD/tests/fixtures/conversation-work.py"
+```
+
+It adds three worktrees of the fixture project under `.worktrees/`, gives the
+project the remote `https://github.com/octo-org/fixture-app`, turns the
+[forge](#an-offline-github) on with five seeded pull requests, and writes
+[`conversation-work/frames.jsonl`](../tests/fixtures/conversation-work/frames.jsonl)
+as the provider's `fixture-frames.jsonl`, with this fixture's paths. Its turn
+replays Claude Code `Edit` and `Bash` calls and their output, in the shape
+Claude Code records them:
+
+| Work row | What the transcript did | Forge state |
+| --- | --- | --- |
+| #41 Key the response cache by locale, **Created**, worktree `fix/cache-key` | edited it, committed, pushed and ran `gh pr create`, then left a test uncommitted | open; checks build passed, lint failed, test running |
+| #38 Bound the retry budget, **Pushed**, worktree `feat/retry-budget` | edited it, committed and pushed its branch | open, approved, every check passed |
+| #35 Drop the legacy cache flag, **Updated** | `gh pr merge 35` | merged |
+| `docs/locale-notes`, a worktree with no pull request | edited `docs/locales.md`, uncommitted | |
+| #12 and #29, **Mentioned** | named by URL and by `#29` in prose | merged; closed |
+
+Every Claude turn in the fixture replays the same frames until
+`home/.claude/fixture-frames.jsonl` is removed. Running the script again
+rewrites the seeds and frames and keeps the worktrees. Commit IDs differ
+between sessions, since the fixture project's first commit does, so the
+pushed range in the retry-budget output differs between Before and After.
+`host::work::transcript::tests` checks that the daemon reads from these frames
+the pull requests, branches and edited directories the table names, with
+their relations.
+
+Mentioned pull requests are listed only once **Show mentioned pull requests**
+is on in Settings; it is off by default.
+
+To see the list arrive late, set a [forge delay](#an-offline-github) of
+3 seconds right after preparing the fixture, before the project is opened, so
+the app knows none of its pull requests yet; the turn's replay asks GitHub
+nothing. The inspector then shows only Source control for several seconds
+before the Work list replaces it, and since every `gh` call waits, the settled
+list takes a minute or two. The steps below capture that loading frame
+(`work-loading`), the settled list (`work-populated`) and the list with
+Mentioned expanded (`work-mentioned`), then remove the delay. The inspector may
+already be open when the chat opens, so they toggle it only when it is not:
+
+```sh
+# List mentioned pull requests too; the setting is off by default.
+evidence drive key ctrl+comma >/dev/null
+evidence drive wait 'App theme' --timeout 15 >/dev/null
+# OCR splits the search field's placeholder unpredictably; its icon sits at its left.
+search=$(evidence drive --json observe | python3 -c '
+import json, sys
+runs = json.load(sys.stdin)["runs"]
+field = min((r for r in runs if "earch" in r["text"] or r["text"].strip() == "settings"), key=lambda r: r["y"])
+print("{},{}".format(round(field["x"] + field["width"] / 2), round(field["y"] + field["height"] / 2)))')
+evidence drive click "$search" >/dev/null
+evidence drive type Mentioned >/dev/null
+evidence drive wait 'Show mentioned pull requests' --timeout 10 >/dev/null
+evidence drive click 'Show mentioned pull requests' >/dev/null
+# Settings are saved in the background.
+evidence env sh -c 'for _ in $(seq 10); do grep -qsx "show_mentioned_pull_requests = true" "$XDG_CONFIG_HOME"/cagents-development*/settings.toml && exit 0; sleep 1; done; exit 1'
+
+evidence env python3 "$tool/tests/fixtures/conversation-work.py" >/dev/null
+# From here GitHub answers 3 s late, so nothing about the project's pull
+# requests is known before the inspector opens; the replay asks GitHub nothing.
+evidence env sh -c 'echo 3 >"$CAGENTS_EVIDENCE_FIXTURE/home/.config/fixture-forge-delay"'
+evidence cli project open '{fixture}/project' >/dev/null
+channel=$(evidence cli --json channel spawn --repository '{fixture}/project' --title 'Locale cache work' |
+    python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["channel"]["id"])')
+evidence cli --json agent spawn --provider claude --model haiku --surface chat \
+    --repository '{fixture}/project' --channel "$channel" \
+    --prompt 'Key the response cache by locale, finish the retry budget and land the legacy flag cleanup.' >/dev/null
+# The turn has replayed once its answer is in the transcript.
+evidence env sh -c 'for _ in $(seq 60); do grep -qs work-answer "$HOME"/.claude/projects/*/*.jsonl && exit 0; sleep 1; done; exit 1'
+
+# Open the chat from its sidebar row.
+evidence drive wait 'Locale cache work' --timeout 30 >/dev/null
+evidence drive click 'Locale cache work' >/dev/null
+evidence drive wait 'Picking' --timeout 30 >/dev/null
+evidence drive move 1,1 >/dev/null
+# Open the pane's inspector (Ctrl+Shift+I) unless it already is.
+observed=$(evidence drive observe)
+if ! grep -Eq 'Source control|Work [0-9]' <<<"$observed"; then
+    evidence drive key ctrl+shift+i >/dev/null
+fi
+evidence shot work-loading
+grep -q 'Bound the retry budget' <<<"$(evidence drive observe)" &&
+    echo 'warning: the Work list may have been in place for work-loading' >&2
+# Rows arrive one lookup at a time; with every answer 3 s late the settled
+# list takes a minute or two.
+evidence drive wait 'Bound the retry budget' --timeout 180 >/dev/null
+evidence drive wait 'Mentioned 2' --timeout 120 >/dev/null
+sleep 3
+evidence shot work-populated
+evidence drive click 'Mentioned' >/dev/null
+sleep 1
+evidence drive move 1,1 >/dev/null
+evidence shot work-mentioned
+# A seed saved after this should not keep GitHub slow.
+evidence env sh -c 'rm -f "$CAGENTS_EVIDENCE_FIXTURE/home/.config/fixture-forge-delay"'
+```
+
+`$tool` is the checkout `pair` runs its tool from, which must contain this
+script. The seeded chat is a live conversation, so it needs no saved seed; a
+`save-seed` after the turn keeps its worktrees and forge, but the chat itself
+reopens only while its provider home is the seed's.
+
 ## A scoped UI caller
 
 Add `start SIDE --ui-scoped-fixture`, or pass `--ui-scoped-fixture` to a remote
@@ -125,7 +240,7 @@ no pull requests and no review requests:
 | `gh repo view --json nameWithOwner,url` | the repository of the checkout's first github.com remote, in gh's order (`upstream`, `github`, `origin`, then the rest), or gh's own error when there is none |
 | `gh pr list ... --json FIELDS` | `[]`, or the seeded pull requests below; `--author @me` means `fixture` |
 | `gh pr view N` | a seeded pull request, or gh's error for an unknown number |
-| `gh pr checks N` | gh's `no checks reported` for a seeded pull request, which the app reads as no checks |
+| `gh pr checks N` | gh's `no checks reported` for a seeded pull request; a seed's checks reach the app through `statusCheckRollup` in `gh pr view` and the queries below instead |
 | `gh api graphql` | empty pages for the review-request poll, the pull request browser and its search; not found for a pull request's own queries |
 | `gh api repos/OWNER/NAME/issues?creator=LOGIN&...` | the creator's most recently updated seeded pull request, with an `Etag` that changes when that row does, and gh's `HTTP 304` failure when `If-None-Match` still matches it |
 | `gh api repos/OWNER/NAME/releases` | `[]`; any other REST endpoint is `404 Not Found` |
@@ -149,6 +264,14 @@ appends epoch time, parent PID and operation label to
 labels name the operation and repository, and REST labels the method and path,
 so daemon Work polling can be counted separately from sidebar and branch
 lookups. No query bodies or variables are recorded.
+
+To see what the app shows while GitHub is slow, write a number of seconds,
+such as `3`, to `home/.config/fixture-forge-delay`. Every answer then waits
+that long first, until the file is removed; anything but a number fails each
+call, naming the file. For a conversation's Work list, keep it
+around 3 seconds, well under 5: the daemon gives up a pull request lookup
+after 5 seconds, including the fixture's own work, and waits 30 seconds or
+more before asking again.
 
 Like GitHub, the issues probe moves only with a pull request's `updatedAt` and
 the fields of the rows it returns (`per_page` of them, newest first). To make
