@@ -10263,7 +10263,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("the daemon did not answer within 6."),
+                .contains("the daemon did not answer within 6 s"),
             "{error}"
         );
         server.join().unwrap();
