@@ -147,14 +147,14 @@ impl Homes {
     }
 
     /// Host short admission must never wait behind another process's flock:
-    /// a held lock refuses with [`ListHeld::Lifecycle`](super::registry::ListHeld).
+    /// a held lock refuses with [`ListHeld::Lifecycle`](super::remote::ListHeld).
     pub(crate) fn try_lifecycle_lock(&self) -> io::Result<crate::instance::OwnedLock> {
         crate::secure_file::prepare_private_directory(&self.root)?;
         crate::instance::owned_lock(
             &self.root.join(".lifecycle.lock"),
             libc::LOCK_EX | libc::LOCK_NB,
         )
-        .map_err(|error| super::registry::ListHeld::Lifecycle.from_flock(error))
+        .map_err(|error| super::remote::ListHeld::Lifecycle.from_flock(error))
     }
 
     fn provider_directory(&self, provider: Provider) -> PathBuf {

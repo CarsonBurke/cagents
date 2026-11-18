@@ -1969,7 +1969,7 @@ pub(crate) mod tests {
     }
     #[test]
     fn a_creation_refused_by_a_held_account_list_leaves_nothing_behind() {
-        use crate::account::registry::ListHeld;
+        use crate::account::remote::ListHeld;
         let (_root, homes, store, _host, reservation) = creating(Provider::Codex);
         let reservation = reservation.with_patience(std::time::Duration::from_millis(30));
         let (_, key) = reservation.create.unwrap();
@@ -2050,7 +2050,7 @@ pub(crate) mod tests {
         assert!(refusal.retryable);
         assert_eq!(
             refusal.message,
-            crate::account::registry::ListHeld::Registry.to_string()
+            crate::account::remote::ListHeld::Registry.to_string()
         );
         assert!(!reservations_active(&host));
         std::thread::scope(|scope| {

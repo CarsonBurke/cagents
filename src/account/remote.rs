@@ -155,6 +155,55 @@ pub enum Settled {
     Abandoned(Option<super::registry::Registry>),
 }
 
+/// Another process held one of the account list's locks when the daemon
+/// asked for it without waiting. Nothing was read or changed, so the same
+/// request can be made again; [`patiently`](super::registry::patiently) does so for a moment first.
+///
+/// Carried as the source of an [`std::io::ErrorKind::WouldBlock`] error, so a
+/// caller that only reports the error still shows this sentence rather than
+/// the operating system's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ListHeld {
+    /// The registry lock: another window, or another account operation of
+    /// the daemon, is writing the list.
+    #[error("Another window is saving the account list. Try again in a moment.")]
+    Registry,
+    /// The account lifecycle lock. Account changes hold it, and so does every
+    /// start of an agent or terminal on an account cagents manages, for as
+    /// long as its process takes to start.
+    #[error(
+        "Another window is changing accounts, or an agent is starting on one. Try again in a moment."
+    )]
+    Lifecycle,
+}
+
+impl ListHeld {
+    /// `error` from a non-blocking `flock` of this lock, as this refusal
+    /// when the lock was held; any other failure as it stands.
+    #[cfg(any(feature = "ui", feature = "host"))]
+    pub(crate) fn from_flock(self, error: std::io::Error) -> std::io::Error {
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            std::io::Error::new(std::io::ErrorKind::WouldBlock, self)
+        } else {
+            error
+        }
+    }
+
+    /// This refusal, if `error` is one.
+    #[cfg(feature = "host")]
+    pub(crate) fn of(error: &std::io::Error) -> Option<Self> {
+        error.get_ref()?.downcast_ref().copied()
+    }
+
+    /// The refusal a daemon's reply carries, if it is this one: retryable,
+    /// in this refusal's own words.
+    pub(crate) fn recognize(message: &str, retryable: bool) -> Option<Self> {
+        [Self::Registry, Self::Lifecycle]
+            .into_iter()
+            .find(|held| retryable && message == held.to_string())
+    }
+}
+
 #[cfg(feature = "host")]
 const NO_HOME: &str = "This account's files are no longer on this device";
 /// A home the sign-in left behind - it duplicated a listed account, or was
@@ -187,7 +236,7 @@ pub(crate) enum LifecycleError {
     /// Another process held the account list's lock past the daemon's
     /// patience. Nothing changed, so the same request can be sent again.
     #[error(transparent)]
-    ListHeld(super::registry::ListHeld),
+    ListHeld(ListHeld),
     #[error("{0}")]
     Failed(String),
 }
@@ -195,7 +244,7 @@ pub(crate) enum LifecycleError {
 #[cfg(feature = "host")]
 impl From<std::io::Error> for LifecycleError {
     fn from(error: std::io::Error) -> Self {
-        match super::registry::ListHeld::of(&error) {
+        match ListHeld::of(&error) {
             Some(held) => Self::ListHeld(held),
             None => Self::Failed(error.to_string()),
         }
@@ -1017,7 +1066,7 @@ mod tests {
 
     #[test]
     fn a_held_account_list_refuses_every_change_retryably_and_changes_nothing() {
-        use crate::account::registry::ListHeld;
+        use super::ListHeld;
         let list = HeldList::new();
         let before = list.store.load().unwrap();
         let patience = std::time::Duration::from_millis(30);

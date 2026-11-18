@@ -54,7 +54,7 @@ pub(super) use table::tests as table_tests;
 #[cfg(test)]
 pub(super) use table::{forget_cancel_id, forget_confirm_id, forget_item_id};
 
-use crate::control::RequestError;
+use crate::control::{Refusal, RequestError};
 
 fn remote_lifecycle<T: serde::de::DeserializeOwned>(
     operation: account::remote::Operation,
@@ -1187,11 +1187,12 @@ struct Login {
     /// The account a save found this sign-in already listed as, whose
     /// pending entry is still to be abandoned once the daemon admits it.
     duplicate_of: Option<AccountId>,
-    /// The warning that a busy daemon refused the request now waiting was
-    /// posted. Its retries do not post it again, so a dismissal stands.
-    busy_noticed: bool,
+    /// The warning that the daemon refused the request now waiting before
+    /// doing anything was posted. Its retries do not post it again, so a
+    /// dismissal stands.
+    refusal_noticed: bool,
     /// How many times abandoning the pending entry failed for a reason other
-    /// than a busy daemon; it is sent again until [`LOGIN_ATTEMPTS`].
+    /// than such a refusal; it is sent again until [`LOGIN_ATTEMPTS`].
     discard_failures: u32,
 }
 
@@ -1200,10 +1201,11 @@ struct Login {
 const LOGIN_ATTEMPTS: u32 = 3;
 /// How long after a failed question the home is asked again, per attempt.
 const LOGIN_RETRY: Millis = 5_000;
-/// How long after a busy daemon refused a sign-in's request it is asked
-/// again. The refusal did nothing and is not a failure, so this neither
-/// grows nor counts against [`LOGIN_ATTEMPTS`].
-const LOGIN_BUSY_RETRY: Millis = 2_000;
+/// How long after the daemon refused a sign-in's request before doing
+/// anything - it was busy, or the account list was held - it is asked again.
+/// The refusal did nothing and is not a failure, so this neither grows nor
+/// counts against [`LOGIN_ATTEMPTS`].
+const LOGIN_REFUSED_RETRY: Millis = 2_000;
 /// How old a pending sign-in with no terminal in this window must be before
 /// this window asks its home who it is signed in as.
 const RECOVER_AFTER: Millis = 60 * 60 * 1_000;
@@ -1218,11 +1220,13 @@ enum LoginPhase {
     Settling,
     /// Nothing signed in; the home's pending entry is being abandoned.
     Discarding,
-    /// The home is signed in, and the daemon was too busy to save it; the
-    /// same save is sent again from `next_check`, without asking the home.
+    /// The home is signed in, and the daemon refused to save it before doing
+    /// anything; the same save is sent again from `next_check`, without
+    /// asking the home.
     SaveWaiting,
-    /// Nothing signed in, and the daemon was too busy to abandon the pending
-    /// entry, or abandoning it failed; it is sent again from `next_check`.
+    /// Nothing signed in, and the daemon refused to abandon the pending entry
+    /// before doing anything, or abandoning it failed; it is sent again from
+    /// `next_check`.
     DiscardWaiting,
     /// The callback could not be acquired; retain the row until dismissed.
     CallbackBlocked,
@@ -1259,7 +1263,10 @@ pub struct Restored {
 
 #[derive(Debug, Clone)]
 pub enum Action {
-    RemoteHomeReady(Provider, Result<crate::account::remote::Created, String>),
+    RemoteHomeReady(
+        Provider,
+        Result<crate::account::remote::Created, RequestError>,
+    ),
     RemoteLoaded(u64, Result<crate::device_service::AccountSnapshot, String>),
     RemoteLogin(AccountId, u64, Result<LaunchRecipe, String>),
     Install(Provider),
@@ -1358,11 +1365,12 @@ pub enum Action {
     /// A busy daemon refused to say who a sign-in's home is signed in as;
     /// nothing was asked of the home.
     LoginRefusedBusy(uuid::Uuid),
-    /// A busy daemon refused to abandon the pending entry of a sign-in found
-    /// to be `existing`, an account already listed.
-    LoginDuplicateRefusedBusy {
+    /// The daemon refused, before doing anything, to abandon the pending
+    /// entry of a sign-in found to be `existing`, an account already listed.
+    LoginDuplicateRefused {
         key: uuid::Uuid,
         existing: AccountId,
+        refusal: Refusal,
     },
     /// The daemon's answer for sign-ins whose terminals this window is not
     /// watching: the ones whose terminals have ended.
@@ -3216,7 +3224,17 @@ impl Cagents {
                     );
                     Task::batch([task, self.reload_registry()])
                 }
-                Err(error) => {
+                // Refused before the home was made, so pressing Add again
+                // tries the same thing afresh.
+                Err(RequestError::Refused(refusal)) => {
+                    self.status = Some(TransientNotice::warning(format!(
+                        "{}, so no {} account was added. Try again in a moment.",
+                        refusal.cause(),
+                        provider.label()
+                    )));
+                    Task::none()
+                }
+                Err(RequestError::Failed(error)) => {
                     self.status = Some(TransientNotice::error(error));
                     Task::none()
                 }
@@ -3724,11 +3742,12 @@ impl Cagents {
                     }
                     // Refused before anything was read or added; the form
                     // stays open to add it again.
-                    Err(RequestError::Busy) => {
+                    Err(RequestError::Refused(refusal)) => {
                         self.status = Some(
-                            TransientNotice::warning(
-                                "The cagents daemon was busy finishing another operation, so the account home was not added. Try again in a moment.",
-                            )
+                            TransientNotice::warning(format!(
+                                "{}, so the account home was not added. Try again in a moment.",
+                                refusal.cause()
+                            ))
                             .with_key(NoticeKey::AccountLink),
                         );
                         Task::none()
@@ -3759,11 +3778,15 @@ impl Cagents {
                 {
                     login.phase = LoginPhase::Waiting;
                     login.after_busy = true;
-                    login.next_check = now_ms() + LOGIN_BUSY_RETRY;
+                    login.next_check = now_ms() + LOGIN_REFUSED_RETRY;
                 }
                 Task::none()
             }
-            Action::LoginDuplicateRefusedBusy { key, existing } => {
+            Action::LoginDuplicateRefused {
+                key,
+                existing,
+                refusal,
+            } => {
                 let Some(index) = self
                     .account_ui
                     .logins
@@ -3773,7 +3796,7 @@ impl Cagents {
                     return Task::none();
                 };
                 self.account_ui.logins[index].duplicate_of = Some(existing);
-                self.login_refused_busy(index);
+                self.login_refused(index, refusal);
                 Task::none()
             }
             Action::LoginCallbackBlocked(key) => {
@@ -4035,8 +4058,9 @@ impl Cagents {
                     }
                     // Refused before anything was admitted, so the account
                     // is still listed and still works.
-                    Err(RequestError::Busy) => Some(TransientNotice::warning(format!(
-                        "The cagents daemon was busy finishing another operation, so {} was not removed. Try again in a moment.",
+                    Err(RequestError::Refused(refusal)) => Some(TransientNotice::warning(format!(
+                        "{}, so {} was not removed. Try again in a moment.",
+                        refusal.cause(),
                         name.as_deref().unwrap_or("the account")
                     ))),
                     // Nothing came back to say what changed, so the account
@@ -4670,7 +4694,7 @@ impl Cagents {
                 recovered: !restored,
                 after_busy: false,
                 duplicate_of: None,
-                busy_noticed: false,
+                refusal_noticed: false,
                 discard_failures: 0,
             });
         }
@@ -4771,10 +4795,9 @@ impl Cagents {
                         provider,
                         copy_codex_config,
                     })
-                    .map_err(|error| error.to_string())
                 })
                 .await
-                .map_err(|error| error.to_string())
+                .map_err(|error| RequestError::Failed(error.to_string()))
                 .and_then(|result| result);
                 Message::AccountUi(Action::RemoteHomeReady(provider, result))
             });
@@ -4891,7 +4914,7 @@ impl Cagents {
             recovered: false,
             after_busy: false,
             duplicate_of: None,
-            busy_noticed: false,
+            refusal_noticed: false,
             discard_failures: 0,
         });
         task
@@ -4959,7 +4982,7 @@ impl Cagents {
                 (false, Some(existing)) => {
                     cosmic::task::future(abandon_duplicate(provider, key, existing))
                 }
-                // Only a remote save is refused busy with no duplicate:
+                // Only a remote save is refused with no duplicate:
                 // a local save registers without asking the daemon, and
                 // the abandon of its duplicate is remembered above.
                 (false, None) => register_remote(provider, key),
@@ -5150,10 +5173,10 @@ impl Cagents {
                 .and_then(|result| result);
                 match asked {
                     Ok(outcome) => outcome,
-                    Err(RequestError::Busy) => {
+                    Err(RequestError::Refused(Refusal::Busy)) => {
                         return Message::AccountUi(Action::LoginRefusedBusy(key));
                     }
-                    Err(RequestError::Failed(error)) => Outcome::Failed(error),
+                    Err(error) => Outcome::Failed(error.to_string()),
                 }
             } else {
                 probe::run(account, None, true).await
@@ -5287,12 +5310,12 @@ impl Cagents {
         })
     }
 
-    /// A busy daemon refused the save or discard of the sign-in at `index`
+    /// The daemon refused the save or discard of the sign-in at `index`
     /// before doing anything. The same request is sent again soon without
     /// spending an attempt, and the warning is posted once while it waits.
-    fn login_refused_busy(&mut self, index: usize) {
+    fn login_refused(&mut self, index: usize, refusal: Refusal) {
         let login = &mut self.account_ui.logins[index];
-        login.next_check = now_ms() + LOGIN_BUSY_RETRY;
+        login.next_check = now_ms() + LOGIN_REFUSED_RETRY;
         let discarding = matches!(
             login.phase,
             LoginPhase::Discarding | LoginPhase::CallbackBlocked | LoginPhase::DiscardWaiting
@@ -5302,17 +5325,19 @@ impl Cagents {
         } else {
             LoginPhase::SaveWaiting
         };
-        if std::mem::replace(&mut login.busy_noticed, true) {
+        if std::mem::replace(&mut login.refusal_noticed, true) {
             return;
         }
         let (provider, key) = (login.provider.label(), login.key);
         let notice = if discarding {
             format!(
-                "The cagents daemon was busy finishing another operation, so the unfinished {provider} sign-in was not discarded yet. cagents will try again."
+                "{}, so the unfinished {provider} sign-in was not discarded yet. cagents will try again.",
+                refusal.cause()
             )
         } else {
             format!(
-                "The cagents daemon was busy finishing another operation, so the new {provider} account was not saved yet. cagents will try again."
+                "{}, so the new {provider} account was not saved yet. cagents will try again.",
+                refusal.cause()
             )
         };
         self.status = Some(TransientNotice::warning(notice).with_key(NoticeKey::SignIn(key)));
@@ -5335,14 +5360,14 @@ impl Cagents {
             return Task::none();
         };
         if let Err(error) = &result {
-            if *error == RequestError::Busy {
+            if let RequestError::Refused(refusal) = *error {
                 // Refused before anything was done, so it is sent again soon,
                 // as it stands, and costs none of the sign-in's attempts.
-                self.login_refused_busy(index);
+                self.login_refused(index, refusal);
                 return Task::none();
             }
             let login = &mut self.account_ui.logins[index];
-            login.busy_noticed = false;
+            login.refusal_noticed = false;
             let provider = login.provider.label();
             if matches!(
                 login.phase,
@@ -6600,8 +6625,8 @@ fn register_remote(provider: Provider, key: uuid::Uuid) -> Task<Message> {
 
 /// Abandons only the pending metadata of a sign-in found to be `existing`,
 /// as the daemon's duplicate path does, preserving the home's login and
-/// history. A busy refusal is reported with `existing`, so it can be sent
-/// again without asking the home who it is.
+/// history. A refusal before anything was done is reported with `existing`,
+/// so it can be sent again without asking the home who it is.
 async fn abandon_duplicate(provider: Provider, key: uuid::Uuid, existing: AccountId) -> Message {
     let abandoned = tokio::task::spawn_blocking(move || {
         abandon_home(provider, key, remote_lifecycle::<Settled>)
@@ -6610,9 +6635,11 @@ async fn abandon_duplicate(provider: Provider, key: uuid::Uuid, existing: Accoun
     .map_err(|error| RequestError::Failed(error.to_string()))
     .and_then(|result| result);
     match abandoned {
-        Err(RequestError::Busy) => {
-            Message::AccountUi(Action::LoginDuplicateRefusedBusy { key, existing })
-        }
+        Err(RequestError::Refused(refusal)) => Message::AccountUi(Action::LoginDuplicateRefused {
+            key,
+            existing,
+            refusal,
+        }),
         result => Message::AccountUi(Action::LoginSettled {
             key,
             result: result.map(|registry| Settled::Duplicate { existing, registry }),
@@ -8345,7 +8372,7 @@ mod app_tests {
             recovered: false,
             after_busy: false,
             duplicate_of: None,
-            busy_noticed: false,
+            refusal_noticed: false,
             discard_failures: 0,
         });
         let phase = |app: &Cagents| app.account_ui.logins.first().map(|login| login.phase);
@@ -8470,7 +8497,7 @@ mod app_tests {
             recovered: false,
             after_busy: false,
             duplicate_of: None,
-            busy_noticed: false,
+            refusal_noticed: false,
             discard_failures: 0,
         });
         drop(app.select_worktree("/elsewhere".into(), false));
@@ -8722,7 +8749,7 @@ mod app_tests {
             recovered: false,
             after_busy: false,
             duplicate_of: None,
-            busy_noticed: false,
+            refusal_noticed: false,
             discard_failures: 0,
         });
         let _ = app.select_worktree("/elsewhere".into(), false);
@@ -11850,7 +11877,7 @@ mod app_tests {
             .unwrap();
         let _ = app.update(Message::AccountUi(Action::Removed {
             id: managed.clone(),
-            result: Err(RequestError::Busy),
+            result: Err(RequestError::Refused(Refusal::Busy)),
         }));
         assert!(app.account_ui.account(&managed).is_some());
         assert_eq!(app.account_ui.registry, registry);
@@ -11929,7 +11956,7 @@ mod app_tests {
             recovered: false,
             after_busy: false,
             duplicate_of: None,
-            busy_noticed: false,
+            refusal_noticed: false,
             discard_failures: 0,
         });
         key
@@ -11991,14 +12018,14 @@ mod app_tests {
             for _ in 0..3 {
                 let _ = app.update(Message::AccountUi(Action::LoginSettled {
                     key,
-                    result: Err(RequestError::Busy),
+                    result: Err(RequestError::Refused(Refusal::Busy)),
                 }));
                 let login = &app.account_ui.logins[0];
                 assert_eq!(login.key, key);
                 assert_eq!(login.phase, waiting);
                 assert_eq!(login.attempts, LOGIN_ATTEMPTS);
                 let due = login.next_check - now_ms();
-                assert!(due > 0 && due <= LOGIN_BUSY_RETRY, "{due}");
+                assert!(due > 0 && due <= LOGIN_REFUSED_RETRY, "{due}");
                 // Posted once: a dismissal stands while it waits.
                 let entries = app.notices.recent().collect::<Vec<_>>();
                 assert!(
@@ -12031,9 +12058,10 @@ mod app_tests {
         app.account_ui.logins[0].phase = LoginPhase::Settling;
         app.account_ui.logins[0].attempts = 1;
         for _ in 0..2 {
-            let _ = app.update(Message::AccountUi(Action::LoginDuplicateRefusedBusy {
+            let _ = app.update(Message::AccountUi(Action::LoginDuplicateRefused {
                 key,
                 existing: existing.clone(),
+                refusal: Refusal::Busy,
             }));
             let login = &app.account_ui.logins[0];
             assert_eq!(login.phase, LoginPhase::SaveWaiting);
@@ -12076,7 +12104,7 @@ mod app_tests {
         let login = &app.account_ui.logins[0];
         assert_eq!(login.phase, LoginPhase::Waiting);
         assert!(login.after_busy);
-        assert!(login.next_check <= now_ms() + LOGIN_BUSY_RETRY);
+        assert!(login.next_check <= now_ms() + LOGIN_REFUSED_RETRY);
         let _ = app.verify_login(key);
         assert_eq!(app.account_ui.logins[0].attempts, 2);
         assert!(!app.account_ui.logins[0].after_busy);
@@ -12478,7 +12506,7 @@ mod app_tests {
         assert!(link.is_some());
         let _ = app.update(Message::AccountUi(Action::LinkReady {
             key: uuid::Uuid::new_v4(),
-            result: Err(RequestError::Busy),
+            result: Err(RequestError::Refused(Refusal::Busy)),
         }));
         assert_eq!(app.account_ui.table.link, link);
         assert!(!app.account_ui.table.linking);
@@ -12486,6 +12514,90 @@ mod app_tests {
             notice_messages(&app),
             [
                 "The cagents daemon was busy finishing another operation, so the account home was not added. Try again in a moment."
+            ]
+        );
+    }
+
+    /// Another window held the account list past the daemon's patience, so
+    /// nothing was added, removed or saved. Each notice says that, not that
+    /// the daemon was busy or that the request failed, and keeps the state a
+    /// retry needs.
+    #[test]
+    fn a_held_account_list_refusal_says_so_and_keeps_what_a_retry_needs() {
+        use crate::account::remote::ListHeld;
+        fn refused<T>(held: ListHeld) -> Result<T, RequestError> {
+            Err(RequestError::Refused(Refusal::AccountList(held)))
+        }
+
+        let mut app = context_inspector_test_app(false);
+        let managed = app.account_ui.add_managed_fixture(Provider::Claude, 6);
+        let registry = app.account_ui.registry.clone();
+        let name = app
+            .account_ui
+            .account(&managed)
+            .map(|state| app.account_ui.display_name(state))
+            .unwrap();
+        let _ = app.update(Message::AccountUi(Action::Remove(managed.clone())));
+        let _ = app.update(Message::AccountUi(Action::RemoveConfirm(managed.clone())));
+        let _ = app.update(Message::AccountUi(Action::Removed {
+            id: managed.clone(),
+            result: refused(ListHeld::Registry),
+        }));
+        assert!(app.account_ui.account(&managed).is_some());
+        assert_eq!(app.account_ui.registry, registry);
+        let entries = app.notices.recent().collect::<Vec<_>>();
+        assert!(
+            matches!(entries.as_slice(), [entry] if entry.notice.severity == NoticeSeverity::Warning
+                && entry.notice.message == format!("Another window was saving the account list, so {name} was not removed. Try again in a moment.")),
+            "{:?}",
+            notice_messages(&app)
+        );
+
+        let mut app = context_inspector_test_app(false);
+        let _ = app.update(Message::AccountUi(Action::LinkStart(Provider::Codex)));
+        let link = app.account_ui.table.link.clone();
+        let _ = app.update(Message::AccountUi(Action::LinkReady {
+            key: uuid::Uuid::new_v4(),
+            result: refused(ListHeld::Lifecycle),
+        }));
+        assert_eq!(app.account_ui.table.link, link);
+        assert_eq!(
+            notice_messages(&app),
+            [
+                "Another window was changing accounts, or an agent was starting on one, so the account home was not added. Try again in a moment."
+            ]
+        );
+
+        let mut app = context_inspector_test_app(false);
+        let _ = app.update(Message::AccountUi(Action::RemoteHomeReady(
+            Provider::Codex,
+            refused(ListHeld::Registry),
+        )));
+        let entries = app.notices.recent().collect::<Vec<_>>();
+        assert!(
+            matches!(entries.as_slice(), [entry] if entry.notice.severity == NoticeSeverity::Warning
+                && entry.notice.message == "Another window was saving the account list, so no Codex account was added. Try again in a moment."),
+            "{:?}",
+            notice_messages(&app)
+        );
+        assert!(app.account_ui.logins.is_empty());
+
+        // A save waits and is sent again as it stands, spending no attempt.
+        let mut app = context_inspector_test_app(false);
+        let key = pending_login(&mut app, 105);
+        app.account_ui.logins[0].phase = LoginPhase::Settling;
+        app.account_ui.logins[0].attempts = LOGIN_ATTEMPTS;
+        let _ = app.update(Message::AccountUi(Action::LoginSettled {
+            key,
+            result: refused(ListHeld::Registry),
+        }));
+        let login = &app.account_ui.logins[0];
+        assert_eq!(login.phase, LoginPhase::SaveWaiting);
+        assert_eq!(login.attempts, LOGIN_ATTEMPTS);
+        assert_eq!(
+            notice_messages(&app),
+            [
+                "Another window was saving the account list, so the new Claude Code account was not saved yet. cagents will try again."
             ]
         );
     }
@@ -13883,7 +13995,7 @@ mod app_tests {
             recovered: false,
             after_busy: false,
             duplicate_of: None,
-            busy_noticed: false,
+            refusal_noticed: false,
             discard_failures: 0,
         });
         let requests = Arc::new(Mutex::new(Vec::new()));

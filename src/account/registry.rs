@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::{Account, AccountHome, AccountId, Identity, home::Homes};
+use super::{Account, AccountHome, AccountId, Identity, home::Homes, remote::ListHeld};
 use crate::agent::Provider;
 use crate::model::ProjectId;
 
@@ -36,45 +36,6 @@ const LOCK_NAME: &str = "accounts.toml.lock";
 const VERSION: u32 = 5;
 /// A registry larger than this is not one cagents wrote.
 const MAX_BYTES: u64 = 256 * 1024;
-
-/// Another process held one of the account list's locks when the daemon
-/// asked for it without waiting. Nothing was read or changed, so the same
-/// request can be made again; [`patiently`] does so for a moment first.
-///
-/// Carried as the source of an [`io::ErrorKind::WouldBlock`] error, so a
-/// caller that only reports the error still shows this sentence rather than
-/// the operating system's.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum ListHeld {
-    /// The registry lock: another window, or another account operation of
-    /// the daemon, is writing the list.
-    #[error("Another window is saving the account list. Try again in a moment.")]
-    Registry,
-    /// The account lifecycle lock. Account changes hold it, and so does every
-    /// start of an agent or terminal on an account cagents manages, for as
-    /// long as its process takes to start.
-    #[error(
-        "Another window is changing accounts, or an agent is starting on one. Try again in a moment."
-    )]
-    Lifecycle,
-}
-
-impl ListHeld {
-    /// `error` from a non-blocking `flock` of this lock, as this refusal
-    /// when the lock was held; any other failure as it stands.
-    pub(crate) fn from_flock(self, error: io::Error) -> io::Error {
-        if error.kind() == io::ErrorKind::WouldBlock {
-            io::Error::new(io::ErrorKind::WouldBlock, self)
-        } else {
-            error
-        }
-    }
-
-    /// This refusal, if `error` is one.
-    pub(crate) fn of(error: &io::Error) -> Option<Self> {
-        error.get_ref()?.downcast_ref().copied()
-    }
-}
 
 /// How long the daemon keeps asking for a held account-list lock before it
 /// refuses with [`ListHeld`]. The locks are held for the moment it takes to
@@ -1600,6 +1561,7 @@ mod tests {
 
     use super::*;
 
+    #[cfg(feature = "host")]
     #[test]
     fn a_held_lock_refuses_in_its_own_words_and_only_it_is_asked_for_again() {
         let root = tempfile::tempdir().unwrap();

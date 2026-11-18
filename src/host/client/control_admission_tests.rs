@@ -455,7 +455,7 @@ fn a_busy_account_operation_refuses_as_the_gate_does() {
 
 #[test]
 fn a_held_account_list_refuses_retryably_in_its_own_words() {
-    use crate::account::{registry::ListHeld, remote::LifecycleError};
+    use crate::account::remote::{LifecycleError, ListHeld};
     for held in [ListHeld::Registry, ListHeld::Lifecycle] {
         let refusal = super::lifecycle_refusal(LifecycleError::ListHeld(held));
         assert_eq!(refusal.code, ProtocolErrorCode::InvalidRequest);

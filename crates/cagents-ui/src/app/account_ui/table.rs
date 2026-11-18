@@ -1429,7 +1429,7 @@ pub(in crate::app) mod tests {
             recovered: false,
             after_busy: false,
             duplicate_of: None,
-            busy_noticed: false,
+            refusal_noticed: false,
             discard_failures: 0,
         };
         assert!(login_caption(&login).starts_with("Finish signing in in the terminal"));
