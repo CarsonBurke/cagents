@@ -156,8 +156,8 @@ fn frame_read_error(error: ipc::FrameError, timeout: Option<Duration>) -> String
         || "Timed out waiting for the daemon response".into(),
         |timeout| {
             format!(
-                "the daemon did not answer within {} s",
-                timeout.as_secs_f64()
+                "the daemon did not answer within {}",
+                crate::control::reply_budget(timeout)
             )
         },
     )
