@@ -571,8 +571,12 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
             Ok(())
         })();
         // After restore has reattached every holder it could, and before
-        // the listener accepts a client that would restore a chat afresh.
-        save_abandoned_identities(&host);
+        // the listener accepts a client that would restore a chat afresh. A
+        // failed restore may not have reached a holder yet; a later start
+        // saves them instead.
+        if restored.is_ok() {
+            save_abandoned_identities(&host);
+        }
         match restored {
             Ok(()) => Ok(()),
             Err(error) => {
