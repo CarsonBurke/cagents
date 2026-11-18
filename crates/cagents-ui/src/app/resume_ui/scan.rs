@@ -113,8 +113,11 @@ pub fn scan(
 ) -> Option<Scan> {
     let mut file = std::fs::File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
+    // A transcript found not to be a resumable conversation is trusted to
+    // stay one only while it still holds the bytes that decided it: one
+    // rewritten in place may now hold a conversation.
     let mut scan = previous
-        .filter(|previous| previous.settled_negative() || continues(&mut file, len, previous))
+        .filter(|previous| continues(&mut file, len, previous))
         .cloned()
         .unwrap_or_default();
     if scan.settled_negative() {
@@ -123,20 +126,21 @@ pub fn scan(
     file.seek(SeekFrom::Start(scan.offset)).ok()?;
     let mut reader = Records::new(provider, path, &mut scan);
     let position = reader.scan.offset;
-    if read_records(
+    let settled = read_records(
         &mut file,
         &mut reader,
         (position, len),
         READ_CHUNK,
         cancel,
         |reader| reader.scan.settled_negative(),
-    )? {
-        return Some(scan);
+    )?;
+    if !settled {
+        reader.finish();
     }
-    reader.finish();
-    // An unfinished last record is read again, whole, next time.
+    // An unfinished last record is read again, whole, next time; a settled
+    // negative keeps where it was decided, so a later read can confirm it.
     scan.boundary = boundary(&mut file, scan.offset).unwrap_or(0);
-    if len >= UNCACHE_BYTES {
+    if !settled && len >= UNCACHE_BYTES {
         uncache(&file);
     }
     Some(scan)
@@ -1135,6 +1139,28 @@ mod tests {
         let scan = read(Provider::Codex, &child, None);
         assert!(scan.summary().is_none());
         assert!(scan.settled_negative());
+        // What it goes on to record is not read.
+        std::fs::File::options()
+            .append(true)
+            .open(&child)
+            .unwrap()
+            .write_all(format!("{}\n", user("Profile it")).as_bytes())
+            .unwrap();
+        let grown = read(Provider::Codex, &child, Some(&scan));
+        assert!(grown.settled_negative());
+        assert_eq!(grown.offset, scan.offset);
+        // Rewritten in place as a conversation, it is read from its start.
+        std::fs::write(
+            &child,
+            format!(
+                "{}\n{}\n",
+                json!({"type":"session_meta","payload":{"id":ID,"cwd":"/work/api","source":"cli"}}),
+                item("UserMessage", "Profile it")
+            ),
+        )
+        .unwrap();
+        let rewritten = read(Provider::Codex, &child, Some(&grown));
+        assert_eq!(rewritten.summary().unwrap().prompts, 1);
     }
 
     #[test]

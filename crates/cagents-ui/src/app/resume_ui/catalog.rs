@@ -77,6 +77,12 @@ struct FileVersion {
     changed: (i64, i64),
 }
 impl FileVersion {
+    /// Whether both versions are of the same file, however it changed. A
+    /// transcript replaced at its path is read from its start.
+    fn same_file(&self, other: &Self) -> bool {
+        (self.device, self.inode) == (other.device, other.inode)
+    }
+
     fn new(metadata: &std::fs::Metadata) -> Self {
         Self {
             device: metadata.dev(),
@@ -224,7 +230,10 @@ impl Cache {
                 let scan = Arc::new(scan::scan(
                     provider,
                     &candidate.path,
-                    previous.as_ref().map(|entry| &*entry.scan),
+                    previous
+                        .as_ref()
+                        .filter(|entry| entry.version.same_file(&candidate.version))
+                        .map(|entry| &*entry.scan),
                     cancel,
                 )?);
                 let mut entries = self.entries.lock().ok()?;
@@ -622,6 +631,56 @@ mod tests {
         assert!(header(Provider::Codex, &path).is_none());
         std::fs::write(&path, format!("{}\n{asked}\n", meta(parent, json!("cli")))).unwrap();
         assert_eq!(header(Provider::Codex, &path).unwrap().id(), parent);
+    }
+
+    /// A rollout found to be a subagent's stays unlisted as it grows, but a
+    /// conversation written over it, in place or by replacing the file, is
+    /// listed.
+    #[test]
+    fn a_conversation_written_over_a_subagent_rollout_is_listed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rollout.jsonl");
+        let id = "f0e49307-af96-4edd-b23f-60b185fe4fea";
+        let cwd = directory.path().to_str().unwrap();
+        let asked =
+            json!({"type":"event_msg","payload":{"type":"user_message","message":"Profile it"}});
+        let cache = Cache::default();
+        let find = |path: &Path| cache.find(Provider::Codex, &candidate(0, path));
+        let inode = |path: &Path| std::fs::metadata(path).unwrap().ino();
+
+        let meta = |source: &str| {
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"{id}","cwd":"{cwd}","source":{source}}}}}"#
+            )
+        };
+        std::fs::write(&path, format!("{}\n", meta(r#"{"subagent":{}}"#))).unwrap();
+        assert!(find(&path).is_none());
+        let written = inode(&path);
+        std::fs::write(&path, format!("{}\n{asked}\n", meta(r#"{"subagent":{}}"#))).unwrap();
+        assert!(find(&path).is_none());
+        std::fs::write(&path, format!("{}\n{asked}\n", meta(r#""cli""#))).unwrap();
+        assert_eq!(inode(&path), written);
+        assert_eq!(find(&path).unwrap().id(), id);
+
+        // The replacement's first record is as long as the subagent's and
+        // ends in the same bytes, so only the file's identity tells them
+        // apart.
+        let padded = |source: &str| {
+            format!(
+                r#"{{"type":"session_meta","payload":{{"source":{source},"id":"{id}","cwd":"{cwd}","note":"{}"}}}}"#,
+                "n".repeat(300)
+            )
+        };
+        let (subagent, main) = (padded(r#"{"subagent":{}}"#), padded(r#""cli","xxxx":12"#));
+        assert_eq!(subagent.len(), main.len());
+        std::fs::write(&path, format!("{subagent}\n")).unwrap();
+        assert!(find(&path).is_none());
+        let replaced = inode(&path);
+        let replacement = path.with_extension("replacement");
+        std::fs::write(&replacement, format!("{main}\n{asked}\n")).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        assert_ne!(inode(&path), replaced);
+        assert_eq!(find(&path).unwrap().id(), id);
     }
 
     /// A transcript with nothing in it has nothing to return to.
