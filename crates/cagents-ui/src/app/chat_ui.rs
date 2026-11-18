@@ -10366,6 +10366,45 @@ impl Cagents {
         }
     }
 
+    /// The target of the chat that names channel `id`, where this window
+    /// runs it.
+    fn channel_naming_chat(&self, id: crate::model::ChannelId) -> Option<Target> {
+        let channel = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)?;
+        let card = self.channel_primary_chat(channel)?;
+        match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => Some(runtime.target),
+            _ => self.chat_ui.parked.get(&card).map(|runtime| runtime.target),
+        }
+    }
+
+    /// The name channel `id`'s conversation has given it, as this window's
+    /// copy of that conversation knows it.
+    pub(super) fn automatic_channel_name(&self, id: crate::model::ChannelId) -> Option<&str> {
+        let target = self.channel_naming_chat(id)?;
+        self.chat_ui
+            .channel_names
+            .get(&target)?
+            .title
+            .as_ref()
+            .map(|(title, _)| title.as_str())
+    }
+
+    /// Lets the next refresh offer channel `id` its automatic name again,
+    /// once its name was cleared here or in another window. A name offered
+    /// at the channel's current view is otherwise never offered twice, and
+    /// clearing a name leaves the view as it was.
+    pub(super) fn offer_channel_name_again(&mut self, id: crate::model::ChannelId) {
+        if let Some(target) = self.channel_naming_chat(id)
+            && let Some(observation) = self.chat_ui.channel_names.get_mut(&target)
+        {
+            observation.last_view = None;
+        }
+    }
+
     /// Names an unnamed channel from the first prompt its primary chat
     /// delivered, and keeps that name as the chat's observation. The
     /// suggestion can be refused, as when the pane has not yet recorded its
@@ -24156,6 +24195,118 @@ pub(in crate::app) mod tests {
             app.durable.channels[0].title,
             "Plan the quarterly roadmap review"
         );
+    }
+
+    #[test]
+    fn a_cleared_channel_name_takes_its_conversation_name_again() {
+        use super::super::chrome_ui::Action as Chrome;
+        use crate::model::{ChannelId, ChannelTitleSource, ProjectChannel, ProjectId};
+        use crate::workspace_model::{
+            ModelChannel, ModelEdit,
+            views::{Pane, Scope, View},
+        };
+        const NAME: &str = "Plan the quarterly roadmap review";
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat_for_provider(&mut app, Provider::Claude, None);
+        let target = chat_runtime(&app, card).target;
+        let id = ChannelId::new();
+        Arc::make_mut(&mut app.durable).channels = vec![ProjectChannel {
+            id,
+            project_id: ProjectId::new(),
+            title: String::new(),
+            title_source: ChannelTitleSource::Manual,
+            ordinal: 0,
+            shared: true,
+            cards: vec![card],
+            focused: Some(card),
+        }];
+        let pane = Pane::from_card(
+            app.card_state(card).unwrap(),
+            app.durable.card_scopes.get(&card).cloned(),
+        )
+        .unwrap();
+        let view = move |revision| View {
+            scope: Scope::Channel(id),
+            revision,
+            retired: Vec::new(),
+            panes: vec![pane.clone()],
+        };
+        app.workspace_model.views = vec![view(5)];
+        let (tx, requests) = super::super::workspace_model_sync::test_model_channel();
+        app.workspace_model_tx = tx;
+        let edits = || std::iter::from_fn(|| requests.try_recv().ok()).collect::<Vec<_>>();
+        let suggestion = |edit: &ModelEdit| {
+            matches!(
+                edit,
+                ModelEdit::SuggestConversationTitle { id: channel, card: pane, title, .. }
+                    if *channel == id && *pane == card && title == NAME
+            )
+        };
+        let rename = |app: &mut crate::app::Cagents, name: &str| {
+            drop(app.update_chrome(Chrome::RenameChannel(id)));
+            drop(app.update_chrome(Chrome::RenameChanged(name.into())));
+            drop(app.update_chrome(Chrome::RenameSubmit));
+            assert!(app.pane_rename_surface().is_none());
+        };
+        app.name_channel_from_prompt(target, NAME);
+        assert!(edits().iter().any(suggestion));
+        assert_eq!(app.automatic_channel_name(id), Some(NAME));
+
+        // A name the person gives is never replaced, even at a later view.
+        rename(&mut app, "Roadmap");
+        app.workspace_model.views = vec![view(6)];
+        drop(app.refresh_channel_title_suggestions());
+        assert!(!edits().iter().any(suggestion));
+        assert_eq!(app.durable.channels[0].title, "Roadmap");
+        // The rename field shows the name clearing gives back.
+        let (placeholder, caption, submit) = app.channel_rename_copy(id, true);
+        assert_eq!(
+            (placeholder.as_ref(), caption, submit),
+            (
+                NAME,
+                "The channel takes its conversation's name.",
+                Some("Use automatic name")
+            )
+        );
+
+        // Clearing it asks the registry to forget it, and the conversation's
+        // name follows, though the channel's view did not change.
+        rename(&mut app, "  ");
+        let sent = edits();
+        let cleared = sent.iter().position(|edit| {
+            matches!(edit, ModelEdit::RetitleChannel { id: channel, title }
+                if *channel == id && title.is_empty())
+        });
+        let offered = sent.iter().position(suggestion);
+        assert!(cleared.is_some() && offered > cleared, "{sent:?}");
+        assert_eq!(app.durable.channels[0].title, NAME);
+
+        // Another window's name is taken as it is, and its clear offers the
+        // conversation's name again from this window, which runs the
+        // conversation.
+        let shared = |title: &str| ModelChannel {
+            id,
+            repository: "/repo/.git".into(),
+            title: title.into(),
+            title_source: ChannelTitleSource::Manual,
+            ordinal: 1,
+        };
+        app.workspace_model.identity = uuid::Uuid::new_v4();
+        app.workspace_model.channels = vec![shared("Their name")];
+        drop(app.reconcile_workspace_model());
+        assert!(!edits().iter().any(suggestion));
+        assert_eq!(app.durable.channels[0].title, "Their name");
+        app.workspace_model.channels = vec![shared("")];
+        drop(app.reconcile_workspace_model());
+        assert!(edits().iter().any(suggestion));
+
+        // A model sent before a rename here looks like a clear, but this
+        // window keeps that rename, so an unattended channel keeps its name.
+        rename(&mut app, "Roadmap");
+        drop(edits());
+        assert_eq!(app.workspace_model.channels, vec![shared("")]);
+        drop(app.reconcile_workspace_model());
+        assert!(app.channel_is_named(id));
     }
 
     #[test]

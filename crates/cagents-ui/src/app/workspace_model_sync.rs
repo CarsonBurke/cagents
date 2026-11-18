@@ -2720,6 +2720,12 @@ impl Cagents {
         if !retitle && !rerank && !record {
             return false;
         }
+        // A name cleared in another window asks for the automatic one, which
+        // this window offers if it runs the channel's conversation. A model
+        // older than this window's own rename looks the same, so it does not
+        // forget that rename (see `channel_is_named`): the registry refuses
+        // the offer once it holds the new name, whose echo then restores it.
+        let cleared = retitle && !local.title.is_empty() && shared.title.is_empty();
         let channel = &mut Arc::make_mut(&mut self.durable).channels[index];
         if retitle {
             channel.title = shared.title.clone();
@@ -2729,6 +2735,9 @@ impl Cagents {
             channel.ordinal = shared.ordinal;
         }
         channel.shared = true;
+        if cleared {
+            self.offer_channel_name_again(shared.id);
+        }
         true
     }
 
