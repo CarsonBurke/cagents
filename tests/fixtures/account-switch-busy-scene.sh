@@ -143,8 +143,22 @@ fi
 step draft
 composer
 "$ne" drive type 'Summarize the project layout.' >/dev/null
+# The model chooser can still hold focus after the pick, so the message
+# lands in its search instead; close it and type into the composer.
+if "$ne" drive observe 2>/dev/null | rg -F 'No model matches' >/dev/null; then
+    "$ne" drive key Escape >/dev/null
+    "$ne" drive wait 'No model matches' --gone --timeout 10 >/dev/null
+    composer
+    "$ne" drive type 'Summarize the project layout.' >/dev/null
+fi
 "$ne" drive key Return >/dev/null
-"$ne" drive wait 'Done' --timeout 45 >/dev/null
+if ! "$ne" drive wait 'Done' --timeout 45 >/dev/null; then
+    # Keep what the window showed, so an unsent first turn can be told
+    # from one the peer never finished.
+    step first-turn-missing
+    echo "The first turn never finished; see $notes/first-turn-missing.txt" >&2
+    exit 1
+fi
 sleep 2
 shot first-turn
 
