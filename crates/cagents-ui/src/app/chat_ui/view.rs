@@ -1378,7 +1378,9 @@ fn reasoning_elapsed(
                 .filter(|last| last.id == item.id)
                 .and(finished_at)
         })?;
-    Some(disclosure::duration(end.saturating_sub(start)))
+    // Under a second reads as "0s", which says nothing.
+    let millis = end.saturating_sub(start);
+    (millis >= 1_000).then(|| disclosure::duration(millis))
 }
 
 /// The providers a draft offers, in the order its picker lists them after
@@ -1825,7 +1827,9 @@ impl Runtime {
             .is_some_and(Coordinated::is_card);
         !card
             && (item.content.status() == Some(chat::ToolStatus::Running)
-                || working && matches!(item.content, ItemContent::Text { thinking: true, .. }))
+                || working
+                    && matches!(item.content, ItemContent::Text { thinking: true, .. })
+                    && !reasoning::contentless(&item.content))
     }
 
     /// Whether the lead's closing line spins, as it does while subagents
@@ -2579,6 +2583,11 @@ impl Runtime {
                 let Some(cached) = self.child_cache.get(&item.id) else {
                     continue;
                 };
+                // As in the lead's transcript, a thought with nothing to
+                // read is working time, not a row.
+                if reasoning::contentless(&item.content) {
+                    continue;
+                }
                 let footer = if (item.role == chat::Role::User && !item.content.is_step())
                     || matches!(item.content, ItemContent::Text { .. })
                 {

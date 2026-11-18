@@ -8401,8 +8401,9 @@ fn finished_reasoning_uses_its_own_end_before_successor_or_turn_timing() {
     }
     thought.at = thought.started_at;
     assert_eq!(
-        reasoning_elapsed(&thought, &[], true, None).as_deref(),
-        Some("0s")
+        reasoning_elapsed(&thought, &[], true, None),
+        None,
+        "under a second has no duration to show"
     );
     thought.at = None;
     let items = vec![Arc::new(thought.clone()), later];
