@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 
 SOURCE = Path(__file__).resolve().parents[1] / "scripts/run-development"
@@ -34,6 +35,39 @@ def wait_until(predicate, message):
         if time.monotonic() >= deadline:
             raise AssertionError(message)
         time.sleep(0.02)
+
+
+def holds_open(process, path):
+    for fd in os.listdir(f"/proc/{process}/fd"):
+        try:
+            target = os.readlink(f"/proc/{process}/fd/{fd}")
+        except FileNotFoundError:
+            # The process can close a descriptor after listdir returns it.
+            continue
+        if target == path:
+            return True
+    return False
+
+
+class OpenDescriptors(unittest.TestCase):
+    def test_a_closed_descriptor_does_not_hide_a_later_match(self):
+        with patch.object(os, "listdir", return_value=["3", "9"]), \
+                patch.object(os, "readlink", side_effect=[FileNotFoundError(), "/fixture/lock"]) as readlink:
+            self.assertTrue(holds_open(123, "/fixture/lock"))
+        self.assertEqual(readlink.call_count, 2)
+
+    def test_a_scan_without_a_matching_descriptor_returns_false(self):
+        for targets in ([], ["/dev/null"], [FileNotFoundError()]):
+            with self.subTest(targets=targets), \
+                    patch.object(os, "listdir", return_value=[str(fd) for fd in range(len(targets))]), \
+                    patch.object(os, "readlink", side_effect=targets):
+                self.assertFalse(holds_open(123, "/fixture/lock"))
+
+    def test_other_read_errors_are_not_suppressed(self):
+        with patch.object(os, "listdir", return_value=["9"]), \
+                patch.object(os, "readlink", side_effect=PermissionError()), \
+                self.assertRaises(PermissionError):
+            holds_open(123, "/fixture/lock")
 
 
 class ZigDiscovery(unittest.TestCase):
@@ -950,8 +984,7 @@ exit 83
             index = lines.index(next(line for line in lines if f"pid {process.pid}," in line))
             return lines[index:index + 6]
 
-        wait_until(lambda: any(os.readlink(f"/proc/{process.pid}/fd/{fd}") == str(lock)
-                               for fd in os.listdir(f"/proc/{process.pid}/fd")),
+        wait_until(lambda: holds_open(process.pid, str(lock)),
                    "fixture daemon never opened its lock")
         block = listing()
         self.assertEqual(
