@@ -104,13 +104,16 @@ fn isolated() -> Option<PathBuf> {
         thread::sleep(Duration::from_millis(10));
     };
     cleanup_discoveries(&root.path().join("run"));
-    assert!(
-        status.is_some_and(|s| s.success()),
-        "resolution fixture failed/deadline:\n{}\n{}",
+    let outcome = match status {
+        Some(status) if status.success() => return None,
+        Some(status) => format!("failed with {status}"),
+        None => "was killed at its 90-second deadline".to_owned(),
+    };
+    panic!(
+        "resolution fixture {test} {outcome}\n--- its stdout ---\n{}\n--- its stderr ---\n{}",
         fs::read_to_string(stdout).unwrap(),
         fs::read_to_string(stderr).unwrap()
     );
-    None
 }
 
 struct Fixture {
@@ -124,20 +127,18 @@ struct Fixture {
 
 impl Fixture {
     fn new(root: PathBuf) -> Self {
-        Self::with_reset(root, false)
+        Self::with_provider(root, None)
     }
 
-    fn with_reset(root: PathBuf, reset: bool) -> Self {
-        let provider = root.join("bin/claude");
-        retained_actor_tests::install_provider(&provider);
-        if reset {
-            // Extend the same offline provider's actual wire protocol. A fresh
-            // provider UUID is learned only after its explicit reset event;
-            // no HOST source, alias map or helper journal is fabricated.
-            let script = fs::read_to_string(&provider).unwrap();
-            let anchor = "        (root/'provider-done').write_text('done')";
-            assert_eq!(script.matches(anchor).count(), 1);
-            let replacement = r#"        (root/'provider-done').write_text('done')
+    /// Extends the same offline provider's actual wire protocol. A fresh
+    /// provider UUID is learned only after its explicit reset event; no HOST
+    /// source, alias map or helper journal is fabricated.
+    fn with_reset(root: PathBuf) -> Self {
+        Self::with_provider(
+            root,
+            Some((
+                "        (root/'provider-done').write_text('done')",
+                r#"        (root/'provider-done').write_text('done')
         deadline=time.monotonic()+30
         while not (root/'reset-now').exists():
             if time.monotonic()>=deadline: raise RuntimeError('reset gate timed out')
@@ -152,7 +153,18 @@ impl Fixture {
         session=str(uuid.uuid4())
         send({'type':'system','subtype':'init','session_id':session})
         (root/'reset-id.tmp').write_text(session)
-        (root/'reset-id.tmp').replace(root/'reset-id')"#;
+        (root/'reset-id.tmp').replace(root/'reset-id')"#,
+            )),
+        )
+    }
+
+    /// Starts the offline provider with one exact fragment of its script replaced.
+    fn with_provider(root: PathBuf, edit: Option<(&str, &str)>) -> Self {
+        let provider = root.join("bin/claude");
+        retained_actor_tests::install_provider(&provider);
+        if let Some((anchor, replacement)) = edit {
+            let script = fs::read_to_string(&provider).unwrap();
+            assert_eq!(script.matches(anchor).count(), 1);
             fs::write(&provider, script.replace(anchor, replacement)).unwrap();
         }
         let proof = HostSessionProof {
@@ -337,6 +349,37 @@ impl Fixture {
             session.launch.session_id
         );
         session
+    }
+
+    /// Holds the provider after its third frame and starts one turn.
+    fn prompt_held_turn(&self) {
+        fs::write(
+            self.root.join("lease-third-frame-gate"),
+            b"hold actual turn",
+        )
+        .unwrap();
+        self.handle()
+            .command(chat::Command::Prompt {
+                text: "One explicit turn survives the application reconnecting".into(),
+                attachments: Vec::new(),
+                mode: chat::PromptMode::Send,
+            })
+            .unwrap();
+    }
+
+    /// The provider records each frame only after writing it, so its count
+    /// can include a frame the helper's actor has yet to read or parse.
+    fn provider_recorded_third_frame(&self) -> bool {
+        fs::read_to_string(self.root.join("produced")).is_ok_and(|text| text.lines().count() >= 3)
+    }
+
+    /// Whether the actor itself has applied the provider's third frame.
+    fn actor_applied_third_frame(&self) -> bool {
+        self.handle().snapshot(None).is_some_and(|snapshot| {
+            serde_json::to_string(&snapshot.items)
+                .unwrap()
+                .contains("FRAME_002|")
+        })
     }
 
     fn spent(&self, client: ClientId) -> bool {
@@ -581,26 +624,16 @@ fn real_retained_claude_update_preview_preserves_pre_id_and_active_turns() {
                 && session.disposition == crate::update::impact::Disposition::Continues)
     );
     fixture.no_prompt();
-    fs::write(
-        fixture.root.join("lease-third-frame-gate"),
-        b"hold actual turn",
-    )
-    .unwrap();
-    fixture
-        .handle()
-        .command(chat::Command::Prompt {
-            text: "One explicit turn survives the application reconnecting".into(),
-            attachments: Vec::new(),
-            mode: chat::PromptMode::Send,
-        })
-        .unwrap();
+    fixture.prompt_held_turn();
+    // Output the actor has read but not yet parsed makes readiness
+    // legitimately Unready, which is not the held turn this test previews.
     wait(
         || {
-            fs::read_to_string(fixture.root.join("produced"))
-                .is_ok_and(|text| text.lines().count() >= 3)
+            fixture.provider_recorded_third_frame()
                 && fixture.handle().attachment_snapshot().busy
+                && fixture.actor_applied_third_frame()
         },
-        "actual provider did not reach its busy gate",
+        "the actor did not apply the provider's third frame at its busy gate",
     );
     assert_eq!(
         fixture.handle().check_update_readiness().unwrap(),
@@ -637,6 +670,61 @@ fn real_retained_claude_update_preview_preserves_pre_id_and_active_turns() {
     assert_eq!(
         fs::read_to_string(fixture.root.join("prompts")).unwrap(),
         "prompt\n"
+    );
+}
+
+/// The provider writes its third frame in two halves and records it after the
+/// first, as a frame spanning several reads looks to the actor. Only the
+/// replaced lines differ from the ordinary fixture provider.
+const SPLIT_THIRD_FRAME: (&str, &str) = (
+    r#"            send({'type':'assistant','uuid':f'frame-{index}','message':{'id':f'frame-{index}','role':'assistant','content':[{'type':'text','text':f'FRAME_{index:03}|'}]}})
+            with (root/'produced').open('a') as log: log.write(str(index)+'\n')"#,
+    r#"            frame={'type':'assistant','uuid':f'frame-{index}','message':{'id':f'frame-{index}','role':'assistant','content':[{'type':'text','text':f'FRAME_{index:03}|'}]}}
+            if index==2:
+                line=json.dumps(frame)
+                sys.stdout.write(line[:len(line)//2]); sys.stdout.flush()
+                with (root/'produced').open('a') as log: log.write(str(index)+'\n')
+                deadline=time.monotonic()+30
+                while not (root/'third-frame-rest').exists():
+                    if time.monotonic()>=deadline: raise RuntimeError('split third frame timed out')
+                    time.sleep(0.01)
+                print(line[len(line)//2:],flush=True)
+            else:
+                send(frame)
+                with (root/'produced').open('a') as log: log.write(str(index)+'\n')"#,
+);
+
+/// Pins the busy-gate wait in the update preview test above. Output the
+/// actor has read but not applied keeps readiness Unready, so the provider's
+/// record and `busy` alone do not mean the held turn has settled.
+#[test]
+fn real_retained_update_readiness_settles_once_the_actor_applies_recorded_output() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
+    let Some(root) = isolated() else { return };
+    let fixture = Fixture::with_provider(root, Some(SPLIT_THIRD_FRAME));
+    let readiness = || fixture.handle().check_update_readiness();
+    fixture.prompt_held_turn();
+    wait(
+        || {
+            fixture.provider_recorded_third_frame()
+                && fixture.handle().attachment_snapshot().busy
+                && readiness() == Ok(chat::runtime::UpdateReadiness::Unready)
+        },
+        "the actor never held the provider's partial third frame",
+    );
+    assert!(!fixture.actor_applied_third_frame());
+    fs::write(fixture.root.join("third-frame-rest"), b"rest").unwrap();
+    wait(
+        || fixture.actor_applied_third_frame(),
+        "the actor did not apply the completed third frame",
+    );
+    assert_eq!(readiness(), Ok(chat::runtime::UpdateReadiness::Busy));
+    fs::write(fixture.root.join("lease-third-frame-release"), b"finish").unwrap();
+    wait(
+        || fixture.root.join("provider-done").exists(),
+        "the held turn did not finish",
     );
 }
 
@@ -949,7 +1037,7 @@ fn real_helper_explicit_reset_resolves_known_a_to_b_from_authenticated_lineage()
         return;
     }
     let Some(root) = isolated() else { return };
-    let mut fixture = Fixture::with_reset(root, true);
+    let mut fixture = Fixture::with_reset(root);
     fixture
         .handle()
         .command(chat::Command::Prompt {

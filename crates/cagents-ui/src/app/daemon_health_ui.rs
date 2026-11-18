@@ -388,20 +388,34 @@ impl Cagents {
 /// What the banner says about an unavailable daemon, or nothing while it
 /// answers.
 fn health_detail(health: &daemon_health::State) -> Option<String> {
+    health_detail_in(
+        health,
+        std::time::SystemTime::now(),
+        &jiff::tz::TimeZone::system(),
+    )
+}
+
+/// [`health_detail`] as read at `now` in `zone`.
+fn health_detail_in(
+    health: &daemon_health::State,
+    now: std::time::SystemTime,
+    zone: &jiff::tz::TimeZone,
+) -> Option<String> {
+    let moment = |since| local_moment(since, now, zone);
     Some(match health {
         daemon_health::State::Responsive => return None,
         daemon_health::State::Unresponsive { since, timeout } => format!(
-            "The daemon has not answered since {}. A reply timed out after {}.",
-            timestamp(*since),
+            "The cagents daemon has not answered since {}. A reply timed out after {}.",
+            moment(*since),
             reply_wait(*timeout),
         ),
         daemon_health::State::Incompatible { actual, .. } => format!(
-            "This window requires daemon protocol {}, but the last daemon reply used protocol {actual}. The window and daemon cannot communicate.",
+            "This window requires protocol {} of the cagents daemon, but its last reply used protocol {actual}, so the two cannot communicate.",
             crate::terminal_ipc::PROTOCOL_VERSION,
         ),
         daemon_health::State::Unreachable { since } => format!(
-            "The daemon has been unreachable since {}. Reconnecting…",
-            timestamp(*since),
+            "The cagents daemon has been unreachable since {}. Reconnecting…",
+            moment(*since),
         ),
     })
 }
@@ -417,12 +431,27 @@ fn reply_wait(timeout: std::time::Duration) -> String {
     }
 }
 
-fn timestamp(time: std::time::SystemTime) -> String {
-    let millis = time
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    unix_time_label(i64::try_from(millis).unwrap_or(i64::MAX))
+/// When the daemon was last heard from, on the reader's clock as the
+/// conversation's own times are: the time of day alone when it was today,
+/// and the day as well when the outage has run past midnight.
+fn local_moment(
+    at: std::time::SystemTime,
+    now: std::time::SystemTime,
+    zone: &jiff::tz::TimeZone,
+) -> String {
+    let zoned = |time| {
+        jiff::Timestamp::try_from(time)
+            .ok()
+            .map(|time| time.to_zoned(zone.clone()))
+    };
+    let Some(at) = zoned(at) else {
+        return "an unknown time".into();
+    };
+    if zoned(now).is_some_and(|now| now.date() == at.date()) {
+        at.strftime("%H:%M").to_string()
+    } else {
+        at.strftime("%a %b %-d, %H:%M").to_string()
+    }
 }
 
 fn health_action_id(state: &State) -> widget::Id {
@@ -539,6 +568,38 @@ mod tests {
             "{detail}"
         );
         assert_eq!(health_detail(&daemon_health::State::Responsive), None);
+    }
+
+    /// The banner names the daemon as the conversation's notices do and
+    /// gives the reader's local time to the minute, as "Finished at" does.
+    #[test]
+    fn an_outage_reads_in_local_time_without_milliseconds() {
+        let zone = jiff::tz::TimeZone::fixed(jiff::tz::offset(-5));
+        let at = |text: &str| std::time::SystemTime::from(text.parse::<jiff::Timestamp>().unwrap());
+        let since = at("2026-11-17T18:15:32.665Z");
+        let detail = health_detail_in(
+            &daemon_health::State::Unresponsive {
+                since,
+                timeout: std::time::Duration::from_secs(30),
+            },
+            at("2026-11-17T18:20:00Z"),
+            &zone,
+        )
+        .unwrap();
+        assert_eq!(
+            detail,
+            "The cagents daemon has not answered since 13:15. A reply timed out after 30 s."
+        );
+        let detail = health_detail_in(
+            &daemon_health::State::Unreachable { since },
+            at("2026-11-18T09:00:00Z"),
+            &zone,
+        )
+        .unwrap();
+        assert_eq!(
+            detail,
+            "The cagents daemon has been unreachable since Tue Nov 17, 13:15. Reconnecting…"
+        );
     }
 
     fn key(key: keyboard::key::Named) -> keyboard::Event {

@@ -294,6 +294,14 @@ questions! {
     SubmitReview,
     /// Spending one of an account's usage resets, asked beside its usage.
     UseUsageReset,
+    /// Installing an application update, which reopens every window, may
+    /// stop live work, and can't be taken back to the version before.
+    InstallUpdate,
+    /// Reconciling a checkout that already holds a pull request's branch
+    /// before opening it, asked in the pull request pane: depending on what
+    /// it holds, updating the branch or setting its upstream in Git, which
+    /// the app has no undo for.
+    UseExistingCheckout,
 }
 
 /// Where a question is asked.
@@ -333,7 +341,9 @@ impl Question {
             | Self::EndCloseHolders
             | Self::DiscardPendingReview
             | Self::SubmitReview
-            | Self::UseUsageReset => Consequence::Irreversible,
+            | Self::UseUsageReset
+            | Self::InstallUpdate
+            | Self::UseExistingCheckout => Consequence::Irreversible,
             Self::EnableAutomation | Self::RunAutomationNow => Consequence::Authorization,
         }
     }
@@ -347,7 +357,8 @@ impl Question {
             | Self::EndCloseHolders
             | Self::DiscardPendingReview
             | Self::SubmitReview
-            | Self::UseUsageReset => Placement::Inline,
+            | Self::UseUsageReset
+            | Self::UseExistingCheckout => Placement::Inline,
             Self::StopWorkingChat
             | Self::StopSendingFirstMessage
             | Self::DiscardUnsentMessage
@@ -362,7 +373,8 @@ impl Question {
             | Self::DeleteChannel
             | Self::CloseWithUnsavedWork
             | Self::DiscardAutomationDraft
-            | Self::PasteMultipleLines => Placement::Dialog,
+            | Self::PasteMultipleLines
+            | Self::InstallUpdate => Placement::Dialog,
         }
     }
 
@@ -393,6 +405,19 @@ impl Question {
         iced::widget::operation::focus(self.initial_focus(dismiss, confirm))
     }
 
+    /// [`Self::focus_task`] for a question that arrives once work `asker`
+    /// started has finished: it takes the keyboard from `asker` or from
+    /// nowhere, but not from a control the person moved to meanwhile, such
+    /// as a comment they began typing.
+    pub(crate) fn focus_task_after<T: Send + 'static>(
+        self,
+        asker: widget::Id,
+        dismiss: widget::Id,
+        confirm: widget::Id,
+    ) -> iced::Task<T> {
+        crate::workspace_widget::focus_after_loading(asker, self.initial_focus(dismiss, confirm))
+    }
+
     /// The id of the surface asking it, by which a test finds which question
     /// is on screen.
     pub(crate) fn surface_id(self) -> widget::Id {
@@ -416,12 +441,25 @@ pub(crate) fn confirmation_surface<'a, M: 'a>(
     actions: impl Into<Element<'a, M>>,
     max_width: f32,
 ) -> Element<'a, M> {
+    tall_confirmation_surface(question, content, actions, max_width, MAX_HEIGHT)
+}
+
+/// A [`confirmation_surface`] that grows to `max_height`, rather than
+/// [`MAX_HEIGHT`], before its body scrolls: for a question whose content,
+/// such as a list of what it affects, is long as a rule.
+pub(crate) fn tall_confirmation_surface<'a, M: 'a>(
+    question: Question,
+    content: impl Into<Element<'a, M>>,
+    actions: impl Into<Element<'a, M>>,
+    max_width: f32,
+    max_height: f32,
+) -> Element<'a, M> {
     debug_assert_eq!(question.placement(), Placement::Dialog);
     crate::interaction::focus_scope(surface_with_actions(
         content,
         actions,
         max_width,
-        MAX_HEIGHT,
+        max_height,
         Some(question.surface_id()),
     ))
 }
@@ -488,15 +526,11 @@ impl Cagents {
             return None;
         }
         match self.cards.get(&card)? {
-            CardRuntime::PullRequests(pane) => {
-                let question = pane.review.review_question()?;
-                Some((
-                    question,
-                    Message::PullRequestReview {
-                        card,
-                        action: pane.review.review_escape()?,
-                    },
-                ))
+            // Its questions are asked in the side panel, which a narrow card
+            // hides: Escape can't answer what isn't there.
+            CardRuntime::PullRequests(pane) if self.pull_request_side_shown(card, pane) => {
+                let (question, action) = pane.review.pane_question()?;
+                Some((question, Message::PullRequestReview { card, action }))
             }
             CardRuntime::Chat(_) => self.focused_close_refusal().map(|target| {
                 (
@@ -563,6 +597,10 @@ impl Cagents {
         let Some(CardRuntime::PullRequests(pane)) = self.cards.get(&card) else {
             return None;
         };
+        // The popover hangs from the side panel's header and hides with it.
+        if !self.pull_request_side_shown(card, pane) {
+            return None;
+        }
         pane.review
             .review_escape()
             .map(|action| Message::PullRequestReview { card, action })

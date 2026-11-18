@@ -289,6 +289,48 @@ fn a_refusal_shown_to_its_reader_is_the_daemons_own_wording() {
     finished(worker);
 }
 
+/// Only the daemon's own busy refusal leaves the caller free to say nothing
+/// was done; any other refusal stays a failure in its own words.
+#[test]
+fn only_the_daemons_busy_refusal_reads_as_busy() {
+    for (refusal, expected) in [
+        (
+            ServerMessage::Error(ProtocolError::new(
+                ProtocolErrorCode::Internal,
+                crate::terminal_ipc::DAEMON_BUSY,
+                true,
+            )),
+            crate::control::RequestError::Busy,
+        ),
+        (
+            denied(),
+            crate::control::RequestError::Failed(
+                "daemon rejected the request (PermissionDenied): The fixture refused this scope"
+                    .into(),
+            ),
+        ),
+    ] {
+        let (_directory, socket, worker) = server(move |peer| {
+            let auth = authenticate(peer, &Authority::default());
+            accepted(peer, &auth);
+            let operation: ClientEnvelope = read_frame(peer).unwrap().unwrap();
+            reply(peer, &operation, refusal);
+        });
+        let error = super::request_described(
+            Operation::Home,
+            Authority::default(),
+            true,
+            false,
+            || Ok(socket),
+            || panic!("no daemon is started"),
+            crate::control::RequestError::from,
+        )
+        .unwrap_err();
+        assert_eq!(error, expected);
+        finished(worker);
+    }
+}
+
 #[test]
 fn refused_present_authority_never_dispatches_or_falls_back_to_user() {
     for authority in [

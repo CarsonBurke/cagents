@@ -135,6 +135,16 @@ pub enum Action {
     Restart,
 }
 
+/// The update review's dismissal.
+fn cancel_id() -> widget::Id {
+    widget::Id::new("update.cancel")
+}
+
+/// The update review's committing action.
+fn confirm_id() -> widget::Id {
+    widget::Id::new("update.confirm")
+}
+
 /// Opens a release's notes in the system browser.
 pub(super) fn release_notes_button<'a>(url: &str) -> Element<'a, Message> {
     crate::ui_controls::button::quiet("Release notes")
@@ -446,7 +456,7 @@ impl Cagents {
                 .into(),
             iced::widget::Space::new().width(Length::Fill).into(),
             crate::ui_controls::button::secondary("Cancel")
-                .id(widget::Id::new("update.cancel"))
+                .id(cancel_id())
                 .on_press(Message::UpdateUi(Action::CancelApply))
                 .into(),
             // Choosing to wait for idle sessions renames the update, and
@@ -462,7 +472,7 @@ impl Cagents {
                             .any(|session| session.disposition == Disposition::WaitsForIdle)
                     }),
                 )
-                .id(widget::Id::new("update.confirm"))
+                .id(confirm_id())
                 .on_press_maybe((!terminal_confirmation).then_some(Message::UpdateUi(
                     Action::ConfirmApply(confirmation.nonce.clone()),
                 )))
@@ -473,7 +483,8 @@ impl Cagents {
         // A short window scrolls what the update affects; Cancel and the
         // update stay in reach.
         Some(dialog_ui::overlay(
-            dialog_ui::scrolling_surface_with_actions(
+            dialog_ui::tall_confirmation_surface(
+                dialog_ui::Question::InstallUpdate,
                 widget::column::with_children(body).spacing(space::L),
                 actions,
                 600.0,
@@ -821,7 +832,23 @@ impl Cagents {
         }
     }
 
+    /// Applies `action`. When it brings the update's review up, the keyboard
+    /// moves into it, onto the answer [`dialog_ui::Question::InstallUpdate`]
+    /// opens on; a review already up keeps the focus the person gave it as
+    /// later polls refresh it.
     pub(super) fn update_update_ui(&mut self, action: Action) -> Task<Message> {
+        let asked = self.update_ui.confirmation.is_some();
+        let task = self.apply_update_action(action);
+        if asked || self.update_ui.confirmation.is_none() {
+            return task;
+        }
+        Task::batch([
+            task,
+            dialog_ui::Question::InstallUpdate.focus(cancel_id(), confirm_id()),
+        ])
+    }
+
+    fn apply_update_action(&mut self, action: Action) -> Task<Message> {
         match action {
             Action::Check => {
                 if !self.settings.check_for_updates {
@@ -850,7 +877,7 @@ impl Cagents {
                         let supported = !matches!(result, UpdateState::Unsupported { .. });
                         self.update_ui.result = Some(result);
                         if supported {
-                            return self.update_update_ui(Action::Poll);
+                            return self.apply_update_action(Action::Poll);
                         }
                     }
                     Err(error) if manual => {
@@ -878,7 +905,7 @@ impl Cagents {
                 if self.update_ui.updating() || self.window_update_blocker().is_some() {
                     return Task::none();
                 }
-                self.update_update_ui(Action::StartApply)
+                self.apply_update_action(Action::StartApply)
             }
             Action::ChoosePolicy(policy) => {
                 self.decide_update(crate::update::UpdateChoice::Policy(policy))
@@ -946,7 +973,7 @@ impl Cagents {
                     self.update_ui.submitted_confirmation = None;
                     self.update_ui.error = Some(error);
                 }
-                self.update_update_ui(Action::Poll)
+                self.apply_update_action(Action::Poll)
             }
             Action::StartApply => {
                 if self.update_ui.updating() {
@@ -1149,7 +1176,7 @@ impl Cagents {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::app) mod tests {
     use super::*;
 
     #[test]
@@ -1472,38 +1499,92 @@ mod tests {
         assert_eq!(ago(2 * 86_400), "2 days ago");
     }
 
-    #[test]
-    fn transient_status_failure_keeps_observing_and_revokes_stale_confirmation() {
-        let mut app = crate::app::tests::context_inspector_test_app(false);
-        let confirmation = crate::update::UpdateConfirmation {
-            stop: None,
-            nonce: uuid::Uuid::new_v4().to_string(),
-            preview: crate::update::impact::Preview {
-                from_version: String::new(),
-                windows: 0,
-                stopped: Vec::new(),
-                stopped_windows: Vec::new(),
-                labels: Default::default(),
-                editors: Vec::new(),
-                candidate: crate::update::impact::Candidate {
-                    version: "new".into(),
-                    protocol: 32,
-                    digest: "verified".into(),
-                },
-                replaces_daemon: false,
-                daemon: None,
-            },
-            expires_at_unix_ms: u64::MAX,
-        };
-        let job = UpdateJob {
+    /// A verified update waiting for the person to confirm it, as a poll
+    /// reports it once its review is ready.
+    pub(in crate::app) fn awaiting_confirmation() -> UpdateJob {
+        UpdateJob {
             id: uuid::Uuid::new_v4().to_string(),
             version: "new".into(),
             phase: UpdatePhase::AwaitingConfirmation,
             message: "Ready".into(),
             log_path: "/fixture/update.log".into(),
-            confirmation: Some(confirmation.clone()),
+            confirmation: Some(crate::update::UpdateConfirmation {
+                stop: None,
+                nonce: uuid::Uuid::new_v4().to_string(),
+                preview: crate::update::impact::Preview {
+                    from_version: String::new(),
+                    windows: 0,
+                    stopped: Vec::new(),
+                    stopped_windows: Vec::new(),
+                    labels: Default::default(),
+                    editors: Vec::new(),
+                    candidate: crate::update::impact::Candidate {
+                        version: "new".into(),
+                        protocol: 32,
+                        digest: "verified".into(),
+                    },
+                    replaces_daemon: false,
+                    daemon: None,
+                },
+                expires_at_unix_ms: u64::MAX,
+            }),
             refusal: None,
-        };
+        }
+    }
+
+    /// Starts the update `job` describes, as Update does, and returns the
+    /// poll that brings its review up.
+    pub(in crate::app) fn review_ready(app: &mut Cagents, job: UpdateJob) -> Message {
+        let mut started = job.clone();
+        started.phase = UpdatePhase::Starting;
+        started.confirmation = None;
+        drop(app.update_update_ui(Action::Applied(Ok(started))));
+        Message::UpdateUi(Action::Polled(Some(job.id.clone()), Ok(Some(job))))
+    }
+
+    /// The review takes the keyboard when it comes up, from a poll or from
+    /// the header control that reopens it, and keeps the focus the person
+    /// gave it while later polls refresh it.
+    #[test]
+    fn the_update_review_takes_the_keyboard_once_as_it_comes_up() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let job = awaiting_confirmation();
+        let poll = review_ready(&mut app, job.clone());
+        let opening = app.update(poll);
+        fn dialog(app: &Cagents) -> Element<'_, Message> {
+            cosmic::Application::dialog(app).expect("the review is up")
+        }
+        assert_eq!(
+            crate::app::tests::focused_element(dialog(&app), opening),
+            Some(cancel_id()),
+            "it opens on Cancel"
+        );
+        let refresh = app.update(Message::UpdateUi(Action::Polled(
+            Some(job.id.clone()),
+            Ok(Some(job.clone())),
+        )));
+        assert_eq!(
+            crate::app::tests::focused_element(dialog(&app), refresh),
+            None,
+            "a poll refreshing the open review moves nothing"
+        );
+        // Looking at a session the review names sets it aside, as
+        // `Action::ShowSession` does; the header control brings it back.
+        app.update_ui.set_aside = Some(job.id.clone());
+        app.update_ui.confirmation = None;
+        let reopening = app.update(Message::UpdateUi(Action::ReviewJob));
+        assert_eq!(
+            crate::app::tests::focused_element(dialog(&app), reopening),
+            Some(cancel_id()),
+            "reopening it from the header opens on Cancel again"
+        );
+    }
+
+    #[test]
+    fn transient_status_failure_keeps_observing_and_revokes_stale_confirmation() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let job = awaiting_confirmation();
+        let confirmation = job.confirmation.clone().unwrap();
         app.update_ui.job = Some(job.clone());
         app.update_ui.confirmation = Some(confirmation);
         drop(app.update_update_ui(Action::Polled(
