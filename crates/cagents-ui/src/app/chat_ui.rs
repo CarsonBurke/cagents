@@ -24587,13 +24587,21 @@ pub(in crate::app) mod tests {
         for (outcome, conversation_error) in [
             (delivery::UNCONFIRMED_INPUT, false),
             (delivery::UNACKNOWLEDGED_INPUT, false),
-            (delivery::CROWDED_INPUT, false),
+            (delivery::UNACKNOWLEDGED_ANSWER, false),
+            (delivery::UNACKNOWLEDGED_STOP, false),
+            (delivery::UNSETTLED_INPUT, false),
             (delivery::RECONNECTING_INPUT, false),
+            (delivery::CROWDED_INPUT, false),
+            (delivery::RETIRING_INPUT, false),
             (delivery::OVERSIZED_INPUT, false),
             (delivery::HANDOVER_INPUT, false),
-            (delivery::UNAVAILABLE_INPUT, true),
-            (delivery::DISCONTINUOUS_INPUT, true),
+            (delivery::DAMAGED_INPUT, false),
+            (delivery::UNSETTLEABLE_INPUT, true),
             (delivery::STOPPED_INPUT, true),
+            (delivery::CLOSING_INPUT, true),
+            (delivery::DISCONTINUOUS_INPUT, true),
+            (delivery::UNSUPPORTED_INPUT, true),
+            (delivery::UNAVAILABLE_INPUT, true),
         ] {
             let mut app = crate::app::tests::context_inspector_test_app(false);
             let card = live_chat(&mut app, Some(KNOWN_THREAD));
@@ -24621,6 +24629,48 @@ pub(in crate::app) mod tests {
                 "{outcome}: {:?}",
                 runtime.conversation_status(false)
             );
+            assert_eq!(
+                runtime.finished_label(),
+                if conversation_error {
+                    "Finished with error"
+                } else {
+                    "Finished"
+                },
+                "{outcome}"
+            );
+        }
+    }
+
+    /// A provider exit reported after a declined send replaces the advice to
+    /// send again, whatever declined it; an outcome that already says the
+    /// conversation cannot go on stays beside the exit.
+    #[test]
+    fn an_exit_after_a_declined_send_replaces_only_a_send_notice() {
+        use chat::failure::delivery;
+        for (outcome, kept) in [
+            (delivery::CROWDED_INPUT, false),
+            (delivery::UNACKNOWLEDGED_INPUT, false),
+            (delivery::UNAVAILABLE_INPUT, true),
+        ] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat(&mut app, Some(KNOWN_THREAD));
+            let target = chat_runtime(&app, card).target;
+            let handle = chat_runtime(&app, card).handle().unwrap().clone();
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .replace_draft(text_editor::Content::with_text("Keep this message"));
+            drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send))));
+            settle(&mut app, card, Err(outcome.into()));
+            assert_eq!(chat_runtime(&app, card).error.as_deref(), Some(outcome));
+            let mut snapshot = (*handle.snapshot()).clone();
+            snapshot.generation += 1;
+            snapshot.exited = true;
+            handle.publish_snapshot_for_test(snapshot);
+            drop(app.update(Message::ChatUi(Action::Wake(target, Wake::Changed))));
+            let runtime = chat_runtime(&app, card);
+            assert!(runtime.snapshot.exited, "{outcome}");
+            assert_eq!(runtime.error.is_some(), kept, "{outcome}");
+            assert_eq!(runtime.composer.text().trim(), "Keep this message");
         }
     }
 
