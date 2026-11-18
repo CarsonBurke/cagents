@@ -347,6 +347,8 @@ enum NoticeKey {
     TerminalSave(CardId, TerminalId),
     /// Starting or restoring the terminal in this card.
     TerminalStart(CardId),
+    /// Restoring this card from the window's saved state at startup.
+    CardRestore(CardId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -647,6 +649,24 @@ fn terminal_handoff_pending_notice(error: String) -> TransientNotice {
     TransientNotice::error(format!(
         "Terminal handoff acknowledgement is pending; it will retry after saving recovers or the window refreshes: {error}"
     ))
+}
+
+/// A card the window's saved state could not restore. The notice stands until
+/// the card opens here anyway, as a pane another window or the daemon still
+/// holds does, and then the copy that arrived replaces the unreadable one.
+fn card_restore_notice(warning: &cagents::persistence::RestoreWarning) -> TransientNotice {
+    use cagents::persistence::RestoreProblem;
+    let title = &warning.title;
+    match &warning.problem {
+        RestoreProblem::Missing => TransientNotice::warning(format!(
+            "Could not restore “{title}”: its saved record is missing."
+        )),
+        RestoreProblem::Unreadable(reason) => TransientNotice::warning(format!(
+            "Could not restore “{title}”. Its saved data is kept."
+        ))
+        .with_details(reason.clone()),
+    }
+    .with_key(NoticeKey::CardRestore(warning.card))
 }
 
 fn chat_return_unsaved_notice(card: CardId) -> TransientNotice {
@@ -2491,7 +2511,7 @@ pub(crate) struct Bootstrap {
     status: Option<String>,
     save_health: Option<SaveHealthState>,
     /// Cards that storage held but could not restore. Advisory, never fatal.
-    restore_warnings: Vec<String>,
+    restore_warnings: Vec<cagents::persistence::RestoreWarning>,
     /// Settings the file holds that this build could not use. Advisory.
     settings_warnings: Vec<String>,
 }
@@ -13917,7 +13937,9 @@ impl Cagents {
     /// paths - a close, a deleted worktree or channel, a sign-in's terminal
     /// retiring, another client removing a shared pane - so this holds for
     /// all of them in one place, after every update, rather than in each.
-    fn resolve_notices_for_closed_cards(&mut self) {
+    /// Likewise a card that could not be restored at startup may still open
+    /// here, from a shared view that holds it, and its report goes then.
+    fn resolve_card_notices(&mut self) {
         self.prune_terminal_save_notices();
         let closed = self
             .notices
@@ -13940,6 +13962,24 @@ impl Cagents {
             })
             .collect::<Vec<_>>();
         for key in closed {
+            self.notices.resolve(key);
+        }
+        let restored = self
+            .notices
+            .entries
+            .iter()
+            .filter_map(|entry| match entry.notice.key.as_ref() {
+                Some(key @ NoticeKey::CardRestore(card))
+                    if self
+                        .card_state(*card)
+                        .is_some_and(|state| state.existence.is_open()) =>
+                {
+                    Some(key.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for key in restored {
             self.notices.resolve(key);
         }
     }
@@ -15866,11 +15906,13 @@ impl Application for Cagents {
             lifecycle_sweep_destination: None,
             input_trace: crate::input_trace::InputTrace::default(),
         };
-        // One notice per lost card, not a single joined line: the log dedupes
-        // by message, so distinct failures stay distinct and a repeated one
-        // collapses into a count. The alternative this replaces was losing
+        // One notice per lost card, not a single joined line, so distinct
+        // failures stay distinct. The alternative this replaces was losing
         // cards with no diagnostic anywhere in the UI.
-        for warning in restore_warnings.into_iter().chain(settings_warnings) {
+        for warning in restore_warnings {
+            app.notices.record(card_restore_notice(&warning));
+        }
+        for warning in settings_warnings {
             app.notices.record(TransientNotice::warning(warning));
         }
         app.sidebar_state
@@ -18221,7 +18263,7 @@ impl Application for Cagents {
         if let Some(notice) = self.status.take() {
             self.report_notice(notice);
         }
-        self.resolve_notices_for_closed_cards();
+        self.resolve_card_notices();
         // A canonical save can arrive before the retry reply. Restore input
         // after either path retires the focused Retry save control.
         let task = Task::batch([task, self.refocus_saved_terminal()]);

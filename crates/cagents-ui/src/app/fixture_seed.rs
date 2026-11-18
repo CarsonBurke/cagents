@@ -371,7 +371,7 @@ mod tests {
                 .load_workspace_restored(window.workspace_id, None)
                 .unwrap()
                 .unwrap();
-            assert_eq!(restored.warnings, Vec::<String>::new(), "{}", window.slot);
+            assert_eq!(restored.warnings, Vec::new(), "{}", window.slot);
             let state = restored.state;
             assert_eq!(state.cards.len(), window.cards.len(), "{}", window.slot);
             let open = window

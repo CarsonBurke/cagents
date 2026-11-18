@@ -232,6 +232,25 @@ pub struct SavedConversation {
     pub updated_at_unix_ms: i64,
 }
 
+/// An open card [`StateStore::load_workspace_restored`] left out of the
+/// workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreWarning {
+    pub card: CardId,
+    pub title: String,
+    pub problem: RestoreProblem,
+}
+
+/// Why an open card could not be restored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestoreProblem {
+    /// The workspace lists the card, but storage holds no record of it.
+    Missing,
+    /// Storage holds the card's record, unchanged, but could not decode it, for
+    /// the reason given.
+    Unreadable(String),
+}
+
 /// A restored workspace together with the cards that could not be restored
 /// into it.
 ///
@@ -240,8 +259,13 @@ pub struct SavedConversation {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RestoredWorkspace {
     pub state: WorkspaceState,
-    /// One human-readable line per card that was left out, newest problem last.
-    pub warnings: Vec<String>,
+    /// One per open card that was left out, in workspace order.
+    pub warnings: Vec<RestoreWarning>,
+    /// The stored generation of each open card left out because it could not
+    /// be decoded. Storage still holds these rows open, so a writer that may
+    /// offer one of them again, as a shared view's copy of the pane, writes
+    /// against this generation.
+    pub unrestored: BTreeMap<CardId, u64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -632,7 +656,7 @@ struct StoreInner {
 /// Remembering how each card was settled is what keeps every flush from
 /// serializing all of them to compare with storage once more.
 ///
-/// Neither half is persisted. A store opened afresh remembers nothing, so its
+/// None of it is persisted. A store opened afresh remembers nothing, so its
 /// first snapshot offers every card on its merits, as any snapshot did before
 /// this was remembered.
 #[derive(Default)]
@@ -641,6 +665,27 @@ struct OfferedCards {
     refused: HashMap<CardId, RefusedClosure>,
     /// Cards, open or closed, whose content storage holds.
     settled: HashMap<CardId, SettledCard>,
+    /// Open cards [`StateStore::load_workspace_restored`] could not decode.
+    /// The window never had them, so a snapshot that leaves one out has not
+    /// closed it; see [`save_workspace_transaction`].
+    unrestored: HashMap<CardId, UnrestoredCard>,
+}
+
+/// An open card row storage could not decode when it restored the workspace.
+///
+/// Every write to a card row advances its generation, so the row is the one
+/// that could not be decoded exactly while it still carries `generation`.
+/// Nothing has to be forgotten when a snapshot that replaces it commits, or
+/// remembered again when one rolls back.
+struct UnrestoredCard {
+    workspace: WorkspaceId,
+    generation: u64,
+}
+
+impl UnrestoredCard {
+    fn holds(&self, workspace: WorkspaceId, stored: &ExistingCard) -> bool {
+        self.workspace == workspace && self.generation == stored.generation
+    }
 }
 
 /// A closed card's final content as storage refused it, with the generation
@@ -747,7 +792,8 @@ impl SettledCard {
             kind,
         } = &self.card;
         // A write leaves an open card's row open and a closed card's closed.
-        stored.existence.is_open() == existence.is_open()
+        !stored.unreadable
+            && stored.existence.is_open() == existence.is_open()
             && stored.generation == expected
             && stored.content_hash == Some(self.content_hash)
             && self.workspace == workspace
@@ -2113,8 +2159,10 @@ impl StateStore {
     /// history that no longer validates — used to abort the entire restore,
     /// which the shell then presents as an empty workspace with no projects and
     /// no worktrees, on every launch, with the cause never logged anywhere.
-    /// Everything that decodes is now restored and every card that did not is
-    /// reported in [`RestoredWorkspace::warnings`] for the shell to surface.
+    /// Everything that decodes is now restored and every open card that did
+    /// not is reported in [`RestoredWorkspace::warnings`] for the shell to
+    /// surface. A closed card is only logged: nothing the user can see or do
+    /// depends on it.
     ///
     /// A corrupt *manifest* is deliberately still all-or-nothing. That is a
     /// different class of failure: without a trustworthy manifest there is no
@@ -2122,11 +2170,16 @@ impl StateStore {
     /// a partial result could not be distinguished from the user's real
     /// workspace and the next save would commit it over the intact rows.
     ///
-    /// A card left out here is absent from the next snapshot, so the save path
-    /// tombstones it — the row and its payload stay, marked closed. That is
-    /// why the failure is *reported* rather than swallowed: the user has to
-    /// learn a card was lost, at the moment it happens, instead of finding it
-    /// closed later with no explanation.
+    /// The record of an open card left out here stays as stored: open, with
+    /// the content that could not be decoded, which a later build that can
+    /// decode it restores. The window never held the card, so a snapshot that
+    /// leaves it out has not closed it, and the save path does not tombstone
+    /// it. Where it sits in the workspace is not kept: the window's channels
+    /// no longer list it. A copy of the card offered later, such as the pane a
+    /// shared view still holds, replaces the record as an ordinary write
+    /// against the generation reported in [`RestoredWorkspace::unrestored`].
+    /// The failure is *reported* rather than swallowed, so the user learns a
+    /// card is missing when it happens.
     pub fn load_workspace_restored(
         &self,
         id: WorkspaceId,
@@ -2141,6 +2194,7 @@ impl StateStore {
 
         let mut cards = Vec::with_capacity(manifest.cards.len());
         let mut warnings = Vec::new();
+        let mut unrestored = BTreeMap::new();
         for summary in &manifest.cards {
             match load_card_connection(&transaction, summary.id, &self.boot_id, proof) {
                 Ok(Some(card)) => cards.push(card),
@@ -2150,10 +2204,13 @@ impl StateStore {
                         card = %summary.id,
                         "workspace manifest references a card row that no longer exists"
                     );
-                    warnings.push(format!(
-                        "{} ({}): the card record is missing from the database",
-                        summary.title, summary.id
-                    ));
+                    if summary.existence.is_open() {
+                        warnings.push(RestoreWarning {
+                            card: summary.id,
+                            title: summary.title.clone(),
+                            problem: RestoreProblem::Missing,
+                        });
+                    }
                 }
                 Err(error) => {
                     tracing::error!(
@@ -2163,11 +2220,29 @@ impl StateStore {
                         %error,
                         "card could not be restored and was left out of the workspace"
                     );
-                    warnings.push(format!("{} ({}): {error}", summary.title, summary.id));
+                    if summary.existence.is_open() {
+                        warnings.push(RestoreWarning {
+                            card: summary.id,
+                            title: summary.title.clone(),
+                            problem: RestoreProblem::Unreadable(error.to_string()),
+                        });
+                        unrestored.insert(summary.id, summary.generation);
+                    }
                 }
             }
         }
         transaction.commit()?;
+        let offered = &mut inner.offered_cards.unrestored;
+        offered.retain(|_, unrestored| unrestored.workspace != id);
+        offered.extend(unrestored.iter().map(|(card, generation)| {
+            (
+                *card,
+                UnrestoredCard {
+                    workspace: id,
+                    generation: *generation,
+                },
+            )
+        }));
 
         let mut state = WorkspaceState {
             schema_version: manifest.schema_version,
@@ -2220,7 +2295,11 @@ impl StateStore {
                 .collect();
             state.agent_updates.retain(|card, _| open.contains(card));
         }
-        Ok(Some(RestoredWorkspace { state, warnings }))
+        Ok(Some(RestoredWorkspace {
+            state,
+            warnings,
+            unrestored,
+        }))
     }
 
     pub fn save_transcript_metadata(
@@ -4440,7 +4519,20 @@ fn save_workspace_transaction(
 
     for (ordinal, card) in state.cards.iter().enumerate() {
         let expected = base.cards.get(&card.id).copied().unwrap_or(0);
-        let stored = existing.get(&card.id);
+        let unreadable;
+        let mut stored = existing.get(&card.id);
+        if let Some(row) = stored
+            && offered_cards
+                .unrestored
+                .get(&card.id)
+                .is_some_and(|unrestored| unrestored.holds(state.id, row))
+        {
+            unreadable = ExistingCard {
+                unreadable: true,
+                ..*row
+            };
+            stored = Some(&unreadable);
+        }
         let generation = if card.existence.is_open() {
             save_open_card(
                 transaction,
@@ -4488,6 +4580,17 @@ fn save_workspace_transaction(
         if incoming_ids.contains(card_id) {
             continue;
         }
+        // A card the window could not restore was never in its snapshot to
+        // leave out, so its absence closes nothing. It keeps its row, open and
+        // unchanged, for a later offer of the card to replace.
+        if offered_cards
+            .unrestored
+            .get(card_id)
+            .is_some_and(|unrestored| unrestored.holds(state.id, stored))
+        {
+            card_generations.insert(*card_id, stored.generation);
+            continue;
+        }
         let tombstone = Existence::Closed {
             tombstone: Tombstone {
                 operation_id: None,
@@ -4511,6 +4614,16 @@ fn save_workspace_transaction(
     offered_cards
         .refused
         .retain(|card, refused| offered(refused.workspace, card));
+    // A row written since it was found undecodable, by this snapshot or an
+    // earlier one, carries a later generation and is an ordinary card now.
+    // Whether this transaction commits does not matter: the generation read
+    // here was committed before it began.
+    offered_cards.unrestored.retain(|card, unrestored| {
+        unrestored.workspace != state.id
+            || existing
+                .get(card)
+                .is_some_and(|stored| unrestored.holds(state.id, stored))
+    });
 
     Ok(WorkspaceCommit {
         generation: next,
@@ -4677,7 +4790,7 @@ fn save_card(
             });
         }
         if stored.kind != kind {
-            validate_card_conversion(transaction, card, stored.kind)?;
+            validate_card_conversion(transaction, card, stored)?;
         }
     } else if expected != 0 {
         return Err(StoreError::StaleGeneration {
@@ -4692,16 +4805,13 @@ fn save_card(
     // columns describe the last *content* change, so leaving the rows untouched
     // is not an approximation of the write — it is the write, with zero dirtied
     // pages and zero WAL frames.
-    let unchanged = stored.is_some_and(|stored| stored.content_hash == Some(write.content_hash));
+    let unchanged = stored.is_some_and(|stored| {
+        !stored.unreadable && stored.content_hash == Some(write.content_hash)
+    });
     if let CardKind::Chat(session) = &card.kind {
         // A conversation offered exactly as stored cannot have changed its
         // identity, so only a changed one is compared with the stored row.
-        validate_chat_identity(
-            transaction,
-            card.id,
-            session,
-            stored.filter(|_| !unchanged).map(|stored| stored.kind),
-        )?;
+        validate_chat_identity(transaction, card.id, session, stored.filter(|_| !unchanged))?;
     }
     if unchanged {
         return Ok(SavedCard {
@@ -4878,34 +4988,52 @@ fn tombstone_card(
 fn validate_card_conversion(
     transaction: &Transaction<'_>,
     card: &CardState,
-    previous: PersistedCardKind,
+    previous: &ExistingCard,
 ) -> Result<()> {
     let invalid = || invalid_state!("card {} has an invalid chat/terminal conversion", card.id);
-    match (previous, &card.kind) {
+    match (previous.kind, &card.kind) {
         (PersistedCardKind::Terminal, CardKind::Chat(session)) => {
             let source = session.terminal.as_ref().ok_or_else(invalid)?;
-            let (id, recipe): (String, String) = transaction.query_row(
-                "SELECT terminal_id, recipe_json FROM terminal_recipes WHERE card_id = ?1",
-                [card.id.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?;
             if source.id != session.id
-                || id != source.id.to_string()
-                || from_json::<crate::model::LaunchRecipe>("terminal recipe", &recipe)?
-                    != source.launch
                 || !(source_chat_launch_matches(source, session) || codex_cli_view(session, source))
                 || exact_chat_resume(session).is_none()
             {
                 return Err(invalid());
             }
+            // The conversation must have started from the terminal stored
+            // for the card.
+            let stored = transaction
+                .query_row(
+                    "SELECT terminal_id, recipe_json FROM terminal_recipes WHERE card_id = ?1",
+                    [card.id.to_string()],
+                    |row| Ok((column_bytes(row, 0)?, column_bytes(row, 1)?)),
+                )
+                .optional()?;
+            let Some((id, recipe)) = stored else {
+                // A terminal card restores from its recipe, so one that could
+                // not be restored may have none left to compare.
+                return if previous.unreadable {
+                    Ok(())
+                } else {
+                    Err(rusqlite::Error::QueryReturnedNoRows.into())
+                };
+            };
+            if id != source.id.to_string().as_bytes()
+                || checked_content::<crate::model::LaunchRecipe>(
+                    card.id,
+                    "terminal recipe",
+                    &recipe,
+                    previous,
+                )?
+                .is_some_and(|recipe| recipe != source.launch)
+            {
+                return Err(invalid());
+            }
         }
         (PersistedCardKind::Chat, CardKind::Terminal(terminal)) => {
-            let content: String = transaction.query_row(
-                "SELECT content_json FROM cards WHERE card_id = ?1",
-                [card.id.to_string()],
-                |row| row.get(0),
-            )?;
-            let session: crate::chat::Session = from_json("chat card", &content)?;
+            let Some(session) = stored_chat_session(transaction, card.id, previous)? else {
+                return Ok(());
+            };
             let proof = terminal.continuity.live_proof();
             let reattach = session.launch.provider == crate::agent::Provider::Codex
                 && proof.is_some()
@@ -4999,7 +5127,7 @@ fn validate_chat_identity(
     transaction: &Transaction<'_>,
     card: CardId,
     session: &crate::chat::Session,
-    previous: Option<PersistedCardKind>,
+    previous: Option<&ExistingCard>,
 ) -> Result<()> {
     if !session.has_valid_native_continuity() {
         return Err(invalid_state!(
@@ -5018,13 +5146,9 @@ fn validate_chat_identity(
     {
         return Err(invalid_state!("chat card {card} changed source identity"));
     }
-    if previous == Some(PersistedCardKind::Chat) {
-        let content: String = transaction.query_row(
-            "SELECT content_json FROM cards WHERE card_id = ?1",
-            [card.to_string()],
-            |row| row.get(0),
-        )?;
-        let stored: crate::chat::Session = from_json("chat card", &content)?;
+    if let Some(previous) = previous.filter(|previous| previous.kind == PersistedCardKind::Chat)
+        && let Some(stored) = stored_chat_session(transaction, card, previous)?
+    {
         if let Some(check) = chat_identity_change(&stored, session) {
             return Err(StoreError::InvalidState(Violation::new(
                 check,
@@ -5033,6 +5157,54 @@ fn validate_chat_identity(
         }
     }
     Ok(())
+}
+
+/// The conversation a stored chat card row holds, which a write of the card is
+/// checked against. `None` when `previous` is a row storage could not restore
+/// and this is what it could not decode; see [`checked_content`].
+fn stored_chat_session(
+    transaction: &Transaction<'_>,
+    card: CardId,
+    previous: &ExistingCard,
+) -> Result<Option<crate::chat::Session>> {
+    let content = transaction.query_row(
+        "SELECT content_json FROM cards WHERE card_id = ?1",
+        [card.to_string()],
+        // A missing payload is as undecodable as a malformed one.
+        |row| match row.get_ref(0)? {
+            rusqlite::types::ValueRef::Null => Ok(Vec::new()),
+            _ => column_bytes(row, 0),
+        },
+    )?;
+    checked_content(card, "chat card", &content, previous)
+}
+
+/// Decodes stored content that a write of `card` is checked against.
+///
+/// A row storage could not restore ([`ExistingCard::unreadable`]) may hold
+/// content that does not decode. Then there is nothing to check the write
+/// against, and `None` lets the write replace the row: the window never held
+/// the card, and refusing the copy it is now offered, such as a shared view's
+/// pane, would refuse it on every flush. Content that does decode is checked
+/// as for any other row, and so is every row the window restored.
+fn checked_content<T: DeserializeOwned>(
+    card: CardId,
+    kind: &str,
+    content: &[u8],
+    previous: &ExistingCard,
+) -> Result<Option<T>> {
+    match from_json_bytes(kind, content) {
+        Ok(content) => Ok(Some(content)),
+        Err(error) if previous.unreadable => {
+            tracing::warn!(
+                %card,
+                %error,
+                "replacing a card row that could not be restored without checking it"
+            );
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// What about the conversation chat payload `stored` binds would change if
@@ -5823,6 +5995,11 @@ struct ExistingCard {
     /// changed by a path that does not maintain the fingerprint. Either way it
     /// never matches a computed fingerprint, so the card is simply rewritten.
     content_hash: Option<i64>,
+    /// Whether this is a row storage could not decode when it restored the
+    /// workspace ([`UnrestoredCard`]). Its fingerprint describes content that
+    /// cannot be read, so it does not show that an offer is already stored,
+    /// and what it holds cannot be compared with an offer that replaces it.
+    unreadable: bool,
 }
 
 fn existing_cards(
@@ -5855,6 +6032,7 @@ fn existing_cards(
                 generation: i64_to_u64(generation, "card generation")?,
                 has_content,
                 content_hash,
+                unreadable: false,
             },
         );
     }
@@ -8069,7 +8247,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(restored.warnings.len(), 1);
-        assert!(restored.warnings[0].contains(&broken_id.to_string()));
+        assert_eq!(restored.warnings[0].card, broken_id);
         assert!(!restored.state.cards.iter().any(|card| card.id == broken_id));
         assert_eq!(
             restored.state.agent_updates,
@@ -12935,11 +13113,11 @@ mod tests {
                 [healthy]
             );
             assert_eq!(restored.warnings.len(), 1, "{:?}", restored.warnings);
-            assert!(restored.warnings[0].contains(&broken.id.to_string()));
+            assert_eq!(restored.warnings[0].card, broken.id);
 
             // The window keeps saving around the lost card, which the next
-            // snapshot closes without touching its terminal record, and a
-            // further unclean reopen still recovers.
+            // snapshot leaves as stored, and a further unclean reopen still
+            // recovers.
             let mut lane = SaveLane {
                 workspace: restored.state.generation,
                 cards: restored
@@ -13699,8 +13877,10 @@ mod tests {
         assert_eq!(restored.state.cards[0].id, survivor);
         assert_eq!(restored.warnings.len(), 1);
         assert!(
-            restored.warnings[0].contains("launch recipe")
-                && restored.warnings[0].contains(&broken_card.to_string()),
+            matches!(
+                &restored.warnings[0].problem,
+                RestoreProblem::Unreadable(reason) if reason.contains("launch recipe")
+            ) && restored.warnings[0].card == broken_card,
             "the warning must name the card and the reason: {:?}",
             restored.warnings
         );
@@ -13724,6 +13904,300 @@ mod tests {
         recovered
             .save(&store, &restored.state)
             .expect("a partially restored workspace must still save");
+    }
+
+    /// A card the window could not restore is not one it closed. Its row
+    /// stays open and unchanged while snapshots leave it out, and a copy
+    /// offered later, as a shared view's pane is, replaces the unreadable row
+    /// once instead of being refused as a resurrected tombstone (#3062).
+    #[test]
+    fn an_unrestored_card_stays_open_until_a_later_copy_replaces_it() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let boot_id = boot("boot-a");
+        let mut workspace = workspace_with_terminal(&boot_id);
+        let mut broken = workspace.cards[0].clone();
+        broken.id = CardId::new();
+        broken.title = "broken".into();
+        let CardKind::Terminal(session) = &mut broken.kind else {
+            unreachable!()
+        };
+        session.id = TerminalId::new();
+        session.continuity = TerminalContinuity::RelaunchAvailable {
+            recipe: session.launch.clone(),
+            last_exit: None,
+        };
+        let broken_terminal = session.id;
+        workspace.cards.push(broken.clone());
+        {
+            let store = StateStore::open(&path, boot_id.clone()).unwrap();
+            SaveLane::default().save(&store, &workspace).unwrap();
+            store.shutdown().unwrap();
+        }
+        // The fingerprint is left alone, as a newer build's write would leave
+        // one describing content this build cannot read.
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE terminal_recipes SET continuity_json = '{\"state\":\"newer\"}'
+                 WHERE terminal_id = ?1",
+                [broken_terminal.to_string()],
+            )
+            .unwrap();
+
+        let store = StateStore::open(&path, boot_id.clone()).unwrap();
+        let restored = store
+            .load_workspace_restored(workspace.id, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.warnings.len(), 1, "{:?}", restored.warnings);
+        assert!(!restored.state.cards.iter().any(|card| card.id == broken.id));
+        let stored_generation = stored_card_row(&store, broken.id).0;
+        let mut lane = SaveLane {
+            workspace: restored.state.generation,
+            cards: restored
+                .state
+                .cards
+                .iter()
+                .map(|card| (card.id, card.generation))
+                .chain([(broken.id, u64::try_from(stored_generation).unwrap())])
+                .collect(),
+        };
+        lane.save(&store, &restored.state).unwrap();
+        let existence: String = store
+            .lock_inner()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT existence_json FROM cards WHERE card_id = ?1",
+                [broken.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            existence, OPEN_EXISTENCE_JSON,
+            "a snapshot that never held the card must not close it"
+        );
+
+        // The shared view still holds the pane and projects it back.
+        let mut projected = restored.state.clone();
+        projected.cards.push(broken.clone());
+        let replaced = lane
+            .save(&store, &projected)
+            .expect("the projected copy replaces the unreadable row");
+        assert!(replaced.refused.is_empty(), "{:?}", replaced.refused);
+        assert!(
+            replaced.card_generations[&broken.id] > u64::try_from(stored_generation).unwrap(),
+            "the copy is written even though its fingerprint matches the row"
+        );
+        // Nothing is refused or rewritten after that.
+        let settled = lane.save(&store, &projected).unwrap();
+        assert!(settled.refused.is_empty(), "{:?}", settled.refused);
+        assert_eq!(
+            settled.card_generations[&broken.id],
+            replaced.card_generations[&broken.id]
+        );
+        drop(store);
+
+        let store = StateStore::open(&path, boot_id).unwrap();
+        let restored = store
+            .load_workspace_restored(workspace.id, None)
+            .unwrap()
+            .unwrap();
+        assert!(restored.warnings.is_empty(), "{:?}", restored.warnings);
+        let card = restored
+            .state
+            .cards
+            .iter()
+            .find(|card| card.id == broken.id)
+            .expect("the replaced card restores");
+        assert_eq!(card.kind, broken.kind);
+    }
+
+    /// A chat card whose stored conversation does not decode holds no identity
+    /// to compare a copy of the card with. The copy a shared view projects
+    /// replaces it, rather than failing the whole window's save.
+    #[test]
+    fn a_projected_copy_replaces_an_undecodable_chat_card() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let boot_id = boot("chat-boot");
+        let (mut workspace, mut chat) = agent_workspace(crate::agent::Provider::Codex);
+        chat.terminal = None;
+        let survivor = workspace.cards[0].clone();
+        let mut lost = survivor.clone();
+        lost.id = CardId::new();
+        lost.title = "conversation".into();
+        lost.kind = CardKind::Chat(chat);
+        workspace.cards.push(lost.clone());
+        {
+            let store = StateStore::open(&path, boot_id.clone()).unwrap();
+            SaveLane::default().save(&store, &workspace).unwrap();
+            store.shutdown().unwrap();
+        }
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE cards SET content_json = '{\"from\":\"a newer build\"}'
+                 WHERE card_id = ?1",
+                [lost.id.to_string()],
+            )
+            .unwrap();
+
+        let store = StateStore::open(&path, boot_id.clone()).unwrap();
+        let restored = store
+            .load_workspace_restored(workspace.id, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.warnings.len(), 1, "{:?}", restored.warnings);
+        assert!(
+            matches!(&restored.warnings[0].problem, RestoreProblem::Unreadable(reason) if reason.contains("chat card")),
+            "{:?}",
+            restored.warnings
+        );
+        let mut lane = SaveLane {
+            workspace: restored.state.generation,
+            cards: restored
+                .state
+                .cards
+                .iter()
+                .map(|card| (card.id, card.generation))
+                .chain(restored.unrestored.clone())
+                .collect(),
+        };
+        let mut projected = restored.state.clone();
+        projected.cards.push(lost.clone());
+        let commit = lane
+            .save(&store, &projected)
+            .expect("an undecodable conversation must not fail the window's save");
+        assert!(commit.refused.is_empty(), "{:?}", commit.refused);
+        drop(store);
+
+        let store = StateStore::open(&path, boot_id).unwrap();
+        let restored = store
+            .load_workspace_restored(workspace.id, None)
+            .unwrap()
+            .unwrap();
+        assert!(restored.warnings.is_empty(), "{:?}", restored.warnings);
+        let card = restored
+            .state
+            .cards
+            .iter()
+            .find(|card| card.id == lost.id)
+            .expect("the replaced conversation restores");
+        assert_eq!(card.kind, lost.kind);
+    }
+
+    /// What a conversation offered over an unreadable terminal row is checked
+    /// against stays checked: only the comparison with the stored recipe,
+    /// which cannot be read, is skipped.
+    #[test]
+    fn a_chat_over_an_unreadable_terminal_row_must_still_resume_its_source() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let boot_id = boot("chat-boot");
+        let (mut workspace, mut chat) = agent_workspace(crate::agent::Provider::Codex);
+        let lost = workspace.cards[0].id;
+        let CardKind::Terminal(source) = &workspace.cards[0].kind else {
+            unreachable!()
+        };
+        let terminal = source.id;
+        {
+            let store = StateStore::open(&path, boot_id.clone()).unwrap();
+            SaveLane::default().save(&store, &workspace).unwrap();
+            store.shutdown().unwrap();
+        }
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE terminal_recipes SET recipe_json = '{\"program\":7}'
+                 WHERE terminal_id = ?1",
+                [terminal.to_string()],
+            )
+            .unwrap();
+
+        let store = StateStore::open(&path, boot_id).unwrap();
+        let restored = store
+            .load_workspace_restored(workspace.id, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.warnings.len(), 1, "{:?}", restored.warnings);
+        let mut lane = SaveLane {
+            workspace: restored.state.generation,
+            cards: restored.unrestored.clone(),
+        };
+        // A conversation that names no conversation to resume cannot be the
+        // terminal's.
+        chat.launch.session_id = None;
+        workspace.generation = restored.state.generation;
+        workspace.cards[0].kind = CardKind::Chat(chat);
+        let refusal = card_refusal(lane.save(&store, &workspace), lost);
+        assert!(
+            refusal
+                .to_string()
+                .contains("invalid chat/terminal conversion"),
+            "{refusal}"
+        );
+    }
+
+    /// The user closed the card already, so nothing they can see or act on is
+    /// missing: a closed card that does not decode is logged, not reported,
+    /// and its tombstone is left alone.
+    #[test]
+    fn an_undecodable_closed_card_is_not_reported() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let boot_id = boot("boot-a");
+        let mut workspace = workspace_with_terminal(&boot_id);
+        let mut closed = workspace.cards[0].clone();
+        closed.id = CardId::new();
+        closed.existence = Existence::Closed {
+            tombstone: Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 1,
+                reason: None,
+            },
+        };
+        let CardKind::Terminal(session) = &mut closed.kind else {
+            unreachable!()
+        };
+        session.id = TerminalId::new();
+        let closed_terminal = session.id;
+        workspace.cards.push(closed.clone());
+        {
+            let store = StateStore::open(&path, boot_id.clone()).unwrap();
+            SaveLane::default().save(&store, &workspace).unwrap();
+            store.shutdown().unwrap();
+        }
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE terminal_recipes SET continuity_json = '{\"state\":\"newer\"}'
+                 WHERE terminal_id = ?1",
+                [closed_terminal.to_string()],
+            )
+            .unwrap();
+
+        let store = StateStore::open(&path, boot_id).unwrap();
+        let restored = store
+            .load_workspace_restored(workspace.id, None)
+            .unwrap()
+            .unwrap();
+        assert!(restored.warnings.is_empty(), "{:?}", restored.warnings);
+        assert!(restored.unrestored.is_empty(), "{:?}", restored.unrestored);
+        assert!(!restored.state.cards.iter().any(|card| card.id == closed.id));
+        let before = stored_card_row(&store, closed.id);
+        let mut lane = SaveLane {
+            workspace: restored.state.generation,
+            cards: restored
+                .state
+                .cards
+                .iter()
+                .map(|card| (card.id, card.generation))
+                .collect(),
+        };
+        lane.save(&store, &restored.state).unwrap();
+        assert_eq!(stored_card_row(&store, closed.id), before);
     }
 
     #[test]

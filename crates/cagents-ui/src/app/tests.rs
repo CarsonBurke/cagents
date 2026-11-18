@@ -9149,6 +9149,52 @@ fn a_completion_index_past_the_end_applies_nothing() {
     assert_eq!(app.lsp_contexts[&card].context.completions.len(), 1);
 }
 
+/// A card the saved state could not restore is reported until the card
+/// opens here anyway, from a shared view that still holds it (#3062).
+#[test]
+fn a_card_restore_report_stands_until_the_card_opens() {
+    let mut app = context_inspector_test_app(true);
+    let card = app.durable.cards[0].clone();
+    Arc::make_mut(&mut app.durable)
+        .cards
+        .retain(|held| held.id != card.id);
+    let notice = card_restore_notice(&cagents::persistence::RestoreWarning {
+        card: card.id,
+        title: "git log".into(),
+        problem: cagents::persistence::RestoreProblem::Unreadable(
+            "corrupt stored terminal continuity".into(),
+        ),
+    });
+    assert_eq!(
+        notice.message,
+        "Could not restore “git log”. Its saved data is kept."
+    );
+    assert_eq!(
+        notice.details.as_deref(),
+        Some("corrupt stored terminal continuity")
+    );
+    app.notices.record(notice);
+    let key = NoticeKey::CardRestore(card.id);
+    app.resolve_card_notices();
+    assert!(app.notices.has(key.clone()), "the card is still missing");
+
+    Arc::make_mut(&mut app.durable).cards.push(card);
+    app.resolve_card_notices();
+    assert!(!app.notices.has(key));
+
+    // A missing record leaves nothing kept to claim.
+    let missing = card_restore_notice(&cagents::persistence::RestoreWarning {
+        card: CardId::new(),
+        title: "git log".into(),
+        problem: cagents::persistence::RestoreProblem::Missing,
+    });
+    assert_eq!(
+        missing.message,
+        "Could not restore “git log”: its saved record is missing."
+    );
+    assert_eq!(missing.details, None);
+}
+
 /// Two cards can hold two documents at once, and diagnostics arrive
 /// unsolicited for either. Routing them by anything but the document id
 /// puts one file's errors on another file's card.
