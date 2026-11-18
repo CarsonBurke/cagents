@@ -1084,7 +1084,7 @@ impl Scroll {
     pub(super) fn content(self) -> f32 {
         self.content
     }
-    pub(super) fn from_top(self) -> f32 {
+    pub(super) fn offset_from_top(self) -> f32 {
         self.from_top
     }
     pub(super) fn window_height(self) -> f32 {
