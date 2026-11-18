@@ -9,6 +9,7 @@
 
 mod fallback;
 mod handle;
+mod history;
 mod import;
 mod input;
 mod lifecycle;
