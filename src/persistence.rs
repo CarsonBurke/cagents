@@ -160,6 +160,8 @@ pub struct RecoveryReport {
     pub boot_changed: bool,
     pub operations_requiring_reconciliation: usize,
     pub terminals_downgraded: usize,
+    /// Terminal records recovery could not decode and left unchanged.
+    pub terminals_unreadable: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4030,6 +4032,7 @@ fn reconcile_startup(connection: &mut Connection, boot_id: &BootId) -> Result<Re
     };
 
     let mut terminals_downgraded = 0;
+    let mut terminals_unreadable = 0;
     if dirty_shutdown || boot_changed {
         let terminal_rows = {
             let mut statement = transaction.prepare(
@@ -4047,9 +4050,31 @@ fn reconcile_startup(connection: &mut Connection, boot_id: &BootId) -> Result<Re
         };
 
         for (terminal_id, recipe_json, continuity_json) in terminal_rows {
-            let recipe = from_json("terminal recipe", &recipe_json)?;
-            let continuity: TerminalContinuity =
-                from_json("terminal continuity", &continuity_json)?;
+            // One record that no longer decodes must not stop the store from
+            // opening: that would leave the whole window without its
+            // workspace, catalog and writer on every launch, since the row
+            // stays on disk. It is left exactly as written instead; its card,
+            // if one is still open, fails to restore on its own and is
+            // reported to the user then.
+            let decoded = from_json::<crate::model::LaunchRecipe>("terminal recipe", &recipe_json)
+                .and_then(|recipe| {
+                    Ok((
+                        recipe,
+                        from_json::<TerminalContinuity>("terminal continuity", &continuity_json)?,
+                    ))
+                });
+            let (recipe, continuity) = match decoded {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    tracing::error!(
+                        terminal = %terminal_id,
+                        %error,
+                        "terminal record could not be decoded during startup recovery and was left unchanged"
+                    );
+                    terminals_unreadable += 1;
+                    continue;
+                }
+            };
             let downgraded = match continuity {
                 TerminalContinuity::Live {
                     host_session_id,
@@ -4103,6 +4128,7 @@ fn reconcile_startup(connection: &mut Connection, boot_id: &BootId) -> Result<Re
         boot_changed,
         operations_requiring_reconciliation,
         terminals_downgraded,
+        terminals_unreadable,
     })
 }
 
@@ -12803,6 +12829,126 @@ mod tests {
             "the snapshot must not be skipped over the downgraded continuity \
              the recovery pass left behind"
         );
+    }
+
+    /// One terminal row that no longer decodes must not stop the store from
+    /// opening after an unclean shutdown or reboot. The healthy terminal is
+    /// still reconciled and restored, the broken one is reported as a lost
+    /// card, and its row is left on disk exactly as written.
+    #[test]
+    fn startup_recovery_isolates_an_unreadable_terminal_row() {
+        struct Corruption {
+            column: &'static str,
+            value: &'static str,
+            reopen_boot: &'static str,
+        }
+        let cases = [
+            Corruption {
+                column: "continuity_json",
+                value: "{not json",
+                reopen_boot: "boot-a",
+            },
+            Corruption {
+                column: "recipe_json",
+                value: r#"{"program":7}"#,
+                reopen_boot: "boot-b",
+            },
+        ];
+        for case in cases {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("state.sqlite3");
+            let boot_id = boot("boot-a");
+            let mut workspace = workspace_with_terminal(&boot_id);
+            let mut broken = workspace.cards[0].clone();
+            broken.id = CardId::new();
+            broken.title = "broken terminal".into();
+            let CardKind::Terminal(terminal) = &mut broken.kind else {
+                unreachable!()
+            };
+            terminal.id = TerminalId::new();
+            let broken_terminal = terminal.id;
+            workspace.cards.push(broken.clone());
+            let healthy = workspace.cards[0].id;
+            {
+                // Dropped without `shutdown`, so the reopen runs recovery.
+                let store = StateStore::open(&path, boot_id.clone()).unwrap();
+                SaveLane::default().save(&store, &workspace).unwrap();
+            }
+            Connection::open(&path)
+                .unwrap()
+                .execute(
+                    &format!(
+                        "UPDATE terminal_recipes SET {} = ?1 WHERE terminal_id = ?2",
+                        case.column
+                    ),
+                    params![case.value, broken_terminal.to_string()],
+                )
+                .unwrap();
+
+            let store = StateStore::open(&path, boot(case.reopen_boot))
+                .unwrap_or_else(|error| panic!("{}: store failed to open: {error}", case.column));
+            assert_eq!(store.recovery_report().terminals_downgraded, 1);
+            assert_eq!(store.recovery_report().terminals_unreadable, 1);
+
+            let restored = store
+                .load_workspace_restored(workspace.id, None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                restored
+                    .state
+                    .cards
+                    .iter()
+                    .map(|card| card.id)
+                    .collect::<Vec<_>>(),
+                [healthy]
+            );
+            assert_eq!(restored.warnings.len(), 1, "{:?}", restored.warnings);
+            assert!(restored.warnings[0].contains(&broken.id.to_string()));
+
+            // The window keeps saving around the lost card, which the next
+            // snapshot closes without touching its terminal record, and a
+            // further unclean reopen still recovers.
+            let mut lane = SaveLane {
+                workspace: restored.state.generation,
+                cards: restored
+                    .state
+                    .cards
+                    .iter()
+                    .map(|card| (card.id, card.generation))
+                    .collect(),
+            };
+            lane.save(&store, &restored.state).unwrap();
+            drop(store);
+            let store = StateStore::open(&path, boot(case.reopen_boot)).unwrap();
+            assert_eq!(store.recovery_report().terminals_unreadable, 1);
+            assert_eq!(
+                store
+                    .load_workspace_restored(workspace.id, None)
+                    .unwrap()
+                    .unwrap()
+                    .state
+                    .cards
+                    .iter()
+                    .map(|card| card.id)
+                    .collect::<Vec<_>>(),
+                [healthy]
+            );
+
+            let inner = store.lock_inner().unwrap();
+            let preserved: String = inner
+                .connection
+                .query_row(
+                    &format!(
+                        "SELECT {} FROM terminal_recipes WHERE terminal_id = ?1",
+                        case.column
+                    ),
+                    [broken_terminal.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(preserved, case.value);
+        }
     }
 
     #[test]
