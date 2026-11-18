@@ -1604,7 +1604,8 @@ pub enum SidebarFocus {
     /// Nothing is focused, or the focused card names no directory at all.
     #[default]
     None,
-    /// A repository card, identified by the worktree it is open on.
+    /// A repository card, identified by the worktree it is open on, or a
+    /// pull request card, by its repository.
     Repository { worktree: PathBuf },
     /// A terminal card, identified by its working directory.
     Terminal { working_directory: PathBuf },

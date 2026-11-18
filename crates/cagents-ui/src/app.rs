@@ -7503,7 +7503,7 @@ impl Cagents {
     /// nothing, so it counts as any other pane.
     fn focused_pane(&self) -> workspace_widget::FocusedPane {
         let Some(card) = self.workspace.focused() else {
-            return workspace_widget::FocusedPane::Other;
+            return workspace_widget::FocusedPane::None;
         };
         match self.cards.get(&card) {
             Some(CardRuntime::Terminal(_))
@@ -7516,6 +7516,7 @@ impl Cagents {
             Some(CardRuntime::Repository(runtime)) if runtime.shows_diff() => {
                 workspace_widget::FocusedPane::Review
             }
+            _ if !self.pane_has_inspector(card) => workspace_widget::FocusedPane::NoInspector,
             _ => workspace_widget::FocusedPane::Other,
         }
     }
@@ -11660,7 +11661,10 @@ impl Cagents {
         // A pane whose content starts with a toolbar keeps the closed
         // inspector's toggle at the toolbar's end rather than over its
         // controls.
-        let inspector_closed = card.is_some() && self.pane_inspector_layout(id).is_none();
+        // A pane with no inspector here, such as an application page, has
+        // no toggle either.
+        let inspector = card.is_some() && self.pane_has_inspector(id);
+        let inspector_closed = inspector && self.pane_inspector_layout(id).is_none();
         let toolbar_toggle = || inspector_closed.then(|| self.pane_inspector_toggle(id, false));
         let toolbar_hosts_toggle = browser_session.is_some()
             || matches!(
@@ -12053,11 +12057,6 @@ impl Cagents {
                     accounts: self.default_account_choices(),
                     updates: self.update_summary(),
                     testing_notification: self.notification_ui.testing,
-                    trailing_clearance: if self.pane_inspector_layout(id).is_none() {
-                        pane_inspector::TOGGLE_CLEARANCE
-                    } else {
-                        0.0
-                    },
                 },
             ),
             Some(CardRuntime::Accounts) => self.accounts_pane(),
@@ -12381,7 +12380,7 @@ impl Cagents {
         };
         // Beside the browser's surface rather than inside it, so a native
         // page never draws over the inspector.
-        let surface = if card.is_some() {
+        let surface = if inspector {
             self.with_pane_inspector(id, surface, toolbar_hosts_toggle)
         } else {
             surface
@@ -12581,9 +12580,10 @@ impl Cagents {
     }
 
     /// The focused card, reduced to what binding the source-control panel
-    /// needs. A card that names no worktree directory - a browser, a
-    /// pull-request list - is [`SidebarFocus::None`], which leaves the panel
-    /// where it is rather than tearing it down.
+    /// needs. A scoped workspace binds its worktree whatever is focused. A
+    /// card that names no worktree directory - a browser, an application
+    /// page - is [`SidebarFocus::None`], which leaves the panel where it is
+    /// rather than tearing it down.
     fn sidebar_focus(&self) -> SidebarFocus {
         if let Some(worktree) = &self.active_workspace {
             return SidebarFocus::Repository {
@@ -12603,8 +12603,12 @@ impl Cagents {
             CardKind::Chat(session) => SidebarFocus::Terminal {
                 working_directory: session.launch.recipe.working_directory.clone(),
             },
+            // The repository whose pull requests it lists, so its inspector
+            // shows that repository's work rather than another's.
+            CardKind::PullRequests(view) => SidebarFocus::Repository {
+                worktree: view.repository.clone(),
+            },
             CardKind::Browser(_)
-            | CardKind::PullRequests(_)
             | CardKind::Settings
             | CardKind::Accounts
             | CardKind::Automations
@@ -14847,10 +14851,7 @@ impl Cagents {
                 .workspace
                 .focused()
                 .is_some_and(|card| self.pane_inspectors.is_open(card)),
-            open_inspectors: Some(
-                self.pane_inspectors
-                    .saved(|card| self.durable.cards.iter().any(|known| known.id == card)),
-            ),
+            open_inspectors: Some(self.saved_open_inspectors()),
             context_sections: self.context_sections,
             sidebar: self.sidebar_state.saved_view(),
             worktree_offsets: self.worktree_offsets.clone(),
@@ -22776,7 +22777,8 @@ mod tests {
         app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
         app.context_sections
             .set_open(context_sections::Section::Workspace, true);
-        drop(app.add_utility_card(CardKind::Settings));
+        // A second pane with an inspector of its own.
+        drop(app.clone_focused_pane());
         let other = app.workspace.focused().unwrap();
         assert_ne!(card, other);
         draw_frames(&mut app, 7, |app, frame| match frame {
@@ -22975,7 +22977,13 @@ mod tests {
             legacy.open_inspectors,
             legacy.context_inspector_open,
         );
-        inspectors.sync(&[card], Some(card), |_| false, |_| true);
+        inspectors.sync(
+            &[card],
+            Some(card),
+            |_| pane_inspector::Availability::Available,
+            |_| false,
+            |_| true,
+        );
         assert!(inspectors.is_open(card));
     }
 
@@ -28988,16 +28996,27 @@ mod tests {
 
     fn repository_card(app: &mut Cagents, worktree: &str) -> CardId {
         let card = CardId::new();
+        let view = RepositoryView {
+            selected_file: None,
+            project: ProjectId::new(),
+            repository: PathBuf::from(worktree),
+            worktree: PathBuf::from(worktree),
+        };
+        // The durable card names its kind, which decides whether it has an
+        // inspector.
+        Arc::make_mut(&mut app.durable).cards.push(CardState {
+            id: card,
+            generation: 0,
+            title: "Repository".into(),
+            width_fraction: 0.7,
+            existence: Existence::Open,
+            kind: CardKind::Repository(view.clone()),
+        });
         app.cards.insert(
             card,
             CardRuntime::Repository(Box::new(
                 repository_widget::RepositoryRuntime::file_list_fixture(
-                    RepositoryView {
-                        selected_file: None,
-                        project: ProjectId::new(),
-                        repository: PathBuf::from(worktree),
-                        worktree: PathBuf::from(worktree),
-                    },
+                    view,
                     &["src/main.rs", "src/other.rs"],
                 ),
             )),
@@ -29066,19 +29085,8 @@ mod tests {
     #[test]
     fn closing_a_card_retires_everything_it_held_at_the_lsp_boundary() {
         let mut app = lsp_test_app();
+        // The fixture's durable card is the one the workspace closes.
         let card = repository_card(&mut app, "/repo");
-        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
-            unreachable!()
-        };
-        let descriptor = runtime.descriptor.clone();
-        Arc::make_mut(&mut app.durable).cards.push(CardState {
-            id: card,
-            generation: 0,
-            title: "Repository".into(),
-            width_fraction: 0.7,
-            existence: Existence::Open,
-            kind: CardKind::Repository(descriptor),
-        });
         app.workspace
             .add_card(
                 WorkspaceCard::new(card, "Repository", CardWidth::Fraction(0.7)).unwrap(),
