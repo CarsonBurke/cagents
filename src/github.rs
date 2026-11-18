@@ -357,6 +357,14 @@ pub struct PullRequest {
     pub changed_files: Option<u64>,
     #[serde(default)]
     pub status_check_rollup: Option<Vec<PullRequestCheckRollup>>,
+    /// GitHub's verdict over every check, `SUCCESS`, `FAILURE`, `ERROR`,
+    /// `PENDING` or `EXPECTED`, where a listing asked for it: the rollup may
+    /// list only some of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_check_state: Option<RemoteValue>,
+    /// How many checks there are, listed or not, where a listing asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_check_count: Option<u64>,
 }
 
 /// An open pull request numbered `number`, for tests here and in the UI crate.
@@ -413,6 +421,14 @@ pub enum PullRequestCheckRollup {
 }
 
 impl PullRequest {
+    /// Whether the rollup has checks its listing left out, past the pages
+    /// read, so only its own state speaks for them.
+    pub fn has_unlisted_checks(&self) -> bool {
+        let listed = self.status_check_rollup.as_ref().map_or(0, Vec::len);
+        self.status_check_count
+            .is_some_and(|count| count > u64::try_from(listed).unwrap_or(u64::MAX))
+    }
+
     /// Local projection only: the list response already contains every check.
     /// Detailed workflow/description data remains an inspector-only request.
     pub fn check_summaries(&self) -> Vec<PullRequestCheck> {

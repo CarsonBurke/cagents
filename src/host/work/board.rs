@@ -330,6 +330,21 @@ pub(super) fn convert(
                 None => {}
             }
         }
+        // Checks GitHub did not list still count toward its verdict: one
+        // beyond them that fails or runs is at least one more of those.
+        // GitHub's FAILURE also covers a cancelled or timed-out check, which
+        // a full listing would count as cancelled; past the listed checks
+        // there is no telling, so it counts as the failure GitHub reports.
+        let unlisted = pull_request.has_unlisted_checks();
+        match pull_request
+            .status_check_state
+            .as_ref()
+            .map(|state| state.0.as_str())
+        {
+            Some("FAILURE" | "ERROR") if unlisted && checks.failed == 0 => checks.failed = 1,
+            Some("PENDING" | "EXPECTED") if unlisted && checks.pending == 0 => checks.pending = 1,
+            _ => {}
+        }
         checks
     });
     let review =
@@ -784,6 +799,38 @@ mod tests {
             ]);
             assert_eq!(convert(&pr, true).checks, Some(expected));
         }
+    }
+
+    #[test]
+    fn a_failure_beyond_the_listed_checks_still_fails_the_card() {
+        use crate::work::CheckOutcome;
+        let mut pr = pull_request("feature", "oid", "OPEN", false);
+        let passed = serde_json::json!({
+            "__typename": "CheckRun", "name": "matrix", "status": "COMPLETED",
+            "conclusion": "SUCCESS",
+        });
+        pr.status_check_rollup = Some(vec![serde_json::from_value(passed).unwrap(); 100]);
+        pr.status_check_count = Some(1_030);
+        for (state, expected) in [
+            ("FAILURE", CheckOutcome::Failing),
+            ("ERROR", CheckOutcome::Failing),
+            ("PENDING", CheckOutcome::Pending),
+            ("EXPECTED", CheckOutcome::Pending),
+            ("SUCCESS", CheckOutcome::Passing),
+        ] {
+            pr.status_check_state = Some(crate::github::RemoteValue(state.into()));
+            let checks = convert(&pr, true).checks.unwrap();
+            assert_eq!(checks.passed, 100, "{state}");
+            assert_eq!(checks.outcome(), Some(expected), "{state}");
+        }
+        // A complete listing is its own verdict: GitHub's state calls a
+        // cancelled check a failure, which the board keeps distinct.
+        pr.status_check_count = Some(100);
+        pr.status_check_state = Some(crate::github::RemoteValue("FAILURE".into()));
+        assert_eq!(
+            convert(&pr, true).checks.unwrap().outcome(),
+            Some(CheckOutcome::Passing)
+        );
     }
 
     #[test]
