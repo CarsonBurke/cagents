@@ -34,8 +34,8 @@ pub(super) const TOGGLE_CLEARANCE: f32 = TOGGLE_INSET + design::PRIMARY_CONTROL_
 /// The inspector shows a pane's work: its conversation's pull requests, the
 /// worktree's changes and files, an editor's language-server results. A
 /// terminal, chat or editor names its worktree, and a pull request pane its
-/// repository. A browser names none: it shows the worktree the window is
-/// scoped to, so it has an inspector only there; see
+/// repository. A browser names none: it shows the worktree a worktree's or
+/// channel's workspace is scoped to, so it has an inspector only there; see
 /// [`Cagents::inspector_availability`]. An application page - Settings,
 /// Accounts, Automations, the Work board of every worktree - belongs to no
 /// worktree, so its inspector could only show whichever worktree the window
@@ -57,7 +57,7 @@ pub(super) enum Availability {
     /// The pane's kind has no inspector, so none is ever opened or restored.
     Never,
     /// The pane has an inspector, but nothing to show in it here, as a
-    /// browser outside a worktree's workspace: an inspector left open waits,
+    /// browser in the unscoped home strip: an inspector left open waits,
     /// hidden, for the pane to be somewhere it has something to show.
     Unavailable,
     Available,
@@ -402,9 +402,10 @@ impl Cagents {
     fn kind_availability(&self, kind: &CardKind) -> Availability {
         match kind {
             _ if !offers_inspector(kind) => Availability::Never,
-            // A browser names no worktree; it shows the one the window is
-            // scoped to, as `sidebar_focus` binds it, and in a channel or
-            // with no worktree selected it has nothing of its own to show.
+            // A browser names no worktree; it shows the one a worktree's or
+            // channel's workspace is scoped to, as `sidebar_focus` binds it.
+            // Only the unscoped home strip leaves it nothing to show: a
+            // browser a strip owns is never on screen there.
             CardKind::Browser(_) if self.active_workspace.is_none() => Availability::Unavailable,
             _ => Availability::Available,
         }
@@ -1476,7 +1477,10 @@ mod tests {
         drop(app.workspace.resize_viewport(1200.0));
         app.sync_pane_inspectors();
 
-        // In a channel, or with no worktree selected.
+        let size = iced::Size::new(1200.0, 800.0);
+
+        // In the unscoped home strip.
+        assert!(mounted_toggle(&app, browser, size).is_none());
         assert_eq!(
             app.inspector_availability(browser),
             Availability::Unavailable
@@ -1490,9 +1494,10 @@ mod tests {
         app.settle_pane_inspectors();
         assert!(!app.pane_inspectors.is_visible(browser));
 
-        // In a worktree's workspace, it shows that worktree.
+        // In a worktree's or channel's workspace, it shows that worktree.
         app.active_workspace = Some(MAIN.into());
         assert!(app.pane_has_inspector(browser));
+        assert!(mounted_toggle(&app, browser, size).is_some());
         assert_eq!(app.focused_pane(), workspace_widget::FocusedPane::Other);
         drop(app.update(Message::ToggleContextInspector));
         app.settle_pane_inspectors();
@@ -1512,7 +1517,8 @@ mod tests {
     }
 
     /// A pull request pane's inspector shows the repository whose pull
-    /// requests it lists, not whichever worktree was focused before it.
+    /// requests it lists, not whichever worktree was focused before it. In a
+    /// worktree's or channel's workspace, the scope wins, as for every pane.
     #[test]
     fn a_pull_request_panes_inspector_shows_its_own_repository() {
         let (mut app, card) = worktree_app();
@@ -1528,6 +1534,11 @@ mod tests {
         app.open_pane_inspector_now(card);
         assert_eq!(app.pane_inspectors.source_control(), Some(card));
         assert_eq!(active_worktree(&app).as_deref(), Some(Path::new(MAIN)));
+
+        app.active_workspace = Some(FIX.into());
+        app.sync_pane_inspectors();
+        drop(app.rebind_source_control());
+        assert_eq!(active_worktree(&app).as_deref(), Some(Path::new(FIX)));
     }
 
     #[test]

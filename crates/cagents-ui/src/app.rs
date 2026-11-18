@@ -12498,9 +12498,10 @@ impl Cagents {
     }
 
     /// The focused card, reduced to what binding the source-control panel
-    /// needs. A card that names no worktree directory - a browser, a
-    /// pull-request list - is [`SidebarFocus::None`], which leaves the panel
-    /// where it is rather than tearing it down.
+    /// needs. A scoped workspace binds its worktree whatever is focused. A
+    /// card that names no worktree directory - a browser, an application
+    /// page - is [`SidebarFocus::None`], which leaves the panel where it is
+    /// rather than tearing it down.
     fn sidebar_focus(&self) -> SidebarFocus {
         if let Some(worktree) = &self.active_workspace {
             return SidebarFocus::Repository {
