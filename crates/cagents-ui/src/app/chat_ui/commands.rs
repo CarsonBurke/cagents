@@ -276,12 +276,16 @@ impl Outgoing {
     /// or among those held for later, or it never will. A turn started and
     /// finished since has had this message's place in it; a reader looking
     /// at earlier history sees it arrive out of view; an exited conversation
-    /// shows nothing more. A snapshot without its items, as a hidden chat's
-    /// is, can only show where the message is held.
+    /// shows nothing more. A message steered into a turn has had its place
+    /// once that turn is over. A snapshot without its items, as a hidden
+    /// chat's is, can only show where the message is held.
     fn settled_by(&self, snapshot: &Snapshot, items: bool) -> bool {
         (items && newest_user_message(snapshot).map(|(id, _)| id) != self.newest_user.as_deref())
             || held_messages(snapshot).any(|id| !self.held.iter().any(|held| held == id))
             || (snapshot.turn_generation > self.turns && !snapshot.busy)
+            || (self.mode == PromptMode::Steer
+                && snapshot.generation > self.generation
+                && !snapshot.busy)
             || (items && snapshot.has_later)
             || snapshot.exited
     }
@@ -1210,6 +1214,17 @@ mod tests {
                 "turn over {turn_over}"
             );
             assert_eq!(runtime.commands.waiting(), 0);
+            if turn_over {
+                continue;
+            }
+            // Steered in, it has had its place once that turn is over, even
+            // from a provider that never shows it.
+            settle(&mut app, card, Ok(()));
+            assert_eq!(chat_runtime(&app, card).commands.outgoing().count(), 1);
+            publish(&mut app, card, |snapshot| snapshot.busy = false);
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(runtime.commands.outgoing().count(), 0);
+            assert!(runtime.commands.is_idle());
         }
     }
 

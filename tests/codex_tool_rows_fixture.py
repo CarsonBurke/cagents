@@ -433,6 +433,35 @@ class CodexToolRowsFixture(unittest.TestCase):
                     scenario.request({"id": 1, "method": "turn/start", "params": {
                         "threadId": scenario.thread}}, home)
 
+    def test_a_home_that_echoes_reports_the_prompt_and_steer_in_the_turn(self):
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as home:
+            Path(home, "fixture-user-items").touch()
+            Path(home, "fixture-turn-pause").write_text("0\n")
+            scenario = PEER["Scenario"]()
+            scenario.history = []
+            asked = [{"type": "text", "text": "List the open pull requests."}]
+            replies = scenario.request({"id": 1, "method": "turn/start", "params": {
+                "threadId": scenario.thread, "input": asked}}, home)
+            turn = replies[0]["result"]["turn"]["id"]
+            pause = next(index for index, reply in enumerate(replies) if "_sleep" in reply)
+            generations = scenario.playback(replies)
+            sent = self.publish(scenario, replies[:pause], generations)
+            echoed = [frame["params"]["item"] for frame in sent if frame.get("method") == "item/completed"
+                      and frame["params"]["item"]["type"] == "userMessage"]
+            self.assertEqual(echoed, [{"id": f"{turn}-user", "type": "userMessage", "content": asked}])
+            steered = [{"type": "text", "text": "Also note any failures."}]
+            steer = scenario.request({"id": 2, "method": "turn/steer", "params": {
+                "threadId": scenario.thread, "expectedTurnId": turn, "input": steered}}, home)
+            self.assertEqual(steer[0], {"id": 2, "result": {"turnId": turn}})
+            self.publish(scenario, steer[1:])
+            finished = self.publish(scenario, replies[pause + 1:], generations)
+            completed = next(frame["params"]["turn"] for frame in finished
+                             if frame.get("method") == "turn/completed"
+                             and frame["params"]["threadId"] == scenario.thread)
+            users = [item["content"] for item in completed["items"] if item["type"] == "userMessage"]
+            self.assertEqual(users, [asked, steered])
+            self.assertEqual(completed["items"][-1]["type"], "agentMessage")
+
     def test_parent_and_child_complete_after_the_pause_without_phantom_work(self):
         scenario = PEER["Scenario"]()
         replies = scenario.request({"id": 1, "method": "turn/start", "params": {

@@ -39,6 +39,8 @@ instead of the usual pause, so a slow capture still finds it running.
 CODEX_HOME/fixture-turn-start-delay may hold seconds, up to 30, to hold each
 turn/start response and the turn's notifications, so a prompt can be seen
 accepted before its turn has begun. A steer of the active turn is accepted.
+With CODEX_HOME/fixture-user-items present, each prompt and steer is reported
+as a userMessage item of its turn, as Codex reports them.
 With CODEX_HOME/fixture-unnamed-child present, the collaboration calls and the
 thread listing report the child without a nickname, as Codex can before it has
 named one; only the child's own thread read reports it as Quinn.
@@ -152,6 +154,12 @@ def web_items():
          "url": "https://example.test/fixture/receipts/schema",
          "snippet": "Synthetic schema: the receipt records probe creation, removal and the final permission."},
     ]})]
+
+
+def echoes(codex_home):
+    """Whether this home's peer reports each prompt and steer as a userMessage
+    item of its turn, as Codex does."""
+    return (Path(codex_home) / "fixture-user-items").is_file()
 
 
 def rollout(codex_home, thread):
@@ -298,6 +306,13 @@ class Scenario:
                 return False
             if thread == self.thread:
                 turn["items"] = [self._child_state(item) for item in turn["items"]]
+                if method == "turn/completed":
+                    # Messages steered into the turn stay in its record, ahead
+                    # of its answer, as Codex keeps them.
+                    known = {item["id"] for item in turn["items"]}
+                    steered = [copy.deepcopy(item) for item in latest["items"]
+                               if item.get("type") == "userMessage" and item["id"] not in known]
+                    turn["items"][-1:-1] = steered
             params["turn"] = turn
             self._store(thread, turn)
             self._published.add(key)
@@ -353,7 +368,7 @@ class Scenario:
                         publish(response)
 
     def notifications(self, turn, starts_child=True, *, pause=PAUSE, web_rows=False, diagnostics=False, plan=None,
-                      unnamed_child=False):
+                      unnamed_child=False, user=None):
         starts_child = starts_child and not (web_rows or diagnostics)
         def notify(method, **params):
             return {"method": method, "params": {"threadId": self.thread, **params}}
@@ -379,7 +394,9 @@ class Scenario:
                       diff="diff --git a/README.md b/README.md\n@@ -1 +1 @@\n-old\n+new\n")
         history, self.history = self.history, []
         replayed = [notify("item/completed", turnId=turn, item=item) for item in history]
-        settled = [*history, *(end for _, end in pairs)]
+        # The prompt itself, as Codex reports it at the start of its turn.
+        echoed = [] if user is None else [{"id": f"{turn}-user", "type": "userMessage", "content": user}]
+        settled = [*history, *echoed, *(end for _, end in pairs)]
         finished = {"id": turn, "status": "completed", "items": settled}
         answer = {"id": "answer", "type": "agentMessage",
                   "text": "Web references ready." if web_rows else "Done.", "phase": None}
@@ -398,6 +415,7 @@ class Scenario:
         return [notify("turn/started", turn={"id": turn, "status": "inProgress", "items": []}),
                 *planning,
                 *replayed,
+                *(notify("item/completed", turnId=turn, item=item) for item in echoed),
                 *child_started,
                 *started, *([] if web_rows else [diff]),
                 {"_sleep": pause if plan is None else plan}, *completed, *settling,
@@ -536,7 +554,8 @@ class Scenario:
                 plan = float(held) if held.isdigit() else PAUSE
             after = self.notifications(turn, starts_child, pause=pause, web_rows=web_rows,
                                        diagnostics=diagnostics, plan=plan,
-                                       unnamed_child=(Path(codex_home) / "fixture-unnamed-child").is_file())
+                                       unnamed_child=(Path(codex_home) / "fixture-unnamed-child").is_file(),
+                                       user=params.get("input", []) if echoes(codex_home) else None)
             held = Path(codex_home) / "fixture-turn-start-delay"
             if held.is_file():
                 # Codex learns a turn's id only from this response or its
@@ -555,6 +574,11 @@ class Scenario:
                     or params.get("expectedTurnId") != latest["id"]):
                 return [{"id": identifier, "error": {"code": -32602, "message": "No matching active fixture turn"}}]
             result = {"turnId": latest["id"]}
+            if echoes(codex_home):
+                after = [{"method": "item/completed", "params": {
+                    "threadId": self.thread, "turnId": latest["id"],
+                    "item": {"id": f"{latest['id']}-steer-{uuid.uuid4()}", "type": "userMessage",
+                             "content": params.get("input", [])}}}]
         elif method == "turn/interrupt":
             thread = params.get("threadId")
             if thread not in (self.thread, self.child):
