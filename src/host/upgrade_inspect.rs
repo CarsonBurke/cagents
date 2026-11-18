@@ -276,7 +276,7 @@ fn inspect(request: Request) -> Result<SourceInspection, String> {
                         match reader.inspect_saved_history(source) {
                             Ok(()) => cold_history.push(source.clone()),
                             Err(reason) => {
-                                tracing::warn!(%reason, "saved history inspection failed");
+                                tracing::warn!(chat = %source.id, %reason, "saved history inspection failed");
                             }
                         }
                     }
