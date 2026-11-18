@@ -138,28 +138,121 @@ impl Cagents {
         {
             self.abandon_removal(card);
         }
+        // A pane taken out of sight for a close that ended some other way, or
+        // was dropped, comes back.
+        if let Some(card) = self.closing_out_of_sight
+            && !self.removal_owner_running(card)
+            && !self.closed_terminal_cards.contains(&card)
+        {
+            self.release_removal(card);
+        }
+        let kept = self.return_kept_panes();
         if self.queued_card_closes.is_empty() {
-            Task::none()
+            kept
         } else {
-            self.next_queued_card_close()
+            Task::batch([kept, self.next_queued_card_close()])
         }
     }
 
-    /// Gives up removing `card`, which stays open and can be closed again.
+    /// Gives up removing `card`, which stays open, comes back to its place,
+    /// and can be closed again.
     pub(super) fn abandon_removal(&mut self, card: CardId) {
         self.shared_views.removals.remove(&card);
-        if self
-            .workspace
-            .pending_close()
-            .is_some_and(|pending| pending.unmounting == card)
-        {
-            let _ = self.workspace.cancel_close(card);
-        }
+        self.release_removal(card);
         if self.close_commit_delivered == Some(card) {
             self.close_commit_delivered = None;
         }
         self.closed_terminal_cards.remove(&card);
         self.proven_gone_cards.remove(&card);
+    }
+
+    /// Reserves `card`'s removal, which takes the pane out of the strip at
+    /// once, or finds it already reserved.
+    pub(super) fn reserve_removal(
+        &mut self,
+        card: CardId,
+    ) -> Result<(crate::workspace::FocusHandoff, Task<Message>), crate::workspace::WorkspaceError>
+    {
+        if let Some(handoff) = self
+            .workspace
+            .pending_close()
+            .filter(|handoff| handoff.unmounting == card)
+        {
+            return Ok((handoff, Task::none()));
+        }
+        let (handoff, update) = self.workspace.request_close(card)?;
+        Ok((
+            handoff,
+            self.apply_viewport(update, false, DurableChange::None),
+        ))
+    }
+
+    /// Gives up `card`'s reserved removal, if it holds it: the pane returns to
+    /// its place, with the keyboard if it had it. The strip changes now; the
+    /// rest of the window catches up at the end of the update.
+    fn release_removal(&mut self, card: CardId) {
+        if self.closing_out_of_sight == Some(card) {
+            self.closing_out_of_sight = None;
+        }
+        if let Ok(update) = self.workspace.cancel_close(card) {
+            self.kept_panes.push((card, update));
+        }
+    }
+
+    /// Brings the rest of the window up to date with panes whose removal was
+    /// given up: what they show, the saved focus, and the keyboard.
+    pub(super) fn return_kept_panes(&mut self) -> Task<Message> {
+        if self.kept_panes.is_empty() {
+            return Task::none();
+        }
+        // A dialog that came back with the pane keeps the keyboard; the pane
+        // takes it back when the dialog closes.
+        if self.modal_is_open() {
+            self.workspace.take_widget_focus_request();
+        }
+        let kept = std::mem::take(&mut self.kept_panes);
+        let tasks: Vec<_> = kept
+            .into_iter()
+            .map(|(_, update)| self.apply_viewport(update, false, DurableChange::None))
+            .collect();
+        Task::batch(tasks)
+    }
+
+    /// Takes a terminal pane out of the strip while the daemon closes its
+    /// terminal, so the pane goes as soon as the reader closes it. Nothing is
+    /// removed: the pane, its terminal and everything saved about them stay
+    /// until the daemon has closed the terminal, and come back if it doesn't.
+    /// When another pane holds the strip's one removal, the pane stays in
+    /// sight and closes as it did before.
+    fn take_closing_pane_out_of_sight(&mut self, card: CardId) -> Task<Message> {
+        if self.closing_out_of_sight == Some(card) {
+            return Task::none();
+        }
+        let Ok((handoff, viewport)) = self.reserve_removal(card) else {
+            return Task::none();
+        };
+        self.closing_out_of_sight = Some(card);
+        // The viewport hands the keyboard to the pane that takes over; with
+        // none left, the toolbar has it.
+        let keyboard = if handoff.target == crate::workspace::FocusTarget::WorkspaceToolbar
+            && self
+                .workspace
+                .focused()
+                .is_none_or(|focused| focused == card)
+        {
+            iced::widget::operation::focus(widget::Id::new(TOOLBAR_FOCUS_ID))
+                .map(cosmic::Action::App)
+        } else {
+            Task::none()
+        };
+        Task::batch([viewport, keyboard])
+    }
+
+    /// Returns a pane taken out of sight for a close that didn't complete.
+    fn bring_back_closing_pane(&mut self, card: CardId) {
+        if self.closing_out_of_sight == Some(card) {
+            self.release_removal(card);
+        }
     }
 
     /// Whether something is still working towards removing `card` once its
@@ -475,7 +568,8 @@ impl Cagents {
         if let Some(session) = self.ended_terminal(card).cloned() {
             let authority = self.terminal_cleanup_authority(card);
             self.completed_release = Some(card);
-            return cosmic::task::future(async move {
+            let out_of_sight = self.take_closing_pane_out_of_sight(card);
+            let release = cosmic::task::future(async move {
                 let source = session.clone();
                 let result = tokio::task::spawn_blocking(move || {
                     let socket = crate::terminal::ensure_daemon_ready()
@@ -539,6 +633,7 @@ impl Cagents {
                     result,
                 }
             });
+            return Task::batch([out_of_sight, release]);
         }
         if self.pending_terminal_spawn(card) {
             self.status = Some(TransientNotice::warning(
@@ -597,6 +692,9 @@ impl Cagents {
         if self.completed_release == Some(card) {
             self.completed_release = None;
         }
+        if !matches!(&result, Ok(CompletedCloseOutcome::ClosedWithBasis(_))) {
+            self.bring_back_closing_pane(card);
+        }
         if !self.card_state(card).is_some_and(|state| {
             state.existence.is_open()
                 && matches!(&state.kind, CardKind::Terminal(current) if current == &session)
@@ -619,6 +717,9 @@ impl Cagents {
             }
             outcome => Ok(outcome),
         });
+        if !matches!(&result, Ok(CompletedCloseOutcome::Closed)) {
+            self.bring_back_closing_pane(card);
+        }
         match result {
             Ok(CompletedCloseOutcome::ClosedWithBasis(_)) => unreachable!(),
             Ok(CompletedCloseOutcome::SourceChanged) => {
@@ -682,15 +783,18 @@ impl Cagents {
             self.abandon_removal(card);
             return self.next_queued_card_close();
         }
-        let reservation = match self.workspace.pending_close() {
-            Some(handoff) if handoff.unmounting == card => Ok(handoff),
-            _ => self.workspace.request_close(card),
-        };
-        match reservation {
-            Ok(handoff) => {
-                // A fresh commit is on its way to this reservation.
+        // A pane already out of sight gave up the keyboard when it left.
+        let out_of_sight = self.closing_out_of_sight == Some(card);
+        match self.reserve_removal(card) {
+            Ok((handoff, viewport)) => {
+                // A fresh commit is on its way to this reservation, which no
+                // longer waits on anything that could bring the pane back.
                 self.close_commit_delivered = None;
-                self.card_removal(handoff)
+                if out_of_sight {
+                    self.closing_out_of_sight = None;
+                    return cosmic::task::message(Message::CommitClose(card));
+                }
+                Task::batch([viewport, self.card_removal(handoff)])
             }
             Err(error) => {
                 self.abandon_removal(card);
@@ -742,7 +846,7 @@ impl Cagents {
                 .pending_close()
                 .is_some_and(|pending| pending.unmounting == id)
             {
-                let _ = self.workspace.cancel_close(id);
+                self.release_removal(id);
             }
             self.status = Some(TransientNotice::warning(reason));
             return None;
@@ -989,7 +1093,10 @@ impl Cagents {
         intent.generation = self.terminal_close_generation;
         let intent = intent.clone();
         let authority = self.terminal_cleanup_authority(intent.card);
-        cosmic::task::future(async move {
+        // The pane leaves now; the daemon's answer either removes it for good
+        // or brings it back with what happened.
+        let out_of_sight = self.take_closing_pane_out_of_sight(intent.card);
+        let close = cosmic::task::future(async move {
             let card = intent.card;
             let terminal = intent.terminal;
             let proof = intent.proof.clone();
@@ -1008,7 +1115,8 @@ impl Cagents {
                 generation,
                 outcome,
             }
-        })
+        });
+        Task::batch([out_of_sight, close])
     }
 
     pub(super) fn terminal_close_finished(
@@ -1083,6 +1191,7 @@ impl Cagents {
                 // The owner positively declined to close: a later explicit Close
                 // may issue a fresh, independently fenced request.
                 self.terminal_close_attempts.remove(&terminal);
+                self.bring_back_closing_pane(card);
                 let intent = self.terminal_close.as_mut().unwrap();
                 intent.restore_card = self.workspace.focused();
                 intent.restore_keyboard_nav = self.core.keyboard_nav();
@@ -1099,6 +1208,7 @@ impl Cagents {
                 if !matches!(outcome, CloseOutcome::Unreachable(_)) {
                     self.terminal_close_attempts.remove(&terminal);
                 }
+                self.bring_back_closing_pane(card);
                 let intent = self.terminal_close.as_mut().unwrap();
                 intent.restore_card = self.workspace.focused();
                 intent.restore_keyboard_nav = self.core.keyboard_nav();
@@ -1762,6 +1872,9 @@ pub(in crate::app) mod tests {
         let holder = queued_terminal(&mut app, first);
         drop(app.update(Message::CloseCard(first)));
         let intent = app.terminal_close.clone().expect("the close is running");
+        // Something else holds the strip's one removal when the answer comes.
+        drop(app.workspace.cancel_close(first));
+        app.closing_out_of_sight = None;
         let _ = app.workspace.request_close(holder).unwrap();
 
         app.retire_ended_terminal(first, 0, None, true);
@@ -1781,6 +1894,169 @@ pub(in crate::app) mod tests {
             app.pane_close_owned(first),
             "Close runs again instead of doing nothing"
         );
+    }
+
+    /// Whether `card` is in sight: taking room in the strip and mounted.
+    fn in_sight(app: &Cagents, card: CardId) -> bool {
+        app.workspace
+            .geometry()
+            .card(card)
+            .is_some_and(|geometry| geometry.width() > 0.0)
+            && app
+                .workspace
+                .visibility(card)
+                .is_some_and(crate::workspace::VisibilityClass::is_mounted)
+    }
+
+    /// Closing a terminal pane takes it away before the daemon has answered;
+    /// the pane and its terminal are removed for good only once it has.
+    #[test]
+    fn a_closed_terminal_pane_leaves_before_the_daemon_answers() {
+        let (mut app, card) = retry_close_fixture();
+        let neighbour = queued_terminal(&mut app, card);
+        drop(app.update(Message::FocusCard(card)));
+        assert!(in_sight(&app, card));
+
+        drop(app.update(Message::CloseCard(card)));
+        let intent = app.terminal_close.clone().expect("the close is running");
+        assert!(intent.pending, "the daemon has not answered");
+        assert!(!in_sight(&app, card), "the pane has gone");
+        let next = app
+            .workspace
+            .focused()
+            .expect("another pane has the keyboard");
+        assert_ne!(next, card, "with the keyboard");
+        assert!(in_sight(&app, next));
+        assert!(in_sight(&app, neighbour));
+        assert!(
+            app.card_state(card).unwrap().existence.is_open(),
+            "nothing is removed until the daemon answers"
+        );
+        assert!(!app.terminal_close_dialog_visible());
+
+        drop(app.update(Message::TerminalCloseFinished {
+            card,
+            terminal: intent.terminal,
+            proof: intent.proof,
+            generation: intent.generation,
+            outcome: CloseOutcome::Closed,
+        }));
+        drop(app.update(Message::CommitClose(card)));
+        assert!(!app.card_state(card).unwrap().existence.is_open());
+        assert!(app.workspace.card(card).is_none());
+        assert_eq!(app.workspace.focused(), Some(next));
+        assert!(
+            app.notices.entries.is_empty() && app.status.is_none(),
+            "a close is not news"
+        );
+    }
+
+    /// A close that doesn't complete brings the pane back where it was, with
+    /// the keyboard, and the dialog that says what happened and what can be
+    /// done: the question for an active terminal, the report otherwise.
+    #[test]
+    fn a_terminal_close_that_does_not_complete_brings_its_pane_back_with_why() {
+        let outcomes: [fn() -> CloseOutcome; 4] = [
+            || CloseOutcome::Active,
+            || CloseOutcome::Unreachable("reply lost".into()),
+            || CloseOutcome::Stale,
+            || {
+                CloseOutcome::Kept(KeptPane {
+                    reason: "a process could not be read".into(),
+                    unreadable: Vec::new(),
+                })
+            },
+        ];
+        for outcome in outcomes {
+            let (mut app, card) = retry_close_fixture();
+            let neighbour = queued_terminal(&mut app, card);
+            drop(app.update(Message::FocusCard(card)));
+            drop(app.update(Message::CloseCard(card)));
+            let intent = app.terminal_close.clone().expect("the close is running");
+            assert!(!in_sight(&app, card));
+
+            let outcome = outcome();
+            let label = format!("{outcome:?}");
+            drop(app.update(Message::TerminalCloseFinished {
+                card,
+                terminal: intent.terminal,
+                proof: intent.proof,
+                generation: intent.generation,
+                outcome,
+            }));
+            assert!(in_sight(&app, card), "{label}: the pane is back");
+            assert_eq!(app.workspace.pending_close(), None, "{label}");
+            assert!(app.closing_out_of_sight.is_none(), "{label}");
+            assert_eq!(app.workspace.focused(), Some(card), "{label}");
+            assert!(app.terminal_close_dialog_visible(), "{label}: it says why");
+            assert!(app.card_state(card).unwrap().existence.is_open(), "{label}");
+            assert!(app.workspace.card(neighbour).is_some(), "{label}");
+            assert_eq!(
+                app.terminal_close.as_ref().unwrap().restore_card,
+                Some(card),
+                "{label}: dismissing the dialog returns to the pane"
+            );
+        }
+    }
+
+    /// A close given up some other way, with nothing left to answer for it,
+    /// still brings its pane back.
+    #[test]
+    fn a_pane_out_of_sight_for_a_close_that_was_dropped_comes_back() {
+        let (mut app, card) = retry_close_fixture();
+        let _neighbour = queued_terminal(&mut app, card);
+        drop(app.update(Message::FocusCard(card)));
+        drop(app.update(Message::CloseCard(card)));
+        assert!(!in_sight(&app, card));
+        app.terminal_close = None;
+        drop(app.update(Message::DismissStatus));
+        assert!(in_sight(&app, card));
+        assert_eq!(app.workspace.pending_close(), None);
+        assert_eq!(app.workspace.focused(), Some(card));
+    }
+
+    /// An ended terminal's pane goes at once too, and comes back if its
+    /// release fails.
+    #[test]
+    fn an_ended_terminal_pane_leaves_before_its_release_is_confirmed() {
+        for released in [true, false] {
+            let (mut app, card) = retry_close_fixture();
+            let neighbour = queued_terminal(&mut app, card);
+            drop(app.update(Message::FocusCard(card)));
+            app.retire_ended_terminal(card, 0, None, true);
+            drop(app.update(Message::CloseCard(card)));
+            assert_eq!(app.completed_release, Some(card));
+            assert!(!in_sight(&app, card), "the pane has gone");
+            assert_ne!(app.workspace.focused(), Some(card));
+            assert!(in_sight(&app, neighbour));
+
+            let session = terminal_source(&app, card);
+            drop(app.update(Message::CompletedTerminalClosed {
+                card,
+                session,
+                result: if released {
+                    Ok(CompletedCloseOutcome::Closed)
+                } else {
+                    Err("the daemon went away".into())
+                },
+            }));
+            if released {
+                drop(app.update(Message::CommitClose(card)));
+                assert!(!app.card_state(card).unwrap().existence.is_open());
+                assert!(app.workspace.card(card).is_none());
+            } else {
+                assert!(in_sight(&app, card), "the pane is back");
+                assert_eq!(app.workspace.focused(), Some(card));
+                assert!(app.card_state(card).unwrap().existence.is_open());
+                assert!(
+                    app.notices
+                        .entries
+                        .iter()
+                        .any(|entry| entry.notice.message.contains("Try Close again")),
+                    "it says why"
+                );
+            }
+        }
     }
 
     /// Each takes the workspace's only removal once the daemon has answered, so
@@ -2632,7 +2908,8 @@ pub(in crate::app) mod tests {
             "a later explicit cancellation upgrades a queued ordinary close"
         );
         app.terminal_close = None;
-        drop(app.next_queued_card_close());
+        // Its pane comes back, and the queue moves on.
+        drop(app.settle_close_queue());
         assert!(app.queued_card_closes.is_empty());
         let next = app.terminal_close.as_ref().unwrap();
         assert_eq!((next.card, next.terminal), (login, login_terminal));

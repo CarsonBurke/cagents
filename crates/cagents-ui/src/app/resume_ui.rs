@@ -1189,7 +1189,7 @@ impl Cagents {
         state.counts = counts;
     }
 
-    fn existing_conversation_card(&self, session: &chat::Session) -> Option<CardId> {
+    pub(super) fn existing_conversation_card(&self, session: &chat::Session) -> Option<CardId> {
         self.durable
             .cards
             .iter()
@@ -1241,6 +1241,12 @@ impl Cagents {
         }
         if let Some(task) = self.defer_retiring_conversation(&entry, false) {
             return task;
+        }
+        // A conversation still stopping after its pane closed reopens once
+        // it has stopped, rather than beside the provider being ended.
+        if self.defer_reopen_while_closing(&entry) {
+            self.close_resume();
+            return Task::none();
         }
         let session = &entry.session;
         if session.native_continuity.retains_provider() || unstarted_successor(session) {

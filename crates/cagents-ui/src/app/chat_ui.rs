@@ -75,6 +75,7 @@ macro_rules! application_atomic {
 mod artifacts;
 mod attachment_draft;
 mod auth_recovery;
+mod background_close;
 #[cfg(test)]
 pub(in crate::app) mod blocked_recovery_tests;
 mod changes;
@@ -539,7 +540,7 @@ pub enum Action {
     CompletionScrolled(Target, f32),
     HandoffFinished(Target, Result<TerminalSession, String>),
     CloseFinished(Target, Result<(), String>),
-    RetainedCloseFinished(Target, chat::Session, Result<(), String>),
+    HeldCloseFinished(Target, chat::Session, Result<(), String>),
     FreshCloseFinished(
         Target,
         Box<chat::Session>,
@@ -566,6 +567,12 @@ pub enum Action {
         Result<Vec<crate::terminal::ipc::LostProcess>, String>,
     ),
     DismissCloseRefusal(Target),
+    /// Reopens a conversation whose close the daemon refused after its pane
+    /// left, on a pane that says why.
+    ReopenRefusedClose(TerminalId),
+    /// Puts away the notice of a refused close, leaving the conversation
+    /// where it is.
+    DismissCloseFailure(TerminalId),
     /// Native viewport geometry and, for deliberate navigation, its direction.
     /// A collapsed page can fit at both edges; geometry cannot choose its next page.
     Scrolled(Target, Option<String>, view::Scroll, Option<view::Page>),
@@ -900,12 +907,14 @@ impl Action {
             Self::CompletionScrolled(..) => "CompletionScrolled",
             Self::HandoffFinished(..) => "HandoffFinished",
             Self::CloseFinished(..) => "CloseFinished",
-            Self::RetainedCloseFinished(..) => "RetainedCloseFinished",
+            Self::HeldCloseFinished(..) => "HeldCloseFinished",
             Self::AskCloseHolders(..) => "AskCloseHolders",
             Self::CloseHolders(..) => "CloseHolders",
             Self::EndCloseHolders(..) => "EndCloseHolders",
             Self::CloseHoldersEnded(..) => "CloseHoldersEnded",
             Self::DismissCloseRefusal(..) => "DismissCloseRefusal",
+            Self::ReopenRefusedClose(..) => "ReopenRefusedClose",
+            Self::DismissCloseFailure(..) => "DismissCloseFailure",
             Self::Scrolled(..) => "Scrolled",
             Self::ModelPicker(..) => "ModelPicker",
             Self::PermissionPicker(..) => "PermissionPicker",
@@ -959,7 +968,7 @@ impl Action {
                 | Self::HandoffFinished(..)
                 | Self::ReturnedLocally(..)
                 | Self::CloseFinished(..)
-                | Self::RetainedCloseFinished(..)
+                | Self::HeldCloseFinished(..)
                 | Self::FreshCloseFinished(..)
                 | Self::CloseHolders(..)
                 | Self::CloseHoldersEnded(..)
@@ -1214,6 +1223,17 @@ pub(super) struct State {
     abandoned: HashMap<Target, chat::Session>,
     /// Conversations being given up in the background after their card left.
     retiring: HashSet<Target>,
+    /// Conversations the reader closed, still stopping after their pane left.
+    background_closes: HashMap<Target, background_close::Closing>,
+    /// Closes the daemon refused after their pane left, until the reader
+    /// reopens or dismisses them.
+    close_failures: Vec<background_close::Failure>,
+    /// Conversations whose last close was refused. Their next close waits on
+    /// its pane for the daemon, so a refusal stays where it can be acted on.
+    close_refused: HashSet<TerminalId>,
+    /// Why a refused conversation's close failed, shown on the pane that
+    /// reopens it once that pane is attached.
+    refusals_to_show: HashMap<TerminalId, String>,
     /// Unsent composer text belonging to a card whose chat runtime has been
     /// dropped.
     ///
@@ -1281,6 +1301,10 @@ impl Default for State {
             explicit_starts: HashMap::new(),
             abandoned: HashMap::new(),
             retiring: HashSet::new(),
+            background_closes: HashMap::new(),
+            close_failures: Vec::new(),
+            close_refused: HashSet::new(),
+            refusals_to_show: HashMap::new(),
             drafts: HashMap::new(),
             draft_attachments: HashMap::new(),
             peer_started: HashMap::new(),
@@ -1335,6 +1359,13 @@ impl State {
 
     pub(super) fn transition_pending(&self) -> bool {
         !self.phases.is_empty() || !self.abandoned.is_empty() || !self.retiring.is_empty()
+    }
+
+    /// Whether a closed chat's conversation is still being stopped. Its pane
+    /// is gone, so this holds nothing the reader is looking at; only work that
+    /// replaces the daemon or the process hearing its answer waits for it.
+    pub(super) fn closing_in_background(&self) -> bool {
+        !self.background_closes.is_empty()
     }
 
     fn attempt(&self, card: CardId) -> Option<&Attempt> {
@@ -8972,7 +9003,11 @@ impl Cagents {
         let skills = if session.is_unstarted() {
             self.open_chat_draft(card_id, session)
         } else {
-            let intent = if session.native_continuity.retains_provider() {
+            // A conversation whose close was refused is still running; its
+            // pane goes back to that provider.
+            let intent = if session.native_continuity.retains_provider()
+                || self.reopens_refused_close(&session)
+            {
                 chat::Intent::Restore
             } else {
                 chat::Intent::Start
@@ -9782,9 +9817,12 @@ impl Cagents {
     /// conversation can be doing - never started, connecting, failed,
     /// disconnected, or live - keeps its card on screen.
     ///
-    /// A retained native owner waits for exact cleanup proof, keeping its saved
-    /// descriptor available for a failed-close retry even when a local adapter
-    /// still has a connection. That adapter may have failed to attach the owner.
+    /// The pane closes with the identity the provider last confirmed, so
+    /// reopening it resumes that conversation. A close the daemon refuses is
+    /// reported afterwards, with a way to reopen the conversation it left
+    /// running (see `background_close`); once a conversation has been refused,
+    /// its next close waits for the daemon instead, so a second refusal stays
+    /// on the pane with whatever it can end.
     /// Two other cases wait for a daemon answer: a return to the terminal
     /// already under way closes the card as soon as it lands, and a chat parked
     /// behind its source terminal closes before that terminal's own close, so
@@ -9868,10 +9906,7 @@ impl Cagents {
                 .cloned(),
             _ => None,
         };
-        if !pending
-            && session.proof.is_some()
-            && (session.owns_codex_listener() || session.native_continuity.retains_provider())
-        {
+        if !pending && self.chat_ui.close_refused.contains(&session.id) {
             let target = self.chat_ui.next_target(card);
             self.chat_ui.phases.insert(
                 card,
@@ -9887,16 +9922,21 @@ impl Cagents {
                         .await
                         .map_err(|error| error.to_string())
                         .and_then(|result| result);
-                Message::ChatUi(Action::RetainedCloseFinished(target, session, result))
+                Message::ChatUi(Action::HeldCloseFinished(target, session, result))
             });
         }
+        // The descriptor the pane closes with is what reopening resumes.
+        self.install_closing_identity(card, &session);
+        let title = self
+            .card_state(card)
+            .map(|state| self.card_display_title(state).to_owned());
         let Some(remove) = self.remove_chat_card(card, None) else {
             return Task::none();
         };
         let retire = if pending {
             Task::none()
         } else {
-            self.end_chat(card, handle, Some(session), close_conversation)
+            self.close_chat_in_background(card, handle, session, title.unwrap_or_default())
         };
         Task::batch([retire, remove])
     }
@@ -10033,8 +10073,9 @@ impl Cagents {
             self.queue_card_close(card, false);
             return None;
         }
-        self.reserve_chat_removal(card)?;
-        self.commit_card_removal(card, replacement)
+        let (_, reserved) = self.reserve_chat_removal(card)?;
+        let committed = self.commit_card_removal(card, replacement)?;
+        Some(Task::batch([reserved, committed]))
     }
 
     /// Opens the terminal that replaces a chat whose removal has committed.
@@ -10054,12 +10095,11 @@ impl Cagents {
 
     /// The workspace's reservation to remove `card`, taken now unless it is
     /// already held; a refusal is reported.
-    fn reserve_chat_removal(&mut self, card: CardId) -> Option<crate::workspace::FocusHandoff> {
-        let handoff = match self.workspace.pending_close() {
-            Some(handoff) if handoff.unmounting == card => Ok(handoff),
-            _ => self.workspace.request_close(card),
-        };
-        handoff
+    fn reserve_chat_removal(
+        &mut self,
+        card: CardId,
+    ) -> Option<(crate::workspace::FocusHandoff, Task<Message>)> {
+        self.reserve_removal(card)
             .inspect_err(|error| {
                 self.status = Some(TransientNotice::error(error.to_string()));
             })
@@ -12419,6 +12459,7 @@ impl Cagents {
                             opening_name,
                             self.list_chat_models(target.card),
                             self.dispatch_queued(target),
+                            self.show_refusal_on_reopen(target.card),
                         ]);
                     }
                     Err(failure)
@@ -12654,6 +12695,9 @@ impl Cagents {
                 }
             }
             Action::Retired(target, result) => {
+                if self.chat_ui.background_closes.contains_key(&target) {
+                    return self.background_close_finished(target, result);
+                }
                 // Nothing is on screen for this conversation, so only a
                 // failure to end it is worth saying anything about.
                 if self.chat_ui.retiring.remove(&target)
@@ -12702,13 +12746,14 @@ impl Cagents {
                     }
                 };
                 if let Some(error) = kept {
-                    self.status = Some(TransientNotice::error(error));
                     self.reread_chat_activity(target);
-                    return if close {
-                        self.begin_chat_close(card)
-                    } else {
-                        Task::none()
-                    };
+                    // A close asked for meanwhile goes ahead, so the pane the
+                    // refusal would point back to is leaving anyway.
+                    if close {
+                        return self.begin_chat_close(card);
+                    }
+                    self.status = Some(TransientNotice::error(error));
+                    return Task::none();
                 }
                 if !self
                     .card_state(card)
@@ -15256,7 +15301,7 @@ impl Cagents {
                     task
                 };
             }
-            Action::RetainedCloseFinished(target, session, result) => {
+            Action::HeldCloseFinished(target, session, result) => {
                 if self
                     .chat_ui
                     .finish(target, |phase| {
@@ -15266,12 +15311,19 @@ impl Cagents {
                 {
                     return Task::none();
                 }
-                if self.chat_return_session(target.card).as_ref() != Some(&session) {
+                // The provider may confirm the conversation's identity while
+                // it closes; the close still answers for it (#1923).
+                let Some(current) = self
+                    .chat_return_session(target.card)
+                    .filter(|current| background_close::only_confirms(&session, current))
+                else {
                     return Task::none();
-                }
+                };
                 if let Err(error) = result {
-                    return self.refuse_chat_close(target.card, session, error);
+                    return self.refuse_chat_close(target.card, current, error);
                 }
+                self.chat_ui.close_refused.remove(&current.id);
+                self.install_closing_identity(target.card, &current);
                 return self
                     .remove_chat_card(target.card, None)
                     .unwrap_or_else(Task::none);
@@ -15287,6 +15339,11 @@ impl Cagents {
                 return self.close_holders_ended(target, session, result);
             }
             Action::DismissCloseRefusal(target) => return self.dismiss_close_refusal(target),
+            Action::ReopenRefusedClose(session) => return self.reopen_refused_close(session),
+            Action::DismissCloseFailure(session) => {
+                self.dismiss_close_failure(session);
+                return Task::none();
+            }
             Action::CloseFinished(target, result) => {
                 if let Some(session) = self.chat_ui.abandoned.remove(&target) {
                     // A restart's close whose card has since been closed. It

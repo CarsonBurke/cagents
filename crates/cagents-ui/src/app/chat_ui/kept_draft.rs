@@ -297,11 +297,22 @@ mod tests {
         {
             let target = *target;
             let source = app.chat_return_session(card).unwrap();
-            drop(app.update(Message::ChatUi(Action::RetainedCloseFinished(
+            drop(app.update(Message::ChatUi(Action::HeldCloseFinished(
                 target,
                 source,
                 Ok(()),
             ))));
+        }
+        // A close running in the background, which the daemon now confirms.
+        let stopping = app
+            .chat_ui
+            .background_closes
+            .keys()
+            .copied()
+            .filter(|target| target.card == card)
+            .collect::<Vec<_>>();
+        for target in stopping {
+            drop(app.update(Message::ChatUi(Action::Retired(target, Ok(())))));
         }
         assert!(!app.workspace.order().any(|id| id == card));
         assert!(!app.card_state(card).unwrap().existence.is_open());

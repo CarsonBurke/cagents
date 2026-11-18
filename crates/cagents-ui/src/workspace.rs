@@ -203,7 +203,7 @@ pub struct StripGeometry {
 
 impl StripGeometry {
     pub fn build(cards: &[WorkspaceCard], viewport_width: f32, config: WorkspaceConfig) -> Self {
-        Self::build_holding(cards, viewport_width, config, None)
+        Self::build_holding(cards, viewport_width, config, None, None)
     }
 
     /// Builds the strip, keeping the panes in `held` filled and every other
@@ -211,27 +211,40 @@ impl StripGeometry {
     /// A resize gesture holds the decision it started with, so dragging one
     /// divider never makes a neighbour jump between its width and the
     /// viewport's halfway through the drag.
+    ///
+    /// `hidden` keeps its slot, so every pane keeps its index, but takes no
+    /// width and no gap: the strip is laid out as if it were gone.
     fn build_holding(
         cards: &[WorkspaceCard],
         viewport_width: f32,
         config: WorkspaceConfig,
         held: Option<&HashSet<CardId>>,
+        hidden: Option<CardId>,
     ) -> Self {
         let viewport_width = finite_nonnegative(viewport_width);
+        let shown = |index: usize| Some(cards[index].id) != hidden;
+        let count = (0..cards.len()).filter(|&index| shown(index)).count();
         let mut cursor = config.leading_padding;
         let mut geometry = Vec::with_capacity(cards.len());
         let mut prefix_ends = Vec::with_capacity(cards.len());
         let available = (viewport_width
             - config.leading_padding
             - config.trailing_padding
-            - config.gap * cards.len().saturating_sub(1) as f32)
+            - config.gap * count.saturating_sub(1) as f32)
             .max(0.0);
         let preferred: Vec<f32> = cards
             .iter()
-            .map(|card| card.width.resolve(viewport_width, config.width_limits))
+            .enumerate()
+            .map(|(index, card)| {
+                if shown(index) {
+                    card.width.resolve(viewport_width, config.width_limits)
+                } else {
+                    0.0
+                }
+            })
             .collect();
         let preferred_total = preferred.iter().sum::<f32>();
-        let expand = cards.len() > 1 && preferred_total > 0.0 && preferred_total < available;
+        let expand = count > 1 && preferred_total > 0.0 && preferred_total < available;
         // Panes that overflow the viewport scroll. A pane too narrow to read
         // there, which cannot share the viewport whole with either neighbour,
         // fills the viewport instead: the strip then pages one pane at a time
@@ -240,7 +253,7 @@ impl StripGeometry {
         // such as three half-width terminals, keep their widths and page two
         // at a time. Stored preferences are untouched, so the narrow width
         // returns once everything fits again.
-        let overflow = cards.len() > 1 && preferred_total > available;
+        let overflow = count > 1 && preferred_total > available;
         let readable = config.width_limits.minimum.min(available);
         let inner = (viewport_width - config.leading_padding - config.trailing_padding).max(0.0);
         let pairs = |index: usize, other: Option<usize>| {
@@ -250,20 +263,38 @@ impl StripGeometry {
                     preferred[index] + config.gap + other <= inner + WIDTH_TOLERANCE
                 })
         };
+        let previous_shown = |index: usize| (0..index).rev().find(|&other| shown(other));
+        let next_shown = |index: usize| (index + 1..cards.len()).find(|&other| shown(other));
+        let last_shown = (0..cards.len()).rev().find(|&index| shown(index));
         let fills = |index: usize| match held {
             Some(held) => held.contains(&cards[index].id),
             None => {
                 overflow
                     && preferred[index] < readable
-                    && !pairs(index, index.checked_sub(1))
-                    && !pairs(index, Some(index + 1))
+                    && !pairs(index, previous_shown(index))
+                    && !pairs(index, next_shown(index))
             }
         };
         let mut filled = Vec::new();
+        let mut placed = false;
 
         for (index, card) in cards.iter().enumerate() {
+            if !shown(index) {
+                geometry.push(CardGeometry {
+                    id: card.id,
+                    index,
+                    start: cursor,
+                    end: cursor,
+                });
+                prefix_ends.push(cursor);
+                continue;
+            }
+            if placed {
+                cursor += config.gap;
+            }
+            placed = true;
             let start = cursor;
-            let width = if cards.len() == 1 && viewport_width > 0.0 {
+            let width = if count == 1 && viewport_width > 0.0 {
                 available
             } else if expand {
                 // Fill spare space proportionally without changing the user's
@@ -275,7 +306,7 @@ impl StripGeometry {
             } else {
                 preferred[index]
             };
-            let end = if expand && index + 1 == cards.len() {
+            let end = if expand && Some(index) == last_shown {
                 // Absorb rounding at the outer edge, avoiding a fractional
                 // scroll range when the panes exactly fill the viewport.
                 viewport_width - config.trailing_padding
@@ -290,12 +321,9 @@ impl StripGeometry {
             });
             prefix_ends.push(end);
             cursor = end;
-            if index + 1 < cards.len() {
-                cursor += config.gap;
-            }
         }
 
-        let total_width = if cards.is_empty() {
+        let total_width = if count == 0 {
             config.leading_padding + config.trailing_padding
         } else {
             cursor + config.trailing_padding
@@ -766,6 +794,11 @@ impl ViewportPoint {
 struct PendingClose {
     id: CardId,
     handoff: FocusHandoff,
+    /// The pane had the keyboard, which goes back to it if it stays.
+    was_focused: bool,
+    /// The pane given the keyboard in its place; while it still has it, the
+    /// keyboard comes back.
+    successor: Option<CardId>,
 }
 
 /// Transient presentation geometry. Durable cards and `geometry()` always hold
@@ -849,6 +882,12 @@ impl Workspace {
 
     pub fn order(&self) -> impl ExactSizeIterator<Item = CardId> + '_ {
         self.cards.iter().map(|card| card.id)
+    }
+
+    /// The panes in sight, in order: every pane but one leaving the strip.
+    pub fn shown(&self) -> impl Iterator<Item = CardId> + '_ {
+        let closing = self.closing();
+        self.order().filter(move |id| Some(*id) != closing)
     }
 
     pub fn focused(&self) -> Option<CardId> {
@@ -1196,11 +1235,20 @@ impl Workspace {
         let source = self
             .index_of(focused)
             .ok_or(WorkspaceError::UnknownCard(focused))?;
-        let destination = match direction {
-            FocusDirection::Left => source.saturating_sub(1),
-            FocusDirection::Right => (source + 1).min(self.cards.len().saturating_sub(1)),
-        };
+        let destination = self.next_shown(source, direction);
         self.reorder(focused, destination)
+    }
+
+    /// The index of the pane beside `index` in `direction`, passing over a
+    /// pane that is leaving, or `index` itself at an end of the strip.
+    fn next_shown(&self, index: usize, direction: FocusDirection) -> usize {
+        let closing = self.closing();
+        let shown = |other: &usize| Some(self.cards[*other].id) != closing;
+        match direction {
+            FocusDirection::Left => (0..index).rev().find(shown),
+            FocusDirection::Right => (index + 1..self.cards.len()).find(shown),
+        }
+        .unwrap_or(index)
     }
 
     pub fn focus(&mut self, id: CardId) -> Result<ViewportUpdate, WorkspaceError> {
@@ -1244,11 +1292,7 @@ impl Workspace {
         }
 
         let current = self.focused_index().unwrap_or(0);
-        let next = match direction {
-            FocusDirection::Left => current.saturating_sub(1),
-            FocusDirection::Right => (current + 1).min(self.cards.len() - 1),
-        };
-        let id = self.cards[next].id;
+        let id = self.cards[self.next_shown(current, direction)].id;
         if self.focused == Some(id) {
             // There is no neighbour past an end of the strip. The pane is
             // still brought back into view, as any navigation would, but the
@@ -1270,7 +1314,15 @@ impl Workspace {
         }
     }
 
-    pub fn request_close(&mut self, id: CardId) -> Result<FocusHandoff, WorkspaceError> {
+    /// Reserves `id`'s removal. The pane leaves the strip at once: its
+    /// neighbours close over its slot and the keyboard moves to the pane
+    /// `FocusHandoff` names, while whatever decides the removal runs.
+    /// [`Self::commit_close`] then removes it, or [`Self::cancel_close`] puts
+    /// it back where it was.
+    pub fn request_close(
+        &mut self,
+        id: CardId,
+    ) -> Result<(FocusHandoff, ViewportUpdate), WorkspaceError> {
         if self.pending_close.is_some() {
             return Err(WorkspaceError::CloseAlreadyPending);
         }
@@ -1296,8 +1348,36 @@ impl Workspace {
             unmounting: id,
             target,
         };
-        self.pending_close = Some(PendingClose { id, handoff });
-        Ok(handoff)
+        let previous = self.presentation_geometry().clone();
+        let camera = self.camera;
+        let was_focused = self.focused == Some(id);
+        // The pane leaving keeps no keyboard: the pane taking over has it, or
+        // the neighbour the strip brings into view does once it is drawn.
+        let successor = match target {
+            FocusTarget::Card(next) => Some(next),
+            _ if was_focused => self
+                .cards
+                .get(index + 1)
+                .or_else(|| index.checked_sub(1).and_then(|i| self.cards.get(i)))
+                .map(|card| card.id),
+            _ => None,
+        };
+        self.pending_close = Some(PendingClose {
+            id,
+            handoff,
+            was_focused,
+            successor,
+        });
+        if let Some(next) = successor {
+            self.focused = Some(next);
+            self.pending_widget_focus = Some(next);
+        }
+        self.rebuild_geometry();
+        self.slide_from(previous, camera);
+        self.reveal_focused();
+        // Its slot may still meet the viewport; what is mounted changes anyway.
+        self.visibility_bands = None;
+        Ok((handoff, self.refresh_visibility(false)))
     }
 
     pub fn commit_close(&mut self, id: CardId) -> Result<ViewportUpdate, WorkspaceError> {
@@ -1314,6 +1394,7 @@ impl Workspace {
         let previous = self.presentation_geometry().clone();
         let index = self.index_of(id).ok_or(WorkspaceError::UnknownCard(id))?;
         let previous_camera = self.camera;
+        // Normally already out of the strip, so nothing moves here.
         self.cards.remove(index);
         self.rebuild_card_indices();
         self.pending_close = None;
@@ -1344,46 +1425,56 @@ impl Workspace {
             self.pending_widget_focus = None;
         }
         self.rebuild_geometry();
-        if !self.cards.is_empty() && self.viewport_width > 0.0 {
-            let mut transition = LayoutTransition {
-                from_total_width: previous.total_width(),
-                from_widths: self
-                    .geometry
-                    .cards()
-                    .iter()
-                    .map(|card| {
-                        previous
-                            .card(card.id)
-                            .map_or(card.width(), CardGeometry::width)
-                    })
-                    .collect(),
-                from_bounds: Some(
-                    self.geometry
-                        .cards()
-                        .iter()
-                        .map(|card| {
-                            let old = previous.card(card.id).unwrap_or(*card);
-                            (old.start, old.end)
-                        })
-                        .collect(),
-                ),
-                geometry: self.geometry.clone(),
-                elapsed: Duration::ZERO,
-            };
-            Self::interpolate_layout(
-                &mut transition,
-                &self.geometry,
-                self.viewport_width,
-                self.config,
-            );
-            self.layout_transition = Some(transition);
-            self.camera = previous_camera;
-        }
+        self.slide_from(previous, previous_camera);
         self.reveal_focused();
         Ok(self.refresh_visibility(false))
     }
 
-    pub fn cancel_close(&mut self, id: CardId) -> Result<(), WorkspaceError> {
+    /// Animates the strip from `previous` to its current geometry, each pane
+    /// moving from where it was drawn. `camera` is where the camera stood.
+    fn slide_from(&mut self, previous: StripGeometry, camera: Camera) {
+        if self.cards.is_empty() || self.viewport_width <= 0.0 {
+            return;
+        }
+        let mut transition = LayoutTransition {
+            from_total_width: previous.total_width(),
+            from_widths: self
+                .geometry
+                .cards()
+                .iter()
+                .map(|card| {
+                    previous
+                        .card(card.id)
+                        .map_or(card.width(), CardGeometry::width)
+                })
+                .collect(),
+            from_bounds: Some(
+                self.geometry
+                    .cards()
+                    .iter()
+                    .map(|card| {
+                        let old = previous.card(card.id).unwrap_or(*card);
+                        (old.start, old.end)
+                    })
+                    .collect(),
+            ),
+            geometry: self.geometry.clone(),
+            elapsed: Duration::ZERO,
+        };
+        Self::interpolate_layout(
+            &mut transition,
+            &self.geometry,
+            self.viewport_width,
+            self.config,
+        );
+        self.layout_transition = Some(transition);
+        self.visibility_bands = None;
+        self.camera = camera;
+    }
+
+    /// Gives up `id`'s reserved removal: the pane comes back to its place, with
+    /// the keyboard if it had it and nothing has taken it since.
+    pub fn cancel_close(&mut self, id: CardId) -> Result<ViewportUpdate, WorkspaceError> {
         let pending = self.pending_close.ok_or(WorkspaceError::NoClosePending)?;
         if pending.id != id {
             return Err(WorkspaceError::WrongPendingClose {
@@ -1391,8 +1482,56 @@ impl Workspace {
                 received: id,
             });
         }
+        let previous = self.presentation_geometry().clone();
+        let camera = self.camera;
         self.pending_close = None;
-        Ok(())
+        let untouched = self.focused == pending.successor.or(Some(id));
+        if pending.was_focused && untouched {
+            self.focused = Some(id);
+            self.pending_widget_focus = Some(id);
+        }
+        self.rebuild_geometry();
+        self.slide_from(previous, camera);
+        self.reveal_focused();
+        self.visibility_bands = None;
+        Ok(self.refresh_visibility(false))
+    }
+
+    /// Removes `id` from the strip whether or not another pane's removal is
+    /// reserved, for a pane already gone from the model, such as one closed in
+    /// another window. A reservation for another pane stays as it was.
+    pub fn remove_card(&mut self, id: CardId) -> Result<ViewportUpdate, WorkspaceError> {
+        self.index_of(id).ok_or(WorkspaceError::UnknownCard(id))?;
+        let other = self.pending_close.take().filter(|pending| pending.id != id);
+        // Without the other reservation in place the strip briefly lays that
+        // pane out again; it is hidden again before anything is drawn.
+        let result = self.request_close(id).and_then(|_| self.commit_close(id));
+        if let Some(other) = other {
+            self.pending_close = Some(other);
+            // The keyboard may have fallen to the pane already leaving; it goes
+            // on to that pane's own successor, or a neighbour still shown.
+            if self.focused == Some(other.id) {
+                let next = match other.handoff.target {
+                    FocusTarget::Card(next) if self.index_of(next).is_some() => Some(next),
+                    _ => self.index_of(other.id).and_then(|index| {
+                        self.cards
+                            .get(index + 1)
+                            .or_else(|| index.checked_sub(1).and_then(|i| self.cards.get(i)))
+                            .map(|card| card.id)
+                    }),
+                };
+                self.focused = next;
+                self.pending_widget_focus = next;
+            }
+            self.rebuild_geometry();
+        }
+        result.map(|update| {
+            let mut update = update;
+            let refreshed = self.refresh_visibility(false);
+            update.transitions.extend(refreshed.transitions);
+            update.offset_changed |= refreshed.offset_changed;
+            update
+        })
     }
 
     pub fn resize_viewport(&mut self, width: f32) -> ViewportUpdate {
@@ -1705,10 +1844,14 @@ impl Workspace {
             .offset()
             .clamp(0.0, geometry.max_offset(viewport_width));
         let bands = self.bands(geometry, target, offset, viewport_width);
+        let closing = self.closing();
         let mounted = bands
             .mounted()
             .filter_map(|index| {
                 let card = geometry.card_at(index)?;
+                if Some(card.id) == closing {
+                    return None;
+                }
                 let opening = self.opening.contains(&card.id);
                 let visibility = bands.class(index);
                 let width = card.width_within_boundaries();
@@ -1785,6 +1928,7 @@ impl Workspace {
             viewport_width,
             self.config,
             self.held_fill.as_ref(),
+            self.closing(),
         )
     }
 
@@ -1794,7 +1938,15 @@ impl Workspace {
             self.viewport_width,
             self.config,
             self.held_fill.as_ref(),
+            self.closing(),
         )
+    }
+
+    /// The pane whose removal is reserved. It has left the strip: it takes no
+    /// room and mounts nothing, though it keeps its place until the removal
+    /// commits, or comes back to it if the removal is given up.
+    fn closing(&self) -> Option<CardId> {
+        self.pending_close.map(|pending| pending.id)
     }
 
     fn rebuild_geometry(&mut self) {
@@ -1945,11 +2097,13 @@ impl Workspace {
         }
 
         let mut transitions = Vec::new();
+        let closing = self.closing();
         self.visibility.retain(|id, class| {
-            let mounted = self
-                .card_indices
-                .get(id)
-                .is_some_and(|index| bands.is_mounted(*index));
+            let mounted = Some(*id) != closing
+                && self
+                    .card_indices
+                    .get(id)
+                    .is_some_and(|index| bands.is_mounted(*index));
             if !mounted {
                 transitions.push(VisibilityTransition {
                     id: *id,
@@ -1961,6 +2115,9 @@ impl Workspace {
         });
         for index in bands.mounted() {
             let id = self.geometry.cards[index].id;
+            if Some(id) == closing {
+                continue;
+            }
             let class = bands.class(index);
             let previous = self
                 .visibility
@@ -4081,7 +4238,7 @@ mod tests {
         assert_eq!(workspace.focused(), Some(ids[0]));
         workspace.focus_adjacent(FocusDirection::Right).unwrap();
         assert_eq!(workspace.focused(), Some(ids[1]));
-        let handoff = workspace.request_close(ids[1]).unwrap();
+        let (handoff, _) = workspace.request_close(ids[1]).unwrap();
         assert_eq!(handoff.target, FocusTarget::Card(ids[2]));
         assert!(workspace.card(ids[1]).is_some());
         workspace.commit_close(ids[1]).unwrap();
@@ -4093,11 +4250,124 @@ mod tests {
     fn closing_an_unfocused_card_does_not_steal_focus() {
         let mut workspace = workspace_with_widths(&[CardWidth::Fixed(300.0); 3], 700.0);
         let ids: Vec<_> = workspace.order().collect();
-        let handoff = workspace.request_close(ids[2]).unwrap();
+        let (handoff, _) = workspace.request_close(ids[2]).unwrap();
         assert_eq!(handoff.target, FocusTarget::Unchanged);
         assert_eq!(workspace.focused(), Some(ids[0]));
         workspace.commit_close(ids[2]).unwrap();
         assert_eq!(workspace.focused(), Some(ids[0]));
+        workspace.check_invariants().unwrap();
+    }
+
+    /// A reserved removal takes the pane out of the strip at once: it takes no
+    /// room, mounts nothing and gives up the keyboard, while it keeps its
+    /// place. Giving the removal up puts it back as it was.
+    #[test]
+    fn a_pane_being_removed_leaves_at_once_and_comes_back_if_it_stays() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fixed(300.0); 3], 1000.0);
+        let ids: Vec<_> = workspace.order().collect();
+        workspace.focus(ids[1]).unwrap();
+        let before = workspace.geometry().clone();
+        let neighbour_start = before.card(ids[2]).unwrap().start;
+
+        let (handoff, update) = workspace.request_close(ids[1]).unwrap();
+        assert_eq!(handoff.target, FocusTarget::Card(ids[2]));
+        assert_eq!(workspace.focused(), Some(ids[2]), "the keyboard moves on");
+        let hidden = workspace.geometry().card(ids[1]).unwrap();
+        assert_eq!(hidden.width(), 0.0, "it takes no room");
+        assert_eq!(
+            workspace.geometry().card(ids[2]).unwrap().start,
+            workspace.geometry().card(ids[0]).unwrap().end + WorkspaceConfig::default().gap,
+            "its neighbour closes over its slot, with no gap left behind"
+        );
+        assert!(
+            !workspace
+                .visibility(ids[1])
+                .is_some_and(VisibilityClass::is_mounted),
+            "nothing is mounted"
+        );
+        assert!(
+            update
+                .transitions
+                .iter()
+                .any(|transition| transition.id == ids[1])
+        );
+        assert!(
+            workspace
+                .projection(1000.0)
+                .mounted
+                .iter()
+                .all(|mounted| mounted.id != ids[1])
+        );
+        assert_eq!(
+            workspace.order().collect::<Vec<_>>(),
+            ids,
+            "it keeps its place"
+        );
+
+        workspace.cancel_close(ids[1]).unwrap();
+        assert_eq!(workspace.focused(), Some(ids[1]), "the keyboard comes back");
+        assert_eq!(workspace.geometry(), &before);
+        assert_eq!(
+            workspace.geometry().card(ids[2]).unwrap().start,
+            neighbour_start
+        );
+        assert!(
+            workspace
+                .visibility(ids[1])
+                .is_some_and(VisibilityClass::is_mounted)
+        );
+        workspace.check_invariants().unwrap();
+    }
+
+    /// Moving along the strip passes over a pane that is leaving.
+    #[test]
+    fn keyboard_navigation_passes_over_a_pane_that_is_leaving() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fixed(300.0); 3], 1000.0);
+        let ids: Vec<_> = workspace.order().collect();
+        workspace.request_close(ids[1]).unwrap();
+        assert_eq!(workspace.focused(), Some(ids[0]));
+        workspace.focus_adjacent(FocusDirection::Right).unwrap();
+        assert_eq!(workspace.focused(), Some(ids[2]));
+        workspace.focus_adjacent(FocusDirection::Left).unwrap();
+        assert_eq!(workspace.focused(), Some(ids[0]));
+        workspace.move_focused(FocusDirection::Right).unwrap();
+        assert_eq!(
+            workspace.order().collect::<Vec<_>>(),
+            vec![ids[1], ids[2], ids[0]]
+        );
+        workspace.check_invariants().unwrap();
+    }
+
+    /// A pane the reader moved to while another was leaving keeps the
+    /// keyboard when the other comes back.
+    #[test]
+    fn a_pane_that_comes_back_leaves_the_keyboard_where_the_reader_put_it() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fixed(300.0); 3], 1000.0);
+        let ids: Vec<_> = workspace.order().collect();
+        workspace.focus(ids[1]).unwrap();
+        workspace.request_close(ids[1]).unwrap();
+        workspace.focus(ids[0]).unwrap();
+        workspace.cancel_close(ids[1]).unwrap();
+        assert_eq!(workspace.focused(), Some(ids[0]));
+        workspace.check_invariants().unwrap();
+    }
+
+    /// A pane closed elsewhere is removed even while another pane's removal
+    /// is reserved, which stays reserved and out of sight.
+    #[test]
+    fn a_pane_removed_beside_a_reserved_removal_leaves_that_one_reserved() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fixed(300.0); 3], 1000.0);
+        let ids: Vec<_> = workspace.order().collect();
+        workspace.focus(ids[1]).unwrap();
+        workspace.request_close(ids[1]).unwrap();
+        workspace.focus(ids[2]).unwrap();
+        workspace.remove_card(ids[2]).unwrap();
+        assert!(workspace.card(ids[2]).is_none());
+        assert_eq!(workspace.pending_close().unwrap().unmounting, ids[1]);
+        assert_eq!(workspace.geometry().card(ids[1]).unwrap().width(), 0.0);
+        assert_eq!(workspace.focused(), Some(ids[0]), "never the pane leaving");
+        workspace.commit_close(ids[1]).unwrap();
+        assert_eq!(workspace.order().collect::<Vec<_>>(), vec![ids[0]]);
         workspace.check_invariants().unwrap();
     }
 

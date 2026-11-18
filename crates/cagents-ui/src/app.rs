@@ -277,6 +277,10 @@ const EXIT_FLUSH_GRACE: Duration = Duration::from_millis(16);
 /// within a frame; the bound only keeps a lost report from leaving an
 /// invisible process holding the session lease, so no new window could open.
 const EXIT_WINDOW_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long an exit waits for chats closed just before it to stop. A close is
+/// the daemon's work and finishes without this process, but its answer is only
+/// heard while the process runs; past this the exit stops listening.
+const EXIT_CHAT_CLOSE_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTENT_MAX_WIDTH: f32 = 560.0;
 const STATUS_SURFACE_MAX_WIDTH: f32 = 360.0;
 
@@ -5093,6 +5097,8 @@ pub enum Message {
     SessionSaveHealthChanged(SessionSaveHealthEvent),
     Lsp(LspEvent),
     LanguageServersReaped,
+    /// The exit stopped waiting for chats closed before it to stop.
+    ExitChatClosesTimedOut,
     RetrySessionSave,
     RetrySharedViewSeeds,
     SessionRecovery(session_recovery::Action),
@@ -5118,11 +5124,14 @@ struct ApplicationExit {
     /// The window the exit closed, until iced reports it gone.
     closing: Option<window::Id>,
     servers_reaped: bool,
+    /// Every chat closed before the exit has been stopped, or the exit gave up
+    /// waiting for the daemon to say so.
+    chats_closed: bool,
 }
 
 impl ApplicationExit {
     fn is_complete(self) -> bool {
-        self.closing.is_none() && self.servers_reaped
+        self.closing.is_none() && self.servers_reaped && self.chats_closed
     }
 }
 
@@ -5818,6 +5827,12 @@ pub struct Cagents {
     queued_card_closes: VecDeque<terminal_close::QueuedCardClose>,
     /// The ended pane whose terminal the daemon is being asked to release.
     completed_release: Option<CardId>,
+    /// The terminal pane taken out of the strip while the daemon is asked to
+    /// close its terminal. It comes back if the close doesn't complete.
+    closing_out_of_sight: Option<CardId>,
+    /// Panes whose reserved removal was given up, with the strip's change in
+    /// bringing them back, applied at the end of the update.
+    kept_panes: Vec<(CardId, crate::workspace::ViewportUpdate)>,
     close_queue_advancing: bool,
     /// The pending removal whose commit has been delivered, so anything still
     /// holding it is one of the closes the commit started.
@@ -10967,6 +10982,7 @@ impl Cagents {
         self.settings_blur_pending()
             || !self.queued_card_closes.is_empty()
             || self.workspace.pending_close().is_some()
+            || !self.kept_panes.is_empty()
     }
 
     /// A navigation save timer with nothing left to save changes nothing a
@@ -14437,18 +14453,30 @@ impl Cagents {
             Message::LanguageServersReaped
         });
         let close = self.close_main_window();
+        // A chat closed just before leaves while its conversation stops; the
+        // process stays to hear the daemon's answer.
+        let chats_closed = !self.chat_ui.closing_in_background();
         self.exit = Some(ApplicationExit {
             closing: close.as_ref().map(|(window, _)| *window),
             servers_reaped: false,
+            chats_closed,
         });
+        let chats = if chats_closed {
+            Task::none()
+        } else {
+            cosmic::task::future(async move {
+                tokio::time::sleep(EXIT_CHAT_CLOSE_TIMEOUT).await;
+                Message::ExitChatClosesTimedOut
+            })
+        };
         let Some((window, close)) = close else {
-            return reap;
+            return Task::batch([reap, chats]);
         };
         let close_timeout = cosmic::task::future(async move {
             tokio::time::sleep(EXIT_WINDOW_CLOSE_TIMEOUT).await;
             Message::WindowClosed(window)
         });
-        Task::batch([close, reap, close_timeout])
+        Task::batch([close, reap, close_timeout, chats])
     }
 
     /// Records one half of the exit and ends the process once both are done.
@@ -15915,6 +15943,8 @@ impl Application for Cagents {
             close_commit_delivered: None,
             terminal_close_attempts: HashSet::new(),
             completed_release: None,
+            closing_out_of_sight: None,
+            kept_panes: Vec::new(),
             terminal_close_generation: 0,
             closed_terminal_cards: HashSet::new(),
             proven_gone_cards: HashSet::new(),
@@ -16210,6 +16240,7 @@ impl Application for Cagents {
                 self.status = Some(TransientNotice::warning(
                     "An update is being prepared, so the pane was kept. Close it again if the update doesn't go ahead.",
                 ));
+                return self.return_kept_panes();
             }
             return Task::none();
         }
@@ -18196,6 +18227,14 @@ impl Application for Cagents {
                 Task::none()
             }
             Message::LanguageServersReaped => self.advance_exit(|exit| exit.servers_reaped = true),
+            Message::ExitChatClosesTimedOut => {
+                if self.exit.is_some_and(|exit| !exit.chats_closed) {
+                    tracing::warn!(
+                        "exiting before the daemon confirmed every closed chat stopped"
+                    );
+                }
+                self.advance_exit(|exit| exit.chats_closed = true)
+            }
             Message::WindowClosed(window) => self.advance_exit(|exit| {
                 if exit.closing == Some(window) {
                     exit.closing = None;

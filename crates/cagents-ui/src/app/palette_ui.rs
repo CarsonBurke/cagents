@@ -1269,7 +1269,7 @@ impl Cagents {
                 let Some(id) = self.workspace.focused() else {
                     return Task::none();
                 };
-                let order: Vec<_> = self.workspace.order().collect();
+                let order: Vec<_> = self.workspace.shown().collect();
                 let Some(index) = order.iter().position(|candidate| *candidate == id) else {
                     return Task::none();
                 };
@@ -1321,7 +1321,7 @@ impl Cagents {
                     Command::FocusPane8 => 7,
                     _ => 8,
                 };
-                let card = self.workspace.order().nth(index);
+                let card = self.workspace.shown().nth(index);
                 card.map_or_else(Task::none, |id| self.update(Message::FocusCard(id)))
             }
             Command::ReviewToggleViewed

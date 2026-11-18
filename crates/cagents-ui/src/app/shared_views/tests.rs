@@ -7938,6 +7938,8 @@ fn channel_move_waits_for_retained_native_chat_cleanup_without_a_modal() {
     let (tx, rx) = test_model_channel();
     app.workspace_model_tx = tx;
     assert!(app.can_move_pane_to_channel(pane.id, destination));
+    // A close after a refusal waits on its pane.
+    app.refuse_chat_close_once_for_test(pane.id);
     let close = app.begin_chat_close(pane.id);
     assert!(app.chat_start_pending(pane.id));
     assert!(!app.modal_is_open());
@@ -7976,7 +7978,10 @@ fn pending_channel_move_refuses_native_close_and_switch_until_refused() {
     assert!(!app.pane_transfer_pending(pane.id));
     assert!(app.chat_switch_blocker(pane.id).is_none());
     let close = app.begin_chat_close(pane.id);
-    assert!(app.chat_start_pending(pane.id));
+    assert!(
+        !app.card_state(pane.id).unwrap().existence.is_open(),
+        "once the move is refused the close goes ahead"
+    );
     drop(close);
 }
 
