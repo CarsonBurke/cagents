@@ -233,16 +233,17 @@ impl Runtime {
             .is_some_and(|handle| handle.has_accepted_user_input());
         let (text, attachments) =
             self.unsent_with_held(self.queued.as_ref().filter(|_| with_first && !delivered));
-        let sending =
-            self.pending
-                .as_ref()
-                .filter(|pending| {
-                    attachments.is_empty()
-                        && pending.sent.as_deref().is_some_and(|sent| {
-                            !sent.trim().is_empty() && sent.trim() == text.trim()
-                        })
-                })
-                .map(|pending| pending.sent_after.clone());
+        let sending = self
+            .commands
+            .iter()
+            .filter(|_| attachments.is_empty())
+            .find(|pending| {
+                pending
+                    .sent
+                    .as_deref()
+                    .is_some_and(|sent| !sent.trim().is_empty() && sent.trim() == text.trim())
+            })
+            .map(|pending| pending.sent_after.clone());
         (text, attachments, sending)
     }
 }
@@ -518,7 +519,10 @@ mod tests {
             let card = live_chat_in(&mut app, Provider::Claude, project.path(), Some("kept"));
             write(&mut app, card, "run the migration");
             submit(&mut app, card);
-            assert!(chat_runtime(&app, card).pending.is_some(), "still sending");
+            assert!(
+                chat_runtime(&app, card).commands.in_flight().is_some(),
+                "still sending"
+            );
             close(&mut app, card);
             let kept = &app.durable.kept_chat_drafts[&card];
             assert_eq!(kept.text, "run the migration");
@@ -564,7 +568,10 @@ mod tests {
         } else {
             submit(&mut app, card);
         }
-        assert!(chat_runtime(&app, card).pending.is_some(), "still sending");
+        assert!(
+            chat_runtime(&app, card).commands.in_flight().is_some(),
+            "still sending"
+        );
         close(&mut app, card);
         assert!(app.durable.kept_chat_drafts[&card].sending);
         (app, card)

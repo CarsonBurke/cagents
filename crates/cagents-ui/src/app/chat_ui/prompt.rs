@@ -126,6 +126,27 @@ impl Drop for LocalSource {
     }
 }
 
+/// A message of the reader's that this window holds until its conversation
+/// has it: what was written, how it is drawn meanwhile, and the files it
+/// carries.
+pub(super) struct LocalPrompt {
+    pub(super) source: Arc<LocalSource>,
+    pub(super) presentation: LocalPresentation,
+    pub(super) attachments: Vec<Attachment>,
+}
+impl LocalPrompt {
+    pub(super) fn new(text: String, attachments: Vec<Attachment>) -> Self {
+        Self {
+            source: LocalSource::new(text),
+            presentation: LocalPresentation::default(),
+            attachments,
+        }
+    }
+    pub(super) fn text(&self) -> &str {
+        self.source.text()
+    }
+}
+
 #[derive(Default)]
 pub(super) struct LocalPresentation {
     pub(super) prepared: Option<Box<Prepared>>,

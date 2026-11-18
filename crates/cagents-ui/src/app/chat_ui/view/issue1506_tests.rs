@@ -1307,7 +1307,7 @@ fn child_chooser_actions_preserve_reader_and_cover_transcript_until_closed() {
         assert_eq!(live.active_scroll(), child_reader);
         assert!(Arc::ptr_eq(&live.snapshot, &publication));
         assert!(
-            live.pending.is_none(),
+            live.commands.is_idle(),
             "chooser actions must not submit or interrupt work"
         );
         assert!(live.interrupt_armed.is_none());

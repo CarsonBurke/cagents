@@ -61,7 +61,7 @@ impl Runtime {
         let unresumable = fresh_available;
         let saved_history = self.has_connected_saved_history(snapshot);
         let enabled = !transitioning
-            && self.pending.is_none()
+            && self.commands.is_idle()
             && self.attachment_chooser_pending.is_none()
             && self.pastes_pending == 0
             && (!saved_history || !snapshot.history_loading);

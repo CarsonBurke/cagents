@@ -187,11 +187,22 @@ fn first_start_waits_for_real_identity_and_prompt_checkpoint_before_publishing_o
         matches!(app.chat_ui.phases.get(&card), Some(Phase::Starting(a)) if a.session.id == candidate.id)
     );
     assert_eq!(
-        runtime(&app, card).queued.as_ref().unwrap().source.text(),
+        runtime(&app, card)
+            .queued
+            .as_ref()
+            .unwrap()
+            .prompt
+            .source
+            .text(),
         "First prompt remains local"
     );
     assert_eq!(
-        runtime(&app, card).queued.as_ref().unwrap().attachments,
+        runtime(&app, card)
+            .queued
+            .as_ref()
+            .unwrap()
+            .prompt
+            .attachments,
         images
     );
     assert!(
@@ -404,22 +415,44 @@ fn failed_first_start_save_retries_with_a_fresh_candidate_after_its_cause_is_rep
         if attempt.target == started && attempt.session == candidate)
     );
     assert_eq!(
-        runtime(&app, card).queued.as_ref().unwrap().source.text(),
+        runtime(&app, card)
+            .queued
+            .as_ref()
+            .unwrap()
+            .prompt
+            .source
+            .text(),
         "First prompt remains local"
     );
     assert_eq!(
-        runtime(&app, card).queued.as_ref().unwrap().attachments,
+        runtime(&app, card)
+            .queued
+            .as_ref()
+            .unwrap()
+            .prompt
+            .attachments,
         images
     );
     drop(app.draft_start_checkpointed(retry_target, retry_attempt, result.clone()));
     drop(app.draft_start_checkpointed(first_target, first_attempt, result));
     assert_eq!(app.chat_ui.attempt(card).unwrap().target, started);
     assert_eq!(
-        runtime(&app, card).queued.as_ref().unwrap().source.text(),
+        runtime(&app, card)
+            .queued
+            .as_ref()
+            .unwrap()
+            .prompt
+            .source
+            .text(),
         "First prompt remains local"
     );
     assert_eq!(
-        runtime(&app, card).queued.as_ref().unwrap().attachments,
+        runtime(&app, card)
+            .queued
+            .as_ref()
+            .unwrap()
+            .prompt
+            .attachments,
         images
     );
     drop(start);
@@ -799,7 +832,13 @@ fn edited_message_requires_a_new_save_before_starting() {
     assert_eq!(restored.chat_drafts[&card], "Second deliberate send");
     let start = app.draft_start_checkpointed(target, attempt, result);
     assert_eq!(
-        runtime(&app, card).queued.as_ref().unwrap().source.text(),
+        runtime(&app, card)
+            .queued
+            .as_ref()
+            .unwrap()
+            .prompt
+            .source
+            .text(),
         "Second deliberate send"
     );
     assert!(
@@ -1051,7 +1090,13 @@ fn saved_first_prompt_keeps_exact_whitespace_and_original_images_before_later_ed
             _ => unreachable!(),
         }
         assert_eq!(
-            runtime(&app, card).queued.as_ref().unwrap().source.text(),
+            runtime(&app, card)
+                .queued
+                .as_ref()
+                .unwrap()
+                .prompt
+                .source
+                .text(),
             first
         );
         assert_eq!(runtime(&app, card).composer.text(), later);
@@ -1071,7 +1116,13 @@ fn saved_first_prompt_keeps_exact_whitespace_and_original_images_before_later_ed
         // Loading this field is recovery data, not a provider submission, and
         // preparing the snapshot has not changed either independent source.
         assert_eq!(
-            runtime(&app, card).queued.as_ref().unwrap().source.text(),
+            runtime(&app, card)
+                .queued
+                .as_ref()
+                .unwrap()
+                .prompt
+                .source
+                .text(),
             first
         );
         assert_eq!(runtime(&app, card).composer.text(), later);
@@ -1217,12 +1268,15 @@ fn accepted_first_prompt_keeps_default_channel_pane_across_empty_reads() {
         drop(app.update(ready));
         let target = runtime(&app, card).target;
         let handle = runtime(&app, card).handle().unwrap().clone();
-        let pending = runtime(&app, card).pending.as_ref().unwrap();
+        let pending = runtime(&app, card).commands.in_flight().unwrap();
         assert_eq!(pending.queued, Some(QueuedStep::Prompt));
         assert_eq!(pending.sent.as_deref(), Some("one original prompt"));
         let command = pending.id;
         drop(app.apply_workspace_model_update(ModelUpdate::Read(empty.clone())));
-        assert_eq!(runtime(&app, card).pending.as_ref().unwrap().id, command);
+        assert_eq!(
+            runtime(&app, card).commands.in_flight().unwrap().id,
+            command
+        );
         let accepted_snapshot = Snapshot {
             ready: true,
             busy: true,
@@ -1260,7 +1314,7 @@ fn accepted_first_prompt_keeps_default_channel_pane_across_empty_reads() {
         if !wake_before_ack {
             drop(app.update(Message::ChatUi(Action::Wake(target, Wake::Changed))));
         }
-        assert!(runtime(&app, card).pending.is_none());
+        assert!(runtime(&app, card).commands.is_idle());
         assert!(runtime(&app, card).queued.is_none());
         assert!(!app.shared_chat_has_local_work(card));
         let mut edits = std::iter::from_fn(|| published.try_recv().ok()).collect::<Vec<_>>();
@@ -1336,7 +1390,7 @@ fn accepted_first_prompt_keeps_default_channel_pane_across_empty_reads() {
             assert!(Arc::ptr_eq(unconfirmed.handle().unwrap(), &handle));
             assert_eq!(unconfirmed.session.id, actor);
             assert!(unconfirmed.session.launch.session_id.is_none());
-            assert!(unconfirmed.pending.is_none() && unconfirmed.queued.is_none());
+            assert!(unconfirmed.commands.is_idle() && unconfirmed.queued.is_none());
             assert!(app.card_state(card).unwrap().existence.is_open());
             assert_eq!(app.workspace.focused(), Some(card));
             let saved = app.persistent_workspace();
@@ -1377,7 +1431,7 @@ fn accepted_first_prompt_keeps_default_channel_pane_across_empty_reads() {
                 .count(),
             1
         );
-        assert!(current.pending.is_none() && current.queued.is_none());
+        assert!(current.commands.is_idle() && current.queued.is_none());
         assert!(app.card_state(card).unwrap().existence.is_open());
         assert_eq!(app.workspace.focused(), Some(card));
         let saved = app.persistent_workspace();
@@ -1915,7 +1969,7 @@ fn accepted_first_prompt_transport_disconnect_before(
         runtime.show(true);
     }
     assert!(handle.is_visible_for_test());
-    let command = runtime(&app, card).pending.as_ref().unwrap();
+    let command = runtime(&app, card).commands.in_flight().unwrap();
     assert_eq!(command.queued, Some(QueuedStep::Prompt));
     let command_id = command.id;
     let retiring_before = app.chat_ui.retiring.clone();
@@ -2003,7 +2057,10 @@ fn accepted_first_prompt_transport_disconnect_before(
     peer.join().unwrap();
     assert_eq!(runtime(&app, card).session.id, actor);
     assert!(runtime(&app, card).queued.is_some());
-    assert_eq!(runtime(&app, card).pending.as_ref().unwrap().id, command_id);
+    assert_eq!(
+        runtime(&app, card).commands.in_flight().unwrap().id,
+        command_id
+    );
 
     // Only application delivery order changes. Prompt Accepted precedes EOF;
     // all real Changed wakes are reduced before EOF's wake, while the driver
@@ -2054,7 +2111,7 @@ fn accepted_first_prompt_transport_disconnect_before(
     assert!(accepted.composer.text().is_empty());
     assert!(accepted.attachments.is_empty());
     assert!(accepted.queued.is_none());
-    assert!(accepted.pending.is_none());
+    assert!(accepted.commands.is_idle());
     assert_eq!(app.chat_ui.retiring, retiring_before);
     assert!(app.card_state(card).unwrap().existence.is_open());
     assert_eq!(

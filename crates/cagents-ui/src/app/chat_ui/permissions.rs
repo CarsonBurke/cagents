@@ -164,7 +164,7 @@ impl Runtime {
                     .into(),
             );
         }
-        if self.pending.is_some() {
+        if self.commands.awaiting_permissions() {
             content.push(design::caption("Waiting for provider confirmation…").into());
         }
         if self.session.launch.provider == Provider::Claude && !self.is_draft() {
@@ -296,7 +296,7 @@ impl Runtime {
                     ))
                     .width(Length::Fill)
                     .class(crate::ui_controls::control_style(
-                        snapshot.permission_mode.as_ref() == Some(mode),
+                        self.chosen_permission_mode() == Some(mode.as_str()),
                         None,
                     ))
                     .on_press_maybe(
