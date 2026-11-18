@@ -382,27 +382,47 @@ claim_updater_state() {
     uninstall_umask=$(umask)
     umask 077
     mkdir "$update_state" 2>/dev/null || :
-    if [ -L "$update_state" ] || [ ! -d "$update_state" ] || [ -L "$update_state/lock" ]; then
+    # Opening a FIFO or device here could block or act on something else.
+    if [ -L "$update_state" ] || [ ! -d "$update_state" ] || [ -L "$update_state/lock" ] \
+        || { [ -e "$update_state/lock" ] && [ ! -f "$update_state/lock" ]; }; then
         fail "unsafe updater state at $update_state; cagents was not removed"
     fi
     { command exec 9>>"$update_state/lock"; } 2>/dev/null \
         || fail "cannot open the updater lock at $update_state; cagents was not removed"
     umask "$uninstall_umask"
-    flock -w 5 9 \
-        || fail 'an application update is in progress; let it finish, then retry; cagents was not removed'
+    # util-linux flock exits 1 only when the wait times out.
+    if flock -w 5 9; then
+        :
+    elif [ "$?" -eq 1 ]; then
+        fail 'an application update is in progress; let it finish, then retry; cagents was not removed'
+    else
+        fail "cannot lock the updater lock at $update_state; cagents was not removed"
+    fi
 }
 
-uninstall_installation() {
+# Succeeds for a marked installation root; reports and fails when there is none.
+check_installation_marker() {
     if [ ! -e "$PREFIX/.cagents-install-root" ]; then
         printf '%s: no install.sh installation found at %s\n' "$PROGRAM" "$PREFIX" >&2
-        return 0
+        return 1
     fi
     [ -f "$PREFIX/.cagents-install-root" ] && [ ! -L "$PREFIX/.cagents-install-root" ] \
         || fail "unsafe installation marker at $PREFIX"
     [ "$(cat "$PREFIX/.cagents-install-root")" = 'cagents install root' ] \
         || fail "unrecognized installation marker at $PREFIX"
+}
 
+uninstall_installation() {
+    # Install refuses a symlinked root too. Through one, the leftover check and
+    # the launcher link targets would not describe the real root.
+    [ ! -L "$PREFIX" ] || fail "refusing to uninstall through symlink $PREFIX"
+    check_installation_marker || return 0
     claim_updater_state
+    # Another uninstall may have held the lock and removed this installation,
+    # or its updater state, while this one waited.
+    check_installation_marker || return 0
+    [ "$update_state/lock" -ef "/proc/$$/fd/9" ] \
+        || fail 'the installation changed while waiting for the updater lock; retry; cagents was not removed'
     if [ -L "$PREFIX/current" ]; then
         stop_daemon_and_wait "$PREFIX/current/bin/cagents"
     elif [ -e "$PREFIX/current" ]; then

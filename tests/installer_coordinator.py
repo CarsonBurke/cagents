@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
 
 
@@ -934,14 +935,19 @@ os.execv({real_tar!r}, [{real_tar!r}, *args])
         '"daemon_present":true,"socket":"/run/user/1000/cagents/cagentsd.sock","daemon_version":null}}',
     )
 
-    def uninstall(self, uninstaller, *options, environment=None):
+    def uninstall_command(self, uninstaller, *options, prefix=None):
+        prefix = prefix or self.prefix
         if uninstaller == "packaged helper":
-            command = ["/bin/sh", str(self.prefix / "current/bin/cagents-uninstall"), "--prefix", str(self.prefix)]
+            command = ["/bin/sh", str(self.prefix / "current/bin/cagents-uninstall"), "--prefix", str(prefix)]
         else:
-            command = ["/bin/sh", str(ROOT / "install.sh"), "--prefix", str(self.prefix),
+            command = ["/bin/sh", str(ROOT / "install.sh"), "--prefix", str(prefix),
                        *(() if "--purge" in options else ("--uninstall",))]
+        return [*command, *options]
+
+    def uninstall(self, uninstaller, *options, environment=None, prefix=None):
         # A typical login umask, which would expose files the uninstaller creates.
-        return subprocess.run([*command, *options], env=environment or self.environment, cwd=self.directory,
+        return subprocess.run(self.uninstall_command(uninstaller, *options, prefix=prefix),
+                              env=environment or self.environment, cwd=self.directory,
                               capture_output=True, text=True, timeout=INSTALL_TIMEOUT_SECONDS, umask=0o022)
 
     def install_serving(self):
@@ -1050,6 +1056,84 @@ os.execv({real_tar!r}, [{real_tar!r}, *args])
                 self.assertEqual(sorted(p.name for p in self.prefix.iterdir()), [".cagents-install-root", "notes.txt"])
                 self.calls.unlink()
         self.assert_installed(self.install(), 'candidate')
+
+    def test_uninstall_refuses_a_symlinked_prefix(self):
+        self.install_serving()
+        link = self.directory / "linked prefix"
+        link.symlink_to(self.prefix)
+        for uninstaller in self.UNINSTALLERS:
+            with self.subTest(uninstaller=uninstaller):
+                result = self.uninstall(uninstaller, prefix=link)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(f"refusing to uninstall through symlink {link}", result.stderr)
+                self.assert_still_installed()
+                self.assertFalse(self.calls.exists())
+
+    def waiting_uninstall(self, uninstaller, state):
+        """Start an uninstall that waits on the updater lock this test holds."""
+        process = subprocess.Popen(self.uninstall_command(uninstaller), env=self.environment, cwd=self.directory,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(process.kill)
+        deadline = time.monotonic() + 5
+        # The waiter holds its own descriptor of the lock once it reaches flock.
+        while not any(os.path.realpath(f"/proc/{pid}/fd/9") == str(state / "lock")
+                      for pid in [process.pid, *self.children(process.pid)]):
+            if process.poll() is not None:
+                self.fail(f"the uninstall exited before waiting: {process.communicate()}")
+            self.assertLess(time.monotonic(), deadline, "the uninstall never waited on the updater lock")
+            time.sleep(0.02)
+        return process
+
+    @staticmethod
+    def children(pid):
+        try:
+            return [int(child) for child in Path(f"/proc/{pid}/task/{pid}/children").read_text().split()]
+        except OSError:
+            return []
+
+    def test_an_uninstall_waiting_on_another_finds_the_installation_gone(self):
+        for uninstaller in self.UNINSTALLERS:
+            with self.subTest(uninstaller=uninstaller):
+                self.install_serving()
+                state = self.record_update()
+                with (state / "lock").open("r+") as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    process = self.waiting_uninstall(uninstaller, state)
+                    # The first uninstall removes everything, then exits.
+                    shutil.rmtree(self.prefix)
+                stdout, stderr = process.communicate(timeout=INSTALL_TIMEOUT_SECONDS)
+                self.assertEqual(process.returncode, 0, stdout + stderr)
+                self.assertIn(f"no install.sh installation found at {self.prefix}", stderr)
+                self.assertNotIn("No such file", stderr)
+                self.assertFalse(self.prefix.exists())
+                self.calls.unlink(missing_ok=True)
+
+    def test_an_uninstall_whose_updater_state_was_replaced_while_waiting_refuses(self):
+        self.install_serving()
+        state = self.record_update()
+        for uninstaller in self.UNINSTALLERS:
+            with self.subTest(uninstaller=uninstaller):
+                with (state / "lock").open("r+") as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    process = self.waiting_uninstall(uninstaller, state)
+                    shutil.rmtree(state)
+                stdout, stderr = process.communicate(timeout=INSTALL_TIMEOUT_SECONDS)
+                self.assertNotEqual(process.returncode, 0, stdout + stderr)
+                self.assertIn("the installation changed while waiting for the updater lock; retry", stderr)
+                self.assert_still_installed()
+                state = self.record_update()
+
+    def test_uninstall_refuses_an_updater_lock_that_is_not_a_regular_file(self):
+        self.install_serving()
+        state = self.prefix / ".update"
+        state.mkdir(mode=0o700)
+        os.mkfifo(state / "lock", 0o600)
+        for uninstaller in self.UNINSTALLERS:
+            with self.subTest(uninstaller=uninstaller):
+                result = self.uninstall(uninstaller)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(f"unsafe updater state at {state}", result.stderr)
+                self.assert_still_installed()
 
     def purge_environment(self):
         environment = dict(self.environment, XDG_CACHE_HOME=str(self.home / "custom cache"),

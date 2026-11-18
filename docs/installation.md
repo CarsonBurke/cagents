@@ -403,7 +403,9 @@ first. Removal also refuses, without removing anything, while the daemon is
 still starting or stopping or an application update is in progress; retry once
 it settles. It removes the updater's state with the program files, so the same
 prefix can be reinstalled. Files you added to the prefix are kept, along with
-its installation marker.
+its installation marker. Like installation, removal refuses a `--prefix` that is
+a symlink; pass the real directory. It uses util-linux `flock` to hold the
+updater's lock.
 
 Remove a Debian installation with:
 
