@@ -342,11 +342,23 @@ mod tests {
     /// Reopens `card`'s conversation from history, connected to a provider
     /// whose transcript holds `items`, and returns the new card.
     fn reopen_with(app: &mut Cagents, card: CardId, items: Vec<Arc<chat::Item>>) -> CardId {
+        reopen_with_page(app, card, items, false)
+    }
+
+    /// [`reopen_with`], with `has_earlier` saying the transcript's earlier
+    /// messages are not loaded.
+    fn reopen_with_page(
+        app: &mut Cagents,
+        card: CardId,
+        items: Vec<Arc<chat::Item>>,
+        has_earlier: bool,
+    ) -> CardId {
         let reopened = begin_reopen(app, card);
         let target = app.chat_ui.attempt(reopened).unwrap().target;
         let handle = fixture_handle(app, reopened, Some("kept"));
         let mut snapshot = (*handle.snapshot()).clone();
         snapshot.items = items;
+        snapshot.has_earlier = has_earlier;
         handle.publish_snapshot_for_test(snapshot.clone());
         answer_start(app, target, Ok(handle));
         // The transcript, shown as the focused card it opens as.
@@ -529,24 +541,29 @@ mod tests {
         }
     }
 
-    /// Closes a chat in `project` showing `items` while it is still sending
-    /// `continue`, with `has_later` saying its latest messages were out of
-    /// view.
+    /// Closes a chat in `project` showing `items`, as `shown` further
+    /// describes, while it is still sending `continue`.
     fn close_sending_continue(
         project: &Path,
         items: Vec<Arc<chat::Item>>,
-        has_later: bool,
+        shown: impl FnOnce(&mut chat::Snapshot),
     ) -> (Cagents, CardId) {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat_in(&mut app, Provider::Claude, project, Some("kept"));
         let handle = chat_runtime(&app, card).handle().unwrap().clone();
         let mut snapshot = (*handle.snapshot()).clone();
         snapshot.items = items;
-        snapshot.has_later = has_later;
+        shown(&mut snapshot);
         handle.publish_snapshot_for_test(snapshot.clone());
         super::super::show_chat_snapshot_for_test(&mut app, card, snapshot);
         write(&mut app, card, "continue");
-        submit(&mut app, card);
+        if chat_runtime(&app, card).snapshot.busy {
+            // Queued behind the agent's work, as Send does not interrupt it.
+            let target = chat_runtime(&app, card).target;
+            drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Queue))));
+        } else {
+            submit(&mut app, card);
+        }
         assert!(chat_runtime(&app, card).pending.is_some(), "still sending");
         close(&mut app, card);
         assert!(app.durable.kept_chat_drafts[&card].sending);
@@ -561,7 +578,7 @@ mod tests {
         for arrived in [false, true] {
             let project = tempfile::tempdir().unwrap();
             let (mut app, card) =
-                close_sending_continue(project.path(), vec![user_said("u-1", "continue")], false);
+                close_sending_continue(project.path(), vec![user_said("u-1", "continue")], |_| {});
             assert_eq!(
                 app.durable.kept_chat_drafts[&card].sent_after,
                 SentAfter::Same("u-1".into())
@@ -594,7 +611,7 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         // Under other ids, as a provider that numbers replayed items gives.
         let (mut app, card) =
-            close_sending_continue(project.path(), vec![user_said("u-1", "continue")], false);
+            close_sending_continue(project.path(), vec![user_said("u-1", "continue")], |_| {});
         let reopened = reopen_with(&mut app, card, repeated());
         assert_eq!(
             chat_runtime(&app, reopened).composer.text().trim_end(),
@@ -602,13 +619,70 @@ mod tests {
         );
 
         // Sent while reading an earlier page.
-        let (mut app, card) =
-            close_sending_continue(project.path(), vec![user_said("u-1", "continue")], true);
+        let (mut app, card) = close_sending_continue(
+            project.path(),
+            vec![user_said("u-1", "continue")],
+            |shown| {
+                shown.has_later = true;
+            },
+        );
         assert_eq!(
             app.durable.kept_chat_drafts[&card].sent_after,
             SentAfter::Unseen
         );
         let reopened = reopen_with(&mut app, card, repeated());
+        assert_eq!(
+            chat_runtime(&app, reopened).composer.text().trim_end(),
+            "continue"
+        );
+
+        // Sent with no message from the reader in view: a page of the
+        // agent's work, its earlier messages not loaded.
+        let (mut app, card) = close_sending_continue(project.path(), Vec::new(), |shown| {
+            shown.has_earlier = true;
+        });
+        assert_eq!(
+            app.durable.kept_chat_drafts[&card].sent_after,
+            SentAfter::Unseen
+        );
+        let reopened = reopen_with(&mut app, card, repeated());
+        assert_eq!(
+            chat_runtime(&app, reopened).composer.text().trim_end(),
+            "continue"
+        );
+
+        // Reopened on a page that starts after the message before it.
+        let (mut app, card) =
+            close_sending_continue(project.path(), vec![user_said("u-1", "continue")], |_| {});
+        let reopened = reopen_with_page(&mut app, card, vec![user_said("u-2", "continue")], true);
+        assert_eq!(
+            chat_runtime(&app, reopened).composer.text().trim_end(),
+            "continue"
+        );
+    }
+
+    /// The agent is busy, so the first `continue` waits in the provider's
+    /// queue as the second is sent, and the chat closes while that one is
+    /// still being sent. The first arriving later does not count as the
+    /// second's arrival.
+    #[test]
+    fn a_message_repeating_a_queued_one_comes_back() {
+        let project = tempfile::tempdir().unwrap();
+        let (mut app, card) =
+            close_sending_continue(project.path(), vec![user_said("u-1", "start")], |shown| {
+                shown.busy = true;
+                shown.capabilities.queue = true;
+                shown.queued_messages = vec![queued("q-1", "continue")];
+            });
+        assert_eq!(
+            app.durable.kept_chat_drafts[&card].sent_after,
+            SentAfter::Unseen
+        );
+        let reopened = reopen_with(
+            &mut app,
+            card,
+            vec![user_said("u-1", "start"), user_said("q-1", "continue")],
+        );
         assert_eq!(
             chat_runtime(&app, reopened).composer.text().trim_end(),
             "continue"
@@ -621,7 +695,7 @@ mod tests {
     fn a_new_message_still_being_sent_settles_by_the_latest_message() {
         let project = tempfile::tempdir().unwrap();
         let (mut app, card) =
-            close_sending_continue(project.path(), vec![user_said("u-1", "go on")], false);
+            close_sending_continue(project.path(), vec![user_said("u-1", "go on")], |_| {});
         assert_eq!(
             app.durable.kept_chat_drafts[&card].sent_after,
             SentAfter::Different

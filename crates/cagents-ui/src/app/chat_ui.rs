@@ -2955,6 +2955,17 @@ fn sent_after(snapshot: &Snapshot, sent: &str) -> SentAfter {
         // The conversation's latest messages are not in view.
         return SentAfter::Unseen;
     }
+    if snapshot
+        .queued_messages
+        .iter()
+        .any(|queued| !queued.editable || queued.text.trim() == sent.trim())
+    {
+        // A message the provider still holds may arrive before this one,
+        // and nothing shows where it will: one reading the same would pass
+        // for this one. A preview may not be the whole message, so it may
+        // read the same too.
+        return SentAfter::Unseen;
+    }
     match user_messages(snapshot).next_back() {
         Some((id, text)) if text.trim() == sent.trim() => SentAfter::Same(id.to_owned()),
         Some(_) => SentAfter::Different,
