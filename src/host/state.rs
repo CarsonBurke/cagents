@@ -3456,8 +3456,10 @@ fn restart_or_stop(
     host: &SharedHost,
     chat: &crate::upgrade::handoff::Chat,
     unattached: &mut Vec<crate::upgrade::handoff::UnattachedChat>,
+    queue_budget: &mut super::chat::UpgradeRestoreQueueBudget,
 ) -> Result<(), String> {
-    let Err(reason) = super::chat::restore_upgrade(host, chat) else {
+    let Err(reason) = super::chat::restore_upgrade_with_queue_budget(host, chat, queue_budget)
+    else {
         return Ok(());
     };
     if crate::daemon::termination_requested() {
@@ -3571,12 +3573,17 @@ fn restore_upgrade_from(
     let mut unattached = Vec::new();
     let mut reattached = Vec::new();
     let mut interrupted_setups = false;
+    // Restarts stay serial: a Codex TUI needs its exact listener first, and a
+    // failed restart must be positively stopped before restore proceeds. Share
+    // lock queue time so one external lock holder cannot delay every restart
+    // by another minute while this daemon cannot yet accept clients.
+    let mut queue_budget = super::chat::UpgradeRestoreQueueBudget::default();
     let restored = (|| {
         // A managed CLI connects to its thread's server. Recreate that exact
         // actor first; starting the TUI first races a socket that does not exist.
         for chat in &checkpoint.chats {
             if ChatRestore::of(chat) == ChatRestore::CodexListener {
-                restart_or_stop(host, chat, &mut unattached)?;
+                restart_or_stop(host, chat, &mut unattached, &mut queue_budget)?;
             }
         }
         // Carried terminals are adopted before anything is relaunched: their
@@ -3741,7 +3748,7 @@ fn restore_upgrade_from(
             if crate::daemon::termination_requested() {
                 return Err(RESTORE_TERMINATED.to_owned());
             }
-            restart_or_stop(host, chat, &mut unattached)?;
+            restart_or_stop(host, chat, &mut unattached, &mut queue_budget)?;
         }
         let recovered = {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());

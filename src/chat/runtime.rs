@@ -1396,7 +1396,6 @@ impl LocalHandle {
     pub(crate) fn is_ready(&self) -> bool {
         self.0.state.lock().unwrap_or_else(|p| p.into_inner()).ready
     }
-    /// Identity received from the provider, not the speculative launch selector.
     /// How long the server this conversation launched has so far waited
     /// behind another process's file lock instead of starting, such as Codex
     /// queueing app-server startups that share one `CODEX_HOME`. Callers that
@@ -1405,6 +1404,7 @@ impl LocalHandle {
         Duration::from_millis(self.0.startup_lock_wait.load(Ordering::Acquire))
     }
 
+    /// Identity received from the provider, not the speculative launch selector.
     pub(crate) fn confirmed_session_id(&self) -> Option<String> {
         self.0
             .confirmed_session
