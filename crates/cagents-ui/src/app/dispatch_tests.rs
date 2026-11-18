@@ -101,6 +101,7 @@ fn a_command_standing_for_another_message_projects_the_workspace_once() {
             1,
             "{command:?}"
         );
+        projection_oracle::assert_projected(&mut app);
     }
 }
 
@@ -111,7 +112,10 @@ fn a_command_standing_for_another_message_projects_the_workspace_once() {
 fn a_focus_shortcut_owes_the_focus_moves_row_reconciliation() {
     let (mut app, _, _) = two_pane_app();
     let before = projections();
+    // As a handler would, within its update.
+    app.dispatching = 1;
     drop(app.dispatch(Message::RunCommand(Command::FocusPane2)));
+    app.dispatching = 0;
     assert_eq!(projections(), before, "a dispatch projects nothing itself");
     let owed = app
         .owed_projection
@@ -185,4 +189,95 @@ fn a_sweep_that_only_moves_exposures_projects_nothing() {
     assert_eq!(projections_of(&mut app, Message::LifecycleSweep), 0);
     assert_eq!(app.exposure(first), Exposure::Visible);
     projection_oracle::assert_projected(&mut app);
+}
+
+/// A helper that dispatches, driven where no update is running to project
+/// what it owes, runs a whole update instead and leaves nothing owed.
+#[test]
+fn a_dispatch_outside_an_update_projects_as_an_update() {
+    let (mut app, _, second) = two_pane_app();
+    let before = projections();
+    drop(app.dispatch(Message::FocusCard(second)));
+    assert_eq!(projections() - before, 1);
+    assert_eq!(app.owed_projection, None);
+    assert_eq!(app.workspace.focused(), Some(second));
+    projection_oracle::assert_projected(&mut app);
+}
+
+/// Bringing a card up is read by projections, so a sweep that hydrates one
+/// still projects the workspace, once.
+#[test]
+fn a_sweep_that_brings_a_card_up_projects_once() {
+    let (mut app, first, second) = two_pane_app();
+    drop(app.workspace.resize_viewport(400.0));
+    app.register_presence(first, Exposure::Offscreen, Residency::Cold);
+    app.register_presence(second, Exposure::Offscreen, Residency::Hot);
+    drop(app.project_workspace(true));
+    assert_eq!(projections_of(&mut app, Message::LifecycleSweep), 1);
+    assert!(!matches!(app.residency(first), Residency::Cold));
+    projection_oracle::assert_projected(&mut app);
+}
+
+/// What two dispatched messages owe together is never narrower than what
+/// either owes alone.
+#[test]
+fn owed_projections_merge_to_what_both_need() {
+    let card = CardId::new();
+    let other = CardId::new();
+    let owed = |projection, camera_only, reconcile_row_selection| OwedProjection {
+        projection,
+        camera_only,
+        reconcile_row_selection,
+        model_update: false,
+    };
+    let scoped = |card| Projection::ScopedChrome(vec![card]);
+    for (first, second, merged) in [
+        (
+            owed(Projection::Unchanged, false, false),
+            owed(Projection::Chrome, false, true),
+            owed(Projection::Chrome, false, true),
+        ),
+        (
+            owed(scoped(card), false, false),
+            owed(scoped(card), false, false),
+            owed(scoped(card), false, false),
+        ),
+        (
+            owed(scoped(card), false, false),
+            owed(scoped(other), false, false),
+            owed(Projection::Full, false, false),
+        ),
+        (
+            owed(Projection::Chrome, false, false),
+            owed(Projection::TranscriptProbes, false, false),
+            owed(Projection::Full, false, false),
+        ),
+        // Moving the camera twice, or once beside nothing, still only
+        // moves the camera.
+        (
+            owed(Projection::Full, true, false),
+            owed(Projection::Unchanged, false, false),
+            owed(Projection::Full, true, false),
+        ),
+        (
+            owed(Projection::Full, true, false),
+            owed(Projection::Full, true, false),
+            owed(Projection::Full, true, false),
+        ),
+        // The camera beside anything else owes the whole projection.
+        (
+            owed(Projection::Full, true, false),
+            owed(Projection::Chrome, false, false),
+            owed(Projection::Full, false, false),
+        ),
+        (
+            owed(Projection::Full, true, true),
+            owed(Projection::Full, false, false),
+            owed(Projection::Full, false, true),
+        ),
+    ] {
+        let label = format!("{first:?} + {second:?}");
+        assert_eq!(first.clone().merge(second.clone()), merged, "{label}");
+        assert_eq!(second.merge(first), merged, "{label} reversed");
+    }
 }

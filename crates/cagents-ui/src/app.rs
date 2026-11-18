@@ -5924,6 +5924,9 @@ pub struct Cagents {
     /// What the messages dispatched since the last projection owe it; see
     /// [`Cagents::dispatch`].
     owed_projection: Option<OwedProjection>,
+    /// How many updates are running their message's handler: a dispatch
+    /// made while none is has no update to project what it owes.
+    dispatching: u32,
     frame_clock: FrameClock,
     latency: crate::performance::InteractionLatency,
     latency_focus: Option<CardId>,
@@ -16090,6 +16093,7 @@ impl Application for Cagents {
             pending_panel_open: None,
             deferred_navigation: VecDeque::new(),
             owed_projection: None,
+            dispatching: 0,
             frame_clock: FrameClock::default(),
             latency: crate::performance::InteractionLatency::default(),
             latency_focus: None,
@@ -17075,7 +17079,9 @@ impl Application for Cagents {
         if let Some(notice) = crate::diagnostics::take_notice() {
             self.notices.record(TransientNotice::warning(notice));
         }
+        self.dispatching += 1;
         let task = self.dispatch(message);
+        self.dispatching -= 1;
         self.finish_update(
             task,
             UpdateEntry {
@@ -17239,9 +17245,12 @@ impl Cagents {
     /// of its own, so one input projects once however many messages it comes
     /// to: a shortcut and the focus move it stands for share one projection.
     ///
-    /// Only for use within `update`, by its own message's handler or the
-    /// helpers it calls: nothing else projects what a dispatch owes.
+    /// Outside a handler, where no update would project what it owes, as
+    /// when a test drives a helper directly, it runs a whole update instead.
     fn dispatch(&mut self, message: Message) -> Task<Message> {
+        if self.dispatching == 0 {
+            return self.update(message);
+        }
         let (message, settled) = match self.admit(message) {
             ControlFlow::Continue(admitted) => admitted,
             ControlFlow::Break(refused) => return refused,
