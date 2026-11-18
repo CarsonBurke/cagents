@@ -15,6 +15,10 @@
 # captures where the message went. With VARIANT=exit, the
 # conversation's own Codex process exits during the wait instead, and the
 # scene ends at the refusal. VARIANT=exclusive holds the daemon exclusively.
+# VARIANT=diverged leaves the daemon free, but gives the other account a
+# different copy of the conversation's history, so the daemon refuses the
+# switch for that reason before changing anything; the scene then removes the
+# copy and sends again.
 set -euo pipefail
 scene=${1:?usage: account-switch-busy-scene.sh prepare|wide|narrow}
 case $scene in prepare|wide|narrow) ;; *) exit 2 ;; esac
@@ -106,6 +110,19 @@ refresh() { # Ask the app to check the system Codex account again now.
     step limited
     "$ne" drive key Escape >/dev/null
 }
+diverge() { # Give the other account a different copy of each rollout.
+    "$ne" env sh -c 'set -e; cd "$HOME/.codex"
+        find sessions -type f -name "*.jsonl" | while IFS= read -r rollout; do
+            mkdir -p "$HOME/$1/${rollout%/*}"
+            printf "{\"fixture\":\"diverged\"}\n" >"$HOME/$1/$rollout"
+        done' sh "$alternate"
+}
+converge() { # Remove those copies, so the switch can copy the history.
+    "$ne" env sh -c 'set -e; cd "$HOME/.codex"
+        find sessions -type f -name "*.jsonl" | while IFS= read -r rollout; do
+            rm -f "$HOME/$1/$rollout"
+        done' sh "$alternate"
+}
 peer_exits() { # End the conversation's own Codex process on the first account.
     "$ne" env sh -c 'for pid in $(pgrep -f "[c]odex-tool-rows[.]py .*--listen"); do
         tr "\0" "\n" </proc/$pid/environ | grep -qx "CODEX_HOME=$HOME/.codex" && kill "$pid"
@@ -137,6 +154,19 @@ refresh
 
 composer
 "$ne" drive type 'Now list the open questions.' >/dev/null
+if [ "${VARIANT:-}" = diverged ]; then
+    # Nothing holds the daemon, so its refusal arrives at once.
+    diverge
+    "$ne" drive key Return >/dev/null
+    sleep 5
+    shot refused
+    converge
+    composer
+    "$ne" drive key Return >/dev/null
+    sleep 15
+    shot sent-again
+    exit 0
+fi
 hold
 "$ne" drive key Return >/dev/null
 sleep 5
