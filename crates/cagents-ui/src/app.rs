@@ -7712,9 +7712,10 @@ impl Cagents {
             && view.selected_number != number
         {
             view.selected_number = number;
-            // Choosing a pull request is browsing, saved with the
-            // navigation burst like moving between panes.
-            tasks.push(self.save_navigation_soon());
+            // Saved now, though it is browsing: a shared view holds the
+            // pane's kind, and an update to that view arriving before a
+            // deferred save would put the previous pull request back.
+            self.persist();
         }
         for url in links {
             tasks.push(self.open_clicked_link(url));

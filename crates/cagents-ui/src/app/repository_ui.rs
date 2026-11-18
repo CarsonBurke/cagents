@@ -152,10 +152,11 @@ impl Cagents {
             && state.kind != CardKind::Repository(view.clone())
         {
             state.kind = CardKind::Repository(view);
-            // Which file the pane shows is browsing, saved with the
-            // navigation burst. Unlike where the editor is, it is part of
-            // the pane a shared view holds.
-            tasks.push(self.save_navigation_soon());
+            // Saved now, though it is browsing: unlike where the editor is,
+            // the file is part of the pane a shared view holds, and an
+            // update to that view arriving before a deferred save would put
+            // the previous file back.
+            self.persist();
         }
         if let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) {
             let navigation = runtime.navigation();

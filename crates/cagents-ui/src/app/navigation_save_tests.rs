@@ -1,6 +1,6 @@
-// Changes of where the window is, or of what it shows inside a pane, are
-// saved with the navigation burst rather than by a full workspace save on
-// the UI thread; window-view state is saved where it lives, in settings.
+// Changes of where the window is are saved with the navigation burst rather
+// than by a full workspace save on the UI thread; window-view state is saved
+// where it lives, in settings.
 
 use super::*;
 use super::super::terminal_output_tests::persists;
@@ -112,44 +112,4 @@ fn going_to_an_open_pane_from_the_sidebar_saves_with_the_navigation_burst() {
     assert_eq!(app.durable.active_channel, Some(channel));
     assert_eq!(app.workspace.focused(), Some(channeled));
     assert_saved_with_the_burst(&mut app, saved, "a pane in a channel");
-}
-
-#[test]
-fn choosing_a_file_in_a_fixed_file_pane_saves_with_the_navigation_burst() {
-    let (mut app, card) = editing_repository_app();
-    let (mut runtime, _) = RepositoryRuntime::selection_fixture(card, "notes.txt");
-    runtime.descriptor.selected_file = Some("notes.txt".into());
-    app.card_state_mut(card).unwrap().kind = CardKind::Repository(runtime.descriptor.clone());
-    app.cards
-        .insert(card, CardRuntime::Repository(Box::new(runtime)));
-
-    let saved = persists();
-    drop(app.update(Message::Repository(RepositoryAction::OpenFile {
-        card,
-        path: "other.txt".into(),
-    })));
-    assert!(matches!(
-        &app.card_state(card).unwrap().kind,
-        CardKind::Repository(view) if view.selected_file.as_deref() == Some(Path::new("other.txt"))
-    ));
-    assert_saved_with_the_burst(&mut app, saved, "choosing a file");
-}
-
-#[test]
-fn choosing_a_pull_request_saves_with_the_navigation_burst() {
-    let mut app = context_inspector_test_app(false);
-    let (card, task) = app.add_pull_requests_card("/fixture".into());
-    drop(task);
-    finish_burst(&mut app);
-
-    let saved = persists();
-    drop(app.update(Message::PullRequestReview {
-        card,
-        action: pull_request_review::Action::Open(crate::pull_request_review::tests::target(7)),
-    }));
-    assert!(matches!(
-        &app.card_state(card).unwrap().kind,
-        CardKind::PullRequests(view) if view.selected_number == Some(7)
-    ));
-    assert_saved_with_the_burst(&mut app, saved, "choosing a pull request");
 }
