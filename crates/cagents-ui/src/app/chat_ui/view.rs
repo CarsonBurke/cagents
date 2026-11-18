@@ -92,6 +92,14 @@ const COMPOSER_TOOLBAR_PADDING: f32 = COMPOSER_CONTROL_INSET;
 /// either side, so the row is no taller than its buttons need.
 const COMPOSER_INSET_Y: f32 =
     (design::PRIMARY_CONTROL_SIZE + 2.0 * space::XS - COMPOSER_LINE_HEIGHT) / 2.0;
+/// How far a scrolled draft runs on into the editor's vertical inset (#2824):
+/// up to the composer's border, never over it.
+const COMPOSER_TEXT_REACH: f32 = COMPOSER_INSET_Y - design::BORDER_WIDTH;
+/// The composer editor's padding: its vertical inset, and its sides with the
+/// rail for the vertical scrollbar.
+fn composer_editor_padding() -> iced::Padding {
+    design::with_vertical_rail(iced::Padding::from([COMPOSER_INSET_Y, space::XS]))
+}
 /// How far a composer control sits above the row's foot: centered on a single
 /// line of text, and beside the last line of a longer one.
 const COMPOSER_CONTROL_INSET: f32 =
@@ -3375,7 +3383,6 @@ impl Runtime {
         } else {
             design::raised
         };
-        let reach = COMPOSER_INSET_Y - design::BORDER_WIDTH;
         let editor = crate::ui_controls::field::editor("Message", &self.composer)
             .id(card_control_id(target.card, "chat-composer"))
             // Nothing can be typed while the conversation changes hands.
@@ -3383,11 +3390,8 @@ impl Runtime {
             .size(design::TEXT_PROSE)
             .height(Length::Shrink)
             .max_height(composer_ceiling)
-            .padding(design::with_vertical_rail(iced::Padding::from([
-                COMPOSER_INSET_Y,
-                space::XS,
-            ])))
-            .fade_into_padding(reach, reach, composer_fill)
+            .padding(composer_editor_padding())
+            .fade_into_padding(COMPOSER_TEXT_REACH, COMPOSER_TEXT_REACH, composer_fill)
             .class(cosmic::theme::iced::TextEditor::Custom(Box::new(
                 composer_editor_style,
             )));
@@ -6912,6 +6916,41 @@ pub(super) fn linked_runtime_for_test(turns: usize) -> Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The composer's scrolled draft, its fade, caret and selection stop on
+    /// the first whole device row inside its border, at the composer's own
+    /// inset, border and reach, wherever it lands and at any scale (#2824).
+    /// Reaching the whole inset would take in the antialiased border's rows.
+    #[test]
+    fn composer_text_reach_stops_inside_its_border() {
+        let padding = composer_editor_padding();
+        let reach = (COMPOSER_TEXT_REACH, COMPOSER_TEXT_REACH);
+        for scale in [0.8, 1.0, 1.25, 1.5, 1.75, 2.0, 3.0] {
+            for top in [0.0, 573.73, 580.4, 580.5, 611.15, 777.95] {
+                let bounds = iced::Rectangle {
+                    x: 326.3,
+                    y: top,
+                    width: 720.0,
+                    height: 12.0 * COMPOSER_LINE_HEIGHT + 2.0 * COMPOSER_INSET_Y,
+                };
+                let (drawn, depth) = crate::ui_controls::field::padding_fade_geometry(
+                    bounds, padding, reach, reach, scale,
+                );
+                let context = format!("scale {scale}, top {top}: {drawn:?}");
+                let border_top = ((bounds.y + design::BORDER_WIDTH) * scale).ceil();
+                let border_bottom =
+                    ((bounds.y + bounds.height - design::BORDER_WIDTH) * scale).floor();
+                let drawn_top = (drawn.y * scale).round();
+                let drawn_bottom = ((drawn.y + drawn.height) * scale).round();
+                assert!(drawn_top >= border_top, "{context}");
+                assert!(drawn_bottom <= border_bottom, "{context}");
+                // The band is not given up: it reaches the first row inside.
+                assert!(drawn_top - border_top <= 1.0, "{context}");
+                assert!(border_bottom - drawn_bottom <= 1.0, "{context}");
+                assert!(depth.0 > 0.0 && depth.1 > 0.0, "{context}");
+            }
+        }
+    }
 
     #[test]
     fn saved_history_composer_offers_attachment_in_its_actions_without_enabling_send() {

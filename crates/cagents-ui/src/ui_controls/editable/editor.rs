@@ -145,7 +145,7 @@ impl<'a, Message: Clone + 'static> TextEditor<'a, Message> {
 /// and its bands are the native editor's own (`overscan_bounds`), so the
 /// fade covers exactly what the editor drew there. Each fade is as deep as
 /// the text reaches, but no deeper than its band.
-fn padding_fade_geometry(
+pub(crate) fn padding_fade_geometry(
     bounds: Rectangle,
     padding: Padding,
     overscan: (f32, f32),
@@ -475,15 +475,17 @@ mod tests {
         Edit(text_editor::Action),
         Cursor(text_editor::Cursor),
     }
-    /// The composer's text, fade and selection bands stop on a whole device
-    /// pixel inside its 1 px border, whatever fractional position and scale
-    /// it lands on, so the renderer's rounded clip never takes in a row the
-    /// antialiased border paints (#2824). Each fade is as deep as the text
-    /// reaches, within its band, and an overscan is limited to the padding.
+    /// The text, fade and selection bands of a field with a 1 px border stop
+    /// on the first whole device row inside it, whatever fractional position
+    /// and scale the field lands on, so the renderer's rounded clip never
+    /// takes in a row the antialiased border paints (#2824). Each fade is as
+    /// deep as the text reaches, within its band, and an overscan is limited
+    /// to the padding. The composer's own geometry is checked by
+    /// `composer_text_reach_stops_inside_its_border`.
     #[test]
     fn padding_fade_stops_on_a_device_pixel_inside_the_border() {
-        // The composer's geometry: a 19.6 px line, a 9.2 px inset and a 1 px
-        // border, with the overscan reaching to the border.
+        // A 9.2 px inset and a 1 px border, with the overscan reaching to the
+        // border.
         let border = 1.0;
         let inset = 9.2;
         let reach = inset - border;
