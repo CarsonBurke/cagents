@@ -310,7 +310,7 @@ fn holds_a_firing(response: &crate::automations::Response) -> bool {
 fn changes_the_daemon(request: &ClientRequest) -> bool {
     matches!(
         request,
-        ClientRequest::Shutdown { .. }
+        ClientRequest::Shutdown
             | ClientRequest::ShutdownV1 { .. }
             | ClientRequest::PrepareUpgrade { .. }
             | ClientRequest::UpgradeImpact { .. }

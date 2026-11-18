@@ -2157,7 +2157,7 @@ impl AppSettings {
             || !(0.25..=1.0).contains(&self.default_native_pane_fraction)
         {
             return Err(SettingsError::Invalid(
-                "Native pane and chat content widths must be between 0.25 and 1.0".into(),
+                "Native pane and chat content widths must be between 0.25 and 1.0",
             ));
         }
         if !(0.25..=1.0).contains(&self.default_column_fraction) {

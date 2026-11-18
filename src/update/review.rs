@@ -124,17 +124,17 @@ fn items(preview: &Preview) -> Vec<Item> {
                 let recovery = recovery_detail(&stopped.reason, &stopped.recovery);
                 if outcome == Outcome::Interrupted {
                     outcome = Outcome::Paused;
-                    let interruption = live.map(|session| live_fact(session)).unwrap_or_default();
+                    let interruption = live.map(live_fact).unwrap_or_default();
                     detail = format!("{interruption}; after the update: {recovery}");
                 } else if matches!(outcome, Outcome::Working | Outcome::Attention) {
-                    let reason = live.map(|session| live_fact(session)).unwrap_or_default();
+                    let reason = live.map(live_fact).unwrap_or_default();
                     detail = format!("{reason}; after the update: {recovery}");
                 } else {
                     outcome = Outcome::Paused;
                     detail = recovery;
                 }
-            } else if detail.is_empty() {
-                if let Some(live) = live {
+            } else if detail.is_empty()
+                && let Some(live) = live {
                     if outcome == Outcome::Paused {
                         detail = recovery_detail(&live_fact(live), CHAT_RECOVERY);
                     } else if matches!(
@@ -144,7 +144,6 @@ fn items(preview: &Preview) -> Vec<Item> {
                         detail = live_fact(live);
                     }
                 }
-            }
             if let Some(live) = live
                 && live.disposition != Disposition::WaitsForIdle
                 && (stops_service || live.disposition == Disposition::Blocked)
@@ -975,7 +974,8 @@ mod tests {
                 "{review}"
             );
         }
-        for disposition in [Disposition::WaitsForIdle] {
+        {
+            let disposition = Disposition::WaitsForIdle;
             let line = review
                 .lines()
                 .find(|line| line.contains(&format!("collision {disposition:?}:")))

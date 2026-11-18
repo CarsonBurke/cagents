@@ -1026,6 +1026,58 @@ fn running_owner_bin(prefix: &Path, executable: &Path) -> io::Result<std::path::
     Ok(bin.to_owned())
 }
 
+fn execute(command: &mut Command) -> io::Result<()> {
+    if CANCELLED.load(Ordering::Relaxed) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "installation cancelled before it started",
+        ));
+    }
+    let mut child = command.spawn()?;
+    let deadline = Instant::now() + Duration::from_secs(30 * 60);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return if status.success() {
+                Ok(())
+            } else {
+                Err(io::Error::other(format!("installer failed ({status})")))
+            };
+        }
+        let cancelled = CANCELLED.load(Ordering::Relaxed);
+        if cancelled || Instant::now() >= deadline {
+            // The unreaped child owns this process group. Give the installer's
+            // EXIT/TERM trap time to restore current before the hard bound.
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGTERM);
+            }
+            let cleanup = Instant::now() + Duration::from_secs(30);
+            while child.try_wait()?.is_none() {
+                if Instant::now() >= cleanup {
+                    unsafe {
+                        libc::kill(-(child.id() as i32), libc::SIGKILL);
+                    }
+                    let _ = child.wait();
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            return Err(io::Error::new(
+                if cancelled {
+                    io::ErrorKind::Interrupted
+                } else {
+                    io::ErrorKind::TimedOut
+                },
+                if cancelled {
+                    "installation cancelled; inspect its current installation before retrying"
+                } else {
+                    "installer exceeded its deadline; inspect its current installation before retrying"
+                },
+            ));
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1406,57 +1458,5 @@ mod tests {
         );
         let unrelated = tempfile::tempdir().unwrap();
         assert!(running_owner_bin(unrelated.path(), &staged.join("cagentsd")).is_err());
-    }
-}
-
-fn execute(command: &mut Command) -> io::Result<()> {
-    if CANCELLED.load(Ordering::Relaxed) {
-        return Err(io::Error::new(
-            io::ErrorKind::Interrupted,
-            "installation cancelled before it started",
-        ));
-    }
-    let mut child = command.spawn()?;
-    let deadline = Instant::now() + Duration::from_secs(30 * 60);
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return if status.success() {
-                Ok(())
-            } else {
-                Err(io::Error::other(format!("installer failed ({status})")))
-            };
-        }
-        let cancelled = CANCELLED.load(Ordering::Relaxed);
-        if cancelled || Instant::now() >= deadline {
-            // The unreaped child owns this process group. Give the installer's
-            // EXIT/TERM trap time to restore current before the hard bound.
-            unsafe {
-                libc::kill(-(child.id() as i32), libc::SIGTERM);
-            }
-            let cleanup = Instant::now() + Duration::from_secs(30);
-            while child.try_wait()?.is_none() {
-                if Instant::now() >= cleanup {
-                    unsafe {
-                        libc::kill(-(child.id() as i32), libc::SIGKILL);
-                    }
-                    let _ = child.wait();
-                    break;
-                }
-                thread::sleep(Duration::from_millis(20));
-            }
-            return Err(io::Error::new(
-                if cancelled {
-                    io::ErrorKind::Interrupted
-                } else {
-                    io::ErrorKind::TimedOut
-                },
-                if cancelled {
-                    "installation cancelled; inspect its current installation before retrying"
-                } else {
-                    "installer exceeded its deadline; inspect its current installation before retrying"
-                },
-            ));
-        }
-        thread::sleep(Duration::from_millis(20));
     }
 }

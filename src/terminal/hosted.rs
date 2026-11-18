@@ -2917,7 +2917,7 @@ fn serve_connection(
                     if let Some(reason) = refusal {
                         // Version, proof and exact request correlation have
                         // passed. Never replay this refused command.
-                        published.reject_input(events, *operation, reason);
+                        published.reject_input(events, operation, reason);
                         continue;
                     }
                 }

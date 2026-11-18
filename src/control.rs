@@ -1941,8 +1941,8 @@ impl ControlClient {
         capture: Option<crate::workspace_model::views::CapturedTerminalSource>,
     ) -> Result<terminal::ipc::TerminalCloseResult, ControlError> {
         let terminal_id = session.id;
-        if !completed_only {
-            if let Err(error) = self.attach_and_synchronize(terminal_id) {
+        if !completed_only
+            && let Err(error) = self.attach_and_synchronize(terminal_id) {
                 // The cleanup request has not been sent. Keep disappearance
                 // distinct from an unconfirmed reply after cleanup admission.
                 return Err(match error {
@@ -1958,7 +1958,6 @@ impl ControlClient {
                     error => error,
                 });
             }
-        }
         let request = ClientRequest::CloseTerminalSource {
             session,
             basis,
@@ -3552,8 +3551,8 @@ where
             }
         };
     }
-    if crate::device::is_remote() && !matches!(cli.command, TopCommand::Ui { .. }) {
-        if let Err(error) = crate::device::prepare() {
+    if crate::device::is_remote() && !matches!(cli.command, TopCommand::Ui { .. })
+        && let Err(error) = crate::device::prepare() {
             if crate::device::daemon_absent(&error) {
                 if stopping_daemon {
                     emit_success(cli.global.json, already_stopped());
@@ -3569,7 +3568,6 @@ where
             emit_error(cli.global.json, &AppError::new("device", error));
             return ExitCode::FAILURE;
         }
-    }
     match execute_with_model_context(cli.command, project_channel_context, service_context) {
         Ok(output) => {
             let code = output.exit_code();

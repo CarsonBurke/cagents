@@ -606,8 +606,8 @@ impl DirectoryPreparation {
         let outer = match resolve_directory(&self.namespace.directory, Path::new(&self.name)) {
             Ok(outer) => outer,
             Err(error) if error.is_not_found() => {
-                if let Some(held) = &self.outer {
-                    if held
+                if let Some(held) = &self.outer
+                    && held
                         .metadata()
                         .map_err(|e| ResolveError::io(&held.path, &e))?
                         .nlink()
@@ -618,7 +618,6 @@ impl DirectoryPreparation {
                             "retained staging is no longer at its internal name; authority preserved for resolution",
                         ));
                     }
-                }
                 self.created = false;
                 self.cleanup_error = None;
                 return Ok(());
@@ -680,8 +679,8 @@ impl DirectoryPreparation {
                     remove_directory_within(outer, OsStr::new("directory"))?;
                 }
                 Err(error) if error.is_not_found() => {
-                    if let Some(held) = &self.payload {
-                        if held
+                    if let Some(held) = &self.payload
+                        && held
                             .metadata()
                             .map_err(|e| ResolveError::io(&held.path, &e))?
                             .nlink()
@@ -692,7 +691,6 @@ impl DirectoryPreparation {
                                 "retained payload is no longer at its internal name; authority preserved for resolution",
                             ));
                         }
-                    }
                 }
                 Err(error) => return Err(error),
             }

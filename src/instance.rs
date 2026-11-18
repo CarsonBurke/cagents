@@ -2109,11 +2109,9 @@ impl Drop for UiUpdateGuard {
         for slot in &self.closed {
             if let Some(executable) = &self.fallback_executable {
                 let _ = launch_window_at(executable, false, Some(slot), None, self.restore_policy);
-            } else {
-                if let Ok(executable) = crate::companion::Product::Ui.beside_current() {
-                    let _ =
-                        launch_window_at(&executable, false, Some(slot), None, self.restore_policy);
-                }
+            } else if let Ok(executable) = crate::companion::Product::Ui.beside_current() {
+                let _ =
+                    launch_window_at(&executable, false, Some(slot), None, self.restore_policy);
             }
         }
         let _ = self._legacy_fence.unlock();

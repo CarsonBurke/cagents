@@ -455,12 +455,11 @@ mod coordinator_fixture {
                 let sent = unsafe { libc::kill(family.child.id() as i32, libc::SIGTERM) };
                 if sent != 0 {
                     let error = io::Error::last_os_error();
-                    if error.raw_os_error() == Some(libc::ESRCH) {
-                        if let Some(status) = family.child.try_wait().unwrap() {
+                    if error.raw_os_error() == Some(libc::ESRCH)
+                        && let Some(status) = family.child.try_wait().unwrap() {
                             family.reaped = true;
                             break status;
                         }
-                    }
                     panic!("coordinator TERM failed: {error}");
                 }
                 if event == b'T' {
@@ -515,13 +514,12 @@ exit 0
                 if let (Ok(coordinator), Ok(installer)) = (
                     fs::read_to_string(root.path().join("coordinator.pid")),
                     fs::read_to_string(root.path().join("installer.pid")),
-                ) {
-                    if let (Ok(coordinator), Ok(installer)) =
+                )
+                    && let (Ok(coordinator), Ok(installer)) =
                         (coordinator.parse(), installer.parse())
                     {
                         break (coordinator, installer);
                     }
-                }
                 assert!(
                     Instant::now() < ready_by,
                     "detached installer did not reach its barrier"
@@ -538,10 +536,10 @@ exit 0
             );
             if mode == "readiness" {
                 // A setup error drops the armed owner before normal completion.
-                let rejected: io::Result<()> = (move || {
+                let rejected: io::Result<()> = {
                     let _child = child;
                     Err(io::Error::other("injected readiness rejection"))
-                })();
+                };
                 assert!(rejected.is_err());
             } else {
                 if mode == "natural" {
@@ -656,15 +654,14 @@ exit 0
 struct OwnedProcess(std::process::Child);
 impl OwnedProcess {
     fn stop_checked(&mut self) -> std::io::Result<()> {
-        if self.0.try_wait()?.is_none() {
-            if let Err(error) = self.0.kill() {
+        if self.0.try_wait()?.is_none()
+            && let Err(error) = self.0.kill() {
                 // An exit racing the signal is still a checked retirement;
                 // a live original child with a rejected signal is an error.
                 if self.0.try_wait()?.is_none() {
                     return Err(error);
                 }
             }
-        }
         self.0.wait()?;
         Ok(())
     }

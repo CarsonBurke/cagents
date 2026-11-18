@@ -1185,6 +1185,125 @@ fn copy_flushed(reader: &mut impl io::Read, writer: &mut impl io::Write) -> io::
         total += count as u64;
     }
 }
+
+pub fn home() -> Option<&'static PathBuf> {
+    SELECTED.get().and_then(|context| context.home.get())
+}
+pub fn shell() -> Option<&'static str> {
+    SELECTED
+        .get()
+        .and_then(|context| context.shell.get())
+        .map(String::as_str)
+}
+pub fn prepare() -> io::Result<()> {
+    if !is_remote() {
+        return Ok(());
+    }
+    match crate::device_service::request(crate::device_service::Operation::Home) {
+        Ok(crate::device_service::Reply::Home {
+            path,
+            shell,
+            environment,
+        }) => {
+            let _ = SELECTED.get().unwrap().home.set(path);
+            let _ = SELECTED.get().unwrap().environment.set(environment);
+            let _ = SELECTED.get().unwrap().shell.set(shell);
+            Ok(())
+        }
+        Ok(_) => Err(io::Error::other(
+            "remote daemon returned an unexpected device identity",
+        )),
+        Err(_) if selected_daemon_absent() => Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            DaemonNotRunning,
+        )),
+        Err(error) => Err(io::Error::other(
+            format!(
+                "could not connect to device {} (SSH host {}): {error}; verify `ssh {} cagents daemon start` and install matching cagents executables",
+                selected().unwrap().name,
+                selected().unwrap().host,
+                selected().unwrap().host
+            ) + &SELECTED
+                .get()
+                .unwrap()
+                .bridges
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())[usize::from(bridge_no_start())]
+            .as_ref()
+            .and_then(|bridge| {
+                bridge
+                    .transport
+                    .last_error
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone()
+            })
+            .map(|error| format!("; {error}"))
+            .unwrap_or_default(),
+        )),
+    }
+}
+
+#[cfg(any(feature = "ui", feature = "host"))]
+pub fn environment(
+    provider: crate::agent::Provider,
+    persistable: bool,
+) -> std::collections::BTreeMap<String, String> {
+    if persistable {
+        // An older device service may still report the session its daemon
+        // was started inside; that is never this conversation's.
+        SELECTED
+            .get()
+            .and_then(|context| context.environment.get())
+            .and_then(|environment| environment.get(&provider))
+            .map(|environment| {
+                environment
+                    .iter()
+                    .filter(|(name, _)| !crate::agent::is_session_variable(name))
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Default::default()
+    }
+}
+
+/// Save one local connection profile. Provider credentials remain exclusively
+/// with their daemon host; this file contains only SSH routing information.
+pub fn save(device: Device) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    validate(&device)?;
+    let mut devices = list()?;
+    devices.retain(|existing| existing.name != device.name);
+    devices.push(device);
+    devices.sort_by(|a, b| a.name.cmp(&b.name));
+    let path = configuration_path()?;
+    let directory = path
+        .parent()
+        .ok_or_else(|| io::Error::other("configuration has no parent directory"))?;
+    crate::secure_file::prepare_private_directory(directory)?;
+    let temporary = directory.join(format!(".devices-{}.json", uuid::Uuid::new_v4().simple()));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(
+            &serde_json::to_vec_pretty(&Devices { devices }).map_err(io::Error::other)?,
+        )?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        fs::rename(&temporary, &path)?;
+        fs::File::open(directory)?.sync_all()
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
+}
 #[cfg(test)]
 mod tests {
     use super::*;

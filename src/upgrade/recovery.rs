@@ -3683,11 +3683,10 @@ fn commit_archive(
                 file.write_all(&bytes)
                     .and_then(|()| file.as_file().sync_all())
                     .map_err(|e| e.to_string())?;
-                if let Err(error) = file.persist_noclobber(&path) {
-                    if read_checkpoint(&path)?.as_deref() != Some(&bytes) {
+                if let Err(error) = file.persist_noclobber(&path)
+                    && read_checkpoint(&path)?.as_deref() != Some(&bytes) {
                         return Err(error.to_string());
                     }
-                }
                 sync_directory(directory)?;
             }
         }

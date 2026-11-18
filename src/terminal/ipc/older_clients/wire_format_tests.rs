@@ -330,9 +330,7 @@ impl Comparison<'_> {
                 }
                 let appended = new.iter().skip(old.len()).any(|(name, _)| {
                     !self
-                        .restated
-                        .iter()
-                        .any(|restated| *restated == (current, name.as_str()))
+                        .restated.contains(&(current, name.as_str()))
                 });
                 if appended && direction == Direction::Reply && gate.is_none() && selected.is_none()
                 {

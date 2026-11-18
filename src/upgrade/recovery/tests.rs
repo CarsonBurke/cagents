@@ -809,13 +809,13 @@ fn scale_chat(
     super::super::floor::Presentation,
 ) {
     let terminal = &preparation.authority.census.terminals[0];
-    let provider = if index % 3 == 0 {
+    let provider = if index.is_multiple_of(3) {
         crate::agent::Provider::Codex
     } else {
         crate::agent::Provider::Claude
     };
     let mut recipe = terminal.launch.clone();
-    recipe.program = format!("/home/person/.local/bin/{}", provider.executable()).into();
+    recipe.program = format!("/home/person/.local/bin/{}", provider.executable());
     // Eight arguments each provider accepts on an exact resume.
     recipe.arguments = match provider {
         crate::agent::Provider::Codex => [
@@ -956,7 +956,7 @@ fn scale_census(
 /// Long chats hold 400 entries of 1.5 KiB (600 KiB of transcript each);
 /// every tenth chat is short and must keep its whole page.
 fn long_or_short(index: usize) -> (usize, usize) {
-    if index % 10 == 0 {
+    if index.is_multiple_of(10) {
         (6, 200)
     } else {
         (400, 1536)
