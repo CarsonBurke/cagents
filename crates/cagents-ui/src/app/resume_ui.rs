@@ -88,6 +88,9 @@ pub(super) struct Reopening {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ReopenStage {
+    /// The conversation is still stopping after its pane closed. Nothing is
+    /// asked of it until that settles (see [`Cagents::reopen_once_stopped`]).
+    AwaitingStop,
     /// The service is preparing the conversation.
     Preparing,
     /// Preparation failed: the pane says why, and Retry prepares it again.
@@ -560,6 +563,16 @@ fn list(
         }
     }
     !cancel.load(Ordering::Relaxed)
+}
+
+/// The conversation `source` resumed without the service's preparation,
+/// which runs under an identity of its own.
+fn unprepared_resume(mut source: chat::Session) -> chat::Session {
+    source.reset_owned_codex_listener();
+    source.id = TerminalId::new();
+    source.proof = None;
+    source.terminal = None;
+    source
 }
 
 /// How long ago `at` was, as a reader scanning a list wants it: minutes and
@@ -1188,7 +1201,7 @@ impl Cagents {
 
     /// The open pane, other than `except`, that already holds the
     /// conversation of `session`.
-    fn existing_conversation_card(
+    pub(super) fn existing_conversation_card(
         &self,
         session: &chat::Session,
         except: Option<CardId>,
@@ -1215,6 +1228,13 @@ impl Cagents {
             return Task::none();
         }
         self.resume_ui.error = None;
+        // A conversation whose stop was refused is still running: it comes
+        // back attached to that provider, never as a second one beside it,
+        // and its notice goes, however it was reopened.
+        if let Some(refused) = self.refused_close_of(&entry.session) {
+            self.close_resume();
+            return self.reopen_refused_close(refused);
+        }
         // Includes a pane still being reopened for this conversation.
         if let Some(card) = self.existing_conversation_card(&entry.session, None) {
             self.close_resume();
@@ -1230,6 +1250,12 @@ impl Cagents {
         if let Some(task) = self.defer_retiring_conversation(&entry) {
             return task;
         }
+        // A conversation still stopping after its pane closed reopens on a
+        // pane put in place now, which attaches once it has stopped rather
+        // than beside the provider being ended.
+        if let Some(task) = self.reopen_while_closing(&entry) {
+            return task;
+        }
         let session = &entry.session;
         if !session.launch.recipe.working_directory.is_dir()
             && !session.launch.needs_read_only_history()
@@ -1240,13 +1266,7 @@ impl Cagents {
         if session.native_continuity.retains_provider() || unstarted_successor(session) {
             return self.reopen_before_preparation(entry);
         }
-        let mut session = entry.session.clone();
-        // A conversation resumed without the service's preparation runs
-        // under an identity of its own.
-        session.reset_owned_codex_listener();
-        session.id = TerminalId::new();
-        session.proof = None;
-        session.terminal = None;
+        let session = unprepared_resume(entry.session.clone());
         self.place_resumed_conversation(entry, session, None).1
     }
 
@@ -1317,9 +1337,63 @@ impl Cagents {
     }
 
     /// Whether the pane `card` is reopening a conversation the service is
-    /// still preparing.
+    /// still preparing, or that is still stopping after its pane closed.
     pub(super) fn reopen_preparing(&self, card: CardId) -> bool {
-        self.reopen_stage(card) == Some(ReopenStage::Preparing)
+        matches!(
+            self.reopen_stage(card),
+            Some(ReopenStage::AwaitingStop | ReopenStage::Preparing)
+        )
+    }
+
+    /// Whether the pane `card` is reopening a conversation still stopping
+    /// after its pane closed.
+    pub(super) fn reopen_awaits_stop(&self, card: CardId) -> bool {
+        self.reopen_stage(card) == Some(ReopenStage::AwaitingStop)
+    }
+
+    /// Puts the pane of a conversation still stopping after its pane closed
+    /// in place at once, as any reopen does. It starts nothing, and asks
+    /// nothing of the conversation, until the stop settles.
+    pub(super) fn reopen_after_stop(
+        &mut self,
+        entry: SavedConversation,
+    ) -> (CardId, Task<Message>) {
+        self.resume_ui.attempts = self.resume_ui.attempts.wrapping_add(1);
+        let attempt = self.resume_ui.attempts;
+        let session = entry.session.clone();
+        let (card, placed) = self.place_resumed_conversation(entry, session, Some(attempt));
+        if let Some(reopening) = self.resume_ui.reopening.get_mut(&card) {
+            reopening.stage = ReopenStage::AwaitingStop;
+        }
+        (card, placed)
+    }
+
+    /// Goes on with the reopen in `card` once the conversation it waited for
+    /// has stopped, as the reopen would have had nothing been stopping. With
+    /// `still_running`, the stop was refused, and the pane goes back to that
+    /// conversation instead.
+    pub(super) fn reopen_once_stopped(
+        &mut self,
+        card: CardId,
+        still_running: Option<chat::Session>,
+    ) -> Task<Message> {
+        let Some(reopening) = self
+            .resume_ui
+            .reopening
+            .get_mut(&card)
+            .filter(|reopening| reopening.stage == ReopenStage::AwaitingStop)
+        else {
+            return Task::none();
+        };
+        if let Some(session) = still_running {
+            return self.start_reopened(card, session);
+        }
+        let source = reopening.entry.session.clone();
+        if source.native_continuity.retains_provider() || unstarted_successor(&source) {
+            reopening.stage = ReopenStage::Preparing;
+            return self.prepare_reopening(card);
+        }
+        self.start_reopened(card, unprepared_resume(source))
     }
 
     fn reopen_stage(&self, card: CardId) -> Option<ReopenStage> {
@@ -1487,6 +1561,18 @@ impl Cagents {
         }
     }
 
+    /// Answers the preparation the pane `card` is waiting on, as the
+    /// service would.
+    #[cfg(test)]
+    pub(super) fn answer_reopening(
+        &mut self,
+        card: CardId,
+        result: Result<Option<Box<chat::Session>>, String>,
+    ) -> Task<Message> {
+        let attempt = self.resume_ui.reopening[&card].attempt;
+        self.update_resume(Action::Prepared(card, attempt, result))
+    }
+
     /// Puts a pane in place beside `beside` for `session`, as a reopen does
     /// while the service prepares it.
     #[cfg(test)]
@@ -1513,7 +1599,7 @@ impl Cagents {
     /// Opens the conversation `session` in a new pane where it belongs,
     /// returning that pane. With `attempt`, the pane waits for that
     /// preparation and starts nothing yet.
-    fn place_resumed_conversation(
+    pub(super) fn place_resumed_conversation(
         &mut self,
         entry: SavedConversation,
         session: chat::Session,
@@ -1629,7 +1715,7 @@ impl Cagents {
 
     /// Closes the picker and stops indexing. Focus is left to whatever the
     /// caller shows next.
-    fn close_resume(&mut self) {
+    pub(super) fn close_resume(&mut self) {
         if let Some(restore) = self.resume_ui.restore_keyboard_nav.take() {
             self.core.set_keyboard_nav(restore);
         }

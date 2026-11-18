@@ -1,0 +1,533 @@
+//! Closing a chat takes its pane away at once. Stopping the conversation, which
+//! the daemon does by asking its provider to end and proving it gone, belongs
+//! to a job the pane does not wait for: the job holds what the pane closed and
+//! answers for it when the daemon does.
+//!
+//! The window saves each close until the daemon has answered it, so a close
+//! the window did not stay to hear is asked again on its next launch, and a
+//! refusal is still reported then. A close the daemon refuses leaves the
+//! conversation running with no pane, so the refusal is reported with a way
+//! back to it. Its next close is the reader's attempt to deal with what held
+//! it, and so waits on its pane, where a second refusal is shown beside
+//! whatever it can end.
+//!
+//! A conversation reopened while it is stopping gets its pane at once, which
+//! waits to attach until the stop settles, so no pane starts or attaches to a
+//! provider that is being ended.
+use super::*;
+use crate::model::StoppingChat;
+use crate::persistence::SavedConversation;
+
+/// A conversation stopping in the background after its pane closed.
+#[derive(Debug)]
+pub(in crate::app) struct Closing {
+    /// The pane that closed.
+    card: CardId,
+    /// The conversation as its pane closed.
+    session: chat::Session,
+    /// Panes that hold it again while it stops: reopens of it, and the
+    /// closed pane itself when a shared view kept it. Each waits in its
+    /// place, unattached, until the stop settles.
+    reopens: Vec<CardId>,
+}
+
+/// Whether `current` is `closed` with nothing changed but what its provider has
+/// confirmed since: the conversation's identity and how its provider is kept.
+pub(super) fn only_confirms(closed: &chat::Session, current: &chat::Session) -> bool {
+    if closed
+        .launch
+        .session_id
+        .as_ref()
+        .is_some_and(|id| current.launch.session_id.as_ref() != Some(id))
+    {
+        return false;
+    }
+    let mut learned = closed.clone();
+    learned.launch.session_id = current.launch.session_id.clone();
+    learned.learn_native_continuity_from(current);
+    &learned == current
+}
+
+/// Whether two descriptors name one conversation: the same pane identity, or
+/// the same provider conversation.
+fn shares_conversation(a: &chat::Session, b: &chat::Session) -> bool {
+    a.id == b.id
+        || (a.launch.provider == b.launch.provider
+            && a.launch.session_id.is_some()
+            && a.launch.session_id == b.launch.session_id)
+}
+
+impl Cagents {
+    /// Saves what the provider has confirmed about the conversation in `card`
+    /// before it closes, so the closed pane, and anything reopening it,
+    /// resume that conversation rather than the one the card was saved with.
+    pub(super) fn install_closing_identity(&mut self, card: CardId, session: &chat::Session) {
+        let confirms = matches!(
+            self.card_state(card).map(|state| &state.kind),
+            Some(CardKind::Chat(saved)) if saved != session && only_confirms(saved, session)
+        );
+        if confirms {
+            let _ = self.install_chat_session(card, session.clone());
+        }
+    }
+
+    /// Stops the conversation a closed pane held, without the pane.
+    pub(super) fn close_chat_in_background(
+        &mut self,
+        card: CardId,
+        handle: Option<Arc<ClientHandle>>,
+        session: chat::Session,
+        title: String,
+    ) -> Task<Message> {
+        let target = self.chat_ui.next_target(card);
+        self.chat_ui.background_closes.insert(
+            target,
+            Closing {
+                card,
+                session: session.clone(),
+                reopens: Vec::new(),
+            },
+        );
+        // Saved before anything is sent, so a window that closes before the
+        // daemon answers still asks again, and reports, on its next launch.
+        let stopping = &mut Arc::make_mut(&mut self.durable).stopping_chats;
+        stopping.retain(|stopping| stopping.session.id != session.id);
+        stopping.push(StoppingChat {
+            session: session.clone(),
+            card,
+            title,
+            refused: None,
+        });
+        self.persist();
+        ask_to_stop(target, handle, session, false)
+    }
+
+    /// Whether `session` is a conversation the last window closed without
+    /// hearing that it stopped, or whose stop was refused. A pane restoring
+    /// it waits for [`Self::resume_stopping_chats`] instead of attaching.
+    pub(in crate::app) fn awaits_stop(&self, session: &chat::Session) -> bool {
+        self.durable
+            .stopping_chats
+            .iter()
+            .any(|stopping| shares_conversation(&stopping.session, session))
+    }
+
+    /// Asks again to stop each chat the last window closed without hearing
+    /// the daemon's answer, and puts back the refusals it had heard. A pane
+    /// that reopened one before that window closed waits for the answer, as
+    /// it did then, or goes back to the conversation still running.
+    pub(in crate::app) fn resume_stopping_chats(&mut self) -> Task<Message> {
+        let mut tasks = Vec::new();
+        for stopping in self.durable.stopping_chats.clone() {
+            let id = stopping.session.id;
+            let reopened: Vec<_> = self
+                .durable
+                .cards
+                .iter()
+                .filter(|state| {
+                    state.existence.is_open()
+                        && matches!(&state.kind, CardKind::Chat(session)
+                            if shares_conversation(&stopping.session, session))
+                })
+                .map(|state| state.id)
+                .filter(|card| self.awaits_attachment(*card))
+                .collect();
+            if stopping.refused.is_some() {
+                self.chat_ui.close_refused.insert(id);
+                let mut reopened = reopened.into_iter();
+                if let Some(card) = reopened.next() {
+                    tasks.push(self.attach_to_refused_close(card, id));
+                }
+                for card in reopened {
+                    if let Some(session) = self.chat_return_session(card) {
+                        tasks.push(self.open_chat(card, session, chat::Intent::Restore));
+                    }
+                }
+                continue;
+            }
+            let asked = self
+                .chat_ui
+                .background_closes
+                .values()
+                .any(|closing| closing.session.id == id);
+            if asked {
+                continue;
+            }
+            let target = self.chat_ui.next_target(stopping.card);
+            let reopens = reopened;
+            self.chat_ui.background_closes.insert(
+                target,
+                Closing {
+                    card: stopping.card,
+                    session: stopping.session.clone(),
+                    reopens,
+                },
+            );
+            tasks.push(ask_to_stop(target, None, stopping.session, true));
+        }
+        Task::batch(tasks)
+    }
+
+    /// The daemon's answer to a background close.
+    pub(super) fn background_close_finished(
+        &mut self,
+        target: Target,
+        result: Result<(), String>,
+    ) -> Task<Message> {
+        let Some(closing) = self.chat_ui.background_closes.remove(&target) else {
+            return Task::none();
+        };
+        let id = closing.session.id;
+        let durable = Arc::make_mut(&mut self.durable);
+        let refused = match result {
+            Ok(()) => {
+                self.chat_ui.close_refused.remove(&id);
+                durable
+                    .stopping_chats
+                    .retain(|stopping| stopping.session.id != id);
+                None
+            }
+            Err(reason) => {
+                tracing::warn!(%reason, "the daemon refused a closed chat's close");
+                self.chat_ui.close_refused.insert(id);
+                if let Some(stopping) = durable
+                    .stopping_chats
+                    .iter_mut()
+                    .find(|stopping| stopping.session.id == id)
+                {
+                    stopping.refused = Some(reason.clone());
+                }
+                Some(reason)
+            }
+        };
+        self.persist();
+        if self.exit.is_some() {
+            // Nothing reopens on the way out. A refusal heard now is saved,
+            // and reported when the window next opens.
+            if self.chat_ui.background_closes.is_empty() {
+                return self.advance_exit(|exit| exit.chats_closed = true);
+            }
+            return Task::none();
+        }
+        let mut tasks = Vec::new();
+        for card in closing.reopens {
+            if self.reopen_awaits_stop(card) {
+                // A refused stop leaves the conversation running: the reopen
+                // goes back to it, its notice going with that.
+                let still_running = refused.as_ref().map(|_| {
+                    self.take_refusal_to_show(id)
+                        .unwrap_or_else(|| closing.session.clone())
+                });
+                tasks.push(self.reopen_once_stopped(card, still_running));
+                continue;
+            }
+            if !self.awaits_attachment(card) {
+                continue;
+            }
+            tasks.push(match &refused {
+                // The closed pane itself, back because a shared view kept it,
+                // holds what that view knows of the conversation now.
+                Some(_) if card == closing.card => self.restore_refused_in_place(card, id),
+                // The conversation is still running, so the pane goes back
+                // to it, and says why it could not be stopped.
+                Some(_) => self.attach_to_refused_close(card, id),
+                // The closed pane itself, back only because a shared view
+                // kept it, goes as it was asked to now that nothing runs.
+                None if card == closing.card => {
+                    self.remove_chat_card(card, None).unwrap_or_else(Task::none)
+                }
+                None => match self.chat_return_session(card) {
+                    Some(session) => self.open_chat(card, session, chat::Intent::Restore),
+                    None => Task::none(),
+                },
+            });
+        }
+        Task::batch(tasks)
+    }
+
+    /// Whether `card` is an open chat pane that has not yet attached to
+    /// anything, as a reopen held behind a stopping conversation is.
+    fn awaits_attachment(&self, card: CardId) -> bool {
+        !self.cards.contains_key(&card)
+            && self.card_state(card).is_some_and(|state| {
+                state.existence.is_open() && matches!(state.kind, CardKind::Chat(_))
+            })
+    }
+
+    /// Reopens a conversation that is still stopping: its pane is put in
+    /// place now and goes on with the reopen once the stop settles. `None`
+    /// when the conversation is not stopping.
+    pub(in crate::app) fn reopen_while_closing(
+        &mut self,
+        entry: &SavedConversation,
+    ) -> Option<Task<Message>> {
+        let target = self
+            .chat_ui
+            .background_closes
+            .iter()
+            .find(|(_, closing)| shares_conversation(&closing.session, &entry.session))
+            .map(|(target, _)| *target)?;
+        let (card, placed) = self.reopen_after_stop(entry.clone());
+        if let Some(closing) = self.chat_ui.background_closes.get_mut(&target) {
+            closing.reopens.push(card);
+        }
+        Some(placed)
+    }
+
+    /// Whether `card` is a reopen waiting, unattached, for its conversation to
+    /// stop. Nothing else may attach it meanwhile.
+    pub(in crate::app) fn holds_reopen(&self, card: CardId) -> bool {
+        self.reopen_awaits_stop(card)
+            || self
+                .chat_ui
+                .background_closes
+                .values()
+                .any(|closing| closing.reopens.contains(&card))
+    }
+
+    /// Gives up the reopen held in `card`, which is closing.
+    pub(super) fn release_held_reopen(&mut self, card: CardId) {
+        for closing in self.chat_ui.background_closes.values_mut() {
+            closing.reopens.retain(|held| *held != card);
+        }
+    }
+
+    /// Whether `session`'s conversation is stopping after its pane closed, or
+    /// its stop was refused.
+    pub(in crate::app) fn has_background_close(&self, session: &chat::Session) -> bool {
+        self.refused_close_of(session).is_some()
+            || self
+                .chat_ui
+                .background_closes
+                .values()
+                .any(|closing| shares_conversation(&closing.session, session))
+    }
+
+    /// Attaches a chat pane a shared view put in the strip. One whose
+    /// conversation is still stopping waits, unattached, for the stop to
+    /// settle, as a reopen does; one whose stop was refused goes back to the
+    /// conversation still running, and says why. A closed pane comes back so
+    /// when the view refuses its removal.
+    pub(in crate::app) fn attach_shared_chat(
+        &mut self,
+        card: CardId,
+        session: chat::Session,
+    ) -> Task<Message> {
+        if let Some(id) = self.refused_close_of(&session) {
+            return self.restore_refused_in_place(card, id);
+        }
+        let target = self
+            .chat_ui
+            .background_closes
+            .iter()
+            .find(|(_, closing)| shares_conversation(&closing.session, &session))
+            .map(|(target, _)| *target);
+        let Some(target) = target else {
+            return self.open_chat(card, session, chat::Intent::Restore);
+        };
+        if let Some(closing) = self.chat_ui.background_closes.get_mut(&target)
+            && !closing.reopens.contains(&card)
+        {
+            closing.reopens.push(card);
+        }
+        // It waits unattached, as a held reopen does.
+        self.cards.remove(&card);
+        Task::none()
+    }
+
+    /// Puts a pane that holds the conversation whose stop was refused back on
+    /// it, as the pane now has it, saying why it could not be stopped.
+    fn restore_refused_in_place(&mut self, card: CardId, id: TerminalId) -> Task<Message> {
+        let Some(session) = self.chat_return_session(card) else {
+            return Task::none();
+        };
+        let _ = self.take_refusal_to_show(id);
+        self.open_chat(card, session, chat::Intent::Restore)
+    }
+
+    /// Takes a refused close out of the window's notices to show on the pane
+    /// that goes back to its conversation, returning that conversation.
+    fn take_refusal_to_show(&mut self, id: TerminalId) -> Option<chat::Session> {
+        let (failure, reason) = self.take_close_failure(id)?;
+        self.chat_ui.refusals_to_show.insert(id, reason);
+        Some(failure.session)
+    }
+
+    /// Whether a refused conversation reopening on a new pane should attach to
+    /// the provider the daemon kept for it rather than start another.
+    pub(super) fn reopens_refused_close(&self, session: &chat::Session) -> bool {
+        self.chat_ui.refusals_to_show.contains_key(&session.id)
+    }
+
+    /// Shows a refused close on the pane its conversation reopened on.
+    pub(super) fn show_refusal_on_reopen(&mut self, card: CardId) -> Task<Message> {
+        let Some(session) = self.chat_return_session(card) else {
+            return Task::none();
+        };
+        let Some(reason) = self.chat_ui.refusals_to_show.remove(&session.id) else {
+            return Task::none();
+        };
+        self.refuse_chat_close(card, session, reason)
+    }
+
+    /// The refused close of the conversation `session` reopens, if any.
+    pub(in crate::app) fn refused_close_of(&self, session: &chat::Session) -> Option<TerminalId> {
+        self.durable
+            .stopping_chats
+            .iter()
+            .find(|stopping| {
+                stopping.refused.is_some() && shares_conversation(&stopping.session, session)
+            })
+            .map(|stopping| stopping.session.id)
+    }
+
+    /// Takes a refused close out of the window's notices, returning it.
+    fn take_close_failure(&mut self, id: TerminalId) -> Option<(StoppingChat, String)> {
+        let stopping = &mut Arc::make_mut(&mut self.durable).stopping_chats;
+        let index = stopping
+            .iter()
+            .position(|stopping| stopping.session.id == id && stopping.refused.is_some())?;
+        let mut failure = stopping.remove(index);
+        self.persist();
+        let reason = failure.refused.take().unwrap_or_default();
+        Some((failure, reason))
+    }
+
+    /// Puts a held pane back on the conversation whose stop was refused.
+    fn attach_to_refused_close(&mut self, card: CardId, id: TerminalId) -> Task<Message> {
+        let Some(session) = self
+            .take_refusal_to_show(id)
+            .or_else(|| self.chat_return_session(card))
+        else {
+            return Task::none();
+        };
+        let _ = self.install_chat_session(card, session.clone());
+        self.persist();
+        self.open_chat(card, session, chat::Intent::Restore)
+    }
+
+    /// Reopens a conversation whose stop was refused, attached to the provider
+    /// still running it, on a pane that says why it could not be stopped. A
+    /// conversation already open is brought into view instead.
+    pub(in crate::app) fn reopen_refused_close(&mut self, id: TerminalId) -> Task<Message> {
+        let Some((failure, reason)) = self.take_close_failure(id) else {
+            return Task::none();
+        };
+        if let Some(card) = self.existing_conversation_card(&failure.session, None) {
+            return cosmic::task::message(Message::FocusCard(card));
+        }
+        self.chat_ui.refusals_to_show.insert(id, reason);
+        // It comes back where it closed, as it closed, with what it had not
+        // sent.
+        let session = failure.session.clone();
+        let entry = SavedConversation {
+            card: failure.card,
+            title: failure.title,
+            session: failure.session,
+            open: false,
+            updated_at_unix_ms: 0,
+        };
+        self.place_resumed_conversation(entry, session, None).1
+    }
+
+    pub(super) fn dismiss_close_failure(&mut self, id: TerminalId) {
+        let _ = self.take_close_failure(id);
+    }
+
+    fn close_failures(&self) -> impl Iterator<Item = (&StoppingChat, &str)> {
+        self.durable
+            .stopping_chats
+            .iter()
+            .filter_map(|stopping| Some((stopping, stopping.refused.as_deref()?)))
+    }
+
+    pub(in crate::app) fn has_close_failure_notices(&self) -> bool {
+        self.close_failures().next().is_some()
+    }
+
+    /// Each refused close, in the application notices, with the way back to
+    /// the conversation it left running.
+    pub(in crate::app) fn close_failure_notice_views(&self) -> Vec<Element<'_, Message>> {
+        let severity = NoticeSeverity::Error;
+        self.close_failures()
+            .map(|(failure, reason)| {
+                let id = failure.session.id;
+                let actions = widget::row::with_children(vec![
+                    notice_surface_action(
+                        severity,
+                        "Reopen",
+                        "Reopen the conversation that couldn't be stopped",
+                        widget::Id::new(format!("chat-close-failure.reopen.{id}")),
+                        Message::ChatUi(Action::ReopenRefusedClose(id)),
+                    ),
+                    notice_surface_action(
+                        severity,
+                        "Dismiss",
+                        "Dismiss application notice",
+                        widget::Id::new(format!("chat-close-failure.dismiss.{id}")),
+                        Message::ChatUi(Action::DismissCloseFailure(id)),
+                    ),
+                ])
+                .spacing(space::XS)
+                .align_y(Alignment::Center);
+                notice_surface(
+                    severity,
+                    widget::column::with_children(vec![
+                        notice_body(close_failure_message(&failure.title)),
+                        notice_surface_details(severity, reason),
+                    ])
+                    .spacing(space::XS)
+                    .width(Length::Fill)
+                    .into(),
+                    Some(actions.into()),
+                    false,
+                )
+            })
+            .collect()
+    }
+}
+
+/// Sends the daemon a closed chat's stop, answered by `Action::Retired`. One
+/// asked again at launch first brings up the daemon the launch would start
+/// anyway, so its absence is not taken for a refusal.
+fn ask_to_stop(
+    target: Target,
+    handle: Option<Arc<ClientHandle>>,
+    session: chat::Session,
+    at_launch: bool,
+) -> Task<Message> {
+    cosmic::task::future(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            if at_launch {
+                crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
+            }
+            close_conversation(handle, Some(session))
+        })
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result);
+        Message::ChatUi(Action::Retired(target, result))
+    })
+}
+
+/// What a refused close's notice says.
+pub(in crate::app) fn close_failure_message(title: &str) -> String {
+    let name = if title.is_empty() {
+        "A closed chat".to_owned()
+    } else {
+        format!("“{title}”")
+    };
+    format!("{name} is still running: its pane closed, but Cagents couldn't stop it.")
+}
+
+#[cfg(test)]
+impl Cagents {
+    /// The close stopping `card`'s conversation in the background, if any.
+    pub(in crate::app) fn background_close_for_test(&self, card: CardId) -> Option<Target> {
+        self.chat_ui
+            .background_closes
+            .keys()
+            .copied()
+            .find(|target| target.card == card)
+    }
+}

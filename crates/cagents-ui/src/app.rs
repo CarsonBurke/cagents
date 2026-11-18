@@ -5233,6 +5233,8 @@ pub enum Message {
     SessionSaveHealthChanged(SessionSaveHealthEvent),
     Lsp(LspEvent),
     LanguageServersReaped,
+    /// The exit stopped waiting for chats closed before it to stop.
+    ExitChatClosesTimedOut,
     RetrySessionSave,
     RetrySharedViewSeeds,
     SessionRecovery(session_recovery::Action),
@@ -5268,11 +5270,14 @@ struct ApplicationExit {
     /// The window the exit closed, until iced reports it gone.
     closing: Option<window::Id>,
     servers_reaped: bool,
+    /// Every chat closed before the exit has been stopped, or the exit gave up
+    /// waiting for the daemon to say so.
+    chats_closed: bool,
 }
 
 impl ApplicationExit {
     fn is_complete(self) -> bool {
-        self.closing.is_none() && self.servers_reaped
+        self.closing.is_none() && self.servers_reaped && self.chats_closed
     }
 }
 
@@ -5972,6 +5977,17 @@ pub struct Cagents {
     queued_card_closes: VecDeque<terminal_close::QueuedCardClose>,
     /// The ended pane whose terminal the daemon is being asked to release.
     completed_release: Option<CardId>,
+    /// Terminal panes hidden from the strip while the daemon is asked to
+    /// close their terminals. Each comes back if its close doesn't complete.
+    /// The strip's own record is lost when it is rebuilt; this one is not.
+    hidden_closes: HashSet<CardId>,
+    /// The daemon's answer for a hidden pane's close that has something to
+    /// ask or report, held while another dialog is open so the two never
+    /// open together.
+    held_close_answer: Option<terminal_close::HeldCloseAnswer>,
+    /// The strip's change in bringing hidden panes back, applied at the end
+    /// of the update.
+    kept_panes: Vec<crate::workspace::ViewportUpdate>,
     close_queue_advancing: bool,
     /// The pending removal whose commit has been delivered, so anything still
     /// holding it is one of the closes the commit started.
@@ -6066,6 +6082,11 @@ impl Cagents {
     }
 
     fn focus_workspace_card(&mut self, id: CardId) -> Task<Message> {
+        // A pane hidden while it closes is gone as far as the reader knows;
+        // asking for it does nothing, as asking for any closed pane does.
+        if self.workspace.is_hidden(id) {
+            return Task::none();
+        }
         match self.workspace.focus(id) {
             Ok(update) => self.apply_viewport(update, true, DurableChange::None),
             Err(error) => {
@@ -6480,6 +6501,12 @@ impl Cagents {
                         // Show saved text without admitting provider effects
                         // from a cached shared descriptor.
                         self.await_shared_chat_admission(card.id, session);
+                        continue;
+                    }
+                    // A conversation the last window was still stopping
+                    // when it closed, or failed to, attaches once the launch
+                    // has asked again (see `resume_stopping_chats`).
+                    if self.awaits_stop(&session) {
                         continue;
                     }
                     // Whether this is an attach, a daemon-proven upgrade
@@ -8943,7 +8970,7 @@ impl Cagents {
         }
         let Some(card) = self
             .card_state(id)
-            .filter(|card| card.existence.is_open())
+            .filter(|card| card.existence.is_open() && !self.workspace.is_hidden(id))
             .cloned()
         else {
             return Task::none();
@@ -10505,7 +10532,8 @@ impl Cagents {
             && !self.focused_repository_is_saving()
             && let Some(backwards) = crate::tab_history::step_direction(&event)
         {
-            let available: Vec<_> = self.workspace.order().collect();
+            // A pane hidden while it closes is not a place to step to.
+            let available: Vec<_> = self.workspace.shown().collect();
             self.tab_history.retain(|id| {
                 self.durable
                     .cards
@@ -11148,6 +11176,7 @@ impl Cagents {
         self.settings_blur_pending()
             || !self.queued_card_closes.is_empty()
             || self.workspace.pending_close().is_some()
+            || !self.kept_panes.is_empty()
     }
 
     /// What a lifecycle sweep's update projects: what the sweep changed,
@@ -14747,18 +14776,32 @@ impl Cagents {
             Message::LanguageServersReaped
         });
         let close = self.close_main_window();
+        // A chat closed just before leaves while its conversation stops. The
+        // process stays to hear the daemon's answer only as long as it would
+        // wait for its window anyway: the close is saved, so an answer it
+        // does not hear is asked for again, and reported, at the next launch.
+        let chats_closed = !self.chat_ui.closing_in_background();
         self.exit = Some(ApplicationExit {
             closing: close.as_ref().map(|(window, _)| *window),
             servers_reaped: false,
+            chats_closed,
         });
+        let chats = if chats_closed {
+            Task::none()
+        } else {
+            cosmic::task::future(async move {
+                tokio::time::sleep(EXIT_WINDOW_CLOSE_TIMEOUT).await;
+                Message::ExitChatClosesTimedOut
+            })
+        };
         let Some((window, close)) = close else {
-            return reap;
+            return Task::batch([reap, chats]);
         };
         let close_timeout = cosmic::task::future(async move {
             tokio::time::sleep(EXIT_WINDOW_CLOSE_TIMEOUT).await;
             Message::WindowClosed(window)
         });
-        Task::batch([close, reap, close_timeout])
+        Task::batch([close, reap, close_timeout, chats])
     }
 
     /// Records one half of the exit and ends the process once both are done.
@@ -16250,6 +16293,9 @@ impl Application for Cagents {
             close_commit_delivered: None,
             terminal_close_attempts: HashSet::new(),
             completed_release: None,
+            hidden_closes: HashSet::new(),
+            held_close_answer: None,
+            kept_panes: Vec::new(),
             terminal_close_generation: 0,
             closed_terminal_cards: HashSet::new(),
             proven_gone_cards: HashSet::new(),
@@ -17389,6 +17435,7 @@ impl Cagents {
                 self.status = Some(TransientNotice::warning(
                     "An update is being prepared, so the pane was kept. Close it again if the update doesn't go ahead.",
                 ));
+                return ControlFlow::Break(self.return_kept_panes());
             }
             return ControlFlow::Break(Task::none());
         }
@@ -18036,7 +18083,9 @@ impl Cagents {
                 // The workspace is on screen: a daemon startup notice has
                 // nothing left to explain.
                 instance::dismiss_startup_wait_notice();
-                let report = self.begin_startup_gate();
+                // Chats the last window closed without hearing whether they
+                // stopped are asked about again, and its refusals reported.
+                let report = Task::batch([self.begin_startup_gate(), self.resume_stopping_chats()]);
                 // window::run silently drops callbacks for windows that have not
                 // opened yet. Initialize only after iced acknowledges this one.
                 #[cfg(feature = "integrated-browser")]
@@ -19400,6 +19449,14 @@ impl Cagents {
                 Task::none()
             }
             Message::LanguageServersReaped => self.advance_exit(|exit| exit.servers_reaped = true),
+            Message::ExitChatClosesTimedOut => {
+                if self.exit.is_some_and(|exit| !exit.chats_closed) {
+                    tracing::warn!(
+                        "exiting before the daemon confirmed every closed chat stopped; the next launch asks again"
+                    );
+                }
+                self.advance_exit(|exit| exit.chats_closed = true)
+            }
             Message::WindowClosed(window) => self.advance_exit(|exit| {
                 if exit.closing == Some(window) {
                     exit.closing = None;
