@@ -348,6 +348,18 @@ fn coalesced_repository_loads_leave_what_a_complete_reconciliation_leaves() {
         )
         .expect("its channel is introduced");
     assert!(opened < created, "a channel's project is opened before it");
+    // The load opens the project; until its receipt arrives the registry's
+    // model still lacks it, so the pass that republishes its channel opens
+    // it once more. `OpenProject` is an upsert, so the second commits nothing.
+    assert_eq!(
+        coalesced
+            .published
+            .iter()
+            .filter(|edit| matches!(edit, ModelEdit::OpenProject { repository, .. } if *repository == unknown))
+            .count(),
+        2,
+        "once by the load, once ahead of its channel in the shared pass"
+    );
     assert!(
         !coalesced.published.iter().any(|edit| matches!(edit,
             ModelEdit::OpenProject { repository, .. } if *repository != unknown)),

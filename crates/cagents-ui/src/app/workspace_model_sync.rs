@@ -3109,8 +3109,10 @@ impl Cagents {
     /// replaced, its successor never received those opens, so they are sent
     /// here for every project a load has opened. A project still loading opens
     /// itself when its load lands, against the successor's model. A project
-    /// the successor tombstoned closes instead, and one whose checkout a later
-    /// read could not reach is not opened anywhere it is missing.
+    /// the successor tombstoned closes instead, or, if the user is reopening
+    /// it, sends its own `ReopenProject`, which a plain open would only be
+    /// refused ahead of. One whose checkout a later read could not reach is
+    /// not opened anywhere it is missing.
     fn introduce_open_projects(&mut self, model: &WorkspaceModel, opened: &mut HashSet<PathBuf>) {
         let unknown = self
             .sidebar_model
@@ -9130,6 +9132,11 @@ mod tests {
             }
             if name == "closed" {
                 app.project_ui.closed.insert(repository.clone());
+            }
+            if name == "tombstoned" {
+                // Being reopened, so the successor's tombstone does not close
+                // it: only the tombstone itself keeps a plain open from going.
+                app.project_ui.reopening.insert(row.id, repository.clone());
             }
             app.sidebar_model.projects.push(row);
             repository
