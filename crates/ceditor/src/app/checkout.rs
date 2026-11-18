@@ -279,11 +279,11 @@ impl Editor {
                         })
                         .and_then(|r| r.request.as_ref())
                         .map(|r| r.destination.clone())
-                    {
-                        self.checkout_history_open = false;
-                        self.selection_epoch = self.selection_epoch.wrapping_add(1);
-                        return Self::open(path, self.selection_epoch);
-                    }
+                {
+                    self.checkout_history_open = false;
+                    self.selection_epoch = self.selection_epoch.wrapping_add(1);
+                    return Self::open(path, self.selection_epoch);
+                }
             }
             Action::Open(path) => {
                 if self.checkout_dialog.as_ref().is_some_and(|d| {

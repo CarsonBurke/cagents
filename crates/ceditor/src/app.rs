@@ -1408,12 +1408,13 @@ impl Editor {
 
     fn add(&mut self, opened: Opened, focus: bool) -> Task<Message> {
         if let Some(file) = &opened.file
-            && let Some(owner) = self.file_owner(&opened.root.join(file)) {
-                if focus && !self.modal_open() {
-                    self.active = Some(owner);
-                }
-                return self.resume_pending_files();
+            && let Some(owner) = self.file_owner(&opened.root.join(file))
+        {
+            if focus && !self.modal_open() {
+                self.active = Some(owner);
             }
+            return self.resume_pending_files();
+        }
         let id = CardId::new();
         let project = ProjectId::new();
         let worktree = WorktreeId::new();
@@ -1507,9 +1508,9 @@ impl Editor {
                 .saved_session
                 .expanded_directories
                 .get(&key.canonical_path.display().to_string())
-            {
-                navigation.restore_expanded_display_paths(paths);
-            }
+        {
+            navigation.restore_expanded_display_paths(paths);
+        }
         let task = repository_task(runtime.initial_load(id));
         let mut review = pull_request_review::State::new(
             Arc::new(GitHubService::system("gh")),
@@ -2322,14 +2323,12 @@ impl Editor {
             .width(420)
             .into()
         });
-        Some(
-            popover(
-                anchor,
-                content,
-                widget::popover::Position::Bottom,
-                Message::CloseNotices,
-            ),
-        )
+        Some(popover(
+            anchor,
+            content,
+            widget::popover::Position::Bottom,
+            Message::CloseNotices,
+        ))
     }
 
     fn appearance(&mut self) -> Task<Message> {
@@ -3494,9 +3493,10 @@ impl Application for Editor {
                         let untitled = self.tab(id).is_some_and(|tab| self.tab_is_untitled(tab));
                         if untitled {
                             if let Some(tab) = self.tab_mut(id)
-                                && tab.mutation.is_none() {
-                                    let _ = tab.runtime.abandon_unsaved_changes();
-                                }
+                                && tab.mutation.is_none()
+                            {
+                                let _ = tab.runtime.abandon_unsaved_changes();
+                            }
                             self.close_confirmed = true;
                             return self.request_close(id);
                         }
@@ -3580,7 +3580,8 @@ impl Application for Editor {
                         ..
                     } = &action
                         && self
-                            .tab(identity.card).is_none_or(|tab| tab.review.annotation_revision() != *review_revision)
+                            .tab(identity.card)
+                            .is_none_or(|tab| tab.review.annotation_revision() != *review_revision)
                     {
                         return Task::none();
                     }
@@ -3594,9 +3595,10 @@ impl Application for Editor {
                         return Task::none();
                     }
                     if let RepositoryAction::Save { card, .. } = &action
-                        && self.tab(*card).is_some_and(|tab| self.tab_is_untitled(tab)) {
-                            return self.save_as(*card);
-                        }
+                        && self.tab(*card).is_some_and(|tab| self.tab_is_untitled(tab))
+                    {
+                        return self.save_as(*card);
+                    }
                     if let RepositoryAction::DirectorySearchLoaded {
                         generation,
                         query,
@@ -3729,21 +3731,21 @@ impl Application for Editor {
                     {
                         tasks.push(repository_task(tab.runtime.preview_fragment(id, &fragment)));
                     }
-                    if listing_changed && !tab.git
-                        && let Some(key) = tab.navigation.active_worktree().cloned() {
-                            let search = tab
-                                .sidebar
-                                .source_control
-                                .as_ref()
-                                .map(|source| source.file_search.clone())
-                                .unwrap_or_default();
-                            let mut model = SourceControlModel::directory_listing(
-                                key,
-                                tab.runtime.listed_files(),
-                            );
-                            model.set_file_search(search);
-                            tab.sidebar.source_control = Some(model);
-                        }
+                    if listing_changed
+                        && !tab.git
+                        && let Some(key) = tab.navigation.active_worktree().cloned()
+                    {
+                        let search = tab
+                            .sidebar
+                            .source_control
+                            .as_ref()
+                            .map(|source| source.file_search.clone())
+                            .unwrap_or_default();
+                        let mut model =
+                            SourceControlModel::directory_listing(key, tab.runtime.listed_files());
+                        model.set_file_search(search);
+                        tab.sidebar.source_control = Some(model);
+                    }
                     if back_to_files && tab.runtime.selected_path().is_none() {
                         tab.owned_file = None;
                         tab.pending_file = None;
@@ -4055,11 +4057,12 @@ impl Application for Editor {
                             }
                             if open {
                                 if !query.trim().is_empty()
-                                    && let Some(source) = tab.sidebar.source_control.as_mut() {
-                                        source.set_file_search(FileSearch::Pending {
-                                            query: query.clone(),
-                                        });
-                                    }
+                                    && let Some(source) = tab.sidebar.source_control.as_mut()
+                                {
+                                    source.set_file_search(FileSearch::Pending {
+                                        query: query.clone(),
+                                    });
+                                }
                                 let search = if query.trim().is_empty() {
                                     Task::none()
                                 } else {
@@ -4622,12 +4625,12 @@ impl Application for Editor {
                     }
                     if let Some(tab) = self.tab_mut(id)
                         && tab.completions.get(index) == Some(&target)
-                            && tab.runtime.apply_completion_target(id, &target)
-                        {
-                            tab.completions.clear();
-                            let focus = tab.runtime.focus_editor(id).map(cosmic::Action::App);
-                            return Task::batch([self.drain(id), focus]);
-                        }
+                        && tab.runtime.apply_completion_target(id, &target)
+                    {
+                        tab.completions.clear();
+                        let focus = tab.runtime.focus_editor(id).map(cosmic::Action::App);
+                        return Task::batch([self.drain(id), focus]);
+                    }
                     self.drain(id)
                 }
                 Message::Jump(id, at) => {
@@ -4841,16 +4844,14 @@ impl Application for Editor {
                 );
             }
             if tab.runtime.lsp_document().is_some() {
-                toolbar_controls.push(
-                    toolbar_actions(vec![
-                        icon_button(Icon::InsertText, "Complete (Ctrl+Space)")
-                            .on_press_maybe((!self.modal_open()).then_some(Message::Complete))
-                            .into(),
-                        icon_button(Icon::Info, "Show symbol information")
-                            .on_press_maybe((!self.modal_open()).then_some(Message::Hover))
-                            .into(),
-                    ]),
-                );
+                toolbar_controls.push(toolbar_actions(vec![
+                    icon_button(Icon::InsertText, "Complete (Ctrl+Space)")
+                        .on_press_maybe((!self.modal_open()).then_some(Message::Complete))
+                        .into(),
+                    icon_button(Icon::Info, "Show symbol information")
+                        .on_press_maybe((!self.modal_open()).then_some(Message::Hover))
+                        .into(),
+                ]));
             }
             toolbar_controls.push(
                 icon_button(Icon::Search, "Find in file (Ctrl+F)")
@@ -6203,9 +6204,11 @@ mod tests {
                         run_tasks(&mut app, task);
                     }
                     _ => {
-                        let task = app.update(Message::Checkout(
-                            checkout::Action::ExistingFinished(id, Ok(Box::new(completed_receipt.unwrap()))),
-                        ));
+                        let task =
+                            app.update(Message::Checkout(checkout::Action::ExistingFinished(
+                                id,
+                                Ok(Box::new(completed_receipt.unwrap())),
+                            )));
                         run_tasks(&mut app, task);
                     }
                 }
@@ -9411,10 +9414,7 @@ mod tests {
             "first note\n"
         );
         assert!(app.tab(id).is_some(), "the tab now shows a different note");
-        assert_eq!(
-            std::fs::read_to_string(&second).unwrap(),
-            "second note\n"
-        );
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "second note\n");
     }
 
     #[test]
@@ -9469,7 +9469,11 @@ mod tests {
 
         drop(app.update(Message::CloseWindow));
         assert_eq!(app.closing, Some(dirty));
-        assert_eq!(app.tabs.len(), 2, "no tab closes before every tab is settled");
+        assert_eq!(
+            app.tabs.len(),
+            2,
+            "no tab closes before every tab is settled"
+        );
 
         drop(app.update(Message::CancelClose));
         assert!(!app.exiting);

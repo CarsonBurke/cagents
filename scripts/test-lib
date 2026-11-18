@@ -176,7 +176,7 @@ def main():
         sys.exit(status)
     lane = tomllib.loads((ROOT / "mise.toml").read_text())["vars"][CHECKED_AS[args.lane]].split()
     sys.stdout.flush()
-    os.execv(ROOT / "scripts/cargo-lane", [str(ROOT / "scripts/cargo-lane"), "check", *lane, "--lib", "--bins", "--examples"])
+    os.execv(ROOT / "scripts/cargo-lane", [str(ROOT / "scripts/cargo-lane"), "clippy", *lane, "--lib", "--bins", "--examples"])
 
 
 def terminal():

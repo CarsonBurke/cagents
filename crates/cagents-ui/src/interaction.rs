@@ -1888,17 +1888,19 @@ impl<Message> Widget<Message, Theme, Renderer> for OverflowFade<'_, Message> {
             viewport,
         );
         let mut state = *tree.state.downcast_ref::<OverflowState>();
-        if self.headers
-            && let Some(room) = state.header_room
-        {
-            state.start = state.start.min(room);
+        if self.headers {
+            // One statement rather than a nested `if`: without the test probe
+            // below, Clippy would collapse the two and move the probe out.
+            state.start = state
+                .header_room
+                .map_or(state.start, |room| state.start.min(room));
+            #[cfg(test)]
+            TOP_FADES.with(|fades| {
+                if let Some(fades) = fades.borrow_mut().as_mut() {
+                    fades.push(state.start);
+                }
+            });
         }
-        #[cfg(test)]
-        TOP_FADES.with(|fades| {
-            if let Some(fades) = fades.borrow_mut().as_mut() {
-                fades.push(state.start);
-            }
-        });
         if state.start <= 0.0 && state.end <= 0.0 {
             return;
         }

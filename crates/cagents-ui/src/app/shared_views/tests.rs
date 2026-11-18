@@ -5066,7 +5066,7 @@ fn batched_projection_preserves_large_workspace_history_and_pending_starts() {
     let terminal = fresh_terminal_session(LaunchRecipe::shell(paths[0].clone()).unwrap());
     let durable = Arc::make_mut(&mut app.durable);
     durable.cards.clear();
-    for (index, path) in paths.iter().enumerate().take(1024) {
+    for (index, path) in paths[..1024].iter().enumerate() {
         let id = CardId::new();
         let existence = if index < 172 {
             Existence::Open

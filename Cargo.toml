@@ -4,10 +4,11 @@ members = [".", "crates/cagents-ui", "crates/ceditor", "crates/browser-import", 
 default-members = ["."]
 resolver = "3"
 
-# Clippy's default lints apply to every workspace crate; `mise run check`
-# runs Clippy and fails on any warning. These two count shapes rather than
-# find defects: handlers take their state explicitly, and spelling out a
-# nested type is often clearer than an alias used once.
+# Clippy's default lints apply to every workspace crate. The check tasks and
+# main's build sentinel run Clippy on the crates each lane builds and fail on
+# any warning. These two count shapes rather than find defects: handlers take
+# their state explicitly, and spelling out a nested type is often clearer than
+# an alias used once.
 [workspace.lints.clippy]
 too_many_arguments = "allow"
 type_complexity = "allow"

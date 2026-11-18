@@ -1395,7 +1395,7 @@ impl Store {
             &self.directory.join(LOCK_NAME),
             libc::LOCK_EX | libc::LOCK_NB,
         )
-        .map_err(|error| ListHeld::Registry.from_flock(error))
+        .map_err(|error| ListHeld::Registry.flock_error(error))
     }
 
     #[cfg(feature = "host")]

@@ -332,7 +332,7 @@ pub(super) fn admit(host: &SharedHost, request: &ClientRequest) -> Result<(), Pr
                 let owned = super::chat::has_native_owner(replacement)?;
                 guard = host.lock().unwrap_or_else(|p| p.into_inner());
                 state = &mut guard;
-                let admitted = !owned && !held_by_recovery(&state, replacement.id);
+                let admitted = !owned && !held_by_recovery(state, replacement.id);
                 if admitted {
                     state.recovery_independence.insert(replacement.id);
                 }
@@ -346,7 +346,7 @@ pub(super) fn admit(host: &SharedHost, request: &ClientRequest) -> Result<(), Pr
             state = &mut guard;
             // Recovery cannot adopt this identity between the two checks: it
             // adopts only what its checkpoint and holders already name.
-            let admitted = fresh && !held_by_recovery(&state, session.id);
+            let admitted = fresh && !held_by_recovery(state, session.id);
             if admitted {
                 state.recovery_independence.insert(session.id);
             }
@@ -358,7 +358,7 @@ pub(super) fn admit(host: &SharedHost, request: &ClientRequest) -> Result<(), Pr
             guard = host.lock().unwrap_or_else(|p| p.into_inner());
             state = &mut guard;
             let admitted = fresh
-                && !held_by_recovery(&state, session.id)
+                && !held_by_recovery(state, session.id)
                 && independent_selection(state, &session.launch);
             if admitted {
                 state.recovery_independence.insert(session.id);
@@ -497,7 +497,7 @@ fn fresh_chat(host: &SharedHost, session: &Session) -> Result<bool, ProtocolErro
         if !state
             .recovery_independence
             .contains_conversation(session.launch.provider, id)
-            || conversation_held_by_recovery(&state, session.launch.provider, id)
+            || conversation_held_by_recovery(state, session.launch.provider, id)
         {
             return Ok(false);
         }

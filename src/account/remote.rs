@@ -181,7 +181,7 @@ impl ListHeld {
     /// `error` from a non-blocking `flock` of this lock, as this refusal
     /// when the lock was held; any other failure as it stands.
     #[cfg(any(feature = "ui", feature = "host"))]
-    pub(crate) fn from_flock(self, error: std::io::Error) -> std::io::Error {
+    pub(crate) fn flock_error(self, error: std::io::Error) -> std::io::Error {
         if error.kind() == std::io::ErrorKind::WouldBlock {
             std::io::Error::new(std::io::ErrorKind::WouldBlock, self)
         } else {
