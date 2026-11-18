@@ -1593,7 +1593,7 @@ fn report_surface(runtime: &Runtime, id: &str) -> ReportSurface {
     let mut element = runtime.delivery_view(
         item,
         &runtime.presentation_cache()[id],
-        design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE),
+        design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT),
     );
     let mut tree = Tree::new(element.as_widget());
     let node = element.as_widget_mut().layout(
@@ -2027,7 +2027,7 @@ fn expanded_report_and_peer_sender_metadata_aligns_with_body_and_stays_findable(
                 let mut element = live.delivery_view(
                     &delivered,
                     &live.presentation_cache()[&delivered.id],
-                    design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE),
+                    design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT),
                 );
                 let mut tree = Tree::new(element.as_widget());
                 let node = element.as_widget_mut().layout(

@@ -30,7 +30,7 @@ fn rendered(runtime: &mut Runtime, width: f32, expanded: bool) {
     let mut element = runtime.step_view(
         item,
         cached,
-        design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE),
+        design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_TRANSCRIPT),
     );
     let renderer = crate::app::tests::headless_renderer();
     let mut tree = Tree::new(element.as_widget());

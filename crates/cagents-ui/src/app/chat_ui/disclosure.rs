@@ -61,7 +61,7 @@ impl From<String> for Headline {
 impl Headline {
     fn view(self) -> Element<'static, Message> {
         let line = |text: String| {
-            crate::ui_controls::fade_text(text)
+            crate::ui_controls::FadeText::transcript(text)
                 .class(cosmic::theme::Text::Custom(design::muted_text))
         };
         match self {

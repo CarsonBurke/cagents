@@ -697,7 +697,7 @@ fn recorded_selected_child_actions_preserve_disclosure_of_colliding_parent() {
     let renderer = crate::app::tests::headless_renderer();
     let inspect = |runtime: &Runtime| {
         let item = runtime.active_item("shared-thought").unwrap();
-        let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
+        let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT);
         let mut element = runtime.prose_view(
             0,
             item,
@@ -796,7 +796,7 @@ fn recorded_tool_timestamp_reserves_footer_space_at_narrow_and_wide_widths() {
         let mut element = runtime.step_view(
             &item,
             &runtime.cache[&item.id],
-            design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE),
+            design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT),
         );
         let mut tree = Tree::new(element.as_widget());
         let limits =
@@ -4891,7 +4891,7 @@ fn live_reasoning_disclosure_toggles_through_actions_and_retains_streaming_choic
             item,
             &runtime.cache[&item.id],
             turn::Slot::Thinking,
-            design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE),
+            design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT),
         )
     };
     let mut tree = Tree::new(view(&app).as_widget());
@@ -5081,7 +5081,7 @@ fn reasoning_disclosure_preserves_keyboard_focus_across_retained_toggles() {
             item,
             &runtime.cache[&item.id],
             turn::Slot::Thinking,
-            design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE),
+            design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT),
         )
     };
     let mut tree = Tree::new(view(&app).as_widget());
@@ -5379,7 +5379,7 @@ fn rendered_exact_tool_targets_keep_verb_prefixed_names() {
             let mut element = runtime.step_view(
                 &item,
                 &runtime.cache[&item.id],
-                design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE),
+                design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT),
             );
             let renderer = crate::app::tests::headless_renderer();
             let mut tree = Tree::new(element.as_widget());
@@ -7414,7 +7414,7 @@ fn copy_web_search_native(select_all: bool) {
     let content = runtime.step_detail(
         canonical,
         &runtime.cache[&item.id],
-        design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE),
+        design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_TRANSCRIPT),
     );
     let mut element = selection::transcript_virtualized(content, target, None, catalog, bookmark);
     let renderer = crate::app::tests::headless_renderer();
@@ -7643,7 +7643,7 @@ fn cli_spawn_step_stays_one_row_and_discloses_its_launch_at_narrow_width() {
     };
     let (mut runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
     let renderer = crate::app::tests::headless_renderer();
-    let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+    let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_TRANSCRIPT);
     let mut catalog = selection::Catalog::builder();
     runtime.selection_item(&mut catalog, &item, turn::Slot::Card, false);
     assert_eq!(catalog.finish().retained_plain_bytes(), 0);
@@ -7754,7 +7754,7 @@ fn delivery_details_are_closed_at_narrow_width_and_preserve_literal_output() {
     let (mut runtime, _handle) = frame_cost::live_runtime(&[item]);
     let item = runtime.snapshot.items[0].clone();
     let renderer = crate::app::tests::headless_renderer();
-    let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+    let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_TRANSCRIPT);
     let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(280.0, 1000.0));
     let mut closed = runtime.delivery_view(&item, &runtime.cache[&item.id], settings);
     let mut tree = Tree::new(&closed);
@@ -7803,7 +7803,7 @@ fn monitor_event_output_remains_visible_and_selectable_without_expanding() {
     };
     let (runtime, _handle) = frame_cost::live_runtime(&[item]);
     let item = &runtime.snapshot.items[0];
-    let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+    let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_TRANSCRIPT);
     let mut view = runtime.delivery_view(item, &runtime.cache[&item.id], settings);
     let mut tree = Tree::new(&view);
     let renderer = crate::app::tests::headless_renderer();
@@ -7860,7 +7860,7 @@ fn queued_and_notice_widgets_copy_through_logical_catalog() {
     prepared.install_local(&mut runtime.queued.as_mut().unwrap().prompt.presentation);
     let queued = runtime.queued.as_ref().unwrap();
     let cached = &runtime.cache[&delivery.id];
-    let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+    let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_TRANSCRIPT);
     let first = notice_identity(Some("turn-a"), "Repeated failure");
     let second = notice_identity(Some("turn-b"), "Repeated failure");
     assert_ne!(first, second);
@@ -8074,7 +8074,7 @@ fn pointer_copy_across_visual_paragraph_and_code_chunks_adds_no_separators() {
             } else {
                 prose::view(
                     cached,
-                    design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE),
+                    design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_TRANSCRIPT),
                     target,
                     None,
                 )
@@ -8732,7 +8732,7 @@ fn reasoning_rows_use_the_selected_subagents_completion_and_duration() {
             &thought,
             &runtime.cache["shared-thought"],
             turn::Slot::Thinking,
-            design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE),
+            design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT),
         );
         let mut tree = Tree::new(element.as_widget());
         let node = element.as_widget_mut().layout(
@@ -8806,7 +8806,7 @@ fn historical_reasoning_pages_do_not_show_live_status_or_borrow_the_latest_turns
                 &thought,
                 &runtime.cache[&thought.id],
                 turn::Slot::Thinking,
-                design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE),
+                design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT),
             );
             let mut tree = Tree::new(element.as_widget());
             let node = element.as_widget_mut().layout(
@@ -8896,7 +8896,7 @@ fn reasoning_preview_rows_keep_duration_disclosure_and_full_width_at_narrow_size
                 &thought,
                 &runtime.cache["thought"],
                 turn::Slot::Thinking,
-                design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE),
+                design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT),
             );
             let mut tree = Tree::new(element.as_widget());
             let node = element.as_widget_mut().layout(
@@ -8955,7 +8955,7 @@ fn reasoning_preview_rows_keep_duration_disclosure_and_full_width_at_narrow_size
         &thought,
         &runtime.cache["thought"],
         turn::Slot::Thinking,
-        design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE),
+        design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT),
     );
     let mut tree = Tree::new(element.as_widget());
     let node = element.as_widget_mut().layout(
@@ -9121,7 +9121,7 @@ fn a_kept_thought_finishes_when_the_answer_after_it_arrives() {
         ),
     ]);
     publish_working(&mut runtime, &handle, |_| {});
-    let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
+    let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT);
     let renderer = crate::app::tests::headless_renderer();
     let mut tree = Tree::new(
         runtime
@@ -9259,7 +9259,7 @@ fn an_exchange_is_found_through_its_first_row_mounted_or_not() {
     let (runtime, _handle) = frame_cost::live_runtime(&items);
     assert_eq!(runtime.turns.len(), 1);
     let turn = &runtime.turns[0];
-    let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
+    let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT);
     let renderer = crate::app::tests::headless_renderer();
     let mut element = runtime.turn_view(turn, settings, true);
     let mut tree = Tree::new(element.as_widget());
@@ -9831,7 +9831,7 @@ fn every_markdown_block_is_drawn() {
         2,
         "the quoted fence and the top-level one"
     );
-    let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
+    let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT);
     let renderer = crate::app::tests::headless_renderer();
     let mut element = prose::view(
         &cached,
@@ -11709,6 +11709,254 @@ fn composer_is_one_row_and_offers_stop_while_busy_with_an_empty_draft() {
                 }
             }
         }
+    }
+}
+
+/// The sequence from #3119: four agents started, a thought with nothing to
+/// read, a fifth agent, then the reply. Every row of the timeline sits the
+/// same distance below the one before it, whether a thought, a group
+/// boundary or nothing at all falls between them; the reply sits the same
+/// distance below the last row however it was reached; and the rows' words,
+/// the agents' names, their states and the reply are set at one size.
+#[test]
+fn a_timeline_keeps_one_pitch_and_one_size_down_to_the_reply() {
+    use iced::advanced::{
+        Layout, layout,
+        widget::{Operation, Tree},
+    };
+    #[derive(Default)]
+    struct Probe {
+        texts: Vec<(String, iced::Rectangle)>,
+        reply: Option<(iced::Rectangle, f32)>,
+    }
+    impl Operation for Probe {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn text(
+            &mut self,
+            _: Option<&iced::advanced::widget::Id>,
+            bounds: iced::Rectangle,
+            text: &str,
+        ) {
+            self.texts.push((text.to_owned(), bounds));
+        }
+        fn custom(
+            &mut self,
+            _: Option<&iced::advanced::widget::Id>,
+            bounds: iced::Rectangle,
+            state: &mut dyn std::any::Any,
+        ) {
+            if let Some(state) = state.downcast_ref::<selectable_prose::State>()
+                && state.plain.as_ref() == REPLY
+            {
+                let (_, size) = state.mounted_typography().expect("the reply is laid out");
+                self.reply = Some((bounds, size.0));
+            }
+        }
+    }
+    const REPLY: &str = "All five designs are ready.";
+    let item = |id: &str, role, content| chat::Item {
+        id: id.into(),
+        role,
+        content,
+        started_at: None,
+        at: None,
+    };
+    let text = |id: &str, role, text: &str, thinking| {
+        item(
+            id,
+            role,
+            ItemContent::Text {
+                text: text.into(),
+                thinking,
+                phase: if thinking {
+                    chat::Phase::Commentary
+                } else {
+                    chat::Phase::Final
+                },
+            },
+        )
+    };
+    let started = |id: &str, name: &str| {
+        item(
+            id,
+            chat::Role::Assistant,
+            ItemContent::Tool {
+                name: "Agent".into(),
+                input: serde_json::json!({
+                    "subagent_type": name,
+                    "description": format!("Design {id}"),
+                    "prompt": "Draft a design",
+                })
+                .to_string(),
+                output: String::new(),
+                status: chat::ToolStatus::Succeeded,
+            },
+        )
+    };
+    let command = item(
+        "command",
+        chat::Role::Assistant,
+        ItemContent::Command {
+            label: "Read the fixture".into(),
+            command: "cat fixture".into(),
+            working_directory: "/project".into(),
+            action: chat::CommandAction::Run,
+            status: chat::ToolStatus::Succeeded,
+            exit_code: Some(0),
+            duration_ms: None,
+            output: String::new(),
+        },
+    );
+    let sequence = |between: Option<chat::Item>| {
+        let mut items = vec![text(
+            "prompt",
+            chat::Role::User,
+            "Draft five designs.",
+            false,
+        )];
+        items.extend((1..=4).map(|n| started(&format!("agent-{n}"), "general-purpose")));
+        items.extend(between);
+        items.push(started("agent-5", "sol-design2"));
+        items.push(text("reply", chat::Role::Assistant, REPLY, false));
+        items
+    };
+    let thought = text("thought", chat::Role::Assistant, "", true);
+    let scenarios = [
+        (
+            "a thought between",
+            sequence(Some(thought.clone())),
+            false,
+            780.0,
+        ),
+        ("nothing between", sequence(None), false, 780.0),
+        (
+            "a group boundary",
+            sequence(Some(command.clone())),
+            false,
+            780.0,
+        ),
+        ("an open group", sequence(Some(command)), true, 780.0),
+        ("a narrow pane", sequence(Some(thought)), false, 220.0),
+    ];
+    let renderer = crate::app::tests::headless_renderer();
+    let shortcuts = crate::settings::KeyboardShortcuts::default();
+    let width_at = |mut element: Element<'static, Message>| {
+        let mut tree = Tree::new(element.as_widget());
+        element
+            .as_widget_mut()
+            .layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(1000.0, 100.0)),
+            )
+            .size()
+            .width
+    };
+    let verb = width_at(design::transcript("Started").into());
+    assert_ne!(
+        verb,
+        width_at(design::body("Started").into()),
+        "the sizes differ"
+    );
+    let mut pitches = Vec::new();
+    let mut reply_gaps = Vec::new();
+    for (scenario, items, open, width) in scenarios {
+        let (mut runtime, _handle) = frame_cost::live_runtime(&items);
+        runtime.tool_groups_expanded = open;
+        let summary = runtime
+            .turns
+            .iter()
+            .find(|turn| !turn.steps.is_empty())
+            .map(|turn| turn.summary.clone());
+        let mut element = runtime.view(
+            None,
+            false,
+            true,
+            &shortcuts,
+            width,
+            0.0,
+            Place { branch: None },
+            true,
+            None,
+            Vec::new(),
+            true,
+        );
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 1400.0)),
+        );
+        let mut probe = Probe::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut probe);
+        // Each row of the timeline, by the words that start it.
+        let rows: Vec<&(String, iced::Rectangle)> = probe
+            .texts
+            .iter()
+            .filter(|(text, _)| {
+                text == "Started"
+                    || text.starts_with("Thought")
+                    || text.starts_with("Thinking")
+                    || text.contains("the fixture")
+                    || summary.as_deref() == Some(text.as_str())
+            })
+            .collect();
+        let expected = 5 + usize::from(scenario != "nothing between") + usize::from(open);
+        assert_eq!(rows.len(), expected, "{scenario}: {rows:?}");
+        let tops: Vec<f32> = rows.iter().map(|(_, bounds)| bounds.y).collect();
+        for pair in tops.windows(2) {
+            pitches.push((scenario, pair[1] - pair[0]));
+        }
+        // Every word in the timeline's rows - verbs, names, previews and
+        // states - is set in the transcript's line box.
+        let (first, last) = (tops[0], *tops.last().unwrap());
+        for (text, bounds) in &probe.texts {
+            if bounds.y >= first && bounds.y <= last && bounds.height > 0.0 {
+                assert_eq!(
+                    bounds.height,
+                    design::LINE_TRANSCRIPT,
+                    "{scenario}: {text:?} sits in the transcript's line box"
+                );
+            }
+        }
+        for (text, bounds) in &rows {
+            if text == "Started" {
+                assert_eq!(
+                    bounds.width, verb,
+                    "{scenario}: the verb is at transcript size"
+                );
+            }
+        }
+        let (reply, size) = probe.reply.expect("the reply is drawn");
+        assert_eq!(
+            size,
+            design::TEXT_TRANSCRIPT,
+            "{scenario}: the reply's size"
+        );
+        reply_gaps.push((scenario, reply.y - (last + design::LINE_TRANSCRIPT)));
+    }
+    let pitch = pitches[0].1;
+    for (scenario, found) in &pitches {
+        assert!(
+            (found - pitch).abs() < 0.5,
+            "{scenario}: rows {found} apart rather than {pitch}: {pitches:?}"
+        );
+    }
+    assert_eq!(
+        pitch,
+        design::LINE_TRANSCRIPT + 2.0 * step::GAP_XS + step::GAP_XS,
+        "a row's line box, its padding and the gap between rows"
+    );
+    for (scenario, gap) in &reply_gaps {
+        assert_eq!(
+            *gap,
+            step::GAP_XS + step::GAP_M,
+            "{scenario}: the reply sits a block's gap below the last row's padding"
+        );
     }
 }
 

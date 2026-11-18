@@ -435,8 +435,10 @@ impl Runtime {
                 .into(),
             );
         }
+        // Each nested row brings the air above it, so the strip has none of
+        // its own: its rows are as far apart as any two rows of the
+        // timeline, and so are its last row and the row after the strip.
         widget::column::with_children(content)
-            .spacing(GAP_XS)
             .width(Length::Fill)
             .into()
     }
@@ -868,7 +870,7 @@ mod tests {
         };
         let renderer = crate::app::tests::headless_renderer();
         let viewport = iced::Rectangle::with_size(iced::Size::new(275.0, 1_000.0));
-        let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
+        let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT);
         for group in [false, true] {
             let (mut runtime, _handle) =
                 super::super::view::prepared_runtime_for_test(std::slice::from_ref(&item));

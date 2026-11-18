@@ -1562,9 +1562,11 @@ mod tests {
              then \u{2007}\u{2007}acme/\u{2060}tools#4\u{a0}Old sidebar experiment."
         );
         // Every part of a label opens its pull request.
-        let style =
-            crate::design::markdown_settings(&cosmic::Theme::dark(), crate::design::TEXT_PROSE)
-                .style;
+        let style = crate::design::markdown_settings(
+            &cosmic::Theme::dark(),
+            crate::design::TEXT_TRANSCRIPT,
+        )
+        .style;
         let spans = text.spans(style);
         let linked = spans
             .iter()
@@ -1597,9 +1599,11 @@ mod tests {
         let text = paragraph(&format!("Fixed in [the **retry** change]({OPEN})."));
         let plain = text.plain();
         assert_eq!(&*plain, "Fixed in \u{2007}\u{2007}the retry change.");
-        let style =
-            crate::design::markdown_settings(&cosmic::Theme::dark(), crate::design::TEXT_PROSE)
-                .style;
+        let style = crate::design::markdown_settings(
+            &cosmic::Theme::dark(),
+            crate::design::TEXT_TRANSCRIPT,
+        )
+        .style;
         // The author's emphasis survives.
         let spans = text.spans(style);
         assert!(spans.iter().any(|span| {
@@ -1832,9 +1836,11 @@ mod tests {
              \u{2007}\u{2007}Acme/\u{2060}Tools#4\u{a0}Old sidebar experiment; \
              #30 and #99 are issues."
         );
-        let style =
-            crate::design::markdown_settings(&cosmic::Theme::dark(), crate::design::TEXT_PROSE)
-                .style;
+        let style = crate::design::markdown_settings(
+            &cosmic::Theme::dark(),
+            crate::design::TEXT_TRANSCRIPT,
+        )
+        .style;
         let spans = text.spans(style);
         let linked = |address: &str| {
             spans

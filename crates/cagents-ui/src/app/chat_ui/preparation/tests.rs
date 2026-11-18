@@ -1162,7 +1162,8 @@ fn managed_image_actual_worker_uses_receipt_label_and_preserves_diagnostics() {
             let markdown::Item::Paragraph(open) = &document.items()[3] else {
                 panic!("shared original image URI")
             };
-            let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+            let settings =
+                design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_TRANSCRIPT);
             assert!(Arc::ptr_eq(
                 open.spans(settings.style)[0].link.as_ref().unwrap(),
                 url.as_ref().unwrap(),
@@ -1210,7 +1211,7 @@ fn literal_image_worker_native_fields_keep_catalog_and_shared_remote_uri() {
     runtime.markdown_prepared(runtime.target, "message", run, ready(Ok(output)));
     let source = runtime.snapshot.items[0].clone();
     let cached = &runtime.cache["message"];
-    let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+    let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_TRANSCRIPT);
     let mut element: Element<'static, Message> = widget::column::with_children(
         (0..2)
             .filter_map(|part| {
@@ -2893,7 +2894,7 @@ fn retained_composite_factories_keep_one_real_worker_graph_until_last_ui_owner_d
         let clones = markdown::cloned_items();
         let mut element = prose::view(
             &cached,
-            design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE),
+            design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_TRANSCRIPT),
             target(),
             None,
         );
@@ -3018,7 +3019,7 @@ fn large_image_title_is_a_flowed_caption_with_its_exact_selection_source() {
     let before = markdown::materialized_bytes();
     let mut element = prose::view(
         &cached,
-        design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE),
+        design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_TRANSCRIPT),
         target(),
         None,
     );

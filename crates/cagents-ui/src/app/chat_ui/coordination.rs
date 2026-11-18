@@ -1428,15 +1428,14 @@ impl Runtime {
         // its tab's words, cut as the tab cuts them.
         let mut line: Vec<Element<'static, Message>> = vec![
             lead,
-            design::body(row.verb)
+            design::transcript(row.verb)
                 .class(cosmic::theme::Text::Custom(design::muted_text))
                 .wrapping(iced::widget::text::Wrapping::None)
                 .into(),
-            chat_title(label)
-                .size(design::TEXT_BODY)
+            design::transcript_name(label)
                 .wrapping(iced::widget::text::Wrapping::None)
                 .into(),
-            crate::ui_controls::fade_text(row.preview.clone())
+            crate::ui_controls::FadeText::transcript(row.preview.clone())
                 .class(cosmic::theme::Text::Custom(design::muted_text))
                 .width(Length::Fill)
                 .into(),
@@ -1446,7 +1445,8 @@ impl Runtime {
         if row.state.live && matches!(row.state.tone, Tone::Plain) {
             line.push(live_dot());
         }
-        let status = design::body(row.state.text).wrapping(iced::widget::text::Wrapping::None);
+        let status =
+            design::transcript(row.state.text).wrapping(iced::widget::text::Wrapping::None);
         let status = match row.state.tone {
             Tone::Plain => status.class(cosmic::theme::Text::Custom(design::muted_text)),
             Tone::Warning => status.class(cosmic::theme::Text::Custom(design::warning_text)),

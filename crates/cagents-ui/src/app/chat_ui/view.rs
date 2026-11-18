@@ -61,7 +61,7 @@ pub(super) fn body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Messag
 fn transcript_body(text: impl Into<String>, target: Target) -> Element<'static, Message> {
     widget::container(selectable_prose::plain(
         text,
-        design::TEXT_BODY,
+        design::TEXT_TRANSCRIPT,
         iced::Font::default(),
         target,
     ))
@@ -131,6 +131,49 @@ const NARROW_FOOTER_LABEL: usize = 20;
 const TIGHT_FOOTER_LABEL: usize = 14;
 const MESSAGE_ACTION_FOOTER: f32 = MESSAGE_ACTION_HEIGHT + step::GAP_XS;
 
+/// What a transcript row is to the rows around it, which alone decides the
+/// space above it.
+///
+/// The space is a property of the two rows it separates, never of the group
+/// or exchange either belongs to, so a column of timeline rows keeps one
+/// pitch whether or not a group boundary, or an item that draws nothing,
+/// falls between two of them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Rhythm {
+    /// One line of the timeline: a step, the strip that folds a group of
+    /// them, a thought, an agent started or messaged.
+    Line,
+    /// Something read as a whole: an answer, narration, an image.
+    Block,
+    /// What sets itself apart: the message that opens an exchange, or a part
+    /// of the transcript of its own, such as a failure or the closing line.
+    Opening,
+}
+
+impl Rhythm {
+    /// The space between a row of this kind and a row of `next` drawn
+    /// beneath it.
+    fn gap(self, next: Rhythm) -> f32 {
+        match (self, next) {
+            (_, Rhythm::Opening) => step::GAP_L,
+            (Rhythm::Line, Rhythm::Line) => step::GAP_XS,
+            _ => step::GAP_M,
+        }
+    }
+
+    /// How a transcript item draws, by its role, slot and what it holds.
+    fn of(item: &chat::Item, slot: turn::Slot, card: bool) -> Self {
+        match (&item.content, slot) {
+            _ if card => Self::Line,
+            (ItemContent::Text { .. }, turn::Slot::Thinking) => Self::Line,
+            (ItemContent::Text { .. } | ItemContent::Image { .. }, _) => Self::Block,
+            // A step, or a notice the grouping placed among the prose, is
+            // drawn as a step's row.
+            _ => Self::Line,
+        }
+    }
+}
+
 /// The loaded transcript keeps row descriptions; only its visible rows create
 /// widget trees, and a visible row is kept between frames by retained::kept.
 ///
@@ -138,25 +181,25 @@ const MESSAGE_ACTION_FOOTER: f32 = MESSAGE_ACTION_HEIGHT + step::GAP_XS;
 /// next semantic boundary instead of adding another gap after an invisible row.
 struct VirtualRows<'a> {
     children: Vec<virtualized::Row<'a>>,
-    gap: f32,
+    /// The kind of the last row drawn, which the next row's gap is measured
+    /// from. A row that draws nothing leaves it as it was.
+    last: Option<Rhythm>,
     trailing_footer: f32,
 }
 impl<'a> VirtualRows<'a> {
-    fn new(gap: f32) -> Self {
+    fn new() -> Self {
         Self {
             children: vec![],
-            gap,
+            last: None,
             trailing_footer: 0.0,
         }
     }
+    /// A part of the transcript of its own, set apart from what is above it.
     fn push(&mut self, row: Element<'a, Message>) -> usize {
-        self.message(row, 0.0)
-    }
-    fn message(&mut self, row: Element<'a, Message>, footer: f32) -> usize {
         self.append(
             virtualized::Row::once(0, 0, 80.0, None, move || row),
-            self.gap,
-            footer,
+            Some(Rhythm::Opening),
+            0.0,
         )
     }
     fn lazy(
@@ -165,13 +208,13 @@ impl<'a> VirtualRows<'a> {
         revision: u64,
         estimate: f32,
         aliases: Vec<iced::advanced::widget::Id>,
-        gap: f32,
+        rhythm: Option<Rhythm>,
         footer: f32,
         build: impl Fn() -> Element<'a, Message> + 'a,
     ) -> usize {
         let mut row = virtualized::Row::new(key, revision, estimate, None, build);
         row.aliases = aliases;
-        self.append(row, gap, footer)
+        self.append(row, rhythm, footer)
     }
     /// Lets the newest row also stand for `id`, which draws nothing of its
     /// own.
@@ -180,9 +223,17 @@ impl<'a> VirtualRows<'a> {
             row.aliases.push(id);
         }
     }
-    fn append(&mut self, mut row: virtualized::Row<'a>, gap: f32, footer: f32) -> usize {
-        if !self.children.is_empty() {
-            let gap = (gap - self.trailing_footer).max(0.0);
+    /// Appends `row`, after the gap its kind takes from the last row drawn.
+    /// A row without a kind draws nothing: it takes no gap, and the next row
+    /// is spaced from the one before it as if it were not there.
+    fn append(
+        &mut self,
+        mut row: virtualized::Row<'a>,
+        rhythm: Option<Rhythm>,
+        footer: f32,
+    ) -> usize {
+        if let (Some(last), Some(next)) = (self.last, rhythm) {
+            let gap = (last.gap(next) - self.trailing_footer).max(0.0);
             if gap > 0.0 {
                 // A gap is keyed by the row it precedes, so history loaded
                 // above it does not hand it another gap's measured height.
@@ -199,7 +250,10 @@ impl<'a> VirtualRows<'a> {
             row.key = index as u64;
         }
         self.children.push(row);
-        self.trailing_footer = footer;
+        if rhythm.is_some() {
+            self.last = rhythm;
+            self.trailing_footer = footer;
+        }
         index
     }
 }
@@ -2564,13 +2618,13 @@ impl Runtime {
         // ten pixels.
         let dark = cosmic::theme::is_dark();
         let markdown_settings =
-            design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
+            design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT);
         let selected = self
             .selected_subagent
             .as_ref()
             .and_then(|id| snapshot.subagents.iter().find(|agent| &agent.id == id));
         let anchors = Vec::new();
-        let mut transcript = VirtualRows::new(step::GAP_L);
+        let mut transcript = VirtualRows::new();
         let mut selected_identity: Option<Element<'_, Message>> = None;
         if let Some(agent) = selected {
             let provider = match self.session.launch.provider {
@@ -2589,7 +2643,7 @@ impl Runtime {
                 .filter(|model| !model.is_empty());
             let mut heading = vec![
                 widget::row::with_children(vec![
-                    chat_title(self.child_label(agent, 80))
+                    design::transcript_name(self.child_label(agent, 80))
                         .width(Length::Fill)
                         .into(),
                     design::heading(Self::native_child_status(agent))
@@ -2728,12 +2782,23 @@ impl Runtime {
                         * 22.0
                         + footer
                 });
+                // The subagent's own messages to it open its exchanges; the
+                // rest of its work keeps the main transcript's rhythm.
+                let rhythm = if item.role == chat::Role::User && !item.content.is_step() {
+                    Rhythm::Opening
+                } else {
+                    let card = cached
+                        .coordination
+                        .as_deref()
+                        .is_some_and(|coordinated| coordinated.is_card());
+                    Rhythm::of(item, turn::slot_of(item), card)
+                };
                 let row_index = transcript.lazy(
                     key.finish(),
                     revision,
                     estimate,
                     vec![scroll::item_id(&item.id), self.find_anchor(&item.id)],
-                    step::GAP_L,
+                    Some(rhythm),
                     footer,
                     move || {
                         scroll::item(
@@ -2810,7 +2875,7 @@ impl Runtime {
                 // first message, so it does not invite one while it comes up.
                 transcript.push(
                     widget::container(
-                        design::body(if self.provider_coming_up() {
+                        design::transcript(if self.provider_coming_up() {
                             "This conversation is starting."
                         } else {
                             "Your conversation appears here. Send a message to begin."
@@ -4935,18 +5000,12 @@ impl Runtime {
                     + 40.0
             })
         };
-        let opening_gap = if turn.prompt.is_empty() {
-            step::GAP_M
-        } else {
-            step::GAP_L
-        };
         // Find reaches an exchange through its first row, whether or not
         // that row is mounted, and so does anything drawn before it.
         // Room for the row's own item too, which is usually all it holds.
         let mut leading = Vec::with_capacity(2);
         leading.push(self.find_anchor(&turn.key));
         let mut rows = 0;
-        let mut after_card = false;
         self.for_each_turn_part(turn, |placement| {
             let (part, cached) = match placement {
                 // An item that draws nothing of its own, such as one still
@@ -4995,16 +5054,19 @@ impl Runtime {
                     (estimate(item), footer)
                 }
             };
-            // A run of coordination rows reads as one list, as the step
-            // strip's rows do, rather than as blocks set apart from one
-            // another.
-            let card = matches!(part, TurnPart::Card(_));
-            let gap = match rows {
-                0 => opening_gap,
-                _ if card && after_card => step::GAP_XS,
-                _ => step::GAP_M,
+            // An exchange the reader or another agent opened is set apart
+            // from the one before it. Every other row is spaced by what it
+            // and the row above it are, so the timeline reads as one list
+            // across the groups it is folded into.
+            let rhythm = match part {
+                _ if rows == 0 && !turn.prompt.is_empty() => Rhythm::Opening,
+                TurnPart::Prompt(_) => Rhythm::Block,
+                TurnPart::Steps | TurnPart::Card(_) => Rhythm::Line,
+                TurnPart::Prose(prose) => {
+                    let placed = &turn.prose[prose];
+                    Rhythm::of(&items[placed.index], placed.slot, false)
+                }
             };
-            after_card = card;
             rows += 1;
             let fingerprint = self.turn_part_fingerprint(turn, part, key, cached, &common, now);
             transcript.lazy(
@@ -5012,7 +5074,7 @@ impl Runtime {
                 fingerprint,
                 estimate,
                 aliases,
-                gap,
+                Some(rhythm),
                 footer,
                 move || {
                     retained::kept(fingerprint, move || {
@@ -5022,6 +5084,9 @@ impl Runtime {
             );
         });
         if rows == 0 {
+            // An exchange that draws nothing yet is still reached through a
+            // row of its own, which takes no room: the rows around it are
+            // spaced as if it were not there.
             let mut key = std::hash::DefaultHasher::new();
             (0u8, &turn.key).hash(&mut key);
             transcript.lazy(
@@ -5029,7 +5094,7 @@ impl Runtime {
                 common.finish(),
                 0.0,
                 leading,
-                opening_gap,
+                None,
                 0.0,
                 || widget::Space::new().into(),
             );
@@ -5046,8 +5111,8 @@ impl Runtime {
         }
         let dark = cosmic::theme::is_dark();
         let markdown_settings =
-            design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
-        let mut transcript = VirtualRows::new(step::GAP_L);
+            design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT);
+        let mut transcript = VirtualRows::new();
         // The preview shows the end of the conversation, which the last few
         // exchanges fill however long it has run.
         let tail = self.turns.len().saturating_sub(PREVIEW_TURNS);
@@ -5098,7 +5163,7 @@ impl Runtime {
         dark: bool,
         viewport: virtualized::Viewport,
     ) -> Element<'a, Message> {
-        let mut rows = VirtualRows::new(step::GAP_L);
+        let mut rows = VirtualRows::new();
         self.push_turn_rows(
             &mut rows,
             turn,
@@ -5112,7 +5177,7 @@ impl Runtime {
 
     #[cfg(test)]
     pub(super) fn find_turn_view_for_test(&self) -> Element<'_, Message> {
-        let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
+        let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT);
         self.turn_view(&self.turns[0], settings, cosmic::theme::is_dark())
     }
 
@@ -5507,9 +5572,12 @@ impl Runtime {
                                 revision,
                                 56.0 + step::GAP_XS,
                                 Some(scroll::item_id(&id)),
+                                // The air above each row, so the strip's
+                                // rows keep the pitch of the rows around
+                                // it at both of its ends.
                                 move || {
                                     widget::container(scroll::item(&id, row))
-                                        .padding(iced::Padding::ZERO.bottom(step::GAP_XS))
+                                        .padding(iced::Padding::ZERO.top(step::GAP_XS))
                                         .into()
                                 },
                             );
@@ -5926,7 +5994,7 @@ impl Runtime {
         };
         let body: Element<'a, Message> = if let Some(prepared) = prepared {
             let mut settings =
-                design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
+                design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT);
             settings.style.font = iced::Font::default();
             if prepared.full.len() > 2048 {
                 let flow = local.presentation.flow.markdown_entry(
@@ -5954,7 +6022,7 @@ impl Runtime {
             }
         } else {
             widget::text(prompt::preview(local.text()).0)
-                .size(design::TEXT_PROSE)
+                .size(design::TEXT_TRANSCRIPT)
                 .into()
         };
         let mut rows: Vec<Element<'a, Message>> = Vec::new();
@@ -6115,7 +6183,7 @@ impl Runtime {
             let text = if let Some(prompt) = prepared {
                 let text = prompt.shown(expanded);
                 let mut settings =
-                    design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
+                    design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT);
                 settings.style.font = iced::Font::default();
                 if text.len() > 2048 {
                     let flow = self.presentation_cache()[&item.id]
@@ -6142,7 +6210,7 @@ impl Runtime {
             } else {
                 // This bounded nonselectable preview cannot certify a full
                 // source/catalog before preparation accepts the current Item.
-                widget::text(fallback).size(design::TEXT_PROSE).into()
+                widget::text(fallback).size(design::TEXT_TRANSCRIPT).into()
             };
             if long {
                 widget::column::with_children(vec![
