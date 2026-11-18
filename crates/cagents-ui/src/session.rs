@@ -15,8 +15,8 @@ use crate::{
         WorkspaceId, WorkspaceState, WorktreeId, WorktreeState,
     },
     persistence::{
-        SnapshotBase, StateStore, StoreError, StoredGenerations, TranscriptPruneReport,
-        TranscriptRetention,
+        RestoreWarning, SnapshotBase, StateStore, StoreError, StoredGenerations,
+        TranscriptPruneReport, TranscriptRetention,
     },
 };
 // Exported at the shared library's root so its expansion names that crate.
@@ -608,10 +608,10 @@ pub struct SessionRuntime {
     database_path: PathBuf,
     restored_projects: Vec<ProjectState>,
     restored_worktrees: Vec<WorktreeState>,
-    /// One line per card that storage held but could not restore. Losing a
-    /// card is a reportable event, not a silent deletion, so the shell can
-    /// surface these.
-    restore_warnings: Vec<String>,
+    /// One per card that storage held but could not restore. Losing a card
+    /// is a reportable event, not a silent deletion, so the shell can surface
+    /// these.
+    restore_warnings: Vec<RestoreWarning>,
     operation_store: Arc<StateStore>,
 }
 
@@ -668,43 +668,13 @@ impl SessionRuntime {
     ) -> Result<(Self, Option<WorkspaceState>), SessionError> {
         let database_path = database_path.as_ref().to_path_buf();
         let store = Arc::new(StateStore::open(&database_path, boot_id)?);
-        // A card storage cannot decode is dropped with a warning rather than
-        // failing the open: the writer thread below must exist even then, or
-        // one unreadable card would disable saving for the whole run.
-        let restored = store
-            .list_workspaces()?
-            .into_iter()
-            .find(|summary| summary.existence.is_open())
-            .map(|summary| store.load_workspace_restored(summary.id, None))
-            .transpose()?
-            .flatten();
-        let (restored, restore_warnings) = match restored {
-            Some(restored) => (Some(restored.state), restored.warnings),
-            None => (None, Vec::new()),
-        };
-        let projects = store.list_projects()?;
-        let worktrees = store.list_worktrees()?;
-        let writes = PendingWrites::restored(
-            restored.as_ref().map_or(0, |state| state.generation),
-            restored
-                .as_ref()
-                .map(|state| {
-                    state
-                        .cards
-                        .iter()
-                        .map(|card| (card.id, card.generation))
-                        .collect()
-                })
-                .unwrap_or_default(),
-            projects
-                .iter()
-                .map(|project| (project.id, project.generation))
-                .collect(),
-            worktrees
-                .iter()
-                .map(|worktree| (worktree.id, worktree.generation))
-                .collect(),
-        );
+        let RestoredSession {
+            workspace: restored,
+            warnings: restore_warnings,
+            projects,
+            worktrees,
+            writes,
+        } = restore_session(&store)?;
 
         let queue = Arc::new((Mutex::new(QueueState::default()), Condvar::new()));
         let last_error = Arc::new(Mutex::new(None));
@@ -1148,7 +1118,7 @@ impl SessionRuntime {
     /// workspace is missing those cards and the user should be told: the
     /// alternative — the behaviour this replaced — was losing the entire
     /// session with no diagnostic anywhere.
-    pub fn restore_warnings(&self) -> &[String] {
+    pub fn restore_warnings(&self) -> &[RestoreWarning] {
         &self.restore_warnings
     }
 
@@ -2120,6 +2090,65 @@ fn report_checkpoint(outcome: Result<bool, StoreError>) {
     if let Err(error) = outcome {
         tracing::warn!(%error, "session WAL checkpoint could not run");
     }
+}
+
+/// What a session restores from storage, with the write lane that continues it.
+struct RestoredSession {
+    workspace: Option<WorkspaceState>,
+    /// The open cards storage could not restore into `workspace`.
+    warnings: Vec<RestoreWarning>,
+    projects: Vec<ProjectState>,
+    worktrees: Vec<WorktreeState>,
+    /// Seeded with the generations storage holds, including those of the
+    /// cards it could not restore.
+    writes: PendingWrites,
+}
+
+/// Restores the open workspace and the catalog, and seeds the write lane.
+///
+/// A card storage cannot decode is dropped with a warning rather than failing
+/// the open: the writer thread must exist even then, or one unreadable card
+/// would disable saving for the whole run.
+fn restore_session(store: &StateStore) -> Result<RestoredSession, SessionError> {
+    let restored = store
+        .list_workspaces()?
+        .into_iter()
+        .find(|summary| summary.existence.is_open())
+        .map(|summary| store.load_workspace_restored(summary.id, None))
+        .transpose()?
+        .flatten();
+    let (restored, restore_warnings, unrestored) = match restored {
+        Some(restored) => (Some(restored.state), restored.warnings, restored.unrestored),
+        None => (None, Vec::new(), BTreeMap::new()),
+    };
+    let projects = store.list_projects()?;
+    let worktrees = store.list_worktrees()?;
+    // A card that could not be restored keeps its row, and a shared view that
+    // still holds the pane offers it again, possibly in the very first
+    // snapshot; that write is made against the generation storage holds for it.
+    let writes = PendingWrites::restored(
+        restored.as_ref().map_or(0, |state| state.generation),
+        restored
+            .iter()
+            .flat_map(|state| state.cards.iter().map(|card| (card.id, card.generation)))
+            .chain(unrestored)
+            .collect(),
+        projects
+            .iter()
+            .map(|project| (project.id, project.generation))
+            .collect(),
+        worktrees
+            .iter()
+            .map(|worktree| (worktree.id, worktree.generation))
+            .collect(),
+    );
+    Ok(RestoredSession {
+        workspace: restored,
+        warnings: restore_warnings,
+        projects,
+        worktrees,
+        writes,
+    })
 }
 
 impl PendingWrites {

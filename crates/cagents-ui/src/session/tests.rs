@@ -989,6 +989,141 @@ fn chained_terminal_retries_preserve_the_persisted_expected_identity() {
     assert_eq!(replacement.replacement.id(), final_id);
 }
 
+/// The shared view can project the pane back before the window has saved
+/// anything, so the lane's very first write of it must already be made
+/// against the generation storage holds for the unreadable row. Flushed
+/// without the writer's rebase, which would otherwise hide a wrong start.
+#[test]
+fn the_first_snapshot_writes_an_unrestored_card_against_its_stored_generation() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("state.sqlite3");
+    let boot = BootId::new("boot-unrestored");
+    let mut latest = workspace();
+    let mut lost = latest.cards[0].clone();
+    lost.id = CardId::new();
+    let CardKind::Terminal(session) = &mut lost.kind else {
+        unreachable!()
+    };
+    session.id = TerminalId::new();
+    let lost_terminal = session.id;
+    latest.cards.push(lost.clone());
+    let (mut runtime, _) = SessionRuntime::open(&path, boot.clone()).unwrap();
+    runtime.snapshot(Arc::new(latest.clone()));
+    runtime.shutdown();
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE terminal_recipes SET continuity_json = '{\"state\":\"newer\"}'
+             WHERE terminal_id = ?1",
+            [lost_terminal.to_string()],
+        )
+        .unwrap();
+
+    let store = StateStore::open(&path, boot).unwrap();
+    let RestoredSession {
+        workspace,
+        warnings,
+        mut writes,
+        ..
+    } = restore_session(&store).unwrap();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    let mut projected = workspace.unwrap();
+    assert!(!projected.cards.iter().any(|card| card.id == lost.id));
+    projected.cards.push(lost.clone());
+    writes.workspace = Some(Arc::new(projected));
+    let errors = writes.flush(&store);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert!(writes.is_settled());
+}
+
+/// A card storage could not decode is left out of the restored window,
+/// and the daemon's shared view projects the pane straight back. The
+/// writer must save that copy over the unreadable row once, rather than
+/// tombstone the card and then be refused on every later save (#3062).
+#[test]
+fn a_projected_copy_of_an_unrestored_card_saves_once() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("state.sqlite3");
+    let boot = BootId::new("boot-unrestored");
+    let mut latest = workspace();
+    let mut lost = latest.cards[0].clone();
+    lost.id = CardId::new();
+    let CardKind::Terminal(session) = &mut lost.kind else {
+        unreachable!()
+    };
+    session.id = TerminalId::new();
+    let lost_terminal = session.id;
+    latest.cards.push(lost.clone());
+    let (mut runtime, _) = SessionRuntime::open(&path, boot.clone()).unwrap();
+    runtime.snapshot(Arc::new(latest.clone()));
+    runtime.shutdown();
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE terminal_recipes SET continuity_json = '{\"state\":\"newer\"}'
+             WHERE terminal_id = ?1",
+            [lost_terminal.to_string()],
+        )
+        .unwrap();
+
+    let (mut runtime, restored) = SessionRuntime::open(&path, boot.clone()).unwrap();
+    let restored = restored.unwrap();
+    assert_eq!(runtime.restore_warnings().len(), 1);
+    assert!(!restored.cards.iter().any(|card| card.id == lost.id));
+    // The row as storage holds it. A refused write would leave it as it
+    // was, so this, not the writer's last error, shows what was saved.
+    let stored = || -> (String, i64) {
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT existence_json, generation FROM cards WHERE card_id = ?1",
+                [lost.id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    };
+    let (_, unreadable_generation) = stored();
+    // A save before the projection, then the projection and later saves.
+    runtime.snapshot(Arc::new(restored.clone()));
+    runtime.flush(Duration::from_secs(10)).unwrap();
+    assert_eq!(
+        stored(),
+        ("\"open\"".to_owned(), unreadable_generation),
+        "a snapshot that never held the card must leave it as stored"
+    );
+    let mut projected = restored;
+    projected.cards.push(lost.clone());
+    let projected = Arc::new(projected);
+    runtime.snapshot(Arc::clone(&projected));
+    runtime.flush(Duration::from_secs(10)).unwrap();
+    let replaced = stored();
+    assert_eq!(replaced.0, "\"open\"");
+    assert!(
+        replaced.1 > unreadable_generation,
+        "the projected copy must replace the unreadable row"
+    );
+    runtime.snapshot(Arc::clone(&projected));
+    runtime.flush(Duration::from_secs(10)).unwrap();
+    assert_eq!(stored(), replaced, "the replaced row is settled");
+    assert_eq!(runtime.last_error(), None);
+    runtime.shutdown();
+
+    let (mut reopened, restored) = SessionRuntime::open(&path, boot).unwrap();
+    assert!(
+        reopened.restore_warnings().is_empty(),
+        "{:?}",
+        reopened.restore_warnings()
+    );
+    assert!(
+        restored
+            .unwrap()
+            .cards
+            .iter()
+            .any(|card| card.id == lost.id)
+    );
+    reopened.shutdown();
+}
+
 #[test]
 fn writer_coalesces_and_restores_latest_snapshot() {
     let directory = tempdir().unwrap();
