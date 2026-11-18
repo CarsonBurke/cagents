@@ -3,12 +3,14 @@
 # size and vertical rhythm (#3119). Offline: the synthetic provider replays
 # transcript-rhythm-scene/frames.jsonl, and no account or model is contacted.
 #
-# Run inside a ready native-evidence session, on the build host:
+# Run on the build host with CAGENTS_EVIDENCE_TASK naming a native-evidence
+# task. The theme goes into the task's seed before a session starts; the
+# scenes run inside a ready session:
 #
-#   tests/fixtures/transcript-rhythm-scene.sh theme dark   # or light, between sessions
+#   tests/fixtures/transcript-rhythm-scene.sh theme dark   # or light
 #   scripts/native-evidence start before --width 1200 --height 1000
-#   CAGENTS_EVIDENCE_TASK=... tests/fixtures/transcript-rhythm-scene.sh wide
-#   CAGENTS_EVIDENCE_TASK=... tests/fixtures/transcript-rhythm-scene.sh narrow
+#   tests/fixtures/transcript-rhythm-scene.sh wide dark
+#   tests/fixtures/transcript-rhythm-scene.sh narrow dark
 #   scripts/native-evidence stop
 #
 # The turn reads, searches and tests in one group of steps, starts four
@@ -17,16 +19,20 @@
 # then holds for 30 seconds, working, before the agents report and the
 # answer arrives.
 #
-# Scenes, each shooting with the side's prefix as native-evidence does:
+# Scenes, each shooting with the side's prefix as native-evidence does, and
+# with LABEL, when given, after "rhythm-":
 #
 #   wide    rhythm-working (the turn mid-way, its rows live) and
 #           rhythm-finished (the same turn answered)
-#   narrow  rhythm-narrow: the finished turn in a pane about 220 pixels wide,
-#           beside two others, after `wide` in the same session
-#   theme   KEY: writes the fixture's theme setting, for the next session
+#   narrow  rhythm-narrow: the finished turn in a narrow pane beside two
+#           others, after `wide` in the same session
+#   theme   KEY: writes the theme into the task's seed, which every later
+#           session starts from
 set -euo pipefail
 
-scene=${1:?usage: transcript-rhythm-scene.sh wide|narrow|theme dark|light}
+scene=${1:?usage: transcript-rhythm-scene.sh wide|narrow [LABEL] | theme dark|light}
+# Names the shots, such as rhythm-dark-working, so each theme keeps its own.
+label=${2:+$2-}
 here=$(cd -- "$(dirname -- "$0")" && pwd)
 evidence() { "${CAGENTS_EVIDENCE_TOOL:-$here/../../scripts/native-evidence}" "$@"; }
 : "${CAGENTS_EVIDENCE_TASK:?name a native-evidence task}"
@@ -36,7 +42,8 @@ config=$fixture/home/.claude
 if [ "$scene" = theme ]; then
     key=${2:?dark or light}
     case $key in dark|light) ;; *) exit 2 ;; esac
-    settings=$fixture/config/cagents-development/settings.toml
+    # A session restores its fixture from the seed, so the theme goes there.
+    settings=$CAGENTS_EVIDENCE_TASK/fixture-seed/config/cagents-development/settings.toml
     mkdir -p "${settings%/*}"
     if [ -f "$settings" ] && grep -q '^app_theme' "$settings"; then
         sed -i "s/^app_theme = .*/app_theme = \"$key\"/" "$settings"
@@ -90,11 +97,11 @@ wide)
     wait_recorded 'rhythm-lint-1-result' 60
     sleep 3
     scroll_top
-    shot rhythm-working
+    shot "rhythm-${label}working"
     wait_recorded 'rhythm-answer-1' 60
     sleep 3
     scroll_top
-    shot rhythm-finished
+    shot "rhythm-${label}finished"
     ;;
 narrow)
     # Two drafts beside the conversation, each pane cycled to a third of the
@@ -104,7 +111,7 @@ narrow)
     evidence drive key ctrl+t >/dev/null
     sleep 2
     scroll_top
-    shot rhythm-narrow
+    shot "rhythm-${label}narrow"
     ;;
 *) exit 2 ;;
 esac
