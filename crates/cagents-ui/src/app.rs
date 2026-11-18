@@ -1208,6 +1208,21 @@ impl Projection {
     }
 }
 
+/// What an extracted `update` handler returns; its arm takes it with `handled!`.
+type Handled = std::ops::ControlFlow<Task<Message>, Task<Message>>;
+
+/// Takes an extracted `update` handler's result. `Break` returns from the
+/// dispatch closure at once, skipping the projection, exactly as a `return`
+/// written inside the arm would; `Continue` is the arm's value.
+macro_rules! handled {
+    ($handler:expr) => {
+        match $handler {
+            std::ops::ControlFlow::Break(task) => return task,
+            std::ops::ControlFlow::Continue(task) => task,
+        }
+    };
+}
+
 /// Evaluates a stage of an update's projection, timed in the UI thread trace.
 macro_rules! projection_stage {
     ($stage:literal, $work:expr) => {{
@@ -16376,7 +16391,7 @@ impl Application for Cagents {
                 project_id,
                 generation,
                 result,
-            } => self.repository_loaded(open_cards, project_id, generation, result),
+            } => handled!(self.repository_loaded(open_cards, project_id, generation, result)),
             Message::AttachedWorktreePrsResolved {
                 project_id,
                 generation,
@@ -16556,8 +16571,8 @@ impl Application for Cagents {
                 }
                 Task::batch(tasks)
             }
-            Message::Repository(action) => self.update_repository(action),
-            Message::Sidebar(action) => self.update_sidebar(action),
+            Message::Repository(action) => handled!(self.update_repository(action)),
+            Message::Sidebar(action) => handled!(self.update_sidebar(action)),
             Message::FoldInProgress { refocus } => {
                 if self.sidebar_state.fold_in_progress() && refocus {
                     sidebar::focus_and_reveal(sidebar::in_progress_focus_id())
@@ -18149,20 +18164,20 @@ impl Application for Cagents {
                 key,
                 request,
                 result,
-            } => self.source_control_loaded(key, request, result),
+            } => handled!(self.source_control_loaded(key, request, result)),
             Message::SourceControlHistory {
                 generation,
                 key,
                 page,
                 head,
                 result,
-            } => self.source_control_history(generation, key, page, head, result),
+            } => handled!(self.source_control_history(generation, key, page, head, result)),
             Message::SourceControlMutated {
                 key,
                 operation,
                 report,
                 committed,
-            } => self.source_control_mutated(key, operation, report, committed),
+            } => handled!(self.source_control_mutated(key, operation, report, committed)),
         };
         // Scoped proof was established during dispatch. Settings commit and
         // close processing can invalidate it before chrome is projected.

@@ -1,9 +1,10 @@
 //! Dispatch for the sidebar's actions: navigation, project, channel and
 //! worktree rows, and the confirmations they open.
 use super::*;
+use std::ops::ControlFlow;
 
 impl Cagents {
-    pub(super) fn update_sidebar(&mut self, action: SidebarAction) -> Task<Message> {
+    pub(super) fn update_sidebar(&mut self, action: SidebarAction) -> Handled {
         // A control in the pane can still be activated while a dialog
         // is up: the modal captures the pointer, and the focus
         // operation the dialog issues on open cannot reach a pane
@@ -21,20 +22,22 @@ impl Cagents {
         // everything while it is up would strand it with no way out - a
         // worse fault than the one this guard exists for.
         if self.modal_is_open() && !answers_discard_confirmation(&action) {
-            return Task::none();
+            return ControlFlow::Break(Task::none());
         }
         // Folding takes the rows, and any keyboard focus on one, out
         // of the tree; ask the tree drawn now before it does.
         if action == SidebarAction::ToggleInProgress {
             if !self.sidebar_state.toggle_in_progress() {
-                return Task::none();
+                return ControlFlow::Break(Task::none());
             }
-            return sidebar::in_progress_holds_focus(
-                &self.sidebar_model,
-                &self.sidebar_state,
-                self.projects_sidebar_mode() == SidebarMode::Compact,
-            )
-            .map(|refocus| cosmic::Action::App(Message::FoldInProgress { refocus }));
+            return ControlFlow::Break(
+                sidebar::in_progress_holds_focus(
+                    &self.sidebar_model,
+                    &self.sidebar_state,
+                    self.projects_sidebar_mode() == SidebarMode::Compact,
+                )
+                .map(|refocus| cosmic::Action::App(Message::FoldInProgress { refocus })),
+            );
         }
         if matches!(&action, SidebarAction::FilesPage { key, .. }
             | SidebarAction::FilesQueryChanged { key, .. }
@@ -46,14 +49,14 @@ impl Cagents {
             | SidebarAction::CommitEditorAction { key, .. }
             | SidebarAction::AmendChanged { key, .. } if !self.source_control_is_bound(key))
         {
-            return Task::none();
+            return ControlFlow::Break(Task::none());
         }
         let action = if matches!(action, SidebarAction::ChangeGroup { .. }) {
             let Some(source) = &self.sidebar_model.source_control else {
-                return Task::none();
+                return ControlFlow::Break(Task::none());
             };
             let Some(resolved) = sidebar::resolve_group_command(source, &action) else {
-                return Task::none();
+                return ControlFlow::Break(Task::none());
             };
             resolved
         } else {
@@ -65,7 +68,7 @@ impl Cagents {
             .sidebar_entered_directory(&action)
             .is_some_and(|directory| self.refuse_in_deleting_worktree(&directory))
         {
-            return Task::none();
+            return ControlFlow::Break(Task::none());
         }
         if let SidebarAction::OpenWorktree {
             project_id,
@@ -99,7 +102,7 @@ impl Cagents {
         if let Some(row) = opened {
             self.select_sidebar_rows(row, sidebar::SelectionIntent::Navigate);
         }
-        match action {
+        let task = match action {
             SidebarAction::ToggleProjects => self.update_chrome(chrome_ui::Action::ToggleProjects),
             SidebarAction::RenameChannel(id) => self.update_chrome(chrome_ui::Action::RenameChannel(id)),
             SidebarAction::MarkChannelRead(id) => {
@@ -126,16 +129,16 @@ impl Cagents {
             SidebarAction::NavigateRow { row, key } => {
                 use keyboard::key::Named;
                 if key == Named::Enter {
-                    return self.open_sidebar_navigation_row(row);
+                    return ControlFlow::Break(self.open_sidebar_navigation_row(row));
                 }
                 if matches!(key, Named::ArrowLeft | Named::ArrowRight) {
                     if let sidebar::SelectionRow::Project(project) = row {
                         let expanded = self.sidebar_state.project_expanded(project);
                         if expanded == (key == Named::ArrowLeft) {
-                            return self.update(Message::Sidebar(SidebarAction::ToggleProject(project)));
+                            return ControlFlow::Break(self.update(Message::Sidebar(SidebarAction::ToggleProject(project))));
                         }
                     }
-                    return Task::none();
+                    return ControlFlow::Break(Task::none());
                 }
                 self.sidebar_keyboard_neighbor(row, key).map_or_else(Task::none, |row| sidebar::focus_and_reveal(sidebar::selection_row_focus_id(row)).map(cosmic::Action::App))
             }
@@ -209,7 +212,7 @@ impl Cagents {
                 repository,
             } => {
                 if self.sidebar_model.project(project_id).is_some_and(|project| project.kind == ProjectKind::Folder) {
-                    return Task::none();
+                    return ControlFlow::Break(Task::none());
                 }
                 self.open_worktree_dialog(
                     project_id,
@@ -221,7 +224,7 @@ impl Cagents {
             SidebarAction::Refresh => {
                 let targets = repository_refresh_targets(&self.sidebar_model.projects);
                 if targets.is_empty() {
-                    return cosmic::task::message(Message::OpenRepository);
+                    return ControlFlow::Break(cosmic::task::message(Message::OpenRepository));
                 }
                 self.sidebar_model.data_state = SidebarDataState::Loading;
                 Task::batch(targets.into_iter().map(|(repository, id)| {
@@ -241,7 +244,7 @@ impl Cagents {
                     self.status = Some(TransientNotice::warning(
                         "This repository is not associated with an authenticated GitHub remote",
                     ));
-                    return Task::none();
+                    return ControlFlow::Break(Task::none());
                 };
                 let head = pull_request_head(
                     &self.sidebar_model.projects,
@@ -417,7 +420,7 @@ impl Cagents {
             }
             SidebarAction::OpenFileInEditor { key, path, editor_id } => {
                 if !self.source_control_is_bound(&key) {
-                    return Task::none();
+                    return ControlFlow::Break(Task::none());
                 }
                 self.open_file_in_editor(
                     key.canonical_path.join(path.as_path()),
@@ -433,7 +436,7 @@ impl Cagents {
             }
             SidebarAction::Stage { key, selection } => {
                 let Some(operation) = self.begin_mutation(&key, MutationKind::Stage, None) else {
-                    return Task::none();
+                    return ControlFlow::Break(Task::none());
                 };
                 let request = StageRequest {
                     worktree: key.canonical_path.clone(),
@@ -448,7 +451,7 @@ impl Cagents {
             }
             SidebarAction::Unstage { key, selection } => {
                 let Some(operation) = self.begin_mutation(&key, MutationKind::Unstage, None) else {
-                    return Task::none();
+                    return ControlFlow::Break(Task::none());
                 };
                 let request = UnstageRequest {
                     worktree: key.canonical_path.clone(),
@@ -468,7 +471,7 @@ impl Cagents {
             // unconfirmed one outright.
             SidebarAction::ConfirmDiscard { key, request } => {
                 let Some(operation) = self.begin_mutation(&key, MutationKind::Discard, None) else {
-                    return Task::none();
+                    return ControlFlow::Break(Task::none());
                 };
                 Self::mutation_task(key, operation, move |service, cancel| {
                     (
@@ -480,7 +483,7 @@ impl Cagents {
             SidebarAction::Commit { key, message, amend } => {
                 let commit_revision = self.sidebar_state.submitted_commit_revision(&key, &message, amend);
                 let Some(operation) = self.begin_mutation(&key, MutationKind::Commit, commit_revision) else {
-                    return Task::none();
+                    return ControlFlow::Break(Task::none());
                 };
                 let request = CommitRequest {
                     worktree: key.canonical_path.clone(),
@@ -496,7 +499,7 @@ impl Cagents {
                 target,
             } => {
                 let Some(operation) = self.begin_mutation(&key, MutationKind::Push, None) else {
-                    return Task::none();
+                    return ControlFlow::Break(Task::none());
                 };
                 let request = PushRequest {
                     worktree: key.canonical_path.clone(),
@@ -510,10 +513,10 @@ impl Cagents {
             SidebarAction::OpenPublish { .. } => Task::none(),
             SidebarAction::LoadMoreHistory { key, page } => {
                 if !self.source_control_is_bound(&key) {
-                    return Task::none();
+                    return ControlFlow::Break(Task::none());
                 }
                 if let Some(source) = self.sidebar_model.source_control.as_mut() {
-                    if source.history_loading || source.next_history_page != page { return Task::none(); }
+                    if source.history_loading || source.next_history_page != page { return ControlFlow::Break(Task::none()); }
                     source.mark_history_requested();
                 }
                 Self::source_control_history_task(self.history_ui.next_page_request(), key, self.sidebar_model.source_control.as_ref().and_then(|source| source.head_oid.as_deref()).and_then(|oid| crate::repository::Oid::parse_object(oid).ok()), page)
@@ -536,10 +539,10 @@ impl Cagents {
                         self.status = Some(TransientNotice::warning(
                             "Remote files cannot be revealed in the local file manager",
                         ));
-                        return Task::none();
+                        return ControlFlow::Break(Task::none());
                     }
                     if !self.source_control_is_bound(&key) {
-                        return Task::none();
+                        return ControlFlow::Break(Task::none());
                     }
                     let path = key.canonical_path.join(path.as_path());
                     cosmic::task::future(async move {
@@ -587,6 +590,7 @@ impl Cagents {
                 }
                 self.save_settings_task(false)
             },
-        }
+        };
+        ControlFlow::Continue(task)
     }
 }

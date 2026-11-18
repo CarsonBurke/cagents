@@ -1,9 +1,10 @@
 //! Dispatch for a repository pane's own actions: editing, saving, review and
 //! Git operations started from inside the pane.
 use super::*;
+use std::ops::ControlFlow;
 
 impl Cagents {
-    pub(super) fn update_repository(&mut self, action: RepositoryAction) -> Task<Message> {
+    pub(super) fn update_repository(&mut self, action: RepositoryAction) -> Handled {
         self.retain_repository_operation(&action);
         if matches!(
             &action,
@@ -19,7 +20,7 @@ impl Cagents {
             {
                 runtime.retire_auto_save_due(identity, *revision, *ticket);
             }
-            return Task::none();
+            return ControlFlow::Break(Task::none());
         }
         if matches!(
             &action,
@@ -37,10 +38,10 @@ impl Cagents {
         } = &action
             && !matches!(self.cards.get(&identity.card), Some(CardRuntime::PullRequests(pane)) if pane.review.annotation_revision() == *review_revision)
         {
-            return Task::none();
+            return ControlFlow::Break(Task::none());
         }
         if self.modal_is_open() && !repository_action_allowed_while_modal(&action) {
-            return Task::none();
+            return ControlFlow::Break(Task::none());
         }
         let card = action.card();
         let find_preferences_changed = matches!(
@@ -191,6 +192,6 @@ impl Cagents {
         if !self.project_ui.closing.is_empty() {
             tasks.push(self.complete_closed_projects());
         }
-        Task::batch(tasks)
+        ControlFlow::Continue(Task::batch(tasks))
     }
 }

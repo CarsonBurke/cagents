@@ -1,6 +1,7 @@
 //! Applying source control results to the bound worktree: a loaded status
 //! snapshot, a page of commit history, and the end of a staged mutation.
 use super::*;
+use std::ops::ControlFlow;
 
 impl Cagents {
     pub(super) fn source_control_loaded(
@@ -8,9 +9,9 @@ impl Cagents {
         key: ActiveWorktreeKey,
         request: u64,
         result: Result<Box<RepositorySnapshot>, String>,
-    ) -> Task<Message> {
+    ) -> Handled {
         if request != self.refresh_ui.source_generation || !self.source_control_is_bound(&key) {
-            return Task::none();
+            return ControlFlow::Break(Task::none());
         }
         self.refresh_ui.source_cancel = None;
         if let Ok(snapshot) = &result
@@ -39,13 +40,13 @@ impl Cagents {
             previous.carry_mutation_into(&mut next);
         }
         self.sidebar_model.source_control = Some(next);
-        match result {
+        ControlFlow::Continue(match result {
             Ok(snapshot) => self.refresh_branch_changes(&snapshot),
             Err(_) => {
                 self.cancel_branch_changes();
                 Task::none()
             }
-        }
+        })
     }
 
     pub(super) fn source_control_history(
@@ -55,9 +56,9 @@ impl Cagents {
         page: u32,
         head: crate::repository::Oid,
         result: Result<Vec<CommitSummary>, String>,
-    ) -> Task<Message> {
+    ) -> Handled {
         if !self.source_control_is_bound(&key) || !self.history_ui.accepts_page(generation) {
-            return Task::none();
+            return ControlFlow::Break(Task::none());
         }
         match result {
             Ok(commits) => {
@@ -83,7 +84,7 @@ impl Cagents {
                 }
             }
         }
-        Task::none()
+        ControlFlow::Continue(Task::none())
     }
 
     pub(super) fn source_control_mutated(
@@ -92,14 +93,14 @@ impl Cagents {
         operation: uuid::Uuid,
         report: Option<String>,
         committed: bool,
-    ) -> Task<Message> {
+    ) -> Handled {
         let Some(mutation) = self
             .source_control_mutations
             .get(&key.canonical_path)
             .copied()
             .filter(|mutation| mutation.id == operation)
         else {
-            return Task::none();
+            return ControlFlow::Break(Task::none());
         };
         let notice_key =
             (mutation.kind == MutationKind::Commit).then(|| NoticeKey::GitCommit(key.clone()));
@@ -143,6 +144,6 @@ impl Cagents {
         if let Some(bound) = bound {
             refreshes.push(self.reload_source_control(&bound));
         }
-        Task::batch(refreshes)
+        ControlFlow::Continue(Task::batch(refreshes))
     }
 }

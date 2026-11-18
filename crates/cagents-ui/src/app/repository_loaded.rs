@@ -1,6 +1,7 @@
 //! Applying a project's loaded repository, worktrees and GitHub state to the
 //! sidebar, the open cards and the refresh bookkeeping.
 use super::*;
+use std::ops::ControlFlow;
 
 impl Cagents {
     pub(super) fn repository_loaded(
@@ -9,9 +10,9 @@ impl Cagents {
         project_id: ProjectId,
         generation: u64,
         result: Result<Box<LoadedRepository>, String>,
-    ) -> Task<Message> {
+    ) -> Handled {
         if self.repository_generations.get(&project_id) != Some(&generation) {
-            return Task::none();
+            return ControlFlow::Break(Task::none());
         }
         self.refresh_ui.projects.remove(&project_id);
         self.refresh_ui.finished(
@@ -25,7 +26,7 @@ impl Cagents {
             Ok(loaded) => 'loaded: {
                 if self.project_ui.closed.contains(&loaded.project.repository) {
                     self.repository_generations.remove(&project_id);
-                    return Task::none();
+                    return ControlFlow::Break(Task::none());
                 }
                 let pr_request = if let GitHubAvailability::Ready {
                     repository_key,
@@ -351,6 +352,6 @@ impl Cagents {
                 task = self.apply_closed_project_tombstones();
             }
         }
-        task
+        ControlFlow::Continue(task)
     }
 }
