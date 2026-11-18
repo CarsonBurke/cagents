@@ -349,7 +349,11 @@ fn a_fresh_conversation_sends_and_reopens_while_recovery_holds_retained_owners()
         "the reopened provider did not resume its conversation",
         || {
             std::fs::read_to_string(root.join("claude-arguments"))
-                .is_ok_and(|arguments| arguments.lines().any(|argument| argument == conversation))
+                .is_ok_and(|arguments| {
+                    arguments
+                        .lines()
+                        .any(|argument| argument == format!("--resume={conversation}"))
+                })
         },
     );
     process_request(
