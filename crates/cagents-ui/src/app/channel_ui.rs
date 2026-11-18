@@ -2428,7 +2428,13 @@ impl Cagents {
         }
         let channel_ui = &self.channel_ui;
         let state = &self.sidebar_state;
-        for project in &mut self.sidebar_model.projects {
+        // The rows are compared through a shared borrow and written only
+        // where they differ: a mutable borrow takes a new revision, and the
+        // navigation list deep-compares every project on a frame after one.
+        // Most projections change no row, so most take none.
+        let mut changed_rows = Vec::new();
+        let mut row_counts = Vec::new();
+        for (position, project) in self.sidebar_model.projects.iter().enumerate() {
             // One primary-branch lookup and placeholder per project refresh,
             // regardless of how many unnamed channels it contains.
             let unnamed = default_channel_title(Some(project));
@@ -2559,15 +2565,29 @@ impl Cagents {
                     .with_attention(attention);
                     row.deletion = deletion;
                     row = row.with_notification_preview(notification_preview.cloned());
-                    if index < project.channels.len() {
-                        project.channels[index] = row;
-                    } else {
-                        project.channels.push(row);
-                    }
+                    changed_rows.push((position, index, row));
                 }
                 index += 1;
             }
-            project.channels.truncate(index);
+            if index != project.channels.len() {
+                row_counts.push((position, index));
+            }
+        }
+        if changed_rows.is_empty() && row_counts.is_empty() {
+            return;
+        }
+        let projects = &mut *self.sidebar_model.projects;
+        // Ascending per project, so a row past the end is always the next one.
+        for (position, index, row) in changed_rows {
+            let channels = &mut projects[position].channels;
+            if index < channels.len() {
+                channels[index] = row;
+            } else {
+                channels.push(row);
+            }
+        }
+        for (position, count) in row_counts {
+            projects[position].channels.truncate(count);
         }
     }
 }
@@ -2975,6 +2995,65 @@ pub(in crate::app) mod tests {
             !app.modal_is_open(),
             "creating a channel opens its composer directly"
         );
+    }
+
+    #[test]
+    fn a_projection_that_changes_no_channel_row_keeps_the_sidebar_revision() {
+        use crate::sidebar::Revisioned;
+
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let project = ProjectId::new();
+        let id = ChannelId::new();
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .push(ProjectChannel {
+                title_source: Default::default(),
+                id,
+                project_id: project,
+                title: "Parser".into(),
+                ordinal: 0,
+                shared: false,
+                cards: vec![card],
+                focused: Some(card),
+            });
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "project".into(),
+            "/repo".into(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        drop(app.project_workspace(false));
+        let settled = Revisioned::revision(&app.sidebar_model.projects);
+
+        drop(app.project_workspace(false));
+        app.refresh_sidebar_channels();
+        assert_eq!(
+            Revisioned::revision(&app.sidebar_model.projects),
+            settled,
+            "rows that are already current take no new revision"
+        );
+
+        Arc::make_mut(&mut app.durable).channels[0].title = "Lexer".into();
+        drop(app.project_workspace(false));
+        assert_ne!(
+            Revisioned::revision(&app.sidebar_model.projects),
+            settled,
+            "a changed row takes a new revision"
+        );
+        assert_eq!(app.sidebar_model.projects[0].channels[0].title, "Lexer");
+
+        Arc::make_mut(&mut app.durable).channels.clear();
+        let renamed = Revisioned::revision(&app.sidebar_model.projects);
+        drop(app.project_workspace(false));
+        assert_ne!(
+            Revisioned::revision(&app.sidebar_model.projects),
+            renamed,
+            "a removed row takes a new revision"
+        );
+        assert!(app.sidebar_model.projects[0].channels.is_empty());
     }
 
     #[test]
