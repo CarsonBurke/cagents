@@ -139,9 +139,14 @@ fn blocked_app_with(
         app.chat_forget(card);
         app.cards
             .insert(card, CardRuntime::Failed("Daemon proof changed".into()));
-        app.chat_ui
-            .blocked_starts
-            .insert(card, blocked_recovery::BlockedStart { source, reopen });
+        app.chat_ui.blocked_starts.insert(
+            card,
+            blocked_recovery::BlockedStart {
+                source,
+                reopen,
+                liveness: Default::default(),
+            },
+        );
     }
     (app, card)
 }

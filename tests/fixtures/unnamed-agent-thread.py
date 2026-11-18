@@ -5,6 +5,9 @@ Before #3095 a daemon-hosted Codex agent's confirmed thread ID reached neither
 its agent record nor, unless a window showed it, its pane; this puts a fixture
 back in that state. Run `forget` through `native-evidence env` between
 sessions, with the fixture daemon stopped.
+
+`listeners` prints the Codex listener socket each forgotten agent's pane owns,
+one per line, for a stand-in provider that outlived its daemon.
 """
 
 import argparse
@@ -63,10 +66,30 @@ def forget(db):
     return forgotten
 
 
+def listeners(db):
+    sockets = []
+    for (descriptor,) in db.execute("SELECT descriptor FROM panes WHERE kind = 'chat'").fetchall():
+        descriptor = json.loads(descriptor)
+        owned = descriptor.get("owned_codex_listener")
+        if (
+            descriptor["launch"]["provider"] == "Codex"
+            and descriptor["launch"].get("session_id") is None
+            and owned
+        ):
+            sockets.append(owned["socket"])
+    if not sockets:
+        raise ValueError("the fixture has no Codex pane with a forgotten thread")
+    return sockets
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["forget"])
-    parser.parse_args()
+    parser.add_argument("action", choices=["forget", "listeners"])
+    action = parser.parse_args().action
+    if action == "listeners":
+        db = sqlite3.connect(f"file:{registry_path()}?mode=ro", uri=True, timeout=5)
+        print("\n".join(listeners(db)))
+        return
     db = sqlite3.connect(f"file:{registry_path()}?mode=rw", uri=True, timeout=5)
     with db:
         print(json.dumps({"forgotten": forget(db)}))

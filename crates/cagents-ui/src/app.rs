@@ -10812,6 +10812,15 @@ impl Cagents {
         for transition in update.transitions {
             tracing::debug!(target: "cagents::pane_open", stage = "visibility", card = ?transition.id, to = ?transition.to);
             self.set_exposure(transition.id, transition.to.into());
+            // Whether an unreachable agent still runs can change while its
+            // card is out of sight, so it is asked again whenever it is shown.
+            if transition.to == VisibilityClass::Visible
+                && let Some(source) = self
+                    .unnamed_agent(transition.id)
+                    .map(|blocked| blocked.source.clone())
+            {
+                tasks.push(self.ask_unnamed_agent_running(transition.id, source));
+            }
             let browser_card = self
                 .card_state(transition.id)
                 .is_some_and(|card| matches!(&card.kind, CardKind::Browser(_)));
@@ -12193,6 +12202,9 @@ impl Cagents {
                 .center(Length::Fill)
                 .into()
             }
+            Some(CardRuntime::Failed(_)) if self.unnamed_agent(id).is_some() => self
+                .unnamed_agent_view(id)
+                .expect("an unreachable agent's card has its own state"),
             Some(CardRuntime::Failed(message)) => widget::container(
                 widget::container(
                     widget::column::with_children(vec![

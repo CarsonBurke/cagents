@@ -198,7 +198,7 @@ impl Cagents {
 
 /// What still runs for `session`, after ending those of `end` that are proved
 /// to be its own.
-fn lost_processes(
+pub(super) fn lost_processes(
     session: chat::Session,
     end: Vec<ProcessStart>,
 ) -> Result<Vec<LostProcess>, String> {
