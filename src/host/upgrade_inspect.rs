@@ -272,9 +272,13 @@ fn inspect(request: Request) -> Result<SourceInspection, String> {
                         && !result
                             .as_ref()
                             .is_ok_and(|resolved| resolved.native_continuity.retains_provider())
-                        && reader.inspect_saved_history(source).is_ok()
                     {
-                        cold_history.push(source.clone());
+                        match reader.inspect_saved_history(source) {
+                            Ok(()) => cold_history.push(source.clone()),
+                            Err(reason) => {
+                                tracing::warn!(%reason, "saved history inspection failed");
+                            }
+                        }
                     }
                     resolutions.push((source.clone(), result));
                 }

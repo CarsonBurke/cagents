@@ -6790,15 +6790,10 @@ for line in sys.stdin:
             .handle
             .clone();
         handle.set_visible(true);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if handle.snapshot(None).unwrap().exited {
-                break;
-            }
-            assert!(Instant::now() < deadline);
-            thread::yield_now();
-        }
-        let snapshot = handle.snapshot(None).unwrap();
+        // The reader's exit ends the saved frame it applies after attach.
+        let snapshot = crate::test_timing::wait_for("the saved reader to apply its frame", || {
+            handle.snapshot(None).filter(|snapshot| snapshot.exited)
+        });
         assert_eq!(snapshot.session_id, saved.launch.session_id);
         assert_eq!(snapshot.items.len(), 1);
         assert!(!handle.owns_work());

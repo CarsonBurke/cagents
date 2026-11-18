@@ -6106,16 +6106,10 @@ pub(super) mod tests {
             let handle =
                 chat::runtime::Handle::start(spec, Box::new(adapter), initial, store, None, |_| {})
                     .unwrap();
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while handle.conversation_title().ok()
-                != Some((session.map(str::to_owned), title.map(str::to_owned)))
-            {
-                assert!(
-                    Instant::now() < deadline,
-                    "history worker did not publish its exact session"
-                );
-                std::thread::sleep(Duration::from_millis(5));
-            }
+            let expected = Some((session.map(str::to_owned), title.map(str::to_owned)));
+            crate::test_timing::wait_for("the history worker to publish its exact session", || {
+                (handle.conversation_title().ok() == expected).then_some(())
+            });
             handle
         };
         let reported = start(Some(SESSION), None);
