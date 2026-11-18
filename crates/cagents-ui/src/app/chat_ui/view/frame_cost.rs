@@ -235,8 +235,9 @@ fn a_streaming_frame_of_a_full_window() {
 
 /// A working turn that gains one short message a frame, as an agent
 /// narrating its work does, after sixteen finished exchanges. Each row is the
-/// frame cost once the working turn holds that many messages; it should not
-/// grow with them, since every message but the newest is unchanged.
+/// frame cost once the working turn holds that many messages. Only the newest
+/// message is built and laid out again, but every message still describes
+/// and places its row each frame, so the cost grows slowly with the turn.
 #[test]
 #[ignore = "a measurement, not a check; see the module documentation"]
 fn a_frame_of_a_turn_gaining_messages() {
