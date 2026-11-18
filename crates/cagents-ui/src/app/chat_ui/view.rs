@@ -331,6 +331,8 @@ const REQUEST_CONTEXT_CEILING: f32 = 160.0;
 /// arrived at the oldest message they have should not have to nudge the wheel
 /// again to be believed.
 const PAGE_REACH: f32 = 24.0;
+/// How many viewport heights before a loaded edge the next page is fetched.
+const PREFETCH_SCREENS: f32 = 2.0;
 
 /// The composer editor, drawing no surface of its own.
 ///
@@ -1061,6 +1063,30 @@ impl Scroll {
 
     pub(super) fn page_height(self) -> f32 {
         (self.window * 0.9).max(1.0)
+    }
+
+    /// Whether the next earlier page should be fetched now, ahead of the
+    /// reader. A page slides the window by half and keeps the older half, so
+    /// short of the very top this waits until the whole viewport is in that
+    /// half: what is on screen never leaves the window.
+    pub(super) fn prefetch_earlier(self) -> bool {
+        self.at_top()
+            || (self.from_top <= self.prefetch_reach()
+                && self.from_top + self.window <= self.content * 0.5)
+    }
+
+    /// Whether the next newer page should be fetched now, the mirror of
+    /// [`Self::prefetch_earlier`].
+    pub(super) fn prefetch_later(self) -> bool {
+        self.at_bottom()
+            || (self.travel() - self.from_top <= self.prefetch_reach()
+                && self.from_top >= self.content * 0.5)
+    }
+
+    /// How far from a loaded edge a page is fetched: far enough that wheel
+    /// and Page Up reading does not reach the edge before the page arrives.
+    fn prefetch_reach(self) -> f32 {
+        self.window * PREFETCH_SCREENS
     }
 }
 

@@ -109,6 +109,16 @@ const LINE_BYTES: usize = 4 * 1024;
 /// tiny paths could satisfy the text budget and still overrun the serialized one.
 const ELEMENT_BYTES: usize = 16;
 type Cursor = (i64, usize);
+/// A page request that slides the window: it keeps the half the reader is in
+/// and fills the other half from further along, so what is on screen stays
+/// loaded. `from` is the old edge in the requested direction; a window that
+/// does not pass it has made no progress and falls back to a page that starts
+/// at that edge.
+#[derive(Clone, Copy)]
+enum Slide {
+    Earlier { from: Cursor },
+    Later { from: Cursor },
+}
 #[derive(Clone, Copy)]
 enum LatestBoundary {
     BeforeAll,
@@ -139,11 +149,16 @@ pub(crate) struct Store {
     end: Option<Cursor>,
     first: Option<Cursor>,
     newest: Option<Cursor>,
+    /// The part in the middle of the window, where a page slide pivots.
+    middle: Option<Cursor>,
     forward: Option<Cursor>,
+    slide: Option<Slide>,
     paging: bool,
     cached_earlier: bool,
     provider_earlier: bool,
     pending_earlier: Option<Cursor>,
+    /// Where the window will end once the provider's earlier page arrives.
+    pending_pivot: Option<Cursor>,
     latest_boundary: Option<LatestBoundary>,
     pub dirty: bool,
     /// Dirty identities are bounded even while the conversation is hidden.
@@ -389,11 +404,14 @@ impl Store {
                 end: None,
                 first: None,
                 newest: None,
+                middle: None,
                 forward: None,
+                slide: None,
                 paging: false,
                 cached_earlier: false,
                 provider_earlier: false,
                 pending_earlier: None,
+                pending_pivot: None,
                 latest_boundary: None,
                 messages: None,
                 dirty: true,
@@ -784,13 +802,20 @@ impl Store {
                 .transpose()
                 .map(Option::flatten)
         };
-        let (end, first, newest, forward, pending_earlier) = (
+        let (end, first, newest, middle, forward, pending_earlier, pending_pivot) = (
             remap(self.end)?,
             remap(self.first)?,
             remap(self.newest)?,
+            remap(self.middle)?,
             remap(self.forward)?,
             remap(self.pending_earlier)?,
+            remap(self.pending_pivot)?,
         );
+        let slide = match self.slide {
+            Some(Slide::Earlier { from }) => remap(Some(from))?.map(|from| Slide::Earlier { from }),
+            Some(Slide::Later { from }) => remap(Some(from))?.map(|from| Slide::Later { from }),
+            None => None,
+        };
         let latest_boundary = match self.latest_boundary {
             Some(LatestBoundary::After(ordinal)) => {
                 let mapped: Option<i64> = transaction.query_row(
@@ -815,8 +840,11 @@ impl Store {
         self.end = end;
         self.first = first;
         self.newest = newest;
+        self.middle = middle;
         self.forward = forward;
+        self.slide = slide;
         self.pending_earlier = pending_earlier;
+        self.pending_pivot = pending_pivot;
         self.latest_boundary = latest_boundary;
         self.dirty = true;
         Ok(())
@@ -973,6 +1001,7 @@ impl Store {
                     // A latest reread cannot satisfy an outstanding older
                     // cursor, including a deferred reread after RPC failure.
                     self.pending_earlier = None;
+                    self.pending_pivot = None;
                 }
                 self.provider_earlier = has_earlier;
                 let mut seen = std::collections::BTreeSet::new();
@@ -988,6 +1017,7 @@ impl Store {
                         warning.clone()
                     }));
                 }
+                let pivot = self.pending_pivot.take();
                 if let Some(first) = self.pending_earlier.take()
                     && self.db.query_row(
                         "SELECT EXISTS(SELECT 1 FROM items WHERE ordinal<?1)",
@@ -995,9 +1025,7 @@ impl Store {
                         |row| row.get::<_, bool>(0),
                     )?
                 {
-                    self.end = Some((first.0, first.1 + 1));
-                    self.forward = None;
-                    self.paging = true;
+                    self.slide_earlier(first, pivot);
                 }
                 self.dirty = true;
                 out.push(Event::HistoryRecovered);
@@ -1049,11 +1077,14 @@ impl Store {
                 self.end = None;
                 self.first = None;
                 self.newest = None;
+                self.middle = None;
                 self.forward = None;
+                self.slide = None;
                 self.paging = false;
                 self.provider_earlier = false;
                 self.cached_earlier = false;
                 self.pending_earlier = None;
+                self.pending_pivot = None;
                 self.latest_boundary = None;
                 self.dirty = true;
                 out.push(Event::Reset { reason });
@@ -1065,6 +1096,7 @@ impl Store {
                 // for an unrelated later history response. Successful pages
                 // consume the cursor before publishing loading=false.
                 self.pending_earlier = None;
+                self.pending_pivot = None;
                 self.latest_boundary = None;
                 out.push(Event::HistoryLoading(false));
                 return Ok(out);
@@ -1081,6 +1113,7 @@ impl Store {
             event @ (Event::Exited { .. } | Event::Error { fatal: true, .. }) => {
                 self.latest_boundary = None;
                 self.pending_earlier = None;
+                self.pending_pivot = None;
                 out.push(event);
                 return Ok(out);
             }
@@ -1165,25 +1198,37 @@ impl Store {
         self.trim_wal();
         Ok(warning)
     }
-    /// Returns true when earlier history is already cached (no provider command).
+    /// Slide the window toward earlier history. It keeps the older half of
+    /// what is displayed, where a reader paging back is, and fills the rest
+    /// from before it. Returns true when earlier history is already cached
+    /// (no provider command).
     pub fn earlier(&mut self) -> Result<bool, String> {
         if self.cached_earlier {
             if let Some(first) = self.first {
-                self.end = Some((first.0, first.1 + 1));
-                self.forward = None;
+                self.slide_earlier(first, self.middle);
             }
-            self.paging = true;
-            self.dirty = true;
             Ok(true)
         } else if self.provider_earlier {
             self.pending_earlier = self.first;
+            self.pending_pivot = self.middle;
             Ok(false)
         } else {
             Err("No earlier transcript is available".into())
         }
     }
-    /// Continue from the newest displayed chunk, retaining it as an anchor.
-    /// Only two cursors are retained, regardless of conversation length.
+    /// End the next window at `pivot`, or at `first` when the window has no
+    /// distinct middle, so that it starts before `first`.
+    fn slide_earlier(&mut self, first: Cursor, pivot: Option<Cursor>) {
+        let pivot = pivot.filter(|pivot| *pivot > first).unwrap_or(first);
+        self.end = Some((pivot.0, pivot.1 + 1));
+        self.forward = None;
+        self.slide = Some(Slide::Earlier { from: first });
+        self.paging = true;
+        self.dirty = true;
+    }
+    /// Slide the window toward newer history. It keeps the newer half of
+    /// what is displayed and continues after it. Only a few cursors are
+    /// retained, regardless of conversation length.
     pub fn later(&mut self) -> Result<bool, String> {
         if self.end.is_none() {
             return Err("No newer cached transcript is available".into());
@@ -1191,9 +1236,12 @@ impl Store {
         let newest = self
             .newest
             .ok_or("No newer cached transcript is available")?;
-        self.forward = Some(newest);
+        let pivot = self.middle.filter(|pivot| *pivot < newest).unwrap_or(newest);
+        self.forward = Some(pivot);
+        self.slide = Some(Slide::Later { from: newest });
         self.paging = true;
         self.pending_earlier = None;
+        self.pending_pivot = None;
         self.dirty = true;
         Ok(true)
     }
@@ -1201,7 +1249,9 @@ impl Store {
         self.paging = false;
         self.forward = None;
         self.end = None;
+        self.slide = None;
         self.pending_earlier = None;
+        self.pending_pivot = None;
         self.dirty = true;
     }
     fn field(&self, id: &str, field: i64, start: usize, end: usize) -> Result<Vec<u8>, StoreError> {
@@ -1355,6 +1405,7 @@ impl Store {
                 .map_err(|e| e.to_string())?
         };
         let mut items = Vec::new();
+        let mut cursors = Vec::new();
         let mut bytes = 0;
         let mut first = None;
         let mut newest = None;
@@ -1444,6 +1495,7 @@ impl Store {
                         Some(first.map_or((ordinal, part), |old: Cursor| old.min((ordinal, part))));
                     bytes += size;
                     copy_projection.push(copy_source);
+                    cursors.push((ordinal, part));
                     items.push(std::sync::Arc::clone(previous));
                     continue;
                 }
@@ -1564,6 +1616,7 @@ impl Store {
                 bytes += size;
                 first = Some(first.map_or((ordinal, part), |old: Cursor| old.min((ordinal, part))));
                 copy_projection.push(copy_source);
+                cursors.push((ordinal, part));
                 items.push(std::sync::Arc::new(item));
             }
         }
@@ -1587,10 +1640,37 @@ impl Store {
                 return self.window_reusing(previous);
             }
         }
+        // A slide keeps half of what was displayed. When the history past
+        // its pivot is too large to fit beside that half, the window holds
+        // nothing new; page from the old edge instead, as a page without
+        // that overlap would.
+        if self.paging {
+            match self.slide {
+                Some(Slide::Earlier { from })
+                    if self.forward.is_none()
+                        && first.is_some_and(|first| first >= from)
+                        && self.end != Some((from.0, from.1 + 1)) =>
+                {
+                    self.end = Some((from.0, from.1 + 1));
+                    return self.window_reusing(previous);
+                }
+                Some(Slide::Later { from })
+                    if self.forward.is_some()
+                        && newest.is_some_and(|newest| newest <= from)
+                        && self.forward != Some(from) =>
+                {
+                    self.forward = Some(from);
+                    return self.window_reusing(previous);
+                }
+                _ => {}
+            }
+        }
         if self.forward.is_none() {
             items.reverse();
             copy_projection.reverse();
+            cursors.reverse();
         }
+        self.middle = cursors.get(cursors.len() / 2).copied();
         self.cached_earlier = match first {
             Some((ordinal, part)) => {
                 part > 0
@@ -1643,6 +1723,7 @@ impl Store {
         previous.clear();
         self.dirty = false;
         self.paging = false;
+        self.slide = None;
         self.changed = Some(Default::default());
         Ok(Window {
             items,
@@ -2369,8 +2450,10 @@ mod tests {
             .collect()
     }
 
+    /// Paging slides the window by half: the half a reader paging that way
+    /// is in stays loaded, so what is on screen never leaves the window.
     #[test]
-    fn bounded_history_pages_overlap_and_continue_in_both_directions() {
+    fn bounded_history_pages_slide_by_half_and_continue_in_both_directions() {
         let mut store = Store::at(std::env::temp_dir()).unwrap();
         for n in 0..400 {
             store
@@ -2380,33 +2463,55 @@ mod tests {
         let latest = store.window().unwrap();
         assert_eq!(latest.items.len(), WINDOW_ITEMS);
         assert!(!latest.has_later);
-        store.earlier().unwrap();
-        let older = store.window().unwrap();
-        assert_eq!(
-            older.items.last().unwrap().id,
-            latest.items.first().unwrap().id
-        );
-        assert!(older.has_later);
-        store.earlier().unwrap();
-        let oldest = store.window().unwrap();
-        assert_eq!(
-            oldest.items.last().unwrap().id,
-            older.items.first().unwrap().id
-        );
-        assert!(oldest.items.len() <= WINDOW_ITEMS);
-        let mut boundary = oldest.items.last().unwrap().id.clone();
+        let mut page = latest.items;
+        for _ in 0..2 {
+            store.earlier().unwrap();
+            let older = store.window().unwrap();
+            assert!(older.items.ends_with(&page[..=page.len() / 2]));
+            assert_eq!(older.items.len(), WINDOW_ITEMS);
+            assert!(older.items[0].id < page[0].id);
+            assert!(older.has_later);
+            page = older.items;
+        }
+        assert_eq!(page[0].id, "row-146");
         for _ in 0..4 {
             store.later().unwrap();
             let next = store.window().unwrap();
-            assert_eq!(next.items.first().unwrap().id, boundary);
+            assert!(next.items.starts_with(&page[page.len() / 2..]));
             assert!(next.items.len() <= WINDOW_ITEMS);
-            boundary = next.items.last().unwrap().id.clone();
+            page = next.items;
             if !next.has_later {
-                assert_eq!(boundary, "row-399");
+                assert_eq!(page.last().unwrap().id, "row-399");
                 return;
             }
         }
         panic!("forward paging never reached cached live end");
+    }
+
+    /// A slide whose kept half fills the byte budget would hold nothing new,
+    /// so it pages from the old edge instead and still reaches earlier rows.
+    #[test]
+    fn a_slide_with_no_room_beside_its_kept_half_still_makes_progress() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        store
+            .apply(Event::Item(history_item("older", &"o".repeat(PART_BYTES))))
+            .unwrap();
+        store
+            .apply(Event::Item(history_item("big", &"b".repeat(23 * PART_BYTES))))
+            .unwrap();
+        for n in 0..30 {
+            store
+                .apply(Event::Item(history_item(&format!("small-{n:02}"), "s")))
+                .unwrap();
+        }
+        let latest = store.window().unwrap();
+        assert_eq!(latest.items[0].id, "big");
+        assert!(latest.has_earlier);
+        store.earlier().unwrap();
+        let older = store.window().unwrap();
+        assert_eq!(older.items[0].id, "older");
+        assert_eq!(older.items[1].id, "big");
+        assert!(older.has_later);
     }
 
     #[test]
@@ -2475,9 +2580,10 @@ mod tests {
         assert_eq!((store.first, store.newest), cursors);
         store.earlier().unwrap();
         let previous = store.window().unwrap();
-        assert_eq!(
-            previous.items.last().unwrap().id,
-            page.items.first().unwrap().id
+        assert!(
+            previous
+                .items
+                .ends_with(&page.items[..=page.items.len() / 2])
         );
         assert!(previous.items.first().unwrap().id < page.items.first().unwrap().id);
     }
@@ -2505,10 +2611,12 @@ mod tests {
             })
             .unwrap();
         let older = store.window().unwrap();
-        assert_eq!(
-            older.items.last().unwrap().id,
-            initial.items.first().unwrap().id
+        assert!(
+            older
+                .items
+                .ends_with(&initial.items[..=initial.items.len() / 2])
         );
+        assert_eq!(older.items[0].id, "row-098");
         store
             .apply(Event::Item(history_item(
                 "row-250",
@@ -2519,9 +2627,10 @@ mod tests {
         assert_eq!(held.items, older.items);
         store.later().unwrap();
         let recent = store.window().unwrap();
-        assert_eq!(
-            recent.items.first().unwrap().id,
-            older.items.last().unwrap().id
+        assert!(
+            recent
+                .items
+                .starts_with(&older.items[older.items.len() / 2..])
         );
         assert_eq!(recent.items.last().unwrap().id, "row-250");
         assert!(!recent.has_later);
