@@ -23,7 +23,7 @@ use cosmic::{
     widget::{self, icon::Handle},
 };
 
-use super::{RowInk, SidebarAction};
+use super::RowInk;
 use crate::{
     agent::Provider,
     design,
@@ -259,11 +259,11 @@ impl Ground {
 
 /// The mark `members` draw, or `None` when there is nobody to draw and the
 /// row keeps its channel glyph.
-pub fn view(
+pub fn view<Message: 'static>(
     members: &Members,
     ground: Ground,
     ink: RowInk,
-) -> Option<Element<'static, SidebarAction>> {
+) -> Option<Element<'static, Message>> {
     let lead = members.lead()?;
     let count = members.len();
     let badge = (count > 1).then(|| badge_label(count));
@@ -274,7 +274,7 @@ pub fn view(
     let peek = members.peek();
     let lone = badge.is_none() && peek.is_none();
     let centre = if lone { LONE_CENTRE } else { LEAD_CENTRE };
-    let mut layers: Vec<Element<'static, SidebarAction>> = Vec::with_capacity(3);
+    let mut layers: Vec<Element<'static, Message>> = Vec::with_capacity(3);
     if let Some(provider) = peek {
         layers.push(at(
             mark(peek_handle(provider), PEEK, ink, opacity),
@@ -315,14 +315,23 @@ pub fn view(
 
 /// `content` with its top left at `(x, y)` in the mark's box. It keeps its
 /// own size where it reaches past the box: the badge overhangs it.
-fn at(content: Element<'static, SidebarAction>, x: f32, y: f32) -> Element<'static, SidebarAction> {
+fn at<Message: 'static>(
+    content: Element<'static, Message>,
+    x: f32,
+    y: f32,
+) -> Element<'static, Message> {
     cosmic::iced::widget::pin(content)
         .position(Point::new(x, y))
         .overflow(true)
         .into()
 }
 
-fn mark(handle: Handle, size: f32, ink: RowInk, opacity: f32) -> Element<'static, SidebarAction> {
+fn mark<Message: 'static>(
+    handle: Handle,
+    size: f32,
+    ink: RowInk,
+    opacity: f32,
+) -> Element<'static, Message> {
     widget::container(
         widget::icon(handle)
             .width(Length::Fixed(size))
@@ -338,12 +347,12 @@ fn mark(handle: Handle, size: f32, ink: RowInk, opacity: f32) -> Element<'static
     .into()
 }
 
-fn count_badge(
+fn count_badge<Message: 'static>(
     label: String,
     width: f32,
     ground: Ground,
     opacity: f32,
-) -> Element<'static, SidebarAction> {
+) -> Element<'static, Message> {
     widget::container(
         widget::text(label)
             .size(BADGE_TEXT)

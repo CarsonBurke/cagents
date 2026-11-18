@@ -6872,21 +6872,23 @@ fn workspace_switcher_does_not_commit_an_old_path_for_a_retargeted_identity() {
     assert!(app.durable.cards.is_empty());
 }
 
-/// Stepping moves only the switcher's selection; the preview follows it
-/// once it rests, and a quick run of steps arms a single timer.
+/// The switcher is drawn from the first press. Stepping moves only its
+/// selection; the preview follows it once it rests, and a quick run of steps
+/// arms a single timer.
 #[test]
 fn workspace_switcher_steps_leave_the_workspace_and_rest_before_previewing() {
     let mut app = workspace_switcher_test_app(4);
     let alt = keyboard::Modifiers::ALT;
     drop(app.cycle_workspace(crate::workspace::FocusDirection::Right, alt));
     let since = app.chrome_ui.workspace_preview_since.unwrap();
-    drop(app.update(Message::WorkspaceSwitcherDue(since)));
-    let first = app.workspace_switcher_selection();
-    assert_eq!(app.chrome_ui.workspace_switcher_rested, first);
-    drop(app.cycle_workspace(crate::workspace::FocusDirection::Right, alt));
+    assert!(app.workspace_switcher().is_some());
+    // Its pane waits for the selection to rest, so a tap that goes straight
+    // back to the last workspace brings nothing up.
+    assert_eq!(app.chrome_ui.workspace_switcher_rested, None);
     let moved = app.chrome_ui.workspace_switcher_moved.unwrap();
     drop(app.cycle_workspace(crate::workspace::FocusDirection::Right, alt));
-    // The second step reuses the timer the first armed.
+    drop(app.cycle_workspace(crate::workspace::FocusDirection::Right, alt));
+    // The later steps reuse the timer the first armed.
     assert!(app.chrome_ui.workspace_switcher_moved.unwrap() >= moved);
     assert_eq!(app.chrome_ui.workspace_switcher_rested, None);
     assert_eq!(
@@ -6940,7 +6942,6 @@ fn workspace_switcher_rows_expose_actions_and_the_selected_workspace() {
         crate::workspace::FocusDirection::Right,
         keyboard::Modifiers::ALT,
     ));
-    app.chrome_ui.workspace_switcher_shown = true;
     let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
     let mut element = app.workspace_switcher().unwrap();
     let mut tree = Tree::new(&element);
