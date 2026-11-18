@@ -56,6 +56,29 @@ pub struct PreparedCheckout {
     pub notice: String,
 }
 
+#[cfg(test)]
+impl PreparedCheckout {
+    /// What [`prepare`] reports when a worktree already holds the pull
+    /// request's branch: `reconciliation`, offered for confirmation. Tests
+    /// build it here because [`prepare`] asks GitHub for the head first.
+    pub(crate) fn reconciling(reconciliation: ExistingPrCheckoutPlan, branch: &str) -> Self {
+        let request = reconciliation.request().clone();
+        Self {
+            repository: request.repository.clone(),
+            branch_input: branch.to_owned(),
+            base: String::new(),
+            existing_worktree: Some(request.worktree.clone()),
+            creation_consent: None,
+            notice: format!(
+                "Open the existing worktree for PR branch {branch}. {}",
+                reconciliation.notice()
+            ),
+            existing_request: Some(request),
+            reconciliation: Some(reconciliation),
+        }
+    }
+}
+
 /// Both shells fence the backend's completed receipt to the review that the
 /// user confirmed. No filesystem lookup or Git command runs on the UI thread.
 pub fn verified_existing_path(

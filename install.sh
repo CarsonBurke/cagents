@@ -67,7 +67,7 @@ if [ "${CAGENTS_DAEMON_LEASE_FD:-}" = 3 ] \
     if (set -o posix) 2>/dev/null; then set -o posix; fi
     # Preserve command -v detection for optional and missing tools. Aliases
     # apply inside functions and command substitutions too.
-    for installer_utility in awk cat chmod cp curl find getconf gh \
+    for installer_utility in awk cat chmod cp curl find flock getconf gh \
         gtk-update-icon-cache id ln mkdir mktemp mv readlink rm rmdir sed \
         sha256sum shasum sleep sync tar uname update-desktop-database; do
         if command -v "$installer_utility" >/dev/null 2>&1; then
@@ -309,6 +309,13 @@ case $PREFIX in
 esac
 [ "$PREFIX" != / ] || fail 'refusing to use / as the installation root'
 
+# BEGIN shared uninstall
+# install.sh and packaging/cagents-uninstall carry this block byte for byte, so
+# both entry points remove an installation the same way; the installer
+# coordinator contract compares the copies. The including script defines fail,
+# read_daemon_status and stop_daemon_and_wait, and sets PROGRAM, PREFIX, HOME,
+# DATA_HOME and CONFIG_HOME.
+
 remove_owned_link() {
     link=$1
     if [ -L "$link" ]; then
@@ -319,27 +326,148 @@ remove_owned_link() {
     fi
 }
 
+# Interpret one `cagents --json daemon status` reply. A daemon process that is
+# present but not serving is starting or draining and can still own terminals,
+# so it is neither running nor stopped.
+classify_daemon_status() {
+    case $1 in
+        *'
+'*) DAEMON_STATUS=unknown ;;
+        '{"ok":true,"command":"daemon.status","data":{'*'"running":false'*'"daemon_present":true'*|\
+        '{"ok":true,"command":"daemon.status","data":{'*'"daemon_present":true'*'"running":false'*|\
+        '{"command":"daemon.status","data":{'*'"running":false,'*'"daemon_present":true'*'},"ok":true}'|\
+        '{"command":"daemon.status","data":{'*'"daemon_present":true'*'"running":false,'*'},"ok":true}')
+            DAEMON_STATUS=transitioning
+            ;;
+        '{"ok":true,"command":"daemon.status","data":{'*'"running":true'*|\
+        '{"command":"daemon.status","data":{'*'"running":true,'*'},"ok":true}')
+            DAEMON_STATUS=running
+            ;;
+        '{"ok":true,"command":"daemon.status","data":{'*'"running":false'*|\
+        '{"command":"daemon.status","data":{'*'"running":false,'*'},"ok":true}')
+            DAEMON_STATUS=stopped
+            ;;
+        *) DAEMON_STATUS=unknown ;;
+    esac
+}
+
+# Validate every purge location before anything is removed.
+resolve_purge_directories() {
+    CACHE_HOME=${XDG_CACHE_HOME:-"$HOME/.cache"}
+    case $CACHE_HOME in
+        /*) ;;
+        *) fail 'XDG_CACHE_HOME must be an absolute path' ;;
+    esac
+    STATE_HOME=${XDG_STATE_HOME:-"$HOME/.local/state"}
+    case $STATE_HOME in
+        /*) ;;
+        *) fail 'XDG_STATE_HOME must be an absolute path' ;;
+    esac
+}
+
+purge_user_data() {
+    rm -rf "$CONFIG_HOME/cagents" "$DATA_HOME/cagents" "$CACHE_HOME/cagents" "$STATE_HOME/cagents"
+}
+
+# An in-app update keeps its job lock and logs in .update and holds the lock for
+# the job's lifetime. Take it, creating it as the updater would if no update has
+# run yet, and keep it until this process exits: an update cannot then start
+# while the installation is removed. Brief status checks also take it, so wait
+# a few seconds before calling it busy.
+claim_updater_state() {
+    update_state=$PREFIX/.update
+    command -v flock >/dev/null 2>&1 \
+        || fail 'flock is required to confirm that no application update is running; cagents was not removed'
+    # The updater refuses state that others can read or write.
+    uninstall_umask=$(umask)
+    umask 077
+    mkdir "$update_state" 2>/dev/null || :
+    # Opening a FIFO or device here could block or act on something else.
+    if [ -L "$update_state" ] || [ ! -d "$update_state" ] || [ -L "$update_state/lock" ] \
+        || { [ -e "$update_state/lock" ] && [ ! -f "$update_state/lock" ]; }; then
+        fail "unsafe updater state at $update_state; cagents was not removed"
+    fi
+    { command exec 9>>"$update_state/lock"; } 2>/dev/null \
+        || fail "cannot open the updater lock at $update_state; cagents was not removed"
+    umask "$uninstall_umask"
+    # util-linux flock exits 1 only when the wait times out.
+    if flock -w 5 9; then
+        :
+    elif [ "$?" -eq 1 ]; then
+        fail 'an application update is in progress; let it finish, then retry; cagents was not removed'
+    else
+        fail "cannot lock the updater lock at $update_state; cagents was not removed"
+    fi
+}
+
+# Succeeds for a marked installation root; reports and fails when there is none.
+check_installation_marker() {
+    if [ ! -e "$PREFIX/.cagents-install-root" ]; then
+        printf '%s: no install.sh installation found at %s\n' "$PROGRAM" "$PREFIX" >&2
+        return 1
+    fi
+    [ -f "$PREFIX/.cagents-install-root" ] && [ ! -L "$PREFIX/.cagents-install-root" ] \
+        || fail "unsafe installation marker at $PREFIX"
+    [ "$(cat "$PREFIX/.cagents-install-root")" = 'cagents install root' ] \
+        || fail "unrecognized installation marker at $PREFIX"
+}
+
+uninstall_installation() {
+    # Install refuses a symlinked root too. Through one, the leftover check and
+    # the launcher link targets would not describe the real root.
+    [ ! -L "$PREFIX" ] || fail "refusing to uninstall through symlink $PREFIX"
+    check_installation_marker || return 0
+    claim_updater_state
+    # Another uninstall may have held the lock and removed this installation,
+    # or its updater state, while this one waited.
+    check_installation_marker || return 0
+    [ "$update_state/lock" -ef "/proc/$$/fd/9" ] \
+        || fail 'the installation changed while waiting for the updater lock; retry; cagents was not removed'
+    if [ -L "$PREFIX/current" ]; then
+        stop_daemon_and_wait "$PREFIX/current/bin/cagents"
+    elif [ -e "$PREFIX/current" ]; then
+        fail "refusing to remove non-symlink $PREFIX/current"
+    fi
+
+    remove_owned_link "$HOME/.local/bin/cagents"
+    remove_owned_link "$DATA_HOME/applications/dev.cagents.Cagents.desktop"
+    remove_owned_link "$DATA_HOME/icons/hicolor/scalable/apps/dev.cagents.Cagents.svg"
+    remove_owned_link "$DATA_HOME/icons/hicolor/128x128/apps/dev.cagents.Cagents.png"
+    remove_owned_link "$DATA_HOME/metainfo/dev.cagents.Cagents.metainfo.xml"
+    remove_owned_link "$CONFIG_HOME/autostart/dev.cagents.Cagents.Daemon.desktop"
+
+    rm -f "$PREFIX/current"
+    rm -rf "$PREFIX/versions"
+    # Remove the held lock last: an updater that opens it meanwhile finds it
+    # held rather than creating another.
+    find "$update_state" -mindepth 1 -maxdepth 1 ! -name lock -exec rm -rf -- {} +
+    # A later install refuses a non-empty root without this marker, so keep it
+    # while anything else remains.
+    uninstall_remaining=$(find "$PREFIX" -mindepth 1 -maxdepth 1 \
+        ! -name .cagents-install-root ! -name .update -print)
+    rm -f "$update_state/lock"
+    if [ -z "$uninstall_remaining" ] && rmdir "$update_state" 2>/dev/null; then
+        rm -f "$PREFIX/.cagents-install-root"
+        rmdir "$PREFIX" 2>/dev/null || :
+    else
+        rmdir "$update_state" 2>/dev/null || :
+        uninstall_remaining=$(find "$PREFIX" -mindepth 1 -maxdepth 1 ! -name .cagents-install-root -print)
+        printf '%s: kept %s and its installation marker because it also contains:\n%s\n' \
+            "$PROGRAM" "$PREFIX" "$uninstall_remaining" >&2
+    fi
+    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+        gtk-update-icon-cache --force --ignore-theme-index "$DATA_HOME/icons/hicolor" >/dev/null 2>&1 || :
+    fi
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database "$DATA_HOME/applications" >/dev/null 2>&1 || :
+    fi
+}
+# END shared uninstall
+
 read_daemon_status() {
     daemon_cli=$1
-    if daemon_output=$(installer_tool "$daemon_cli" --json daemon status 2>/dev/null); then
-        case $daemon_output in
-            *'
-'*) DAEMON_STATUS=unknown ;;
-            *'"running":false'*'"daemon_present":true'*|*'"daemon_present":true'*'"running":false'*)
-                # A real daemon can still be starting or draining. A held
-                # reservation alone is never evidence of such a process.
-                DAEMON_STATUS=unknown
-                ;;
-            '{"ok":true,"command":"daemon.status","data":{'*'"running":true'*|\
-            '{"command":"daemon.status","data":{'*'"running":true,'*'},"ok":true}')
-                DAEMON_STATUS=running
-                ;;
-            '{"ok":true,"command":"daemon.status","data":{'*'"running":false'*|\
-            '{"command":"daemon.status","data":{'*'"running":false,'*'},"ok":true}')
-                DAEMON_STATUS=stopped
-                ;;
-            *) DAEMON_STATUS=unknown ;;
-        esac
+    if daemon_output=$(installer_tool "$daemon_cli" --json daemon status 2>/dev/null 9>&-); then
+        classify_daemon_status "$daemon_output"
     else
         DAEMON_STATUS=unknown
     fi
@@ -351,11 +479,12 @@ stop_daemon_and_wait() {
     case $DAEMON_STATUS in
         stopped) return 0 ;;
         running) ;;
+        transitioning) fail 'the daemon is starting or stopping; retry once it has settled; installation was not changed' ;;
         *) fail 'cannot verify daemon status; installation was not changed' ;;
     esac
 
     DAEMON_SHUTDOWN_REQUESTED=1
-    installer_tool "$daemon_cli" daemon stop --require-empty >/dev/null \
+    installer_tool "$daemon_cli" daemon stop --require-empty >/dev/null 9>&- \
         || fail 'daemon was not stopped: finish terminals or explicitly confirm their termination with cagents daemon stop --confirm, then retry; installation was not changed'
 
     wait_for_daemon_shutdown "$daemon_cli"
@@ -405,40 +534,12 @@ prepare_daemon_upgrade() {
 }
 
 uninstall_cagents() {
-    if [ -e "$PREFIX/.cagents-install-root" ]; then
-        [ -f "$PREFIX/.cagents-install-root" ] && [ ! -L "$PREFIX/.cagents-install-root" ] \
-            || fail "unsafe installation marker at $PREFIX"
-        [ "$(cat "$PREFIX/.cagents-install-root")" = 'cagents install root' ] \
-            || fail "unrecognized installation marker at $PREFIX"
-
-        if [ -L "$PREFIX/current" ]; then
-            stop_daemon_and_wait "$PREFIX/current/bin/cagents"
-        elif [ -e "$PREFIX/current" ]; then
-            fail "refusing to remove non-symlink $PREFIX/current"
-        fi
-
-        remove_owned_link "$HOME/.local/bin/cagents"
-        remove_owned_link "$DATA_HOME/applications/dev.cagents.Cagents.desktop"
-        remove_owned_link "$DATA_HOME/icons/hicolor/scalable/apps/dev.cagents.Cagents.svg"
-        remove_owned_link "$DATA_HOME/icons/hicolor/128x128/apps/dev.cagents.Cagents.png"
-        remove_owned_link "$DATA_HOME/metainfo/dev.cagents.Cagents.metainfo.xml"
-        remove_owned_link "$CONFIG_HOME/autostart/dev.cagents.Cagents.Daemon.desktop"
-
-        rm -f "$PREFIX/current"
-        rm -rf "$PREFIX/versions"
-        rm -f "$PREFIX/.cagents-install-root"
-        rmdir "$PREFIX" 2>/dev/null || :
-    else
-        printf '%s: no install.sh installation found at %s\n' "$PROGRAM" "$PREFIX" >&2
-    fi
-
     if [ "$PURGE" -eq 1 ]; then
-        CACHE_HOME=${XDG_CACHE_HOME:-"$HOME/.cache"}
-        case $CACHE_HOME in
-            /*) ;;
-            *) fail 'XDG_CACHE_HOME must be an absolute path' ;;
-        esac
-        rm -rf "$CONFIG_HOME/cagents" "$DATA_HOME/cagents" "$CACHE_HOME/cagents"
+        resolve_purge_directories
+    fi
+    uninstall_installation
+    if [ "$PURGE" -eq 1 ]; then
+        purge_user_data
         printf 'cagents program files and user data have been removed.\n'
     else
         printf 'cagents program files have been removed; user data was preserved.\n'

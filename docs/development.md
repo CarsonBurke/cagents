@@ -1506,7 +1506,12 @@ worker beneath a private subreaper. When the worker exits, for any reason, the
 subreaper kills and reaps every remaining descendant. Only killing the
 subreaper itself, for example by the OOM killer, leaves them behind. After a
 passing worker it prints how many it killed: a nonzero count means the product
-left processes behind. Same-test reexecs that call `env_clear()` must pass
+left processes behind. Everything the supervisor, worker and fixture body
+write is collected and replayed through libtest's capture, so a failing
+fixture's own assertion appears under that test's heading in the lane log.
+Only the killed-descendant count also goes straight to stderr; the rest of a
+passing test's output appears with `--show-output` or `--nocapture` once the
+test finishes. Same-test reexecs that call `env_clear()` must pass
 `retained_fixture::owner_env()` through.
 
 Prefer the narrow target that covers the changed contract, for example:

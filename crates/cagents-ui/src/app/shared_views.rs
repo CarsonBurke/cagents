@@ -8053,12 +8053,14 @@ mod tests {
         app.card_chrome.remove(&pane.id);
         app.shared_views.chrome_cards_visited.set(0);
         drop(app.sync_scoped_chrome(&members));
+        // Missing chrome falls back to the full pass, which visits every card
+        // that can be drawn and leaves the closed one without chrome.
         assert_eq!(
             app.shared_views.chrome_cards_visited.get(),
-            app.durable.cards.len()
+            app.durable.cards.len() - 1
         );
         assert!(app.card_chrome.contains_key(&pane.id));
-        assert!(app.card_chrome.contains_key(&history.id));
+        assert!(!app.card_chrome.contains_key(&history.id));
     }
 
     #[test]
@@ -8075,8 +8077,10 @@ mod tests {
         drop(app.sync_scoped_chrome(&[pane.id]));
         assert_eq!(
             app.shared_views.chrome_cards_visited.get(),
-            app.durable.cards.len()
+            app.durable.cards.len() - 1
         );
+        // The closed terminal has no chrome but keeps its number.
+        assert!(!app.card_chrome.contains_key(&history.id));
         assert!(app.chrome_ui.terminal_ordinals[&pane.id] > existing);
         assert_eq!(app.chrome_ui.terminal_ordinals[&history.id], existing);
         let chrome = &app.card_chrome[&pane.id];

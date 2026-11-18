@@ -110,3 +110,56 @@ fn success_failure_panic_and_timeout_reap_detached_descendants() {
         assert_reaped(&processes, outcome);
     }
 }
+
+const FAILURE_PROBE_ENV: &str = "CAGENTS_TEST_RETAINED_FIXTURE_FAILURE_PROBE";
+const PROBE_STDOUT: &str = "retained fixture probe: body progress on stdout";
+const PROBE_FAILURE: &str = "retained fixture probe: the body's own assertion";
+
+#[test]
+#[ignore = "child process for the retained fixture failure-capture test"]
+fn failing_fixture_probe() {
+    if std::env::var_os(FAILURE_PROBE_ENV).is_none() || run_isolated() {
+        return;
+    }
+    // Only the worker gets here. Like a real fixture body, it writes to the
+    // descriptors it inherited and then fails one of its own assertions.
+    println!("{PROBE_STDOUT}");
+    panic!("{PROBE_FAILURE}");
+}
+
+/// A failure inside the worker used to reach the lane log only on the
+/// harness's raw stderr, interleaved with every other test's output, while
+/// the failing test itself reported just the supervisor's exit status.
+#[test]
+fn a_fixture_failure_is_reported_in_the_failing_tests_captured_output() {
+    let module = module_path!().split_once("::").unwrap().1;
+    let probe = format!("{module}::failing_fixture_probe");
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &probe, "--include-ignored", "--test-threads=1"])
+        .env(FAILURE_PROBE_ENV, "1")
+        // Capture is the behavior under test, whatever this run selected.
+        .env_remove("RUST_TEST_NOCAPTURE")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "the probe must fail\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    // libtest prints each failing test's captured output under this heading.
+    let captured = stdout
+        .split_once(&format!("---- {probe} stdout ----"))
+        .unwrap_or_else(|| panic!("no captured output for {probe}:\n{stdout}"))
+        .1;
+    for expected in [PROBE_STDOUT, PROBE_FAILURE, "fixture supervisor failed"] {
+        assert!(
+            captured.contains(expected),
+            "{expected:?} missing from the captured output:\n{captured}"
+        );
+    }
+    assert!(
+        !stderr.contains(PROBE_FAILURE),
+        "the fixture's failure escaped libtest's capture:\n{stderr}"
+    );
+}
