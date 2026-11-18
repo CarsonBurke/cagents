@@ -127,6 +127,14 @@ authenticate: OAuth session expired and could not be refreshed` to
 that error before any reply. One Send of text plus images must show one failure
 notice.
 
+To check how a conversation reads after cagents declines one send, write the
+name of a [delivery outcome](../src/chat/failure.rs), such as `CROWDED_INPUT`
+or `UNAVAILABLE_INPUT`, to `.cagents-fixture-refuse-input` in the fixture
+`HOME` (not the provider's home): `scripts/native-evidence env sh -c 'echo
+CROWDED_INPUT >"$HOME/.cagents-fixture-refuse-input"'`. A debug build refuses
+the next Claude input with that outcome before sending anything, then removes
+the file, so sending again goes through.
+
 To check where a failure is drawn after delivered work, write a diagnostic to
 `fixture-delivery-error` instead. Every prompt then gets a reply, a background
 command's completion notice, a follow-up, and that error. The notice must

@@ -544,6 +544,14 @@ macro_rules! delivery_outcomes {
         /// The texts of every [`DeliveryOutcome`].
         pub mod delivery {
             $($(#[$doc])* pub const $name: &str = concat!($summary, " ", $action);)*
+            /// The outcome named `name`, as a fixture names it.
+            #[cfg(debug_assertions)]
+            pub fn named(name: &str) -> Option<&'static str> {
+                match name {
+                    $(stringify!($name) => Some($name),)*
+                    _ => None,
+                }
+            }
             pub(super) const ALL: &[(&str, super::DeliveryOutcome)] = &[$((
                 $name,
                 super::DeliveryOutcome {
