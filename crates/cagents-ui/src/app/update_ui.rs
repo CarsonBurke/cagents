@@ -182,7 +182,11 @@ fn confirmation_details(
     if confirmation.stop.is_some() {
         confirmation_message(confirmation, job).to_owned()
     } else {
-        preview_details(&confirmation.preview)
+        let mut details = preview_details(&confirmation.preview);
+        if let Some(handoff) = terminal_handoff(confirmation) {
+            details.push_str(&format!("\n{handoff}\n"));
+        }
+        details
     }
 }
 
@@ -195,18 +199,37 @@ fn attention_summary(daemon: &crate::update::impact::DaemonImpact) -> Option<Str
         .iter()
         .filter(|session| session.disposition == Disposition::Blocked)
         .count();
+    let sessions = match sessions {
+        0 => None,
+        1 => Some("1 session".to_owned()),
+        count => Some(format!("{count} sessions")),
+    };
     let subject = match (sessions, daemon.blockers.is_empty()) {
-        (0, true) => return None,
-        (0, false) => "The terminal service is".to_owned(),
-        (1, _) => "1 session is".to_owned(),
-        (count, _) => format!("{count} sessions are"),
+        (None, true) => return None,
+        (None, false) => "The terminal service is".to_owned(),
+        (Some(sessions), true) => format!("{sessions} is"),
+        (Some(sessions), false) => format!("{sessions} and the terminal service are"),
     };
     // The worker observes the daemon again twice a second, so resolving
     // these is all there is to do: there is nothing to retry, and the update
     // becomes available by itself.
     Some(format!(
-        "{subject} holding this update back. You can update once that's resolved; this list updates as it changes."
+        "{subject} holding this update back. The update becomes available as soon as this is resolved."
     ))
+}
+
+/// Where a window's blocked review can go when waiting will not resolve it:
+/// a terminal can review stopping the work that a window cannot.
+fn terminal_handoff(confirmation: &crate::update::UpdateConfirmation) -> Option<String> {
+    confirmation
+        .terminal_command
+        .as_ref()
+        .filter(|_| confirmation.stop.is_none() && !confirmable(confirmation))
+        .map(|command| {
+            format!(
+                "If this can't be resolved, cancel this review and run `{command}` from a system terminal outside cagents to review stopping that work."
+            )
+        })
 }
 
 /// Whether the review can be confirmed from a window. What holds an update
@@ -432,6 +455,9 @@ impl Cagents {
                         .class(cosmic::theme::Text::Custom(design::warning_text))
                         .into(),
                 );
+            }
+            if let Some(handoff) = terminal_handoff(confirmation) {
+                body.push(notice_body(handoff));
             }
             // What stands in the way leads; what merely happens follows.
             let (attention, settled): (Vec<_>, Vec<_>) = daemon
@@ -1524,6 +1550,7 @@ pub(in crate::app) mod tests {
             message: "Ready".into(),
             log_path: "/fixture/update.log".into(),
             confirmation: Some(crate::update::UpdateConfirmation {
+                terminal_command: None,
                 stop: None,
                 nonce: uuid::Uuid::new_v4().to_string(),
                 preview: crate::update::impact::Preview {
@@ -1700,6 +1727,7 @@ pub(in crate::app) mod tests {
     fn live_session_confirmation_is_modal_and_cancel_never_starts_an_update() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         app.update_ui.confirmation = Some(crate::update::UpdateConfirmation {
+            terminal_command: None,
             stop: None,
             nonce: uuid::Uuid::new_v4().to_string(),
             preview: crate::update::impact::Preview {
@@ -1793,6 +1821,7 @@ pub(in crate::app) mod tests {
     ) -> crate::update::UpdateConfirmation {
         use crate::model::{BootId, HostIncarnation, HostSessionId, HostSessionProof};
         crate::update::UpdateConfirmation {
+            terminal_command: None,
             stop: None,
             nonce: uuid::Uuid::new_v4().to_string(),
             preview: crate::update::impact::Preview {
@@ -1866,10 +1895,12 @@ pub(in crate::app) mod tests {
     fn a_blocked_review_offers_the_update_once_nothing_holds_it_back() {
         use crate::update::impact::Disposition;
         let mut app = crate::app::tests::context_inspector_test_app(false);
-        let blocked = daemon_preview(vec![
+        let mut blocked = daemon_preview(vec![
             session("Shell · project", Disposition::Continues),
             session("Codex · project", Disposition::Blocked),
         ]);
+        blocked.terminal_command = Some("cagents daemon upgrade --version 9.8.7".into());
+        let handoff = "If this can't be resolved, cancel this review and run `cagents daemon upgrade --version 9.8.7` from a system terminal outside cagents to review stopping that work.";
         let mut job = awaiting(&blocked);
         let poll = review_ready(&mut app, job.clone());
         drop(app.update(poll));
@@ -1891,6 +1922,12 @@ pub(in crate::app) mod tests {
             "nor confirmed by a stale press"
         );
         assert!(app.update_ui.confirmation.is_some(), "the review stays up");
+        assert_eq!(
+            terminal_handoff(&blocked).as_deref(),
+            Some(handoff),
+            "waiting is not the only way on"
+        );
+        assert!(confirmation_details(&blocked, Some(&job)).ends_with(&format!("\n{handoff}\n")));
 
         let mut resolved = blocked.clone();
         resolved.preview.daemon.as_mut().unwrap().sessions[1].disposition = Disposition::Continues;
@@ -1905,6 +1942,10 @@ pub(in crate::app) mod tests {
                 [Message::UpdateUi(Action::ConfirmApply(nonce))] if *nonce == resolved.nonce
             ),
             "the update is available once nothing holds it back"
+        );
+        assert!(
+            terminal_handoff(&resolved).is_none(),
+            "nor sends the person to a terminal"
         );
     }
 
@@ -2004,7 +2045,7 @@ pub(in crate::app) mod tests {
         let daemon = confirmation.preview.daemon.as_mut().unwrap();
         assert_eq!(
             attention_summary(daemon).unwrap(),
-            "1 session is holding this update back. You can update once that's resolved; this list updates as it changes."
+            "1 session is holding this update back. The update becomes available as soon as this is resolved."
         );
         assert!(policy_choice(daemon).is_none());
         daemon.sessions[1].disposition = Disposition::WaitsForIdle;
@@ -2018,6 +2059,13 @@ pub(in crate::app) mod tests {
                 .unwrap()
                 .starts_with("The terminal service is")
         );
+        daemon.sessions[1].disposition = Disposition::Blocked;
+        assert!(
+            attention_summary(daemon)
+                .unwrap()
+                .starts_with("1 session and the terminal service are holding this update back.")
+        );
+        daemon.sessions[1].disposition = Disposition::WaitsForIdle;
         let details = preview_details(&confirmation.preview);
         assert!(details.starts_with("Update to 9.8.7\n"));
         assert!(details.contains(
