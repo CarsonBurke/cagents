@@ -2307,11 +2307,12 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
             shell.request_redraw_at(due);
         }
         if let Event::Mouse(mouse::Event::ButtonReleased(IcedMouseButton::Left)) = event
-            && state.review_control_pressed {
-                state.review_control_pressed = false;
-                shell.capture_event();
-                return;
-            }
+            && state.review_control_pressed
+        {
+            state.review_control_pressed = false;
+            shell.capture_event();
+            return;
+        }
         if matches!(
             event,
             Event::Mouse(mouse::Event::ButtonPressed(IcedMouseButton::Left))
@@ -2392,12 +2393,13 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     }
                     Action::SetTextSelection if ours => {
                         if let Some(ActionData::SetTextSelection(selection)) = &request.data
-                            && a11y.valid_selection(selection) {
-                                a11y.review = true;
-                                a11y.selection = Some(*selection);
-                                state.preedit = None;
-                                self.publish_review(true, shell);
-                            }
+                            && a11y.valid_selection(selection)
+                        {
+                            a11y.review = true;
+                            a11y.selection = Some(*selection);
+                            state.preedit = None;
+                            self.publish_review(true, shell);
+                        }
                     }
                     _ => {}
                 }

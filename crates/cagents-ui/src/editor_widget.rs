@@ -2469,10 +2469,10 @@ where
         // publishes via on_edit so the app calls content.perform().
         {
             let state = tree.state.downcast_mut::<State<Highlighter>>();
-            if let Some(action) = state.pending_edit.take() {
-                if let Some(on_edit) = self.on_edit.as_ref() {
-                    shell.publish((on_edit)(action));
-                }
+            if let Some(action) = state.pending_edit.take()
+                && let Some(on_edit) = self.on_edit.as_ref()
+            {
+                shell.publish((on_edit)(action));
             }
         }
 
@@ -3119,7 +3119,7 @@ where
         let point = if let Some(at) = self.popup_at {
             use cosmic::iced::advanced::graphics::text::cosmic_text;
             internal.editor.buffer().layout_runs().find_map(|run| {
-                if run.line_i != at.line as usize {
+                if run.line_i != at.line {
                     return None;
                 }
                 let cursor = cosmic_text::Cursor::new(run.line_i, at.column);
@@ -4600,24 +4600,24 @@ mod tests {
         )];
         for replacement in ["a", "zz"] {
             let output = snapshot
-                .replace_matches_with(&matches, "λ", replacement, Default::default(), false)
+                .replace_matches_with(matches, "λ", replacement, Default::default(), false)
                 .unwrap();
             assert_eq!(output.len(), original.len() - 2 + replacement.len());
             assert!(
                 snapshot
-                    .replacement_edits(&matches, "λ", replacement, Default::default(), false)
+                    .replacement_edits(matches, "λ", replacement, Default::default(), false)
                     .is_ok()
             );
         }
         assert!(
             snapshot
-                .replace_matches_with(&matches, "λ", "zzz", Default::default(), false)
+                .replace_matches_with(matches, "λ", "zzz", Default::default(), false)
                 .unwrap_err()
                 .contains("result size limit")
         );
         assert!(
             snapshot
-                .replacement_edits(&matches, "λ", "zzz", Default::default(), false)
+                .replacement_edits(matches, "λ", "zzz", Default::default(), false)
                 .is_err()
         );
         assert_eq!(snapshot.source.text().as_ref(), original);
@@ -4812,7 +4812,7 @@ mod tests {
         );
         let edits = snapshot
             .replacement_edits(
-                &[
+                [
                     (
                         Position { line: 0, column: 4 },
                         Position {

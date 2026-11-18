@@ -1400,8 +1400,7 @@ fn reasoning_elapsed(
             items
                 .iter()
                 .skip_while(|candidate| candidate.id != item.id)
-                .skip(1)
-                .next()
+                .nth(1)
                 .and_then(|candidate| candidate.started_at.or(candidate.at))
         })
         .or_else(|| {
@@ -2224,7 +2223,7 @@ impl Runtime {
             .selection_bookmarks
             .borrow_mut()
             .entry(self.selected_subagent.clone())
-            .or_insert_with(Default::default)
+            .or_default()
             .clone();
         (catalog, bookmark)
     }
@@ -2342,15 +2341,15 @@ impl Runtime {
                     input.reader_source.prefixes(),
                 );
             }
-            if let Some(output) = &cached.tool_output {
-                if !output.text.is_empty() {
-                    builder.indexed(
-                        &item.id,
-                        &[5],
-                        output.text.clone(),
-                        output.reader_source.prefixes(),
-                    );
-                }
+            if let Some(output) = &cached.tool_output
+                && !output.text.is_empty()
+            {
+                builder.indexed(
+                    &item.id,
+                    &[5],
+                    output.text.clone(),
+                    output.reader_source.prefixes(),
+                );
             }
             for (index, patch) in cached.patches.iter().enumerate() {
                 if !patch.text.is_empty() {
@@ -2526,19 +2525,16 @@ impl Runtime {
                         .into(),
                 );
             }
-            heading.push(
-                crate::interaction::tooltip(
-                    design::caption(match model {
-                        Some(model) => format!(
-                            "{provider} subagent · {}",
-                            Self::short_description(model, 80)
-                        ),
-                        None => format!("{provider} subagent"),
-                    }),
-                    self.native_child_identity(agent),
-                )
-                .into(),
-            );
+            heading.push(crate::interaction::tooltip(
+                design::caption(match model {
+                    Some(model) => format!(
+                        "{provider} subagent · {}",
+                        Self::short_description(model, 80)
+                    ),
+                    None => format!("{provider} subagent"),
+                }),
+                self.native_child_identity(agent),
+            ));
             let heading: Element<'_, Message> = widget::column::with_children(heading)
                 .spacing(step::GAP_XS)
                 .width(Length::Fill)
@@ -2548,7 +2544,7 @@ impl Runtime {
                 // stopping it is how that work ends.
                 if agent.status.is_live() && snapshot.capabilities.stop_subagent {
                     widget::row::with_children(vec![
-                        heading.into(),
+                        heading,
                         crate::ui_controls::button::quiet("Stop")
                             .icon(Icon::Stop)
                             .name(
@@ -2568,7 +2564,7 @@ impl Runtime {
                     .align_y(Alignment::Center)
                     .into()
                 } else {
-                    heading.into()
+                    heading
                 },
             );
             if agent.items.is_empty()
@@ -3407,7 +3403,7 @@ impl Runtime {
         // contents. The action handler checks the current draft before sending;
         // tying the binding to a view-time draft snapshot can leave Enter
         // inserting a newline until another pointer event redraws the pane.
-        let key_submit = if available && !self.start_blocked.is_some() {
+        let key_submit = if available && self.start_blocked.is_none() {
             (modes.first().copied(), modes.get(1).copied())
         } else {
             (None, None)
@@ -3586,7 +3582,7 @@ impl Runtime {
                             }))
                             .on_press_maybe(
                                 (available
-                                    && !self.start_blocked.is_some()
+                                    && self.start_blocked.is_none()
                                     && !self.provider_coming_up())
                                 .then(|| action(Action::SubmitControl(target, mode))),
                             )
@@ -3658,23 +3654,23 @@ impl Runtime {
         // the trailing group with usage at every footer width.
         let fit = FooterFit::for_width(content_width);
         let mut status: Vec<Element<'_, Message>> = Vec::new();
-        if fit == FooterFit::Wide {
-            if let Some(branch) = &place.branch {
-                status.push(bounded(
-                    widget::row::with_children(vec![
-                        crate::ui_controls::passive_icon(crate::sidebar::worktree_icon(), 12),
-                        crate::ui_controls::FadeText::caption(branch.clone())
-                            .limit(FOOTER_LABEL)
-                            .into(),
-                    ])
-                    .spacing(step::GAP_XS)
-                    .align_y(Alignment::Center)
-                    .into(),
-                    branch,
-                    "Branch",
-                    FOOTER_LABEL,
-                ));
-            }
+        if fit == FooterFit::Wide
+            && let Some(branch) = &place.branch
+        {
+            status.push(bounded(
+                widget::row::with_children(vec![
+                    crate::ui_controls::passive_icon(crate::sidebar::worktree_icon(), 12),
+                    crate::ui_controls::FadeText::caption(branch.clone())
+                        .limit(FOOTER_LABEL)
+                        .into(),
+                ])
+                .spacing(step::GAP_XS)
+                .align_y(Alignment::Center)
+                .into(),
+                branch,
+                "Branch",
+                FOOTER_LABEL,
+            ));
         }
         let mut engine = Vec::new();
         if !self.closed_elsewhere {
@@ -5285,7 +5281,7 @@ impl Runtime {
         // them, links their transcripts while it lists them, tells how those
         // it left in the background are doing, and remembers which of its
         // parts the reader unfolded.
-        if !cached.is_some_and(|cached| cached.coordination.is_some()) {
+        if cached.is_none_or(|cached| cached.coordination.is_none()) {
             return false;
         }
         let mut unfolded: Vec<&str> = self
@@ -5418,10 +5414,10 @@ impl Runtime {
     /// it is base64 and the provider's description is the only thing that reads
     /// as a label.
     fn attachment_label<'a>(path: &'a str, description: &'a str) -> &'a str {
-        if !path.starts_with("data:") {
-            if let Some(name) = path.rsplit('/').next().filter(|name| !name.is_empty()) {
-                return name;
-            }
+        if !path.starts_with("data:")
+            && let Some(name) = path.rsplit('/').next().filter(|name| !name.is_empty())
+        {
+            return name;
         }
         if description.is_empty() {
             "Attachment"
@@ -6065,7 +6061,7 @@ impl Runtime {
             disclosure.then_some(expanded),
             disclosure.then(|| Action::Toggle(self.target, item.id.clone())),
         );
-        let mut rows = vec![crate::interaction::tooltip(heading_row, heading.clone()).into()];
+        let mut rows = vec![crate::interaction::tooltip(heading_row, heading.clone())];
         if (expanded || monitor) && has_body {
             if expanded
                 && *kind != chat::DeliveryKind::Notice
@@ -6420,14 +6416,11 @@ pub(super) fn request_view<'a>(
         rows.push(field_view(target, request, field, answers, available));
     }
     for (label, uri) in artifacts::links(request) {
-        rows.push(
-            crate::interaction::tooltip(
-                widget::button::link(format!("Open artifact: {label}"))
-                    .on_press(action(Action::OpenDocument(target, uri.clone()))),
-                uri,
-            )
-            .into(),
-        );
+        rows.push(crate::interaction::tooltip(
+            widget::button::link(format!("Open artifact: {label}"))
+                .on_press(action(Action::OpenDocument(target, uri.clone()))),
+            uri,
+        ));
     }
     rows.push(answers_view(target, request, available, surface));
     widget::container(

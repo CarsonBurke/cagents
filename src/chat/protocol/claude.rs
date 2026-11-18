@@ -1132,10 +1132,7 @@ impl Claude {
         if text.trim().is_empty() && attachments.is_empty() {
             return Err("A Claude prompt cannot be empty".into());
         }
-        if matches!(
-            text.split_whitespace().next(),
-            Some("/resume" | "/fork")
-        ) {
+        if matches!(text.split_whitespace().next(), Some("/resume" | "/fork")) {
             return Err(
                 "Claude resume/fork commands require opening a separate native session".into(),
             );
@@ -1619,7 +1616,8 @@ impl Claude {
                 let mut aliases: Vec<_> = self
                     .resolved
                     .iter()
-                    .filter(|&(_alias, resolved)| resolved == id).map(|(alias, _resolved)| alias.clone())
+                    .filter(|&(_alias, resolved)| resolved == id)
+                    .map(|(alias, _resolved)| alias.clone())
                     .collect();
                 aliases.sort_unstable();
                 aliases.dedup();
@@ -2115,10 +2113,9 @@ impl Claude {
                             // conversation, so only its launch is known.
                             let launched = child.is_none() && async_launch(frame);
                             let ended = self.ended_agent(&tool_id);
-                            if launched
-                                && ended.is_none() {
-                                    self.background_agents.insert(tool_id.clone());
-                                }
+                            if launched && ended.is_none() {
+                                self.background_agents.insert(tool_id.clone());
+                            }
                             let background = self.background_agents.contains(&tool_id);
                             let status = if let Some(ended) =
                                 ended.filter(|ended| launched || *ended == ToolStatus::Stopped)
@@ -2762,12 +2759,13 @@ impl Claude {
                 .get(&ScopedId::new(None, tool))
                 .and_then(|item| item.content.status())
                 .is_some_and(|status| status != ToolStatus::Running)
-                && !self.restarted_agents.iter().any(|known| known == tool) {
-                    self.restarted_agents.push_back(tool.into());
-                    if self.restarted_agents.len() > MAX_TOOLS {
-                        self.restarted_agents.pop_front();
-                    }
+                && !self.restarted_agents.iter().any(|known| known == tool)
+            {
+                self.restarted_agents.push_back(tool.into());
+                if self.restarted_agents.len() > MAX_TOOLS {
+                    self.restarted_agents.pop_front();
                 }
+            }
             ToolStatus::Running
         } else if ended.is_some() && self.ended_agent(tool) == Some(ToolStatus::Stopped) {
             ToolStatus::Stopped
@@ -5717,10 +5715,11 @@ fn task_notification(inner: &str) -> ItemContent {
             "",
             "",
             false,
-        ) {
-            summary = heading;
-            body = command;
-        }
+        )
+    {
+        summary = heading;
+        body = command;
+    }
     ItemContent::Delivery {
         kind,
         from: String::new(),

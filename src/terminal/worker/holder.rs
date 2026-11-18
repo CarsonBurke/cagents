@@ -908,13 +908,14 @@ impl Drop for Holder {
                 }
             }
             if let Some(mut process) = self.process.take()
-                && let Err(error) = process.child.wait() {
-                    process.retain(
-                        self.pidfd.take(),
-                        &format!("Terminal child wait failed: {error}"),
-                    );
-                }
-                // Successful exact wait drops its reservation normally.
+                && let Err(error) = process.child.wait()
+            {
+                process.retain(
+                    self.pidfd.take(),
+                    &format!("Terminal child wait failed: {error}"),
+                );
+            }
+            // Successful exact wait drops its reservation normally.
         } else if let Some(process) = self.process.take() {
             process.retain(
                 self.pidfd.take(),

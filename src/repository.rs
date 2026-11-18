@@ -6369,10 +6369,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .into());
         }
         let tag = format!("refs/tags/{name}");
-        if explicit_remote.is_none() && ValidatedRefName::parse(tag.clone()).is_ok()
-            && let Some(oid) = self.resolve_optional_ref(repository, &tag, cancellation)? {
-                return Ok(BaseRevision::object_id(oid.to_string())?);
-            }
+        if explicit_remote.is_none()
+            && ValidatedRefName::parse(tag.clone()).is_ok()
+            && let Some(oid) = self.resolve_optional_ref(repository, &tag, cancellation)?
+        {
+            return Ok(BaseRevision::object_id(oid.to_string())?);
+        }
         let remote_name = explicit_remote.unwrap_or(name);
         if let Some((remote, branch)) = remotes
             .iter()
@@ -6433,9 +6435,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     .remote
                     .iter()
                     .any(|reference| reference.name == head.target)
-                {
-                    return Ok(BaseRevision::remote_ref(head.target.as_str())?);
-                }
+            {
+                return Ok(BaseRevision::remote_ref(head.target.as_str())?);
+            }
             for branch in ["main", "master"] {
                 if let Some(reference) = refs.remote.iter().find(|reference| {
                     reference.name.as_str() == format!("refs/remotes/{}/{branch}", remote.name)
@@ -12775,11 +12777,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     .existing_branch_oid
                     .as_deref()
                     .is_some_and(|oid| oid != consent.expected_head().as_str())
-                {
-                    return Err(ValidationError::InvalidBranch(
+            {
+                return Err(ValidationError::InvalidBranch(
                         "The existing local branch is not at the reviewed PR commit. Its history was preserved; choose another branch or explicitly open the local work instead".into(),
                     ).into());
-                }
+            }
             // The durable identity lease must win over changed repository state:
             // a replay is still a conflict after an earlier attempt made a branch.
             if journal.existing_branch_oid.is_some()

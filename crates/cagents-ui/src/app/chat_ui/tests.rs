@@ -2135,7 +2135,7 @@ fn hidden_children_prepare_no_transcript_cache_until_their_tab_is_selected() {
         1,
         "only parent source is prepared before child selection"
     );
-    assert!(runtime.cache["body-2"].markdown.items().len() > 0);
+    assert!(!runtime.cache["body-2"].markdown.items().is_empty());
     for selected in [Some("child-2"), Some("child-3"), None] {
         drop(app.handle_chat_ui(Action::SelectSubagent(target, selected.map(str::to_owned))));
         let runtime = app.chat_runtime_mut(target).unwrap();
@@ -4456,7 +4456,7 @@ fn a_pane_inspector_overlay_excludes_covered_widgets_and_keeps_other_panes_reach
     let composer = card_control_id(card, "chat-composer");
     let sibling = widget::Id::new("inspector-test.other-pane");
     let viewport = iced::Rectangle::with_size(iced::Size::new(640.0, 720.0));
-    let mut tree = Tree::new(&view(&app, card));
+    let mut tree = Tree::new(view(&app, card));
     {
         let mut element = view(&app, card);
         let node = element.as_widget_mut().layout(
@@ -12360,7 +12360,7 @@ fn stopped_agent_terminal(app: &mut Cagents, arguments: &[&str], exited: bool) -
     terminal.launch = launch.clone();
     terminal.continuity = crate::model::TerminalContinuity::RelaunchAvailable {
         recipe: launch,
-        last_exit: exited.then(|| crate::model::TerminalExit {
+        last_exit: exited.then_some(crate::model::TerminalExit {
             code: Some(0),
             signal: None,
             occurred_at_unix_ms: 1,
@@ -12969,7 +12969,7 @@ fn a_draft_moved_to_another_provider_or_account_is_saved_as_its_new_conversation
     assert_eq!(stored.launch.session_id.as_deref(), Some(fresh_id));
     // A late or repeated press, once nothing offers it, keeps it.
     let _ = app.update(Message::ChatUi(Action::StartFresh(card)));
-    assert!(!app.chat_ui.attempt(card).is_some());
+    assert!(app.chat_ui.attempt(card).is_none());
     assert_eq!(flushed(&app), stored);
 }
 
@@ -16575,7 +16575,7 @@ fn nonretryable_failed_resume_preserves_an_explicit_fresh_start_offer() {
         stopped.secondary,
         Some(("Close", stopped::Press::Close, true))
     );
-    assert_eq!(runtime.stopped(true, false).primary.unwrap().2, false);
+    assert!(!runtime.stopped(true, false).primary.unwrap().2);
     assert!(
         matches!(stopped.primary.unwrap().1.message(runtime.target), Message::ChatUi(Action::StartFresh(fresh)) if fresh == card)
     );

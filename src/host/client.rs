@@ -604,7 +604,6 @@ fn retention_pin_generation(
     host: &SharedHost,
     terminal: crate::model::TerminalId,
 ) -> Result<Option<String>, String> {
-    
     super::agent_execution::registry(host).and_then(|registry| {
         registry
             .lock()

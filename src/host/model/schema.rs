@@ -558,9 +558,9 @@ fn tokens(sql: &str) -> Result<Vec<String>, String> {
         && out
             .get(p..p + 3)
             .is_some_and(|v| v == ["if", "not", "exists"])
-        {
-            out.drain(p..p + 3);
-        }
+    {
+        out.drain(p..p + 3);
+    }
     while out.last().is_some_and(|v| v == ";") {
         out.pop();
     }

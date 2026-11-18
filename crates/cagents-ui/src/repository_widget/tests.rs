@@ -478,8 +478,7 @@ async fn unavailable_explicit_file_protection_replaces_pixels_and_fences_old_rea
     let missing = root.join("retired-history");
     assert_eq!(
         crate::worktree_cleanup::protect(&missing)
-            .err()
-            .expect("the real guard must fail")
+            .expect_err("the real guard must fail")
             .kind(),
         std::io::ErrorKind::NotFound
     );

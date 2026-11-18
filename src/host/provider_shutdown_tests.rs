@@ -565,9 +565,10 @@ fn cleanup_refusal_is_reported_and_healthy_owners_still_stop() {
     let deadline = Instant::now() + Duration::from_secs(5);
     let pid: i32 = loop {
         if let Ok(text) = fs::read_to_string(root.join("root-pid"))
-            && let Ok(pid) = text.parse() {
-                break pid;
-            }
+            && let Ok(pid) = text.parse()
+        {
+            break pid;
+        }
         assert!(Instant::now() < deadline, "healthy PTY did not start");
         thread::sleep(Duration::from_millis(5));
     };

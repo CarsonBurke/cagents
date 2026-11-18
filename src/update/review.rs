@@ -134,16 +134,17 @@ fn items(preview: &Preview) -> Vec<Item> {
                     detail = recovery;
                 }
             } else if detail.is_empty()
-                && let Some(live) = live {
-                    if outcome == Outcome::Paused {
-                        detail = recovery_detail(&live_fact(live), CHAT_RECOVERY);
-                    } else if matches!(
-                        outcome,
-                        Outcome::Attention | Outcome::Working | Outcome::Interrupted
-                    ) {
-                        detail = live_fact(live);
-                    }
+                && let Some(live) = live
+            {
+                if outcome == Outcome::Paused {
+                    detail = recovery_detail(&live_fact(live), CHAT_RECOVERY);
+                } else if matches!(
+                    outcome,
+                    Outcome::Attention | Outcome::Working | Outcome::Interrupted
+                ) {
+                    detail = live_fact(live);
                 }
+            }
             if let Some(live) = live
                 && live.disposition != Disposition::WaitsForIdle
                 && (stops_service || live.disposition == Disposition::Blocked)

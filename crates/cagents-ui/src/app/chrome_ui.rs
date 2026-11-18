@@ -2662,7 +2662,7 @@ impl Cagents {
                     return Task::none();
                 };
                 let target = *target;
-                let Some(title) = normalize_card_name(&draft) else {
+                let Some(title) = normalize_card_name(draft) else {
                     return match target {
                         RenameTarget::Channel(id) if self.channel_has_given_name(id) => {
                             self.use_automatic_channel_name(id)
@@ -2893,13 +2893,12 @@ impl Cagents {
                         .name(format!("New {label} tab")),
                         tooltip,
                     )
-                    .into()
                 });
             widget::column::with_children(vec![
                 widget::container(design::heading("New tab"))
                     .padding([6.0, space::S])
                     .into(),
-                crate::design::horizontal_rule().into(),
+                crate::design::horizontal_rule(),
                 widget::column::with_children(items)
                     .spacing(space::XXS)
                     .into(),
@@ -3587,15 +3586,11 @@ impl Cagents {
         let actions = widget::row::with_children(self.workflow_header())
             .spacing(space::XXS)
             .align_y(Alignment::Center);
-        let header = self.native_header(tabs.into(), Some(actions.into()), true);
-        widget::column::with_children(vec![
-            header,
-            crate::design::horizontal_rule().into(),
-            content,
-        ])
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+        let header = self.native_header(tabs, Some(actions.into()), true);
+        widget::column::with_children(vec![header, crate::design::horizontal_rule(), content])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     /// The header's controls beside the window controls: attention and
@@ -3818,14 +3813,14 @@ impl Cagents {
         let attention = self.sidebar_state.card_attention(id);
         let tip = if attention != sidebar::AttentionSummary::default() {
             let mut tip = format!("{tip}\n{}", attention.description());
-            if attention.unread != 0 && self.settings.notifications.message_previews {
-                if let Some(preview) = card
+            if attention.unread != 0
+                && self.settings.notifications.message_previews
+                && let Some(preview) = card
                     .and_then(super::notification_ui::card_session)
                     .and_then(|session| self.notification_ui.previews.get(&session))
-                {
-                    tip.push('\n');
-                    tip.push_str(&preview.text);
-                }
+            {
+                tip.push('\n');
+                tip.push_str(&preview.text);
             }
             Cow::Owned(tip)
         } else {

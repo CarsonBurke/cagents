@@ -75,7 +75,7 @@ pub fn focused_escape<'a, Message: 'a>(
                 ..
             }
         )
-        .then(|| on_escape())
+        .then(&on_escape)
     })
 }
 
@@ -1888,17 +1888,17 @@ impl<Message> Widget<Message, Theme, Renderer> for OverflowFade<'_, Message> {
             viewport,
         );
         let mut state = *tree.state.downcast_ref::<OverflowState>();
-        if self.headers {
-            if let Some(room) = state.header_room {
-                state.start = state.start.min(room);
-            }
-            #[cfg(test)]
-            TOP_FADES.with(|fades| {
-                if let Some(fades) = fades.borrow_mut().as_mut() {
-                    fades.push(state.start);
-                }
-            });
+        if self.headers
+            && let Some(room) = state.header_room
+        {
+            state.start = state.start.min(room);
         }
+        #[cfg(test)]
+        TOP_FADES.with(|fades| {
+            if let Some(fades) = fades.borrow_mut().as_mut() {
+                fades.push(state.start);
+            }
+        });
         if state.start <= 0.0 && state.end <= 0.0 {
             return;
         }
@@ -2989,10 +2989,10 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
         viewport: &Rectangle,
         renderer: &Renderer,
     ) -> mouse::Interaction {
-        if let Kind::RevealWidth { progress, .. } = self.kind {
-            if progress < 1.0 || !cursor.is_over(layout.bounds()) {
-                return mouse::Interaction::None;
-            }
+        if let Kind::RevealWidth { progress, .. } = self.kind
+            && (progress < 1.0 || !cursor.is_over(layout.bounds()))
+        {
+            return mouse::Interaction::None;
         }
         let interaction = self.content.as_widget().mouse_interaction(
             &tree.children[0],
@@ -3078,30 +3078,30 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
             // Keep low-emphasis rows legible against neutral surfaces without
             // turning hover feedback into a selected-state fill.
             let alpha = state.hover.interpolate(0.0, 0.10, state.now);
-            if alpha > 0.0 {
-                if let Some(bounds) = layout.bounds().intersection(viewport) {
-                    let mut color: Color = theme.current_container().on.into();
-                    color.a *= alpha;
-                    // Draw after the child, otherwise opaque button surfaces
-                    // completely cover the feedback. This captures no events.
-                    renderer.with_layer(bounds, |renderer| {
-                        renderer.fill_quad(
-                            renderer::Quad {
-                                bounds: layout.bounds(),
-                                border: cosmic::iced::Border {
-                                    radius: if themed_radius {
-                                        theme.cosmic().corner_radii.radius_s.into()
-                                    } else {
-                                        crate::design::RADIUS_S.into()
-                                    },
-                                    ..Default::default()
+            if alpha > 0.0
+                && let Some(bounds) = layout.bounds().intersection(viewport)
+            {
+                let mut color: Color = theme.current_container().on.into();
+                color.a *= alpha;
+                // Draw after the child, otherwise opaque button surfaces
+                // completely cover the feedback. This captures no events.
+                renderer.with_layer(bounds, |renderer| {
+                    renderer.fill_quad(
+                        renderer::Quad {
+                            bounds: layout.bounds(),
+                            border: cosmic::iced::Border {
+                                radius: if themed_radius {
+                                    theme.cosmic().corner_radii.radius_s.into()
+                                } else {
+                                    crate::design::RADIUS_S.into()
                                 },
                                 ..Default::default()
                             },
-                            color,
-                        )
-                    });
-                }
+                            ..Default::default()
+                        },
+                        color,
+                    )
+                });
             }
         }
     }
@@ -3117,10 +3117,10 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
             return None;
         }
         let tip_open = tree.state.downcast_ref::<State>().tip_open;
-        if let Some(tip) = self.tip.as_mut().filter(|_| tip_open) {
-            if tree.children.len() < 2 {
-                tree.children.push(Tree::new(&*tip.content()));
-            }
+        if let Some(tip) = self.tip.as_mut().filter(|_| tip_open)
+            && tree.children.len() < 2
+        {
+            tree.children.push(Tree::new(&*tip.content()));
         }
         let (content_state, tip_state) = tree.children.split_at_mut(1);
         let child = self.content.as_widget_mut().overlay(
@@ -3131,22 +3131,22 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
             translation,
         );
         let state = tree.state.downcast_ref::<State>();
-        if state.tip_open {
-            if let Some(tip) = &mut self.tip {
-                let prefer_above = tip.prefer_above;
-                let tip = overlay::Element::new(Box::new(TipOverlay {
-                    content: tip.content(),
-                    tree: &mut tip_state[0],
-                    anchor: layout.bounds() + translation,
-                    progress: state.tooltip.interpolate(0.0, 1.0, state.now),
-                    prefer_above,
-                }));
-                return Some(if let Some(child) = child {
-                    overlay::Group::with_children(vec![child, tip]).overlay()
-                } else {
-                    tip
-                });
-            }
+        if state.tip_open
+            && let Some(tip) = &mut self.tip
+        {
+            let prefer_above = tip.prefer_above;
+            let tip = overlay::Element::new(Box::new(TipOverlay {
+                content: tip.content(),
+                tree: &mut tip_state[0],
+                anchor: layout.bounds() + translation,
+                progress: state.tooltip.interpolate(0.0, 1.0, state.now),
+                prefer_above,
+            }));
+            return Some(if let Some(child) = child {
+                overlay::Group::with_children(vec![child, tip]).overlay()
+            } else {
+                tip
+            });
         }
         child
     }
@@ -3203,6 +3203,262 @@ impl<'a, Message: 'a> From<Effect<'a, Message>> for Element<'a, Message> {
     fn from(effect: Effect<'a, Message>) -> Self {
         Self::new(effect)
     }
+}
+
+// Keep the wrapper anonymous: giving it its child's ID would register two
+// incompatible states under one name in iced's named-widget reconciliation.
+fn control_identity(tree: &Tree) -> Option<&Id> {
+    tree.id
+        .as_ref()
+        .or_else(|| tree.children.first().and_then(control_identity))
+}
+
+struct TipOverlay<'a, 'b, Message> {
+    content: &'a mut Element<'b, Message>,
+    tree: &'a mut Tree,
+    anchor: Rectangle,
+    progress: f32,
+    prefer_above: bool,
+}
+
+impl<Message> overlay::Overlay<Message, Theme, Renderer> for TipOverlay<'_, '_, Message> {
+    fn layout(&mut self, renderer: &Renderer, bounds: Size) -> layout::Node {
+        let node = self.content.as_widget_mut().layout(
+            self.tree,
+            renderer,
+            &layout::Limits::new(Size::ZERO, bounds),
+        );
+        let size = node.size();
+        let x = (self.anchor.center_x() - size.width / 2.0)
+            .clamp(0.0, (bounds.width - size.width).max(0.0));
+        let below = self.anchor.y + self.anchor.height + TIP_GAP;
+        let y = if !self.prefer_above && below + size.height <= bounds.height {
+            below
+        } else {
+            self.anchor.y - size.height - TIP_GAP
+        };
+        node.move_to(Point::new(
+            x,
+            y.clamp(0.0, (bounds.height - size.height).max(0.0)),
+        ))
+    }
+    fn draw(
+        &self,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+    ) {
+        if self.progress <= 0.0 {
+            return;
+        }
+        // The same surface as every other floating element
+        // (`design::elevated`), faded as two primitives rather than by
+        // deriving and serializing an entire theme per frame.
+        let component = &theme.current_container().component;
+        let fade = |color: Color| Color {
+            a: color.a * self.progress,
+            ..color
+        };
+        let mut style = *style;
+        style.text_color = fade(component.on.into());
+        renderer.with_layer(layout.bounds(), |renderer| {
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds: layout.bounds(),
+                    border: cosmic::iced::Border {
+                        color: fade(crate::design::component_rule(theme)),
+                        width: crate::design::BORDER_WIDTH,
+                        radius: crate::design::RADIUS_S.into(),
+                    },
+                    ..Default::default()
+                },
+                fade(component.base.into()),
+            );
+            self.content.as_widget().draw(
+                self.tree,
+                renderer,
+                theme,
+                &style,
+                layout,
+                cursor,
+                &layout.bounds(),
+            );
+        });
+    }
+}
+
+struct FadedTheme {
+    source: Theme,
+    serialized: serde_json::Value,
+    progress: f32,
+    theme: Theme,
+}
+
+impl FadedTheme {
+    fn new(source: &Theme) -> Self {
+        Self {
+            source: source.clone(),
+            serialized: serde_json::to_value(source.cosmic())
+                .expect("pinned COSMIC theme is serializable"),
+            progress: 1.0,
+            theme: source.clone(),
+        }
+    }
+
+    fn at(&mut self, progress: f32) -> &Theme {
+        if self.progress == progress {
+            return &self.theme;
+        }
+        let source = self.source.cosmic();
+        // Only the six surface containers are private in cosmic_theme::Theme.
+        // Cache the source serialization, overwrite their colors from typed
+        // originals, and deserialize by reference (no per-frame JSON clone).
+        // ColorRepr explicitly accepts palette's floating-point RGBA variant;
+        // hex serialization would quantize alpha to 8 bits on every frame.
+        for (key, container) in [
+            ("background", source.background(false)),
+            ("primary", source.primary(false)),
+            ("secondary", source.secondary(false)),
+            ("transparent_background", source.background(true)),
+            ("transparent_primary", source.primary(true)),
+            ("transparent_secondary", source.secondary(true)),
+        ] {
+            set_container_colors(&mut self.serialized[key], container, progress);
+        }
+        let mut cosmic = cosmic::cosmic_theme::Theme::deserialize(&self.serialized)
+            .expect("typed RGBA colors preserve the pinned COSMIC theme schema");
+        // Public semantic colors can be adjusted directly without serializing,
+        // parsing, or rounding their RGB components or original transparency.
+        macro_rules! components {
+            ($($field:ident),+ $(,)?) => {$(
+                cosmic.$field = source.$field.clone();
+                for color in component_colors(&mut cosmic.$field) { color.alpha *= progress; }
+            )+};
+        }
+        components!(
+            button,
+            accent,
+            success,
+            destructive,
+            warning,
+            accent_button,
+            success_button,
+            destructive_button,
+            warning_button,
+            icon_button,
+            link_button,
+            list_button,
+            text_button
+        );
+        cosmic.palette = source.palette.clone();
+        macro_rules! palette_colors {
+            ($($field:ident),+ $(,)?) => {$(cosmic.palette.$field.alpha *= progress;)+};
+        }
+        palette_colors!(
+            bright_red,
+            bright_green,
+            bright_orange,
+            gray_1,
+            gray_2,
+            neutral_0,
+            neutral_1,
+            neutral_2,
+            neutral_3,
+            neutral_4,
+            neutral_5,
+            neutral_6,
+            neutral_7,
+            neutral_8,
+            neutral_9,
+            neutral_10,
+            accent_blue,
+            accent_indigo,
+            accent_purple,
+            accent_pink,
+            accent_red,
+            accent_orange,
+            accent_yellow,
+            accent_green,
+            accent_warm_grey,
+            ext_warm_grey,
+            ext_orange,
+            ext_yellow,
+            ext_blue,
+            ext_purple,
+            ext_pink,
+            ext_indigo
+        );
+        cosmic.shade = source.shade;
+        cosmic.shade.alpha *= progress;
+        cosmic.accent_text = source.accent_text.map(|mut color| {
+            color.alpha *= progress;
+            color
+        });
+        cosmic.control_tint = source.control_tint;
+        cosmic.text_tint = source.text_tint;
+        self.theme = Theme {
+            theme_type: cosmic::theme::ThemeType::Custom(Arc::new(cosmic)),
+            ..self.source.clone()
+        };
+        self.progress = progress;
+        &self.theme
+    }
+}
+
+fn component_colors(component: &mut Component) -> [&mut Srgba; 12] {
+    [
+        &mut component.base,
+        &mut component.hover,
+        &mut component.pressed,
+        &mut component.selected,
+        &mut component.selected_text,
+        &mut component.focus,
+        &mut component.divider,
+        &mut component.on,
+        &mut component.disabled,
+        &mut component.on_disabled,
+        &mut component.border,
+        &mut component.disabled_border,
+    ]
+}
+
+fn set_container_colors(value: &mut serde_json::Value, source: &Container, progress: f32) {
+    for (key, color) in [
+        ("base", source.base),
+        ("divider", source.divider),
+        ("on", source.on),
+        ("small_widget", source.small_widget),
+    ] {
+        set_color(&mut value[key], color, progress);
+    }
+    let component = &source.component;
+    for (key, color) in [
+        ("base", component.base),
+        ("hover", component.hover),
+        ("pressed", component.pressed),
+        ("selected", component.selected),
+        ("selected_text", component.selected_text),
+        ("focus", component.focus),
+        ("divider", component.divider),
+        ("on", component.on),
+        ("disabled", component.disabled),
+        ("on_disabled", component.on_disabled),
+        ("border", component.border),
+        ("disabled_border", component.disabled_border),
+    ] {
+        set_color(&mut value["component"][key], color, progress);
+    }
+}
+
+fn set_color(value: &mut serde_json::Value, source: Srgba, progress: f32) {
+    if !value.is_object() {
+        // Serialize the typed RGBA alternative once, not the hex-based theme
+        // serializer. Subsequent frames replace only its numeric alpha.
+        *value = serde_json::to_value(source).expect("palette RGBA is serializable");
+    }
+    value["alpha"] = (source.alpha * progress).into();
 }
 
 #[cfg(test)]
@@ -4743,260 +4999,4 @@ mod tests {
             );
         }
     }
-}
-
-// Keep the wrapper anonymous: giving it its child's ID would register two
-// incompatible states under one name in iced's named-widget reconciliation.
-fn control_identity(tree: &Tree) -> Option<&Id> {
-    tree.id
-        .as_ref()
-        .or_else(|| tree.children.first().and_then(control_identity))
-}
-
-struct TipOverlay<'a, 'b, Message> {
-    content: &'a mut Element<'b, Message>,
-    tree: &'a mut Tree,
-    anchor: Rectangle,
-    progress: f32,
-    prefer_above: bool,
-}
-
-impl<Message> overlay::Overlay<Message, Theme, Renderer> for TipOverlay<'_, '_, Message> {
-    fn layout(&mut self, renderer: &Renderer, bounds: Size) -> layout::Node {
-        let node = self.content.as_widget_mut().layout(
-            self.tree,
-            renderer,
-            &layout::Limits::new(Size::ZERO, bounds),
-        );
-        let size = node.size();
-        let x = (self.anchor.center_x() - size.width / 2.0)
-            .clamp(0.0, (bounds.width - size.width).max(0.0));
-        let below = self.anchor.y + self.anchor.height + TIP_GAP;
-        let y = if !self.prefer_above && below + size.height <= bounds.height {
-            below
-        } else {
-            self.anchor.y - size.height - TIP_GAP
-        };
-        node.move_to(Point::new(
-            x,
-            y.clamp(0.0, (bounds.height - size.height).max(0.0)),
-        ))
-    }
-    fn draw(
-        &self,
-        renderer: &mut Renderer,
-        theme: &Theme,
-        style: &renderer::Style,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-    ) {
-        if self.progress <= 0.0 {
-            return;
-        }
-        // The same surface as every other floating element
-        // (`design::elevated`), faded as two primitives rather than by
-        // deriving and serializing an entire theme per frame.
-        let component = &theme.current_container().component;
-        let fade = |color: Color| Color {
-            a: color.a * self.progress,
-            ..color
-        };
-        let mut style = *style;
-        style.text_color = fade(component.on.into());
-        renderer.with_layer(layout.bounds(), |renderer| {
-            renderer.fill_quad(
-                renderer::Quad {
-                    bounds: layout.bounds(),
-                    border: cosmic::iced::Border {
-                        color: fade(crate::design::component_rule(theme)),
-                        width: crate::design::BORDER_WIDTH,
-                        radius: crate::design::RADIUS_S.into(),
-                    },
-                    ..Default::default()
-                },
-                fade(component.base.into()),
-            );
-            self.content.as_widget().draw(
-                self.tree,
-                renderer,
-                theme,
-                &style,
-                layout,
-                cursor,
-                &layout.bounds(),
-            );
-        });
-    }
-}
-
-struct FadedTheme {
-    source: Theme,
-    serialized: serde_json::Value,
-    progress: f32,
-    theme: Theme,
-}
-
-impl FadedTheme {
-    fn new(source: &Theme) -> Self {
-        Self {
-            source: source.clone(),
-            serialized: serde_json::to_value(source.cosmic())
-                .expect("pinned COSMIC theme is serializable"),
-            progress: 1.0,
-            theme: source.clone(),
-        }
-    }
-
-    fn at(&mut self, progress: f32) -> &Theme {
-        if self.progress == progress {
-            return &self.theme;
-        }
-        let source = self.source.cosmic();
-        // Only the six surface containers are private in cosmic_theme::Theme.
-        // Cache the source serialization, overwrite their colors from typed
-        // originals, and deserialize by reference (no per-frame JSON clone).
-        // ColorRepr explicitly accepts palette's floating-point RGBA variant;
-        // hex serialization would quantize alpha to 8 bits on every frame.
-        for (key, container) in [
-            ("background", source.background(false)),
-            ("primary", source.primary(false)),
-            ("secondary", source.secondary(false)),
-            ("transparent_background", source.background(true)),
-            ("transparent_primary", source.primary(true)),
-            ("transparent_secondary", source.secondary(true)),
-        ] {
-            set_container_colors(&mut self.serialized[key], container, progress);
-        }
-        let mut cosmic = cosmic::cosmic_theme::Theme::deserialize(&self.serialized)
-            .expect("typed RGBA colors preserve the pinned COSMIC theme schema");
-        // Public semantic colors can be adjusted directly without serializing,
-        // parsing, or rounding their RGB components or original transparency.
-        macro_rules! components {
-            ($($field:ident),+ $(,)?) => {$(
-                cosmic.$field = source.$field.clone();
-                for color in component_colors(&mut cosmic.$field) { color.alpha *= progress; }
-            )+};
-        }
-        components!(
-            button,
-            accent,
-            success,
-            destructive,
-            warning,
-            accent_button,
-            success_button,
-            destructive_button,
-            warning_button,
-            icon_button,
-            link_button,
-            list_button,
-            text_button
-        );
-        cosmic.palette = source.palette.clone();
-        macro_rules! palette_colors {
-            ($($field:ident),+ $(,)?) => {$(cosmic.palette.$field.alpha *= progress;)+};
-        }
-        palette_colors!(
-            bright_red,
-            bright_green,
-            bright_orange,
-            gray_1,
-            gray_2,
-            neutral_0,
-            neutral_1,
-            neutral_2,
-            neutral_3,
-            neutral_4,
-            neutral_5,
-            neutral_6,
-            neutral_7,
-            neutral_8,
-            neutral_9,
-            neutral_10,
-            accent_blue,
-            accent_indigo,
-            accent_purple,
-            accent_pink,
-            accent_red,
-            accent_orange,
-            accent_yellow,
-            accent_green,
-            accent_warm_grey,
-            ext_warm_grey,
-            ext_orange,
-            ext_yellow,
-            ext_blue,
-            ext_purple,
-            ext_pink,
-            ext_indigo
-        );
-        cosmic.shade = source.shade;
-        cosmic.shade.alpha *= progress;
-        cosmic.accent_text = source.accent_text.map(|mut color| {
-            color.alpha *= progress;
-            color
-        });
-        cosmic.control_tint = source.control_tint;
-        cosmic.text_tint = source.text_tint;
-        self.theme = Theme {
-            theme_type: cosmic::theme::ThemeType::Custom(Arc::new(cosmic)),
-            ..self.source.clone()
-        };
-        self.progress = progress;
-        &self.theme
-    }
-}
-
-fn component_colors(component: &mut Component) -> [&mut Srgba; 12] {
-    [
-        &mut component.base,
-        &mut component.hover,
-        &mut component.pressed,
-        &mut component.selected,
-        &mut component.selected_text,
-        &mut component.focus,
-        &mut component.divider,
-        &mut component.on,
-        &mut component.disabled,
-        &mut component.on_disabled,
-        &mut component.border,
-        &mut component.disabled_border,
-    ]
-}
-
-fn set_container_colors(value: &mut serde_json::Value, source: &Container, progress: f32) {
-    for (key, color) in [
-        ("base", source.base),
-        ("divider", source.divider),
-        ("on", source.on),
-        ("small_widget", source.small_widget),
-    ] {
-        set_color(&mut value[key], color, progress);
-    }
-    let component = &source.component;
-    for (key, color) in [
-        ("base", component.base),
-        ("hover", component.hover),
-        ("pressed", component.pressed),
-        ("selected", component.selected),
-        ("selected_text", component.selected_text),
-        ("focus", component.focus),
-        ("divider", component.divider),
-        ("on", component.on),
-        ("disabled", component.disabled),
-        ("on_disabled", component.on_disabled),
-        ("border", component.border),
-        ("disabled_border", component.disabled_border),
-    ] {
-        set_color(&mut value["component"][key], color, progress);
-    }
-}
-
-fn set_color(value: &mut serde_json::Value, source: Srgba, progress: f32) {
-    if !value.is_object() {
-        // Serialize the typed RGBA alternative once, not the hex-based theme
-        // serializer. Subsequent frames replace only its numeric alpha.
-        *value = serde_json::to_value(source).expect("palette RGBA is serializable");
-    }
-    value["alpha"] = (source.alpha * progress).into();
 }

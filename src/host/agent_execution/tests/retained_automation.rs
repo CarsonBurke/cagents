@@ -161,12 +161,13 @@ fn completed_retained_automation_retires_only_after_exact_idle_close() {
                     &self.host,
                     EXECUTION_CLIENT,
                     ClientRequest::ChatClose { chat_id: self.id },
-                ) {
-                    eprintln!(
-                        "retained automation fixture cleanup failed: {}",
-                        error.message
-                    );
-                }
+                )
+            {
+                eprintln!(
+                    "retained automation fixture cleanup failed: {}",
+                    error.message
+                );
+            }
         }
     }
     let _cleanup = Cleanup {

@@ -1545,9 +1545,9 @@ pub(super) fn publish_authenticated_source_for_start(
         && (handle.actor_identity().is_none_or(|identity| {
             identity.instance != intent.actor || identity.record != intent.owner
         }) || pair.as_ref() != intent.replacement_holder.as_ref())
-        {
-            return Err("Console publication lost its exact provider or replacement holder".into());
-        }
+    {
+        return Err("Console publication lost its exact provider or replacement holder".into());
+    }
     if install == handle.is_close_only() {
         return Err("Retained publication mode does not match its authenticated attachment".into());
     }
@@ -3452,45 +3452,44 @@ pub(in crate::host) fn reconcile_retired_actors(host: &SharedHost) -> Result<(),
                             .actor_identity()
                             .is_some_and(|identity| identity.instance == ownership.actor())
                     });
-                if pending && !attached
+                if pending
+                    && !attached
                     && let Err(error) =
                         close_unattached(host, ownership.source(), Some(ownership.owner().clone()))
-                    {
-                        // Actor-local notification/retirement failures keep the
-                        // same durable intent and close-only retry owner. They
-                        // must not make unrelated native chats or the daemon
-                        // unavailable. Unknown census/global lease failures
-                        // still stop reconciliation instead of defaulting away.
-                        let current = registry
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .native_actor_ownership(ownership.actor())?
-                            .ok_or("Pending cleanup lost its durable ownership intent")?;
-                        if current != ownership {
-                            return Err(
-                                "Pending ownership changed during failed cleanup reconciliation"
-                                    .into(),
-                            );
-                        }
-                        let paths = crate::daemon::RuntimePaths::discover()
-                            .map_err(|error| error.to_string())?;
-                        if crate::daemon::lease_owner(&paths.lock, &proof)
-                            .map_err(|error| error.to_string())?
-                            != std::process::id()
-                            || {
-                                let state = host.lock().unwrap_or_else(|p| p.into_inner());
-                                state.shutting_down || state.proof() != &proof
-                            }
-                        {
-                            return Err(
-                                "Daemon ownership changed during pending cleanup reconciliation"
-                                    .into(),
-                            );
-                        }
-                        let diagnostic = error.chars().take(1024).collect::<String>();
-                        tracing::warn!(actor=%ownership.actor(), error=%diagnostic,
-                            "Pending retained actor cleanup remains retryable; durable ownership was preserved");
+                {
+                    // Actor-local notification/retirement failures keep the
+                    // same durable intent and close-only retry owner. They
+                    // must not make unrelated native chats or the daemon
+                    // unavailable. Unknown census/global lease failures
+                    // still stop reconciliation instead of defaulting away.
+                    let current = registry
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .native_actor_ownership(ownership.actor())?
+                        .ok_or("Pending cleanup lost its durable ownership intent")?;
+                    if current != ownership {
+                        return Err(
+                            "Pending ownership changed during failed cleanup reconciliation".into(),
+                        );
                     }
+                    let paths = crate::daemon::RuntimePaths::discover()
+                        .map_err(|error| error.to_string())?;
+                    if crate::daemon::lease_owner(&paths.lock, &proof)
+                        .map_err(|error| error.to_string())?
+                        != std::process::id()
+                        || {
+                            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                            state.shutting_down || state.proof() != &proof
+                        }
+                    {
+                        return Err(
+                            "Daemon ownership changed during pending cleanup reconciliation".into(),
+                        );
+                    }
+                    let diagnostic = error.chars().take(1024).collect::<String>();
+                    tracing::warn!(actor=%ownership.actor(), error=%diagnostic,
+                            "Pending retained actor cleanup remains retryable; durable ownership was preserved");
+                }
                 continue;
             }
             // Execution exit and parent wait collection are distinct. Only the

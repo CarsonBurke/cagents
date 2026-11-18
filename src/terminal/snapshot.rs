@@ -970,20 +970,21 @@ pub(crate) fn capture_viewport(
                 result => result.unwrap_or(0),
             };
             if let Ok(link) = std::str::from_utf8(&uri[..length])
-                && !link.is_empty() {
-                    if let Some(last) = hyperlinks
-                        .last_mut()
-                        .filter(|last| last.end == column && last.uri == link)
-                    {
-                        last.end += 1;
-                    } else {
-                        hyperlinks.push(HyperlinkSpan {
-                            start: column,
-                            end: column + 1,
-                            uri: link.into(),
-                        });
-                    }
+                && !link.is_empty()
+            {
+                if let Some(last) = hyperlinks
+                    .last_mut()
+                    .filter(|last| last.end == column && last.uri == link)
+                {
+                    last.end += 1;
+                } else {
+                    hyperlinks.push(HyperlinkSpan {
+                        start: column,
+                        end: column + 1,
+                        uri: link.into(),
+                    });
                 }
+            }
         }
         localize_file_links(&mut hyperlinks, &local_host);
         lines.push(Arc::new(RowSnapshot {

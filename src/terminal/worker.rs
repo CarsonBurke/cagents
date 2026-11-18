@@ -2519,10 +2519,10 @@ impl TerminalHandle {
         if matches!(
             command,
             Command::Interrupt(_) | Command::CloseChecked { .. }
-        )
-            && published.completed.load(Ordering::Acquire) {
-                return Err(TerminalSendError::Closed);
-            }
+        ) && published.completed.load(Ordering::Acquire)
+        {
+            return Err(TerminalSendError::Closed);
+        }
         if let Command::Interrupt(key) = command {
             return if published.request_interrupt(key) {
                 Ok(())
@@ -3359,13 +3359,12 @@ impl Worker {
         let mut retained = retained;
         if retained.is_none()
             && let Some(start) = self.reader_start.take()
-                && start.send(()).is_err()
-            {
-                retained = Some(
-                    "The prepared reader did not accept activation; original replay is retained"
-                        .into(),
-                );
-            }
+            && start.send(()).is_err()
+        {
+            retained = Some(
+                "The prepared reader did not accept activation; original replay is retained".into(),
+            );
+        }
         #[cfg(test)]
         if retained.is_none() {
             drop(self.test_startup_queue.take());
@@ -3434,34 +3433,33 @@ impl Worker {
                     deadline,
                     reply,
                 } = command
-                {
-                    // A panicking observer/inspection cannot unwind this
-                    // complete original owner out of its parked frame.
-                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        self.checked_close(allow_active, deadline)
-                    }))
-                    .unwrap_or_else(|_| {
-                        super::ipc::TerminalCloseResult::Unknown(
-                            "Checked close panicked; original startup custody remains retained"
-                                .into(),
-                        )
-                    });
-                    let closed = outcome == super::ipc::TerminalCloseResult::Closed;
-                    if closed {
-                        // Only an explicit checked destructive close releases
-                        // unresolved replay. Ordinary shutdown/Drop does not.
-                        self.holder.prove_startup_cleanup();
-                        drop(self.reader_start.take());
-                        self.published
-                            .startup_unresolved
-                            .store(false, Ordering::Release);
-                        self.published.request_shutdown();
-                        let _ = reply.send(outcome);
-                        self.run();
-                        return;
-                    }
+            {
+                // A panicking observer/inspection cannot unwind this
+                // complete original owner out of its parked frame.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.checked_close(allow_active, deadline)
+                }))
+                .unwrap_or_else(|_| {
+                    super::ipc::TerminalCloseResult::Unknown(
+                        "Checked close panicked; original startup custody remains retained".into(),
+                    )
+                });
+                let closed = outcome == super::ipc::TerminalCloseResult::Closed;
+                if closed {
+                    // Only an explicit checked destructive close releases
+                    // unresolved replay. Ordinary shutdown/Drop does not.
+                    self.holder.prove_startup_cleanup();
+                    drop(self.reader_start.take());
+                    self.published
+                        .startup_unresolved
+                        .store(false, Ordering::Release);
+                    self.published.request_shutdown();
                     let _ = reply.send(outcome);
+                    self.run();
+                    return;
                 }
+                let _ = reply.send(outcome);
+            }
             // The original reader remains unactivated. In particular, no raw
             // query can be parsed or answered before ownership is confirmed.
             // A dropped external observer is not an owner-release instruction.

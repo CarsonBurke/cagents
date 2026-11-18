@@ -1474,39 +1474,39 @@ async fn run(
         }
         for (action, token) in pending.actions {
             if let Some(notice) = action_notice(&snapshot, action)
-                && let Some(host) = host.upgrade() {
-                    let window = host
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .activate_notification_destination(
-                            notice.event.target(),
-                            notice.event.source_session(),
-                            notice.window.as_deref(),
-                            notice.event.destination.as_ref(),
-                        );
-                    // Activation and the matched executable handshake can wait;
-                    // they never run under the daemon's session lock.
-                    match crate::instance::activate_destination(&window, token.as_deref()) {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            if let Err(error) = crate::instance::launch_notification_destination(
-                                &window,
-                                token.as_deref(),
-                            ) {
-                                tracing::warn!(%error, "could not launch notification destination");
-                                snapshot.diagnostic = Some(format!(
-                                    "Could not open the notification's window: {error}"
-                                ));
-                            }
-                        }
-                        Err(error) => {
-                            tracing::warn!(%error, "could not activate notification destination");
-                            snapshot.diagnostic = Some(format!(
-                                "Could not activate the notification's window: {error}"
-                            ))
+                && let Some(host) = host.upgrade()
+            {
+                let window = host
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .activate_notification_destination(
+                        notice.event.target(),
+                        notice.event.source_session(),
+                        notice.window.as_deref(),
+                        notice.event.destination.as_ref(),
+                    );
+                // Activation and the matched executable handshake can wait;
+                // they never run under the daemon's session lock.
+                match crate::instance::activate_destination(&window, token.as_deref()) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        if let Err(error) = crate::instance::launch_notification_destination(
+                            &window,
+                            token.as_deref(),
+                        ) {
+                            tracing::warn!(%error, "could not launch notification destination");
+                            snapshot.diagnostic =
+                                Some(format!("Could not open the notification's window: {error}"));
                         }
                     }
+                    Err(error) => {
+                        tracing::warn!(%error, "could not activate notification destination");
+                        snapshot.diagnostic = Some(format!(
+                            "Could not activate the notification's window: {error}"
+                        ))
+                    }
                 }
+            }
         }
         let delivery_groups = delivery
             .keys()

@@ -953,6 +953,20 @@ fn floating_toggle_style(theme: &cosmic::Theme) -> iced::widget::container::Styl
 }
 
 #[cfg(test)]
+impl Cagents {
+    /// Opens `card`'s inspector and lets its slide finish.
+    pub(super) fn open_pane_inspector_now(&mut self, card: CardId) {
+        drop(self.set_pane_inspector_open(card, true));
+        self.settle_pane_inspectors();
+    }
+
+    /// Finishes every inspector's slide.
+    pub(super) fn settle_pane_inspectors(&mut self) {
+        drop(self.advance_pane_inspector_transitions(Instant::now() + DIALOG_TRANSITION_DURATION));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1966,19 +1980,5 @@ mod tests {
         );
         assert!(!inspectors.is_visible(panes[1]));
         assert!(inspectors.saved(|_| true).is_empty());
-    }
-}
-
-#[cfg(test)]
-impl Cagents {
-    /// Opens `card`'s inspector and lets its slide finish.
-    pub(super) fn open_pane_inspector_now(&mut self, card: CardId) {
-        drop(self.set_pane_inspector_open(card, true));
-        self.settle_pane_inspectors();
-    }
-
-    /// Finishes every inspector's slide.
-    pub(super) fn settle_pane_inspectors(&mut self) {
-        drop(self.advance_pane_inspector_transitions(Instant::now() + DIALOG_TRANSITION_DURATION));
     }
 }

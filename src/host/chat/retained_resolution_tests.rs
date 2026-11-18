@@ -25,18 +25,19 @@ fn cleanup_discoveries(directory: &Path) {
         };
         if kind.is_dir() {
             cleanup_discoveries(&entry.path());
-        } else if kind.is_file() && entry.path().extension().is_some_and(|v| v == "json")
+        } else if kind.is_file()
+            && entry.path().extension().is_some_and(|v| v == "json")
             && let Ok(bytes) = fs::read(entry.path())
-                && let Ok(owner) = serde_json::from_slice::<HolderRecord>(&bytes)
-            {
-                for process in [&owner.root, &owner.holder] {
-                    if process.pid != std::process::id() as i32 && process.is_current() {
-                        unsafe {
-                            libc::kill(process.pid, libc::SIGKILL);
-                        }
+            && let Ok(owner) = serde_json::from_slice::<HolderRecord>(&bytes)
+        {
+            for process in [&owner.root, &owner.holder] {
+                if process.pid != std::process::id() as i32 && process.is_current() {
+                    unsafe {
+                        libc::kill(process.pid, libc::SIGKILL);
                     }
                 }
             }
+        }
     }
 }
 
@@ -406,9 +407,11 @@ impl Drop for Fixture {
             .get(&self.original.id)
             .map(|r| r.handle.clone());
         if let Some(handle) = handle
-            && handle.close().is_ok() && handle.finish_retained_close().is_ok() {
-                return;
-            }
+            && handle.close().is_ok()
+            && handle.finish_retained_close().is_ok()
+        {
+            return;
+        }
         // Failure containment only, not a successful retirement oracle.
         for process in [&self.identity.record.root, &self.identity.record.holder] {
             if process.is_current() {

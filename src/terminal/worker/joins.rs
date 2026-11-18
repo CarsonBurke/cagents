@@ -192,15 +192,17 @@ pub(super) fn request(owner: &Arc<JoinOwner>, release: bool, final_drop: bool) {
             p.released = true;
             owner.changed.notify_all();
         }
-        if !p.registered && p.reservation.is_some()
-            && let Some(service) = owner.service {
-                service
-                    .pending
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .push(owner.clone());
-                p.registered = true;
-            }
+        if !p.registered
+            && p.reservation.is_some()
+            && let Some(service) = owner.service
+        {
+            service
+                .pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(owner.clone());
+            p.registered = true;
+        }
     }
     dispatch(owner);
 }

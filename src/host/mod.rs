@@ -627,9 +627,10 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
             .startup_recovery()
             .is_some();
     if !recovery_only
-        && let Err(error) = account_lifecycle::restore_unregistered_homes(Arc::downgrade(&host)) {
-            tracing::warn!(%error, "lost accounts will not be restored automatically");
-        }
+        && let Err(error) = account_lifecycle::restore_unregistered_homes(Arc::downgrade(&host))
+    {
+        tracing::warn!(%error, "lost accounts will not be restored automatically");
+    }
     if !recovery_only {
         let collect_host = Arc::downgrade(&host);
         let runtime_root = paths.directory.clone();

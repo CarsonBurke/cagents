@@ -1274,7 +1274,7 @@ impl Runtime {
         };
         let placed = reading
             .cli
-            .then(|| reading.outcome.run.as_ref())
+            .then_some(reading.outcome.run.as_ref())
             .flatten()
             .and_then(|run| run.placed_in.as_ref());
         let destination = placed.map(|placed| {

@@ -1013,10 +1013,10 @@ impl Store {
                         || pending.1 != role
                         || pending.2 != thinking
                         || pending.3.len() + delta.len() > 64 * 1024
-                })
-                    && let Some(warning) = self.flush_text()? {
-                        out.push(nonfatal(warning));
-                    }
+                }) && let Some(warning) = self.flush_text()?
+                {
+                    out.push(nonfatal(warning));
+                }
                 if delta.len() > 64 * 1024 {
                     if let Some(warning) = self.append(&id, role, thinking, &delta)? {
                         out.push(nonfatal(warning));
@@ -2548,9 +2548,10 @@ mod tests {
         loop {
             for item in &page.items {
                 if seen.insert(item.id.clone())
-                    && let ItemContent::Text { text, .. } = &item.content {
-                        bytes += text.len();
-                    }
+                    && let ItemContent::Text { text, .. } = &item.content
+                {
+                    bytes += text.len();
+                }
             }
             if !page.has_later {
                 break;
@@ -2905,9 +2906,10 @@ mod tests {
         let mut restored = String::new();
         for item in pages.into_iter().flatten() {
             if seen.insert(item.id.clone())
-                && let ItemContent::Text { text, .. } = &item.content {
-                    restored.push_str(text);
-                }
+                && let ItemContent::Text { text, .. } = &item.content
+            {
+                restored.push_str(text);
+            }
         }
         assert!(
             restored == original,

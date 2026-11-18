@@ -373,17 +373,16 @@ impl<Message> Widget<Message, Theme, Renderer> for Reorder<'_, Message> {
     }
     fn diff(&mut self, tree: &mut Tree) {
         let state = tree.state.downcast_mut::<State>();
-        if let Kind::Strip { items, enabled, .. } = &self.kind {
-            if !enabled
+        if let Kind::Strip { items, enabled, .. } = &self.kind
+            && (!enabled
                 || state.drag.as_ref().is_some_and(|drag| {
                     !items
                         .iter()
                         .map(|item| item.id)
                         .eq(drag.order.iter().copied())
-                })
-            {
-                state.suppress_release |= state.drag.take().is_some();
-            }
+                }))
+        {
+            state.suppress_release |= state.drag.take().is_some();
         }
         let cancel_channel = matches!(&self.kind, Kind::ChannelScope { generation, enabled, .. }
             if !enabled || state.channel_drag.as_ref().is_some_and(|drag| drag.generation != *generation));

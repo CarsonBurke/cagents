@@ -134,9 +134,9 @@ impl Journal {
                                 .select(owners::window)
                                 .first::<String>(connection)
                                 .optional()?
-                            {
-                                remember_owner(connection, &session, &window)?;
-                            }
+                        {
+                            remember_owner(connection, &session, &window)?;
+                        }
                         return Ok(None);
                     }
                     return Err(diesel::result::Error::RollbackTransaction);

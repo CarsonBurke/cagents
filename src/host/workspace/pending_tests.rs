@@ -226,9 +226,10 @@ fn failed_pending_save_still_publishes_the_worker_and_retry_reuses_it() {
     let deadline = Instant::now() + Duration::from_secs(3);
     let launches = loop {
         if let Ok(launches) = fs::read_to_string(fixture.directory.path().join("launches"))
-            && !launches.is_empty() {
-                break launches;
-            }
+            && !launches.is_empty()
+        {
+            break launches;
+        }
         assert!(Instant::now() < deadline, "original process did not start");
         thread::sleep(Duration::from_millis(1));
     };

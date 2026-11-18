@@ -82,7 +82,8 @@ pub(in crate::host) fn confirmed_identity_update(
         || replacement
             .launch
             .session_id
-            .as_ref().is_none_or(|id| uuid::Uuid::parse_str(id).is_err())
+            .as_ref()
+            .is_none_or(|id| uuid::Uuid::parse_str(id).is_err())
     {
         return false;
     }

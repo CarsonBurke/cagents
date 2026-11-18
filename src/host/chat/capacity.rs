@@ -401,7 +401,6 @@ pub(in crate::host) fn inspect(
     super::super::account_lifecycle::ensure_idle(host)?;
     // A writer's own delegation capability is separate from managed work.
     let ownership = super::super::agent_execution::registry(host).and_then(|registry| {
-        
         registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())

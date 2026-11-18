@@ -1941,23 +1941,22 @@ impl ControlClient {
         capture: Option<crate::workspace_model::views::CapturedTerminalSource>,
     ) -> Result<terminal::ipc::TerminalCloseResult, ControlError> {
         let terminal_id = session.id;
-        if !completed_only
-            && let Err(error) = self.attach_and_synchronize(terminal_id) {
-                // The cleanup request has not been sent. Keep disappearance
-                // distinct from an unconfirmed reply after cleanup admission.
-                return Err(match error {
-                    ControlError::Remote {
-                        code: ProtocolErrorCode::TerminalNotFound,
-                        retryable: false,
-                        ..
-                    } => ControlError::Remote {
-                        code: ProtocolErrorCode::TerminalNotFound,
-                        message: terminal::ipc::TERMINAL_CLOSE_SOURCE_ABSENT.into(),
-                        retryable: false,
-                    },
-                    error => error,
-                });
-            }
+        if !completed_only && let Err(error) = self.attach_and_synchronize(terminal_id) {
+            // The cleanup request has not been sent. Keep disappearance
+            // distinct from an unconfirmed reply after cleanup admission.
+            return Err(match error {
+                ControlError::Remote {
+                    code: ProtocolErrorCode::TerminalNotFound,
+                    retryable: false,
+                    ..
+                } => ControlError::Remote {
+                    code: ProtocolErrorCode::TerminalNotFound,
+                    message: terminal::ipc::TERMINAL_CLOSE_SOURCE_ABSENT.into(),
+                    retryable: false,
+                },
+                error => error,
+            });
+        }
         let request = ClientRequest::CloseTerminalSource {
             session,
             basis,
@@ -3565,9 +3564,12 @@ where
                 emit_error(cli.global.json, &AppError::new("daemon_not_running", error));
                 return ExitCode::FAILURE;
             }
-            emit_error(cli.global.json, &AppError::new("device", error));
+            emit_error(cli.global.json, &AppError::new("daemon_not_running", error));
             return ExitCode::FAILURE;
         }
+        emit_error(cli.global.json, &AppError::new("device", error));
+        return ExitCode::FAILURE;
+    }
     match execute_with_model_context(cli.command, project_channel_context, service_context) {
         Ok(output) => {
             let code = output.exit_code();

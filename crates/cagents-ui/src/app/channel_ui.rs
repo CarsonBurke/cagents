@@ -759,11 +759,11 @@ impl Cagents {
             return self.delete_channel(id);
         }
         if let Action::SessionsClosed(id, operation, result) = action {
-            if !self
+            if self
                 .channel_ui
                 .closing
                 .get(&id)
-                .is_some_and(|attempt| attempt.operation == operation)
+                .is_none_or(|attempt| attempt.operation != operation)
             {
                 return Task::none();
             }

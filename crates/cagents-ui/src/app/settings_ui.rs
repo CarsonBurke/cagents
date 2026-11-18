@@ -1134,7 +1134,7 @@ fn settings_layout<'a>(
                 .padding(design::list::edge_padding(space::M, 0.0))
                 .width(Length::Fill)
                 .into(),
-            categories.into(),
+            categories,
         ])
         .width(Length::Fixed(RAIL_WIDTH))
         .height(Length::Fill)
@@ -1275,23 +1275,15 @@ fn settings_layout<'a>(
             .height(Length::Fill)
             .into();
     if narrow {
-        widget::column::with_children(vec![
-            navigation,
-            crate::design::horizontal_rule().into(),
-            content,
-        ])
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+        widget::column::with_children(vec![navigation, crate::design::horizontal_rule(), content])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     } else {
-        widget::row::with_children(vec![
-            navigation,
-            crate::design::vertical_rule().into(),
-            content,
-        ])
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+        widget::row::with_children(vec![navigation, crate::design::vertical_rule(), content])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 }
 

@@ -552,10 +552,10 @@ fn queued_status_and_progress_cannot_cross_a_session_restart() {
         assert_eq!(displayed, LspStatus::Starting);
         for event in [old_ready, old_failed, old_progress] {
             assert!(!manager.event_is_current(&event));
-            if manager.event_is_current(&event) {
-                if let LspEvent::Status { status, .. } = event {
-                    displayed = status;
-                }
+            if manager.event_is_current(&event)
+                && let LspEvent::Status { status, .. } = event
+            {
+                displayed = status;
             }
             assert_eq!(displayed, LspStatus::Starting);
         }
@@ -4068,11 +4068,11 @@ fn the_event_channel_stays_bounded_under_diagnostic_flooding() {
             else {
                 break;
             };
-            if let LspEvent::Diagnostics { items, .. } = event {
-                if items.first().is_some_and(|item| item.message == newest) {
-                    seen_newest = true;
-                    break;
-                }
+            if let LspEvent::Diagnostics { items, .. } = event
+                && items.first().is_some_and(|item| item.message == newest)
+            {
+                seen_newest = true;
+                break;
             }
         }
         assert!(
@@ -4159,7 +4159,7 @@ fn a_crashed_server_reports_a_restartable_status_and_keeps_the_document() {
         );
         let uri = Url::from_file_path(&file).expect("uri");
         assert_eq!(
-            &*manager
+            manager
                 .snapshots
                 .latest(&uri)
                 .expect("the snapshot survives the crash")
@@ -4442,7 +4442,7 @@ fn a_missing_executable_reports_unavailable_and_leaves_editing_working() {
         assert!(status.can_restart());
         manager.change(doc, 2, &[], "abcd\n");
         assert_eq!(
-            &*manager
+            manager
                 .snapshots
                 .latest(&Url::from_file_path(&file).expect("uri"))
                 .expect("snapshot")

@@ -357,7 +357,7 @@ fn transcript_impl<'a>(
 ) -> Element<'a, Message> {
     let captured = Rc::new(Cell::new(false));
     let content = widget::scrollable(Element::new(InputCapture {
-        content: content.into(),
+        content,
         captured: captured.clone(),
     }))
     .direction(iced::widget::scrollable::Direction::Vertical(
@@ -2130,14 +2130,13 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                     .captured
                     .as_ref()
                     .is_some_and(|captured| captured.get());
-            if moved || wheel_intent {
-                if let Some(context) = anchor
+            if (moved || wheel_intent)
+                && let Some(context) = anchor
                     .contexts
                     .iter_mut()
                     .find(|context| context.subagent.as_deref() == self.subagent)
-                {
-                    context.edge = None;
-                }
+            {
+                context.edge = None;
             }
             if state.restore && self.restoration_pending && !moved {
                 return;

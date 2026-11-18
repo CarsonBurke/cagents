@@ -125,9 +125,10 @@ pub(crate) fn affected_accounts(
     // identity. Reserve both before either probe; an idempotent completed
     // registration has no probe and therefore needs no System reservation.
     if let Operation::Register { provider, .. } = operation
-        && !accounts.is_empty() {
-            accounts.push(super::Account::system(*provider));
-        }
+        && !accounts.is_empty()
+    {
+        accounts.push(super::Account::system(*provider));
+    }
     Ok(accounts)
 }
 

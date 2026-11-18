@@ -2258,20 +2258,23 @@ fn sigkill_host_fixture(semantic_held: bool) {
                 true
             };
             let helper = coordinator.helper.as_mut().unwrap();
-            if !helper_collected && release && helper.exited()
-                && let Some(status) = helper.reap() {
-                    assert!(libc::WIFEXITED(status));
-                    assert_eq!(
-                        libc::WEXITSTATUS(status),
-                        73,
-                        "exact helper must prove its existing teardown contract"
-                    );
-                    helper_collected = true;
-                    sigkill_write(
-                        &root.join("helper-reaped.json"),
-                        &SigkillMarker::for_actor(&case, &receipt.identity),
-                    );
-                }
+            if !helper_collected
+                && release
+                && helper.exited()
+                && let Some(status) = helper.reap()
+            {
+                assert!(libc::WIFEXITED(status));
+                assert_eq!(
+                    libc::WEXITSTATUS(status),
+                    73,
+                    "exact helper must prove its existing teardown contract"
+                );
+                helper_collected = true;
+                sigkill_write(
+                    &root.join("helper-reaped.json"),
+                    &SigkillMarker::for_actor(&case, &receipt.identity),
+                );
+            }
             if let Some(status) = coordinator.successor.as_mut().unwrap().poll() {
                 break status;
             }

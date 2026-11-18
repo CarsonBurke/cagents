@@ -214,7 +214,8 @@ impl Omp {
     ) {
         if self
             .execution
-            .as_ref().is_none_or(|execution| execution.request != request)
+            .as_ref()
+            .is_none_or(|execution| execution.request != request)
         {
             return;
         }

@@ -468,11 +468,10 @@ impl Cagents {
                                 last_error = Some(error.clone());
                                 let _ = sender.send_blocking(Action::Failed(error));
                             }
-                            match receiver.recv_timeout(crate::daemon_health::retry_delay()) {
-                                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                                    break 'control;
-                                }
-                                _ => {}
+                            if let Err(crossbeam_channel::RecvTimeoutError::Disconnected) =
+                                receiver.recv_timeout(crate::daemon_health::retry_delay())
+                            {
+                                break 'control;
                             }
                         } else {
                             break;

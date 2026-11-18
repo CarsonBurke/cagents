@@ -700,7 +700,8 @@ impl Registry {
         scope: Result<&LaunchAccountScope, &str>,
         confirmed_session: Option<&str>,
     ) -> Result<(), String> {
-        let scope = scope.cloned()
+        let scope = scope
+            .cloned()
             .map_err(|reason| reason.chars().take(4096).collect::<String>());
         let mut receipt = NativeActorRetirement {
             phase: NativeActorPhase::Installed,

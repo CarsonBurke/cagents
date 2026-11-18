@@ -1662,7 +1662,7 @@ pub(super) fn preflight_retirement(
     let Ok(registry) = registry(host) else {
         return Ok(());
     };
-    
+
     registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -2610,7 +2610,8 @@ fn console_line(item: &chat::Item, now: u64) -> Option<String> {
     let running = item.content.status() == Some(ToolStatus::Running);
     if running
         && item
-            .started_at.is_none_or(|started| now.saturating_sub(started) < CONSOLE_RUNNING_AFTER_MILLIS)
+            .started_at
+            .is_none_or(|started| now.saturating_sub(started) < CONSOLE_RUNNING_AFTER_MILLIS)
     {
         return None;
     }

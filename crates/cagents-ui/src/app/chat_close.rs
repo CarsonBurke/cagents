@@ -256,7 +256,7 @@ impl Cagents {
         // What isn't lost, the reader should know where to find.
         let kept = intent
             .filter(|intent| intent.keeps_unsent)
-            .and_then(|_| match question {
+            .and(match question {
                 dialog_ui::Question::StopWorkingChat => {
                     Some("Unsent and queued messages come back when you reopen this chat in this window.")
                 }

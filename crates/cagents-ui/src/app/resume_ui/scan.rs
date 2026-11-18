@@ -408,7 +408,7 @@ impl<'a> Records<'a> {
     fn record(&mut self, line: &[u8]) {
         let has = |finder: &memmem::Finder<'_>| finder.find(line).is_some();
         let declared = self.scan.identity.is_some();
-        let titled = self.finder.titles.iter().any(|finder| has(finder))
+        let titled = self.finder.titles.iter().any(&has)
             || self
                 .finder
                 .title_types

@@ -3768,8 +3768,9 @@ pub(super) fn read_presentation(
         }
         return Ok(ServerResponse::ChatSnapshot {
             chat_id,
-            snapshot: after_generation.is_none_or(|generation| generation < receipt.generation)
-            .then(|| receipt.snapshot()),
+            snapshot: after_generation
+                .is_none_or(|generation| generation < receipt.generation)
+                .then(|| receipt.snapshot()),
         }
         .into());
     }

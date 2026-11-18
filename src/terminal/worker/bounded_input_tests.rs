@@ -1503,10 +1503,7 @@ fn inactive_pty_and_exited_child_still_observe_capture_cancellation() {
         commands.send(Command::Shutdown).unwrap();
     }
     waiter.join().unwrap();
-    assert!(
-        observed.unwrap(),
-        "queued exact cancellation was ignored"
-    );
+    assert!(observed.unwrap(), "queued exact cancellation was ignored");
 }
 
 #[test]

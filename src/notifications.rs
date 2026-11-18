@@ -160,9 +160,9 @@ impl Event {
                     .chain(content.preview.chars())
                     .any(char::is_control)
                 || (content.request.is_some() && self.evidence.kind != Kind::Waiting))
-            {
-                return Err("Notification preview exceeds its text boundary".into());
-            }
+        {
+            return Err("Notification preview exceeds its text boundary".into());
+        }
         if self.evidence.key.len() > 1024
             || self
                 .directory

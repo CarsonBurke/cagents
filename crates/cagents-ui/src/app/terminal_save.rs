@@ -358,7 +358,7 @@ impl Cagents {
             .width(Length::Fill)
             .into(),
             Some(
-                widget::row::with_children(vec![retry, copy.into()])
+                widget::row::with_children(vec![retry, copy])
                     .spacing(space::XS)
                     .align_y(Alignment::Center)
                     .into(),
@@ -385,10 +385,10 @@ impl Cagents {
                 {
                     return Task::none();
                 }
-                return iced::clipboard::write(format!(
+                iced::clipboard::write(format!(
                     "Terminal save failed\nPane: {card}\nTerminal: {terminal}\n{}",
                     entry.failure.error.diagnostics
-                ));
+                ))
             }
             Action::Retry(card, terminal) => {
                 let Some(entry) = self.terminal_save.entries.get(&card) else {

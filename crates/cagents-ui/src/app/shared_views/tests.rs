@@ -6952,11 +6952,11 @@ fn terminal_that_cannot_restore_as_saved_only_attaches_when_the_registry_is_unav
     assert!(app.terminal_start_held(id, false));
     drop(app.start_terminal(id, session, true, false));
     assert!(
-        !app.terminal_starts
+        app.terminal_starts
             .lock()
             .unwrap()
             .get(&id)
-            .is_some_and(|starts| *starts > 1),
+            .is_none_or(|starts| *starts <= 1),
         "opening it adds no start of its own"
     );
 }
@@ -7668,7 +7668,7 @@ async fn a_pane_name_the_registry_changed_is_saved_so_the_next_start_admits_its_
 
     let directory = tempfile::tempdir().unwrap();
     let (session, _) = SessionRuntime::open(
-        &directory.path().join("window.sqlite3"),
+        directory.path().join("window.sqlite3"),
         crate::model::BootId::new("pane-name-test"),
     )
     .unwrap();

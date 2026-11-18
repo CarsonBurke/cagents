@@ -6896,8 +6896,8 @@ fn project_header_row<'a>(
 /// `RowInteraction::actions`, which narrows it only while they are on screen,
 /// so a long project name reads in full until the moment it would run under
 /// them.
-fn project_identity_row<'a>(
-    project: &'a SidebarProject,
+fn project_identity_row(
+    project: &SidebarProject,
     selected: bool,
     modal_open: bool,
     compact: bool,
@@ -6995,8 +6995,8 @@ fn project_name_label(project: &SidebarProject, query: &str) -> Element<'static,
 /// read and are shown beside the failure. A running creation looks like the
 /// worktree row it is about to become, muted and with a spinner, so a slow
 /// `git worktree add` shows up the moment it is asked for.
-fn operation_rows<'a>(
-    project: &'a SidebarProject,
+fn operation_rows(
+    project: &SidebarProject,
     modal_open: bool,
 ) -> impl Iterator<Item = Element<'static, SidebarAction>> {
     let grid = RowGrid::child(false);
@@ -7052,8 +7052,8 @@ fn operation_rows<'a>(
 
 /// The same operation rows as [`operation_rows`], reduced to the icon rail the
 /// compact sidebar is made of: the one glyph is also the row's one control.
-fn compact_operation_rows<'a>(
-    project: &'a SidebarProject,
+fn compact_operation_rows(
+    project: &SidebarProject,
     modal_open: bool,
 ) -> impl Iterator<Item = Element<'static, SidebarAction>> {
     let grid = RowGrid::child(true);
@@ -7118,8 +7118,8 @@ fn gated_operation_action(
     }
 }
 
-fn operation_control<'a>(
-    operation: &'a WorktreeOperationRow,
+fn operation_control(
+    operation: &WorktreeOperationRow,
     modal_open: bool,
 ) -> Option<Element<'static, SidebarAction>> {
     let action = gated_operation_action(operation, modal_open)?;
@@ -10120,7 +10120,7 @@ fn worktree_panel<'a>(
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into(),
-            crate::design::horizontal_rule().into(),
+            crate::design::horizontal_rule(),
             footer(false, modal_open),
         ])
         .width(Length::Fill)
@@ -10613,9 +10613,9 @@ fn panel_section<'a>(
         parts.action_name,
     );
     let header: Element<'a, SidebarAction> = if let Some(actions) = actions {
-        RowInteraction::actions(header.into(), actions, 0.0).into()
+        RowInteraction::actions(header, actions, 0.0)
     } else {
-        header.into()
+        header
     };
     let mut column = widget::column::with_capacity(2).push(header);
     if expanded {
@@ -13560,7 +13560,7 @@ fn search_label(
             cosmic::iced::widget::rich_text(spans)
                 .size(size)
                 .font(font)
-                .class(class.clone())
+                .class(class)
                 .wrapping(cosmic::iced::widget::text::Wrapping::None)
                 .width(Length::Fill),
         )
@@ -14574,41 +14574,41 @@ mod row_interaction {
                         }
                     }
                     Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
-                        if let Some((project, _)) = state.origin.take() {
-                            if state.dragging {
-                                if let Some((before, _)) = state.drop.take().filter(|_| hovered) {
-                                    shell.publish(match (&self.kind, project) {
-                                        (
-                                            Kind::Reorder {
-                                                project: Some(owner),
-                                                ..
-                                            },
-                                            source,
-                                        ) => SidebarAction::ReorderMember {
-                                            project: *owner,
-                                            source,
-                                            before,
+                        if let Some((project, _)) = state.origin.take()
+                            && state.dragging
+                        {
+                            if let Some((before, _)) = state.drop.take().filter(|_| hovered) {
+                                shell.publish(match (&self.kind, project) {
+                                    (
+                                        Kind::Reorder {
+                                            project: Some(owner),
+                                            ..
                                         },
-                                        (_, super::SelectionRow::Project(project)) => {
-                                            SidebarAction::ReorderProject {
-                                                project,
-                                                before: before.and_then(|row| {
-                                                    if let super::SelectionRow::Project(id) = row {
-                                                        Some(id)
-                                                    } else {
-                                                        None
-                                                    }
-                                                }),
-                                            }
+                                        source,
+                                    ) => SidebarAction::ReorderMember {
+                                        project: *owner,
+                                        source,
+                                        before,
+                                    },
+                                    (_, super::SelectionRow::Project(project)) => {
+                                        SidebarAction::ReorderProject {
+                                            project,
+                                            before: before.and_then(|row| {
+                                                if let super::SelectionRow::Project(id) = row {
+                                                    Some(id)
+                                                } else {
+                                                    None
+                                                }
+                                            }),
                                         }
-                                        _ => unreachable!(),
-                                    });
-                                }
-                                state.dragging = false;
-                                shell.request_redraw();
-                                shell.capture_event();
-                                return;
+                                    }
+                                    _ => unreachable!(),
+                                });
                             }
+                            state.dragging = false;
+                            shell.request_redraw();
+                            shell.capture_event();
+                            return;
                         }
                     }
                     Event::Window(window::Event::Unfocused)
@@ -14915,23 +14915,23 @@ mod row_interaction {
                         .draw(tree, renderer, theme, style, layout, cursor, viewport);
                 }
             }
-            if let Some((_, y)) = state.drop {
-                if let Some(clip) = layout.bounds().intersection(viewport) {
-                    renderer.with_layer(clip, |renderer| {
-                        renderer.fill_quad(
-                            renderer::Quad {
-                                bounds: Rectangle {
-                                    x: layout.bounds().x,
-                                    y: y - 1.0,
-                                    width: layout.bounds().width,
-                                    height: 2.0,
-                                },
-                                ..Default::default()
+            if let Some((_, y)) = state.drop
+                && let Some(clip) = layout.bounds().intersection(viewport)
+            {
+                renderer.with_layer(clip, |renderer| {
+                    renderer.fill_quad(
+                        renderer::Quad {
+                            bounds: Rectangle {
+                                x: layout.bounds().x,
+                                y: y - 1.0,
+                                width: layout.bounds().width,
+                                height: 2.0,
                             },
-                            cosmic::iced::Color::from(*theme.cosmic().accent_color()),
-                        );
-                    });
-                }
+                            ..Default::default()
+                        },
+                        cosmic::iced::Color::from(*theme.cosmic().accent_color()),
+                    );
+                });
             }
         }
 

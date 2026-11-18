@@ -1754,13 +1754,13 @@ struct VirtualStripState {
 // reclaim those states before being parked outside the traversed child tree;
 // otherwise the next frame drops them and remounting downcasts State::None.
 fn reclaim_named_states(tree: &mut Tree) {
-    if let Some(widget::Id(iced_accessibility::id::Internal::Custom(_, name))) = &tree.id {
-        if let Some((state, children)) = tree::NAMED.with(|named| named.borrow_mut().remove(name)) {
-            tree.state = state;
-            for (index, child) in children {
-                if let Some(slot) = tree.children.get_mut(index) {
-                    *slot = child;
-                }
+    if let Some(widget::Id(iced_accessibility::id::Internal::Custom(_, name))) = &tree.id
+        && let Some((state, children)) = tree::NAMED.with(|named| named.borrow_mut().remove(name))
+    {
+        tree.state = state;
+        for (index, child) in children {
+            if let Some(slot) = tree.children.get_mut(index) {
+                *slot = child;
             }
         }
     }

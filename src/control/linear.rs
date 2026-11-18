@@ -565,11 +565,12 @@ fn linked_workspace(
     linked: Option<String>,
 ) -> Result<Option<String>, AppError> {
     if let Some(a) = &explicit
-        && !linked.as_ref().is_some_and(|b| a.eq_ignore_ascii_case(b)) {
-            return Err(error(
-                "--workspace conflicts with the linked issue's workspace",
-            ));
-        }
+        && !linked.as_ref().is_some_and(|b| a.eq_ignore_ascii_case(b))
+    {
+        return Err(error(
+            "--workspace conflicts with the linked issue's workspace",
+        ));
+    }
     Ok(explicit.or(linked))
 }
 fn client(workspace: Option<&str>) -> Result<Client, AppError> {

@@ -3861,9 +3861,11 @@ fn application_close_advances_only_after_current_durability_fence_resolves() {
 
     let _ = app.update(Message::WindowCloseRequested(window));
     let _ = app.update(Message::DiscardAndCloseRepository(first));
-    assert!(app.dirty_repository_close.as_ref().is_some_and(
-        |close| close.card == first && close.remaining == VecDeque::from([second])
-    ));
+    assert!(
+        app.dirty_repository_close
+            .as_ref()
+            .is_some_and(|close| close.card == first && close.remaining == [second])
+    );
 
     let completion = fixture.durable_retry(&mut app, first);
     let _ = app.update(completion);
@@ -6098,8 +6100,8 @@ fn restored_agents_attach_one_at_a_time_after_visible_cards_start() {
 #[test]
 fn startup_qualification_attaches_offscreen_shell_omp_and_custom_terminal_owners_serially() {
     let mut app = context_inspector_test_app(false);
-    let terminals = ["/bin/sh", "/usr/bin/omp", "/fixture/custom-wrapper"]
-        .map(|program| restored_live_terminal(program));
+    let terminals =
+        ["/bin/sh", "/usr/bin/omp", "/fixture/custom-wrapper"].map(restored_live_terminal);
     app.durable = Arc::new(WorkspaceState {
         cards: terminals.to_vec().into(),
         ..WorkspaceState::default()
@@ -6721,7 +6723,7 @@ fn workspace_switcher_home_end_hover_and_stale_actions_use_the_frozen_hold() {
     assert_eq!(app.chrome_ui.workspace_switcher_rows.len(), 20);
     let key = |key: keyboard::key::Named| Message::KeyEvent {
         event: keyboard::Event::KeyPressed {
-            key: keyboard::Key::Named(key.clone()),
+            key: keyboard::Key::Named(key),
             modified_key: keyboard::Key::Named(key),
             physical_key: keyboard::key::Physical::Code(keyboard::key::Code::End),
             location: keyboard::Location::Standard,
@@ -10531,8 +10533,8 @@ pub(super) fn focused_element(
         .as_widget_mut()
         .operate(&mut tree, Layout::new(&node), &renderer, &mut probe);
     let _ = probe.finish();
-    let answer = found.lock().expect("the probe survived").clone();
-    answer
+
+    found.lock().expect("the probe survived").clone()
 }
 
 /// A jump that moves the caret must also hand the editor the keyboard.

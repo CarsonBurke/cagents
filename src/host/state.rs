@@ -5029,11 +5029,12 @@ fn start_terminal_view_owned_reserved(
                 false,
                 execution_recipe.clone(),
                 retained_environment,
-            ) {
-                drop(state);
-                let _ = handle.shutdown();
-                return Err(error);
-            }
+            )
+        {
+            drop(state);
+            let _ = handle.shutdown();
+            return Err(error);
+        }
         let record = state
             .terminals
             .get_mut(&terminal_id)

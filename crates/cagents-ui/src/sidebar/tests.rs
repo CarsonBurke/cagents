@@ -10419,7 +10419,7 @@ fn compact_search_and_pr_filter_apply_while_the_popover_is_open() {
 fn the_search_input_carries_the_focus_target_the_application_reveals() {
     let mut state = SidebarState::default();
     assert!(
-        Tree::new(&search(&state, false))
+        Tree::new(search(&state, false))
             .find(&search_focus_id())
             .is_some()
     );
@@ -10428,7 +10428,7 @@ fn the_search_input_carries_the_focus_target_the_application_reveals() {
     // the application focuses.
     state.apply(&SidebarAction::SearchChanged("cagents".into()));
     assert!(
-        Tree::new(&search(&state, false))
+        Tree::new(search(&state, false))
             .find(&search_focus_id())
             .is_some()
     );

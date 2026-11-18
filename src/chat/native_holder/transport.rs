@@ -506,9 +506,10 @@ pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, St
                 return Err(io::Error::last_os_error());
             }
             if let Some(directory) = directory_fd
-                && libc::fcntl(directory, libc::F_SETFD, 0) == -1 {
-                    return Err(io::Error::last_os_error());
-                }
+                && libc::fcntl(directory, libc::F_SETFD, 0) == -1
+            {
+                return Err(io::Error::last_os_error());
+            }
             Ok(())
         });
     }

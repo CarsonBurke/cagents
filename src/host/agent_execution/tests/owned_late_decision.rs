@@ -102,12 +102,13 @@ struct Evidence {
 impl Drop for Evidence {
     fn drop(&mut self) {
         if (!self.success || thread::panicking())
-            && let Some(directory) = self.directory.take() {
-                eprintln!(
-                    "late-decision failure evidence retained: {}",
-                    directory.keep().display()
-                );
-            }
+            && let Some(directory) = self.directory.take()
+        {
+            eprintln!(
+                "late-decision failure evidence retained: {}",
+                directory.keep().display()
+            );
+        }
     }
 }
 struct Capture(thread::JoinHandle<io::Result<()>>);
@@ -271,7 +272,8 @@ impl ControllerChild {
             .child
             .as_mut()
             .expect("owned original child")
-            .try_wait()?.is_some()
+            .try_wait()?
+            .is_some()
         {
             self.reaped = true;
             return Ok(());

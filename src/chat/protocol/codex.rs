@@ -123,9 +123,10 @@ fn append_display_output(
     // single-line output preserve a UTF-8-safe suffix instead.
     if start > 0
         && let Some(line) = tail[start..].find('\n')
-        && start + line + 1 < tail.len() {
-            start += line + 1;
-        }
+        && start + line + 1 < tail.len()
+    {
+        start += line + 1;
+    }
     window.omitted = window.omitted.saturating_add(start);
     window.head = head.len();
     *output = head;
@@ -1590,21 +1591,22 @@ impl Codex {
                 return Err("Codex did not return full turn items as requested; history cannot be hydrated safely".into());
             }
             for value in array(turn, "items")? {
-                if !active && value["type"] == "userMessage"
+                if !active
+                    && value["type"] == "userMessage"
                     && let Some(label) = value["content"]
                         .as_array()
                         .into_iter()
                         .flatten()
                         .find_map(|input| input["text"].as_str())
                         .and_then(crate::account::clean_label)
-                        && !self.branch_points.iter().any(|point| point.id == turn_id)
-                            && self.branch_points.len() < 128
-                        {
-                            self.branch_points.push(chat::BranchPoint {
-                                id: turn_id.into(),
-                                label,
-                            });
-                        }
+                    && !self.branch_points.iter().any(|point| point.id == turn_id)
+                    && self.branch_points.len() < 128
+                {
+                    self.branch_points.push(chat::BranchPoint {
+                        id: turn_id.into(),
+                        label,
+                    });
+                }
                 if value["type"] == "collabAgentToolCall" {
                     for id in value["receiverThreadIds"]
                         .as_array()
@@ -3574,10 +3576,11 @@ impl Adapter for Codex {
                 // a notification for an item this adapter never tracked cannot
                 // fail the session over a patch nothing would render.
                 if let Some(item) = self.active_items.get_mut(&id)
-                    && let ItemContent::Changes { changes, .. } = &mut item.content {
-                        *changes = file_changes(params)?;
-                        step.events.push(Event::Item(item.clone()));
-                    }
+                    && let ItemContent::Changes { changes, .. } = &mut item.content
+                {
+                    *changes = file_changes(params)?;
+                    step.events.push(Event::Item(item.clone()));
+                }
             }
             "serverRequest/resolved" => {
                 let id = rpc_id(&params["requestId"])?;
@@ -4615,12 +4618,12 @@ fn parse_item_with_windows(
         if bytes > MAX_ITEM_BYTES
             && let ItemContent::Tool { output, .. } | ItemContent::Command { output, .. } =
                 &mut item.content
-            {
-                let limit = MAX_ITEM_BYTES.saturating_sub(bytes.saturating_sub(output.len()));
-                // Completed items replace streamed items, so apply the same bound.
-                let full = std::mem::take(output);
-                append_display_output(output, &full, limit, &mut window);
-            }
+        {
+            let limit = MAX_ITEM_BYTES.saturating_sub(bytes.saturating_sub(output.len()));
+            // Completed items replace streamed items, so apply the same bound.
+            let full = std::mem::take(output);
+            append_display_output(output, &full, limit, &mut window);
+        }
         if item.content.byte_len() > limit {
             return Err("Codex item exceeds native client size bound".into());
         }

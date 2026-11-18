@@ -1791,10 +1791,10 @@ fn contains_text(content: &ItemContent, query: &str) -> bool {
             body,
             ..
         } => {
-            find::contains(&from, query)
-                || find::contains(&sender, query)
-                || find::contains(&summary, query)
-                || find::contains(&body, query)
+            find::contains(from, query)
+                || find::contains(sender, query)
+                || find::contains(summary, query)
+                || find::contains(body, query)
         }
     }
 }
@@ -3617,29 +3617,29 @@ impl Runtime {
                 insertion.push(' ');
             }
         }
-        if !insertion.is_empty() {
-            if let Ok(Some(change)) = attachment_draft::edit(
+        if !insertion.is_empty()
+            && let Ok(Some(change)) = attachment_draft::edit(
                 &mut self.composer,
                 text_editor::Edit::Paste(Arc::new(insertion)),
-            ) {
-                for (other_id, other) in &mut self.attachment_bookmarks {
-                    // Equal collapsed anchors follow paste initiation order,
-                    // independent of worker completion order. User caret
-                    // mapping retains its normal left affinity.
-                    let later_at_start = !earlier.contains(other_id)
-                        && other.cursor.selection.is_none()
-                        && other.cursor.position == change.start;
-                    other.changed(&change);
-                    if later_at_start && other.valid {
-                        other.cursor.position = change.inserted_end();
-                    }
+            )
+        {
+            for (other_id, other) in &mut self.attachment_bookmarks {
+                // Equal collapsed anchors follow paste initiation order,
+                // independent of worker completion order. User caret
+                // mapping retains its normal left affinity.
+                let later_at_start = !earlier.contains(other_id)
+                    && other.cursor.selection.is_none()
+                    && other.cursor.position == change.start;
+                other.changed(&change);
+                if later_at_start && other.valid {
+                    other.cursor.position = change.inserted_end();
                 }
-                self.cancel_invalid_attachment_jobs();
-                if current != bookmark.cursor {
-                    if let Some(mapped) = attachment_draft::mapped(current, &change) {
-                        attachment_draft::move_to(&mut self.composer, mapped);
-                    }
-                }
+            }
+            self.cancel_invalid_attachment_jobs();
+            if current != bookmark.cursor
+                && let Some(mapped) = attachment_draft::mapped(current, &change)
+            {
+                attachment_draft::move_to(&mut self.composer, mapped);
             }
         }
         self.merge_attachments(attachments);
@@ -8070,9 +8070,7 @@ impl Cagents {
         let Some(CardKind::Chat(source)) = self.card_state(card).map(|state| &state.kind) else {
             return None;
         };
-        if source.launch.session_id.is_none() {
-            return None;
-        }
+        source.launch.session_id.as_ref()?;
         let choices = self
             .chat_accounts(source.launch.provider, &source.launch.recipe)
             .into_iter()
@@ -11551,7 +11549,7 @@ impl Cagents {
             );
             return Task::none();
         }
-        return cosmic::task::future(async move {
+        cosmic::task::future(async move {
             let worker_ticket = id.clone();
             let result = images::run_worker(move || {
                 worker_ticket.check()?;
@@ -11569,7 +11567,7 @@ impl Cagents {
             .await
             .and_then(|r| r);
             Message::ChatUi(Action::AttachmentsPrepared(target, id, result))
-        });
+        })
     }
 
     fn handle_chat_ui_inner(&mut self, action: Action) -> Task<Message> {
@@ -13379,20 +13377,20 @@ impl Cagents {
                 }
             }
             Action::AppendProviderDraft(target) => {
-                if let Some(runtime) = self.chat_runtime_mut(target) {
-                    if let Some(provided) = &runtime.snapshot.composer {
-                        let mut text = runtime.composer.text();
-                        if !text.trim().is_empty() {
-                            text.push('\n');
-                        }
-                        text.push_str(provided);
-                        // Appending promotes the recalled prompt to the unsent
-                        // draft, just as typing or completing a word does.
-                        runtime.history_cursor = None;
-                        runtime.history_stash = None;
-                        runtime.history_attachment_stash = None;
-                        runtime.replace_draft(text_editor::Content::with_text(&text));
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && let Some(provided) = &runtime.snapshot.composer
+                {
+                    let mut text = runtime.composer.text();
+                    if !text.trim().is_empty() {
+                        text.push('\n');
                     }
+                    text.push_str(provided);
+                    // Appending promotes the recalled prompt to the unsent
+                    // draft, just as typing or completing a word does.
+                    runtime.history_cursor = None;
+                    runtime.history_stash = None;
+                    runtime.history_attachment_stash = None;
+                    runtime.replace_draft(text_editor::Content::with_text(&text));
                 }
             }
             Action::SubmitControl(target, mode) => {
@@ -13832,20 +13830,20 @@ impl Cagents {
                     runtime.composer_actions = false;
                     runtime.branch_picker = false;
                 }
-                if command == Command::LoadEarlier {
-                    if let Some(runtime) = self.chat_runtime_mut(target) {
-                        if runtime.selected_subagent.is_some() {
-                            return Task::none();
-                        }
-                        if runtime
-                            .pending
-                            .as_ref()
-                            .is_some_and(|pending| pending.page.is_none())
-                            && runtime.deferred_page != Some(HistoryNavigation::Latest)
-                        {
-                            runtime.deferred_page = Some(HistoryNavigation::EarlierExplicit);
-                            return Task::none();
-                        }
+                if command == Command::LoadEarlier
+                    && let Some(runtime) = self.chat_runtime_mut(target)
+                {
+                    if runtime.selected_subagent.is_some() {
+                        return Task::none();
+                    }
+                    if runtime
+                        .pending
+                        .as_ref()
+                        .is_some_and(|pending| pending.page.is_none())
+                        && runtime.deferred_page != Some(HistoryNavigation::Latest)
+                    {
+                        runtime.deferred_page = Some(HistoryNavigation::EarlierExplicit);
+                        return Task::none();
                     }
                 }
                 if matches!(command, Command::Branch { .. })
@@ -14117,10 +14115,10 @@ impl Cagents {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
-                if !runtime
+                if runtime
                     .pending
                     .as_ref()
-                    .is_some_and(|pending| pending.id == id)
+                    .is_none_or(|pending| pending.id != id)
                 {
                     return Task::none();
                 }
@@ -14924,13 +14922,11 @@ impl Cagents {
                             if runtime.pastes_pending >= 2 {
                                 runtime.error = Some("Two attachments are already loading. Dropped files were inserted as paths; wait before attaching more.".into());
                                 rest.extend(files.into_iter().map(file_drop::Item::File));
+                            } else if let Some((id, lease)) = attachment_draft::admit() {
+                                staged = Some((id, files, lease));
                             } else {
-                                if let Some((id, lease)) = attachment_draft::admit() {
-                                    staged = Some((id, files, lease));
-                                } else {
-                                    runtime.error = Some("Two attachments are already loading. Dropped files were inserted as paths; wait before attaching more.".into());
-                                    rest.extend(files.into_iter().map(file_drop::Item::File));
-                                }
+                                runtime.error = Some("Two attachments are already loading. Dropped files were inserted as paths; wait before attaching more.".into());
+                                rest.extend(files.into_iter().map(file_drop::Item::File));
                             }
                         }
                         file_drop::Dropped::Items(rest)
@@ -14973,22 +14969,22 @@ impl Cagents {
                 ]);
             }
             Action::RemoveAttachment(target, index) => {
-                if let Some(runtime) = self.chat_runtime_mut(target) {
-                    if index < runtime.attachments.len() {
-                        let token = runtime.attachments[index]
-                            .reference
-                            .as_ref()
-                            .map(chat::ImageReference::token);
-                        if let Some(token) = token
-                            && !runtime.remove_image_token(&token)
-                        {
-                            return Task::none();
-                        }
-                        runtime.attachments.remove(index);
-                        runtime.thumbnails.sync(&runtime.attachments);
-                        runtime.revision = runtime.revision.wrapping_add(1);
-                        runtime.settle_restored_notice();
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && index < runtime.attachments.len()
+                {
+                    let token = runtime.attachments[index]
+                        .reference
+                        .as_ref()
+                        .map(chat::ImageReference::token);
+                    if let Some(token) = token
+                        && !runtime.remove_image_token(&token)
+                    {
+                        return Task::none();
                     }
+                    runtime.attachments.remove(index);
+                    runtime.thumbnails.sync(&runtime.attachments);
+                    runtime.revision = runtime.revision.wrapping_add(1);
+                    runtime.settle_restored_notice();
                 }
             }
             Action::Model(target, id) => {
@@ -15094,8 +15090,8 @@ impl Cagents {
                 return self.chat_send(target, Command::SetPermissionMode { mode }, false);
             }
             Action::Field(target, request, field, value) => {
-                if let Some(runtime) = self.chat_runtime_mut(target) {
-                    if let Some(schema) = runtime
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && let Some(schema) = runtime
                         .snapshot
                         .requests
                         .iter()
@@ -15106,24 +15102,23 @@ impl Cagents {
                                 .iter()
                                 .find(|candidate| candidate.id == field)
                         })
-                    {
-                        let values = runtime.answers.entry((request, field)).or_default();
-                        if schema.multiple {
-                            values.retain(|selected| {
-                                schema.choices.iter().any(|choice| &choice.id == selected)
-                            });
-                        } else {
-                            values.clear();
-                        }
-                        if !value.is_empty() {
-                            values.push(value);
-                        }
+                {
+                    let values = runtime.answers.entry((request, field)).or_default();
+                    if schema.multiple {
+                        values.retain(|selected| {
+                            schema.choices.iter().any(|choice| &choice.id == selected)
+                        });
+                    } else {
+                        values.clear();
+                    }
+                    if !value.is_empty() {
+                        values.push(value);
                     }
                 }
             }
             Action::Choice(target, request, field, value) => {
-                if let Some(runtime) = self.chat_runtime_mut(target) {
-                    if let Some(schema) = runtime
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && let Some(schema) = runtime
                         .snapshot
                         .requests
                         .iter()
@@ -15134,21 +15129,17 @@ impl Cagents {
                                 .iter()
                                 .find(|candidate| candidate.id == field)
                         })
-                    {
-                        if schema.choices.iter().any(|choice| choice.id == value) {
-                            let values = runtime.answers.entry((request, field)).or_default();
-                            if schema.multiple {
-                                if let Some(index) =
-                                    values.iter().position(|selected| selected == &value)
-                                {
-                                    values.remove(index);
-                                } else {
-                                    values.push(value);
-                                }
-                            } else {
-                                *values = vec![value];
-                            }
+                    && schema.choices.iter().any(|choice| choice.id == value)
+                {
+                    let values = runtime.answers.entry((request, field)).or_default();
+                    if schema.multiple {
+                        if let Some(index) = values.iter().position(|selected| selected == &value) {
+                            values.remove(index);
+                        } else {
+                            values.push(value);
                         }
+                    } else {
+                        *values = vec![value];
                     }
                 }
             }

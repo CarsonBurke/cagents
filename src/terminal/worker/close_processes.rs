@@ -116,9 +116,10 @@ impl Drop for FrozenProcess {
     fn drop(&mut self) {
         if self.resume
             && let Err(error) = signal(&self.pidfd, libc::SIGCONT)
-                && error.raw_os_error() != Some(libc::ESRCH) {
-                    tracing::error!(pid = self.identity.pid, %error, "failed to resume terminal process after close inspection");
-                }
+            && error.raw_os_error() != Some(libc::ESRCH)
+        {
+            tracing::error!(pid = self.identity.pid, %error, "failed to resume terminal process after close inspection");
+        }
     }
 }
 

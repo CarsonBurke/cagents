@@ -268,15 +268,17 @@ impl State {
             return true;
         }
         if let Event::Keyboard(keyboard::Event::KeyReleased { physical_key, .. }) = event
-            && let Some(i) = barrier.keys.iter().position(|key| key == physical_key) {
-                barrier.keys.swap_remove(i);
-                return true;
-            }
+            && let Some(i) = barrier.keys.iter().position(|key| key == physical_key)
+        {
+            barrier.keys.swap_remove(i);
+            return true;
+        }
         if let Event::Mouse(mouse::Event::ButtonReleased(button)) = event
-            && let Some(i) = barrier.buttons.iter().position(|held| held == button) {
-                barrier.buttons.swap_remove(i);
-                return true;
-            }
+            && let Some(i) = barrier.buttons.iter().position(|held| held == button)
+        {
+            barrier.buttons.swap_remove(i);
+            return true;
+        }
         if !self.review {
             return false;
         }

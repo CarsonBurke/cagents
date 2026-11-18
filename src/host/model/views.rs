@@ -201,20 +201,23 @@ pub(super) fn update_terminal_source(
     }
     if before == Some(claimed_before)
         && let (Some(CardKind::Terminal(before)), Some(CardKind::Terminal(after))) = (before, after)
-            && same_terminal_identity(before, after) && ended_terminal(after) {
-                if before
-                    .continuity
-                    .live_proof()
-                    .is_some_and(|proof| proof.is_complete())
-                {
-                    return write_terminal_source(db, id, before, after);
-                }
-                if before.continuity == after.continuity
-                    && let Some((source, ended)) = terminal_source(db, id)?
-                        && ended == *before {
-                            return write_terminal_source(db, id, &source, after);
-                        }
-            }
+        && same_terminal_identity(before, after)
+        && ended_terminal(after)
+    {
+        if before
+            .continuity
+            .live_proof()
+            .is_some_and(|proof| proof.is_complete())
+        {
+            return write_terminal_source(db, id, before, after);
+        }
+        if before.continuity == after.continuity
+            && let Some((source, ended)) = terminal_source(db, id)?
+            && ended == *before
+        {
+            return write_terminal_source(db, id, &source, after);
+        }
+    }
     db.execute(
         "DELETE FROM shared_view_terminal_sources WHERE pane=?1",
         [id.to_string()],
@@ -676,9 +679,9 @@ pub(super) fn apply_recorded(
                 && bindings::read(transaction, before.id)?
                     .and_then(|b| b.basis)
                     .is_some_and(|original| &original != worker)
-                {
-                    return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
-                }
+            {
+                return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
+            }
             changed = match change {
                 Change::Transfer {
                     id,

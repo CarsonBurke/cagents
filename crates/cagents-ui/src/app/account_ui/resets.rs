@@ -171,10 +171,10 @@ impl State {
     }
 
     fn finish(&mut self, key: &str, status: ConsumeStatus, message: String) -> bool {
-        if !self
+        if self
             .pending
             .as_ref()
-            .is_some_and(|attempt| attempt.key == key)
+            .is_none_or(|attempt| attempt.key != key)
         {
             return false;
         }

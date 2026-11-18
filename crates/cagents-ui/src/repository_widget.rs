@@ -7654,11 +7654,10 @@ impl RepositoryRuntime {
                             .or_else(|| self.current_selection_scope())
                     })
                     .flatten();
-                self.find_selection_revision =
-                    self.find_selection.and_then(|_| match &self.document {
-                        DocumentState::Editable(document) => Some(document.revision),
-                        _ => None,
-                    });
+                self.find_selection_revision = self.find_selection.and(match &self.document {
+                    DocumentState::Editable(document) => Some(document.revision),
+                    _ => None,
+                });
                 // Recapturing the same coordinates after a change must also
                 // replace a cached stale-scope refusal for this revision.
                 self.find_cache = None;
@@ -8338,11 +8337,14 @@ impl RepositoryRuntime {
         self.reveal_diff_row(row);
         // A deleted row shown above the line starts at its top; only the
         // line itself carries the editor's offset within it.
-        let fraction = self
+        let fraction = if self
             .diff_model()
             .is_some_and(|model| diff_row_lines(model, self.diff_mode, row).1 == Some(source.line))
-            .then_some(source.fraction)
-            .unwrap_or_default();
+        {
+            source.fraction
+        } else {
+            Default::default()
+        };
         // The other layout's saved place predates this line; switching
         // layouts now keeps the line on screen.
         self.viewports.diff = [None; 2];
@@ -9251,8 +9253,8 @@ fn assemble_repository_files(
         files.entry(path.clone()).or_insert(false);
     }
     Ok(files
-        .into_iter()
-        .map(|(path, _tracked)| {
+        .into_keys()
+        .map(|path| {
             let status = statuses.get(&path);
             let (staged, unstaged) = status.map_or((false, false), |status| {
                 (status.staged.is_some(), status.unstaged.is_some())
@@ -9485,7 +9487,7 @@ pub fn view_with_review<'a>(
             FileListState::Loading => loading(),
             FileListState::Failed(error) => widget::container(
                 widget::column::with_children(vec![
-                    information_state("Could not list files", error.clone()).into(),
+                    information_state("Could not list files", error.clone()),
                     crate::ui_controls::button::secondary("Retry loading files")
                         .on_press_maybe(
                             (!runtime.file_list_loading)
@@ -10113,9 +10115,10 @@ fn find_strip<'a>(
         selection = selection
             .on_toggle(move |enabled| RepositoryAction::FindSelectionChanged { card, enabled });
     }
-    options.push(
-        crate::interaction::tooltip(selection, "Search the selection captured when enabled").into(),
-    );
+    options.push(crate::interaction::tooltip(
+        selection,
+        "Search the selection captured when enabled",
+    ));
     strips.push(
         widget::row::with_children(options)
             .spacing(space::S)
@@ -10164,7 +10167,6 @@ fn find_strip<'a>(
                         preserve,
                         "Keep each matched word's upper, lower or title case (plain text)",
                     )
-                    .into()
                 },
                 crate::ui_controls::button::secondary("Replace")
                     .on_press_maybe(
@@ -10239,8 +10241,7 @@ fn editor_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Repo
             .width(Length::Fill)
             .height(Length::Fill),
             format!("{width} × {height} pixels"),
-        )
-        .into(),
+        ),
         DocumentState::Pdf {
             source: _,
             path: _,
@@ -10364,25 +10365,22 @@ fn pdf_document_view<'a>(
             .on_press_maybe(to.map(|zoom| RepositoryAction::PdfZoom { card, zoom }))
     };
     controls.push(step(zoom.smaller(), Icon::ZoomOut, "Draw the page smaller").into());
-    controls.push(
-        crate::interaction::tooltip(
-            // A fixed width, because the label is between the two controls a
-            // reader presses repeatedly and "Fit", "50%" and "125%" are three
-            // different widths. The text fills that width so that it is the
-            // label rather than the box that is centred on.
-            widget::container(
-                crate::design::body(
-                    zoom.percent()
-                        .map_or_else(|| "Fit".to_owned(), |percent| format!("{percent}%")),
-                )
-                .width(Length::Fill)
-                .center(),
+    controls.push(crate::interaction::tooltip(
+        // A fixed width, because the label is between the two controls a
+        // reader presses repeatedly and "Fit", "50%" and "125%" are three
+        // different widths. The text fills that width so that it is the
+        // label rather than the box that is centred on.
+        widget::container(
+            crate::design::body(
+                zoom.percent()
+                    .map_or_else(|| "Fit".to_owned(), |percent| format!("{percent}%")),
             )
-            .width(Length::Fixed(ZOOM_LABEL_WIDTH)),
-            "How large the page is drawn, against the size it would print",
+            .width(Length::Fill)
+            .center(),
         )
-        .into(),
-    );
+        .width(Length::Fixed(ZOOM_LABEL_WIDTH)),
+        "How large the page is drawn, against the size it would print",
+    ));
     controls.push(step(zoom.larger(), Icon::ZoomIn, "Draw the page larger").into());
     controls.push(
         // Enabled even while fitted, because this is the mode the viewer is
@@ -10446,8 +10444,7 @@ fn pdf_document_view<'a>(
             .width(Length::Fill)
             .height(Length::Fill),
             format!("Page {} of {pages}, {width} × {height} pixels", page + 1),
-        )
-        .into(),
+        ),
     ])
     .width(Length::Fill)
     .height(Length::Fill)
@@ -11986,8 +11983,7 @@ fn diff_review_gutter(
                 .height(typography.line_height)
                 .class(cosmic::theme::Button::Text),
             "Comment on this line · Shift-click to select a range",
-        )
-        .into(),
+        ),
         None => label,
     }
 }

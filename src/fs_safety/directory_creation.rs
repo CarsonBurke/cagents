@@ -612,12 +612,12 @@ impl DirectoryPreparation {
                         .map_err(|e| ResolveError::io(&held.path, &e))?
                         .nlink()
                         != 0
-                    {
-                        return Err(ResolveError::message(
-                            &held.path,
-                            "retained staging is no longer at its internal name; authority preserved for resolution",
-                        ));
-                    }
+                {
+                    return Err(ResolveError::message(
+                        &held.path,
+                        "retained staging is no longer at its internal name; authority preserved for resolution",
+                    ));
+                }
                 self.created = false;
                 self.cleanup_error = None;
                 return Ok(());
@@ -685,12 +685,12 @@ impl DirectoryPreparation {
                             .map_err(|e| ResolveError::io(&held.path, &e))?
                             .nlink()
                             != 0
-                        {
-                            return Err(ResolveError::message(
-                                &held.path,
-                                "retained payload is no longer at its internal name; authority preserved for resolution",
-                            ));
-                        }
+                    {
+                        return Err(ResolveError::message(
+                            &held.path,
+                            "retained payload is no longer at its internal name; authority preserved for resolution",
+                        ));
+                    }
                 }
                 Err(error) => return Err(error),
             }

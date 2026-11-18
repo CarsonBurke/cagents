@@ -264,7 +264,7 @@ impl State {
             let source = aligned_sources.and_then(|sources| sources[index].as_ref());
             let key = source.and_then(Key::of);
             let run = run_at(&raw.items, index, aligned_sources);
-            let hydrated = run.as_ref().and_then(|run| {
+            let hydrated = run.as_ref().map(|run| {
                 let complete =
                     source.is_none_or(|source| run.start == 0 && source.bytes as usize <= run.end);
                 let readable =
@@ -293,7 +293,7 @@ impl State {
                     .as_ref()
                     .and_then(|key| self.failures.get(key))
                     .is_some_and(|failed| *failed >= ATTEMPTS);
-                Some((hydrated, readable && !exhausted))
+                (hydrated, readable && !exhausted)
             });
             let mut unjoined = index + 1;
             // Joining never makes a message larger than preparation accepts,

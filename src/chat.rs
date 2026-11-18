@@ -871,7 +871,8 @@ pub fn is_upgrade_identity_learning(source: &Session, replacement: &Session) -> 
         || source
             .proof
             .as_ref()
-            .zip(replacement.proof.as_ref()).is_none_or(|(old, new)| old.boot_id != new.boot_id)
+            .zip(replacement.proof.as_ref())
+            .is_none_or(|(old, new)| old.boot_id != new.boot_id)
         || source.terminal.as_ref().is_some_and(|terminal| {
             terminal.continuity.live_proof().as_ref() != source.proof.as_ref()
         })

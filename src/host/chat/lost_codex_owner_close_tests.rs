@@ -1096,9 +1096,10 @@ fn assert_codex_started(fixture: &Fixture, root: &std::path::Path) {
     let deadline = Instant::now() + Duration::from_secs(5);
     let argv = loop {
         if let Ok(argv) = std::fs::read_to_string(root.join("started-argv"))
-            && argv == expected {
-                break argv;
-            }
+            && argv == expected
+        {
+            break argv;
+        }
         assert!(
             Instant::now() < deadline,
             "the fake app-server never launched"

@@ -2491,10 +2491,10 @@ fn publish_diagnostics(state: &mut RouterState, params: lsp_types::PublishDiagno
     // on the wire and the server will republish against it. A server that
     // sends no version leaves the client no choice but the newest text, which
     // is why `version_support` is advertised in `initialize`.
-    if let Some(version) = params.version {
-        if version != snapshot.version {
-            return;
-        }
+    if let Some(version) = params.version
+        && version != snapshot.version
+    {
+        return;
     }
     let items: Vec<LspDiagnostic> = params
         .diagnostics
@@ -3055,10 +3055,10 @@ impl SessionState {
                 // Only this binding's own requests are cancelled: another tab
                 // on the same file is still waiting for its answers.
                 self.cancel_for_doc(doc, &context.events).await;
-                if let Some(bound) = self.bindings.get_mut(&uri) {
-                    if let Some(index) = bound.iter().position(|entry| *entry == doc) {
-                        bound.remove(index);
-                    }
+                if let Some(bound) = self.bindings.get_mut(&uri)
+                    && let Some(index) = bound.iter().position(|entry| *entry == doc)
+                {
+                    bound.remove(index);
                 }
                 let remaining = match self.open.get_mut(&uri) {
                     Some(count) => {
@@ -3087,19 +3087,19 @@ impl SessionState {
             }
             SessionCommand::Request(request) => self.dispatch(request, context, done).await,
             SessionCommand::Cancel { request } => {
-                if let Some(slot) = self.by_request.remove(&request) {
-                    if let Some(entry) = self.in_flight.remove(&slot) {
-                        self.cancel_wire(entry.wire_id);
-                        entry.abort.abort();
-                        context
-                            .events
-                            .emit(LspEvent::RequestFailed {
-                                request: entry.id,
-                                doc: entry.doc,
-                                error: LspError::Cancelled,
-                            })
-                            .await;
-                    }
+                if let Some(slot) = self.by_request.remove(&request)
+                    && let Some(entry) = self.in_flight.remove(&slot)
+                {
+                    self.cancel_wire(entry.wire_id);
+                    entry.abort.abort();
+                    context
+                        .events
+                        .emit(LspEvent::RequestFailed {
+                            request: entry.id,
+                            doc: entry.doc,
+                            error: LspError::Cancelled,
+                        })
+                        .await;
                 }
             }
             SessionCommand::Shutdown => {}
@@ -3189,7 +3189,7 @@ impl SessionState {
         });
         let _ = started_rx.await;
         self.in_flight.insert(
-            slot.clone(),
+            slot,
             InFlight {
                 id,
                 doc,
@@ -3209,14 +3209,13 @@ impl SessionState {
     }
 
     fn forget(&mut self, request: LspRequestId) {
-        if let Some(slot) = self.by_request.remove(&request) {
-            if self
+        if let Some(slot) = self.by_request.remove(&request)
+            && self
                 .in_flight
                 .get(&slot)
                 .is_some_and(|entry| entry.id == request)
-            {
-                self.in_flight.remove(&slot);
-            }
+        {
+            self.in_flight.remove(&slot);
         }
     }
 
@@ -4278,12 +4277,12 @@ impl LspManager {
                 discovery::discover(&worker_path, &worker_worktree, &markers, &active_cancelled)
             })
             .await;
-            if !worker_cancelled.load(Ordering::Acquire) {
-                if let Ok(Some(root)) = root {
-                    events
-                        .emit(LspEvent::RootDiscovered { doc, ticket, root })
-                        .await;
-                }
+            if !worker_cancelled.load(Ordering::Acquire)
+                && let Ok(Some(root)) = root
+            {
+                events
+                    .emit(LspEvent::RootDiscovered { doc, ticket, root })
+                    .await;
             }
         });
         self.pending_opens.insert(
@@ -4448,19 +4447,18 @@ impl LspManager {
             .get(&key)
             .map(|handle| Arc::clone(&handle.retired));
         let handle = self.ensure_session(&key, &server, &root, worktree);
-        if let Ok(handle) = &handle {
-            if prior_session
+        if let Ok(handle) = &handle
+            && prior_session
                 .as_ref()
                 .is_none_or(|prior| !Arc::ptr_eq(prior, &handle.retired))
-            {
-                *owner
-                    .created_session
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner()) = Some(CapturedSession {
-                    key: key.clone(),
-                    retired: Arc::clone(&handle.retired),
-                });
-            }
+        {
+            *owner
+                .created_session
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(CapturedSession {
+                key: key.clone(),
+                retired: Arc::clone(&handle.retired),
+            });
         }
 
         let uri = Arc::new(uri);
@@ -4795,11 +4793,10 @@ impl LspManager {
                 .sessions
                 .get(&captured.key)
                 .is_some_and(|current| Arc::ptr_eq(&current.retired, &captured.retired))
+                && let Some(handle) = self.sessions.remove(&captured.key)
             {
-                if let Some(handle) = self.sessions.remove(&captured.key) {
-                    self.retire_handle(handle);
-                    reopen.push(captured.key);
-                }
+                self.retire_handle(handle);
+                reopen.push(captured.key);
             }
         }
         for key in reopen {
@@ -5133,10 +5130,10 @@ impl LspManager {
             .map(|(key, _)| key.clone())
             .collect();
         for key in keys {
-            if let Some(handle) = self.sessions.remove(&key) {
-                if let Some(retiring) = handle.retire() {
-                    self.retiring.push(retiring);
-                }
+            if let Some(handle) = self.sessions.remove(&key)
+                && let Some(retiring) = handle.retire()
+            {
+                self.retiring.push(retiring);
             }
         }
     }
@@ -5378,19 +5375,18 @@ impl LspManager {
                         _ => None,
                     }
                 };
-                if let Some(pid) = pid {
-                    if let Ok(status) =
+                if let Some(pid) = pid
+                    && let Ok(status) =
                         tokio::fs::read_to_string(format!("/proc/{pid}/status")).await
-                    {
-                        let rss = status
-                            .lines()
-                            .find_map(|line| line.strip_prefix("VmRSS:"))
-                            .and_then(|value| value.split_whitespace().next())
-                            .and_then(|value| value.parse::<u64>().ok())
-                            .unwrap_or(0)
-                            * 1024;
-                        watched.resident_bytes.store(rss, Ordering::Relaxed);
-                    }
+                {
+                    let rss = status
+                        .lines()
+                        .find_map(|line| line.strip_prefix("VmRSS:"))
+                        .and_then(|value| value.split_whitespace().next())
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .unwrap_or(0)
+                        * 1024;
+                    watched.resident_bytes.store(rss, Ordering::Relaxed);
                 }
                 let doc = watched
                     .activity

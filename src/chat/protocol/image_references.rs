@@ -294,9 +294,9 @@ pub(super) mod legacy {
                 && (!ids.insert(reference.id)
                     || crate::chat::attachment_assets::restore_reference(reference, source)
                         .is_none())
-                {
-                    return None;
-                }
+            {
+                return None;
+            }
         }
         Some((plain, references))
     }

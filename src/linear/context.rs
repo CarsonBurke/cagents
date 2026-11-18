@@ -188,12 +188,12 @@ fn validate(issue: &LinkedIssue) -> Result<(), Error> {
             || !workspace
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'_'))
-        {
-            return Err(Error::new(
-                "linear_invalid_workspace",
-                "Workspace aliases must contain only ASCII letters, digits, or underscores",
-            ));
-        }
+    {
+        return Err(Error::new(
+            "linear_invalid_workspace",
+            "Workspace aliases must contain only ASCII letters, digits, or underscores",
+        ));
+    }
     Ok(())
 }
 

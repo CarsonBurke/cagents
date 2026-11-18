@@ -10081,9 +10081,10 @@ mod tests {
     }
     fn descriptor_busy_gate(attempt: i32) -> bool {
         if let Some((entered, proceed)) = DESCRIPTOR_BUSY_GATE.with(|gate| gate.borrow_mut().take())
-            && (entered.send(()).is_err() || proceed.recv_timeout(Duration::from_secs(5)).is_err()) {
-                return false;
-            }
+            && (entered.send(()).is_err() || proceed.recv_timeout(Duration::from_secs(5)).is_err())
+        {
+            return false;
+        }
         std::thread::sleep(Duration::from_millis(1));
         attempt < 5000
     }

@@ -182,10 +182,10 @@ impl Cagents {
         &mut self,
         card: CardId,
     ) -> (Task<Message>, Option<CardId>) {
-        if !self
+        if self
             .chat_ui
             .attempt(card)
-            .is_some_and(|attempt| attempt.upgrade_admission.is_some())
+            .is_none_or(|attempt| attempt.upgrade_admission.is_none())
         {
             return (Task::none(), None);
         }

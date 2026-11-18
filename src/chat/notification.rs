@@ -342,20 +342,21 @@ impl Snapshot {
             request: None,
         };
         if kind == Kind::Waiting
-            && let Some(request) = self.requests.first() {
-                content.request = Some(match request.kind {
-                    super::RequestKind::Approval => RequestType::Approval,
-                    super::RequestKind::Question => RequestType::Question,
-                    super::RequestKind::Consent => RequestType::Consent,
-                });
-                // Public question prompts are useful; field initial/answer
-                // values and all secret fields stay out of the excerpt.
-                content.preview = public_question_preview(request)
-                    .unwrap_or_else(|| presentation::preview(&request.description));
-                if content.preview.is_empty() {
-                    content.preview = presentation::preview(&request.title);
-                }
+            && let Some(request) = self.requests.first()
+        {
+            content.request = Some(match request.kind {
+                super::RequestKind::Approval => RequestType::Approval,
+                super::RequestKind::Question => RequestType::Question,
+                super::RequestKind::Consent => RequestType::Consent,
+            });
+            // Public question prompts are useful; field initial/answer
+            // values and all secret fields stay out of the excerpt.
+            content.preview = public_question_preview(request)
+                .unwrap_or_else(|| presentation::preview(&request.description));
+            if content.preview.is_empty() {
+                content.preview = presentation::preview(&request.title);
             }
+        }
         if content.preview.is_empty() {
             content.preview =
                 response_preview(&self.notification_preview, self.error.as_deref(), kind);

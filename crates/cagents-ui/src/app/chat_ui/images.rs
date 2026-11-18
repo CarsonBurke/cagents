@@ -1038,7 +1038,7 @@ impl Gallery {
                 widget::column::with_children(vec![
                     toolbar.into(),
                     design::caption(entry.label.as_str()).into(),
-                    canvas.into(),
+                    canvas,
                     design::caption(
                         "Scroll to zoom · Drag to pan · Left / Right to browse · Ctrl+C to copy",
                     )

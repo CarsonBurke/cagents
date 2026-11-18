@@ -4394,7 +4394,7 @@ fn native_app_dispatches_home_end_and_latest_while_cold_placeholder_fits() {
                     keyboard::key::Named::End
                 };
                 app.chat_scroll_key(&keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Named(key.clone()),
+                    key: keyboard::Key::Named(key),
                     modified_key: keyboard::Key::Named(key),
                     physical_key: keyboard::key::Physical::Unidentified(
                         keyboard::key::NativeCode::Unidentified,
@@ -4636,12 +4636,10 @@ fn native_app_dispatches_home_end_and_latest_while_cold_placeholder_fits() {
             runtime(&app, target).scroll_memory.edge(None),
             Some(if command == "Home" {
                 scroll::Edge::Start
+            } else if command == "Latest" {
+                scroll::Edge::Latest
             } else {
-                if command == "Latest" {
-                    scroll::Edge::Latest
-                } else {
-                    scroll::Edge::End
-                }
+                scroll::Edge::End
             })
         );
         drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
@@ -6932,14 +6930,14 @@ fn reading_column_is_stable_across_transcript_states() {
             } else {
                 frame_cost::transcript(1)
             };
-            if state == 5 || state == 6 {
-                if let ItemContent::Text { text, .. } = &mut items.last_mut().unwrap().content {
-                    *text = if state == 5 {
-                        "w".repeat(3000)
-                    } else {
-                        format!("```rust\n{}\n```", "long_code_token".repeat(1000))
-                    };
-                }
+            if (state == 5 || state == 6)
+                && let ItemContent::Text { text, .. } = &mut items.last_mut().unwrap().content
+            {
+                *text = if state == 5 {
+                    "w".repeat(3000)
+                } else {
+                    format!("```rust\n{}\n```", "long_code_token".repeat(1000))
+                };
             }
             let (mut runtime, _handle) = frame_cost::live_runtime(&items);
             if state == 2 {
@@ -7202,7 +7200,7 @@ fn notice_projection_keeps_exact_visible_newlines() {
     let long = "line\n".repeat(NOTICE_LINES + 1);
     assert_eq!(
         visible_notice_body(&long, false),
-        vec!["line"; NOTICE_LINES].join("\n")
+        ["line"; NOTICE_LINES].join("\n")
     );
     assert_eq!(visible_notice_body(&long, true), long);
 }
@@ -7825,7 +7823,7 @@ fn queued_and_notice_widgets_copy_through_logical_catalog() {
     let content = widget::column::with_children(vec![
         notice_entry("Repeated failure", runtime.target, first),
         runtime.queued_view(&queued),
-        runtime.delivery_view(&delivery, &cached, settings),
+        runtime.delivery_view(&delivery, cached, settings),
         notice_entry("Repeated failure", runtime.target, second),
     ]);
     let mut element = selection::transcript_virtualized(

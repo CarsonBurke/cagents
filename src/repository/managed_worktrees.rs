@@ -145,11 +145,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             return Ok(());
         };
         if let Some(destination) = destination
-            && (managed == primary || !managed.starts_with(&primary)) {
-                // Never hide a whole checkout or a shared ancestor. Keep the
-                // valid location and exclude only this operation's child.
-                managed = destination.to_owned();
-            }
+            && (managed == primary || !managed.starts_with(&primary))
+        {
+            // Never hide a whole checkout or a shared ancestor. Keep the
+            // valid location and exclude only this operation's child.
+            managed = destination.to_owned();
+        }
         self.ensure_managed_directory_in_checkout_ignored(
             repository,
             &primary,

@@ -821,11 +821,11 @@ impl State {
                 let Some(composer) = &self.discussion.composer else {
                     return ActionTask::none();
                 };
-                if !discussion::same_identity(
+                if discussion::same_identity(
                     &composer.authority.context,
                     &self.context.clone().expect("loaded context"),
                 )
-                .is_ok()
+                .is_err()
                 {
                     self.notice = Some("The account or pull request changed. Restore that account before using this draft.".into());
                     return ActionTask::none();

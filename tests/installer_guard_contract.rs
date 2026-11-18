@@ -456,10 +456,11 @@ mod coordinator_fixture {
                 if sent != 0 {
                     let error = io::Error::last_os_error();
                     if error.raw_os_error() == Some(libc::ESRCH)
-                        && let Some(status) = family.child.try_wait().unwrap() {
-                            family.reaped = true;
-                            break status;
-                        }
+                        && let Some(status) = family.child.try_wait().unwrap()
+                    {
+                        family.reaped = true;
+                        break status;
+                    }
                     panic!("coordinator TERM failed: {error}");
                 }
                 if event == b'T' {
@@ -514,12 +515,11 @@ exit 0
                 if let (Ok(coordinator), Ok(installer)) = (
                     fs::read_to_string(root.path().join("coordinator.pid")),
                     fs::read_to_string(root.path().join("installer.pid")),
-                )
-                    && let (Ok(coordinator), Ok(installer)) =
-                        (coordinator.parse(), installer.parse())
-                    {
-                        break (coordinator, installer);
-                    }
+                ) && let (Ok(coordinator), Ok(installer)) =
+                    (coordinator.parse(), installer.parse())
+                {
+                    break (coordinator, installer);
+                }
                 assert!(
                     Instant::now() < ready_by,
                     "detached installer did not reach its barrier"
@@ -655,13 +655,14 @@ struct OwnedProcess(std::process::Child);
 impl OwnedProcess {
     fn stop_checked(&mut self) -> std::io::Result<()> {
         if self.0.try_wait()?.is_none()
-            && let Err(error) = self.0.kill() {
-                // An exit racing the signal is still a checked retirement;
-                // a live original child with a rejected signal is an error.
-                if self.0.try_wait()?.is_none() {
-                    return Err(error);
-                }
+            && let Err(error) = self.0.kill()
+        {
+            // An exit racing the signal is still a checked retirement;
+            // a live original child with a rejected signal is an error.
+            if self.0.try_wait()?.is_none() {
+                return Err(error);
             }
+        }
         self.0.wait()?;
         Ok(())
     }
