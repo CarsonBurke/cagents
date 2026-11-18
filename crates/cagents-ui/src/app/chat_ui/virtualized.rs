@@ -34,7 +34,7 @@ pub(super) struct PlaceholderPolicy {
     pub visit: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub(super) struct LogicalRange {
     pub identity: u64,
     pub bytes: std::ops::Range<usize>,
@@ -64,6 +64,14 @@ impl LogicalRanges {
             chunk,
         }
     }
+    /// Whether both name the same ranges of the same prepared outline.
+    fn same(&self, other: &Self) -> bool {
+        let source = match (&self.source, &other.source) {
+            (Some(left), Some(right)) => std::sync::Arc::ptr_eq(left, right),
+            (left, right) => left.is_none() && right.is_none(),
+        };
+        source && self.range == other.range && self.chunk == other.chunk
+    }
     pub(super) fn iter(&self) -> impl Iterator<Item = LogicalRange> + '_ {
         self.source.as_deref().unwrap_or(&[])[self.range.clone()]
             .iter()
@@ -82,9 +90,17 @@ pub(super) struct Row<'a> {
     pub anchor: bool,
     pub logical: Option<LogicalRange>,
     pub descendants: LogicalRanges,
-    rebuild: Option<Box<dyn Fn() -> Element<'a, Message> + 'a>>,
-    build: Option<Box<dyn FnOnce() -> Element<'a, Message> + 'a>>,
+    source: Source<'a>,
     content: Option<Element<'a, Message>>,
+}
+/// What a row builds its element from.
+enum Source<'a> {
+    /// A builder that can run again after the row's tree is evicted.
+    Rebuild(Box<dyn Fn() -> Element<'a, Message> + 'a>),
+    /// A builder that runs once; the row keeps the element it built.
+    Once(Option<Box<dyn FnOnce() -> Element<'a, Message> + 'a>>),
+    /// Empty space of this height, which needs no builder of its own.
+    Space(f32),
 }
 impl<'a> Row<'a> {
     pub fn once(
@@ -102,8 +118,7 @@ impl<'a> Row<'a> {
             anchor: false,
             logical: None,
             descendants: LogicalRanges::default(),
-            rebuild: None,
-            build: Some(Box::new(build)),
+            source: Source::Once(Some(Box::new(build))),
             content: None,
         }
     }
@@ -122,8 +137,21 @@ impl<'a> Row<'a> {
             anchor: false,
             logical: None,
             descendants: LogicalRanges::default(),
-            rebuild: Some(Box::new(build)),
-            build: None,
+            source: Source::Rebuild(Box::new(build)),
+            content: None,
+        }
+    }
+    /// A row of empty space, such as the gap between two other rows.
+    pub fn space(key: u64, revision: u64, height: f32) -> Self {
+        Self {
+            key,
+            revision,
+            estimate: height,
+            aliases: Vec::new(),
+            anchor: false,
+            logical: None,
+            descendants: LogicalRanges::default(),
+            source: Source::Space(height),
             content: None,
         }
     }
@@ -131,9 +159,10 @@ impl<'a> Row<'a> {
         if self.content.is_none() {
             #[cfg(test)]
             CONSTRUCTED.with(|count| count.set(count.get() + 1));
-            self.content = Some(match &self.rebuild {
-                Some(build) => build(),
-                None => self.build.take().expect("a static row is built once")(),
+            self.content = Some(match &mut self.source {
+                Source::Rebuild(build) => build(),
+                Source::Once(build) => build.take().expect("a static row is built once")(),
+                Source::Space(height) => widget::Space::new().height(*height).into(),
             });
         }
         self.content.as_mut().unwrap()
@@ -218,6 +247,45 @@ impl Height {
         }
     }
 }
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread's columns rebuilt every index.
+    static REINDEXES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// What a row last gave the column's indexes, so a column rebuilt with the
+/// same rows corrects only the offsets of rows that changed.
+struct Shape {
+    key: u64,
+    anchor: bool,
+    aliases: Vec<Id>,
+    logical: Option<LogicalRange>,
+    descendants: LogicalRanges,
+    revision: u64,
+    estimate: f32,
+}
+impl Shape {
+    fn of(row: &Row<'_>) -> Self {
+        Self {
+            key: row.key,
+            anchor: row.anchor,
+            aliases: row.aliases.clone(),
+            logical: row.logical.clone(),
+            descendants: row.descendants.clone(),
+            revision: row.revision,
+            estimate: row.estimate,
+        }
+    }
+    /// Whether `row` holds the same place in every index but the offsets.
+    fn indexes(&self, row: &Row<'_>) -> bool {
+        self.key == row.key
+            && self.anchor == row.anchor
+            && self.aliases == row.aliases
+            && self.logical == row.logical
+            && self.descendants.same(&row.descendants)
+    }
+}
+
 #[derive(Default)]
 struct State {
     axis: Axis,
@@ -229,6 +297,7 @@ struct State {
     realized: std::ops::Range<usize>,
     offsets: PrefixSums,
     descriptors: u64,
+    shapes: Vec<Shape>,
     observed: Option<Viewport>,
     positions: HashMap<u64, usize>,
     anchors: HashSet<u64>,
@@ -349,7 +418,38 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
             state.heights.clear();
             state.width = constraint;
         }
-        if width_changed || state.descriptors != self.revision {
+        // A transcript builds its column again for every frame, mostly with
+        // the same rows: a streaming answer changes one row's revision.
+        // Rebuilding every index for that is work in the length of the
+        // transcript on every frame, so only a changed row is corrected.
+        let reshaped = state.descriptors != self.revision
+            && (state.shapes.len() != self.rows.len()
+                || !self
+                    .rows
+                    .iter()
+                    .zip(&state.shapes)
+                    .all(|(row, shape)| shape.indexes(row)));
+        if !width_changed && !reshaped && state.descriptors != self.revision {
+            for (index, (row, shape)) in self.rows.iter().zip(&mut state.shapes).enumerate() {
+                if shape.revision != row.revision || shape.estimate != row.estimate {
+                    shape.revision = row.revision;
+                    shape.estimate = row.estimate;
+                    state.offsets.set(
+                        index,
+                        state
+                            .heights
+                            .get(&row.key)
+                            .map_or(row.estimate, |height| height.for_row(row))
+                            .max(0.0),
+                    );
+                }
+            }
+            state.descriptors = self.revision;
+        }
+        if width_changed || reshaped {
+            #[cfg(test)]
+            REINDEXES.with(|count| count.set(count.get() + 1));
+            state.shapes = self.rows.iter().map(Shape::of).collect();
             state.positions = self
                 .rows
                 .iter()
@@ -494,7 +594,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
             for key in previous.keys() {
                 if let Some(index) = state.positions.get(key) {
                     let row = &mut self.rows[*index];
-                    if row.rebuild.is_some() {
+                    if !matches!(row.source, Source::Once(_)) {
                         row.content = None;
                     }
                 }
@@ -1198,6 +1298,164 @@ mod tests {
                 && count == 301
                 && last == Some(0)));
         }
+    }
+
+    /// A transcript builds its column again for every frame. Rebuilt with the
+    /// same rows, it corrects the offsets of the rows that changed; with
+    /// different rows, it indexes them again. Either way an offscreen row's
+    /// placeholder sits where the rows above it end.
+    #[test]
+    fn a_column_rebuilt_each_frame_keeps_offsets_exact() {
+        #[derive(Default)]
+        struct Placeholders(HashMap<Id, Rectangle>);
+        impl Operation for Placeholders {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
+                if let Some(id) = id {
+                    self.0.insert(id.clone(), bounds);
+                }
+            }
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        let window = Rc::new(Cell::new(Some(Viewport {
+            top: 0.0,
+            height: 100.0,
+            bottom: false,
+        })));
+        let build = |rows: &[(u64, f32)]| {
+            column(
+                rows.iter()
+                    .map(|&(key, height)| {
+                        Row::new(
+                            key,
+                            u64::from(height.to_bits()),
+                            height,
+                            Some(Id::from(format!("row-{key}"))),
+                            move || widget::Space::new().height(height).into(),
+                        )
+                    })
+                    .collect(),
+                window.clone(),
+            )
+        };
+        let limits = layout::Limits::new(Size::ZERO, Size::new(600.0, f32::INFINITY));
+        let mut rows: Vec<(u64, f32)> = (1..=200)
+            .map(|key| (key, 20.0 + (key % 3) as f32))
+            .collect();
+        let mut tree = Tree::new(&build(&rows));
+        let reindexes = || REINDEXES.with(Cell::get);
+        let mut check = |rows: &[(u64, f32)]| {
+            let mut element = build(rows);
+            tree.diff(element.as_widget_mut());
+            let node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            let mut placeholders = Placeholders::default();
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut placeholders,
+            );
+            let mut top = 0.0;
+            for &(key, height) in rows {
+                let bounds = placeholders.0[&Id::from(format!("row-{key}"))];
+                assert_eq!((bounds.y, bounds.height), (top, height), "row {key}");
+                top += height;
+            }
+            assert_eq!(node.size().height, top);
+        };
+        check(&rows);
+        let indexed = reindexes();
+        check(&rows);
+        // An offscreen row grows, then a mounted one, and the column only
+        // corrects their offsets.
+        rows[150].1 = 64.0;
+        check(&rows);
+        rows[1].1 = 48.0;
+        check(&rows);
+        assert_eq!(reindexes(), indexed, "the same rows keep their indexes");
+        // Earlier history arrives above, and a row leaves.
+        rows.insert(0, (999, 33.0));
+        rows.remove(120);
+        check(&rows);
+        assert_eq!(reindexes(), indexed + 1, "new rows are indexed again");
+    }
+
+    /// A row measured while mounted, then changed while offscreen, keeps
+    /// its measured height adjusted by how its estimate changed, as a full
+    /// reindex would place it.
+    #[test]
+    fn a_measured_row_changed_offscreen_keeps_its_measured_height() {
+        #[derive(Default)]
+        struct Placeholders(HashMap<Id, Rectangle>);
+        impl Operation for Placeholders {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
+                if let Some(id) = id {
+                    self.0.insert(id.clone(), bounds);
+                }
+            }
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        let window = Rc::new(Cell::new(Some(Viewport {
+            top: 0.0,
+            height: 100.0,
+            bottom: false,
+        })));
+        // Row 3 is drawn 50 tall against an estimate of 20.
+        let build = |revision: u64, estimate: f32| {
+            column(
+                (1..=200u64)
+                    .map(|key| {
+                        let (revision, estimate, drawn) = match key {
+                            3 => (revision, estimate, 50.0),
+                            _ => (0, 20.0, 20.0),
+                        };
+                        Row::new(
+                            key,
+                            revision,
+                            estimate,
+                            Some(Id::from(format!("row-{key}"))),
+                            move || widget::Space::new().height(drawn).into(),
+                        )
+                    })
+                    .collect(),
+                window.clone(),
+            )
+        };
+        let limits = layout::Limits::new(Size::ZERO, Size::new(600.0, f32::INFINITY));
+        let mut tree = Tree::new(&build(1, 20.0));
+        let mut placed = |revision: u64, estimate: f32| {
+            let mut element = build(revision, estimate);
+            tree.diff(element.as_widget_mut());
+            let node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            let mut placeholders = Placeholders::default();
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut placeholders,
+            );
+            let bounds = |key: u64| placeholders.0[&Id::from(format!("row-{key}"))];
+            (bounds(3).height, bounds(4).y, node.size().height)
+        };
+        assert_eq!(placed(1, 20.0), (50.0, 90.0, 199.0 * 20.0 + 50.0));
+        window.set(Some(Viewport {
+            top: 3_000.0,
+            height: 100.0,
+            bottom: false,
+        }));
+        assert_eq!(placed(1, 20.0), (50.0, 90.0, 199.0 * 20.0 + 50.0));
+        let indexed = REINDEXES.with(Cell::get);
+        assert_eq!(placed(2, 26.0), (56.0, 96.0, 199.0 * 20.0 + 56.0));
+        assert_eq!(REINDEXES.with(Cell::get), indexed);
     }
 
     #[test]

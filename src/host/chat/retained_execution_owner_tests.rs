@@ -624,3 +624,26 @@ fn answer_helper_ack_cannot_replace_a_missing_or_different_durable_cursor() {
             .is_err()
     );
 }
+
+#[test]
+fn a_run_transition_requires_the_confirmed_conversation_in_the_census() {
+    let mut fixture = Fixture::new();
+    fixture.install();
+    let actor = fixture.identity.instance;
+    let confirmed = uuid::Uuid::new_v4().to_string();
+    // Without a helper-confirmed conversation there is nothing to require.
+    require_published_identity(&fixture.registry, actor, None).unwrap();
+    // A confirmed conversation the census does not carry yet refuses the
+    // transition, so its run stays open until the identity is published.
+    assert!(require_published_identity(&fixture.registry, actor, Some(&confirmed)).is_err());
+    let owner = fixture.authenticate().unwrap();
+    let mut projected = fixture.source.clone();
+    projected.launch.session_id = Some(confirmed.clone());
+    fixture
+        .registry
+        .confirm_native_actor_identity(&owner.0, &projected)
+        .unwrap();
+    require_published_identity(&fixture.registry, actor, Some(&confirmed)).unwrap();
+    let other = uuid::Uuid::new_v4().to_string();
+    assert!(require_published_identity(&fixture.registry, actor, Some(&other)).is_err());
+}

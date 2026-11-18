@@ -869,6 +869,47 @@ pub fn shared_kind(kind: &CardKind) -> CardKind {
     kind
 }
 
+/// Whether `shared_kind(local) == *shared`, without copying `local`.
+pub fn is_shared_kind(local: &CardKind, shared: &CardKind) -> bool {
+    use crate::model::{BrowserSession, RepositoryView};
+    // The kinds `shared_kind` rewrites are compared field by field, each
+    // rewritten field against what it is rewritten to.
+    match (local, shared) {
+        (CardKind::Browser(local), CardKind::Browser(shared)) => {
+            let BrowserSession {
+                id,
+                current_url,
+                history,
+                history_index,
+                scroll_x: _,
+                scroll_y: _,
+                fidelity,
+            } = local;
+            *id == shared.id
+                && *current_url == shared.current_url
+                && *history == shared.history
+                && *history_index == shared.history_index
+                && shared.scroll_x == 0.0
+                && shared.scroll_y == 0.0
+                && *fidelity == shared.fidelity
+        }
+        (CardKind::Repository(local), CardKind::Repository(shared)) => {
+            let RepositoryView {
+                project: _,
+                repository,
+                worktree,
+                selected_file,
+            } = local;
+            shared.project == crate::model::ProjectId::from_uuid(uuid::Uuid::nil())
+                && *repository == shared.repository
+                && *worktree == shared.worktree
+                && *selected_file == shared.selected_file
+        }
+        (CardKind::Browser(_) | CardKind::Repository(_), _) => false,
+        _ => local == shared,
+    }
+}
+
 /// Apply an optimistic transfer across projections before its host reply.
 pub fn transfer(
     views: &mut [View],
@@ -1017,6 +1058,92 @@ mod wire_tests {
         assert!(
             !later.follows_captured(None),
             "a replacement that finished before the delayed probe is still a replacement"
+        );
+    }
+
+    #[test]
+    fn shared_kind_comparison_reads_kinds_as_they_are_shared() {
+        let browser = BrowserSession {
+            id: BrowserId::new(),
+            current_url: "https://example.com".parse().unwrap(),
+            history: vec!["https://example.com".parse().unwrap()],
+            history_index: 0,
+            scroll_x: 12.,
+            scroll_y: 40.,
+            fidelity: BrowserRestoreFidelity::UrlOnly,
+        };
+        let repository = RepositoryView {
+            project: ProjectId::new(),
+            repository: "/repo".into(),
+            worktree: "/repo/wt".into(),
+            selected_file: None,
+        };
+        // Each kind as it is, as it is shared, and with one field changed.
+        let mut kinds = vec![CardKind::Work];
+        let browsers = [
+            browser.clone(),
+            BrowserSession {
+                scroll_x: 0.,
+                scroll_y: 0.,
+                ..browser.clone()
+            },
+            BrowserSession {
+                id: BrowserId::new(),
+                ..browser.clone()
+            },
+            BrowserSession {
+                current_url: "https://example.org".parse().unwrap(),
+                ..browser.clone()
+            },
+            BrowserSession {
+                history: vec![],
+                ..browser.clone()
+            },
+            BrowserSession {
+                history_index: 1,
+                ..browser.clone()
+            },
+            BrowserSession {
+                fidelity: BrowserRestoreFidelity::HistoryAndScroll,
+                ..browser.clone()
+            },
+        ];
+        let repositories = [
+            repository.clone(),
+            RepositoryView {
+                project: ProjectId::from_uuid(uuid::Uuid::nil()),
+                ..repository.clone()
+            },
+            RepositoryView {
+                repository: "/other".into(),
+                ..repository.clone()
+            },
+            RepositoryView {
+                worktree: "/repo/other".into(),
+                ..repository.clone()
+            },
+            RepositoryView {
+                selected_file: Some("src/lib.rs".into()),
+                ..repository.clone()
+            },
+        ];
+        kinds.extend(browsers.into_iter().map(CardKind::Browser));
+        kinds.extend(repositories.into_iter().map(CardKind::Repository));
+        kinds.extend(kinds.clone().iter().map(shared_kind));
+        for local in &kinds {
+            for shared in &kinds {
+                assert_eq!(
+                    is_shared_kind(local, shared),
+                    shared_kind(local) == *shared,
+                    "{local:?} against {shared:?}"
+                );
+            }
+        }
+        let scrolled = CardKind::Browser(browser);
+        assert!(is_shared_kind(&scrolled, &shared_kind(&scrolled)));
+        assert!(
+            !is_shared_kind(&scrolled, &scrolled),
+            "scroll is not shared"
         );
     }
 

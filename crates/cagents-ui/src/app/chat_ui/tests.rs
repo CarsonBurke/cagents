@@ -3888,6 +3888,104 @@ fn automatic_account_switch_names_the_subagent_holding_the_conversation() {
     assert!(!app.chat_start_pending(card), "no switch was attempted");
 }
 
+/// The text `card`'s view lays out within 900 by 980, in order. The
+/// footer's fit follows the workspace's geometry for the card, not this
+/// limit, so a test of the wide footer resizes the workspace first.
+pub(super) fn visible_text(app: &Cagents, card: CardId) -> Vec<String> {
+    use iced::advanced::{
+        Layout, layout,
+        widget::{Operation, Tree},
+    };
+    #[derive(Default)]
+    struct Texts(Vec<String>);
+    impl Operation for Texts {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, text: &str) {
+            self.0.push(text.to_owned());
+        }
+    }
+    let renderer = crate::app::tests::headless_renderer();
+    let mut element = app.chat_view(card);
+    let mut tree = Tree::new(element.as_widget());
+    let node = element.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &layout::Limits::new(iced::Size::ZERO, iced::Size::new(900.0, 980.0)),
+    );
+    let mut text = Texts::default();
+    element
+        .as_widget_mut()
+        .operate(&mut tree, Layout::new(&node), &renderer, &mut text);
+    text.0
+}
+
+/// The footer keeps naming the account the conversation is on while an
+/// automatic switch away from it waits, and after the daemon refuses it,
+/// as the conversation never left that account.
+#[test]
+fn the_footer_names_the_conversations_account_through_a_pending_switch() {
+    for refusal in [
+        chat::Recovery::Busy,
+        chat::Recovery::Unresponsive,
+        chat::Recovery::Unreached,
+    ] {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target) = limited_automatic_chat(&mut app, "Keep this message");
+        // Wide enough that the footer names the account beside its
+        // avatar, rather than only to assistive technology.
+        let _ = app.workspace.resize_viewport(1200.0);
+        let launch = &chat_runtime(&app, card).session.launch;
+        let accounts = app
+            .chat_accounts(launch.provider, &launch.recipe)
+            .expect("two accounts to choose between");
+        let current = accounts.current;
+        let candidate = accounts
+            .choices
+            .into_iter()
+            .find(|choice| !choice.selected)
+            .expect("an account to switch to")
+            .label;
+        assert_ne!(current, candidate);
+        // Names the conversation's account, and not the one it may move
+        // to, which it has not reached.
+        let named = |app: &Cagents| {
+            let text = visible_text(app, card);
+            text.contains(&current) && !text.contains(&candidate)
+        };
+        assert!(
+            named(&app),
+            "{current} before sending: {:?}",
+            visible_text(&app, card)
+        );
+
+        drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send))));
+        assert!(app.chat_start_pending(card), "sending asked for a switch");
+        assert!(
+            named(&app),
+            "{current} while the switch waits: {:?}",
+            visible_text(&app, card)
+        );
+
+        let attempt = chat_runtime_attempt(&app, card);
+        answer_start(
+            &mut app,
+            attempt,
+            Err(chat::StartFailure {
+                message: crate::terminal_ipc::DAEMON_BUSY.into(),
+                recovery: refusal,
+            }),
+        );
+        assert!(!app.chat_start_pending(card));
+        assert!(
+            named(&app),
+            "{current} once {refusal:?} refused the switch: {:?}",
+            visible_text(&app, card)
+        );
+    }
+}
+
 /// A switch the daemon refused only because it was finishing another
 /// operation moved nothing. The conversation stays on its own account and
 /// attached, offers no restore of an account that was never removed, says
@@ -4132,7 +4230,7 @@ fn an_unadmitted_switch_keeps_the_conversation_without_claiming_busy() {
         assert_eq!(runtime.session, source);
         assert_eq!(runtime.error.as_deref(), Some(notice));
         assert!(!notice.contains("busy"));
-        assert!(chat::failure::is_account_switch_refusal(notice));
+        assert!(chat::failure::answers_one_send(notice));
         assert_eq!(runtime.reported_errors().next(), None);
         assert_eq!(runtime.composer.text().trim(), "Keep this message");
     }
@@ -8549,6 +8647,118 @@ fn a_refused_first_prompt_name_is_offered_again_from_a_chat_on_no_screen() {
 }
 
 #[test]
+fn a_cleared_channel_name_takes_its_conversation_name_again() {
+    use super::super::chrome_ui::Action as Chrome;
+    use crate::model::{ChannelId, ChannelTitleSource, ProjectChannel, ProjectId};
+    use crate::workspace_model::{
+        ModelChannel, ModelEdit,
+        views::{Pane, Scope, View},
+    };
+    const NAME: &str = "Plan the quarterly roadmap review";
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = live_chat_for_provider(&mut app, Provider::Claude, None);
+    let target = chat_runtime(&app, card).target;
+    let id = ChannelId::new();
+    Arc::make_mut(&mut app.durable).channels = vec![ProjectChannel {
+        id,
+        project_id: ProjectId::new(),
+        title: String::new(),
+        title_source: ChannelTitleSource::Manual,
+        ordinal: 0,
+        shared: true,
+        cards: vec![card],
+        focused: Some(card),
+    }];
+    let pane = Pane::from_card(
+        app.card_state(card).unwrap(),
+        app.durable.card_scopes.get(&card).cloned(),
+    )
+    .unwrap();
+    let view = move |revision| View {
+        scope: Scope::Channel(id),
+        revision,
+        retired: Vec::new(),
+        panes: vec![pane.clone()],
+    };
+    app.workspace_model.views = vec![view(5)];
+    let (tx, requests) = super::super::workspace_model_sync::test_model_channel();
+    app.workspace_model_tx = tx;
+    let edits = || std::iter::from_fn(|| requests.try_recv().ok()).collect::<Vec<_>>();
+    let suggestion = |edit: &ModelEdit| {
+        matches!(
+            edit,
+            ModelEdit::SuggestConversationTitle { id: channel, card: pane, title, .. }
+                if *channel == id && *pane == card && title == NAME
+        )
+    };
+    let rename = |app: &mut crate::app::Cagents, name: &str| {
+        drop(app.update_chrome(Chrome::RenameChannel(id)));
+        drop(app.update_chrome(Chrome::RenameChanged(name.into())));
+        drop(app.update_chrome(Chrome::RenameSubmit));
+        assert!(app.pane_rename_surface().is_none());
+    };
+    app.name_channel_from_prompt(target, NAME);
+    assert!(edits().iter().any(suggestion));
+    assert_eq!(app.automatic_channel_name(id), Some(NAME));
+
+    // A name the person gives is never replaced, even at a later view.
+    rename(&mut app, "Roadmap");
+    app.workspace_model.views = vec![view(6)];
+    drop(app.refresh_channel_title_suggestions());
+    assert!(!edits().iter().any(suggestion));
+    assert_eq!(app.durable.channels[0].title, "Roadmap");
+    // The rename field shows the name clearing gives back.
+    let (placeholder, caption, submit) = app.channel_rename_copy(id, true);
+    assert_eq!(
+        (placeholder.as_ref(), caption, submit),
+        (
+            NAME,
+            "The channel takes its conversation's name.",
+            Some("Use automatic name")
+        )
+    );
+
+    // Clearing it asks the registry to forget it, and the conversation's
+    // name follows, though the channel's view did not change.
+    rename(&mut app, "  ");
+    let sent = edits();
+    let cleared = sent.iter().position(|edit| {
+        matches!(edit, ModelEdit::RetitleChannel { id: channel, title }
+            if *channel == id && title.is_empty())
+    });
+    let offered = sent.iter().position(suggestion);
+    assert!(cleared.is_some() && offered > cleared, "{sent:?}");
+    assert_eq!(app.durable.channels[0].title, NAME);
+
+    // Another window's name is taken as it is, and its clear offers the
+    // conversation's name again from this window, which runs the
+    // conversation.
+    let shared = |title: &str| ModelChannel {
+        id,
+        repository: "/repo/.git".into(),
+        title: title.into(),
+        title_source: ChannelTitleSource::Manual,
+        ordinal: 1,
+    };
+    app.workspace_model.identity = uuid::Uuid::new_v4();
+    app.workspace_model.channels = vec![shared("Their name")];
+    drop(app.reconcile_workspace_model());
+    assert!(!edits().iter().any(suggestion));
+    assert_eq!(app.durable.channels[0].title, "Their name");
+    app.workspace_model.channels = vec![shared("")];
+    drop(app.reconcile_workspace_model());
+    assert!(edits().iter().any(suggestion));
+
+    // A model sent before a rename here looks like a clear, but this
+    // window keeps that rename, so an unattended channel keeps its name.
+    rename(&mut app, "Roadmap");
+    drop(edits());
+    assert_eq!(app.workspace_model.channels, vec![shared("")]);
+    drop(app.reconcile_workspace_model());
+    assert!(app.channel_is_named(id));
+}
+
+#[test]
 fn presentation_projection_retries_a_deferred_title_with_the_ahead_scope_proof() {
     use super::super::workspace_model_sync::{EdgeChanges, ModelUpdate};
     use crate::model::{ChannelId, ChannelTitleSource, ProjectChannel, ProjectId};
@@ -8965,6 +9175,102 @@ pub(super) fn settle(app: &mut Cagents, card: CardId, result: Result<(), String>
     let id = runtime.pending.as_ref().expect("a command is pending").id;
     let target = runtime.target;
     let _ = app.update(Message::ChatUi(Action::CommandFinished(target, id, result)));
+}
+
+/// A send the conversation declined without harm is told in the
+/// transcript, and the message stays to send again, but the conversation
+/// does not read as failed. One the conversation can no longer take does.
+#[test]
+fn a_declined_send_is_a_notice_unless_the_conversation_cannot_go_on() {
+    use chat::failure::delivery;
+    for (outcome, conversation_error) in [
+        (delivery::UNCONFIRMED_INPUT, false),
+        (delivery::UNACKNOWLEDGED_INPUT, false),
+        (delivery::UNACKNOWLEDGED_ANSWER, false),
+        (delivery::UNACKNOWLEDGED_STOP, false),
+        (delivery::UNSETTLED_INPUT, false),
+        (delivery::RECONNECTING_INPUT, false),
+        (delivery::CROWDED_INPUT, false),
+        (delivery::RETIRING_INPUT, false),
+        (delivery::OVERSIZED_INPUT, false),
+        (delivery::HANDOVER_INPUT, false),
+        (delivery::DAMAGED_INPUT, false),
+        (delivery::UNSETTLEABLE_INPUT, true),
+        (delivery::STOPPED_INPUT, true),
+        (delivery::CLOSING_INPUT, true),
+        (delivery::DISCONTINUOUS_INPUT, true),
+        (delivery::UNSUPPORTED_INPUT, true),
+        (delivery::UNAVAILABLE_INPUT, true),
+    ] {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .replace_draft(text_editor::Content::with_text("Keep this message"));
+        drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send))));
+        settle(&mut app, card, Err(outcome.into()));
+        let runtime = chat_runtime(&app, card);
+        assert!(
+            runtime.failures.iter().any(|note| note.text == outcome),
+            "{outcome}: {:?}",
+            runtime.failures
+        );
+        assert_eq!(runtime.composer.text().trim(), "Keep this message");
+        assert_eq!(
+            runtime.reported_errors().next().is_some(),
+            conversation_error,
+            "{outcome}"
+        );
+        assert_eq!(
+            runtime.conversation_status(false).1 == "Error",
+            conversation_error,
+            "{outcome}: {:?}",
+            runtime.conversation_status(false)
+        );
+        assert_eq!(
+            runtime.finished_label(),
+            if conversation_error {
+                "Finished with error"
+            } else {
+                "Finished"
+            },
+            "{outcome}"
+        );
+    }
+}
+
+/// A provider exit reported after a declined send replaces the advice to
+/// send again, whatever declined it; an outcome that already says the
+/// conversation cannot go on stays beside the exit.
+#[test]
+fn an_exit_after_a_declined_send_replaces_only_a_send_notice() {
+    use chat::failure::delivery;
+    for (outcome, kept) in [
+        (delivery::CROWDED_INPUT, false),
+        (delivery::UNACKNOWLEDGED_INPUT, false),
+        (delivery::UNAVAILABLE_INPUT, true),
+    ] {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let handle = chat_runtime(&app, card).handle().unwrap().clone();
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .replace_draft(text_editor::Content::with_text("Keep this message"));
+        drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send))));
+        settle(&mut app, card, Err(outcome.into()));
+        assert_eq!(chat_runtime(&app, card).error.as_deref(), Some(outcome));
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.exited = true;
+        handle.publish_snapshot_for_test(snapshot);
+        drop(app.update(Message::ChatUi(Action::Wake(target, Wake::Changed))));
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.snapshot.exited, "{outcome}");
+        assert_eq!(runtime.error.is_some(), kept, "{outcome}");
+        assert_eq!(runtime.composer.text().trim(), "Keep this message");
+    }
 }
 
 /// A restored conversation, begun but never named by its provider, whose

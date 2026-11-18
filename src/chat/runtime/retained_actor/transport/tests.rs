@@ -2432,6 +2432,67 @@ fn synchronous_refresh_publishes_all_transitions_and_rejects_a_delayed_observer_
     stop.send(()).unwrap();
     peer.join().unwrap();
 }
+/// #2849: the helper confirms a conversation and then journals the run
+/// outcome that follows it. An outcome read must leave the proxy holding
+/// an identity at least as new as its page, so the daemon cannot settle
+/// that run before publishing the conversation it requires.
+#[test]
+fn an_outcome_page_is_never_newer_than_the_identity_read_with_it() {
+    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let socket = root.path().join("outcome-read.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let actor = RemoteActor::fixture_at(socket);
+    let unconfirmed = actor.state().as_ref().clone();
+    assert!(unconfirmed.confirmed_session.is_none());
+    let mut confirmed = unconfirmed.clone();
+    confirmed.changed += 1;
+    confirmed.confirmed_session = Some("confirmed-before-outcome".into());
+    confirmed.outbox_latest += 1;
+    let finished = OutboxEntry {
+        sequence: confirmed.outbox_latest,
+        update: Update::Execution {
+            run: crate::model::RunId::new(),
+            update: crate::agent_execution::Update::Finished {
+                state: crate::agent_execution::State::Succeeded,
+                result: Default::default(),
+            },
+        },
+    };
+    // The helper confirms and journals the outcome right after answering
+    // the first request of the read, whichever request that is.
+    let peer = thread::spawn(move || {
+        let mut published = false;
+        for _ in 0..4 {
+            let (stream, _) = listener.accept().unwrap();
+            let request: Invocation = receive(&stream, TIMEOUT).unwrap();
+            let reply = match request.method.as_str() {
+                "state" => {
+                    serde_json::to_value(Some(if published { &confirmed } else { &unconfirmed }))
+                }
+                "outbox_unacked" => serde_json::to_value(if published {
+                    vec![finished.clone()]
+                } else {
+                    Vec::new()
+                }),
+                method => panic!("unexpected outcome-read request {method}"),
+            };
+            send(&stream, &Ok::<Value, String>(reply.unwrap()), TIMEOUT).unwrap();
+            published = true;
+        }
+    });
+    for _ in 0..2 {
+        let page = actor.uncommitted_outcomes().unwrap();
+        assert!(
+            page.is_empty() || actor.state().confirmed_session.is_some(),
+            "the page holds an outcome that follows a confirmation the proxy has not read"
+        );
+    }
+    assert_eq!(
+        actor.state().confirmed_session.as_deref(),
+        Some("confirmed-before-outcome")
+    );
+    peer.join().unwrap();
+}
 /// #2339: while a close drains the outbox, the outcome broker refreshes
 /// the same closed actor. When its newer reply is published first, the
 /// close's older reply is stale, not a failed close.

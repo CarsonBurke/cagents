@@ -2661,7 +2661,10 @@ impl Cagents {
                 .or_insert(card_id);
             self.worktree_owners.insert(card_id, scope_path);
         }
-        if let Some(pane) = &display.pane {
+        // Pane names live in the window's settings, which must follow the
+        // registry's, or the next start migrates this view again (#3032).
+        let save_title = display.pane.as_ref().is_some_and(|pane| {
+            let changed = self.chrome_ui.user_titles.get(&card_id) != pane.user_title.as_ref();
             match &pane.user_title {
                 Some(title) => {
                     self.chrome_ui.user_titles.insert(card_id, title.clone());
@@ -2670,7 +2673,13 @@ impl Cagents {
                     self.chrome_ui.user_titles.remove(&card_id);
                 }
             }
-        }
+            changed
+        });
+        let save_title = if save_title {
+            self.save_settings_task(false)
+        } else {
+            Task::none()
+        };
         self.cards.insert(card_id, CardRuntime::Loading);
         self.register_presence(card_id, Exposure::Offscreen, Residency::Cold);
         // Native chats keep a lightweight attachment even offscreen, just as
@@ -2683,6 +2692,7 @@ impl Cagents {
             }
             crate::agent_execution::HostedSession::Terminal(_) => Task::none(),
         };
+        let attach = Task::batch([attach, save_title]);
         if !active {
             return Some(attach);
         }
@@ -2720,6 +2730,12 @@ impl Cagents {
         if !retitle && !rerank && !record {
             return false;
         }
+        // A name cleared in another window asks for the automatic one, which
+        // this window offers if it runs the channel's conversation. A model
+        // older than this window's own rename looks the same, so it does not
+        // forget that rename (see `channel_is_named`): the registry refuses
+        // the offer once it holds the new name, whose echo then restores it.
+        let cleared = retitle && !local.title.is_empty() && shared.title.is_empty();
         let channel = &mut Arc::make_mut(&mut self.durable).channels[index];
         if retitle {
             channel.title = shared.title.clone();
@@ -2729,6 +2745,9 @@ impl Cagents {
             channel.ordinal = shared.ordinal;
         }
         channel.shared = true;
+        if cleared {
+            self.offer_channel_name_again(shared.id);
+        }
         true
     }
 

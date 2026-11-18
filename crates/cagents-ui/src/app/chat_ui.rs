@@ -7943,13 +7943,13 @@ impl Cagents {
         if !chat::is_account_recovery(&source, &replacement) {
             return Task::none();
         }
-        // A refused earlier attempt no longer describes this one, which may
-        // take as long to answer.
+        // What answered an earlier send, such as a refused switch, no longer
+        // describes this attempt, which may take as long to answer.
         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card)
             && runtime
                 .error
                 .as_deref()
-                .is_some_and(chat::failure::is_account_switch_refusal)
+                .is_some_and(chat::failure::answers_one_send)
         {
             runtime.error = None;
         }
@@ -10366,6 +10366,45 @@ impl Cagents {
         }
     }
 
+    /// The target of the chat that names channel `id`, where this window
+    /// runs it.
+    fn channel_naming_chat(&self, id: crate::model::ChannelId) -> Option<Target> {
+        let channel = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)?;
+        let card = self.channel_primary_chat(channel)?;
+        match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => Some(runtime.target),
+            _ => self.chat_ui.parked.get(&card).map(|runtime| runtime.target),
+        }
+    }
+
+    /// The name channel `id`'s conversation has given it, as this window's
+    /// copy of that conversation knows it.
+    pub(super) fn automatic_channel_name(&self, id: crate::model::ChannelId) -> Option<&str> {
+        let target = self.channel_naming_chat(id)?;
+        self.chat_ui
+            .channel_names
+            .get(&target)?
+            .title
+            .as_ref()
+            .map(|(title, _)| title.as_str())
+    }
+
+    /// Lets the next refresh offer channel `id` its automatic name again,
+    /// once its name was cleared here or in another window. A name offered
+    /// at the channel's current view is otherwise never offered twice, and
+    /// clearing a name leaves the view as it was.
+    pub(super) fn offer_channel_name_again(&mut self, id: crate::model::ChannelId) {
+        if let Some(target) = self.channel_naming_chat(id)
+            && let Some(observation) = self.chat_ui.channel_names.get_mut(&target)
+        {
+            observation.last_view = None;
+        }
+    }
+
     /// Names an unnamed channel from the first prompt its primary chat
     /// delivered, and keeps that name as the chat's observation. The
     /// suggestion can be refused, as when the pane has not yet recorded its
@@ -12763,15 +12802,16 @@ impl Cagents {
                         let previous_limit = runtime.failure_ui.limit_occurrence;
                         let rehydrating = runtime.presentation_evicted;
                         runtime.refresh();
-                        // The daemon reports an exit that happened while it
-                        // was busy only once it is free, after its refusal.
-                        // Sending again no longer applies: the provider's own
-                        // report and the way back to it stand instead.
+                        // An exit can be reported after what answered the
+                        // last send, as the daemon reports one that happened
+                        // while it was busy only once it is free. Sending
+                        // again no longer applies: the provider's own report
+                        // and the way back to it stand instead.
                         if runtime.snapshot.exited
                             && runtime
                                 .error
                                 .as_deref()
-                                .is_some_and(chat::failure::is_account_switch_refusal)
+                                .is_some_and(chat::failure::answers_one_send)
                         {
                             runtime.error = None;
                         }

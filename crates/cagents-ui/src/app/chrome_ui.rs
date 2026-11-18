@@ -764,6 +764,72 @@ mod tests {
     }
 
     #[test]
+    fn a_blank_channel_rename_clears_only_a_given_name() {
+        use crate::model::{ChannelId, ChannelTitleSource, ProjectChannel, ProjectId};
+        use crate::workspace_model::ModelEdit;
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let (tx, requests) = super::super::workspace_model_sync::test_model_channel();
+        app.workspace_model_tx = tx;
+        for (title, source, given) in [
+            ("Roadmap", ChannelTitleSource::Manual, true),
+            ("From its conversation", ChannelTitleSource::Provider, false),
+            ("", ChannelTitleSource::Manual, false),
+        ] {
+            let id = ChannelId::new();
+            Arc::make_mut(&mut app.durable).channels = vec![ProjectChannel {
+                id,
+                project_id: ProjectId::new(),
+                title: title.into(),
+                title_source: source,
+                ordinal: 0,
+                shared: true,
+                cards: Vec::new(),
+                focused: None,
+            }];
+            app.note_channel_named(id);
+            drop(app.update_chrome(Action::RenameChannel(id)));
+            // No conversation here names the channel, so the copy says what
+            // clearing does without promising a name.
+            let (placeholder, caption, submit) = app.channel_rename_copy(id, true);
+            assert_eq!(placeholder, "Channel name");
+            assert_eq!(
+                caption,
+                "The channel stays unnamed until its conversation names it."
+            );
+            assert_eq!(submit, given.then_some("Use automatic name"));
+            assert_eq!(
+                app.channel_rename_copy(id, false).1,
+                if given {
+                    "Clear the name to use its conversation's name."
+                } else {
+                    ""
+                }
+            );
+            drop(app.update_chrome(Action::RenameChanged(" \t".into())));
+            drop(app.update_chrome(Action::RenameSubmit));
+            let sent = std::iter::from_fn(|| requests.try_recv().ok()).collect::<Vec<_>>();
+            if given {
+                assert!(app.chrome_ui.rename.is_none());
+                assert!(
+                    matches!(sent.as_slice(), [ModelEdit::RetitleChannel { id: channel, title }]
+                        if *channel == id && title.is_empty()),
+                    "{sent:?}"
+                );
+                assert_eq!(app.durable.channels[0].title, "");
+                assert!(!app.channel_is_named(id));
+            } else {
+                // Nothing to clear, so the draft stays open, as for a pane.
+                assert!(app.chrome_ui.rename.is_some());
+                assert!(sent.is_empty(), "{sent:?}");
+                assert_eq!(app.durable.channels[0].title, title);
+                assert_eq!(app.durable.channels[0].title_source, source);
+                assert!(app.channel_is_named(id));
+                drop(app.update_chrome(Action::RenameCancel));
+            }
+        }
+    }
+
+    #[test]
     fn stale_rename_cancel_does_not_steal_focus_from_a_new_palette() {
         use iced::advanced::widget::Tree;
 
@@ -785,20 +851,15 @@ mod tests {
     }
 
     #[test]
-    fn blank_rename_keeps_the_draft_open_until_it_is_corrected() {
+    fn blank_pane_rename_keeps_the_draft_open_until_it_is_corrected() {
         let mut app = super::super::tests::context_inspector_test_app(true);
         let id = app.workspace.focused().unwrap();
         let original = app.card_state(id).unwrap().title.clone();
         for draft in ["", "   ", "\t\n"] {
-            for target in [
-                RenameTarget::Pane(id),
-                RenameTarget::Channel(crate::model::ChannelId::new()),
-            ] {
-                app.chrome_ui.rename = Some((target, draft.into()));
-                drop(app.update_chrome(Action::RenameSubmit));
-                assert_eq!(app.chrome_ui.rename.as_ref().unwrap().1, draft);
-                assert_eq!(app.card_state(id).unwrap().title, original);
-            }
+            app.chrome_ui.rename = Some((RenameTarget::Pane(id), draft.into()));
+            drop(app.update_chrome(Action::RenameSubmit));
+            assert_eq!(app.chrome_ui.rename.as_ref().unwrap().1, draft);
+            assert_eq!(app.card_state(id).unwrap().title, original);
         }
         app.chrome_ui.rename = Some((RenameTarget::Pane(id), original));
         drop(app.update_chrome(Action::RenameChanged(" New name ".into())));
@@ -2603,10 +2664,15 @@ impl Cagents {
                 let Some((target, draft)) = self.chrome_ui.rename.as_ref() else {
                     return Task::none();
                 };
-                let Some(title) = normalize_card_name(&draft) else {
-                    return Task::none();
-                };
                 let target = *target;
+                let Some(title) = normalize_card_name(&draft) else {
+                    return match target {
+                        RenameTarget::Channel(id) if self.channel_has_given_name(id) => {
+                            self.use_automatic_channel_name(id)
+                        }
+                        RenameTarget::Channel(_) | RenameTarget::Pane(_) => Task::none(),
+                    };
+                };
                 let restore = self.dismiss_rename();
                 let id = match target {
                     RenameTarget::Pane(id) => id,
@@ -3545,8 +3611,87 @@ impl Cagents {
         ]
     }
 
+    /// Whether channel `id` has a name someone gave it, which clearing can
+    /// give back to its conversation.
+    fn channel_has_given_name(&self, id: crate::model::ChannelId) -> bool {
+        self.durable.channels.iter().any(|channel| {
+            channel.id == id
+                && channel.title_source == crate::model::ChannelTitleSource::Manual
+                && !channel.title.is_empty()
+        })
+    }
+
+    /// Gives channel `id` back the name its conversation gives it, which an
+    /// empty rename asks for. The channel shows as new until its primary
+    /// chat, in whichever window runs it, offers that name again.
+    fn use_automatic_channel_name(&mut self, id: crate::model::ChannelId) -> Task<Message> {
+        let restore = self.dismiss_rename();
+        let Some(channel) = Arc::make_mut(&mut self.durable)
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == id)
+        else {
+            return restore;
+        };
+        // As the registry stores a cleared name: empty, which any automatic
+        // name may fill.
+        channel.title.clear();
+        self.publish_model_edit(crate::workspace_model::ModelEdit::RetitleChannel {
+            id,
+            title: String::new(),
+        });
+        self.note_channel_unnamed(id);
+        self.offer_channel_name_again(id);
+        self.refresh_sidebar_channels();
+        self.persist();
+        Task::batch([
+            restore,
+            self.sync_chrome(),
+            self.refresh_channel_title_suggestions(),
+        ])
+    }
+
+    /// The rename field's placeholder, its caption, and the label of the
+    /// button that submits it (none while submitting does nothing), for
+    /// channel `id` with a `blank` draft or not. A blank draft gives back the
+    /// conversation's name, which the placeholder shows where it is known.
+    pub(super) fn channel_rename_copy(
+        &self,
+        id: crate::model::ChannelId,
+        blank: bool,
+    ) -> (Cow<'_, str>, &'static str, Option<&'static str>) {
+        let given = self.channel_has_given_name(id);
+        let automatic = self.automatic_channel_name(id);
+        (
+            automatic.map_or("Channel name".into(), Cow::Borrowed),
+            match (blank, given, automatic) {
+                (false, true, _) => "Clear the name to use its conversation's name.",
+                (false, false, _) => "",
+                (true, _, Some(_)) => "The channel takes its conversation's name.",
+                (true, _, None) => "The channel stays unnamed until its conversation names it.",
+            },
+            match (blank, given) {
+                (false, _) => Some("Rename"),
+                (true, true) => Some("Use automatic name"),
+                // Nothing to clear: the channel has no given name.
+                (true, false) => None,
+            },
+        )
+    }
+
     pub(super) fn pane_rename_surface(&self) -> Option<Element<'_, Message>> {
         let (target, draft) = self.chrome_ui.rename.as_ref()?;
+        let blank = normalize_card_name(draft).is_none();
+        // A channel's name can be cleared, which gives it back the name its
+        // conversation gives it; a pane's cannot.
+        let (placeholder, caption, submit): (Cow<'_, str>, _, _) = match target {
+            RenameTarget::Pane(_) => (
+                "Pane name".into(),
+                if blank { "Name cannot be blank." } else { "" },
+                (!blank).then_some("Rename"),
+            ),
+            RenameTarget::Channel(id) => self.channel_rename_copy(*id, blank),
+        };
         Some(
             widget::container(
                 widget::column::with_children(vec![
@@ -3555,32 +3700,18 @@ impl Cagents {
                         RenameTarget::Channel(_) => "Rename channel",
                     })
                     .into(),
-                    crate::ui_controls::field::text(
-                        match target {
-                            RenameTarget::Pane(_) => "Pane name",
-                            RenameTarget::Channel(_) => "Channel name",
-                        },
-                        draft,
-                    )
-                    .id(widget::Id::new("chrome.rename.input"))
-                    .on_input(|value| Message::ChromeUi(Action::RenameChanged(value)))
-                    .on_submit(|_| Message::ChromeUi(Action::RenameSubmit))
-                    .into(),
-                    design::caption(if normalize_card_name(draft).is_none() {
-                        "Name cannot be blank."
-                    } else {
-                        ""
-                    })
-                    .into(),
+                    crate::ui_controls::field::text(placeholder, draft)
+                        .id(widget::Id::new("chrome.rename.input"))
+                        .on_input(|value| Message::ChromeUi(Action::RenameChanged(value)))
+                        .on_submit(|_| Message::ChromeUi(Action::RenameSubmit))
+                        .into(),
+                    design::caption(caption).into(),
                     widget::row::with_children(vec![
                         crate::ui_controls::button::secondary("Cancel")
                             .on_press(Message::ChromeUi(Action::RenameCancel))
                             .into(),
-                        crate::ui_controls::button::primary("Rename")
-                            .on_press_maybe(
-                                normalize_card_name(draft)
-                                    .map(|_| Message::ChromeUi(Action::RenameSubmit)),
-                            )
+                        crate::ui_controls::button::primary(submit.unwrap_or("Rename"))
+                            .on_press_maybe(submit.map(|_| Message::ChromeUi(Action::RenameSubmit)))
                             .into(),
                     ])
                     .spacing(space::XS)

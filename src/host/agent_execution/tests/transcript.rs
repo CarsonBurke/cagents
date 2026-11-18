@@ -438,31 +438,51 @@ fn a_saved_pane_that_is_not_hosted_is_listed_and_its_conversation_read() {
 #[cfg(target_os = "linux")]
 #[test]
 fn undisplayed_retained_agent_saves_confirmed_identity_before_restart() {
-    retained_identity_case(false, false, ProviderHome::Original);
+    retained_identity_case(false, Confirmation::WhileServing, ProviderHome::Original);
 }
 
 #[cfg(target_os = "linux")]
 #[test]
 fn confirmed_identity_retries_after_census_publication_failure() {
-    retained_identity_case(true, false, ProviderHome::Original);
+    retained_identity_case(true, Confirmation::WhileServing, ProviderHome::Original);
+}
+
+/// #2849: a drain that published no identity (none was confirmed yet) must
+/// not settle a run whose outcome it reads after the provider confirmed one.
+#[cfg(target_os = "linux")]
+#[test]
+fn identity_confirmed_after_drain_publication_still_gates_the_run_outcome() {
+    retained_identity_case(
+        true,
+        Confirmation::DuringOutcomeDrain,
+        ProviderHome::Original,
+    );
 }
 
 #[cfg(target_os = "linux")]
 #[test]
 fn shutdown_saves_identity_confirmed_after_background_broker_stops() {
-    retained_identity_case(false, true, ProviderHome::Original);
+    retained_identity_case(
+        false,
+        Confirmation::AfterBrokerStops,
+        ProviderHome::Original,
+    );
 }
 
 #[cfg(target_os = "linux")]
 #[test]
 fn shutdown_saves_confirmed_identity_after_provider_home_is_removed() {
-    retained_identity_case(false, true, ProviderHome::Removed);
+    retained_identity_case(false, Confirmation::AfterBrokerStops, ProviderHome::Removed);
 }
 
 #[cfg(target_os = "linux")]
 #[test]
 fn shutdown_saves_confirmed_identity_after_provider_home_is_replaced() {
-    retained_identity_case(false, true, ProviderHome::Replaced);
+    retained_identity_case(
+        false,
+        Confirmation::AfterBrokerStops,
+        ProviderHome::Replaced,
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -473,12 +493,22 @@ enum ProviderHome {
     Replaced,
 }
 
+/// When the provider confirms its conversation relative to the daemon's
+/// outcome broker.
 #[cfg(target_os = "linux")]
-fn retained_identity_case(
-    fail_census: bool,
-    shutdown_before_confirmation: bool,
-    home: ProviderHome,
-) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Confirmation {
+    /// While the broker serves the actor normally.
+    WhileServing,
+    /// While a broker drain is held after its identity publication found no
+    /// confirmed conversation, and before it reads the actor's outcomes.
+    DuringOutcomeDrain,
+    /// After graceful shutdown stopped the broker.
+    AfterBrokerStops,
+}
+
+#[cfg(target_os = "linux")]
+fn retained_identity_case(fail_census: bool, confirmation: Confirmation, home: ProviderHome) {
     if super::retained_automation::isolated_retained() {
         return;
     }
@@ -585,6 +615,16 @@ fn retained_identity_case(
         // schema, and before the provider can publish its confirmed identity.
         db.execute_batch("CREATE TRIGGER reject_confirmed_census BEFORE UPDATE ON native_actor_ownerships WHEN json_extract(NEW.ownership, '$.source.launch.session_id') IS NOT NULL BEGIN SELECT RAISE(ABORT, 'fixture census publication failure'); END;").unwrap();
     }
+    let shutdown_before_confirmation = confirmation == Confirmation::AfterBrokerStops;
+    let fence = (confirmation == Confirmation::DuringOutcomeDrain).then(|| {
+        let fence = crate::host::chat::retained_actor::drain_fence::arm(id);
+        crate::host::chat::retained_actor::wake(&host, id);
+        fence.wait_reached(Duration::from_secs(15));
+        // The provider is still held before its result, so the drain's
+        // identity publication found nothing to publish.
+        assert!(handle.confirmed_session_id().is_none());
+        fence
+    });
     if shutdown_before_confirmation {
         let (terminals, _) = host.lock().unwrap().graceful_shutdown();
         assert!(terminals.is_empty());
@@ -606,6 +646,27 @@ fn retained_identity_case(
         "provider never confirmed its conversation",
     );
     let confirmed = handle.confirmed_session_id().unwrap();
+    if let Some(fence) = fence {
+        // Release the held drain only once the helper has published the run's
+        // terminal outcome, so its outcome read includes it.
+        wait(
+            || {
+                handle
+                    .uncommitted_outcomes_until(Instant::now() + Duration::from_secs(5))
+                    .unwrap()
+                    .iter()
+                    .any(|entry| {
+                        matches!(&entry.update,
+                        crate::chat::runtime::Update::Execution {
+                            run,
+                            update: crate::agent_execution::Update::Finished { .. },
+                        } if *run == accepted.run.id)
+                    })
+            },
+            "provider never published its terminal outcome",
+        );
+        fence.release();
+    }
     if home == ProviderHome::Original {
         save_claude_transcript(&host, id, root);
     }

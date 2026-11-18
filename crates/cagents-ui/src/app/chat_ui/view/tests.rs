@@ -8881,6 +8881,247 @@ fn fingerprints(runtime: &Runtime, dark: bool) -> Vec<u64> {
         .collect()
 }
 
+/// The rows of the exchange at `turn`, each with the value that decides
+/// whether it is drawn again.
+/// The rows' fingerprints at a fixed time, so that only what the test
+/// changed can change them, never a second ticking over between reads.
+fn row_fingerprints(runtime: &Runtime, turn: usize) -> Vec<(TurnPart, u64)> {
+    runtime.turn_row_fingerprints_at(&runtime.turns[turn], true, Some(60_000))
+}
+
+fn message(id: &str, role: chat::Role, text: &str, thinking: bool, at: u64) -> chat::Item {
+    chat::Item {
+        id: id.into(),
+        role,
+        content: ItemContent::Text {
+            text: text.into(),
+            thinking,
+            phase: if role == chat::Role::User {
+                chat::Phase::Final
+            } else {
+                chat::Phase::Commentary
+            },
+        },
+        started_at: Some(at),
+        at: Some(at),
+    }
+}
+
+/// Publishes what `change` makes of the chat, with the agent working,
+/// and prepares it.
+fn publish_working(
+    runtime: &mut Runtime,
+    handle: &ClientHandle,
+    change: impl FnOnce(&mut Snapshot),
+) {
+    let mut snapshot = (*handle.snapshot()).clone();
+    snapshot.generation += 1;
+    snapshot.busy = true;
+    change(&mut snapshot);
+    handle.publish_delta_snapshot_for_test(snapshot);
+    runtime.refresh();
+    preparation::drain_fixture(runtime);
+}
+
+/// A thought is finished by what follows it rather than by any change to
+/// the thought itself, so its kept row is drawn again when the answer
+/// arrives, while the prompt above it keeps its own.
+#[test]
+fn a_kept_thought_finishes_when_the_answer_after_it_arrives() {
+    use iced::advanced::{
+        Layout, layout,
+        widget::{Operation, Tree},
+    };
+    #[derive(Default)]
+    struct Texts(Vec<String>);
+    impl Operation for Texts {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, text: &str) {
+            self.0.push(text.to_owned());
+        }
+    }
+    let (mut runtime, handle) = frame_cost::live_runtime(&[
+        message("prompt", chat::Role::User, "Why does it fail?", false, 0),
+        message(
+            "thought",
+            chat::Role::Assistant,
+            "**First thought**\n\nLatest line",
+            true,
+            1_000,
+        ),
+    ]);
+    publish_working(&mut runtime, &handle, |_| {});
+    let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
+    let renderer = crate::app::tests::headless_renderer();
+    let mut tree = Tree::new(
+        runtime
+            .turn_view(&runtime.turns[0], settings, true)
+            .as_widget(),
+    );
+    let texts = |runtime: &Runtime, tree: &mut Tree| {
+        let mut element = runtime.turn_view(&runtime.turns[0], settings, true);
+        tree.diff(element.as_widget_mut());
+        let node = element.as_widget_mut().layout(
+            tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(640.0, 2000.0)),
+        );
+        let mut texts = Texts::default();
+        element
+            .as_widget_mut()
+            .operate(tree, Layout::new(&node), &renderer, &mut texts);
+        texts.0
+    };
+    let working = texts(&runtime, &mut tree);
+    assert!(
+        working.iter().any(|text| text.contains("Latest line"))
+            && !working.iter().any(|text| text.contains("First thought")),
+        "{working:?}"
+    );
+    let before = row_fingerprints(&runtime, 0);
+    let revision = runtime.cache["thought"].revision;
+    publish_working(&mut runtime, &handle, |snapshot| {
+        snapshot.items.push(Arc::new(message(
+            "answer",
+            chat::Role::Assistant,
+            "Because the cursor is stale.",
+            false,
+            13_000,
+        )));
+    });
+    assert_eq!(
+        runtime.cache["thought"].revision, revision,
+        "the thought itself is unchanged"
+    );
+    let after = row_fingerprints(&runtime, 0);
+    assert_eq!(after[0], before[0], "the prompt keeps its row");
+    assert_ne!(after[1], before[1], "the thought's row is drawn again");
+    let finished = texts(&runtime, &mut tree);
+    assert!(
+        finished.iter().any(|text| text.contains("First thought")),
+        "{finished:?}"
+    );
+}
+
+/// The strip spins only while its newest step is the newest thing the
+/// agent did, so its kept row is drawn again when a message follows the
+/// step, though no step changed.
+#[test]
+fn a_kept_strip_stops_spinning_when_a_message_follows_its_step() {
+    let (mut runtime, handle) = frame_cost::live_runtime(&[
+        message("prompt", chat::Role::User, "Read the parser.", false, 0),
+        chat::Item {
+            id: "read".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Tool {
+                name: "Read".into(),
+                input: r#"{"file_path":"/project/src/parser.rs"}"#.into(),
+                output: String::new(),
+                status: chat::ToolStatus::Running,
+            },
+            started_at: Some(1_000),
+            at: Some(1_000),
+        },
+    ]);
+    publish_working(&mut runtime, &handle, |_| {});
+    let strip = |rows: &[(TurnPart, u64)]| {
+        rows.iter()
+            .find(|(part, _)| *part == TurnPart::Steps)
+            .expect("a step strip")
+            .1
+    };
+    assert_eq!(
+        runtime.strip_status(&runtime.turns[0]),
+        Some(chat::ToolStatus::Running)
+    );
+    let before = row_fingerprints(&runtime, 0);
+    publish_working(&mut runtime, &handle, |snapshot| {
+        snapshot.items.push(Arc::new(message(
+            "answer",
+            chat::Role::Assistant,
+            "Reading it now.",
+            false,
+            2_000,
+        )));
+    });
+    assert_eq!(runtime.strip_status(&runtime.turns[0]), None);
+    let after = row_fingerprints(&runtime, 0);
+    assert_eq!(after[0], before[0], "the prompt keeps its row");
+    assert_ne!(strip(&after), strip(&before), "the strip is drawn again");
+}
+
+/// Find reaches an exchange through its first row, in one place, whether
+/// or not that row is mounted: a long exchange read far below its prompt
+/// is found all the same.
+#[test]
+fn an_exchange_is_found_through_its_first_row_mounted_or_not() {
+    use iced::advanced::{
+        Layout, layout,
+        widget::{Operation, Tree},
+    };
+    struct Anchors(widget::Id, Vec<iced::Rectangle>);
+    impl Operation for Anchors {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn container(&mut self, id: Option<&widget::Id>, bounds: iced::Rectangle) {
+            if id == Some(&self.0) {
+                self.1.push(bounds);
+            }
+        }
+    }
+    let mut items = vec![message(
+        "prompt",
+        chat::Role::User,
+        "Check every parser.",
+        false,
+        0,
+    )];
+    items.extend((0..80).map(|step| {
+        message(
+            &format!("step-{step}"),
+            chat::Role::Assistant,
+            &format!("Step {step}: checked the cursor handling."),
+            false,
+            1_000 + step,
+        )
+    }));
+    let (runtime, _handle) = frame_cost::live_runtime(&items);
+    assert_eq!(runtime.turns.len(), 1);
+    let turn = &runtime.turns[0];
+    let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
+    let renderer = crate::app::tests::headless_renderer();
+    let mut element = runtime.turn_view(turn, settings, true);
+    let mut tree = Tree::new(element.as_widget());
+    let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(640.0, f32::INFINITY));
+    let height = element
+        .as_widget_mut()
+        .layout(&mut tree, &renderer, &limits)
+        .size()
+        .height;
+    assert!(height > 3_000.0, "the exchange is {height} tall");
+    for top in [0.0, height - 300.0] {
+        let viewport = virtualized::Viewport {
+            top,
+            height: 300.0,
+            bottom: false,
+        };
+        let mut element = runtime.turn_view_in(turn, settings, true, viewport);
+        let mut tree = Tree::new(element.as_widget());
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let mut anchors = Anchors(runtime.find_anchor(&turn.key), Vec::new());
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut anchors);
+        assert_eq!(anchors.1.len(), 1, "read from {top}: {:?}", anchors.1);
+        assert_eq!(anchors.1[0].y, 0.0, "read from {top}");
+    }
+}
+
 /// A lone step that stopped an agent names it on its collapsed strip as
 /// its open row does, once the daemon says how Claude addresses it, and
 /// the drawn turn is redrawn when it learns that.

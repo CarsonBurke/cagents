@@ -106,23 +106,18 @@ pub const COMMAND_OUT_OF_MEMORY: &str =
 pub const PROVIDER_EXITED: &str = "Provider exited with ";
 
 /// Whether a reported error tells of something the agent carried on past,
-/// rather than a failure of the conversation. It still gets its notice in
-/// the transcript, but the conversation's state does not become an error.
+/// or of one send the conversation outlived, rather than a failure of the
+/// conversation. It still gets its notice in the transcript, but the
+/// conversation's state does not become an error.
 pub fn is_notice(message: &str) -> bool {
-    message.trim_start().starts_with(COMMAND_OUT_OF_MEMORY) || is_account_switch_refusal(message)
+    message.trim_start().starts_with(COMMAND_OUT_OF_MEMORY) || answers_one_send(message)
 }
 
-/// Whether `message` reports a send whose automatic account switch the daemon
-/// never admitted. The conversation itself is untouched, so this answers the
-/// send rather than describing the conversation, and the next switch attempt
-/// replaces it.
-pub fn is_account_switch_refusal(message: &str) -> bool {
-    [
-        delivery::ACCOUNT_SWITCH_BUSY,
-        delivery::ACCOUNT_SWITCH_UNANSWERED,
-        delivery::ACCOUNT_SWITCH_UNREACHED,
-    ]
-    .contains(&message.trim())
+/// Whether `message` is a [`DeliveryOutcome`] that answers one send and
+/// leaves the conversation as it was. The next attempt, whether the reader's
+/// or an automatic one, replaces it.
+pub fn answers_one_send(message: &str) -> bool {
+    DeliveryOutcome::parse(message).is_some_and(|outcome| outcome.notice)
 }
 
 /// What a runtime exit report says happened to the provider, in words: the
@@ -528,6 +523,10 @@ pub struct DeliveryOutcome {
     /// Whether the request may still have gone through, rather than
     /// certainly not.
     pub unknown: bool,
+    /// Whether this answers one send and leaves the conversation as it was,
+    /// rather than describing the conversation: sending again, perhaps after
+    /// a moment or with a smaller message, is all it asks.
+    pub notice: bool,
 }
 
 macro_rules! delivery_unknown {
@@ -539,17 +538,38 @@ macro_rules! delivery_unknown {
     };
 }
 
+macro_rules! delivery_notice {
+    (send) => {
+        true
+    };
+    (conversation) => {
+        false
+    };
+}
+
+/// Each outcome names whether the request may have gone through (`unknown`)
+/// or certainly did not (`refused`), and whether it answers one `send` or
+/// describes the `conversation`.
 macro_rules! delivery_outcomes {
-    ($($(#[$doc:meta])* $kind:ident $name:ident: $summary:literal, $action:literal;)*) => {
+    ($($(#[$doc:meta])* $kind:ident $scope:ident $name:ident: $summary:literal, $action:literal;)*) => {
         /// The texts of every [`DeliveryOutcome`].
         pub mod delivery {
             $($(#[$doc])* pub const $name: &str = concat!($summary, " ", $action);)*
+            /// The outcome named `name`, as a fixture names it.
+            #[cfg(debug_assertions)]
+            pub fn named(name: &str) -> Option<&'static str> {
+                match name {
+                    $(stringify!($name) => Some($name),)*
+                    _ => None,
+                }
+            }
             pub(super) const ALL: &[(&str, super::DeliveryOutcome)] = &[$((
                 $name,
                 super::DeliveryOutcome {
                     summary: $summary,
                     action: $action,
                     unknown: delivery_unknown!($kind),
+                    notice: delivery_notice!($scope),
                 },
             )),*];
         }
@@ -558,73 +578,73 @@ macro_rules! delivery_outcomes {
 
 delivery_outcomes! {
     /// An input whose delivery was never confirmed, settled as not sent.
-    refused UNCONFIRMED_INPUT: "Claude couldn't accept this in time, so it was not sent.", "Try again.";
+    refused send UNCONFIRMED_INPUT: "Claude couldn't accept this in time, so it was not sent.", "Try again.";
     /// The caller stopped waiting while the outcome is still unknown.
-    unknown UNACKNOWLEDGED_INPUT: "Claude hasn't confirmed this yet.",
+    unknown send UNACKNOWLEDGED_INPUT: "Claude hasn't confirmed this yet.",
         "It may still go through, so check the conversation before trying again.";
     /// An answer whose outcome is still unknown when its caller stops waiting.
-    unknown UNACKNOWLEDGED_ANSWER: "Claude hasn't confirmed this answer yet.",
+    unknown send UNACKNOWLEDGED_ANSWER: "Claude hasn't confirmed this answer yet.",
         "It may still go through, so check the conversation before answering again.";
     /// A stop whose outcome is still unknown when its caller stops waiting.
-    unknown UNACKNOWLEDGED_STOP: "Claude hasn't confirmed the stop yet.",
+    unknown send UNACKNOWLEDGED_STOP: "Claude hasn't confirmed the stop yet.",
         "It may still take effect, so check the conversation before trying again.";
     /// A new input while an earlier one is still unconfirmed.
-    refused UNSETTLED_INPUT: "Claude hasn't confirmed the previous request yet, so this was not sent.",
+    refused send UNSETTLED_INPUT: "Claude hasn't confirmed the previous request yet, so this was not sent.",
         "Try again in a moment.";
     /// Every new input once an unconfirmed one cannot be settled.
-    refused UNSETTLEABLE_INPUT: "Claude stopped confirming requests in this conversation, so this was not sent.",
+    refused conversation UNSETTLEABLE_INPUT: "Claude stopped confirming requests in this conversation, so this was not sent.",
         "Close and reopen the conversation to continue.";
     /// Pending inputs once the proxy stopped before their outcome was known.
-    unknown STOPPED_INPUT: "Claude's conversation process stopped before confirming this, so it may or may not have gone through.",
+    unknown conversation STOPPED_INPUT: "Claude's conversation process stopped before confirming this, so it may or may not have gone through.",
         "Check the conversation before trying again.";
     /// A new input while the proxy reattaches to its helper.
-    refused RECONNECTING_INPUT: "Claude is still reconnecting to this conversation, so this was not sent.",
+    refused send RECONNECTING_INPUT: "Claude is still reconnecting to this conversation, so this was not sent.",
         "Try again in a moment.";
     /// A new input beyond the requests already waiting.
-    refused CROWDED_INPUT: "Too many requests are waiting for Claude, so this was not sent.",
+    refused send CROWDED_INPUT: "Too many requests are waiting for Claude, so this was not sent.",
         "Try again in a moment.";
     /// A new input while completed ones are still being retired.
-    refused RETIRING_INPUT: "Claude is still finishing earlier requests, so this was not sent.",
+    refused send RETIRING_INPUT: "Claude is still finishing earlier requests, so this was not sent.",
         "Try again in a moment.";
     /// An input too large for one protocol frame.
-    refused OVERSIZED_INPUT: "This is too large to send to Claude, so it was not sent.",
+    refused send OVERSIZED_INPUT: "This is too large to send to Claude, so it was not sent.",
         "Shorten it or split it into smaller messages.";
     /// An input to a helper whose conversation is closing.
-    refused CLOSING_INPUT: "Claude's conversation is closing, so this was not sent.",
+    refused conversation CLOSING_INPUT: "Claude's conversation is closing, so this was not sent.",
         "Reopen the conversation to continue.";
     /// An input to a helper handing its conversation to an updated daemon.
-    refused HANDOVER_INPUT: "Claude's conversation is moving to the updated cagents service, so this was not sent.",
+    refused send HANDOVER_INPUT: "Claude's conversation is moving to the updated cagents service, so this was not sent.",
         "Try again in a moment.";
     /// An input after the helper lost track of earlier outcomes.
-    refused DISCONTINUOUS_INPUT: "Claude can't confirm earlier work in this conversation, so this was not sent.",
+    refused conversation DISCONTINUOUS_INPUT: "Claude can't confirm earlier work in this conversation, so this was not sent.",
         "Start a new conversation to continue.";
     /// An input whose frame arrived altered.
-    refused DAMAGED_INPUT: "This request was damaged on its way to Claude, so it was not sent.",
+    refused send DAMAGED_INPUT: "This request was damaged on its way to Claude, so it was not sent.",
         "Try again.";
     /// An intact input that the helper's protocol does not describe.
-    refused UNSUPPORTED_INPUT: "Claude's conversation process doesn't support this request, so it was not sent.",
+    refused conversation UNSUPPORTED_INPUT: "Claude's conversation process doesn't support this request, so it was not sent.",
         "Close and reopen the conversation to continue.";
     /// Any input once the proxy has stopped.
-    refused UNAVAILABLE_INPUT: "Claude's conversation process is no longer reachable, so this was not sent.",
+    refused conversation UNAVAILABLE_INPUT: "Claude's conversation process is no longer reachable, so this was not sent.",
         "Close and reopen the conversation to continue.";
     /// A send that needed an automatic account switch the daemon refused
     /// while it finished another operation. The conversation stayed on its
     /// account, and the message is still in the composer, so sending again
     /// is the retry.
-    refused ACCOUNT_SWITCH_BUSY: "Your message wasn't sent. This conversation's account can't be used right now, and the cagents daemon was busy finishing something else, so it couldn't move the conversation to another account.",
+    refused send ACCOUNT_SWITCH_BUSY: "Your message wasn't sent. This conversation's account can't be used right now, and the cagents daemon was busy finishing something else, so it couldn't move the conversation to another account.",
         "Send again in a moment.";
     /// A send that needed an automatic account switch, when the daemon took
     /// the connection but never answered it. Nothing was asked of it, so the
     /// conversation stayed on its account; the daemon may be hung, which the
     /// daemon health banner reports with its own restart.
-    refused ACCOUNT_SWITCH_UNANSWERED: "Your message wasn't sent. This conversation's account can't be used right now, and the cagents daemon didn't respond in time to move the conversation to another account.",
+    refused send ACCOUNT_SWITCH_UNANSWERED: "Your message wasn't sent. This conversation's account can't be used right now, and the cagents daemon didn't respond in time to move the conversation to another account.",
         "Send again, or restart the daemon if this keeps happening.";
     /// A send that needed an automatic account switch, when no daemon could
     /// be reached to ask: its socket was missing or refused the connection,
     /// the connection closed before its handshake, or it speaks another
     /// protocol. Nothing was asked, so the conversation stayed on its
     /// account; a daemon that is gone or mismatched has its own banner.
-    refused ACCOUNT_SWITCH_UNREACHED: "Your message wasn't sent. This conversation's account can't be used right now, and the cagents daemon couldn't be reached to move the conversation to another account.",
+    refused send ACCOUNT_SWITCH_UNREACHED: "Your message wasn't sent. This conversation's account can't be used right now, and the cagents daemon couldn't be reached to move the conversation to another account.",
         "Send again, or restart the daemon if this keeps happening.";
 }
 
@@ -651,6 +671,7 @@ mod tests {
                 summary: "Claude hasn't confirmed this yet.",
                 action: "It may still go through, so check the conversation before trying again.",
                 unknown: true,
+                notice: true,
             })
         );
         for (index, (text, outcome)) in delivery::ALL.iter().enumerate() {
@@ -674,6 +695,62 @@ mod tests {
             DeliveryOutcome::parse(&format!("Claude said: {}", delivery::UNCONFIRMED_INPUT)),
             None
         );
+    }
+
+    /// An outcome that answers one send is a notice: the conversation is as
+    /// it was, and sending again is the way on. One that describes the
+    /// conversation, which cannot take this or any later message as it is,
+    /// stays its error.
+    #[test]
+    fn delivery_outcomes_answering_one_send_are_notices() {
+        use delivery::*;
+        let sends = [
+            UNCONFIRMED_INPUT,
+            UNACKNOWLEDGED_INPUT,
+            UNACKNOWLEDGED_ANSWER,
+            UNACKNOWLEDGED_STOP,
+            UNSETTLED_INPUT,
+            RECONNECTING_INPUT,
+            CROWDED_INPUT,
+            RETIRING_INPUT,
+            OVERSIZED_INPUT,
+            HANDOVER_INPUT,
+            DAMAGED_INPUT,
+            ACCOUNT_SWITCH_BUSY,
+            ACCOUNT_SWITCH_UNANSWERED,
+            ACCOUNT_SWITCH_UNREACHED,
+        ];
+        let conversation = [
+            UNSETTLEABLE_INPUT,
+            STOPPED_INPUT,
+            CLOSING_INPUT,
+            DISCONTINUOUS_INPUT,
+            UNSUPPORTED_INPUT,
+            UNAVAILABLE_INPUT,
+        ];
+        // Every outcome is in exactly one of the two lists.
+        assert_eq!(sends.len() + conversation.len(), ALL.len());
+        for (text, outcome) in ALL {
+            assert_eq!(
+                outcome.notice,
+                sends.contains(text),
+                "{text} is classified as {}",
+                if outcome.notice {
+                    "a notice"
+                } else {
+                    "an error"
+                }
+            );
+            assert_ne!(sends.contains(text), conversation.contains(text), "{text}");
+            assert_eq!(answers_one_send(text), outcome.notice, "{text}");
+            assert_eq!(is_notice(text), outcome.notice, "{text}");
+            // Its surrounding whitespace aside, only the exact text counts.
+            assert_eq!(answers_one_send(&format!("  {text}\n")), outcome.notice);
+            assert!(!answers_one_send(&format!("Claude said: {text}")));
+        }
+        // The other notice is not a delivery outcome.
+        let stopped = format!("{COMMAND_OUT_OF_MEMORY} It was retried.");
+        assert!(is_notice(&stopped) && !answers_one_send(&stopped));
     }
 
     #[test]

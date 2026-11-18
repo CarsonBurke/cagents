@@ -1886,6 +1886,10 @@ fn first_model_read_uses_moved_native_pane_instead_of_stale_managed_placement() 
         .agent_labels
         .insert(agent.id, "Mailbox lead".into());
     app.workspace_model = model;
+    let settings = tempfile::tempdir().unwrap();
+    app.settings_path = Some(settings.path().join("settings.toml"));
+    app.settings_write_blocked = false;
+    let saved = app.settings_save_generation;
     drop(app.reconcile_workspace_model());
     assert!(
         app.durable
@@ -1896,6 +1900,13 @@ fn first_model_read_uses_moved_native_pane_instead_of_stale_managed_placement() 
             .cards
             .contains(&card)
     );
+    // The adopted pane's name is saved with the window's settings, or the
+    // next start would read it back missing and migrate the view (#3032).
+    assert_eq!(
+        app.chrome_ui.user_titles.get(&card).map(String::as_str),
+        Some("Mailbox lead")
+    );
+    assert!(app.settings_save_generation > saved);
     assert!(
         !app.durable
             .channels

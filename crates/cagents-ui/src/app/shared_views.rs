@@ -3,6 +3,7 @@
 mod discovery;
 pub(super) mod seed_refusal;
 mod settlement;
+mod view_index;
 
 use super::*;
 use crate::workspace_model::{
@@ -18,6 +19,91 @@ struct LocalViews {
     scopes: Vec<Scope>,
     cards: HashMap<Scope, Vec<CardId>>,
     panes: HashMap<Scope, Vec<Pane>>,
+    /// Seeded scopes whose panes equal their baseline, so `panes` leaves them
+    /// out: publishing one changes nothing unless a transfer reaches it. Only
+    /// a complete save's projection settles any.
+    settled: HashSet<Scope>,
+}
+
+/// One pane of a scope as this window would publish it, borrowed from its
+/// card and what is layered over it, so a pane that matches its baseline is
+/// never copied.
+enum LocalPane<'a> {
+    /// A terminal whose start has not saved, held as its view lists it.
+    Held(&'a Pane),
+    Card {
+        card: &'a CardState,
+        title: &'a str,
+        user_title: Option<&'a String>,
+        pending_terminal_start: bool,
+        scope: Option<&'a Path>,
+    },
+}
+
+impl<'p> LocalPane<'p> {
+    fn to_pane(&self) -> Pane {
+        match *self {
+            Self::Held(pane) => pane.clone(),
+            Self::Card {
+                card,
+                title,
+                user_title,
+                pending_terminal_start,
+                scope,
+            } => Pane {
+                id: card.id,
+                title: title.to_owned(),
+                user_title: user_title.cloned(),
+                pending_terminal_start,
+                width_fraction: card.width_fraction,
+                kind: views::shared_kind(&card.kind),
+                scope: scope.map(Path::to_owned),
+            },
+        }
+    }
+
+    /// Whether `local` would publish exactly `shared`, in order.
+    fn all_match(mut local: impl Iterator<Item = LocalPane<'p>>, shared: &[Pane]) -> bool {
+        let mut shared = shared.iter();
+        loop {
+            match (local.next(), shared.next()) {
+                (None, None) => return true,
+                (Some(local), Some(shared)) if local.matches(shared) => {}
+                _ => return false,
+            }
+        }
+    }
+
+    /// Whether [`Self::to_pane`] would equal `pane`.
+    fn matches(&self, pane: &Pane) -> bool {
+        match *self {
+            Self::Held(held) => held == pane,
+            Self::Card {
+                card,
+                title,
+                user_title,
+                pending_terminal_start,
+                scope,
+            } => {
+                let Pane {
+                    id: shared_id,
+                    title: shared_title,
+                    user_title: shared_user_title,
+                    pending_terminal_start: shared_pending,
+                    width_fraction: shared_width,
+                    kind: shared_kind,
+                    scope: shared_scope,
+                } = pane;
+                *shared_id == card.id
+                    && shared_title == title
+                    && shared_user_title.as_ref() == user_title
+                    && *shared_pending == pending_terminal_start
+                    && *shared_width == card.width_fraction
+                    && shared_scope.as_deref() == scope
+                    && views::is_shared_kind(&card.kind, shared_kind)
+            }
+        }
+    }
 }
 
 /// Which scopes need local presentation projected. A selected pass still
@@ -128,6 +214,9 @@ impl ViewScopeAuthorities<'_> {
 struct ScopeDiscovery<'a> {
     scopes: Vec<Cow<'a, Scope>>,
     worktree_cards: Vec<(&'a CardState, &'a Path)>,
+    /// Every card a channel lists, by its identity, which is unique in a
+    /// workspace.
+    channeled: HashMap<CardId, &'a CardState>,
 }
 
 /// Preserve durable-card order within each logical resource. Canonical and
@@ -254,6 +343,12 @@ pub(super) struct State {
     pub(super) publisher_index_entries: usize,
     #[cfg(test)]
     publisher_scope_comparisons: usize,
+    /// Scopes complete publications left settled, publishing nothing.
+    #[cfg(test)]
+    pub(super) settled_publications: usize,
+    /// Settled scopes a transfer reached, published from their baseline.
+    #[cfg(test)]
+    pub(super) transfer_unsettled: usize,
     #[cfg(test)]
     pub(super) chrome_cards_visited: std::cell::Cell<usize>,
     #[cfg(test)]
@@ -309,6 +404,8 @@ pub(super) struct State {
     restoration_requests: HashMap<CardId, TerminalId>,
     /// What complete saves keep of scope discovery between passes.
     discovery: discovery::ViewDiscovery,
+    /// Where each scope's view is in the model, kept between publications.
+    view_index: view_index::ViewIndex,
 }
 
 impl State {
@@ -395,6 +492,104 @@ impl State {
             .collect::<HashMap<_, _>>();
         self.restoration_requests
             .retain(|card, terminal| open.get(card) == Some(terminal));
+    }
+
+    /// A copy of everything a publication reads or writes, so a test can
+    /// publish the same state two ways. The copy keeps no discovery or view
+    /// index, and its key sets are new sets.
+    #[cfg(test)]
+    pub(super) fn publication_copy(&self) -> Self {
+        let Self {
+            removals,
+            snapshot_sequence,
+            terminal_source_workers,
+            scope_absences,
+            view_sequences,
+            metadata_revisions,
+            closed,
+            local_projection_count: _,
+            topology_build_count: _,
+            view_projection_count: _,
+            selected_projection_count: _,
+            scope_discovery_count: _,
+            notification_attribution_count: _,
+            pane_attachment_count: _,
+            structural_tail_count: _,
+            chrome_tail_count: _,
+            publisher_index_entries: _,
+            publisher_scope_comparisons: _,
+            settled_publications: _,
+            transfer_unsettled: _,
+            chrome_cards_visited: _,
+            order_rewrites: _,
+            held_descriptor_clones: _,
+            registry_unavailable,
+            unintroduced_projects,
+            baseline,
+            initialized,
+            seeding,
+            seed_attempts,
+            seed_failures,
+            pending,
+            source_bases,
+            requested_transfers,
+            attached,
+            retained,
+            closed_chats,
+            observed_chats,
+            observed_terminals,
+            applying,
+            creating_default,
+            deferred_default,
+            defaults,
+            default_requests,
+            blocked,
+            quarantined,
+            fenced_closes,
+            adoptions,
+            chat_adoptions,
+            restorations,
+            restoration_requests,
+            discovery: _,
+            view_index: _,
+        } = self;
+        Self {
+            removals: removals.clone(),
+            snapshot_sequence: *snapshot_sequence,
+            terminal_source_workers: terminal_source_workers.clone(),
+            scope_absences: scope_absences.clone(),
+            view_sequences: view_sequences.clone(),
+            metadata_revisions: metadata_revisions.clone(),
+            closed: closed.clone(),
+            registry_unavailable: *registry_unavailable,
+            unintroduced_projects: *unintroduced_projects,
+            baseline: baseline.clone(),
+            initialized: initialized.clone(),
+            seeding: seeding.clone(),
+            seed_attempts: seed_attempts.clone(),
+            seed_failures: seed_failures.clone(),
+            pending: pending.clone(),
+            source_bases: source_bases.clone(),
+            requested_transfers: requested_transfers.clone(),
+            attached: attached.clone(),
+            retained: retained.clone(),
+            closed_chats: closed_chats.clone(),
+            observed_chats: observed_chats.clone(),
+            observed_terminals: observed_terminals.clone(),
+            applying: *applying,
+            creating_default: *creating_default,
+            deferred_default: deferred_default.clone(),
+            defaults: defaults.clone(),
+            default_requests: default_requests.clone(),
+            blocked: blocked.clone(),
+            quarantined: quarantined.clone(),
+            fenced_closes: fenced_closes.clone(),
+            adoptions: adoptions.clone(),
+            chat_adoptions: chat_adoptions.clone(),
+            restorations: restorations.clone(),
+            restoration_requests: restoration_requests.clone(),
+            ..Self::default()
+        }
     }
 
     pub(super) fn for_workspace(workspace: &WorkspaceState) -> Self {
@@ -1082,16 +1277,16 @@ impl Cagents {
             .iter()
             .flat_map(|channel| channel.cards.iter().copied())
             .collect::<HashSet<_>>();
-        let worktree_cards = self
-            .durable
-            .cards
-            .iter()
-            .filter(|card| !channel_cards.contains(&card.id))
-            .filter_map(|card| {
-                self.unchanneled_card_worktree_indexed(card, &topology.roots)
-                    .map(|path| (card, path))
-            })
-            .collect::<Vec<_>>();
+        let mut channeled = HashMap::with_capacity(channel_cards.len());
+        let mut worktree_cards = Vec::new();
+        for card in self.durable.cards.iter() {
+            if channel_cards.contains(&card.id) {
+                channeled.insert(card.id, card);
+            } else if let Some(path) = self.unchanneled_card_worktree_indexed(card, &topology.roots)
+            {
+                worktree_cards.push((card, path));
+            }
+        }
         let mut channels = HashSet::new();
         let mut scopes = self
             .durable
@@ -1130,6 +1325,7 @@ impl Cagents {
         ScopeDiscovery {
             scopes,
             worktree_cards,
+            channeled,
         }
     }
 
@@ -1161,6 +1357,7 @@ impl Cagents {
         let ScopeDiscovery {
             scopes,
             worktree_cards,
+            ..
         } = self.discover_view_scopes_with(topology);
         let worktree = worktree_cards
             .iter()
@@ -1231,12 +1428,19 @@ impl Cagents {
         }
     }
 
+    #[cfg(test)]
+    fn hold_reported_title(&self, scope: &Scope, pane: &mut Pane) {
+        if let Some(title) = self.held_reported_title(scope, pane.id) {
+            pane.title = title.to_owned();
+        }
+    }
+
     /// A reported title waiting for its deferred save is not published yet:
     /// the pane keeps the title this window last shared for it, so neither an
     /// edit nor a captured baseline carries the newer one before that save.
-    fn hold_reported_title(&self, scope: &Scope, pane: &mut Pane) {
-        if !self.reported_title_save.cards.contains(&pane.id) {
-            return;
+    fn held_reported_title(&self, scope: &Scope, card: CardId) -> Option<&str> {
+        if !self.reported_title_save.cards.contains(&card) {
+            return None;
         }
         // A pane moving to `scope` in this same save is still in its source's
         // baseline; a move publishes no title, so hold that one too.
@@ -1247,45 +1451,63 @@ impl Cagents {
             .iter()
             .filter(|(other, _)| *other != scope)
             .map(|(_, panes)| panes);
-        if let Some(shared) = in_scope
+        in_scope
             .chain(elsewhere)
             .flatten()
-            .find(|shared| shared.id == pane.id)
+            .find(|shared| shared.id == card)
+            .map(|shared| shared.title.as_str())
+    }
+
+    /// `card` as a pane of `scope`, or `None` if the scope publishes no pane
+    /// for it. `listed_pending` says whether a view lists its pane with a
+    /// terminal start pending.
+    fn local_pane<'a>(
+        &'a self,
+        scope: &'a Scope,
+        card: &'a CardState,
+        listed_pending: impl FnOnce(CardId) -> bool,
+    ) -> Option<LocalPane<'a>> {
+        let id = card.id;
+        if self.shared_views.retained.contains(&id)
+            || self.chat_is_unused_default(id)
+            || self.shared_views.defaults.contains_key(&id)
+            // What `Pane::from_card` publishes.
+            || !card.existence.is_open()
+            || card.kind.is_utility()
         {
-            pane.title.clone_from(&shared.title);
+            return None;
         }
+        if let Some(held) = self.unsaved_terminal_pane(scope, id) {
+            return Some(LocalPane::Held(held));
+        }
+        Some(LocalPane::Card {
+            card,
+            title: self
+                .held_reported_title(scope, id)
+                .unwrap_or(card.title.as_str()),
+            user_title: self.chrome_ui.user_titles.get(&id),
+            pending_terminal_start: matches!(card.kind, CardKind::Terminal(_))
+                && (self.durable.pending_terminal_creations.contains(&id) || listed_pending(id)),
+            scope: match scope {
+                Scope::Worktree { path, .. } => Some(path.as_path()),
+                Scope::Channel(_) => self.durable.card_scopes.get(&id).map(PathBuf::as_path),
+            },
+        })
     }
 
     fn local_view_panes(&self, scope: &Scope) -> Vec<Pane> {
         self.local_view_cards(scope)
             .into_iter()
             .filter_map(|id| {
-                if self.shared_views.retained.contains(&id)
-                    || self.chat_is_unused_default(id)
-                    || self.shared_views.defaults.contains_key(&id)
-                {
-                    return None;
-                }
-                let mut pane = Pane::from_card(
-                    self.card_state(id)?,
-                    self.durable.card_scopes.get(&id).cloned(),
-                )?;
-                pane.user_title = self.chrome_ui.user_titles.get(&id).cloned();
-                self.hold_reported_title(scope, &mut pane);
-                pane.pending_terminal_start = matches!(pane.kind, CardKind::Terminal(_))
-                    && (self.durable.pending_terminal_creations.contains(&id)
-                        || self
-                            .workspace_model
-                            .views
-                            .iter()
-                            .flat_map(|view| &view.panes)
-                            .any(|shared| shared.id == id && shared.pending_terminal_start));
-                if let Scope::Worktree { path, .. } = scope {
-                    pane.scope = Some(path.clone());
-                }
-                self.hold_unsaved_terminal_pane(scope, &mut pane);
-                Some(pane)
+                self.local_pane(scope, self.card_state(id)?, |id| {
+                    self.workspace_model
+                        .views
+                        .iter()
+                        .flat_map(|view| &view.panes)
+                        .any(|shared| shared.id == id && shared.pending_terminal_start)
+                })
             })
+            .map(|pane| pane.to_pane())
             .collect()
     }
 
@@ -1329,14 +1551,17 @@ impl Cagents {
         let mut phase = WorkspaceProjectionTiming::new(selected.is_none());
         let discovery = self.discover_view_scopes_with(topology);
         phase.mark("local_discover");
-        self.project_local_views(selected, discovery, phase)
+        self.project_local_views(selected, discovery, false, phase)
     }
 
     /// The local side of the `publishable` scopes among those discovered.
+    /// With `settle`, a seeded scope whose panes equal its baseline is left
+    /// out of `panes` and listed as settled instead.
     fn project_local_views<'a>(
         &'a self,
         selected: Option<&HashSet<Scope>>,
         discovery: ScopeDiscovery<'a>,
+        settle: bool,
         mut phase: WorkspaceProjectionTiming,
     ) -> LocalViews {
         #[cfg(test)]
@@ -1346,17 +1571,12 @@ impl Cagents {
         let ScopeDiscovery {
             scopes,
             worktree_cards,
+            channeled,
         } = discovery;
-        let cards = self
-            .durable
-            .cards
-            .iter()
-            .map(|card| (card.id, card))
-            .collect::<HashMap<_, _>>();
-        let mut by_path = HashMap::<&Path, Vec<CardId>>::new();
+        let mut by_path = HashMap::<&Path, Vec<&CardState>>::new();
         for (card, path) in worktree_cards {
             if shows_in_worktree(card) {
-                by_path.entry(path).or_default().push(card.id);
+                by_path.entry(path).or_default().push(card);
             }
         }
         let channel_cards = self
@@ -1368,8 +1588,8 @@ impl Cagents {
                 let members = channel
                     .cards
                     .iter()
-                    .copied()
-                    .filter(|id| cards.get(id).is_some_and(|card| card.existence.is_open()))
+                    .filter_map(|id| channeled.get(id).copied())
+                    .filter(|card| card.existence.is_open())
                     .collect::<Vec<_>>();
                 (channel.id, members)
             })
@@ -1416,39 +1636,41 @@ impl Cagents {
         phase.mark("local_members");
         let mut members = HashMap::with_capacity(scopes.len());
         let mut panes = HashMap::with_capacity(scopes.len());
+        let mut settled = HashSet::new();
         for scope in &scopes {
             let listed = local_cards(scope).unwrap_or_default();
-            let projected = listed
-                .iter()
-                .filter_map(|id| {
-                    if self.shared_views.retained.contains(id)
-                        || self.chat_is_unused_default(*id)
-                        || self.shared_views.defaults.contains_key(id)
-                    {
-                        return None;
-                    }
-                    let mut pane =
-                        Pane::from_card(cards.get(id)?, self.durable.card_scopes.get(id).cloned())?;
-                    pane.user_title = self.chrome_ui.user_titles.get(id).cloned();
-                    self.hold_reported_title(scope, &mut pane);
-                    pane.pending_terminal_start = matches!(pane.kind, CardKind::Terminal(_))
-                        && (self.durable.pending_terminal_creations.contains(id)
-                            || pending.contains(id));
-                    if let Scope::Worktree { path, .. } = scope {
-                        pane.scope = Some(path.clone());
-                    }
-                    self.hold_unsaved_terminal_pane(scope, &mut pane);
-                    Some(pane)
-                })
-                .collect();
-            members.insert(scope.clone(), listed.to_vec());
-            panes.insert(scope.clone(), projected);
+            let projected = || {
+                listed
+                    .iter()
+                    .filter_map(|card| self.local_pane(scope, card, |id| pending.contains(&id)))
+            };
+            members.insert(scope.clone(), listed.iter().map(|card| card.id).collect());
+            // An unseeded scope publishes its seed whatever its baseline.
+            let settles = settle
+                && self.shared_views.initialized.contains(scope)
+                && self
+                    .shared_views
+                    .baseline
+                    .get(scope)
+                    .is_some_and(|baseline| LocalPane::all_match(projected(), baseline));
+            if settles {
+                settled.insert(scope.clone());
+            } else {
+                panes.insert(
+                    scope.clone(),
+                    projected().map(|pane| pane.to_pane()).collect(),
+                );
+            }
         }
+        tracing::debug!(target: "cagents::workspace_pipeline", stage = "local_settled",
+            settled = settled.len(), projected = panes.len(),
+            "Compared the projected scopes with their baselines");
         phase.mark("local_panes");
         LocalViews {
             scopes,
             cards: members,
             panes,
+            settled,
         }
     }
 
@@ -1680,6 +1902,7 @@ impl Cagents {
                     scopes: scopes.to_vec(),
                     cards,
                     panes,
+                    settled: HashSet::new(),
                 }
             }
         }
@@ -2044,6 +2267,7 @@ impl Cagents {
             scopes,
             cards,
             mut panes,
+            mut settled,
         } = projected;
         // Ownership is global even when only one destination is published: a
         // transfer's source can be outside the projected scopes.
@@ -2053,11 +2277,49 @@ impl Cagents {
             .iter()
             .flat_map(|(scope, panes)| panes.iter().map(|pane| (pane.id, scope.clone())))
             .collect::<HashMap<_, _>>();
+        // A settled scope's panes are its baseline. It publishes nothing
+        // unless a transfer reads or writes that baseline: a pane in it that
+        // another baseline also lists, or a pane leaving it for another
+        // scope. Such a scope is published from its panes as any other.
+        if !settled.is_empty() {
+            let mut moving = HashSet::new();
+            let desired = panes.iter().map(|(scope, panes)| (scope, panes)).chain(
+                settled
+                    .iter()
+                    .map(|scope| (scope, &self.shared_views.baseline[scope])),
+            );
+            for (destination, desired) in desired {
+                for pane in desired {
+                    if let Some(source) = previous_owners
+                        .get(&pane.id)
+                        .filter(|source| *source != destination)
+                    {
+                        moving.insert(source.clone());
+                        moving.insert(destination.clone());
+                    }
+                }
+            }
+            for scope in moving {
+                if settled.remove(&scope) {
+                    #[cfg(test)]
+                    {
+                        self.shared_views.transfer_unsettled += 1;
+                    }
+                    panes.insert(scope.clone(), self.shared_views.baseline[&scope].clone());
+                }
+            }
+        }
+        #[cfg(test)]
+        {
+            self.shared_views.settled_publications += settled.len();
+        }
         phase.mark("publish_owners");
         // Only the projected scopes and the sources their panes may leave are
         // published, so only their canonical views are looked up: a complete
         // pass projects what the window shows, not every historical scope.
         let mut needed = scopes.iter().collect::<HashSet<_>>();
+        // A settled scope's panes are in its own baseline, so they name no
+        // other source.
         for pane in panes.values().flatten() {
             if let Some(source) = previous_owners.get(&pane.id) {
                 needed.insert(source);
@@ -2085,17 +2347,17 @@ impl Cagents {
                 }
             }
         } else {
-            for (index, view) in self.workspace_model.views.iter().enumerate() {
-                #[cfg(test)]
-                {
-                    self.shared_views.publisher_scope_comparisons += 1;
-                }
-                if needed.contains(&view.scope) {
+            let index = self
+                .shared_views
+                .view_index
+                .refresh(&self.workspace_model.views);
+            for scope in needed {
+                if let Some(&index) = index.get(scope) {
                     #[cfg(test)]
                     {
                         self.shared_views.publisher_index_entries += 1;
                     }
-                    view_indices.entry(view.scope.clone()).or_insert(index);
+                    view_indices.insert(scope.clone(), index);
                 }
             }
         }
@@ -2206,8 +2468,9 @@ impl Cagents {
             {
                 continue;
             }
+            let settled = settled.contains(&scope);
             let panes = panes.remove(&scope).unwrap_or_default();
-            if !self.shared_views.initialized.contains(&scope) {
+            if !settled && !self.shared_views.initialized.contains(&scope) {
                 if self.shared_views.seeding.insert(scope.clone()) {
                     // Only close IDs belonging to this host view. Other views'
                     // tombstones and utility panes are unrelated client state.
@@ -2260,7 +2523,11 @@ impl Cagents {
                 .get(&scope)
                 .map(|&index| self.workspace_model.views[index].revision)
                 .unwrap_or(0);
-            let changes = {
+            // A settled scope's panes equal its baseline: no change, and its
+            // baseline stays as it is.
+            let changes = if settled {
+                Vec::new()
+            } else {
                 let previous = self
                     .shared_views
                     .baseline
@@ -2350,7 +2617,9 @@ impl Cagents {
                     change,
                 });
             }
-            self.shared_views.baseline.insert(scope.clone(), panes);
+            if !settled {
+                self.shared_views.baseline.insert(scope.clone(), panes);
+            }
             let defaults = cards[&scope]
                 .iter()
                 .copied()
@@ -2396,12 +2665,13 @@ impl Cagents {
             // own seed/baseline and pending edits until their receipts arrive.
             let cards = self.local_view_cards(&scope);
             let panes = self.local_view_panes(&scope);
-            self.rebase_seeded_attachments(&scope, &panes);
+            self.rebase_seeded_panes(&scope, &panes);
             self.publish_projected_view_changes(
                 LocalViews {
                     scopes: vec![scope.clone()],
                     cards: HashMap::from([(scope.clone(), cards)]),
                     panes: HashMap::from([(scope.clone(), panes)]),
+                    settled: HashSet::new(),
                 },
                 ViewProjection::Selected(&[scope]),
             );
@@ -2409,11 +2679,19 @@ impl Cagents {
     }
 
     /// A seed's baseline is what this window saved, but the registry keeps the
-    /// panes it already holds. A terminal attached while the seed was in flight
-    /// has proved its same session under the running daemon, so that update is
-    /// based on the registry's record. Based on the saved one it is refused, and
-    /// the record then stays behind the attachment until another window writes.
-    fn rebase_seeded_attachments(&mut self, scope: &Scope, local: &[Pane]) {
+    /// panes it already holds. Two of this window's differences from such a
+    /// pane are based on the registry's record instead, so they are published:
+    ///
+    /// - A terminal attached while the seed was in flight has proved its same
+    ///   session under the running daemon. Based on the saved record the
+    ///   update is refused, and the record then stays behind the attachment
+    ///   until another window writes.
+    /// - A pane name the registry's pane lacks never reached it, as one given
+    ///   before the registry existed or whose publication failed: a person can
+    ///   change a pane's name but not remove it. Unpublished, the registry's
+    ///   pane differs from this window's on every start, which migrates the
+    ///   view again (#3032). A name the registry holds is newer and stays.
+    fn rebase_seeded_panes(&mut self, scope: &Scope, local: &[Pane]) {
         let Some(view) = self
             .workspace_model
             .views
@@ -2441,6 +2719,9 @@ impl Cagents {
                 seeded.kind = shared.kind.clone();
                 seeded.pending_terminal_start = shared.pending_terminal_start;
                 seeded.scope = shared.scope.clone();
+            }
+            if shared.user_title.is_none() && seeded.user_title == current.user_title {
+                seeded.user_title = None;
             }
         }
     }
@@ -3449,6 +3730,7 @@ impl Cagents {
             return Task::none();
         }
         let mut tasks = Vec::new();
+        let mut user_titles_changed = false;
         let mut retained_upgrades = Vec::new();
         let local_order = current.clone();
         let local_members = current.iter().copied().collect::<HashSet<_>>();
@@ -3616,6 +3898,8 @@ impl Cagents {
             }
             let keep_live = self.observe_terminal_save(pane);
             if !keep_live {
+                user_titles_changed |=
+                    self.chrome_ui.user_titles.get(&pane.id) != pane.user_title.as_ref();
                 match &pane.user_title {
                     Some(title) => {
                         // A user's name takes precedence over a reported title,
@@ -3909,6 +4193,12 @@ impl Cagents {
         }
         if !self.shared_views.applying {
             self.persist();
+        }
+        // Pane names live in the window's settings, not its workspace save.
+        // Unsaved, the next start reads the old names back, which no longer
+        // match the registry's, and migrates the view again (#3032).
+        if user_titles_changed {
+            tasks.push(self.save_settings_task(false));
         }
         Task::batch(tasks)
     }

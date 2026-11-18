@@ -2,7 +2,7 @@
 use super::super::{LocalHandle, QueueRefusal, Rejection, Update};
 pub(crate) use super::final_snapshot::{RetirementInspection, VerifiedRetirement};
 use super::journal::Journal;
-use super::journal::{ContinuityLoss, InputIdentity, InputReceipt, InputState};
+use super::journal::{ContinuityLoss, InputIdentity, InputReceipt, InputState, OutboxEntry};
 use super::{MAX_FRAME, deadline_io, final_snapshot, journal};
 use crate::{
     chat::{
@@ -811,6 +811,25 @@ impl RemoteActor {
             }
         }
         Ok(())
+    }
+    /// The helper's unacknowledged outcome page, then its resident state.
+    /// The helper confirms a conversation before it journals the outcomes
+    /// that follow, so the identity refreshed after the page is at least as
+    /// new as every outcome in it. The daemon requires that identity to be
+    /// durable before it settles a run from the page.
+    pub fn uncommitted_outcomes(&self) -> Result<Vec<OutboxEntry>, String> {
+        let page = self.call("outbox_unacked", Value::Null)?;
+        self.refresh_state()?;
+        Ok(page)
+    }
+    /// [`Self::uncommitted_outcomes`], bounded by `deadline`.
+    pub fn uncommitted_outcomes_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<Vec<OutboxEntry>, String> {
+        let page = self.call_until("outbox_unacked", Value::Null, deadline)?;
+        self.refresh_state_until(deadline)?;
+        Ok(page)
     }
     pub fn outcome_clock_until(&self, deadline: Instant) -> Result<(u64, u64), String> {
         if self.0.stop.load(Ordering::Acquire) {
@@ -1716,6 +1735,10 @@ impl RemoteActor {
         }
         if self.0.recovering_inputs.load(Ordering::Acquire) {
             return Err(RECONNECTING_INPUT.into());
+        }
+        #[cfg(debug_assertions)]
+        if let Some(outcome) = super::fixture_refusal::take() {
+            return Err(outcome.into());
         }
         let payload = serde_json::to_value(payload).map_err(|error| error.to_string())?;
         let bytes = serde_json::to_vec(&payload).map_err(|error| error.to_string())?;

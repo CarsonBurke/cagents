@@ -201,12 +201,10 @@ impl Handle {
             remote.wake_outcomes();
         }
     }
+    /// See [`RemoteActor::uncommitted_outcomes`].
     pub(crate) fn uncommitted_outcomes(&self) -> Result<Vec<OutboxEntry>, String> {
         match &self.0 {
-            Owner::Remote(remote) => {
-                remote.refresh_state()?;
-                remote.call("outbox_unacked", serde_json::Value::Null)
-            }
+            Owner::Remote(remote) => remote.uncommitted_outcomes(),
             _ => Err("This actor has no retained outcome outbox".into()),
         }
     }
@@ -219,14 +217,13 @@ impl Handle {
         };
         remote.outcome_clock_until(deadline)
     }
+    /// See [`RemoteActor::uncommitted_outcomes_until`].
     pub(crate) fn uncommitted_outcomes_until(
         &self,
         deadline: std::time::Instant,
     ) -> Result<Vec<OutboxEntry>, String> {
         match &self.0 {
-            Owner::Remote(remote) => {
-                remote.call_until("outbox_unacked", serde_json::Value::Null, deadline)
-            }
+            Owner::Remote(remote) => remote.uncommitted_outcomes_until(deadline),
             _ => Err("This actor has no retained outcome outbox".into()),
         }
     }
