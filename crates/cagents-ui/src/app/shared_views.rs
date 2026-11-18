@@ -4408,7 +4408,9 @@ impl Cagents {
         }
         self.lifecycle.remove(id);
         if self.workspace.card(id).is_some() {
-            let _ = self.workspace.remove_card(id);
+            if self.workspace.request_close(id).is_ok() {
+                let _ = self.workspace.commit_close(id);
+            }
         }
         if let Some(card) = self.card_state_mut(id) {
             card.existence = super::project_ui::removed_existence("pane closed in another client");
@@ -4486,7 +4488,9 @@ impl Cagents {
                 _ => {}
             }
             self.set_exposure(id, Exposure::Offscreen);
-            let _ = self.workspace.remove_card(id);
+            if self.workspace.request_close(id).is_ok() {
+                let _ = self.workspace.commit_close(id);
+            }
         }
         for (index, pane) in panes.iter().enumerate() {
             if self.workspace.card(pane.id).is_none() {

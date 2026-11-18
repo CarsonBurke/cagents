@@ -10073,9 +10073,8 @@ impl Cagents {
             self.queue_card_close(card, false);
             return None;
         }
-        let (_, reserved) = self.reserve_chat_removal(card)?;
-        let committed = self.commit_card_removal(card, replacement)?;
-        Some(Task::batch([reserved, committed]))
+        self.reserve_chat_removal(card)?;
+        self.commit_card_removal(card, replacement)
     }
 
     /// Opens the terminal that replaces a chat whose removal has committed.
@@ -10095,11 +10094,12 @@ impl Cagents {
 
     /// The workspace's reservation to remove `card`, taken now unless it is
     /// already held; a refusal is reported.
-    fn reserve_chat_removal(
-        &mut self,
-        card: CardId,
-    ) -> Option<(crate::workspace::FocusHandoff, Task<Message>)> {
-        self.reserve_removal(card)
+    fn reserve_chat_removal(&mut self, card: CardId) -> Option<crate::workspace::FocusHandoff> {
+        let handoff = match self.workspace.pending_close() {
+            Some(handoff) if handoff.unmounting == card => Ok(handoff),
+            _ => self.workspace.request_close(card),
+        };
+        handoff
             .inspect_err(|error| {
                 self.status = Some(TransientNotice::error(error.to_string()));
             })

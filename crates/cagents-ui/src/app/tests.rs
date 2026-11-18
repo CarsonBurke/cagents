@@ -11129,7 +11129,7 @@ pub(super) fn context_inspector_test_app(with_focused_card: bool) -> Cagents {
         close_commit_delivered: None,
         terminal_close_attempts: HashSet::new(),
         completed_release: None,
-        closing_out_of_sight: None,
+        hidden_closes: HashSet::new(),
         kept_panes: Vec::new(),
         terminal_close_generation: 0,
         closed_terminal_cards: HashSet::new(),

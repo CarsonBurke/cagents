@@ -5827,12 +5827,13 @@ pub struct Cagents {
     queued_card_closes: VecDeque<terminal_close::QueuedCardClose>,
     /// The ended pane whose terminal the daemon is being asked to release.
     completed_release: Option<CardId>,
-    /// The terminal pane taken out of the strip while the daemon is asked to
-    /// close its terminal. It comes back if the close doesn't complete.
-    closing_out_of_sight: Option<CardId>,
-    /// Panes whose reserved removal was given up, with the strip's change in
-    /// bringing them back, applied at the end of the update.
-    kept_panes: Vec<(CardId, crate::workspace::ViewportUpdate)>,
+    /// Terminal panes hidden from the strip while the daemon is asked to
+    /// close their terminals. Each comes back if its close doesn't complete.
+    /// The strip's own record is lost when it is rebuilt; this one is not.
+    hidden_closes: HashSet<CardId>,
+    /// The strip's change in bringing hidden panes back, applied at the end
+    /// of the update.
+    kept_panes: Vec<crate::workspace::ViewportUpdate>,
     close_queue_advancing: bool,
     /// The pending removal whose commit has been delivered, so anything still
     /// holding it is one of the closes the commit started.
@@ -5921,6 +5922,11 @@ impl Cagents {
     }
 
     fn focus_workspace_card(&mut self, id: CardId) -> Task<Message> {
+        // A pane hidden while it closes is gone as far as the reader knows;
+        // asking for it does nothing, as asking for any closed pane does.
+        if self.workspace.is_hidden(id) {
+            return Task::none();
+        }
         match self.workspace.focus(id) {
             Ok(update) => self.apply_viewport(update, true, DurableChange::None),
             Err(error) => {
@@ -8791,7 +8797,7 @@ impl Cagents {
         }
         let Some(card) = self
             .card_state(id)
-            .filter(|card| card.existence.is_open())
+            .filter(|card| card.existence.is_open() && !self.workspace.is_hidden(id))
             .cloned()
         else {
             return Task::none();
@@ -10335,7 +10341,8 @@ impl Cagents {
             && !self.focused_repository_is_saving()
             && let Some(backwards) = crate::tab_history::step_direction(&event)
         {
-            let available: Vec<_> = self.workspace.order().collect();
+            // A pane hidden while it closes is not a place to step to.
+            let available: Vec<_> = self.workspace.shown().collect();
             self.tab_history.retain(|id| {
                 self.durable
                     .cards
@@ -15943,7 +15950,7 @@ impl Application for Cagents {
             close_commit_delivered: None,
             terminal_close_attempts: HashSet::new(),
             completed_release: None,
-            closing_out_of_sight: None,
+            hidden_closes: HashSet::new(),
             kept_panes: Vec::new(),
             terminal_close_generation: 0,
             closed_terminal_cards: HashSet::new(),

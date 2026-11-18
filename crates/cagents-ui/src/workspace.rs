@@ -203,7 +203,7 @@ pub struct StripGeometry {
 
 impl StripGeometry {
     pub fn build(cards: &[WorkspaceCard], viewport_width: f32, config: WorkspaceConfig) -> Self {
-        Self::build_holding(cards, viewport_width, config, None, None)
+        Self::build_holding(cards, viewport_width, config, None, |_| false)
     }
 
     /// Builds the strip, keeping the panes in `held` filled and every other
@@ -212,17 +212,17 @@ impl StripGeometry {
     /// divider never makes a neighbour jump between its width and the
     /// viewport's halfway through the drag.
     ///
-    /// `hidden` keeps its slot, so every pane keeps its index, but takes no
-    /// width and no gap: the strip is laid out as if it were gone.
+    /// A `hidden` pane keeps its slot, so every pane keeps its index, but
+    /// takes no width and no gap: the strip is laid out as if it were gone.
     fn build_holding(
         cards: &[WorkspaceCard],
         viewport_width: f32,
         config: WorkspaceConfig,
         held: Option<&HashSet<CardId>>,
-        hidden: Option<CardId>,
+        hidden: impl Fn(CardId) -> bool,
     ) -> Self {
         let viewport_width = finite_nonnegative(viewport_width);
-        let shown = |index: usize| Some(cards[index].id) != hidden;
+        let shown = |index: usize| !hidden(cards[index].id);
         let count = (0..cards.len()).filter(|&index| shown(index)).count();
         let mut cursor = config.leading_padding;
         let mut geometry = Vec::with_capacity(cards.len());
@@ -794,10 +794,15 @@ impl ViewportPoint {
 struct PendingClose {
     id: CardId,
     handoff: FocusHandoff,
-    /// The pane had the keyboard, which goes back to it if it stays.
+}
+
+/// A pane taken out of the strip while whatever decides its removal runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HiddenCard {
+    /// The pane had the keyboard, which goes back to it if it returns.
     was_focused: bool,
     /// The pane given the keyboard in its place; while it still has it, the
-    /// keyboard comes back.
+    /// keyboard comes back with the pane.
     successor: Option<CardId>,
 }
 
@@ -838,6 +843,9 @@ pub struct Workspace {
     visibility_bands: Option<VisibilityBands>,
     pending_widget_focus: Option<CardId>,
     pending_close: Option<PendingClose>,
+    /// Panes out of sight: they keep their place in the order but take no
+    /// room, mount nothing and take no keyboard. See [`Self::hide_card`].
+    hidden: HashMap<CardId, HiddenCard>,
     resize_limits: Option<(CardId, WidthLimits)>,
     /// The panes a resize gesture keeps filled until it ends; see
     /// [`StripGeometry::build_holding`].
@@ -863,6 +871,7 @@ impl Workspace {
             visibility_bands: None,
             pending_widget_focus: None,
             pending_close: None,
+            hidden: HashMap::new(),
             resize_limits: None,
             held_fill: None,
             config,
@@ -884,10 +893,15 @@ impl Workspace {
         self.cards.iter().map(|card| card.id)
     }
 
-    /// The panes in sight, in order: every pane but one leaving the strip.
+    /// The panes in sight, in order: every pane but those hidden while they
+    /// close.
     pub fn shown(&self) -> impl Iterator<Item = CardId> + '_ {
-        let closing = self.closing();
-        self.order().filter(move |id| Some(*id) != closing)
+        self.order().filter(|id| !self.is_hidden(*id))
+    }
+
+    /// Whether `id` is out of sight while whatever decides its removal runs.
+    pub fn is_hidden(&self, id: CardId) -> bool {
+        self.hidden.contains_key(&id)
     }
 
     pub fn focused(&self) -> Option<CardId> {
@@ -1239,16 +1253,26 @@ impl Workspace {
         self.reorder(focused, destination)
     }
 
-    /// The index of the pane beside `index` in `direction`, passing over a
-    /// pane that is leaving, or `index` itself at an end of the strip.
+    /// The index of the pane beside `index` in `direction`, passing over
+    /// hidden panes, or `index` itself at an end of the strip.
     fn next_shown(&self, index: usize, direction: FocusDirection) -> usize {
-        let closing = self.closing();
-        let shown = |other: &usize| Some(self.cards[*other].id) != closing;
+        self.shown_beside(index, direction).unwrap_or(index)
+    }
+
+    fn shown_beside(&self, index: usize, direction: FocusDirection) -> Option<usize> {
+        let shown = |other: &usize| !self.is_hidden(self.cards[*other].id);
         match direction {
             FocusDirection::Left => (0..index).rev().find(shown),
             FocusDirection::Right => (index + 1..self.cards.len()).find(shown),
         }
-        .unwrap_or(index)
+    }
+
+    /// The shown pane that takes over from the pane at `index`: the one after
+    /// it, or else the one before.
+    fn shown_neighbour(&self, index: usize) -> Option<CardId> {
+        self.shown_beside(index, FocusDirection::Right)
+            .or_else(|| self.shown_beside(index, FocusDirection::Left))
+            .map(|other| self.cards[other].id)
     }
 
     pub fn focus(&mut self, id: CardId) -> Result<ViewportUpdate, WorkspaceError> {
@@ -1269,7 +1293,7 @@ impl Workspace {
         if self.index_of(id).is_none() {
             return Err(WorkspaceError::UnknownCard(id));
         }
-        if self.pending_close.is_some_and(|pending| pending.id == id) {
+        if self.pending_close.is_some_and(|pending| pending.id == id) || self.is_hidden(id) {
             return Err(WorkspaceError::CardClosing(id));
         }
 
@@ -1314,32 +1338,15 @@ impl Workspace {
         }
     }
 
-    /// Reserves `id`'s removal. The pane leaves the strip at once: its
-    /// neighbours close over its slot and the keyboard moves to the pane
-    /// `FocusHandoff` names, while whatever decides the removal runs.
-    /// [`Self::commit_close`] then removes it, or [`Self::cancel_close`] puts
-    /// it back where it was.
-    pub fn request_close(
-        &mut self,
-        id: CardId,
-    ) -> Result<(FocusHandoff, ViewportUpdate), WorkspaceError> {
+    pub fn request_close(&mut self, id: CardId) -> Result<FocusHandoff, WorkspaceError> {
         if self.pending_close.is_some() {
             return Err(WorkspaceError::CloseAlreadyPending);
         }
         let index = self.index_of(id).ok_or(WorkspaceError::UnknownCard(id))?;
         let target = if self.focused == Some(id) {
-            self.cards
-                .get(index + 1)
-                .or_else(|| {
-                    index
-                        .checked_sub(1)
-                        .and_then(|previous| self.cards.get(previous))
-                })
-                .filter(|card| {
-                    self.visibility(card.id)
-                        .is_some_and(VisibilityClass::is_mounted)
-                })
-                .map(|card| FocusTarget::Card(card.id))
+            self.shown_neighbour(index)
+                .filter(|next| self.visibility(*next).is_some_and(VisibilityClass::is_mounted))
+                .map(FocusTarget::Card)
                 .unwrap_or(FocusTarget::WorkspaceToolbar)
         } else {
             FocusTarget::Unchanged
@@ -1348,36 +1355,8 @@ impl Workspace {
             unmounting: id,
             target,
         };
-        let previous = self.presentation_geometry().clone();
-        let camera = self.camera;
-        let was_focused = self.focused == Some(id);
-        // The pane leaving keeps no keyboard: the pane taking over has it, or
-        // the neighbour the strip brings into view does once it is drawn.
-        let successor = match target {
-            FocusTarget::Card(next) => Some(next),
-            _ if was_focused => self
-                .cards
-                .get(index + 1)
-                .or_else(|| index.checked_sub(1).and_then(|i| self.cards.get(i)))
-                .map(|card| card.id),
-            _ => None,
-        };
-        self.pending_close = Some(PendingClose {
-            id,
-            handoff,
-            was_focused,
-            successor,
-        });
-        if let Some(next) = successor {
-            self.focused = Some(next);
-            self.pending_widget_focus = Some(next);
-        }
-        self.rebuild_geometry();
-        self.slide_from(previous, camera);
-        self.reveal_focused();
-        // Its slot may still meet the viewport; what is mounted changes anyway.
-        self.visibility_bands = None;
-        Ok((handoff, self.refresh_visibility(false)))
+        self.pending_close = Some(PendingClose { id, handoff });
+        Ok(handoff)
     }
 
     pub fn commit_close(&mut self, id: CardId) -> Result<ViewportUpdate, WorkspaceError> {
@@ -1394,10 +1373,10 @@ impl Workspace {
         let previous = self.presentation_geometry().clone();
         let index = self.index_of(id).ok_or(WorkspaceError::UnknownCard(id))?;
         let previous_camera = self.camera;
-        // Normally already out of the strip, so nothing moves here.
         self.cards.remove(index);
         self.rebuild_card_indices();
         self.pending_close = None;
+        self.hidden.remove(&id);
         self.visibility.remove(&id);
         if self.pending_widget_focus == Some(id) {
             self.pending_widget_focus = None;
@@ -1406,15 +1385,13 @@ impl Workspace {
             self.focused = match pending.handoff.target {
                 FocusTarget::Card(next) if self.index_of(next).is_some() => Some(next),
                 FocusTarget::Unchanged => self.focused,
-                _ => self
-                    .cards
-                    .get(index)
-                    .or_else(|| {
-                        index
-                            .checked_sub(1)
-                            .and_then(|previous| self.cards.get(previous))
-                    })
-                    .map(|card| card.id),
+                // The pane now at its index is the one after it; a hidden
+                // pane is passed over while any other is shown.
+                _ => (index..self.cards.len())
+                    .chain((0..index.min(self.cards.len())).rev())
+                    .find(|&other| !self.is_hidden(self.cards[other].id))
+                    .or_else(|| (!self.cards.is_empty()).then(|| index.min(self.cards.len() - 1)))
+                    .map(|other| self.cards[other].id),
             };
             if !matches!(pending.handoff.target, FocusTarget::Card(_)) {
                 self.pending_widget_focus = self.focused;
@@ -1472,9 +1449,7 @@ impl Workspace {
         self.camera = camera;
     }
 
-    /// Gives up `id`'s reserved removal: the pane comes back to its place, with
-    /// the keyboard if it had it and nothing has taken it since.
-    pub fn cancel_close(&mut self, id: CardId) -> Result<ViewportUpdate, WorkspaceError> {
+    pub fn cancel_close(&mut self, id: CardId) -> Result<(), WorkspaceError> {
         let pending = self.pending_close.ok_or(WorkspaceError::NoClosePending)?;
         if pending.id != id {
             return Err(WorkspaceError::WrongPendingClose {
@@ -1482,11 +1457,56 @@ impl Workspace {
                 received: id,
             });
         }
+        self.pending_close = None;
+        Ok(())
+    }
+
+    /// Takes `id` out of the strip while whatever decides its removal runs:
+    /// its neighbours close over its slot and the keyboard moves on to the
+    /// shown pane beside it, which the strip brings into view. The pane keeps
+    /// its place in the order. [`Self::show_card`] puts it back; removing it
+    /// still goes through [`Self::request_close`] and [`Self::commit_close`].
+    pub fn hide_card(&mut self, id: CardId) -> Result<ViewportUpdate, WorkspaceError> {
+        let index = self.index_of(id).ok_or(WorkspaceError::UnknownCard(id))?;
+        if self.is_hidden(id) {
+            return Ok(ViewportUpdate::unchanged());
+        }
+        let _ = self.finish_card_resize(id);
         let previous = self.presentation_geometry().clone();
         let camera = self.camera;
-        self.pending_close = None;
-        let untouched = self.focused == pending.successor.or(Some(id));
-        if pending.was_focused && untouched {
+        let was_focused = self.focused == Some(id);
+        let successor = was_focused.then(|| self.shown_neighbour(index)).flatten();
+        self.hidden.insert(
+            id,
+            HiddenCard {
+                was_focused,
+                successor,
+            },
+        );
+        if self.pending_widget_focus == Some(id) {
+            self.pending_widget_focus = None;
+        }
+        if let Some(next) = successor {
+            self.focused = Some(next);
+            self.pending_widget_focus = Some(next);
+        }
+        self.rebuild_geometry();
+        self.slide_from(previous, camera);
+        self.reveal_focused();
+        // Its slot may still meet the viewport; what is mounted changes anyway.
+        self.visibility_bands = None;
+        Ok(self.refresh_visibility(false))
+    }
+
+    /// Puts a hidden pane back where it was, with the keyboard if it had it
+    /// and nothing has taken it since. `None` when `id` is not hidden.
+    pub fn show_card(&mut self, id: CardId) -> Option<ViewportUpdate> {
+        let hidden = self.hidden.remove(&id)?;
+        self.index_of(id)?;
+        let previous = self.presentation_geometry().clone();
+        let camera = self.camera;
+        let untouched = self.focused == hidden.successor.or(Some(id));
+        if hidden.was_focused && untouched {
             self.focused = Some(id);
             self.pending_widget_focus = Some(id);
         }
@@ -1494,44 +1514,7 @@ impl Workspace {
         self.slide_from(previous, camera);
         self.reveal_focused();
         self.visibility_bands = None;
-        Ok(self.refresh_visibility(false))
-    }
-
-    /// Removes `id` from the strip whether or not another pane's removal is
-    /// reserved, for a pane already gone from the model, such as one closed in
-    /// another window. A reservation for another pane stays as it was.
-    pub fn remove_card(&mut self, id: CardId) -> Result<ViewportUpdate, WorkspaceError> {
-        self.index_of(id).ok_or(WorkspaceError::UnknownCard(id))?;
-        let other = self.pending_close.take().filter(|pending| pending.id != id);
-        // Without the other reservation in place the strip briefly lays that
-        // pane out again; it is hidden again before anything is drawn.
-        let result = self.request_close(id).and_then(|_| self.commit_close(id));
-        if let Some(other) = other {
-            self.pending_close = Some(other);
-            // The keyboard may have fallen to the pane already leaving; it goes
-            // on to that pane's own successor, or a neighbour still shown.
-            if self.focused == Some(other.id) {
-                let next = match other.handoff.target {
-                    FocusTarget::Card(next) if self.index_of(next).is_some() => Some(next),
-                    _ => self.index_of(other.id).and_then(|index| {
-                        self.cards
-                            .get(index + 1)
-                            .or_else(|| index.checked_sub(1).and_then(|i| self.cards.get(i)))
-                            .map(|card| card.id)
-                    }),
-                };
-                self.focused = next;
-                self.pending_widget_focus = next;
-            }
-            self.rebuild_geometry();
-        }
-        result.map(|update| {
-            let mut update = update;
-            let refreshed = self.refresh_visibility(false);
-            update.transitions.extend(refreshed.transitions);
-            update.offset_changed |= refreshed.offset_changed;
-            update
-        })
+        Some(self.refresh_visibility(false))
     }
 
     pub fn resize_viewport(&mut self, width: f32) -> ViewportUpdate {
@@ -1844,12 +1827,11 @@ impl Workspace {
             .offset()
             .clamp(0.0, geometry.max_offset(viewport_width));
         let bands = self.bands(geometry, target, offset, viewport_width);
-        let closing = self.closing();
         let mounted = bands
             .mounted()
             .filter_map(|index| {
                 let card = geometry.card_at(index)?;
-                if Some(card.id) == closing {
+                if self.is_hidden(card.id) {
                     return None;
                 }
                 let opening = self.opening.contains(&card.id);
@@ -1928,7 +1910,7 @@ impl Workspace {
             viewport_width,
             self.config,
             self.held_fill.as_ref(),
-            self.closing(),
+            |id| self.hidden.contains_key(&id),
         )
     }
 
@@ -1938,15 +1920,8 @@ impl Workspace {
             self.viewport_width,
             self.config,
             self.held_fill.as_ref(),
-            self.closing(),
+            |id| self.hidden.contains_key(&id),
         )
-    }
-
-    /// The pane whose removal is reserved. It has left the strip: it takes no
-    /// room and mounts nothing, though it keeps its place until the removal
-    /// commits, or comes back to it if the removal is given up.
-    fn closing(&self) -> Option<CardId> {
-        self.pending_close.map(|pending| pending.id)
     }
 
     fn rebuild_geometry(&mut self) {
@@ -2097,9 +2072,9 @@ impl Workspace {
         }
 
         let mut transitions = Vec::new();
-        let closing = self.closing();
+        let hidden = &self.hidden;
         self.visibility.retain(|id, class| {
-            let mounted = Some(*id) != closing
+            let mounted = !hidden.contains_key(id)
                 && self
                     .card_indices
                     .get(id)
@@ -2115,7 +2090,7 @@ impl Workspace {
         });
         for index in bands.mounted() {
             let id = self.geometry.cards[index].id;
-            if Some(id) == closing {
+            if self.is_hidden(id) {
                 continue;
             }
             let class = bands.class(index);
@@ -4238,7 +4213,7 @@ mod tests {
         assert_eq!(workspace.focused(), Some(ids[0]));
         workspace.focus_adjacent(FocusDirection::Right).unwrap();
         assert_eq!(workspace.focused(), Some(ids[1]));
-        let (handoff, _) = workspace.request_close(ids[1]).unwrap();
+        let handoff = workspace.request_close(ids[1]).unwrap();
         assert_eq!(handoff.target, FocusTarget::Card(ids[2]));
         assert!(workspace.card(ids[1]).is_some());
         workspace.commit_close(ids[1]).unwrap();
@@ -4250,7 +4225,7 @@ mod tests {
     fn closing_an_unfocused_card_does_not_steal_focus() {
         let mut workspace = workspace_with_widths(&[CardWidth::Fixed(300.0); 3], 700.0);
         let ids: Vec<_> = workspace.order().collect();
-        let (handoff, _) = workspace.request_close(ids[2]).unwrap();
+        let handoff = workspace.request_close(ids[2]).unwrap();
         assert_eq!(handoff.target, FocusTarget::Unchanged);
         assert_eq!(workspace.focused(), Some(ids[0]));
         workspace.commit_close(ids[2]).unwrap();
@@ -4258,20 +4233,26 @@ mod tests {
         workspace.check_invariants().unwrap();
     }
 
-    /// A reserved removal takes the pane out of the strip at once: it takes no
-    /// room, mounts nothing and gives up the keyboard, while it keeps its
-    /// place. Giving the removal up puts it back as it was.
+    /// Hiding takes a pane out of the strip at once: it takes no room, mounts
+    /// nothing and gives up the keyboard, while it keeps its place and
+    /// reserves nothing. Showing it puts it back as it was.
     #[test]
-    fn a_pane_being_removed_leaves_at_once_and_comes_back_if_it_stays() {
+    fn a_hidden_pane_leaves_at_once_and_comes_back_as_it_was() {
         let mut workspace = workspace_with_widths(&[CardWidth::Fixed(300.0); 3], 1000.0);
         let ids: Vec<_> = workspace.order().collect();
         workspace.focus(ids[1]).unwrap();
         let before = workspace.geometry().clone();
         let neighbour_start = before.card(ids[2]).unwrap().start;
 
-        let (handoff, update) = workspace.request_close(ids[1]).unwrap();
-        assert_eq!(handoff.target, FocusTarget::Card(ids[2]));
+        let update = workspace.hide_card(ids[1]).unwrap();
+        assert!(workspace.is_hidden(ids[1]));
+        assert!(workspace.pending_close().is_none(), "nothing is reserved");
         assert_eq!(workspace.focused(), Some(ids[2]), "the keyboard moves on");
+        assert_eq!(
+            workspace.take_widget_focus_request(),
+            Some(ids[2]),
+            "to the pane the model says has it"
+        );
         let hidden = workspace.geometry().card(ids[1]).unwrap();
         assert_eq!(hidden.width(), 0.0, "it takes no room");
         assert_eq!(
@@ -4303,8 +4284,17 @@ mod tests {
             ids,
             "it keeps its place"
         );
+        assert_eq!(
+            workspace.shown().collect::<Vec<_>>(),
+            vec![ids[0], ids[2]]
+        );
+        assert!(matches!(
+            workspace.focus(ids[1]),
+            Err(WorkspaceError::CardClosing(_))
+        ));
 
-        workspace.cancel_close(ids[1]).unwrap();
+        workspace.show_card(ids[1]).unwrap();
+        assert!(!workspace.is_hidden(ids[1]));
         assert_eq!(workspace.focused(), Some(ids[1]), "the keyboard comes back");
         assert_eq!(workspace.geometry(), &before);
         assert_eq!(
@@ -4316,15 +4306,46 @@ mod tests {
                 .visibility(ids[1])
                 .is_some_and(VisibilityClass::is_mounted)
         );
+        assert!(workspace.show_card(ids[1]).is_none(), "shown once");
         workspace.check_invariants().unwrap();
     }
 
-    /// Moving along the strip passes over a pane that is leaving.
+    /// A hidden pane reserves nothing: another pane's removal is requested
+    /// and committed around it, and the hidden pane's own removal commits
+    /// without bringing it back.
     #[test]
-    fn keyboard_navigation_passes_over_a_pane_that_is_leaving() {
+    fn a_hidden_pane_leaves_other_removals_free() {
         let mut workspace = workspace_with_widths(&[CardWidth::Fixed(300.0); 3], 1000.0);
         let ids: Vec<_> = workspace.order().collect();
+        workspace.focus(ids[1]).unwrap();
+        workspace.hide_card(ids[1]).unwrap();
+        assert_eq!(workspace.focused(), Some(ids[2]));
+
+        let handoff = workspace.request_close(ids[2]).unwrap();
+        assert_eq!(
+            handoff.target,
+            FocusTarget::Card(ids[0]),
+            "the keyboard passes over the hidden pane"
+        );
+        workspace.commit_close(ids[2]).unwrap();
+        assert_eq!(workspace.focused(), Some(ids[0]), "never the hidden pane");
+        assert!(workspace.is_hidden(ids[1]));
+        assert_eq!(workspace.geometry().card(ids[1]).unwrap().width(), 0.0);
+
         workspace.request_close(ids[1]).unwrap();
+        workspace.commit_close(ids[1]).unwrap();
+        assert!(!workspace.is_hidden(ids[1]));
+        assert_eq!(workspace.order().collect::<Vec<_>>(), vec![ids[0]]);
+        assert_eq!(workspace.focused(), Some(ids[0]));
+        workspace.check_invariants().unwrap();
+    }
+
+    /// Moving along the strip passes over a hidden pane.
+    #[test]
+    fn keyboard_navigation_passes_over_a_hidden_pane() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fixed(300.0); 3], 1000.0);
+        let ids: Vec<_> = workspace.order().collect();
+        workspace.hide_card(ids[1]).unwrap();
         assert_eq!(workspace.focused(), Some(ids[0]));
         workspace.focus_adjacent(FocusDirection::Right).unwrap();
         assert_eq!(workspace.focused(), Some(ids[2]));
@@ -4338,36 +4359,43 @@ mod tests {
         workspace.check_invariants().unwrap();
     }
 
-    /// A pane the reader moved to while another was leaving keeps the
+    /// A pane the reader moved to while another was hidden keeps the
     /// keyboard when the other comes back.
     #[test]
     fn a_pane_that_comes_back_leaves_the_keyboard_where_the_reader_put_it() {
         let mut workspace = workspace_with_widths(&[CardWidth::Fixed(300.0); 3], 1000.0);
         let ids: Vec<_> = workspace.order().collect();
         workspace.focus(ids[1]).unwrap();
-        workspace.request_close(ids[1]).unwrap();
+        workspace.hide_card(ids[1]).unwrap();
         workspace.focus(ids[0]).unwrap();
-        workspace.cancel_close(ids[1]).unwrap();
+        workspace.show_card(ids[1]).unwrap();
         assert_eq!(workspace.focused(), Some(ids[0]));
         workspace.check_invariants().unwrap();
     }
 
-    /// A pane closed elsewhere is removed even while another pane's removal
-    /// is reserved, which stays reserved and out of sight.
+    /// The keyboard leaving a hidden pane goes to the neighbour the strip
+    /// brings into view, even when that neighbour was not drawn, so the
+    /// focus the model records and the focus the window is asked for agree.
     #[test]
-    fn a_pane_removed_beside_a_reserved_removal_leaves_that_one_reserved() {
-        let mut workspace = workspace_with_widths(&[CardWidth::Fixed(300.0); 3], 1000.0);
+    fn a_hidden_pane_hands_the_keyboard_to_a_neighbour_brought_into_view() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fixed(900.0); 3], 1000.0);
         let ids: Vec<_> = workspace.order().collect();
         workspace.focus(ids[1]).unwrap();
-        workspace.request_close(ids[1]).unwrap();
-        workspace.focus(ids[2]).unwrap();
-        workspace.remove_card(ids[2]).unwrap();
-        assert!(workspace.card(ids[2]).is_none());
-        assert_eq!(workspace.pending_close().unwrap().unmounting, ids[1]);
-        assert_eq!(workspace.geometry().card(ids[1]).unwrap().width(), 0.0);
-        assert_eq!(workspace.focused(), Some(ids[0]), "never the pane leaving");
-        workspace.commit_close(ids[1]).unwrap();
-        assert_eq!(workspace.order().collect::<Vec<_>>(), vec![ids[0]]);
+        for _ in 0..200 {
+            workspace.tick(Duration::from_millis(16));
+        }
+        assert_ne!(workspace.visibility(ids[2]), Some(VisibilityClass::Visible));
+        workspace.hide_card(ids[1]).unwrap();
+        assert_eq!(workspace.focused(), Some(ids[2]));
+        for _ in 0..200 {
+            workspace.tick(Duration::from_millis(16));
+        }
+        assert!(
+            workspace
+                .visibility(ids[2])
+                .is_some_and(VisibilityClass::is_mounted)
+        );
+        assert_eq!(workspace.take_widget_focus_request(), Some(ids[2]));
         workspace.check_invariants().unwrap();
     }
 

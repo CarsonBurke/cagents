@@ -1278,6 +1278,7 @@ impl Cagents {
         ));
         self.workspace = Self::rebuild_workspace(&scoped);
         self.workspace.resize_viewport(width);
+        self.rehide_closing_panes();
         // Focus selects the initial position only on the first visit. Returning
         // to a strip restores its actual offset, even if focus is offscreen.
         let offset = offset.unwrap_or_else(|| self.workspace.camera().target());
@@ -1518,6 +1519,7 @@ impl Cagents {
         let width = self.workspace.viewport_width();
         self.workspace = Self::rebuild_workspace(&home);
         self.workspace.resize_viewport(width);
+        self.rehide_closing_panes();
         if scope_removed {
             Arc::make_mut(&mut self.durable).focused = self.workspace.focused();
             self.persist();
