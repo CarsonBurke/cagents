@@ -255,6 +255,31 @@ fn a_fresh_conversation_sends_and_reopens_while_recovery_holds_retained_owners()
             },
         );
     }
+    // A terminal that opens no saved conversation starts beside them.
+    let mut shell = original.clone();
+    shell.id = TerminalId::new();
+    assert!(matches!(
+        process_request(
+            &host,
+            user,
+            ClientRequest::Spawn {
+                session: shell.clone(),
+                options: TerminalSpawnOptions::default(),
+            },
+        )
+        .unwrap()
+        .0,
+        ServerResponse::Spawned { .. }
+    ));
+    process_request(
+        &host,
+        user,
+        ClientRequest::CloseTerminalChecked {
+            terminal_id: shell.id,
+            allow_active: true,
+        },
+    )
+    .unwrap();
     // An unstarted draft reusing the checkpointed allocation is no fresh start.
     let mut reused = claude(&root, None);
     reused.id = codex.source.id;
@@ -477,6 +502,11 @@ fn a_terminal_launch_names_the_conversation_its_provider_opens() {
             Selection::New(Provider::Claude, ID.into()),
         ),
         ("/usr/bin/claude", vec!["--continue"], Selection::Unknown),
+        (
+            "/usr/bin/claude",
+            vec!["--from-pr", "12"],
+            Selection::Unknown,
+        ),
         ("/usr/bin/claude", vec!["--resume"], Selection::Unknown),
         (
             "/usr/bin/claude",

@@ -4596,11 +4596,15 @@ fn start_terminal_view_owned_reserved(
         }
         return Ok((descriptor, handle));
     }
-    let recovery = shared
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .startup_recovery()
-        .map(str::to_owned);
+    let recovery = {
+        let state = shared.lock().unwrap_or_else(|p| p.into_inner());
+        // A terminal admitted as independent of recovery's originals starts
+        // beside them, as a fresh conversation does.
+        state
+            .startup_recovery()
+            .filter(|_| !state.recovery_independence.contains(session.id))
+            .map(str::to_owned)
+    };
     if let Some(message) = recovery {
         return Err(ProtocolError::new(
             ProtocolErrorCode::TerminalUnavailable,

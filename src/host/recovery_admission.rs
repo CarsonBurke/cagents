@@ -547,7 +547,9 @@ enum Selection {
 }
 
 /// Reads every argument, not only an interactive launch's: a provider's
-/// subcommands, such as `codex exec resume`, resume conversations too.
+/// subcommands, such as `codex exec resume`, resume conversations too. It
+/// reads the launches cagents builds, which run the provider directly; a
+/// shell command line is the person's own, as anything typed into one is.
 fn selection(launch: &crate::model::LaunchRecipe) -> Selection {
     let Some((provider, arguments)) = Provider::launched(launch) else {
         return Selection::Nothing;
@@ -562,7 +564,8 @@ fn selection(launch: &crate::model::LaunchRecipe) -> Selection {
             });
         let latest = match provider {
             Provider::Codex => flag == "--last",
-            _ => matches!(flag, "--continue" | "-c"),
+            // A pull request's linked session is one the provider picks too.
+            _ => matches!(flag, "--continue" | "-c" | "--from-pr"),
         };
         if latest {
             return Selection::Unknown;
