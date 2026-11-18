@@ -7943,13 +7943,13 @@ impl Cagents {
         if !chat::is_account_recovery(&source, &replacement) {
             return Task::none();
         }
-        // A refused earlier attempt no longer describes this one, which may
-        // take as long to answer.
+        // What answered an earlier send, such as a refused switch, no longer
+        // describes this attempt, which may take as long to answer.
         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card)
             && runtime
                 .error
                 .as_deref()
-                .is_some_and(chat::failure::is_account_switch_refusal)
+                .is_some_and(chat::failure::answers_one_send)
         {
             runtime.error = None;
         }
@@ -12763,15 +12763,16 @@ impl Cagents {
                         let previous_limit = runtime.failure_ui.limit_occurrence;
                         let rehydrating = runtime.presentation_evicted;
                         runtime.refresh();
-                        // The daemon reports an exit that happened while it
-                        // was busy only once it is free, after its refusal.
-                        // Sending again no longer applies: the provider's own
-                        // report and the way back to it stand instead.
+                        // An exit can be reported after what answered the
+                        // last send, as the daemon reports one that happened
+                        // while it was busy only once it is free. Sending
+                        // again no longer applies: the provider's own report
+                        // and the way back to it stand instead.
                         if runtime.snapshot.exited
                             && runtime
                                 .error
                                 .as_deref()
-                                .is_some_and(chat::failure::is_account_switch_refusal)
+                                .is_some_and(chat::failure::answers_one_send)
                         {
                             runtime.error = None;
                         }
@@ -19729,7 +19730,7 @@ pub(in crate::app) mod tests {
             assert_eq!(runtime.session, source);
             assert_eq!(runtime.error.as_deref(), Some(notice));
             assert!(!notice.contains("busy"));
-            assert!(chat::failure::is_account_switch_refusal(notice));
+            assert!(chat::failure::answers_one_send(notice));
             assert_eq!(runtime.reported_errors().next(), None);
             assert_eq!(runtime.composer.text().trim(), "Keep this message");
         }
@@ -24575,6 +24576,52 @@ pub(in crate::app) mod tests {
         let id = runtime.pending.as_ref().expect("a command is pending").id;
         let target = runtime.target;
         let _ = app.update(Message::ChatUi(Action::CommandFinished(target, id, result)));
+    }
+
+    /// A send the conversation declined without harm is told in the
+    /// transcript, and the message stays to send again, but the conversation
+    /// does not read as failed. One the conversation can no longer take does.
+    #[test]
+    fn a_declined_send_is_a_notice_unless_the_conversation_cannot_go_on() {
+        use chat::failure::delivery;
+        for (outcome, conversation_error) in [
+            (delivery::UNCONFIRMED_INPUT, false),
+            (delivery::UNACKNOWLEDGED_INPUT, false),
+            (delivery::CROWDED_INPUT, false),
+            (delivery::RECONNECTING_INPUT, false),
+            (delivery::OVERSIZED_INPUT, false),
+            (delivery::HANDOVER_INPUT, false),
+            (delivery::UNAVAILABLE_INPUT, true),
+            (delivery::DISCONTINUOUS_INPUT, true),
+            (delivery::STOPPED_INPUT, true),
+        ] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat(&mut app, Some(KNOWN_THREAD));
+            let target = chat_runtime(&app, card).target;
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .replace_draft(text_editor::Content::with_text("Keep this message"));
+            drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send))));
+            settle(&mut app, card, Err(outcome.into()));
+            let runtime = chat_runtime(&app, card);
+            assert!(
+                runtime.failures.iter().any(|note| note.text == outcome),
+                "{outcome}: {:?}",
+                runtime.failures
+            );
+            assert_eq!(runtime.composer.text().trim(), "Keep this message");
+            assert_eq!(
+                runtime.reported_errors().next().is_some(),
+                conversation_error,
+                "{outcome}"
+            );
+            assert_eq!(
+                runtime.conversation_status(false).1 == "Error",
+                conversation_error,
+                "{outcome}: {:?}",
+                runtime.conversation_status(false)
+            );
+        }
     }
 
     /// A restored conversation, begun but never named by its provider, whose
