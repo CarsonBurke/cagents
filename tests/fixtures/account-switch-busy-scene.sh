@@ -160,6 +160,11 @@ if [ "${VARIANT:-}" = diverged ]; then
     "$ne" drive key Return >/dev/null
     sleep 5
     shot refused
+    # Open the report's details, which carry the daemon's own reason.
+    at=$(locate 'Details')
+    [ -n "$at" ] || { echo 'Could not locate the report details.' >&2; exit 1; }
+    "$ne" drive click "$at" >/dev/null
+    shot refused-details
     converge
     composer
     "$ne" drive key Return >/dev/null
