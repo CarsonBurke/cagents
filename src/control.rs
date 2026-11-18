@@ -41,6 +41,8 @@ pub use automations::AutomationCommand;
 #[cfg(all(test, feature = "host"))]
 mod daemon_stop_tests;
 mod sessions;
+#[cfg(test)]
+mod startup_route;
 mod terminal_list;
 #[cfg(test)]
 mod terminal_start_authority_tests;
@@ -8171,6 +8173,10 @@ mod tests {
         let client = ControlClient::from_stream(client_stream).unwrap();
         let server_stream = server.join().unwrap();
         assert!(!client.peer_closed(), "a quiet daemon keeps it open");
+        // Shut the socket itself down: a test process forking concurrently
+        // can briefly hold a duplicate of the descriptor, which would keep a
+        // bare drop from closing the connection.
+        server_stream.shutdown(std::net::Shutdown::Both).unwrap();
         drop(server_stream);
         assert!(client.peer_closed());
     }

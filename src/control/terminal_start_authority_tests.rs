@@ -31,6 +31,7 @@ enum Business {
     List,
 }
 impl Business {
+    const ALL: [Self; 4] = [Self::Spawn, Self::Write, Self::Close, Self::List];
     fn name(self) -> &'static str {
         match self {
             Self::Spawn => "spawn",
@@ -161,8 +162,8 @@ impl Peer {
                     assert_eq!(request.proof.as_ref(), Some(&proof()));
                     break (peer, request);
                 }
-                // Let the causal predecessor finish its valid readiness probe
-                // before driving the actual terminal operation.
+                // A connection that only handshakes is a separate readiness
+                // probe. Diagnose it only after the actual terminal operation.
                 readiness += 1;
                 assert!(readiness <= 1, "no repeated readiness or fallback");
             };
@@ -307,12 +308,7 @@ fn local(role: &str) {
     let no_start = role == "user-no-start";
     let id = TerminalId::new();
     let mut routing = Vec::new();
-    for business in [
-        Business::Spawn,
-        Business::Write,
-        Business::Close,
-        Business::List,
-    ] {
+    for business in Business::ALL {
         let mutation = !matches!(business, Business::List);
         for refuse_auth in if scoped && mutation {
             vec![false, true]
@@ -342,6 +338,15 @@ fn local(role: &str) {
             routing.push((business, refuse_auth, staged.get(), readiness, raw));
         }
     }
+    // Readiness hands its connection to the request, so each route shows in
+    // how its command reports the daemon once it is gone.
+    for business in Business::ALL {
+        let mut args = arguments(business, id);
+        if no_start {
+            args.insert(1, "--no-start".into());
+        }
+        startup_route::run_absent(args);
+    }
     // Reach every real command and both scoped refusal boundaries first;
     // only then diagnose the predecessor's startup/staged-owner behavior.
     for (business, refused_auth, staged, readiness, raw) in routing {
@@ -352,9 +357,8 @@ fn local(role: &str) {
             "{business:?} auth_refused={refused_auth}: scoped mutation bypasses staged owner"
         );
         assert_eq!(
-            readiness,
-            usize::from(!scoped_mutation && !no_start),
-            "{business:?}: scoped mutation must not recover/start before authentication"
+            readiness, 0,
+            "{business:?}: readiness hands its connection to the request rather than handshaking twice"
         );
         assert_eq!(
             raw,
@@ -518,6 +522,18 @@ fn child(selector: &str, role: &str, remote_verb: Option<Business>) {
         assert!(outputs(&stdout).is_empty());
     } else {
         let scoped = !role.starts_with("user");
+        // A scoped mutation must not recover/start before authentication.
+        let routes = Business::ALL.map(|business| {
+            startup_route::Route::of(
+                scoped && !matches!(business, Business::List),
+                role == "user-no-start",
+            )
+        });
+        startup_route::assert_absent_routes(&stderr, &routes);
+        let errors = errors
+            .into_iter()
+            .filter(|error| error["error"]["kind"] == "protocol")
+            .collect::<Vec<_>>();
         assert_eq!(errors.len(), if scoped { 6 } else { 0 });
         for error in errors {
             assert_eq!(error["ok"], false);
