@@ -1126,7 +1126,7 @@ fn preview_hide_and_subagent_switch_release_owners_and_fence_late_attempts() {
     let bytes = preview_png();
     let budget = images::Budget::new(1024, 4);
     let runtime = app.chat_runtime_mut(target).unwrap();
-    preview_items(runtime, &[parent.clone()]);
+    preview_items(runtime, std::slice::from_ref(&parent));
     let parent_attempt = runtime.cache[&parent.id].image_attempt;
     finish_preview(
         runtime,
@@ -1196,13 +1196,16 @@ fn explicit_preview_pressure_can_retire_automatic_owners_in_other_panes() {
     let bytes = preview_png();
     let budget = images::Budget::new(1024, 4);
     let runtime = app.chat_runtime_mut(owner_target).unwrap();
-    preview_items(runtime, &[old.clone()]);
+    preview_items(runtime, std::slice::from_ref(&old));
     finish_preview(
         runtime,
         &old,
         images::bounded_handle(bytes.clone(), &budget),
     );
-    preview_items(app.chat_runtime_mut(target).unwrap(), &[requested.clone()]);
+    preview_items(
+        app.chat_runtime_mut(target).unwrap(),
+        std::slice::from_ref(&requested),
+    );
     drop(app.handle_chat_ui(Action::LoadImage(target, requested.id.clone())));
     let attempt = chat_runtime(&app, requested_card).cache[&requested.id].image_attempt;
     drop(app.handle_chat_ui(Action::ImageLoaded(

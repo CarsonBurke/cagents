@@ -298,7 +298,7 @@ fn launch_model(arguments: &[String]) -> Option<String> {
 /// launched `--resume` ID. Rewrites the same flags `arguments()` validates
 /// so a checkpointed launch stays self-consistent. Forgery checks stay in
 /// `arguments()` — only call this with the live provider's own identity.
-pub fn align_resume_identity(arguments: &mut Vec<String>, id: &str) -> Result<(), String> {
+pub fn align_resume_identity(arguments: &mut [String], id: &str) -> Result<(), String> {
     let mut index = 0;
     while index < arguments.len() {
         let (flag, inline) = match arguments[index].split_once('=') {

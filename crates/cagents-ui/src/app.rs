@@ -10641,9 +10641,7 @@ impl Cagents {
         {
             return None;
         }
-        let Some(card) = self.workspace.focused() else {
-            return None;
-        };
+        let card = self.workspace.focused()?;
         if !self.chat_input_drawn(card) || !self.card_holds_keyboard(card) {
             return None;
         }

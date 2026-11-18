@@ -743,12 +743,8 @@ pub(super) fn complete(
         return None;
     }
     let order: Vec<_> = interested.into_iter().map(|item| item.id.clone()).collect();
-    let Some(priority) = order.iter().position(|id| *id == item.id) else {
-        return None;
-    };
-    let Some(cached) = runtime.presentation_cache().get(&item.id) else {
-        return None;
-    };
+    let priority = order.iter().position(|id| *id == item.id)?;
+    let cached = runtime.presentation_cache().get(&item.id)?;
     if cached.image_attempt != attempt
         || cached
             .image_source

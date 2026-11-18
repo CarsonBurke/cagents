@@ -1676,7 +1676,7 @@ mod tests {
                 "diff must clear highlights before any base event"
             );
             let (_, statuses) = ui.update(
-                &[release.clone()],
+                std::slice::from_ref(&release),
                 mouse::Cursor::Available(Point::new(20.0, 15.0)),
                 &mut renderer,
                 &mut clipboard::Null,

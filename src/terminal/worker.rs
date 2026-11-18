@@ -88,8 +88,8 @@ const READER_SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 /// cancellation between bounded channel waits.
 const READER_SEND_POLL: Duration = Duration::from_millis(10);
 /// How long a synchronized update (DEC mode 2026) may withhold output from the
-/// published grid. A program brackets a frame it has to emit in several writes
-/// - clearing the screen, then repainting it - so that no half-drawn frame is
+/// published grid. A program brackets a frame it has to emit in several writes -
+/// clearing the screen, then repainting it - so that no half-drawn frame is
 /// shown; reads split that frame arbitrarily, and publishing between them
 /// flashes an empty screen. Ghostty bounds the hold the same way, so a program
 /// that dies or never ends the update cannot freeze its card.

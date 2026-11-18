@@ -3159,7 +3159,7 @@ mod tests {
         let mut element = Element::new(Selection {
             catalog: None,
             bookmark: None,
-            content: content,
+            content,
             context: None,
             click_clock: next_click_time,
         });

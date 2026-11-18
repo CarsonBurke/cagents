@@ -471,7 +471,7 @@ mod tests {
         let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
         assert_eq!(pending(&registry.db, 100).unwrap(), [entry.clone()]);
         let tx = registry.db.transaction().unwrap();
-        acknowledge(&tx, &[entry.clone()]).unwrap();
+        acknowledge(&tx, std::slice::from_ref(&entry)).unwrap();
         drop(tx);
         assert_eq!(
             pending(&registry.db, 100).unwrap(),

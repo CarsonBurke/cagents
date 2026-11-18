@@ -1278,9 +1278,7 @@ impl State {
             return None;
         }
         if let Action::Received { sequence, result } = action {
-            let Some((expected, pending)) = self.pending else {
-                return None;
-            };
+            let (expected, pending) = self.pending?;
             if expected != sequence {
                 return None;
             }
@@ -1613,9 +1611,7 @@ impl State {
             );
         }
         if let Action::Confirm(generation) = action {
-            let Some(confirmation) = self.confirmation.take() else {
-                return None;
-            };
+            let confirmation = self.confirmation.take()?;
             if confirmation.generation != generation {
                 self.confirmation = Some(confirmation);
                 return None;

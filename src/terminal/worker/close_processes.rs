@@ -614,7 +614,7 @@ mod tests {
                 .collect(),
             root_kill_receipt: Arc::new(Mutex::new(false)),
         };
-        assert!(!frozen(&[helper.clone()]).has_jobs());
+        assert!(!frozen(std::slice::from_ref(&helper)).has_jobs());
         assert!(frozen(&[helper.clone(), job.clone()]).has_jobs());
         let background = CloseProcess {
             parent: root.pid,

@@ -2734,7 +2734,7 @@ fn checkpoint_wal(connection: &Connection) {
         ))
     });
     match outcome {
-        Ok((busy, frames, checkpointed)) if busy == 0 => {
+        Ok((0, frames, checkpointed)) => {
             tracing::debug!(frames, checkpointed, "checkpointed the session WAL");
         }
         Ok((_, frames, checkpointed)) => {

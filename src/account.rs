@@ -1637,7 +1637,7 @@ mod tests {
     fn only_an_account_wide_window_makes_the_account_limited() {
         let scoped = window("fable", WindowKind::Scoped, 1.0, None);
         assert_eq!(
-            status_for(&[scoped.clone()], false, false),
+            status_for(std::slice::from_ref(&scoped), false, false),
             UsageStatus::Warning
         );
         let weekly = window("weekly", WindowKind::Weekly, 1.02, None);
@@ -1646,9 +1646,12 @@ mod tests {
             UsageStatus::Limited
         );
         let calm = window("session", WindowKind::Session, 0.3, None);
-        assert_eq!(status_for(&[calm.clone()], false, false), UsageStatus::Ok);
         assert_eq!(
-            status_for(&[calm.clone()], false, true),
+            status_for(std::slice::from_ref(&calm), false, false),
+            UsageStatus::Ok
+        );
+        assert_eq!(
+            status_for(std::slice::from_ref(&calm), false, true),
             UsageStatus::Warning
         );
         assert_eq!(status_for(&[calm], true, false), UsageStatus::Limited);

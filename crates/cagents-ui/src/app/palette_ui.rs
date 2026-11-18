@@ -838,9 +838,7 @@ impl Cagents {
                             && primary == Some(card.id)))
                     .then_some(channel.title.as_str())
                 });
-                let checkout = pane_channels
-                    .get(&card.id)
-                    .is_none()
+                let checkout = (!pane_channels.contains_key(&card.id))
                     .then(|| self.unchanneled_card_worktree_indexed(card, &roots))
                     .flatten();
                 let place = pane_channels

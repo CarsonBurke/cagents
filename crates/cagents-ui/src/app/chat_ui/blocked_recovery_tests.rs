@@ -1226,7 +1226,7 @@ fn a_pending_paste_disables_fresh_in_place() {
     ));
     drop(app.handle_chat_ui(Action::StartFresh(card)));
     assert!(
-        app.chat_ui.phases.get(&card).is_none(),
+        !app.chat_ui.phases.contains_key(&card),
         "nothing closes mid-paste"
     );
 }

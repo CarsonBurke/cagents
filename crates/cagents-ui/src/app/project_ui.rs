@@ -4661,7 +4661,8 @@ pub(in crate::app) mod tests {
         let mut missing = model;
         missing.projects[1].repository = root.join("missing.git");
         assert!(
-            shared_project_session_scope(&[folder.clone()], &folder, &missing.projects).is_err()
+            shared_project_session_scope(std::slice::from_ref(&folder), &folder, &missing.projects)
+                .is_err()
         );
     }
 

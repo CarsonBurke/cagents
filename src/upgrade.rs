@@ -2554,7 +2554,9 @@ pub(crate) mod handoff {
                         .proves(source, current, serving)
                 );
                 assert!(!store.path.with_file_name(RECOVERED_FILE).exists());
-                store.record_recovered(&[entry.clone()]).unwrap();
+                store
+                    .record_recovered(std::slice::from_ref(&entry))
+                    .unwrap();
                 let path = store.path.with_file_name(RECOVERED_FILE);
                 let before = std::fs::read(&path).unwrap();
                 let evidence = store.recovered_chats().unwrap();

@@ -1509,7 +1509,9 @@ mod tests {
             panic!("{:?}", receipt.state);
         };
         assert!(reason.len() <= 4096);
-        journal.retire_acknowledged_inputs(&[lost.clone()]).unwrap();
+        journal
+            .retire_acknowledged_inputs(std::slice::from_ref(&lost))
+            .unwrap();
         assert!(
             journal.admit(&lost).is_err(),
             "a retired refusal is never admitted"

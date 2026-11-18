@@ -764,9 +764,7 @@ impl State {
     }
     #[cfg(test)]
     pub(super) fn growing_canonical_for_test(&self, item: &Arc<chat::Item>) -> Option<usize> {
-        let Some(entry) = self.entries.get(&item.id) else {
-            return None;
-        };
+        let entry = self.entries.get(&item.id)?;
         let latest = entry.shared.latest.lock().unwrap();
         if entry.running
             || !latest.growing

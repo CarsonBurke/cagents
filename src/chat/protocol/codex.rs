@@ -158,7 +158,7 @@ fn remote_socket(address: &str) -> Result<Option<PathBuf>, String> {
 /// Record a provider-confirmed rotation in the recipe: rewrites the `resume`
 /// thread ID `create()` validates so a checkpointed launch stays
 /// self-consistent. Only call with the live provider's own identity.
-pub fn align_resume_identity(arguments: &mut Vec<String>, id: &str) -> Result<(), String> {
+pub fn align_resume_identity(arguments: &mut [String], id: &str) -> Result<(), String> {
     let mut index = 0;
     while index < arguments.len() {
         if arguments[index] == "resume" {

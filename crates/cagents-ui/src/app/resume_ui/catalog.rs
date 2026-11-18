@@ -780,7 +780,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            names(&[seed.clone()])[0].get(id).map(String::as_str),
+            names(std::slice::from_ref(&seed))[0]
+                .get(id)
+                .map(String::as_str),
             Some("Renamed")
         );
         for title in [
@@ -794,7 +796,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                names(&[seed.clone()])[0].get(id).cloned(),
+                names(std::slice::from_ref(&seed))[0].get(id).cloned(),
                 crate::workspace_model::channel_title(&title)
             );
         }

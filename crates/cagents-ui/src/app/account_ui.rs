@@ -5838,8 +5838,7 @@ impl Cagents {
             .filter(|recipe| {
                 recipe
                     .environment
-                    .get(account::home_variable(provider).unwrap_or_default())
-                    .is_some()
+                    .contains_key(account::home_variable(provider).unwrap_or_default())
                     && account_of_recipe(&self.account_ui.accounts, provider, recipe)
                         .is_some_and(|account| &account.id == id)
             })

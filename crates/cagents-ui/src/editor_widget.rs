@@ -1709,9 +1709,7 @@ where
                 }
                 search = start + text[start..].chars().next().map_or(1, char::len_utf8);
             }
-            let Some(span) = span else {
-                return None;
-            };
+            let span = span?;
             let (start, end) = (excerpt.position(span.start), excerpt.position(span.end));
             Some(if caret_at < anchor_at {
                 Cursor {

@@ -1882,7 +1882,7 @@ mod tests {
         let original = terminal();
         let expected = census(&original);
         assert!(matches!(
-            compare(&expected, &proof(), &[original.clone()], &[]),
+            compare(&expected, &proof(), std::slice::from_ref(&original), &[]),
             Outcome::Usable { .. }
         ));
         for actual in [
@@ -1983,7 +1983,7 @@ mod tests {
         expected.terminals.clear();
         expected.chats.push(original.clone());
         assert!(matches!(
-            compare(&expected, &proof(), &[], &[original.clone()]),
+            compare(&expected, &proof(), &[], std::slice::from_ref(&original)),
             Outcome::Usable { .. }
         ));
         let mut changed_owner = proof();

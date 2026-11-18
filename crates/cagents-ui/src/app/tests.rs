@@ -178,7 +178,7 @@ fn archived_worktree_pr_requires_exact_branch_and_head() {
     }))
     .unwrap();
     assert_eq!(
-        matching_attached_pr(&record, &head, &[pr.clone()]).map(|pr| pr.number),
+        matching_attached_pr(&record, &head, std::slice::from_ref(&pr)).map(|pr| pr.number),
         Some(7)
     );
     let mut duplicate = pr.clone();
@@ -191,7 +191,7 @@ fn archived_worktree_pr_requires_exact_branch_and_head() {
                 ..record.clone()
             },
             &head,
-            &[pr.clone()]
+            std::slice::from_ref(&pr)
         )
         .is_none()
     );
@@ -202,7 +202,7 @@ fn archived_worktree_pr_requires_exact_branch_and_head() {
                 ..record.clone()
             },
             &head,
-            &[pr.clone()]
+            std::slice::from_ref(&pr)
         )
         .is_none()
     );
@@ -259,7 +259,7 @@ fn attached_pr_overrides_reused_branch_without_hiding_unpushed_open_work() {
     apply_attached_worktree_prs(
         &mut project,
         &[(record.clone(), None)],
-        &[open.clone()],
+        std::slice::from_ref(&open),
         &[merged],
     );
     assert_eq!(
@@ -369,12 +369,12 @@ fn pull_request_head_prefers_the_context_worktree() {
     );
 
     assert_eq!(
-        pull_request_head(&[project.clone()], project_id, None),
+        pull_request_head(std::slice::from_ref(&project), project_id, None),
         "",
         "a project-level create must not adopt the first worktree's branch"
     );
     assert_eq!(
-        pull_request_head(&[project.clone()], project_id, Some(&selected)),
+        pull_request_head(std::slice::from_ref(&project), project_id, Some(&selected)),
         "selected"
     );
     assert_eq!(

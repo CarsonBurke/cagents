@@ -2061,7 +2061,7 @@ mod tests {
         );
         record_live_panes(
             &mut inspection,
-            &[source.clone()],
+            std::slice::from_ref(&source),
             &[terminal],
             &proof,
             false,

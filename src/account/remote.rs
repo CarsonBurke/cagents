@@ -823,7 +823,7 @@ mod tests {
         let host = crate::host::AccountReservation::test_host();
         let reservation = crate::host::AccountReservation::test_install(
             &host,
-            &[account.clone()],
+            std::slice::from_ref(&account),
             store.clone(),
             &homes,
         )
@@ -916,7 +916,7 @@ mod tests {
         let account = Account::linked(Provider::Codex, linked_key, linked.clone());
         let reservation = crate::host::AccountReservation::test_install(
             &host,
-            &[account.clone()],
+            std::slice::from_ref(&account),
             store.clone(),
             &homes,
         )

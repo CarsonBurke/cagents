@@ -1918,8 +1918,8 @@ fn a_commit_date_git_cannot_normalise_costs_only_its_own_row() {
 
 /// The two ways `git restore --worktree` *refuses* a request — a pathspec that
 /// matches nothing, a path that is unmerged — are both settled before it
-/// writes anything, so both really have changed nothing at all and both exit
-/// 1. Reporting them as "may have applied part of a multi-path change" asked
+/// writes anything, so both really have changed nothing at all and both exit 1.
+/// Reporting them as "may have applied part of a multi-path change" asked
 /// the user to reconcile a destructive operation that never happened.
 ///
 /// This is a claim about a refusal and not about `restore` as a whole:
