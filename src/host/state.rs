@@ -5732,7 +5732,11 @@ fn commit_redraw(
 }
 
 #[cfg(test)]
-fn record_event(host: &Weak<HostLock>, terminal_id: TerminalId, event: TerminalEvent) {
+pub(in crate::host) fn record_event(
+    host: &Weak<HostLock>,
+    terminal_id: TerminalId,
+    event: TerminalEvent,
+) {
     record_event_from(host, terminal_id, event, None);
 }
 fn record_event_from(
