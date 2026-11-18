@@ -538,7 +538,15 @@ fn composer_placeholder(mode: Option<PromptMode>, busy: bool) -> &'static str {
 /// allows, and `enter_sends` decides which chord the first of them answers to,
 /// so the tooltip names the key the composer is actually bound to rather than
 /// a fixed one.
-fn submit_control(mode: PromptMode, slot: usize, enter_sends: bool) -> (Icon, String) {
+/// A submit control's icon and its name, which is also its tooltip. The name
+/// ends with the chord that presses it, or with `unsendable`, why it can't be
+/// pressed in a refused conversation, where no chord sends either.
+fn submit_control(
+    mode: PromptMode,
+    slot: usize,
+    enter_sends: bool,
+    unsendable: Option<blocked_recovery::Unsendable>,
+) -> (Icon, String) {
     let primary = if enter_sends { "Enter" } else { "Ctrl+Enter" };
     let (name, verb, chord) = match (mode, slot) {
         (PromptMode::Send, _) => (Icon::Send, "Send message", primary),
@@ -547,7 +555,8 @@ fn submit_control(mode: PromptMode, slot: usize, enter_sends: bool) -> (Icon, St
         (PromptMode::Queue, 0) => (Icon::Alarm, "Queue for the next turn", primary),
         (PromptMode::Queue, _) => (Icon::Alarm, "Queue for the next turn", "Ctrl+Shift+Enter"),
     };
-    (name, format!("{verb} — {chord}"))
+    let tail = unsendable.map_or(chord, |unsendable| unsendable.reason);
+    (name, format!("{verb} — {tail}"))
 }
 /// The submit mode a composer key press asks for, or `None` when the press is
 /// ordinary editing.
@@ -3668,7 +3677,14 @@ impl Runtime {
         // the moment the preference changed. The steering and queueing modes
         // still say so, because there the mode is not what a reader expects
         // Enter to do.
-        let placeholder = if selected.is_some() {
+        // A refused conversation keeps its draft but sends nothing; the field
+        // says so, rather than inviting a message that has nowhere to go.
+        let unsendable = self
+            .start_blocked
+            .map(|reopen| reopen.unsendable(fresh_available));
+        let placeholder = if let Some(unsendable) = unsendable {
+            unsendable.placeholder
+        } else if selected.is_some() {
             "Message main agent"
         } else {
             composer_placeholder(modes.first().copied(), self.turn_running())
@@ -3679,7 +3695,7 @@ impl Runtime {
         // inserting a newline until another pointer event redraws the pane.
         // A first message still on its way keeps the binding too: Enter then
         // sends nothing, rather than breaking the line of the next draft.
-        let key_submit = if (available || self.queued.is_some()) && !self.start_blocked.is_some() {
+        let key_submit = if (available || self.queued.is_some()) && self.start_blocked.is_none() {
             (modes.first().copied(), modes.get(1).copied())
         } else {
             (None, None)
@@ -3729,8 +3745,10 @@ impl Runtime {
                 && !self.is_draft());
         let editor = crate::ui_controls::field::editor("Message", &self.composer)
             .id(card_control_id(target.card, "chat-composer"))
-            // Nothing can be typed while the conversation changes hands.
-            .placeholder(if read_only { "" } else { placeholder })
+            // Nothing can be typed while the conversation changes hands. A
+            // refused conversation's box, read-only or not, says why it
+            // sends nothing.
+            .placeholder(if transitioning { "" } else { placeholder })
             .size(design::TEXT_PROSE)
             .height(Length::Shrink)
             .max_height(composer_ceiling)
@@ -3863,7 +3881,7 @@ impl Runtime {
                             PromptMode::Steer if !self.turn_running() => PromptMode::Send,
                             mode => mode,
                         };
-                        let (name, tooltip) = submit_control(shown, slot, enter_sends);
+                        let (name, tooltip) = submit_control(shown, slot, enter_sends, unsendable);
                         crate::ui_controls::icon_button(name, tooltip)
                             .id(card_control_id(target.card, &format!("chat-submit-{slot}")))
                             .selected(slot == 0)

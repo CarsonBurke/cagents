@@ -10223,7 +10223,7 @@ fn submit_tooltips_name_the_chord_the_preference_bound() {
         (PromptMode::Steer, 1, true, "Ctrl+Shift+Enter"),
         (PromptMode::Queue, 1, false, "Ctrl+Shift+Enter"),
     ] {
-        let (_, label) = submit_control(mode, slot, enter_sends);
+        let (_, label) = submit_control(mode, slot, enter_sends, None);
         assert!(
             label.ends_with(chord),
             "{mode:?} in slot {slot} is bound to {chord} but reads {label:?}"

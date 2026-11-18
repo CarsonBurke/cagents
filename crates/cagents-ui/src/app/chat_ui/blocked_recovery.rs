@@ -24,6 +24,30 @@ pub(super) const UNNAMED_AGENT_TERMINAL: &str =
 pub(super) const UNNAMED_AGENT_UNSENT: &str = "Closing also discards your unsent message:";
 pub(super) const UNNAMED_AGENT_UNSENT_ATTACHMENTS: &str =
     "Closing also discards your unsent message and its attachments.";
+pub(super) const UNSENDABLE_UNTIL_RESTART: Unsendable = Unsendable {
+    placeholder: "Messages can be sent once this conversation reopens",
+    reason: "available once this conversation reopens",
+};
+pub(super) const UNSENDABLE_UNTIL_REOPENED: Unsendable = Unsendable {
+    placeholder: "Reopen this conversation to send a message",
+    reason: "reopen this conversation first",
+};
+pub(super) const UNSENDABLE_UNTIL_FRESH: Unsendable = Unsendable {
+    placeholder: "Start a new conversation to send a message",
+    reason: "start a new conversation first",
+};
+pub(super) const UNSENDABLE: Unsendable = Unsendable {
+    placeholder: "This conversation can't take new messages",
+    reason: "this conversation can't take new messages",
+};
+
+/// Why a refused conversation's composer sends nothing: in its empty field,
+/// and after the name of its disabled Send control.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Unsendable {
+    pub(super) placeholder: &'static str,
+    pub(super) reason: &'static str,
+}
 pub(super) const CLOSE_GUIDANCE: &str = "Details say why. Closing this tab discards any unsent message; the conversation itself isn't deleted.";
 pub(in crate::app) const UPDATE_HEADLINE: &str =
     "This conversation hasn't reopened since the update.";
@@ -111,6 +135,22 @@ impl Reopen {
             (Self::Unproven, false) => CLOSE_GUIDANCE.to_owned(),
             (Self::AfterRestart, true) => [RESTART_GUIDANCE, RESTART_FRESH_TRADEOFF].join(" "),
             (Self::AfterRestart, false) => [RESTART_GUIDANCE, RESTART_CLOSE_TRADEOFF].join(" "),
+        }
+    }
+
+    /// Why the composer of a conversation refused this way sends nothing.
+    /// `fresh`: the card offers Start a new conversation, which takes the
+    /// draft along.
+    pub(super) fn unsendable(self, fresh: bool) -> Unsendable {
+        match (self, fresh) {
+            // Both come back by themselves: after a restart, or once the
+            // update's restore finishes.
+            (Self::AfterRestart | Self::UpdateRecovery, _) => UNSENDABLE_UNTIL_RESTART,
+            (Self::UpdateStopped, _) => UNSENDABLE_UNTIL_REOPENED,
+            (Self::Unproven, true) => UNSENDABLE_UNTIL_FRESH,
+            // Its pane shows no message box, only why it can't reopen and
+            // Close; this names the case should a draft ever be drawn.
+            (Self::Unproven, false) | (Self::UnnamedAgent, _) => UNSENDABLE,
         }
     }
 
