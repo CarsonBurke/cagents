@@ -3629,6 +3629,81 @@ fn a_pull_request_fetch_writes_only_its_private_refs_and_proves_the_head() {
     );
 }
 
+/// Reviewing a pull request must not refresh the user's own view of the
+/// remote. Given a command-line refspec, Git also applies the remote's
+/// configured fetch mapping to what it transferred, which would advance a
+/// stale `origin/main` and change its ahead/behind counts and the expectation
+/// an implicit `--force-with-lease` relies on.
+#[test]
+fn a_pull_request_fetch_leaves_a_stale_tracking_ref_where_the_user_left_it() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let root = publish_main(&fixture);
+    fixture.git_in_work(&["fetch", "--quiet", "origin"]);
+    let tracking_before = fixture.text(&["rev-parse", "refs/remotes/origin/main"]);
+    assert_eq!(tracking_before, root.as_str());
+    let remote_refs = || fixture.text(&["for-each-ref", "refs/remotes/"]);
+    let remote_refs_before = remote_refs();
+
+    // Someone else advances the base and opens a pull request from a second
+    // clone, so this worktree's `origin/main` is now stale.
+    let other = fixture.root.path().join("other");
+    fixture.run(
+        fixture.root.path(),
+        &[
+            "clone",
+            "--quiet",
+            fixture.origin().to_str().unwrap(),
+            "other",
+        ],
+    );
+    fixture.run(
+        &other,
+        &["commit", "--quiet", "--allow-empty", "-m", "base moves"],
+    );
+    fixture.run(&other, &["push", "--quiet", "origin", "main"]);
+    let base_tip = Oid::parse(
+        String::from_utf8(fixture.run(&other, &["rev-parse", "HEAD"]))
+            .unwrap()
+            .trim(),
+    )
+    .unwrap();
+    fixture.run(
+        &other,
+        &["commit", "--quiet", "--allow-empty", "-m", "feature"],
+    );
+    fixture.run(
+        &other,
+        &["push", "--quiet", "origin", "HEAD:refs/pull/7/head"],
+    );
+    let feature = Oid::parse(
+        String::from_utf8(fixture.run(&other, &["rev-parse", "HEAD"]))
+            .unwrap()
+            .trim(),
+    )
+    .unwrap();
+
+    let range = fixture
+        .service()
+        .fetch_pull_request_range(
+            &fixture.work(),
+            "origin",
+            7,
+            &ValidatedBranchName::parse("main").unwrap(),
+            &feature,
+            &CancellationToken::new(),
+        )
+        .expect("fetch pull request range");
+    assert_eq!(range.base_tip, base_tip);
+    assert_eq!(
+        fixture.text(&["rev-parse", "refs/remotes/origin/main"]),
+        tracking_before,
+        "the review fetch advanced the user's remote-tracking ref"
+    );
+    assert_eq!(remote_refs(), remote_refs_before);
+}
+
 /// Multi-valued URLs use Git's first destination, so forge association cannot
 /// identify a different repository than `git fetch <remote>` reads (#828).
 #[test]

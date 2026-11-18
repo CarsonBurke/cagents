@@ -4238,7 +4238,13 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     ///
     /// The fetch names exactly two refspecs and forces only the private refs,
     /// with `--no-tags`, no submodule recursion and no `FETCH_HEAD` write, so
-    /// no branch, tag or remote-tracking ref of the user's can move. Fetches
+    /// no branch, tag or remote-tracking ref of the user's can move. The empty
+    /// `--refmap=` is what keeps the remote-tracking refs still: given a
+    /// command-line refspec, Git otherwise also applies the remote's
+    /// configured fetch mapping to every ref it transferred, so fetching the
+    /// base branch would advance `refs/remotes/<remote>/<base>` as well, and
+    /// with it the ahead/behind counts and the expectation an implicit
+    /// `--force-with-lease` checks. Fetches
     /// for one repository are serialized process-wide: two review panes
     /// opening at once would otherwise race Git's own ref lock and one of
     /// them would fail for no reason the user can see.
@@ -4277,6 +4283,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     "--no-tags",
                     "--no-recurse-submodules",
                     "--no-write-fetch-head",
+                    "--refmap=",
                     "--end-of-options",
                     remote,
                     &refspec,
@@ -12800,12 +12807,18 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     let _remote =
                         self.checked_remote(&journal.request.repository, remote, cancellation)?;
                     ValidatedBranchName::parse(branch)?;
+                    // `--refmap=`: the refspec names the one cache this
+                    // creation reads, and the remote's configured mapping
+                    // must not also rewrite whatever other refs it routes the
+                    // fetched branch to.
                     let mut fetch = self.git_mutation(
                         &journal.request.repository,
                         [
                             "fetch",
                             "--no-tags",
                             "--no-recurse-submodules",
+                            "--refmap=",
+                            "--end-of-options",
                             remote.as_str(),
                             &format!("+refs/heads/{branch}:{reference}"),
                         ],
@@ -14040,6 +14053,38 @@ mod worktree_journal_tests {
         assert_eq!(
             fixture.git(&["rev-parse", "topic"]),
             remote.git(&["rev-parse", "topic"])
+        );
+    }
+
+    /// The refresh names the one tracking ref the creation reads. A remote
+    /// whose configuration routes its branches to more than one place must not
+    /// have those other refs rewritten by a fetch the user never ran.
+    #[test]
+    fn remote_branch_refresh_writes_only_the_tracking_ref_it_names() {
+        let mut fixture = Fixture::new();
+        let remote = Fixture::new();
+        remote.git(&["branch", "topic"]);
+        fixture.add_remote("origin", &remote);
+        fixture.git(&[
+            "config",
+            "--add",
+            "remote.origin.fetch",
+            "+refs/heads/*:refs/remotes/mirror/*",
+        ]);
+        fixture.resolve(fixture.input("origin/topic"));
+        let report = fixture.run(&CancellationToken::new());
+        assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+        assert_eq!(
+            fixture.git(&["rev-parse", "refs/remotes/origin/topic"]),
+            remote.git(&["rev-parse", "topic"])
+        );
+        assert_eq!(
+            fixture.git(&[
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/remotes/mirror/"
+            ]),
+            ""
         );
     }
 
