@@ -1392,7 +1392,19 @@ fn navigation_input(
             } else if y < 0.0 && scroll.at_bottom() && before.is_none_or(|old| top >= old) {
                 Some(view::Page::Newer)
             } else {
-                None
+                // A wheel within reach of a loaded edge is a reader heading
+                // there: the page they are heading for is fetched ahead of
+                // them. Elsewhere a notch is only reading, and asks nothing
+                // of the model.
+                before.and_then(|old| {
+                    if top < old && scroll.prefetch_earlier() {
+                        Some(view::Page::Earlier)
+                    } else if top > old && scroll.prefetch_later() {
+                        Some(view::Page::Newer)
+                    } else {
+                        None
+                    }
+                })
             }
         }
         Some(_) => None,

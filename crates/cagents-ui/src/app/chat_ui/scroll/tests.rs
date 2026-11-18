@@ -3469,6 +3469,34 @@ fn wheel_navigation_respects_direction_and_nested_capture() {
     assert!(navigation_input(Some(10.0), 10.0, top, Some(0.0), false).is_none());
 }
 
+/// A wheel heading for a loaded edge asks for its page a couple of screens
+/// ahead of it, so the page is there when the reader is; reading elsewhere
+/// asks for nothing (#3102).
+#[test]
+fn wheel_toward_a_loaded_edge_fetches_ahead_of_the_reader() {
+    let near_top = Scroll::new(600.0, 10_000.0, 800.0);
+    assert!(!near_top.at_top() && near_top.prefetch_earlier());
+    assert_eq!(
+        navigation_input(Some(660.0), 600.0, near_top, Some(1.0), false),
+        Some(view::Page::Earlier)
+    );
+    // Wheeling away from that edge is reading.
+    assert_eq!(
+        navigation_input(Some(540.0), 600.0, near_top, Some(-1.0), false),
+        None
+    );
+    let middle = Scroll::new(4_600.0, 10_000.0, 800.0);
+    assert_eq!(
+        navigation_input(Some(4_660.0), 4_600.0, middle, Some(1.0), false),
+        None
+    );
+    let near_bottom = Scroll::new(8_600.0, 10_000.0, 800.0);
+    assert_eq!(
+        navigation_input(Some(8_540.0), 8_600.0, near_bottom, Some(-1.0), false),
+        Some(view::Page::Newer)
+    );
+}
+
 #[test]
 fn fitting_geometry_keeps_wheel_direction_without_inventing_input() {
     let fitting = Scroll::new(0.0, 200.0, 400.0);
