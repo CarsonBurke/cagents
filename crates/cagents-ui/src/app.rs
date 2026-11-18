@@ -19726,7 +19726,10 @@ fn open_terminal(
     let recovery_lease = recovered.recovery_lease;
     let session = recovered.session;
     // A daemon the recovery already proved ready isn't proven again; the
-    // worker's own connection is the attachment's.
+    // worker's own connection is the attachment's. One that died since is
+    // therefore not started again here: its attach fails, and only a
+    // launch with no proof to keep would have gone ahead on a new daemon,
+    // which the pane's Retry still does.
     let socket = recovered.socket;
     let spawned = matches!(&mode, TerminalStartMode::Spawn(_));
     let wake = move |wake: crate::terminal::TerminalWake| {

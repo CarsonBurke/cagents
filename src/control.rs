@@ -1114,6 +1114,31 @@ impl ControlClient {
         &self.proof
     }
 
+    /// Whether the daemon has closed this connection, as a daemon replaced
+    /// since the handshake has. Asks nothing of the daemon and never blocks:
+    /// a pending notification or nothing to read both leave it open.
+    pub fn peer_closed(&self) -> bool {
+        let mut byte = 0_u8;
+        // SAFETY: the descriptor belongs to this live stream, and the one-byte
+        // buffer is valid for the call. MSG_PEEK leaves any byte queued.
+        let read = unsafe {
+            libc::recv(
+                self.stream.as_raw_fd(),
+                (&mut byte as *mut u8).cast(),
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        match read {
+            0 => true,
+            read if read > 0 => false,
+            _ => !matches!(
+                io::Error::last_os_error().kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+            ),
+        }
+    }
+
     pub(crate) fn protocol(&self) -> u16 {
         self.protocol
     }
@@ -8125,6 +8150,29 @@ mod tests {
                 "{arguments:?}: {error}"
             );
         }
+    }
+
+    /// A connection kept across a wait reads as closed once its daemon is
+    /// gone, without asking it anything.
+    #[test]
+    fn peer_closed_tells_a_replaced_daemon_from_a_quiet_one() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let proof = proof("session", "boot", "incarnation");
+        let server_proof = proof.clone();
+        let server = thread::spawn(move || {
+            let connect: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            write_frame(
+                &mut server_stream,
+                &connected_envelope(connect.request_id, server_proof.clone(), server_proof),
+            )
+            .unwrap();
+            server_stream
+        });
+        let client = ControlClient::from_stream(client_stream).unwrap();
+        let server_stream = server.join().unwrap();
+        assert!(!client.peer_closed(), "a quiet daemon keeps it open");
+        drop(server_stream);
+        assert!(client.peer_closed());
     }
 
     #[test]

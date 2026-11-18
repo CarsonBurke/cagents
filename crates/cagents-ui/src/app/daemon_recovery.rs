@@ -1,5 +1,4 @@
 use std::{
-    borrow::BorrowMut,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -73,7 +72,7 @@ pub(super) fn reconcile(
         session,
         explicit_retry,
         &socket,
-        || Ok(client),
+        || Leased::Fresh(client).or_reconnect(&socket),
         Path::new("/proc"),
         holder_of_kind,
     )
@@ -117,7 +116,7 @@ fn reconcile_without_proof(
 /// Resolve saved-pane ownership at its captured endpoint without starting a daemon.
 /// The caller may attach the result, but must not execute a returned replay plan.
 /// `client` is already connected to `socket`, and is asked again rather than
-/// connecting a second time.
+/// connecting a second time, unless its daemon was replaced meanwhile.
 pub(super) fn inspect_saved_at(
     session: TerminalSession,
     socket: &Path,
@@ -127,10 +126,46 @@ pub(super) fn inspect_saved_at(
         session,
         false,
         socket,
-        || Ok(client),
+        || Leased::Held(client).or_reconnect(socket),
         Path::new("/proc"),
         holder_of_kind,
     )
+}
+
+/// The connection a recovery reads once it holds the recovery lease.
+enum Leased<'a> {
+    /// A connection the caller keeps using after the recovery.
+    Held(&'a mut ControlClient),
+    Fresh(ControlClient),
+}
+
+impl Leased<'_> {
+    /// Keeps a connection made before the lease, which can wait out another
+    /// recovery for seconds, only while its daemon still holds it open. A
+    /// daemon replaced meanwhile is read through a new connection, under its
+    /// own proof, as a recovery that connected after the lease would read it.
+    fn or_reconnect(self, socket: &Path) -> Result<Self, String> {
+        if !self.client().peer_closed() {
+            return Ok(self);
+        }
+        ControlClient::connect(socket)
+            .map(Self::Fresh)
+            .map_err(|error| error.to_string())
+    }
+
+    fn client(&self) -> &ControlClient {
+        match self {
+            Self::Held(client) => client,
+            Self::Fresh(client) => client,
+        }
+    }
+
+    fn client_mut(&mut self) -> &mut ControlClient {
+        match self {
+            Self::Held(client) => client,
+            Self::Fresh(client) => client,
+        }
+    }
 }
 
 const CONVERSATION_HELD: &str = "the saved agent conversation is already hosted by another terminal; preserving the live session";
@@ -347,7 +382,11 @@ fn reconcile_with(
         session,
         explicit_retry,
         socket,
-        || ControlClient::connect(socket).map_err(|error| error.to_string()),
+        || {
+            ControlClient::connect(socket)
+                .map(Leased::Fresh)
+                .map_err(|error| error.to_string())
+        },
         proc_root,
         holder,
     )
@@ -355,11 +394,11 @@ fn reconcile_with(
 
 /// Recovers `session` against the daemon at `socket`, read through the
 /// connection `connect` gives once the recovery lease is held.
-fn reconcile_on<C: BorrowMut<ControlClient>>(
+fn reconcile_on<'a>(
     session: TerminalSession,
     explicit_retry: bool,
     socket: &Path,
-    connect: impl FnOnce() -> Result<C, String>,
+    connect: impl FnOnce() -> Result<Leased<'a>, String>,
     proc_root: &Path,
     holder: impl Fn(
         crate::model::TerminalId,
@@ -380,7 +419,7 @@ fn reconcile_on<C: BorrowMut<ControlClient>>(
             .map_err(|error| format!("cannot serialize terminal recovery: {error}"))?,
     );
     let mut client = connect()?;
-    let client = client.borrow_mut();
+    let client = client.client_mut();
     let proof = client.proof().clone();
     let mut terminals = client.list().map_err(|error| error.to_string())?;
     // A daemon still restoring lists and attaches, so a terminal it lists is
