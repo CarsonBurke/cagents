@@ -2309,6 +2309,24 @@ exec(compile(code, "native-evidence copy helper", "exec"))
             self.assertIn("title, state (OPEN, CLOSED or MERGED), headRefName, baseRefName, updatedAt, "
                           "headRepositoryOwner.login and headRepository.name", refused.stderr)
 
+    def test_the_forge_answers_late_while_its_delay_is_set(self) -> None:
+        self.built()
+        self.run_tool("start", "after")
+        fixture = self.switch_forge_on()
+        delay = fixture / "home" / ".config" / "fixture-forge-delay"
+        # Read on every call: a step can slow a running session's GitHub.
+        delay.write_text("0.6\n")
+        started = time.monotonic()
+        self.fixture_shell("gh --version")
+        self.assertGreaterEqual(time.monotonic() - started, 0.6)
+        delay.write_text("soon\n")
+        refused = self.fixture_shell("gh --version", check=False)
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn('fixture-forge-delay must hold a number of seconds, such as 3 or 0.5, not "soon"',
+                      refused.stderr)
+        delay.unlink()
+        self.assertEqual(self.fixture_shell("gh --version").returncode, 0)
+
     def test_a_forgotten_session_releases_the_lock_at_its_limit(self) -> None:
         self.built()
         self.run_tool("start", "after", "--limit", "1", "--startup-timeout", "600")

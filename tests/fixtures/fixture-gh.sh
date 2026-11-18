@@ -13,6 +13,7 @@
 #       headRepository. Each repository lists
 #       those whose url is under https://github.com/OWNER/NAME/pull/, in file
 #       order.
+#   home/.config/fixture-forge-delay  Seconds every answer waits first.
 #   avatars/OWNER.image  Copied into the app's avatar cache, with a fresh
 #       modification time, whenever the app resolves a repository. Any PNG,
 #       JPEG, GIF or WebP up to 1 MiB and 1024x1024 pixels.
@@ -26,6 +27,19 @@ config=$fixture/home/.config
 if [ ! -e "$config/fixture-forge" ]; then
     printf '%s\n' 'gh: the fixture has no forge access' >&2
     exit 1
+fi
+
+# Opt-in slow GitHub: home/.config/fixture-forge-delay holds the seconds,
+# such as 3 or 0.5, that every answer waits, so a step can capture what the
+# app shows while GitHub is still answering. Read on every call.
+delay_file=$config/fixture-forge-delay
+if [ -e "$delay_file" ]; then
+    delay=$(head -n 1 -- "$delay_file" 2>/dev/null || :)
+    if ! printf '%s\n' "$delay" | grep -Eqx '([0-9]+(\.[0-9]*)?|\.[0-9]+)'; then
+        printf 'gh: %s must hold a number of seconds, such as 3 or 0.5, not "%s"\n' "$delay_file" "$delay" >&2
+        exit 1
+    fi
+    sleep "$delay"
 fi
 
 login=fixture
