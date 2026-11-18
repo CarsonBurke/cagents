@@ -838,6 +838,146 @@ fn a_complete_rename_can_be_staged_unstaged_and_discarded() {
     assert!(!fixture.work().join("new-name.txt").exists());
 }
 
+/// With copy detection on, a staged copy is shown against its source, but
+/// the source stays a file of its own. Unstaging the copy must leave the
+/// source's index entry alone: it can hold a deliberately staged version that
+/// neither HEAD nor the working tree keeps.
+#[test]
+fn unstaging_a_copy_keeps_the_sources_own_staged_version() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    fixture.git_in_work(&["config", "status.renames", "copies"]);
+    let original = b"line1\nline2\nline3\nline4\nline5\n";
+    fixture.write("source.txt", original);
+    fixture.commit_all("initial");
+    fixture.write("copy.txt", original);
+    fixture.write("source.txt", b"line1\nline2\nline3\nline4\nstaged\n");
+    fixture.git_in_work(&["add", "source.txt", "copy.txt"]);
+    fixture.write("source.txt", b"line1\nline2\nline3\nline4\nworktree\n");
+
+    let snapshot = fixture.snapshot();
+    let copy = entry(&snapshot, ChangeArea::Staged, "copy.txt");
+    assert_eq!(copy.kind, ChangeKind::Copied);
+    assert_eq!(copy.old_path, Some(path("source.txt")));
+    let selection = vec![PathSelection::from_changed_path(copy)];
+
+    let outcome = fixture
+        .service()
+        .unstage(
+            &UnstageRequest {
+                worktree: fixture.work(),
+                selection,
+            },
+            &CancellationToken::new(),
+        )
+        .expect("unstage");
+    assert_eq!(
+        outcome,
+        MutationOutcome::Applied {
+            paths: vec![path("copy.txt")]
+        }
+    );
+    assert_eq!(
+        fixture.text(&["show", ":source.txt"]),
+        "line1\nline2\nline3\nline4\nstaged"
+    );
+    assert_eq!(fixture.porcelain(), "MM source.txt\n?? copy.txt");
+}
+
+/// A copy recorded with intent to add, beside a source with a staged and a
+/// further unstaged version of its own: what the stage and discard tests act on.
+fn unstaged_copy_beside_an_edited_source() -> Option<Fixture> {
+    let fixture = Fixture::new()?;
+    fixture.git_in_work(&["config", "status.renames", "copies"]);
+    let original = b"line1\nline2\nline3\nline4\nline5\n";
+    fixture.write("source.txt", original);
+    fixture.commit_all("initial");
+    fixture.write("source.txt", b"line1\nline2\nline3\nline4\nstaged\n");
+    fixture.git_in_work(&["add", "source.txt"]);
+    fixture.write("source.txt", b"line1\nline2\nline3\nline4\nworktree\n");
+    fixture.write("copy.txt", original);
+    fixture.git_in_work(&["add", "--intent-to-add", "copy.txt"]);
+    Some(fixture)
+}
+
+fn unstaged_copy_selection(fixture: &Fixture) -> Vec<PathSelection> {
+    let snapshot = fixture.snapshot();
+    let copy = entry(&snapshot, ChangeArea::Unstaged, "copy.txt");
+    assert_eq!(copy.kind, ChangeKind::Copied);
+    assert_eq!(copy.old_path, Some(path("source.txt")));
+    vec![PathSelection::from_changed_path(copy)]
+}
+
+/// Staging a copy stages the copy, not the source's unrelated working edits.
+#[test]
+fn staging_a_copy_leaves_the_sources_working_edits_unstaged() {
+    let Some(fixture) = unstaged_copy_beside_an_edited_source() else {
+        return;
+    };
+    let selection = unstaged_copy_selection(&fixture);
+    let outcome = fixture
+        .service()
+        .stage(
+            &StageRequest {
+                worktree: fixture.work(),
+                selection,
+            },
+            &CancellationToken::new(),
+        )
+        .expect("stage");
+    assert_eq!(
+        outcome,
+        MutationOutcome::Applied {
+            paths: vec![path("copy.txt")]
+        }
+    );
+    assert_eq!(
+        fixture.text(&["show", ":source.txt"]),
+        "line1\nline2\nline3\nline4\nstaged"
+    );
+    assert_eq!(
+        fixture.text(&["show", ":copy.txt"]),
+        "line1\nline2\nline3\nline4\nline5"
+    );
+}
+
+/// Discarding a copy's working change must not throw away the source's own
+/// working edits, which exist nowhere else.
+#[test]
+fn discarding_a_copy_keeps_the_sources_working_edits() {
+    let Some(fixture) = unstaged_copy_beside_an_edited_source() else {
+        return;
+    };
+    let selection = unstaged_copy_selection(&fixture);
+    let outcome = fixture
+        .service()
+        .discard(
+            &DiscardRequest {
+                worktree: fixture.work(),
+                tracked: selection,
+                untracked: Vec::new(),
+                confirmed: true,
+            },
+            &CancellationToken::new(),
+        )
+        .expect("discard");
+    assert_eq!(
+        outcome,
+        MutationOutcome::Applied {
+            paths: vec![path("copy.txt")]
+        }
+    );
+    assert_eq!(
+        fs::read(fixture.work().join("source.txt")).unwrap(),
+        b"line1\nline2\nline3\nline4\nworktree\n"
+    );
+    assert_eq!(
+        fixture.text(&["show", ":source.txt"]),
+        "line1\nline2\nline3\nline4\nstaged"
+    );
+}
+
 /// A `pre-commit` hook can leave a process outside Git's process group holding
 /// the stdout and stderr the executor reads. The process group signalled at the
 /// deadline cannot reach it, so nothing will ever close those pipes — and the
@@ -2316,6 +2456,101 @@ fn a_non_fast_forward_push_is_reported_as_not_pushed() {
     );
 }
 
+/// Git pushes to every push URL a remote configures, and each reports on its
+/// own. One refusing the branch while another accepts it is not a push that
+/// definitively did not happen: claiming so would hide that the branch is now
+/// published somewhere.
+#[test]
+fn a_push_refused_by_only_some_destinations_is_not_reported_as_not_pushed() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let published = publish_main(&fixture);
+    let destinations = ["first-push.git", "second-push.git"].map(|name| {
+        let destination = fixture.root.path().join(name);
+        fixture.run(
+            fixture.root.path(),
+            &[
+                "clone",
+                "--quiet",
+                "--bare",
+                fixture.origin().to_str().unwrap(),
+                destination.to_str().unwrap(),
+            ],
+        );
+        fixture.git_in_work(&[
+            "config",
+            "--add",
+            "remote.origin.pushurl",
+            destination.to_str().unwrap(),
+        ]);
+        destination
+    });
+    // Another clone has moved a destination's branch on, so a fast-forward
+    // from this worktree is refused there.
+    let diverge = |destination: &Path| {
+        let tree = fixture.text(&["rev-parse", "HEAD^{tree}"]);
+        let commit = String::from_utf8(fixture.run(
+            destination,
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                published.as_str(),
+                "-m",
+                "elsewhere",
+            ],
+        ))
+        .unwrap();
+        fixture.run(
+            destination,
+            &["update-ref", "refs/heads/main", commit.trim()],
+        );
+        commit.trim().to_owned()
+    };
+    let main_at = |destination: &Path| {
+        String::from_utf8(fixture.run(destination, &["rev-parse", "refs/heads/main"]))
+            .unwrap()
+            .trim()
+            .to_owned()
+    };
+    let request = PushRequest {
+        worktree: fixture.work(),
+        branch: ValidatedBranchName::parse("main").unwrap(),
+        target: PushTarget::Upstream {
+            remote: "origin".into(),
+            remote_ref: ValidatedRefName::parse("refs/heads/main").unwrap(),
+        },
+    };
+
+    let first_tip = diverge(&destinations[0]);
+    fixture.write("a.txt", b"local\n");
+    let local = fixture.commit_all("local");
+    let outcome = fixture
+        .service()
+        .push(&request, &CancellationToken::new())
+        .expect("push");
+    assert_eq!(main_at(&destinations[0]), first_tip);
+    assert_eq!(main_at(&destinations[1]), local.as_str());
+    assert!(
+        matches!(outcome, PushOutcome::OutcomeUnknown { .. }),
+        "the second destination took the branch: {outcome:?}"
+    );
+
+    // Refused by every destination, it is definitively not pushed.
+    let second_tip = diverge(&destinations[1]);
+    let outcome = fixture
+        .service()
+        .push(&request, &CancellationToken::new())
+        .expect("push");
+    assert!(
+        matches!(outcome, PushOutcome::NotPushed { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(main_at(&destinations[0]), first_tip);
+    assert_eq!(main_at(&destinations[1]), second_tip);
+}
+
 #[test]
 fn an_ambiguous_push_is_reconciled_against_the_remote() {
     let Some(fixture) = Fixture::new() else {
@@ -3627,6 +3862,81 @@ fn a_pull_request_fetch_writes_only_its_private_refs_and_proves_the_head() {
         ],
         "{remaining}"
     );
+}
+
+/// Reviewing a pull request must not refresh the user's own view of the
+/// remote. Given a command-line refspec, Git also applies the remote's
+/// configured fetch mapping to what it transferred, which would advance a
+/// stale `origin/main` and change its ahead/behind counts and the expectation
+/// an implicit `--force-with-lease` relies on.
+#[test]
+fn a_pull_request_fetch_leaves_a_stale_tracking_ref_where_the_user_left_it() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let root = publish_main(&fixture);
+    fixture.git_in_work(&["fetch", "--quiet", "origin"]);
+    let tracking_before = fixture.text(&["rev-parse", "refs/remotes/origin/main"]);
+    assert_eq!(tracking_before, root.as_str());
+    let remote_refs = || fixture.text(&["for-each-ref", "refs/remotes/"]);
+    let remote_refs_before = remote_refs();
+
+    // Someone else advances the base and opens a pull request from a second
+    // clone, so this worktree's `origin/main` is now stale.
+    let other = fixture.root.path().join("other");
+    fixture.run(
+        fixture.root.path(),
+        &[
+            "clone",
+            "--quiet",
+            fixture.origin().to_str().unwrap(),
+            "other",
+        ],
+    );
+    fixture.run(
+        &other,
+        &["commit", "--quiet", "--allow-empty", "-m", "base moves"],
+    );
+    fixture.run(&other, &["push", "--quiet", "origin", "main"]);
+    let base_tip = Oid::parse(
+        String::from_utf8(fixture.run(&other, &["rev-parse", "HEAD"]))
+            .unwrap()
+            .trim(),
+    )
+    .unwrap();
+    fixture.run(
+        &other,
+        &["commit", "--quiet", "--allow-empty", "-m", "feature"],
+    );
+    fixture.run(
+        &other,
+        &["push", "--quiet", "origin", "HEAD:refs/pull/7/head"],
+    );
+    let feature = Oid::parse(
+        String::from_utf8(fixture.run(&other, &["rev-parse", "HEAD"]))
+            .unwrap()
+            .trim(),
+    )
+    .unwrap();
+
+    let range = fixture
+        .service()
+        .fetch_pull_request_range(
+            &fixture.work(),
+            "origin",
+            7,
+            &ValidatedBranchName::parse("main").unwrap(),
+            &feature,
+            &CancellationToken::new(),
+        )
+        .expect("fetch pull request range");
+    assert_eq!(range.base_tip, base_tip);
+    assert_eq!(
+        fixture.text(&["rev-parse", "refs/remotes/origin/main"]),
+        tracking_before,
+        "the review fetch advanced the user's remote-tracking ref"
+    );
+    assert_eq!(remote_refs(), remote_refs_before);
 }
 
 /// Multi-valued URLs use Git's first destination, so forge association cannot
