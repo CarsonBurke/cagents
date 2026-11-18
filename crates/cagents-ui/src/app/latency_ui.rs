@@ -177,7 +177,7 @@ impl Cagents {
         };
         self.latency_fixture_started = true;
         match fixture.next_direction() {
-            Some(direction) => self.update(Message::FocusAdjacent(direction)),
+            Some(direction) => self.dispatch(Message::FocusAdjacent(direction)),
             None => {
                 if let Err(error) = fixture.finish(
                     &mut self.latency,

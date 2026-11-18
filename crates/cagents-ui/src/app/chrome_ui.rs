@@ -2723,7 +2723,7 @@ impl Cagents {
                 self.begin_dirty_close(DirtyCloseIntent::PaneGroup, dirty)
             }
             Action::Clone(id) => {
-                let focus = self.update(Message::FocusCard(id));
+                let focus = self.dispatch(Message::FocusCard(id));
                 if self.workspace.focused() == Some(id) {
                     Task::batch([focus, self.clone_focused_pane()])
                 } else {
@@ -2747,6 +2747,8 @@ impl Cagents {
             Action::Reveal(id) => {
                 let was_collapsed = self.chrome_ui.projects_collapsed;
                 self.chrome_ui.projects_collapsed = false;
+                // A whole update rather than a dispatch: the row to reveal is
+                // found in the sidebar as projecting the new focus leaves it.
                 let focus = self.update(Message::FocusCard(id));
                 if self.workspace.focused() != Some(id) {
                     self.chrome_ui.projects_collapsed = was_collapsed;
