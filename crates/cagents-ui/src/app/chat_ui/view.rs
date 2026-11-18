@@ -445,6 +445,18 @@ fn composer_trailing(modes: &[PromptMode], busy: bool, has_draft: bool) -> Vec<T
         .collect()
 }
 
+/// What an empty composer says it is for, when Enter would send in `mode`
+/// and the conversation is `busy` or not.
+fn composer_placeholder(mode: Option<PromptMode>, busy: bool) -> &'static str {
+    match mode {
+        // Until the turn a message just sent starts shows, there is no turn
+        // in view to steer: what is written next joins it.
+        Some(PromptMode::Steer) if busy => "Steer this turn",
+        Some(PromptMode::Queue) => "Queue for the next turn",
+        Some(PromptMode::Send | PromptMode::Steer) | None => "Message",
+    }
+}
+
 /// The icon and tooltip for a submit control.
 ///
 /// `slot` is the control's place among the modes the provider currently
@@ -3412,12 +3424,7 @@ impl Runtime {
         let placeholder = if selected.is_some() {
             "Message main agent"
         } else {
-            match modes.first() {
-                Some(PromptMode::Send) => "Message",
-                Some(PromptMode::Steer) => "Steer this turn",
-                Some(PromptMode::Queue) => "Queue for the next turn",
-                None => "Message",
-            }
+            composer_placeholder(modes.first().copied(), snapshot.busy)
         };
         // Key bindings must remain available while the editor changes its own
         // contents. The action handler checks the current draft before sending;
@@ -3588,30 +3595,37 @@ impl Runtime {
         // a user arrives from works and what the composer already answers to.
         // A dropdown listing them duplicated that path in a control that was
         // permanently present for something used occasionally.
-        let submissions: Vec<Element<'_, Message>> = composer_trailing(modes, under_way, has_draft)
-            .into_iter()
-            .map(|control| match control {
-                Trailing::Submit { mode, slot } => {
-                    let (name, tooltip) = submit_control(mode, slot, enter_sends);
-                    crate::ui_controls::icon_button(name, tooltip)
-                        .id(card_control_id(target.card, &format!("chat-submit-{slot}")))
-                        .selected(slot == 0)
-                        .tone(crate::design::Tone::Themed(if slot == 0 {
-                            design::accent_color
-                        } else {
-                            design::muted_icon_color
-                        }))
-                        .on_press_maybe(
-                            (available
-                                && !self.start_blocked.is_some()
-                                && !self.provider_coming_up())
-                            .then(|| action(Action::SubmitControl(target, mode))),
-                        )
-                        .into()
-                }
-                Trailing::Stop => self.stop_control(available),
-            })
-            .collect();
+        // Stop waits for a turn to stop, as the placeholder waits for one to
+        // steer.
+        let submissions: Vec<Element<'_, Message>> =
+            composer_trailing(modes, snapshot.busy, has_draft)
+                .into_iter()
+                .map(|control| match control {
+                    Trailing::Submit { mode, slot } => {
+                        let shown = match mode {
+                            PromptMode::Steer if !snapshot.busy => PromptMode::Send,
+                            mode => mode,
+                        };
+                        let (name, tooltip) = submit_control(shown, slot, enter_sends);
+                        crate::ui_controls::icon_button(name, tooltip)
+                            .id(card_control_id(target.card, &format!("chat-submit-{slot}")))
+                            .selected(slot == 0)
+                            .tone(crate::design::Tone::Themed(if slot == 0 {
+                                design::accent_color
+                            } else {
+                                design::muted_icon_color
+                            }))
+                            .on_press_maybe(
+                                (available
+                                    && !self.start_blocked.is_some()
+                                    && !self.provider_coming_up())
+                                .then(|| action(Action::SubmitControl(target, mode))),
+                            )
+                            .into()
+                    }
+                    Trailing::Stop => self.stop_control(available),
+                })
+                .collect();
         // One row: `+`, the draft, then what sends or stops it. The controls
         // hold the row's foot, so a draft that grows keeps them beside its
         // last line, and the inset centers them on a single line of text.

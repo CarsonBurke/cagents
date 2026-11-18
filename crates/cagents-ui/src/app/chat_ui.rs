@@ -2940,6 +2940,20 @@ fn user_messages(snapshot: &Snapshot) -> impl DoubleEndedIterator<Item = (&str, 
         })
 }
 
+/// What follows `message` in `text`, where `text` begins with it as a
+/// message of its own: all of it, or its first lines.
+fn leading<'a>(text: &'a str, message: &str) -> Option<&'a str> {
+    let message = message.trim();
+    if message.is_empty() {
+        return None;
+    }
+    let rest = text.trim_start().strip_prefix(message)?;
+    if rest.trim().is_empty() {
+        return Some("");
+    }
+    rest.strip_prefix('\n')
+}
+
 /// What the reader had said last in `snapshot`'s conversation, as `sent`
 /// goes to it.
 fn sent_after(snapshot: &Snapshot, sent: &str) -> SentAfter {
@@ -3803,13 +3817,21 @@ impl Runtime {
 
     /// Returns every held follow-up to the composer, in the order written.
     fn restore_followups(&mut self) {
+        if self.return_followups() {
+            let _ = self.present();
+        }
+    }
+
+    /// [`Self::restore_followups`], leaving the pane to be presented by its
+    /// caller. Whether there were any.
+    fn return_followups(&mut self) -> bool {
         if self.followups.is_empty() {
-            return;
+            return false;
         }
         let (text, attachments) = self.combined_followups();
         self.followups.clear();
         self.take_back(&text, attachments, PromptMode::Queue);
-        let _ = self.present();
+        true
     }
 
     /// The held follow-ups as the one prompt they are sent as: their text in
@@ -4020,9 +4042,11 @@ impl Runtime {
         self.settle_draft_echo();
     }
 
-    /// Drops the composer text if it is exactly the message it may repeat,
-    /// which the conversation already has, so it is not offered again. Any
-    /// other text is the reader's own and stays.
+    /// Drops from the composer the message it may repeat, which the
+    /// conversation already has, so it is not offered again: the whole text
+    /// where it is exactly that message, or, for one still being sent as its
+    /// chat closed, the lines it leads. Any other text is the reader's own
+    /// and stays.
     fn settle_draft_echo(&mut self) {
         let Some((revision, echo)) = self.draft_echo.take() else {
             return;
@@ -4069,10 +4093,17 @@ impl Runtime {
                 // to repeat it.
                 return;
             };
-            composer.trim() == message.trim()
+            // A message still being sent leads what was written after it,
+            // which is the reader's own however it went.
+            match &echo {
+                DraftEcho::First => (composer.trim() == message.trim()).then(String::new),
+                DraftEcho::Latest(_) => {
+                    leading(&composer, message).map(|rest| rest.trim_end().to_owned())
+                }
+            }
         };
-        if repeated {
-            self.replace_draft(text_editor::Content::new());
+        if let Some(rest) = repeated {
+            self.replace_draft(text_editor::Content::with_text(&rest));
         }
     }
 
@@ -5599,7 +5630,7 @@ impl Runtime {
         self.child_ordinals.observe(&snapshot.subagents);
         if !self.presents() {
             self.release_transcript_presentation();
-            self.commands.settle(&snapshot, false);
+            self.settle_commands(&snapshot, false);
             Arc::make_mut(&mut snapshot).evict_transcript();
             self.snapshot = snapshot;
             self.source_clock = source_clock;
@@ -5678,7 +5709,7 @@ impl Runtime {
         });
         self.scroll_memory.retain_children(&snapshot.subagents);
         self.settle_recalls(&snapshot);
-        if self.commands.settle(&snapshot, true) {
+        if self.settle_commands(&snapshot, true) {
             self.prepare_local_prompt();
         }
         self.taken_back.retain(|id| {
@@ -11354,7 +11385,17 @@ impl Cagents {
         let mut pending = commands::PendingCommand::new(id, &command);
         pending.queued = step;
         if let Some(sent) = &pending.sent {
-            pending.sent_after = sent_after(&runtime.snapshot, sent);
+            // A message still on its way reading the same may arrive first,
+            // and nothing would tell the two apart.
+            pending.sent_after = if runtime
+                .commands
+                .outgoing()
+                .any(|outgoing| outgoing.prompt.text().trim() == sent.trim())
+            {
+                SentAfter::Unseen
+            } else {
+                sent_after(&runtime.snapshot, sent)
+            };
         }
         if let Some(page) = pending.page {
             if page == view::Page::Latest {
@@ -11399,7 +11440,8 @@ impl Cagents {
             runtime.prepare_local_prompt();
         }
         runtime.error = None;
-        match runtime.commands.push(pending, command) {
+        let snapshot = runtime.snapshot.clone();
+        match runtime.commands.push(pending, command, &snapshot) {
             Some((id, command)) => run_chat_command(target, id, Some(handle), command),
             None => Task::none(),
         }
@@ -11410,7 +11452,8 @@ impl Cagents {
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
-        let Some((id, command)) = runtime.commands.next() else {
+        let snapshot = runtime.snapshot.clone();
+        let Some((id, command)) = runtime.commands.next(&snapshot) else {
             return Task::none();
         };
         let handle = runtime.handle().cloned().filter(|_| !runtime.disconnected);
@@ -12955,6 +12998,9 @@ impl Cagents {
                             refresh_limits,
                             self.list_chat_models(target.card),
                             self.resume_current_find(target, true),
+                            // A command waiting for the turn a message
+                            // starts goes once the conversation shows it.
+                            self.next_chat_command(target),
                             self.dispatch_queued(target),
                             self.resume_history_navigation(target),
                             fork.map_or_else(Task::none, |session| {
@@ -14165,6 +14211,8 @@ impl Cagents {
                         runtime.refresh();
                         let snapshot = runtime.snapshot.clone();
                         runtime.commands.accept(&mut pending, &snapshot);
+                        let items = runtime.presents();
+                        runtime.settle_commands(&snapshot, items);
                         runtime.prepare_local_prompt();
                         if pending.page == Some(view::Page::Latest)
                             && runtime.deferred_page == Some(HistoryNavigation::Latest)
@@ -14204,18 +14252,19 @@ impl Cagents {
                             runtime.earlier_asked = None;
                             runtime.later_asked = None;
                         }
-                        // Those written since go back with them, ahead of
-                        // which they cannot be sent.
-                        if !pending.followups.is_empty() {
+                        // A message the provider did not take goes back to
+                        // the composer, and so does any written after it:
+                        // sent without it, they would arrive out of order.
+                        // Held follow-ups were written after it too, or are
+                        // what it carried.
+                        let unsent = pending.take_unsent();
+                        if !pending.followups.is_empty() || unsent.is_some() {
                             runtime.restore_followups();
                         }
                         if let Some(id) = &pending.take_back {
                             runtime.recalling.retain(|recall| &recall.message.id != id);
                         }
-                        // A message the provider did not take goes back to
-                        // the composer, and so does any written after it:
-                        // sent without it, they would arrive out of order.
-                        if let Some(outgoing) = pending.outgoing.take() {
+                        if let Some(outgoing) = unsent {
                             let mut messages = vec![outgoing];
                             messages.extend(runtime.commands.withdraw_messages());
                             runtime.restore_outgoing(messages);

@@ -11,8 +11,20 @@
 //! then settles it. One it accepts stays shown until the conversation itself
 //! shows the change; one it refuses is undone, and a message it refused goes
 //! back to the composer with the reason, so nothing written is lost.
+//!
+//! A message sent starts a turn, but only once the provider says so. What
+//! acts on that turn - steering it, queueing behind it, stopping it - waits
+//! here until it has begun, since a provider asked about a turn it has not
+//! started yet refuses. Should the turn end or never begin meanwhile, a
+//! message waiting for it is sent as a message of its own.
 use super::*;
 use std::collections::VecDeque;
+
+/// How long a model or permission mode the provider took reads as chosen
+/// while the conversation still reports the one before it. A provider
+/// confirms a choice in a later report than its answer to the command; one
+/// that never does has not made the change.
+const CHOICE_PATIENCE: Duration = Duration::from_secs(5);
 
 /// One command to the provider, with what this window shows of it until the
 /// provider answers.
@@ -52,6 +64,9 @@ pub(super) struct PendingCommand {
     /// Any other command, kept so that the same request given again while
     /// this one is still on its way is not sent twice.
     repeat: Option<Command>,
+    /// Whether this command waited for a turn a message on its way was to
+    /// start, so that it was given for that turn.
+    held: bool,
 }
 
 impl PendingCommand {
@@ -93,6 +108,7 @@ impl PendingCommand {
                 Command::Prompt { .. } | Command::Slash { .. } | Command::Compact
             ))
             .then(|| command.clone()),
+            held: false,
         }
     }
 
@@ -103,16 +119,32 @@ impl PendingCommand {
         self.carried = Some(message);
     }
 
-    /// Whether giving `command` now would only ask again for what this
-    /// command already asks.
-    fn repeated_by(&self, command: &Command) -> bool {
-        if let Command::Answer { request_id, .. } = command {
-            // A request takes one answer; a second click, whichever choice it
-            // was on, comes too late.
-            return self.request.as_ref() == Some(request_id);
-        }
-        self.repeat.as_ref() == Some(command)
+    /// Takes the reader's message this command carried, unless the
+    /// conversation already shows it: one it has is not the reader's to
+    /// write again.
+    pub(super) fn take_unsent(&mut self) -> Option<Outgoing> {
+        self.outgoing.take().filter(|outgoing| !outgoing.arrived)
     }
+
+    /// The same kind of request as `command`, for telling whether `command`
+    /// repeats this one.
+    fn same_kind(&self, command: &Command) -> bool {
+        self.repeat
+            .as_ref()
+            .is_some_and(|repeat| std::mem::discriminant(repeat) == std::mem::discriminant(command))
+    }
+}
+
+/// Whether `command` acts on the turn under way, which the provider has to
+/// have begun before it can take it.
+fn acts_on_turn(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Prompt {
+            mode: PromptMode::Steer | PromptMode::Queue,
+            ..
+        } | Command::Interrupt
+    )
 }
 
 /// A setting a command chooses, shown as chosen while the provider takes it.
@@ -180,14 +212,24 @@ pub(super) struct Outgoing {
     /// The glance a queue row shows of it, made once.
     pub(super) preview: String,
     pub(super) mode: PromptMode,
-    /// The reader's newest message the transcript held when this was sent.
-    /// Another in its place is this one arriving.
+    /// The reader's newest message the transcript held when this went to
+    /// the provider. Another in its place is this one arriving.
     newest_user: Option<String>,
-    /// The messages the provider held for later when this was sent. A new
-    /// one is this one arriving there.
+    /// The messages the provider held for later when this went. A new one
+    /// is this one arriving there.
     held: Vec<String>,
-    /// The turns the provider had started when this was sent.
+    /// The turns the provider had started when this went.
     turns: u64,
+    /// The error the conversation reported when this went. A new one, with
+    /// no turn begun, is the turn this was to start failing.
+    error: Option<String>,
+    /// The publication this went after.
+    generation: u64,
+    /// Whether a publication since showed the conversation working.
+    busy_seen: bool,
+    /// Whether the conversation shows it already, though the provider has
+    /// yet to answer for it.
+    arrived: bool,
 }
 
 impl Outgoing {
@@ -197,14 +239,31 @@ impl Outgoing {
         mode: PromptMode,
         snapshot: &Snapshot,
     ) -> Self {
-        Self {
+        let mut outgoing = Self {
             preview: prompt::queue_preview(&text),
             prompt: prompt::LocalPrompt::new(text, attachments),
             mode,
-            newest_user: newest_user_message(snapshot).map(str::to_owned),
-            held: held_messages(snapshot).map(str::to_owned).collect(),
-            turns: snapshot.turn_generation,
-        }
+            newest_user: None,
+            held: Vec::new(),
+            turns: 0,
+            error: None,
+            generation: 0,
+            busy_seen: false,
+            arrived: false,
+        };
+        outgoing.leaves_after(snapshot);
+        outgoing
+    }
+
+    /// Notes what `snapshot` holds as this message goes to the provider, so
+    /// that what changes afterwards can be told apart as its doing.
+    fn leaves_after(&mut self, snapshot: &Snapshot) {
+        self.newest_user = newest_user_message(snapshot).map(|(id, _)| id.to_owned());
+        self.held = held_messages(snapshot).map(str::to_owned).collect();
+        self.turns = snapshot.turn_generation;
+        self.error = snapshot.error.clone();
+        self.generation = snapshot.generation;
+        self.busy_seen = false;
     }
 
     /// Whether the transcript shows this message as its own: a message sent
@@ -220,11 +279,44 @@ impl Outgoing {
     /// shows nothing more. A snapshot without its items, as a hidden chat's
     /// is, can only show where the message is held.
     fn settled_by(&self, snapshot: &Snapshot, items: bool) -> bool {
-        (items && newest_user_message(snapshot) != self.newest_user.as_deref())
+        (items && newest_user_message(snapshot).map(|(id, _)| id) != self.newest_user.as_deref())
             || held_messages(snapshot).any(|id| !self.held.iter().any(|held| held == id))
             || (snapshot.turn_generation > self.turns && !snapshot.busy)
             || (items && snapshot.has_later)
             || snapshot.exited
+    }
+
+    /// Whether `snapshot` shows the turn this message was to start failing
+    /// before it began: the provider took the message, then stopped working
+    /// with an error of its own and no turn begun. Nothing of it reached the
+    /// conversation, or it would have settled already.
+    fn failed_in(&self, snapshot: &Snapshot) -> bool {
+        self.in_transcript()
+            && snapshot.generation > self.generation
+            && !snapshot.busy
+            && !snapshot.exited
+            && snapshot.turn_generation == self.turns
+            && snapshot.error.is_some()
+            && (snapshot.error != self.error || self.busy_seen)
+    }
+
+    /// Whether `snapshot` shows this very message, where it is going.
+    fn shown_in(&self, snapshot: &Snapshot, items: bool) -> bool {
+        let text = self.prompt.text().trim();
+        if text.is_empty() {
+            return false;
+        }
+        if self.in_transcript() {
+            items
+                && newest_user_message(snapshot).is_some_and(|(id, shown)| {
+                    Some(id) != self.newest_user.as_deref() && shown.trim() == text
+                })
+        } else {
+            snapshot
+                .queued_messages
+                .iter()
+                .any(|message| !self.held.contains(&message.id) && message.text.trim() == text)
+        }
     }
 }
 
@@ -235,19 +327,19 @@ fn held_messages(snapshot: &Snapshot) -> impl Iterator<Item = &str> {
         .map(|message| message.id.as_str())
 }
 
-fn newest_user_message(snapshot: &Snapshot) -> Option<&str> {
-    snapshot
-        .items
-        .iter()
-        .rev()
-        .find(|item| {
-            item.role == chat::Role::User
-                && matches!(
-                    item.content,
-                    ItemContent::Text { .. } | ItemContent::Image { .. }
-                )
-        })
-        .map(|item| item.id.as_str())
+/// The reader's newest message in `snapshot`'s transcript, by ID, with its
+/// text where it has any.
+fn newest_user_message(snapshot: &Snapshot) -> Option<(&str, &str)> {
+    snapshot.items.iter().rev().find_map(|item| {
+        if item.role != chat::Role::User {
+            return None;
+        }
+        match &item.content {
+            ItemContent::Text { text, .. } => Some((item.id.as_str(), text.as_str())),
+            ItemContent::Image { .. } => Some((item.id.as_str(), "")),
+            _ => None,
+        }
+    })
 }
 
 /// What a command the provider accepted changed, shown until the
@@ -259,9 +351,34 @@ enum Effect {
 
 struct Settling {
     effect: Effect,
-    /// The generation presented when the provider accepted it. A choice is
-    /// in effect by any later one.
+    /// The generation presented when the provider accepted it.
     after: u64,
+    /// The error the conversation reported then. A new one since is how a
+    /// provider says it did not make a change it took the command for.
+    error: Option<String>,
+    accepted: Instant,
+}
+
+impl Settling {
+    /// Whether a choice the provider took no longer needs showing ahead of
+    /// what `snapshot` reports: it reports the choice, or reports since that
+    /// it could not make it, or has had its time to.
+    fn choice_settled_by(&self, choice: &Choice, snapshot: &Snapshot) -> bool {
+        choice.shown_by(snapshot)
+            || snapshot.exited
+            || (snapshot.generation > self.after
+                && (snapshot.error != self.error || self.accepted.elapsed() >= CHOICE_PATIENCE))
+    }
+}
+
+/// What one publication settled of a chat's commands.
+#[derive(Default)]
+pub(super) struct Settled {
+    /// Whether anything shown of them changed.
+    pub(super) changed: bool,
+    /// Messages the provider took whose turn failed before it began, in the
+    /// order they were sent.
+    pub(super) failed: Vec<Outgoing>,
 }
 
 /// A chat's commands: the one in flight, those waiting behind it, and those
@@ -274,9 +391,9 @@ pub(super) struct Commands {
 }
 
 impl Commands {
-    /// Whether nothing is on its way to the provider.
+    /// Whether nothing is on its way to the provider, nor waiting to go.
     pub(super) fn is_idle(&self) -> bool {
-        self.in_flight.is_none()
+        self.in_flight.is_none() && self.waiting.is_empty()
     }
 
     #[cfg(test)]
@@ -304,9 +421,21 @@ impl Commands {
         }
     }
 
-    /// Whether `command` would only repeat one still on its way.
+    /// Whether `command` would only repeat one still on its way: the newest
+    /// of its kind asks the same. A model chosen, another, then the first
+    /// again is a change of mind, and the last of them goes.
     pub(super) fn repeats(&self, command: &Command) -> bool {
-        self.iter().any(|pending| pending.repeated_by(command))
+        if let Command::Answer { request_id, .. } = command {
+            // A request takes one answer; a second click, whichever choice it
+            // was on, comes too late.
+            return self
+                .iter()
+                .any(|pending| pending.request.as_ref() == Some(request_id));
+        }
+        self.iter()
+            .filter(|pending| pending.same_kind(command))
+            .last()
+            .is_some_and(|pending| pending.repeat.as_ref() == Some(command))
     }
 
     /// Whether a command is carrying held follow-ups to the provider.
@@ -331,19 +460,15 @@ impl Commands {
     }
 
     /// Adds a command to the end of the line. Returns it to be sent now when
-    /// nothing is ahead of it.
+    /// nothing is ahead of it and it can go, as [`Self::next`] says.
     pub(super) fn push(
         &mut self,
         pending: PendingCommand,
         command: Command,
+        snapshot: &Snapshot,
     ) -> Option<(u64, Command)> {
-        if self.in_flight.is_some() {
-            self.waiting.push_back((pending, command));
-            return None;
-        }
-        let id = pending.id;
-        self.in_flight = Some(pending);
-        Some((id, command))
+        self.waiting.push_back((pending, command));
+        self.next(snapshot)
     }
 
     /// Takes the command in flight once its answer, for `id`, has come.
@@ -354,15 +479,56 @@ impl Commands {
         self.in_flight.take()
     }
 
-    /// Puts the next waiting command in flight, if none is.
-    pub(super) fn next(&mut self) -> Option<(u64, Command)> {
+    /// Whether a message the provider took has yet to start the turn it
+    /// asks for.
+    fn turn_coming(&self, snapshot: &Snapshot) -> bool {
+        !snapshot.exited
+            && self.settling.iter().any(|settling| {
+                matches!(&settling.effect, Effect::Outgoing(outgoing)
+                    if outgoing.in_transcript() && snapshot.turn_generation == outgoing.turns)
+            })
+    }
+
+    /// Puts the next waiting command in flight, if none is, as `snapshot`
+    /// allows. One that acts on the turn waits while a message sent ahead
+    /// of it has yet to start that turn. Once the turn has come and gone, or
+    /// never came, a message that waited for it goes as a message of its
+    /// own, and a request to stop it is dropped: there is nothing to stop.
+    pub(super) fn next(&mut self, snapshot: &Snapshot) -> Option<(u64, Command)> {
         if self.in_flight.is_some() {
             return None;
         }
-        let (pending, command) = self.waiting.pop_front()?;
-        let id = pending.id;
-        self.in_flight = Some(pending);
-        Some((id, command))
+        let coming = self.turn_coming(snapshot);
+        loop {
+            let (pending, command) = self.waiting.front_mut()?;
+            if acts_on_turn(command) {
+                if coming {
+                    pending.held = true;
+                    return None;
+                }
+                if pending.held && !snapshot.busy {
+                    match command {
+                        Command::Prompt { mode, .. } => {
+                            *mode = PromptMode::Send;
+                            if let Some(outgoing) = &mut pending.outgoing {
+                                outgoing.mode = PromptMode::Send;
+                            }
+                        }
+                        _ => {
+                            self.waiting.pop_front();
+                            continue;
+                        }
+                    }
+                }
+            }
+            let (mut pending, command) = self.waiting.pop_front()?;
+            if let Some(outgoing) = &mut pending.outgoing {
+                outgoing.leaves_after(snapshot);
+            }
+            let id = pending.id;
+            self.in_flight = Some(pending);
+            return Some((id, command));
+        }
     }
 
     /// Withdraws the waiting messages, which must not reach the provider
@@ -392,42 +558,74 @@ impl Commands {
                     .into_iter()
                     .map(|(pending, _)| pending),
             )
-            .filter_map(|pending| pending.outgoing)
+            .filter_map(|mut pending| pending.take_unsent())
             .collect()
     }
 
     /// Keeps what an accepted command changed shown until `snapshot`, or a
-    /// later one, shows it.
+    /// later one, shows it. A message the conversation already shows needs
+    /// nothing more.
     pub(super) fn accept(&mut self, pending: &mut PendingCommand, snapshot: &Snapshot) {
-        let after = snapshot.generation;
-        if let Some(outgoing) = pending.outgoing.take().or(pending.carried.take()) {
-            self.settling.push(Settling {
-                effect: Effect::Outgoing(outgoing),
-                after,
-            });
+        let settling = |effect| Settling {
+            effect,
+            after: snapshot.generation,
+            error: snapshot.error.clone(),
+            accepted: Instant::now(),
+        };
+        let message = match pending.outgoing.take() {
+            Some(outgoing) => Some(outgoing).filter(|outgoing| !outgoing.arrived),
+            None => pending.carried.take(),
+        };
+        if let Some(outgoing) = message {
+            self.settling.push(settling(Effect::Outgoing(outgoing)));
         }
         if let Some(choice) = pending.choice.clone() {
-            self.settling.push(Settling {
-                effect: Effect::Choice(choice),
-                after,
-            });
+            self.settling.push(settling(Effect::Choice(choice)));
         }
-        self.settle(snapshot, true);
     }
 
-    /// Lets go of what `snapshot` now shows. A choice the provider took is
-    /// in effect by its next publication, whatever it reports; a message
-    /// waits for its own arrival, as [`Outgoing::settled_by`] describes.
+    /// Lets go of what `snapshot` now shows. A choice the provider took
+    /// waits for the conversation to report it, as
+    /// [`Settling::choice_settled_by`] says; a message for its own arrival,
+    /// as [`Outgoing::settled_by`] does, unless its turn fails first. The
+    /// message in flight stops being drawn once the conversation shows it.
     /// `items` says whether `snapshot` carries its transcript.
-    pub(super) fn settle(&mut self, snapshot: &Snapshot, items: bool) -> bool {
+    pub(super) fn settle(&mut self, snapshot: &Snapshot, items: bool) -> Settled {
+        let mut settled = Settled::default();
         let before = self.settling.len();
-        self.settling.retain(|settling| match &settling.effect {
-            Effect::Choice(choice) => {
-                snapshot.generation <= settling.after && !choice.shown_by(snapshot)
+        for settling in std::mem::take(&mut self.settling) {
+            match settling.effect {
+                Effect::Choice(ref choice) => {
+                    if !settling.choice_settled_by(choice, snapshot) {
+                        self.settling.push(settling);
+                    }
+                }
+                Effect::Outgoing(mut outgoing) => {
+                    if outgoing.settled_by(snapshot, items) {
+                    } else if outgoing.failed_in(snapshot) {
+                        settled.failed.push(outgoing);
+                    } else {
+                        outgoing.busy_seen |= snapshot.busy;
+                        self.settling.push(Settling {
+                            effect: Effect::Outgoing(outgoing),
+                            ..settling
+                        });
+                    }
+                }
             }
-            Effect::Outgoing(outgoing) => !outgoing.settled_by(snapshot, items),
-        });
-        self.settling.len() != before
+        }
+        settled.changed = self.settling.len() != before;
+        if let Some(outgoing) = self
+            .in_flight
+            .as_mut()
+            .and_then(|pending| pending.outgoing.as_mut())
+            && !outgoing.arrived
+            && outgoing.shown_in(snapshot, items)
+        {
+            outgoing.arrived = true;
+            settled.changed = true;
+        }
+        settled
     }
 
     /// The reader's messages this window still shows as on their way, in
@@ -453,21 +651,29 @@ impl Commands {
                 self.in_flight
                     .iter_mut()
                     .chain(self.waiting.iter_mut().map(|(pending, _)| pending))
-                    .filter_map(|pending| pending.outgoing.as_mut()),
+                    .filter_map(|pending| pending.outgoing.as_mut())
+                    .filter(|outgoing| !outgoing.arrived),
             )
     }
 
-    /// The messages the provider has not accepted yet, which closing the
-    /// chat now would leave unsent.
+    /// The messages the provider has not accepted yet, nor the conversation
+    /// shown, which closing the chat now would leave unsent.
     pub(super) fn unsent(&self) -> impl Iterator<Item = &Outgoing> {
-        self.iter().filter_map(|pending| pending.outgoing.as_ref())
+        self.iter()
+            .filter_map(|pending| pending.outgoing.as_ref())
+            .filter(|outgoing| !outgoing.arrived)
     }
 
     /// What the reader had said before the first message the provider has
     /// not accepted, which tells that message apart once it arrives.
     pub(super) fn first_unsent_after(&self) -> SentAfter {
         self.iter()
-            .find(|pending| pending.outgoing.is_some())
+            .find(|pending| {
+                pending
+                    .outgoing
+                    .as_ref()
+                    .is_some_and(|outgoing| !outgoing.arrived)
+            })
             .map(|pending| pending.sent_after.clone())
             .unwrap_or_default()
     }
@@ -516,6 +722,23 @@ impl Runtime {
         self.snapshot.busy
             || self.commands.outgoing().next().is_some()
             || self.commands.carrying_followups()
+    }
+
+    /// Lets go of what `snapshot` shows of this chat's commands, as
+    /// [`Commands::settle`] does. A message whose turn failed before it began
+    /// comes back to the composer, with the reason the conversation gives
+    /// and everything written after it, which cannot be sent ahead of it.
+    /// Whether anything shown changed.
+    pub(super) fn settle_commands(&mut self, snapshot: &Snapshot, items: bool) -> bool {
+        let settled = self.commands.settle(snapshot, items);
+        if settled.failed.is_empty() {
+            return settled.changed;
+        }
+        self.return_followups();
+        let mut messages = settled.failed;
+        messages.extend(self.commands.withdraw_messages());
+        self.restore_outgoing(messages);
+        true
     }
 
     /// Returns messages the provider did not take to the composer, in the
@@ -789,15 +1012,15 @@ mod tests {
             (pending, command)
         };
         let (pending, command) = message(1, "one");
-        assert!(commands.push(pending, command).is_some());
+        assert!(commands.push(pending, command, &snapshot).is_some());
         let refresh = Command::RefreshPermissions;
         assert!(
             commands
-                .push(PendingCommand::new(2, &refresh), refresh.clone())
+                .push(PendingCommand::new(2, &refresh), refresh.clone(), &snapshot)
                 .is_none()
         );
         let (pending, command) = message(3, "three");
-        assert!(commands.push(pending, command).is_none());
+        assert!(commands.push(pending, command, &snapshot).is_none());
         assert!(commands.repeats(&refresh));
         let refused = commands.finish(1).unwrap();
         let withdrawn = commands.withdraw_messages();
@@ -809,7 +1032,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["three"]
         );
-        assert_eq!(commands.next().map(|(id, _)| id), Some(2));
+        assert_eq!(commands.next(&snapshot).map(|(id, _)| id), Some(2));
     }
 
     /// Enter, where it sends, still sends while a command is on its way: a
@@ -857,5 +1080,267 @@ mod tests {
                 runtime.composer.text()
             );
         }
+    }
+
+    /// Publishes the conversation's next report, as `change` has it, and
+    /// lets the window hear of it.
+    fn publish(app: &mut Cagents, card: CardId, change: impl FnOnce(&mut Snapshot)) {
+        let runtime = chat_runtime(app, card);
+        let target = runtime.target;
+        let mut snapshot = (*runtime.snapshot).clone();
+        snapshot.generation += 1;
+        change(&mut snapshot);
+        show_chat_snapshot_for_test(app, card, snapshot);
+        drop(app.update(Message::ChatUi(Action::Wake(target, Wake::Changed))));
+        if let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) {
+            preparation::drain_fixture(runtime);
+        }
+    }
+
+    /// The provider takes a message, then fails to start its turn: Codex
+    /// refusing `turn/start` goes idle with an error and nothing more. The
+    /// message comes back to the composer ahead of what was written since,
+    /// rather than reading as sending for good with the composer steering a
+    /// turn that never began.
+    #[test]
+    fn a_message_whose_turn_fails_to_begin_returns_to_the_composer() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = sending(&mut app, card, "Fix the build");
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .replace_draft(text_editor::Content::with_text("and the tests"));
+        settle(&mut app, card, Ok(()));
+        publish(&mut app, card, |snapshot| {
+            snapshot.busy = true;
+            snapshot.detail = "Waiting for provider turn".into();
+        });
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.commands.outgoing().count(), 1, "still on its way");
+        assert!(runtime.composer.text().trim_end() == "and the tests");
+        publish(&mut app, card, |snapshot| {
+            snapshot.busy = false;
+            snapshot.detail = "Turn failed".into();
+            snapshot.error = Some("Codex RPC error: the thread is closed".into());
+        });
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.commands.outgoing().count(), 0);
+        assert!(!runtime.turn_under_way());
+        assert_eq!(
+            runtime.composer.text().trim_end(),
+            "Fix the build\nand the tests"
+        );
+        assert!(
+            runtime
+                .reported_errors()
+                .any(|error| error.contains("the thread is closed"))
+        );
+        let text = visible_text(&app, card);
+        assert!(!text.iter().any(|line| line == "Sending…"), "{text:?}");
+
+        // A provider that only goes idle, having started the turn, has
+        // taken the message.
+        let target = sending(&mut app, card, "Fix the build");
+        settle(&mut app, card, Ok(()));
+        publish(&mut app, card, |snapshot| {
+            snapshot.busy = true;
+            snapshot.turn_generation += 1;
+        });
+        publish(&mut app, card, |snapshot| {
+            snapshot.busy = false;
+            snapshot.error = Some("Codex RPC error: rate limited".into());
+        });
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert_eq!(runtime.commands.outgoing().count(), 0);
+        assert!(
+            runtime.composer.text().trim_end().is_empty(),
+            "{:?}",
+            runtime.composer.text()
+        );
+    }
+
+    /// A message written while the one before it is still on its way acts
+    /// on the turn that one starts. It waits until the provider shows the
+    /// turn has begun, since Codex refuses to steer a turn it has not
+    /// started; once it has, the message steers it. Should the turn come and
+    /// go first, the message is sent as one of its own.
+    #[test]
+    fn a_message_written_while_one_is_sending_waits_for_its_turn() {
+        for turn_over in [false, true] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat(&mut app, Some(KNOWN_THREAD));
+            let target = chat_runtime(&app, card).target;
+            publish(&mut app, card, |snapshot| {
+                snapshot.capabilities.steer = true;
+            });
+            sending(&mut app, card, "Look at the logs");
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .replace_draft(text_editor::Content::with_text("Then fix them"));
+            drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Steer))));
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(runtime.commands.waiting(), 1);
+            assert!(runtime.composer.text().trim().is_empty());
+
+            settle(&mut app, card, Ok(()));
+            // Accepted, the first has yet to start its turn: the daemon
+            // reads as working, but the provider has no turn to steer.
+            publish(&mut app, card, |snapshot| snapshot.busy = true);
+            let runtime = chat_runtime(&app, card);
+            assert!(runtime.commands.in_flight().is_none(), "held for the turn");
+            assert_eq!(runtime.commands.waiting(), 1);
+            assert!(!runtime.commands.is_idle());
+
+            publish(&mut app, card, |snapshot| {
+                snapshot.turn_generation += 1;
+                snapshot.busy = !turn_over;
+                snapshot.items.push(user_text("u-logs", "Look at the logs"));
+            });
+            let runtime = chat_runtime(&app, card);
+            let in_flight = runtime.commands.in_flight().expect("released");
+            let outgoing = in_flight.outgoing.as_ref().unwrap();
+            assert_eq!(outgoing.prompt.text(), "Then fix them");
+            assert_eq!(
+                outgoing.mode,
+                if turn_over {
+                    PromptMode::Send
+                } else {
+                    PromptMode::Steer
+                },
+                "turn over {turn_over}"
+            );
+            assert_eq!(runtime.commands.waiting(), 0);
+        }
+    }
+
+    /// Changing one's mind about a model while the first change is on its
+    /// way sends each change; only a repeat of the latest is dropped.
+    #[test]
+    fn a_choice_changed_back_is_not_taken_for_a_repeat() {
+        let mut commands = Commands::default();
+        let snapshot = Snapshot::default();
+        let model = |model: &str| Command::SetModel {
+            model: model.into(),
+            reasoning: None,
+        };
+        let mut id = 0;
+        let mut give = |commands: &mut Commands, command: Command| {
+            if commands.repeats(&command) {
+                return false;
+            }
+            id += 1;
+            let _ = commands.push(PendingCommand::new(id, &command), command, &snapshot);
+            true
+        };
+        assert!(give(&mut commands, model("a")));
+        assert!(give(&mut commands, model("b")));
+        assert!(give(&mut commands, model("a")), "a change of mind");
+        assert!(!give(&mut commands, model("a")), "a repeat");
+        assert!(give(&mut commands, Command::RefreshPermissions));
+        assert!(!give(&mut commands, Command::RefreshPermissions));
+        assert_eq!(commands.iter().count(), 4);
+        assert_eq!(commands.chosen_model(), Some(("a", None)));
+    }
+
+    /// A model the provider took reads as chosen until the conversation
+    /// reports it, rather than flicking back to the old one for the reports
+    /// in between; a provider that says it could not make the change undoes
+    /// it.
+    #[test]
+    fn an_accepted_choice_holds_until_the_conversation_reports_it() {
+        let mut commands = Commands::default();
+        let mut snapshot = Snapshot {
+            selected_model: Some("old".into()),
+            ..Snapshot::default()
+        };
+        let choose = |commands: &mut Commands, snapshot: &Snapshot, model: &str| {
+            let command = Command::SetModel {
+                model: model.into(),
+                reasoning: None,
+            };
+            let id = commands.iter().count() as u64 + 1;
+            let (id, _) = commands
+                .push(PendingCommand::new(id, &command), command, snapshot)
+                .unwrap();
+            let mut pending = commands.finish(id).unwrap();
+            commands.accept(&mut pending, snapshot);
+        };
+        choose(&mut commands, &snapshot, "new");
+        for _ in 0..3 {
+            snapshot.generation += 1;
+            let _ = commands.settle(&snapshot, true);
+            assert_eq!(commands.chosen_model(), Some(("new", None)));
+        }
+        snapshot.generation += 1;
+        snapshot.selected_model = Some("new".into());
+        let _ = commands.settle(&snapshot, true);
+        assert_eq!(commands.chosen_model(), None, "the report says it now");
+
+        choose(&mut commands, &snapshot, "other");
+        snapshot.generation += 1;
+        snapshot.error = Some("Claude set_model: unavailable".into());
+        let _ = commands.settle(&snapshot, true);
+        assert_eq!(commands.chosen_model(), None, "the provider refused it");
+    }
+
+    /// A message refused while follow-ups wait behind it brings them back
+    /// too, after it, rather than sending them on without it.
+    #[test]
+    fn a_refused_message_brings_back_the_follow_ups_held_behind_it() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        publish(&mut app, card, |snapshot| {
+            snapshot.capabilities.steer = false;
+            snapshot.capabilities.queue = false;
+        });
+        sending(&mut app, card, "First thought");
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .replace_draft(text_editor::Content::with_text("Second thought"));
+        drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Queue))));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.followups.len(), 1, "held for the next turn");
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .replace_draft(text_editor::Content::with_text("Third"));
+        settle(&mut app, card, Err("Codex is not answering".into()));
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.followups.is_empty());
+        assert!(runtime.commands.is_idle(), "nothing sent in its place");
+        assert_eq!(
+            runtime.composer.text().trim_end(),
+            "First thought\nSecond thought\nThird"
+        );
+    }
+
+    /// Where the conversation shows a message before the provider's answer
+    /// for it has come, as Claude's can, the message is drawn once: the
+    /// conversation's own row replaces the one on its way.
+    #[test]
+    fn a_message_shown_before_its_answer_is_drawn_once() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = sending(&mut app, card, "Summarise the failing tests");
+        publish(&mut app, card, |snapshot| {
+            snapshot.busy = true;
+            snapshot.turn_generation += 1;
+            snapshot
+                .items
+                .push(user_text("sent", "Summarise the failing tests"));
+        });
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.commands.in_flight().is_some(), "not answered yet");
+        assert_eq!(runtime.commands.outgoing().count(), 0);
+        assert!(
+            runtime.local_prompt().is_none(),
+            "the conversation's row is the one drawn"
+        );
+        let text = visible_text(&app, card);
+        assert!(!text.iter().any(|line| line == "Sending…"), "{text:?}");
+        settle(&mut app, card, Ok(()));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert!(runtime.commands.is_idle());
+        assert_eq!(runtime.commands.outgoing().count(), 0);
     }
 }

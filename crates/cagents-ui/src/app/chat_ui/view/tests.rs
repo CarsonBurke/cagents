@@ -1873,7 +1873,8 @@ fn timeline_activity_follows_real_work_and_settles_into_the_finished_stamp() {
         reasoning: None,
     };
     let pending = commands::PendingCommand::new(1, &model);
-    assert!(runtime.commands.push(pending, model).is_some());
+    let snapshot = runtime.snapshot.clone();
+    assert!(runtime.commands.push(pending, model, &snapshot).is_some());
     assert!(!runtime.sending());
     assert_eq!(activity(&runtime), None);
     runtime.commands = commands::Commands::default();
@@ -1883,7 +1884,7 @@ fn timeline_activity_follows_real_work_and_settles_into_the_finished_stamp() {
         mode: PromptMode::Queue,
     };
     let pending = commands::PendingCommand::new(1, &message);
-    assert!(runtime.commands.push(pending, message).is_some());
+    assert!(runtime.commands.push(pending, message, &snapshot).is_some());
     assert!(runtime.sending());
     assert_eq!(
         activity(&runtime),
@@ -6259,6 +6260,49 @@ fn a_stop_waiting_for_confirmation_keeps_its_place_and_says_what_it_stops() {
         assert!(!says(&first));
         assert!(says(&second), "{:?}", second.text);
     }
+}
+
+/// While a message is only on its way, there is no turn in view: the
+/// composer invites a message rather than steering, and offers no Stop
+/// until the conversation shows the turn has begun.
+#[test]
+fn a_message_on_its_way_offers_no_turn_to_steer_or_stop() {
+    let roles = ["chat-submit-0", "chat-stop", "chat-composer"];
+    let (mut runtime, _handle) = furnished_runtime();
+    let message = Command::Prompt {
+        text: "Look at the logs".into(),
+        attachments: Vec::new(),
+        mode: PromptMode::Send,
+    };
+    let mut pending = commands::PendingCommand::new(1, &message);
+    pending.outgoing = Some(commands::Outgoing::new(
+        "Look at the logs".into(),
+        Vec::new(),
+        PromptMode::Send,
+        &runtime.snapshot,
+    ));
+    let snapshot = runtime.snapshot.clone();
+    assert!(runtime.commands.push(pending, message, &snapshot).is_some());
+    assert!(runtime.turn_under_way());
+    runtime.composer = text_editor::Content::with_text("Then fix them");
+    let laid = lay_out(&runtime, 900.0, None, &roles);
+    assert!(laid.controls.contains_key("chat-submit-0"));
+    assert!(!laid.controls.contains_key("chat-stop"));
+    assert_eq!(
+        composer_placeholder(Some(PromptMode::Steer), false),
+        "Message"
+    );
+    assert_eq!(
+        composer_placeholder(Some(PromptMode::Steer), true),
+        "Steer this turn"
+    );
+    assert_eq!(
+        composer_placeholder(Some(PromptMode::Queue), false),
+        "Queue for the next turn"
+    );
+    Arc::make_mut(&mut runtime.snapshot).busy = true;
+    let laid = lay_out(&runtime, 900.0, None, &roles);
+    assert!(laid.controls.contains_key("chat-stop"));
 }
 
 #[test]
