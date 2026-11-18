@@ -919,7 +919,7 @@ impl Cagents {
                 self.update_ui.set_aside = self.update_ui.job.as_ref().map(|job| job.id.clone());
                 self.update_ui.confirmation = None;
                 let selected =
-                    channel.map_or_else(Task::none, |channel| self.select_channel(channel));
+                    channel.map_or_else(Task::none, |channel| self.navigate_to_channel(channel));
                 Task::batch([selected, cosmic::task::message(Message::FocusCard(card))])
             }
             Action::CopyDetails => {

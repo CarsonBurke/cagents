@@ -5940,7 +5940,7 @@ fn placeholders_save_with_the_navigation_that_opens_and_leaves_them() {
     use crate::app::terminal_output_tests::persists;
     let mut app = crate::app::tests::context_inspector_test_app(false);
     let saved = persists();
-    drop(app.navigate_to_worktree(FIXTURE_DIRECTORY.into()));
+    drop(app.navigate_to_worktree(FIXTURE_DIRECTORY.into(), true));
     let automatic = app.workspace.focused().unwrap();
     assert!(app.chat_is_unused_default(automatic));
     assert_eq!(persists(), saved, "opening the placeholder waits");
@@ -5951,17 +5951,17 @@ fn placeholders_save_with_the_navigation_that_opens_and_leaves_them() {
     assert!(written.cards.iter().all(|card| card.id != automatic));
     assert_ne!(written.focused, Some(automatic));
 
-    drop(app.navigate_to_worktree("/workspace/elsewhere".into()));
+    drop(app.navigate_to_worktree("/workspace/elsewhere".into(), true));
     assert!(app.card_state(automatic).is_none());
     assert_eq!(persists(), saved + 1, "discarding the placeholder waits");
     drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
     assert_eq!(persists(), saved + 2);
 
-    drop(app.navigate_to_worktree(FIXTURE_DIRECTORY.into()));
+    drop(app.navigate_to_worktree(FIXTURE_DIRECTORY.into(), true));
     let used = app.workspace.focused().unwrap();
     write(&mut app, used, "keep this message");
     let before = persists();
-    drop(app.navigate_to_worktree("/workspace/elsewhere".into()));
+    drop(app.navigate_to_worktree("/workspace/elsewhere".into(), true));
     assert_eq!(
         persists(),
         before + 1,
