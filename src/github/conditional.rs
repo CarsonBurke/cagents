@@ -45,11 +45,14 @@ pub fn checks_settling(pull_requests: &[PullRequest]) -> bool {
         .any(|pull_request| {
             let checks = pull_request.check_summaries();
             checks.iter().any(|check| check.bucket.0 == "pending")
-                // Pending beyond the checks a rollup lists.
-                || pull_request
-                    .status_check_state
-                    .as_ref()
-                    .is_some_and(|state| matches!(state.0.as_str(), "PENDING" | "EXPECTED"))
+                // Pending beyond the checks a rollup lists. A complete
+                // listing speaks for itself: a required check that never
+                // reports keeps the rollup EXPECTED, not settling.
+                || (pull_request.has_unlisted_checks()
+                    && pull_request
+                        .status_check_state
+                        .as_ref()
+                        .is_some_and(|state| matches!(state.0.as_str(), "PENDING" | "EXPECTED")))
                 || (checks.is_empty() && recent(pull_request))
         })
 }
@@ -205,7 +208,11 @@ mod tests {
             old,
             pending.clone()
         )]));
-        assert!(!checks_settling(&[pull_request("OPEN", &now, passed)]));
+        assert!(!checks_settling(&[pull_request(
+            "OPEN",
+            &now,
+            passed.clone()
+        )]));
         assert!(checks_settling(&[pull_request(
             "OPEN",
             &now,
@@ -218,8 +225,13 @@ mod tests {
         )]));
         assert!(!checks_settling(&[pull_request("MERGED", &now, pending)]));
         // A check still running beyond those the rollup lists.
-        let mut beyond = pull_request("OPEN", old, serde_json::json!([]));
-        beyond.status_check_state = Some(crate::github::RemoteValue("PENDING".into()));
+        let mut beyond = pull_request("OPEN", old, passed);
+        beyond.status_check_state = Some(crate::github::RemoteValue("EXPECTED".into()));
+        // Every check listed: a required check that never reports does not
+        // keep the listing rereading.
+        beyond.status_check_count = Some(1);
+        assert!(!checks_settling(std::slice::from_ref(&beyond)));
+        beyond.status_check_count = Some(130);
         assert!(checks_settling(&[beyond]));
     }
 

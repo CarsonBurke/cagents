@@ -318,7 +318,7 @@ pub(super) fn convert(
     };
     // Only the open listing reads rollups; elsewhere checks are unknown,
     // not absent.
-    let checks = pull_request.status_check_rollup.as_ref().map(|listed| {
+    let checks = pull_request.status_check_rollup.as_ref().map(|_| {
         let mut checks = Checks::default();
         for check in pull_request.check_summaries() {
             match check.work_state() {
@@ -332,9 +332,10 @@ pub(super) fn convert(
         }
         // Checks GitHub did not list still count toward its verdict: one
         // beyond them that fails or runs is at least one more of those.
-        let unlisted = pull_request
-            .status_check_count
-            .is_some_and(|count| count > u64::try_from(listed.len()).unwrap_or(u64::MAX));
+        // GitHub's FAILURE also covers a cancelled or timed-out check, which
+        // a full listing would count as cancelled; past the listed checks
+        // there is no telling, so it counts as the failure GitHub reports.
+        let unlisted = pull_request.has_unlisted_checks();
         match pull_request
             .status_check_state
             .as_ref()
