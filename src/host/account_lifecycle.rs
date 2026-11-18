@@ -2005,6 +2005,9 @@ pub(crate) mod tests {
     #[test]
     fn a_creation_waits_out_an_account_list_held_for_a_moment() {
         let (_root, homes, store, _host, reservation) = creating(Provider::Codex);
+        // Long enough that a slow scheduler cannot outlast it before the
+        // lock is released; only waiting, not its bound, is under test.
+        let reservation = reservation.with_patience(std::time::Duration::from_secs(30));
         let (_, key) = reservation.create.unwrap();
         let target = homes.path(Provider::Codex, key);
         let held = homes.lifecycle_lock().unwrap();
