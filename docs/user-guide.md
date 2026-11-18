@@ -142,10 +142,11 @@ determine which models and permission modes are available.
   when the window is resized. New panes default to half the viewport.
 - Mouse-wheel and trackpad scrolling stay inside pane content; they do not pan
   the workspace strip.
-- **Focus follows mouse** is on by default: resting the pointer on a pane for
-  300 ms focuses it, without scrolling, and puts the keyboard in its message
-  input, terminal or editor. Typing, clicking or dragging during the dwell
-  cancels it, and an open chat menu or picker, dialog or palette suppresses it.
+- **Focus follows mouse** is on by default: moving the pointer into a pane
+  focuses it at once, without scrolling, and puts the keyboard in its message
+  input, terminal or editor. An open chat menu or picker, dialog or palette
+  suppresses it. A pane you only pass over is not marked read; that happens
+  once it stays focused for a moment, as for any other pane.
   Turn it off in **Settings > General > Workspace** to focus panes only by
   clicking them or with pane navigation.
 - Focusing a chat pane in any way, by clicking it, navigating to it, switching

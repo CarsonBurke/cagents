@@ -5584,7 +5584,7 @@ fn a_narrow_pane_closes_its_inspector_and_one_reopened_there_covers_it_until_esc
         "a pane focus request lands in the inspector, not its hidden content"
     );
     assert_eq!(app.focus_pane_keyboard_after_press(card).units(), 0);
-    assert_eq!(app.focus_pane_keyboard_after_rest(card).units(), 0);
+    assert_eq!(app.focus_pane_keyboard_after_entry(card).units(), 0);
     resize(&mut app, 520.0);
     assert!(
         app.pane_inspectors.is_open(card),
@@ -11114,7 +11114,7 @@ pub(super) fn context_inspector_test_app(with_focused_card: bool) -> Cagents {
 }
 
 #[test]
-fn pane_attention_tracks_semantic_events_and_a_rested_hover_acknowledges_only_its_pane() {
+fn pane_attention_tracks_semantic_events_and_a_hover_reads_only_the_pane_it_stays_on() {
     use crate::agent::{Activity, ActivityState, Provider};
     let mut app = context_inspector_test_app(true);
     let window = window::Id::RESERVED;
@@ -11150,12 +11150,36 @@ fn pane_attention_tracks_semantic_events_and_a_rested_hover_acknowledges_only_it
     let offset = app.workspace.camera().offset();
     let _ = app.update(Message::Viewport {
         generation: app.workspace_view_generation,
-        event: WorkspaceViewportEvent::PointerRested(second_id),
+        event: WorkspaceViewportEvent::PointerEntered(second_id),
     });
     assert_eq!(app.workspace.focused(), Some(second_id));
     assert_eq!(app.workspace.camera().offset(), offset);
-    // Only the pane the pointer rested on is read; the ones it crossed to
-    // get there are the widget's to filter out, and never arrive here.
+    // Hover focus is immediate, but passing over a pane does not read it.
+    assert!(app.sidebar_state.has_card_update(second_id));
+    // The pointer moves on to the third pane before the attention dwell
+    // ends, and that dwell's timer, stale now, reads neither.
+    let stale = app.attention_focus_epoch;
+    let _ = app.update(Message::Viewport {
+        generation: app.workspace_view_generation,
+        event: WorkspaceViewportEvent::PointerEntered(third_id),
+    });
+    assert_eq!(app.workspace.focused(), Some(third_id));
+    drop(app.update(Message::AcknowledgeVisiblePane {
+        card: second_id,
+        epoch: stale,
+    }));
+    assert!(app.sidebar_state.has_card_update(second_id));
+    assert!(app.sidebar_state.has_card_update(third_id));
+    // Back on the second pane, and it stays there for the dwell.
+    let _ = app.update(Message::Viewport {
+        generation: app.workspace_view_generation,
+        event: WorkspaceViewportEvent::PointerEntered(second_id),
+    });
+    drop(app.update(Message::AcknowledgeVisiblePane {
+        card: second_id,
+        epoch: app.attention_focus_epoch,
+    }));
+    // Only the pane the pointer stayed on is read.
     assert!(!app.sidebar_state.has_card_update(second_id));
     assert!(app.sidebar_state.has_card_update(third_id));
     app.observe_agent_activity_for_card(second_id, activity(ActivityState::Waiting));
@@ -11163,7 +11187,7 @@ fn pane_attention_tracks_semantic_events_and_a_rested_hover_acknowledges_only_it
     app.settings.focus_follows_mouse = false;
     let _ = app.update(Message::Viewport {
         generation: app.workspace_view_generation,
-        event: WorkspaceViewportEvent::PointerRested(third_id),
+        event: WorkspaceViewportEvent::PointerEntered(third_id),
     });
     assert_eq!(app.workspace.focused(), Some(second_id));
     assert!(app.sidebar_state.has_card_update(third_id));
@@ -11191,7 +11215,7 @@ fn focus_only_changes_are_saved_once_per_burst() {
     for card in [second_id, third_id] {
         let _ = app.update(Message::Viewport {
             generation: app.workspace_view_generation,
-            event: WorkspaceViewportEvent::PointerRested(card),
+            event: WorkspaceViewportEvent::PointerEntered(card),
         });
         assert_eq!(app.durable.focused, Some(card));
         assert!(
@@ -11205,7 +11229,7 @@ fn focus_only_changes_are_saved_once_per_burst() {
     // A change that must be saved now takes the pending focus with it.
     let _ = app.update(Message::Viewport {
         generation: app.workspace_view_generation,
-        event: WorkspaceViewportEvent::PointerRested(second_id),
+        event: WorkspaceViewportEvent::PointerEntered(second_id),
     });
     assert!(app.navigation_save.is_some());
     let _ = app.apply_viewport(ViewportUpdate::unchanged(), false, DurableChange::Content);

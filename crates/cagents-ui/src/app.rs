@@ -1618,7 +1618,7 @@ impl Default for PanePresence {
 
 /// How long a change of where this window is - its focus, channel or
 /// worktree - waits to be saved. Navigation comes in bursts: a held key, a
-/// pointer resting on one pane after another, a person clicking down the
+/// pointer moving across one pane after another, a person clicking down the
 /// sidebar. Each save projects every shared view and copies the workspace and
 /// every chat draft on the UI thread, so a burst is saved once, at its first
 /// move plus this delay. Any other save in between carries it along, and
@@ -1694,6 +1694,14 @@ struct ReplicaSnapshotDebt {
     registry: uuid::Uuid,
     workspace: crate::model::WorkspaceId,
     writer: crate::session::WriterIdentity,
+}
+
+/// Whether a focus change reads the newly focused pane's update at once, or
+/// leaves that to the attention dwell once the pane has stayed visible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FocusRead {
+    Now,
+    AfterDwell,
 }
 
 /// What an update changed in the durable workspace beside focus, which decides
@@ -2200,10 +2208,10 @@ fn update_workspace_viewport(
         }
         WorkspaceViewportEvent::Resized(width) => (workspace.resize_viewport(width), true),
         // Pointer activation hands the keyboard over itself, through
-        // `focus_pane_keyboard_after_rest` and `_after_press`, which leave a
+        // `focus_pane_keyboard_after_entry` and `_after_press`, which leave a
         // control the person chose where it is. The workspace's own request
         // would focus the pane's control regardless.
-        WorkspaceViewportEvent::PointerRested(card) => {
+        WorkspaceViewportEvent::PointerEntered(card) => {
             let update = workspace
                 .focus_without_scrolling(card)
                 .unwrap_or_else(|_| ViewportUpdate::unchanged());
@@ -3198,7 +3206,7 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
             | Message::FocusAdjacent(_)
             | Message::Viewport {
                 event: WorkspaceViewportEvent::PointerFocused { .. }
-                    | WorkspaceViewportEvent::PointerRested(_),
+                    | WorkspaceViewportEvent::PointerEntered(_),
                 ..
             }
             | Message::ToggleContextInspector
@@ -10093,10 +10101,10 @@ impl Cagents {
         .map(cosmic::Action::App)
     }
 
-    /// The keyboard after the pointer rested on `card` and focused it. It
+    /// The keyboard after the pointer moved into `card` and focused it. It
     /// comes from another pane or from nowhere; a field outside the strip,
     /// such as sidebar search, keeps what is being typed into it.
-    fn focus_pane_keyboard_after_rest(&mut self, card: CardId) -> Task<Message> {
+    fn focus_pane_keyboard_after_entry(&mut self, card: CardId) -> Task<Message> {
         if !self.card_holds_keyboard(card) {
             return Task::none();
         }
@@ -10784,6 +10792,16 @@ impl Cagents {
         synchronize_scroll: bool,
         durable_change: DurableChange,
     ) -> Task<Message> {
+        self.apply_viewport_reading(update, synchronize_scroll, durable_change, FocusRead::Now)
+    }
+
+    fn apply_viewport_reading(
+        &mut self,
+        update: ViewportUpdate,
+        synchronize_scroll: bool,
+        durable_change: DurableChange,
+        read: FocusRead,
+    ) -> Task<Message> {
         // A pane resized too narrow for its inspector closes it before it is
         // drawn squeezed.
         self.sync_pane_inspectors();
@@ -10799,7 +10817,7 @@ impl Cagents {
             Arc::make_mut(&mut self.durable).focused = focused;
         }
         let mut tasks = Vec::new();
-        if focus_changed {
+        if focus_changed && read == FocusRead::Now {
             tasks.push(self.acknowledge_active_pane());
         }
         if self.chrome_ui.tabs_focus != focused {
@@ -17242,12 +17260,12 @@ impl Application for Cagents {
                 if matches!(
                     event,
                     WorkspaceViewportEvent::PointerFocused { .. }
-                        | WorkspaceViewportEvent::PointerRested(_)
+                        | WorkspaceViewportEvent::PointerEntered(_)
                 ) && self.workspace_inputs_blocked()
                 {
                     return Task::none();
                 }
-                if matches!(event, WorkspaceViewportEvent::PointerRested(_))
+                if matches!(event, WorkspaceViewportEvent::PointerEntered(_))
                     && (!self.settings.focus_follows_mouse
                         || self.chat_menu_open()
                         || self.device_ui.menu_open)
@@ -17257,12 +17275,21 @@ impl Application for Cagents {
                 let previous_width = self.workspace.viewport_width();
                 let (update, synchronize_scroll) =
                     update_workspace_viewport(&mut self.workspace, event);
-                let task = self.apply_viewport(update, false, DurableChange::None);
+                // The pointer passing over a pane on its way elsewhere focuses
+                // it, but has not read it: its update is read once it stays
+                // visible for the attention dwell, like any other pane.
+                let read = if matches!(event, WorkspaceViewportEvent::PointerEntered(_)) {
+                    FocusRead::AfterDwell
+                } else {
+                    FocusRead::Now
+                };
+                let task =
+                    self.apply_viewport_reading(update, false, DurableChange::None, read);
                 let keyboard = match event {
-                    WorkspaceViewportEvent::PointerRested(card)
+                    WorkspaceViewportEvent::PointerEntered(card)
                         if self.workspace.focused() == Some(card) =>
                     {
-                        self.focus_pane_keyboard_after_rest(card)
+                        self.focus_pane_keyboard_after_entry(card)
                     }
                     // Another button's press, such as one opening a context
                     // menu over selected text, leaves the keyboard alone.
