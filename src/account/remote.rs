@@ -35,13 +35,17 @@ pub enum Operation {
 }
 
 #[cfg(feature = "host")]
-pub(crate) fn affected_account(operation: &Operation) -> Result<Option<super::Account>, String> {
-    use super::{Account, home::Homes, registry::Store};
+pub(crate) fn affected_account(
+    operation: &Operation,
+) -> Result<Option<super::Account>, LifecycleError> {
+    use super::{
+        Account,
+        home::Homes,
+        registry::{LIST_PATIENCE, Store, patiently},
+    };
     let homes = Homes::installation().ok_or("Remote account storage is unavailable")?;
-    let registry = Store::installation()
-        .ok_or("Remote account registry is unavailable")?
-        .try_load()
-        .map_err(|error| error.to_string())?;
+    let store = Store::installation().ok_or("Remote account registry is unavailable")?;
+    let registry = patiently(LIST_PATIENCE, || store.try_load())?;
     match operation {
         Operation::Register { provider, key } | Operation::Abandon { provider, key } => {
             let pending = registry
@@ -102,7 +106,9 @@ pub(crate) fn affected_account(operation: &Operation) -> Result<Option<super::Ac
 }
 
 #[cfg(feature = "host")]
-pub(crate) fn affected_accounts(operation: &Operation) -> Result<Vec<super::Account>, String> {
+pub(crate) fn affected_accounts(
+    operation: &Operation,
+) -> Result<Vec<super::Account>, LifecycleError> {
     let provider = match operation {
         Operation::Create { provider, .. }
         | Operation::Link { provider, .. }
@@ -178,8 +184,36 @@ pub(crate) enum LifecycleError {
     /// the same request can be sent again.
     #[error("{}", crate::terminal_ipc::DAEMON_BUSY)]
     Busy,
+    /// Another process held the account list's lock past the daemon's
+    /// patience. Nothing changed, so the same request can be sent again.
+    #[error(transparent)]
+    ListHeld(super::registry::ListHeld),
     #[error("{0}")]
     Failed(String),
+}
+
+#[cfg(feature = "host")]
+impl From<std::io::Error> for LifecycleError {
+    fn from(error: std::io::Error) -> Self {
+        match super::registry::ListHeld::of(&error) {
+            Some(held) => Self::ListHeld(held),
+            None => Self::Failed(error.to_string()),
+        }
+    }
+}
+
+#[cfg(feature = "host")]
+impl From<String> for LifecycleError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+#[cfg(feature = "host")]
+impl From<&str> for LifecycleError {
+    fn from(message: &str) -> Self {
+        Self::Failed(message.into())
+    }
 }
 
 /// The opaque host reservation remains borrowed throughout provider I/O.
@@ -197,7 +231,8 @@ pub(crate) fn execute_reserved(
 }
 
 /// Only creation can be refused as busy: it alone waits for the control
-/// gate's writer. Every other operation fails in its own words.
+/// gate's writer. Any operation can find the account list held by another
+/// process for longer than it waits; every other failure is in its own words.
 #[cfg(feature = "host")]
 fn execute_at(
     operation: Operation,
@@ -210,7 +245,7 @@ fn execute_at(
             provider,
             copy_codex_config,
         } => create(provider, copy_codex_config, reservation, &homes, &store),
-        operation => change(operation, reservation, homes, store).map_err(LifecycleError::Failed),
+        operation => change(operation, reservation, homes, store),
     }
 }
 
@@ -229,7 +264,7 @@ fn create(
         .enable_all()
         .build()
         .map_err(|error| Failed(error.to_string()))?;
-    reservation.verify().map_err(Failed)?;
+    reservation.verify()?;
     if !Account::PROVIDERS.contains(&provider) {
         return Err(Failed("Omp manages its own logins".into()));
     }
@@ -252,7 +287,7 @@ fn create(
         )
         .map_err(|error| match EnrollmentRefused::of(&error) {
             Some(EnrollmentRefused::Busy) => LifecycleError::Busy,
-            _ => Failed(error.to_string()),
+            _ => LifecycleError::from(error),
         })?;
     let account = Account::managed(provider, key, home.clone());
     let recipe = login_recipe_with_path(&account, program, search.as_deref()).map_err(|error| {
@@ -270,7 +305,7 @@ fn change(
     reservation: &crate::host::AccountReservation,
     homes: super::home::Homes,
     store: super::registry::Store,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, LifecycleError> {
     use super::{
         Account, UsageStatus,
         probe::{self, Outcome},
@@ -279,8 +314,7 @@ fn change(
     let now = crate::chat::now_ms().unwrap_or_default();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        .build()
-        .map_err(|error| error.to_string())?;
+        .build()?;
     reservation.verify()?;
     match operation {
         Operation::Create { .. } => unreachable!("execute_at creates accounts itself"),
@@ -296,19 +330,27 @@ fn change(
                 super::expand_linked_home(path.trim(), std::env::var_os("HOME").as_deref())?;
             let path = reservation.link_home(provider, key, &chosen)?;
             crate::secure_file::validate_owned_directory(&path)
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| LifecycleError::Failed(error.to_string()))?;
             let system = Account::system(provider).resolved_home();
             let (registry, result) = reservation.commit(|| {
                 let _lifecycle = homes.try_lifecycle_lock()?;
                 store.try_update_reserved(reservation, |registry| {
-                    registry.link(provider, key, path, system.as_deref(), Some(&homes), now)
+                    registry.link(
+                        provider,
+                        key,
+                        path.clone(),
+                        system.as_deref(),
+                        Some(&homes),
+                        now,
+                    )
                 })
             })?;
             let key = result?;
-            serde_json::to_value((registry, key)).map_err(|error| error.to_string())
+            serde_json::to_value((registry, key))
+                .map_err(|error| LifecycleError::Failed(error.to_string()))
         }
         Operation::Register { provider, key } => {
-            let registry = store.try_load().map_err(|error| error.to_string())?;
+            let registry = reservation.patiently(|| store.try_load())?;
             // A transport interruption can lose a successful reply. Retrying
             // the same pending key must not delete or replace that login.
             if registry.find(key).is_some_and(|registered| {
@@ -319,7 +361,7 @@ fn change(
                     identity: None,
                     snapshot: None,
                 })
-                .map_err(|error| error.to_string());
+                .map_err(|error| LifecycleError::Failed(error.to_string()));
             }
             if !registry
                 .pending()
@@ -334,7 +376,7 @@ fn change(
                     Outcome::Answered {
                         identity, snapshot, ..
                     } => (identity, snapshot),
-                    Outcome::Failed(error) => return Err(error),
+                    Outcome::Failed(error) => return Err(error.into()),
                     Outcome::Busy => {
                         return Err(
                             "The provider is already verifying another account; try again".into(),
@@ -349,7 +391,7 @@ fn change(
                     store.try_update_reserved(reservation, |registry| registry.release(key, &homes))
                 })?;
                 return serde_json::to_value(Settled::Abandoned(Some(registry)))
-                    .map_err(|error| error.to_string());
+                    .map_err(|error| LifecycleError::Failed(error.to_string()));
             }
             // The pending-home probe may have taken a long time. The live
             // token fences daemon ingress, but an external rename/replacement
@@ -380,7 +422,12 @@ fn change(
                 added_at: now,
             };
             let (registry, registered) = reservation.commit(|| {
-                store.try_register_pending_reserved(reservation, &homes, managed, &system_identity)
+                store.try_register_pending_reserved(
+                    reservation,
+                    &homes,
+                    managed.clone(),
+                    &system_identity,
+                )
             })?;
             let settled = match registered {
                 Ok(()) => Settled::Registered {
@@ -400,10 +447,10 @@ fn change(
                     }
                 }
             };
-            serde_json::to_value(settled).map_err(|error| error.to_string())
+            serde_json::to_value(settled).map_err(|error| LifecycleError::Failed(error.to_string()))
         }
         Operation::Abandon { provider, key } => {
-            let registry = store.try_load().map_err(|error| error.to_string())?;
+            let registry = reservation.patiently(|| store.try_load())?;
             if !registry
                 .pending()
                 .iter()
@@ -415,15 +462,16 @@ fn change(
                 store.try_update_reserved(reservation, |registry| registry.release(key, &homes))
             })?;
             serde_json::to_value(Settled::Abandoned(Some(registry)))
-                .map_err(|error| error.to_string())
+                .map_err(|error| LifecycleError::Failed(error.to_string()))
         }
         Operation::Restore { provider, key } => {
             let restored = restore_reserved(&runtime, reservation, &homes, &store, provider, key)
-                .map_err(|failure| failure.message)?;
-            serde_json::to_value(restored).map_err(|error| error.to_string())
+                .map_err(|failure| failure.error)?;
+            serde_json::to_value(restored)
+                .map_err(|error| LifecycleError::Failed(error.to_string()))
         }
         Operation::Remove { id } => {
-            let registry = store.try_load().map_err(|error| error.to_string())?;
+            let registry = reservation.patiently(|| store.try_load())?;
             let account = registry
                 .accounts(Some(&homes))
                 .into_iter()
@@ -443,7 +491,8 @@ fn change(
             } else {
                 return Err("File deletion is not available in this build. Your account and its files were kept.".into());
             };
-            serde_json::to_value((registry, error)).map_err(|error| error.to_string())
+            serde_json::to_value((registry, error))
+                .map_err(|error| LifecycleError::Failed(error.to_string()))
         }
     }
 }
@@ -452,7 +501,7 @@ fn change(
 #[cfg(feature = "host")]
 #[derive(Debug)]
 pub(crate) struct RestoreFailure {
-    pub message: String,
+    pub error: LifecycleError,
     /// The home was examined and stays as it is: asking again would get the
     /// same answer. Otherwise something was busy or did not answer.
     pub settled: bool,
@@ -462,17 +511,17 @@ pub(crate) struct RestoreFailure {
 impl RestoreFailure {
     fn settled(message: impl Into<String>) -> Self {
         Self {
-            message: message.into(),
+            error: LifecycleError::Failed(message.into()),
             settled: true,
         }
     }
 }
 
 #[cfg(feature = "host")]
-impl<T: Into<String>> From<T> for RestoreFailure {
-    fn from(message: T) -> Self {
+impl<T: Into<LifecycleError>> From<T> for RestoreFailure {
+    fn from(error: T) -> Self {
         Self {
-            message: message.into(),
+            error: error.into(),
             settled: false,
         }
     }
@@ -523,7 +572,7 @@ fn restore_reserved(
     if !Account::PROVIDERS.contains(&provider) {
         return Err(RestoreFailure::settled("Omp manages its own logins"));
     }
-    let registry = store.try_load().map_err(|error| error.to_string())?;
+    let registry = reservation.patiently(|| store.try_load())?;
     if registry.is_newer() {
         return Err(RestoreFailure::settled(
             "The account list was saved by a newer cagents, so this version leaves it unchanged",
@@ -608,8 +657,8 @@ fn restore_reserved(
             .and_then(|identity| identity.organization.clone()),
         added_at,
     };
-    let (registry, restored) =
-        reservation.commit(|| store.try_restore_reserved(reservation, homes, managed, &system))?;
+    let (registry, restored) = reservation
+        .commit(|| store.try_restore_reserved(reservation, homes, managed.clone(), &system))?;
     Ok(RestoredHome { registry, restored })
 }
 
@@ -835,6 +884,199 @@ mod tests {
             std::fs::read(linked.join("history")).unwrap(),
             b"keep linked history"
         );
+    }
+
+    /// A pending sign-in, a linked account and a home to link, each under
+    /// its own reservation with `patience` for a held account-list lock.
+    struct HeldList {
+        _root: tempfile::TempDir,
+        homes: Homes,
+        store: Store,
+        host: crate::host::SharedHost,
+        pending: (uuid::Uuid, std::path::PathBuf),
+        linked: Account,
+        unlinked: std::path::PathBuf,
+    }
+
+    impl HeldList {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let homes = Homes::at(root.path().join("homes"));
+            let store = Store::at(root.path().join("registry"));
+            let pending = store
+                .create_pending(&homes, Provider::Codex, 1, || {
+                    homes.create(Provider::Codex, None)
+                })
+                .unwrap();
+            let linked_home = root.path().join("linked");
+            let unlinked = root.path().join("unlinked");
+            std::fs::create_dir(&linked_home).unwrap();
+            std::fs::create_dir(&unlinked).unwrap();
+            let linked_key = uuid::Uuid::new_v4();
+            store
+                .update(|registry| {
+                    registry.link(
+                        Provider::Codex,
+                        linked_key,
+                        linked_home.clone(),
+                        None,
+                        Some(&homes),
+                        1,
+                    )
+                })
+                .unwrap()
+                .1
+                .unwrap();
+            Self {
+                homes,
+                store,
+                host: crate::host::AccountReservation::test_host(),
+                pending,
+                linked: Account::linked(Provider::Codex, linked_key, linked_home),
+                unlinked,
+                _root: root,
+            }
+        }
+
+        /// Every operation that changes this list, with what it reserves.
+        fn operations(&self) -> Vec<(Operation, Vec<Account>)> {
+            let (key, home) = self.pending.clone();
+            let pending = Account::managed(Provider::Codex, key, home);
+            let link_key = uuid::Uuid::new_v4();
+            vec![
+                (
+                    Operation::Register {
+                        provider: Provider::Codex,
+                        key,
+                    },
+                    vec![pending.clone(), Account::system(Provider::Codex)],
+                ),
+                (
+                    Operation::Abandon {
+                        provider: Provider::Codex,
+                        key,
+                    },
+                    vec![pending],
+                ),
+                (
+                    Operation::Remove {
+                        id: self.linked.id(),
+                    },
+                    vec![self.linked.clone()],
+                ),
+                (
+                    Operation::Link {
+                        provider: Provider::Codex,
+                        key: link_key,
+                        path: self.unlinked.display().to_string(),
+                    },
+                    vec![Account::linked(
+                        Provider::Codex,
+                        link_key,
+                        self.unlinked.clone(),
+                    )],
+                ),
+                (
+                    Operation::Restore {
+                        provider: Provider::Codex,
+                        key: uuid::Uuid::new_v4(),
+                    },
+                    Vec::new(),
+                ),
+            ]
+        }
+
+        fn reserve(
+            &self,
+            accounts: &[Account],
+            patience: std::time::Duration,
+        ) -> crate::host::AccountReservation {
+            crate::host::AccountReservation::test_install(
+                &self.host,
+                accounts,
+                self.store.clone(),
+                &self.homes,
+            )
+            .unwrap()
+            .with_patience(patience)
+        }
+
+        fn execute(
+            &self,
+            operation: Operation,
+            reservation: &crate::host::AccountReservation,
+        ) -> Result<serde_json::Value, LifecycleError> {
+            execute_at(
+                operation,
+                reservation,
+                self.homes.clone(),
+                self.store.clone(),
+            )
+        }
+    }
+
+    #[test]
+    fn a_held_account_list_refuses_every_change_retryably_and_changes_nothing() {
+        use crate::account::registry::ListHeld;
+        let list = HeldList::new();
+        let before = list.store.load().unwrap();
+        let patience = std::time::Duration::from_millis(30);
+        for (operation, accounts) in list.operations() {
+            let reservation = list.reserve(&accounts, patience);
+            let held = list.store.lock().unwrap();
+            let started = std::time::Instant::now();
+            let error = list.execute(operation.clone(), &reservation).unwrap_err();
+            assert_eq!(
+                error,
+                LifecycleError::ListHeld(ListHeld::Registry),
+                "{operation:?}"
+            );
+            assert!(
+                started.elapsed() >= patience,
+                "{operation:?} asked only once"
+            );
+            drop(held);
+            assert_eq!(list.store.load().unwrap(), before, "{operation:?}");
+        }
+        // The lifecycle lock is taken only by the changes that need it, after
+        // their reservation was verified: linking a home here.
+        let (operation, accounts) = list
+            .operations()
+            .into_iter()
+            .find(|(operation, _)| matches!(operation, Operation::Link { .. }))
+            .unwrap();
+        let reservation = list.reserve(&accounts, patience);
+        let held = list.homes.lifecycle_lock().unwrap();
+        let error = list.execute(operation.clone(), &reservation).unwrap_err();
+        assert_eq!(error, LifecycleError::ListHeld(ListHeld::Lifecycle));
+        assert_eq!(list.store.load().unwrap(), before);
+        drop(held);
+        // Nothing was changed, so the same request succeeds once it is free.
+        let Operation::Link { key, .. } = operation else {
+            unreachable!()
+        };
+        list.execute(operation, &reservation).unwrap();
+        assert!(list.store.load().unwrap().find(key).is_some());
+    }
+
+    #[test]
+    fn a_change_waits_out_an_account_list_held_for_a_moment() {
+        let list = HeldList::new();
+        let (operation, accounts) = list
+            .operations()
+            .into_iter()
+            .find(|(operation, _)| matches!(operation, Operation::Abandon { .. }))
+            .unwrap();
+        let reservation = list.reserve(&accounts, std::time::Duration::from_secs(30));
+        let held = list.store.lock().unwrap();
+        std::thread::scope(|scope| {
+            let abandoning = scope.spawn(|| list.execute(operation, &reservation));
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(!abandoning.is_finished(), "the change did not wait");
+            drop(held);
+            abandoning.join().unwrap().unwrap();
+        });
+        assert!(list.store.load().unwrap().pending().is_empty());
     }
 
     #[test]
