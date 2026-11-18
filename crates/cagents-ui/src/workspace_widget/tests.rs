@@ -198,7 +198,8 @@ fn card_cursor_uses_translated_child_coordinates_without_reviving_blocked_hover(
         .on_press("click");
     let row =
         cosmic::widget::row::with_children(vec![editor.into(), button.into()]).height(Length::Fill);
-    let mut surface: Element<'_, &str> = CardSurface::new(row).on_pointer_rest(Some("rest")).into();
+    let mut surface: Element<'_, &str> =
+        CardSurface::new(row).on_pointer_enter(Some("enter")).into();
     let mut tree = Tree::new(&surface);
     let node = surface
         .as_widget_mut()
@@ -261,7 +262,7 @@ fn card_cursor_uses_translated_child_coordinates_without_reviving_blocked_hover(
 /// Drives one [`CardSurface`] spanning x 100..300 of the window, beneath
 /// the window's input trace, in the window's own coordinates unless a
 /// sample says otherwise.
-struct RestProbe {
+struct EntryProbe {
     renderer: Renderer,
     surface: Element<'static, &'static str>,
     tree: Tree,
@@ -272,7 +273,7 @@ struct RestProbe {
     cursor: mouse::Cursor,
 }
 
-impl RestProbe {
+impl EntryProbe {
     const OUTSIDE: Point = Point::new(50.0, 40.0);
     const INSIDE: Point = Point::new(150.0, 40.0);
     /// Where the pointer is over the next pane along.
@@ -299,7 +300,7 @@ impl RestProbe {
             )
             .traced_by(&input)
             .on_pointer_focus("click", "other click")
-            .on_pointer_rest(Some("rest")),
+            .on_pointer_enter(Some("enter")),
             &input,
         );
         let mut tree = Tree::new(&surface);
@@ -371,12 +372,11 @@ impl RestProbe {
         );
     }
 
-    /// Frames before and after the dwell elapses, and everything the pane
-    /// published since the last look.
-    fn rest(&mut self) -> Vec<&'static str> {
+    /// The next frames, and everything the pane published since the last
+    /// look.
+    fn settle(&mut self) -> Vec<&'static str> {
         self.frame(Duration::ZERO);
-        self.frame(HOVER_ACTIVATION_DWELL * 2);
-        self.frame(HOVER_ACTIVATION_DWELL * 3);
+        self.frame(Duration::from_millis(16));
         mem::take(&mut self.messages)
     }
 }
@@ -386,83 +386,86 @@ fn moved(position: Point) -> Event {
 }
 
 #[test]
-fn a_pane_activates_on_hover_only_after_the_pointer_crosses_in_and_rests() {
-    let mut probe = RestProbe::new();
-    probe.move_to(RestProbe::OUTSIDE);
-    probe.move_to(RestProbe::INSIDE);
+fn a_pane_activates_at_the_next_frame_once_the_pointer_crosses_in() {
+    let mut probe = EntryProbe::new();
+    probe.move_to(EntryProbe::OUTSIDE);
+    probe.move_to(EntryProbe::INSIDE);
+    assert!(
+        probe.messages.is_empty(),
+        "reported at the frame, once every widget has seen the motion"
+    );
     probe.frame(Duration::ZERO);
-    assert!(probe.messages.is_empty(), "activation waits for the dwell");
-    // Moving about inside the pane keeps the dwell it started, and the
-    // rest is reported once however many frames follow.
+    assert_eq!(mem::take(&mut probe.messages), ["enter"]);
+    // Moving about inside the pane is no new entry.
     probe.move_to(Point::new(180.0, 60.0));
-    assert_eq!(probe.rest(), ["rest"]);
+    assert!(probe.settle().is_empty());
 
-    // Sweeping through on the way somewhere else activates nothing.
-    let mut probe = RestProbe::new();
-    probe.move_to(RestProbe::OUTSIDE);
-    probe.move_to(RestProbe::INSIDE);
-    probe.move_to(RestProbe::NEIGHBOUR);
-    assert!(probe.rest().is_empty());
+    // Leaving again before the frame is drawn activates nothing.
+    let mut probe = EntryProbe::new();
+    probe.move_to(EntryProbe::OUTSIDE);
+    probe.move_to(EntryProbe::INSIDE);
+    probe.move_to(EntryProbe::NEIGHBOUR);
+    assert!(probe.settle().is_empty());
 }
 
 #[test]
-fn typing_or_clicking_before_the_dwell_keeps_focus_where_it_is() {
+fn typing_or_clicking_before_the_next_frame_keeps_focus_where_it_is() {
     let key = Event::Keyboard(key_press(
         "a",
         keyboard::key::Code::KeyA,
         keyboard::Modifiers::empty(),
         false,
     ));
-    let mut probe = RestProbe::new();
-    probe.move_to(RestProbe::OUTSIDE);
-    probe.move_to(RestProbe::INSIDE);
-    probe.send(key.clone(), mouse::Cursor::Available(RestProbe::INSIDE));
+    let mut probe = EntryProbe::new();
+    probe.move_to(EntryProbe::OUTSIDE);
+    probe.move_to(EntryProbe::INSIDE);
+    probe.send(key.clone(), mouse::Cursor::Available(EntryProbe::INSIDE));
     // Further drift inside the pane does not re-arm what typing cancelled.
     probe.move_to(Point::new(160.0, 40.0));
-    assert!(probe.rest().is_empty());
+    assert!(probe.settle().is_empty());
 
     // A shortcut the workspace captures, or a key a focused input
     // elsewhere takes, never reaches the pane, and cancels it all the same.
-    let mut probe = RestProbe::new();
-    probe.move_to(RestProbe::OUTSIDE);
-    probe.move_to(RestProbe::INSIDE);
+    let mut probe = EntryProbe::new();
+    probe.move_to(EntryProbe::OUTSIDE);
+    probe.move_to(EntryProbe::INSIDE);
     probe.elsewhere(&key);
-    assert!(probe.rest().is_empty());
+    assert!(probe.settle().is_empty());
 
-    let mut probe = RestProbe::new();
-    probe.move_to(RestProbe::OUTSIDE);
-    probe.move_to(RestProbe::INSIDE);
+    let mut probe = EntryProbe::new();
+    probe.move_to(EntryProbe::OUTSIDE);
+    probe.move_to(EntryProbe::INSIDE);
     probe.send(
         Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
-        mouse::Cursor::Available(RestProbe::INSIDE),
+        mouse::Cursor::Available(EntryProbe::INSIDE),
     );
-    // The click activates the pane itself; the dwell adds nothing.
-    assert_eq!(probe.rest(), ["click"]);
+    // The click activates the pane itself; the entry adds nothing.
+    assert_eq!(probe.settle(), ["click"]);
 }
 
-/// The pane was entered, but by the time the dwell ends it is no longer
-/// where the pointer rests.
+/// The pane was entered, but by the next frame it is no longer where the
+/// pointer is.
 #[test]
-fn a_pane_that_left_the_pointer_during_the_dwell_is_not_activated() {
+fn a_pane_that_left_the_pointer_before_the_next_frame_is_not_activated() {
     // Keyboard navigation or a new pane moves the strip, and the pointer,
     // which never moved, now rests over a neighbour.
-    let mut probe = RestProbe::new();
-    probe.move_to(RestProbe::OUTSIDE);
-    probe.move_to(RestProbe::INSIDE);
+    let mut probe = EntryProbe::new();
+    probe.move_to(EntryProbe::OUTSIDE);
+    probe.move_to(EntryProbe::INSIDE);
     probe.frame_with(
-        HOVER_ACTIVATION_DWELL * 2,
-        mouse::Cursor::Available(RestProbe::NEIGHBOUR),
+        Duration::ZERO,
+        mouse::Cursor::Available(EntryProbe::NEIGHBOUR),
     );
     // Nor does it activate once scrolled back under the pointer.
-    assert!(probe.rest().is_empty());
+    assert!(probe.settle().is_empty());
 
     // The pane scrolled out of view, where it receives no frames, and its
     // first one back comes long after the pointer stopped over it.
-    let mut probe = RestProbe::new();
-    probe.move_to(RestProbe::OUTSIDE);
-    probe.move_to(RestProbe::INSIDE);
-    probe.frame(HOVER_ACTIVATION_DWELL + HOVER_ACTIVATION_LATENESS * 2);
-    assert!(probe.rest().is_empty());
+    let mut probe = EntryProbe::new();
+    probe.move_to(EntryProbe::OUTSIDE);
+    probe.move_to(EntryProbe::INSIDE);
+    probe.frame(HOVER_ACTIVATION_LATENESS * 2);
+    assert!(probe.settle().is_empty());
 }
 
 /// A pane that comes out from under something the pointer was already
@@ -471,54 +474,54 @@ fn a_pane_that_left_the_pointer_during_the_dwell_is_not_activated() {
 fn uncovering_a_pane_under_a_still_pointer_is_not_an_entry() {
     // A dropdown drawn over the pane leaves it the motions beneath, but
     // with no cursor, and then closes under the pointer.
-    let mut probe = RestProbe::new();
-    probe.move_to(RestProbe::OUTSIDE);
-    probe.move_translated(RestProbe::INSIDE, mouse::Cursor::Unavailable);
-    assert!(probe.rest().is_empty(), "an overlay covers the pane");
+    let mut probe = EntryProbe::new();
+    probe.move_to(EntryProbe::OUTSIDE);
+    probe.move_translated(EntryProbe::INSIDE, mouse::Cursor::Unavailable);
+    assert!(probe.settle().is_empty(), "an overlay covers the pane");
     probe.move_to(Point::new(151.0, 40.0));
-    assert!(probe.rest().is_empty());
+    assert!(probe.settle().is_empty());
 
     // A context menu opened from outside the pane captures every motion
     // over it, and then an item is chosen over the pane.
-    let mut probe = RestProbe::new();
-    probe.move_to(RestProbe::OUTSIDE);
-    probe.elsewhere(&moved(RestProbe::INSIDE));
+    let mut probe = EntryProbe::new();
+    probe.move_to(EntryProbe::OUTSIDE);
+    probe.elsewhere(&moved(EntryProbe::INSIDE));
     probe.move_to(Point::new(151.0, 40.0));
-    assert!(probe.rest().is_empty());
+    assert!(probe.settle().is_empty());
 
     // A popup surface outside the window closes, returning the pointer.
-    let mut probe = RestProbe::new();
-    probe.move_to(RestProbe::OUTSIDE);
+    let mut probe = EntryProbe::new();
+    probe.move_to(EntryProbe::OUTSIDE);
     probe.send(
         Event::Mouse(mouse::Event::CursorLeft),
         mouse::Cursor::Unavailable,
     );
-    probe.move_to(RestProbe::INSIDE);
-    assert!(probe.rest().is_empty());
+    probe.move_to(EntryProbe::INSIDE);
+    assert!(probe.settle().is_empty());
 
     // The strip scrolls the pane under a pointer that stays put.
-    let mut probe = RestProbe::new();
+    let mut probe = EntryProbe::new();
     probe.move_translated(
-        RestProbe::INSIDE,
-        mouse::Cursor::Available(RestProbe::NEIGHBOUR),
+        EntryProbe::INSIDE,
+        mouse::Cursor::Available(EntryProbe::NEIGHBOUR),
     );
     probe.move_to(Point::new(151.0, 40.0));
-    assert!(probe.rest().is_empty());
+    assert!(probe.settle().is_empty());
 
     // A pane mounted beneath the pointer has no sample to cross from.
-    let mut probe = RestProbe::new();
-    probe.move_to(RestProbe::INSIDE);
-    assert!(probe.rest().is_empty());
+    let mut probe = EntryProbe::new();
+    probe.move_to(EntryProbe::INSIDE);
+    assert!(probe.settle().is_empty());
 
     // A pane remounted after a far jump last saw the pointer where it was
     // before; the pointer has since moved on beneath other panes and
     // stopped where the pane now comes to lie.
-    let mut probe = RestProbe::new();
-    probe.move_to(RestProbe::OUTSIDE);
+    let mut probe = EntryProbe::new();
+    probe.move_to(EntryProbe::OUTSIDE);
     probe.elsewhere(&moved(Point::new(149.0, 40.0)));
-    probe.elsewhere(&moved(RestProbe::INSIDE));
+    probe.elsewhere(&moved(EntryProbe::INSIDE));
     probe.move_to(Point::new(151.0, 40.0));
-    assert!(probe.rest().is_empty());
+    assert!(probe.settle().is_empty());
 }
 
 #[test]
@@ -849,8 +852,8 @@ fn hover_and_activation_focus_keep_a_control_the_person_is_using() {
     let sidebar_id = widget::Id::new("sidebar.search");
     let other_id = widget::Id::new("left-pane.composer");
     let target = widget::Id::new("right-pane.composer");
-    // (held, mounted, rest focuses, activation focuses)
-    for (held, mounted, after_rest, after_activation) in [
+    // (held, mounted, hover entry focuses, activation focuses)
+    for (held, mounted, after_entry, after_activation) in [
         (None, true, true, true),
         (Some(&sidebar_id), true, false, false),
         (Some(&other_id), true, true, false),
@@ -893,7 +896,7 @@ fn hover_and_activation_focus_keep_a_control_the_person_is_using() {
             let expected = if activation {
                 after_activation
             } else {
-                after_rest
+                after_entry
             };
             assert_eq!(
                 editor.0, expected,

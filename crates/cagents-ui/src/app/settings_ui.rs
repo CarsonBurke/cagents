@@ -486,7 +486,7 @@ fn settings_category_controls<'a>(
             );
             let activation = crate::settings_widgets::toggle(
                 "Focus follows mouse",
-                "When on, resting the pointer on a pane focuses it and puts the keyboard in its message input, terminal or editor, without scrolling. Typing, clicking or dragging before then keeps focus where it is. When off, click a pane or use pane navigation to focus it.",
+                "When on, moving the pointer into a pane focuses it and puts the keyboard in its message input, terminal or editor, without scrolling. When off, click a pane or use pane navigation to focus it.",
                 draft.focus_follows_mouse,
                 |enabled| Message::SettingsChanged {
                     field: SettingsField::FocusFollowsMouse,

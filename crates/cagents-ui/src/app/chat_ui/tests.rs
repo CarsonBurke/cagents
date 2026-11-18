@@ -8230,10 +8230,10 @@ fn stepping_through_find_matches_keeps_the_keyboard_in_the_search() {
     );
 }
 
-/// Resting the pointer on another pane leaves the keyboard with a chat
+/// Moving the pointer into another pane leaves the keyboard with a chat
 /// menu that is still open, and follows the pointer again once it closes.
 #[test]
-fn an_open_chat_menu_holds_focus_against_the_resting_pointer() {
+fn an_open_chat_menu_holds_focus_against_the_hovering_pointer() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
     app.settings.focus_follows_mouse = true;
     let first = live_chat(&mut app, Some("menu-first"));
@@ -8242,7 +8242,7 @@ fn an_open_chat_menu_holds_focus_against_the_resting_pointer() {
     let _ = app.apply_viewport(update, false, DurableChange::Content);
     let _ = app.update(Message::Viewport {
         generation: app.workspace_view_generation,
-        event: WorkspaceViewportEvent::PointerRested(second),
+        event: WorkspaceViewportEvent::PointerEntered(second),
     });
     assert_eq!(app.workspace.focused(), Some(second));
     let target = chat_runtime(&app, second).target;
@@ -8250,13 +8250,13 @@ fn an_open_chat_menu_holds_focus_against_the_resting_pointer() {
     assert!(app.chat_menu_open());
     let _ = app.update(Message::Viewport {
         generation: app.workspace_view_generation,
-        event: WorkspaceViewportEvent::PointerRested(first),
+        event: WorkspaceViewportEvent::PointerEntered(first),
     });
     assert_eq!(app.workspace.focused(), Some(second));
     app.chat_runtime_mut(target).unwrap().composer_actions = false;
     let _ = app.update(Message::Viewport {
         generation: app.workspace_view_generation,
-        event: WorkspaceViewportEvent::PointerRested(first),
+        event: WorkspaceViewportEvent::PointerEntered(first),
     });
     assert_eq!(app.workspace.focused(), Some(first));
     // A menu flagged open in a pane without focus is not on screen, and
@@ -8264,7 +8264,7 @@ fn an_open_chat_menu_holds_focus_against_the_resting_pointer() {
     app.chat_runtime_mut(target).unwrap().composer_actions = true;
     let _ = app.update(Message::Viewport {
         generation: app.workspace_view_generation,
-        event: WorkspaceViewportEvent::PointerRested(second),
+        event: WorkspaceViewportEvent::PointerEntered(second),
     });
     assert_eq!(app.workspace.focused(), Some(second));
 }
