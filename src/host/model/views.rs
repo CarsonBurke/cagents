@@ -785,7 +785,7 @@ pub(super) fn apply_recorded(
                         return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
                     }
                     if let Some(capture) = capture {
-                        if capture.scope != *scope || capture.before != *before {
+                        if capture.scope != *scope || *capture.before != *before {
                             return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
                         }
                         bindings::captured(transaction, capture, None)?;
@@ -960,8 +960,64 @@ pub(super) fn adopt_authenticated_agent_pane_with_console(
     successor: &crate::agent_execution::HostedSession,
     replaced_console: Option<&crate::model::TerminalSession>,
 ) -> Result<bool, String> {
-    use crate::{agent_execution::HostedSession, model::CardKind};
     let id = crate::model::CardId::from_uuid(agent.as_uuid());
+    adopt_authenticated_pane(db, id, retained, successor, replaced_console)
+}
+
+/// The descriptor of the open pane presenting chat `id`, if any.
+pub(super) fn chat_pane_session(
+    db: &Connection,
+    id: crate::model::TerminalId,
+) -> Result<Option<crate::chat::Session>, String> {
+    let Some(pane) = store::chat_pane(db, id)? else {
+        return Ok(None);
+    };
+    let Some(scope) = owner(db, pane)? else {
+        return Ok(None);
+    };
+    let view = read(db, &scope)?;
+    if view.retired.contains(&pane) {
+        return Ok(None);
+    }
+    Ok(view
+        .panes
+        .into_iter()
+        .find(|candidate| candidate.id == pane)
+        .and_then(|candidate| match candidate.kind {
+            crate::model::CardKind::Chat(session) => Some(session),
+            _ => None,
+        }))
+}
+
+/// Saves the provider-confirmed conversation ID to the pane presenting
+/// `source`'s chat, when it still shows exactly that process. The caller has
+/// authenticated `source` and checked that `learned` changes only its ID.
+pub(super) fn learn_chat_pane_identity(
+    db: &Connection,
+    source: &crate::chat::Session,
+    learned: &crate::chat::Session,
+) -> Result<bool, String> {
+    use crate::agent_execution::HostedSession;
+    let Some(id) = store::chat_pane(db, source.id)? else {
+        return Ok(false);
+    };
+    adopt_authenticated_pane(
+        db,
+        id,
+        &[HostedSession::Chat(source.clone())],
+        &HostedSession::Chat(learned.clone()),
+        None,
+    )
+}
+
+fn adopt_authenticated_pane(
+    db: &Connection,
+    id: crate::model::CardId,
+    retained: &[crate::agent_execution::HostedSession],
+    successor: &crate::agent_execution::HostedSession,
+    replaced_console: Option<&crate::model::TerminalSession>,
+) -> Result<bool, String> {
+    use crate::{agent_execution::HostedSession, model::CardKind};
     let Some(scope) = owner(db, id)? else {
         return Ok(false);
     };
@@ -976,14 +1032,14 @@ pub(super) fn adopt_authenticated_agent_pane_with_console(
             if retained.contains(&HostedSession::Chat(current.clone()))
                 && (crate::chat::is_upgrade_recovery(current, next)
                     || crate::chat::is_upgrade_identity_learning(current, next)
-                    || super::execution::retained_identity_update(current, next)) =>
+                    || super::execution::confirmed_identity_update(current, next)) =>
         {
             CardKind::Chat(next.clone())
         }
         (CardKind::Terminal(current), _) => {
             let terminal = |source: &HostedSession| match source {
                 HostedSession::Terminal(session) => Some(session.clone()),
-                HostedSession::Chat(session) => session.terminal.clone(),
+                HostedSession::Chat(session) => session.terminal.as_deref().cloned(),
             };
             let Some(next) = terminal(successor) else {
                 return Ok(false);
@@ -2258,7 +2314,7 @@ mod tests {
         seed(&mut registry, channel, vec![original.clone()]);
         let mut delayed = original.clone();
         if let CardKind::Chat(chat) = &mut delayed.kind {
-            chat.terminal = Some(terminal);
+            chat.terminal = Some(Box::new(terminal));
         }
         let mut current = original.clone();
         if let CardKind::Chat(chat) = &mut current.kind {
@@ -2911,7 +2967,7 @@ mod tests {
                         session_id: Some(uuid::Uuid::new_v4().to_string()),
                     },
                     proof: terminal.continuity.live_proof(),
-                    terminal: Some(terminal.clone()),
+                    terminal: Some(Box::new(terminal.clone())),
                     owned_codex_listener: None,
                     native_continuity: Default::default(),
                 })
@@ -2933,7 +2989,7 @@ mod tests {
             let presentation = |session: &HostedSession| match session {
                 HostedSession::Chat(session) if !console => CardKind::Chat(session.clone()),
                 HostedSession::Chat(session) => {
-                    CardKind::Terminal(session.terminal.clone().unwrap())
+                    CardKind::Terminal(session.terminal.as_deref().cloned().unwrap())
                 }
                 HostedSession::Terminal(session) => CardKind::Terminal(session.clone()),
             };
@@ -3193,7 +3249,7 @@ mod tests {
                         session_id: Some(uuid::Uuid::new_v4().to_string()),
                     },
                     proof: terminal.continuity.live_proof(),
-                    terminal: Some(terminal),
+                    terminal: Some(Box::new(terminal)),
                     owned_codex_listener: None,
                     native_continuity: Default::default(),
                 })
@@ -3202,7 +3258,7 @@ mod tests {
             };
             let original = r.bind_agent(accepted.agent.id, None, live.clone()).unwrap();
             let console = if let HostedSession::Chat(session) = &live {
-                let terminal = session.terminal.clone().unwrap();
+                let terminal = session.terminal.as_deref().cloned().unwrap();
                 r.bind_agent_console(original.id, &live, terminal.clone())
                     .unwrap();
                 Some(Pane {
@@ -3764,7 +3820,7 @@ mod tests {
                 session_id: None,
             },
             proof: terminal.continuity.live_proof(),
-            terminal: Some(terminal),
+            terminal: Some(Box::new(terminal)),
             owned_codex_listener: None,
             native_continuity: Default::default(),
         });

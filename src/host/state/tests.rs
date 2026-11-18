@@ -26,7 +26,7 @@ fn startup_state_is_answered_while_startup_recovery_refuses_other_requests() {
             response => panic!("unexpected startup state response: {response:?}"),
         };
     let refused = || {
-        crate::host::client::process_request(&host, 0, ClientRequest::BuildInfo)
+        crate::host::client::process_request(&host, 0, ClientRequest::ChatCapacitySet { limit: 1 })
             .unwrap_err()
             .code
     };
@@ -321,16 +321,10 @@ fn a_pane_that_has_not_recorded_its_conversation_takes_its_first_prompt_name() {
         let handle =
             chat::runtime::Handle::start(spec, Box::new(adapter), initial, store, None, |_| {})
                 .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while handle.conversation_title().ok()
-            != Some((session.map(str::to_owned), title.map(str::to_owned)))
-        {
-            assert!(
-                Instant::now() < deadline,
-                "history worker did not publish its exact session"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        let expected = Some((session.map(str::to_owned), title.map(str::to_owned)));
+        crate::test_timing::wait_for("the history worker to publish its exact session", || {
+            (handle.conversation_title().ok() == expected).then_some(())
+        });
         handle
     };
     let reported = start(Some(SESSION), None);
@@ -1472,7 +1466,7 @@ for line in sys.stdin:
     changed.id = TerminalId::new();
     assert!(super::super::chat::resolve_upgrade(&replacement, &changed).is_err());
     changed = source.clone();
-    changed.terminal = Some(TerminalSession {
+    changed.terminal = Some(Box::new(TerminalSession {
         owned_codex_listener: None,
         recovery_origin: None,
         predecessor: None,
@@ -1484,7 +1478,7 @@ for line in sys.stdin:
             recipe: source.launch.recipe.clone(),
             last_exit: None,
         },
-    });
+    }));
     assert!(super::super::chat::resolve_upgrade(&replacement, &changed).is_err());
     restore_upgrade_from(
         &replacement,

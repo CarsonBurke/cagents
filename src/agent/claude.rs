@@ -80,6 +80,21 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
     create_chat: crate::chat::protocol::claude::create,
 };
 
+/// Claude Code's project key for a working directory, as its
+/// `cwd.replace(/[^a-zA-Z0-9]/g, "-")` spells it. JavaScript strings are
+/// UTF-16, so each code unit that is not an ASCII letter or digit becomes one
+/// hyphen: a character outside the Basic Multilingual Plane, such as an emoji,
+/// becomes two.
+#[cfg(any(feature = "ui", feature = "host"))]
+fn project_key(cwd: &str) -> String {
+    cwd.encode_utf16()
+        .map(|unit| match u8::try_from(unit) {
+            Ok(byte) if byte.is_ascii_alphanumeric() => char::from(byte),
+            _ => '-',
+        })
+        .collect()
+}
+
 /// Claude Code's project-key and candidate-directory rules, shared by the
 /// presence probe and the stricter reader. They intentionally apply different
 /// file policies: presence includes unreadable or symlinked transcripts.
@@ -98,13 +113,12 @@ impl TranscriptLookup {
             .to_str()
             .ok_or("Claude history directory is not UTF-8")?;
         Ok(Self {
-            project: cwd
-                .chars()
-                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-                .collect(),
+            project: project_key(cwd),
             filename: format!("{id}.jsonl"),
         })
     }
+    /// Claude Code cuts a key longer than 200 UTF-16 code units and appends a
+    /// hash. The key is ASCII, so its byte length is that count.
     fn hashed(&self) -> bool {
         self.project.len() > 200
     }
@@ -149,8 +163,9 @@ pub(crate) fn transcript_exists(config: &Path, cwd: &Path, id: &str) -> bool {
 /// for a session started in `cwd`, which must already be canonical.
 ///
 /// Claude names a project directory after its working directory with every
-/// character but ASCII alphanumerics replaced, and cuts a long name at 200
-/// characters followed by a hash this does not reproduce. Such a name is found
+/// UTF-16 code unit but ASCII alphanumerics replaced (see [`project_key`]), and
+/// cuts a long name at 200 code units followed by a hash this does not
+/// reproduce. Such a name is found
 /// by the transcript it holds and refused when more than one does.
 #[cfg(any(feature = "ui", feature = "host"))]
 pub fn transcript(config: &Path, cwd: &Path, id: &str) -> Result<PathBuf, String> {
@@ -270,6 +285,33 @@ mod tests {
                 .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
                 .collect::<String>(),
         )
+    }
+
+    #[test]
+    fn project_key_replaces_utf16_code_units_as_claude_does() {
+        // Oracle: node -e 'console.log(s.replace(/[^a-zA-Z0-9]/g, "-"))'.
+        assert_eq!(
+            project_key("/home/u/a\u{1F600}\u{e9}\u{10FFFF}z"),
+            "-home-u-a-----z"
+        );
+        assert_eq!(project_key("/srv/Repo_2.d"), "-srv-Repo-2-d");
+    }
+
+    #[test]
+    fn supplementary_characters_count_twice_toward_the_hashed_name_limit() {
+        // 101 characters, but 202 UTF-16 code units: Claude hashes this name.
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("claude");
+        let cwd = PathBuf::from(format!("/x/{}a", "\u{1F600}".repeat(99)));
+        let key = project_key(cwd.to_str().unwrap());
+        assert_eq!(key.len(), 202);
+        let directory = config
+            .join("projects")
+            .join(format!("{}-1k2j3h", &key[..200]));
+        std::fs::create_dir_all(&directory).unwrap();
+        let file = directory.join(format!("{SESSION}.jsonl"));
+        std::fs::write(&file, b"{}").unwrap();
+        assert_eq!(transcript_for_start(&config, &cwd, SESSION).unwrap(), file);
     }
 
     #[test]

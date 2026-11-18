@@ -1429,7 +1429,7 @@ pub(in crate::app) mod tests {
             recovered: false,
             after_busy: false,
             duplicate_of: None,
-            busy_noticed: false,
+            refusal_noticed: false,
             discard_failures: 0,
         };
         assert!(login_caption(&login).starts_with("Finish signing in in the terminal"));
@@ -1782,7 +1782,7 @@ pub(in crate::app) mod tests {
             Outcome::Answered {
                 identity: None,
                 catalog: None,
-                snapshot: snapshot.clone(),
+                snapshot: Box::new(snapshot.clone()),
             },
         );
         let widths = [1_400.0, 1_100.0, 520.0, 360.0];
@@ -1860,7 +1860,7 @@ pub(in crate::app) mod tests {
             Outcome::Answered {
                 identity: None,
                 catalog: None,
-                snapshot: snapshot.clone(),
+                snapshot: Box::new(snapshot.clone()),
             },
         );
         assert_eq!(

@@ -291,6 +291,17 @@ fn fallback_summary(text: &str) -> String {
     Runtime::short_description(chat::failure::headline(text), 160)
 }
 
+/// What an original says beyond the summary the notice already shows: a
+/// report that opens with that summary as its own paragraph shows only the
+/// rest under Details. Copy details still copies the complete original.
+fn beyond_summary<'a>(text: &'a str, summary: &str) -> &'a str {
+    text.strip_prefix(summary)
+        .and_then(|rest| rest.strip_prefix("\n\n"))
+        .map(str::trim_start)
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(text)
+}
+
 fn diagnostic_key(text: &str) -> String {
     use sha2::Digest;
     format!("{:x}", sha2::Sha256::digest(text.as_bytes()))
@@ -453,7 +464,17 @@ impl State {
             return None;
         }
         let (key, summary, guidance, kind, explained) =
-            if let Some(failure) = Failure::parse(provider, text) {
+            if chat::failure::account_switch_refusal_reason(text).is_some() {
+                // Before any provider wording: the daemon's reason after the
+                // summary is not a provider's report, and is kept for Details.
+                (
+                    diagnostic_key(text),
+                    chat::failure::ACCOUNT_SWITCH_REFUSED.to_owned(),
+                    chat::failure::ACCOUNT_SWITCH_REFUSED_ACTION,
+                    None,
+                    false,
+                )
+            } else if let Some(failure) = Failure::parse(provider, text) {
                 (
                     diagnostic_key(failure.key.as_ref()),
                     failure.summary,
@@ -1323,7 +1344,9 @@ impl Runtime {
         };
         let mut sources = Vec::new();
         for source in self.diagnostic_sources(incident) {
-            if let Some(text) = self.failure_source(source)
+            if let Some(text) = self
+                .failure_source(source)
+                .map(|text| beyond_summary(text, &incident.summary))
                 && !sources.contains(&text)
             {
                 sources.push(text);
@@ -1657,6 +1680,24 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn details_leave_out_the_summary_the_notice_already_shows() {
+        let reason = "Alternate account has divergent conversation history";
+        let refused = chat::failure::account_switch_refused(reason);
+        let meta = State::metadata(Provider::Codex, &refused, false, "").unwrap();
+        assert_eq!(beyond_summary(&refused, &meta.summary), reason);
+        // A report that only begins with the summary's words, or has nothing
+        // beyond it, is shown whole.
+        for text in [
+            "Headline\nsame paragraph",
+            "Headline continues",
+            "Headline\n\n  ",
+        ] {
+            assert_eq!(beyond_summary(text, "Headline"), text);
+        }
+        assert_eq!(beyond_summary("Headline\n\nrest", "Headline"), "rest");
+    }
 
     fn text(id: &str, role: chat::Role, body: &str) -> chat::Item {
         chat::Item {

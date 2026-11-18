@@ -529,7 +529,7 @@ fn restore_authenticated(
         // an equal recipe alone cannot authorize a concurrent replacement.
         let (projected, worker) =
             project_paired_terminal_for_start(&state, terminal, paired_holder.as_ref(), proof)?;
-        *terminal = projected;
+        **terminal = projected;
         Ok(Some(worker))
     })();
     let paired = match paired {
@@ -571,7 +571,7 @@ fn restore_authenticated(
     };
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
     let pair_unchanged =
-        pair_projection_is_current(&state, session.terminal.as_ref(), paired.as_ref());
+        pair_projection_is_current(&state, session.terminal.as_deref(), paired.as_ref());
     if state.shutting_down
         || !pair_unchanged
         || require_unreserved_terminals(&state, &session).is_err()
@@ -627,7 +627,7 @@ fn restore_authenticated(
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     let pair_current = pair_projection_is_current(
         &state,
-        record.session.terminal.as_ref(),
+        record.session.terminal.as_deref(),
         record.paired_terminal.as_ref(),
     );
     if state.shutting_down

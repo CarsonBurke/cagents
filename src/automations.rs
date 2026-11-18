@@ -119,10 +119,10 @@ impl Request {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Response {
     Listed(Vec<Summary>),
-    Automation(Automation),
+    Automation(Box<Automation>),
     Firing(Firing),
     History(HistoryPage),
-    Detail(RunDetail),
+    Detail(Box<RunDetail>),
     Removed,
     CancellationRequested,
     Proposal(Box<Proposal>),

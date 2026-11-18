@@ -59,7 +59,7 @@ pub async fn consume(
             identity: Some(identity),
             snapshot,
             ..
-        } if same_identity(&identity, &expected) => snapshot,
+        } if same_identity(&identity, &expected) => *snapshot,
         Outcome::Answered { .. } => {
             return unsent(
                 prior,
@@ -164,7 +164,7 @@ pub async fn consume(
             identity: Some(identity),
             snapshot,
             ..
-        } if same_identity(&identity, &expected) => Some(snapshot),
+        } if same_identity(&identity, &expected) => Some(*snapshot),
         _ => None,
     };
     let message = match (status, snapshot.is_some()) {

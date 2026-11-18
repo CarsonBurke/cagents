@@ -163,7 +163,7 @@ enum Command {
     PreserveForRestart(Sender<Result<(), String>>),
     ObserveAgentProcess(Sender<Option<AgentProcess>>),
     ApplyAgentActivity {
-        process: AgentProcess,
+        process: Box<AgentProcess>,
         activity: Option<crate::agent::Activity>,
         title: Option<String>,
         reply: Sender<Option<crate::agent::Activity>>,
@@ -1520,7 +1520,7 @@ impl TerminalHandle {
         let deadline = std::time::Instant::now() + timeout;
         if self
             .try_command(Command::ApplyAgentActivity {
-                process,
+                process: Box::new(process),
                 activity,
                 title,
                 reply,
@@ -4066,7 +4066,7 @@ impl Worker {
                     .agent_activity
                     .lock()
                     .unwrap_or_else(|p| p.into_inner());
-                let unchanged = self.agent_process.as_ref() == Some(&process)
+                let unchanged = self.agent_process.as_ref() == Some(&*process)
                     && current_activity == proposed
                     && title.as_ref().is_none_or(|title| {
                         self.published
@@ -4091,7 +4091,7 @@ impl Worker {
                     return false;
                 }
                 let current = self.observe_agent_process();
-                let valid = std::time::Instant::now() < deadline && current == Some(&process);
+                let valid = std::time::Instant::now() < deadline && current == Some(&*process);
                 let activity = if valid {
                     // Process identity is known even when the provider cannot
                     // report a state (for example, before its first message).

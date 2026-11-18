@@ -24,8 +24,8 @@
 # stop the evidence session afterward. Commands only describe synthetic output.
 set -euo pipefail
 
-scene=${1:?usage: reasoning-row-scene.sh wide|narrow|web|coordination|diagnostics|refresh-core|refresh-notices|activity|agents|plan}
-case "$scene" in wide|narrow|web|coordination|diagnostics|refresh-core|refresh-notices|activity|agents|plan) ;; *) exit 2 ;; esac
+scene=${1:?usage: reasoning-row-scene.sh wide|narrow|web|coordination|diagnostics|refresh-core|refresh-notices|activity|agents|plan|contentless}
+case "$scene" in wide|narrow|web|coordination|diagnostics|refresh-core|refresh-notices|activity|agents|plan|contentless) ;; *) exit 2 ;; esac
 transcript_right=810
 if [ "$scene" = narrow ]; then transcript_right=535; fi
 here=$(cd -- "$(dirname -- "$0")" && pwd)
@@ -97,6 +97,9 @@ find_row() {
         sleep 1
     done
     printf 'reasoning-row-scene: row not visible: %s\n' "$1" >&2
+    evidence drive --json observe | /usr/bin/python3 -c 'import json,sys
+for run in json.load(sys.stdin)["runs"]: print(run["x"], run["y"], repr(run["text"]), file=sys.stderr)' || true
+    evidence shot "debug-row-not-visible" >&2 || true
     return 1
 }
 
@@ -322,6 +325,41 @@ if [ "$scene" = activity ]; then
     exit 0
 fi
 
+# A long agentic turn as Claude sends it: most thoughts are only a signature
+# (or redacted), between commands, with one summarized thought. Captured
+# while a signature-only thought is live, then finished, then with the first
+# command group open.
+if [ "$scene" = contentless ]; then
+    cp "$here/reasoning-row-scene/contentless.jsonl" "$config/fixture-frames.jsonl.next"
+    mv "$config/fixture-frames.jsonl.next" "$config/fixture-frames.jsonl"
+    evidence cli project open "$fixture/project" >/dev/null
+    spawn_scene claude haiku 'Fixture: run the probe and confirm the cleanup.' \
+        "$fixture/state/reasoning-contentless-spawn.json" 'Contentless thoughts'
+    ready=false
+    for _ in $(seq 40); do
+        if rg -q '"uuid":"contentless-cd-1-result"' "$config/projects"; then ready=true; break; fi
+        sleep 1
+    done
+    [ "$ready" = true ] || { printf '%s\n' 'reasoning-row-scene: the commands did not start' >&2; exit 1; }
+    sleep 2
+    scroll_top
+    shot contentless-working
+    finished=false
+    for _ in $(seq 90); do
+        if rg -q '"uuid":"contentless-answer-1"' "$config/projects"; then finished=true; break; fi
+        sleep 1
+    done
+    [ "$finished" = true ] || { printf '%s\n' 'reasoning-row-scene: the turn did not finish' >&2; exit 1; }
+    sleep 3
+    scroll_top
+    shot contentless-finished
+    click_row '\bcommands?\b'
+    scroll_top
+    shot contentless-finished-expanded
+    printf '%s\n' 'Captured a turn of signature-only thoughts working, finished and expanded.'
+    exit 0
+fi
+
 # Subagents still working after the lead has answered, beside a finished one
 # and an older background command: the transcript keeps one activity
 # indicator.
@@ -436,20 +474,29 @@ if [ "$scene" = coordination ]; then
         # detail - the prompt or message in full, then the tool call -
         # opens from the row's menu. OCR may read a fold's toggle as two
         # overlapping runs ("Show", "w full prompt"), so match its tail.
-        row_detail 'Started\b.*Fixture' 'Show details'
+        # OCR can clip a row's leading verb into its own short run ("> Mes"),
+        # so each row is also known by the part of its line only it shows.
+        started='Started\b.*Fixture|\bgeneral-purpose\b'
+        message='Message to\b.*Fixture|\bReview follow-up\b'
+        row_detail "$started" 'Show details'
         click_row 'full prompt\b'
         find_row 'PROMPT[ _]?END\b|invented' >/dev/null
         shot rows-coordination-prompt-expanded
         click_row 'w less\b'
         find_row '^Input$' >/dev/null
         shot rows-coordination-tool-expanded
-        row_detail 'Started\b.*Fixture' 'Hide details'
-        row_detail 'Message to\b.*Fixture' 'Show details'
-        click_row 'full message\b'
+        row_detail "$started" 'Hide details'
+        row_detail "$message" 'Show details'
+        # A message short enough to show whole has no fold to open.
+        folded=false
+        if text_visible 'full message\b'; then
+            click_row 'full message\b'
+            folded=true
+        fi
         find_row 'MESSAGE[ _]?END\b|concise report' >/dev/null
         shot rows-coordination-message-expanded
-        click_row 'w less\b'
-        row_detail 'Message to\b.*Fixture' 'Hide details'
+        if [ "$folded" = true ]; then click_row 'w less\b'; fi
+        row_detail "$message" 'Hide details'
     fi
     scroll_bottom
     if text_visible '^Details$'; then
@@ -463,7 +510,9 @@ if [ "$scene" = coordination ]; then
     find_row 'REPORT[ _]?END\b|synthetic evidence' >/dev/null
     shot rows-report-expanded
     if text_visible '^Copy report$'; then
-        click_row '\bCopy\b'
+        # The report's own seventh line also starts with "Copy report", above
+        # the button, so match the button's whole label.
+        click_row '^Copy report$'
         copy_contains REPORT_END
     fi
     touch "$coordination_done"

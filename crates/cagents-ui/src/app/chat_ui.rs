@@ -540,7 +540,12 @@ pub enum Action {
     HandoffFinished(Target, Result<TerminalSession, String>),
     CloseFinished(Target, Result<(), String>),
     RetainedCloseFinished(Target, chat::Session, Result<(), String>),
-    FreshCloseFinished(Target, chat::Session, chat::Session, Result<(), String>),
+    FreshCloseFinished(
+        Target,
+        Box<chat::Session>,
+        Box<chat::Session>,
+        Result<(), String>,
+    ),
     ToggleBlockedDetails(CardId, chat::Session),
     CopyBlockedDetails(CardId, chat::Session),
     /// Asks the daemon what still runs for a conversation whose Close it
@@ -1072,7 +1077,7 @@ enum Phase {
     SavingDraft {
         target: Target,
     },
-    Starting(Attempt),
+    Starting(Box<Attempt>),
     Returning {
         target: Target,
         local: Option<LocalReturn>,
@@ -6574,7 +6579,7 @@ pub(super) fn conversion(session: &TerminalSession) -> Result<chat::Session, Str
             session_id,
         },
         proof: None,
-        terminal: Some(session.clone()),
+        terminal: Some(Box::new(session.clone())),
     })
 }
 
@@ -6594,26 +6599,30 @@ fn return_terminal(session: &chat::Session) -> Result<TerminalSession, String> {
         && let Some(source) = &session.terminal
         && source.continuity.live_proof().is_some()
     {
-        return Ok(source.clone());
+        return Ok(TerminalSession::clone(source));
     }
     let recipe = session
         .launch
         .terminal_recipe()
         .ok_or_else(|| "Cannot form a safe exact-session terminal resume command.".to_owned())?;
     let id = TerminalId::new();
-    let mut terminal = session.terminal.clone().unwrap_or_else(|| TerminalSession {
-        owned_codex_listener: None,
-        recovery_origin: None,
-        predecessor: None,
-        id,
-        launch: recipe.clone(),
-        continuity: TerminalContinuity::RelaunchAvailable {
-            recipe: recipe.clone(),
-            last_exit: None,
-        },
-        resume_hint: None,
-        transcript_path: None,
-    });
+    let mut terminal = session
+        .terminal
+        .as_deref()
+        .cloned()
+        .unwrap_or_else(|| TerminalSession {
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+            id,
+            launch: recipe.clone(),
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe: recipe.clone(),
+                last_exit: None,
+            },
+            resume_hint: None,
+            transcript_path: None,
+        });
     terminal.id = id;
     terminal.launch = recipe.clone();
     terminal.resume_hint = crate::model::agent_recovery::hint_from_launch(&recipe);
@@ -7956,7 +7965,7 @@ impl Cagents {
         let target = self.chat_ui.next_target(card);
         self.chat_ui.phases.insert(
             card,
-            Phase::Starting(Attempt {
+            Phase::Starting(Box::new(Attempt {
                 target,
                 intent: chat::Intent::Restore,
                 session: replacement.clone(),
@@ -7968,7 +7977,7 @@ impl Cagents {
                     committed: false,
                     submit,
                 }),
-            }),
+            })),
         );
         let sender = self.chat_ui.sender.clone();
         cosmic::task::future(async move {
@@ -10195,7 +10204,7 @@ impl Cagents {
         let target = self.chat_ui.next_target(card);
         self.chat_ui.phases.insert(
             card,
-            Phase::Starting(Attempt {
+            Phase::Starting(Box::new(Attempt {
                 target,
                 intent,
                 session: session.clone(),
@@ -10203,7 +10212,7 @@ impl Cagents {
                 upgrade_committed: false,
                 resume_committed: false,
                 upgrade_admission: upgrade_admission.clone(),
-            }),
+            })),
         );
         let sender = self.chat_ui.sender.clone();
         cosmic::task::future(async move {
@@ -12448,6 +12457,7 @@ impl Cagents {
                             chat::Recovery::Busy
                                 | chat::Recovery::Unresponsive
                                 | chat::Recovery::Unreached
+                                | chat::Recovery::NotAdmitted
                         ) && account_source.is_some()
                             && automatic_submit.is_some() =>
                     {
@@ -12475,18 +12485,18 @@ impl Cagents {
                             }
                         }
                         if !runtime.disconnected && !runtime.snapshot.exited {
-                            runtime.error = Some(
-                                match failure.recovery {
-                                    chat::Recovery::Busy => {
-                                        chat::failure::delivery::ACCOUNT_SWITCH_BUSY
-                                    }
-                                    chat::Recovery::Unresponsive => {
-                                        chat::failure::delivery::ACCOUNT_SWITCH_UNANSWERED
-                                    }
-                                    _ => chat::failure::delivery::ACCOUNT_SWITCH_UNREACHED,
+                            runtime.error = Some(match failure.recovery {
+                                chat::Recovery::Busy => {
+                                    chat::failure::delivery::ACCOUNT_SWITCH_BUSY.to_owned()
                                 }
-                                .to_owned(),
-                            );
+                                chat::Recovery::Unresponsive => {
+                                    chat::failure::delivery::ACCOUNT_SWITCH_UNANSWERED.to_owned()
+                                }
+                                chat::Recovery::NotAdmitted => {
+                                    chat::failure::account_switch_refused(&failure.message)
+                                }
+                                _ => chat::failure::delivery::ACCOUNT_SWITCH_UNREACHED.to_owned(),
+                            });
                         }
                         // As a wake read now would have left it.
                         let session = runtime.session.clone();
@@ -13046,7 +13056,7 @@ impl Cagents {
             }
             Action::StartFresh(card) => return self.begin_fresh_conversation(card),
             Action::FreshCloseFinished(target, source, requested, result) => {
-                return self.finish_fresh_conversation(target, source, requested, result);
+                return self.finish_fresh_conversation(target, *source, *requested, result);
             }
             Action::ToggleBlockedDetails(card, source) => {
                 if self.blocked_failure_source(card) == Some(&source) {
@@ -15211,7 +15221,7 @@ impl Cagents {
                 let preserve =
                     runtime.session.launch.provider == Provider::Codex && !snapshot.exited;
                 if preserve {
-                    runtime.session.terminal = Some(terminal.clone());
+                    runtime.session.terminal = Some(Box::new(terminal.clone()));
                 }
                 let session = runtime.session.clone();
                 self.commit_chat_session(target.card, session);

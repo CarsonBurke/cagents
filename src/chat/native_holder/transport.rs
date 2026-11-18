@@ -130,7 +130,7 @@ impl Spawn {
 enum Request {
     Spawn {
         protocol: u32,
-        spawn: Spawn,
+        spawn: Box<Spawn>,
     },
     Confirm {
         thread: String,
@@ -587,7 +587,7 @@ pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, St
             &control,
             &Request::Spawn {
                 protocol: PROTOCOL,
-                spawn: request,
+                spawn: Box::new(request),
             },
             START_TIMEOUT,
         )?;
@@ -1496,7 +1496,7 @@ extern "C" fn serve_if_requested() {
         let scope = crate::daemon::process_scope::enroll_dividing_holder()
             .ok()
             .flatten();
-        let mut residence = match Residence::start(spawn, scope) {
+        let mut residence = match Residence::start(*spawn, scope) {
             Ok(residence) => residence,
             Err(error) => {
                 // Only startup has no Started response yet. Preserve the

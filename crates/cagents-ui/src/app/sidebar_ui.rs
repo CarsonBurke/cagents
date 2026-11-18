@@ -187,9 +187,9 @@ impl Cagents {
                 repository,
             } => {
                 let directory = self.project_entry_directory(project_id, &repository);
-                self.navigate_to_worktree(directory)
+                self.navigate_to_worktree(directory, true)
             }
-            SidebarAction::OpenWorktree { path, .. } => self.navigate_to_worktree(path),
+            SidebarAction::OpenWorktree { path, .. } => self.navigate_to_worktree(path, true),
             SidebarAction::BrowsePullRequests { project_id } => self.browse_pull_requests(project_id),
             SidebarAction::OpenPullRequest {
                 project_id,

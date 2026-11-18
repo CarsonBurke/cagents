@@ -43,7 +43,7 @@ fn capture(registry: &Registry, channel: ChannelId) -> CapturedTerminalSource {
         scope: view.scope.clone(),
         view_revision: view.revision,
         model_sequence: model.sequence,
-        before: view.panes[0].clone(),
+        before: Box::new(view.panes[0].clone()),
     }
 }
 fn publish(registry: &mut Registry, source: &TerminalSession, worker: &TerminalRemovalBasis) {
@@ -103,7 +103,7 @@ fn stale_exit_cannot_overwrite_an_identical_replacement_or_consume_a_receipt() {
     seed(&mut registry, channel, vec![pane]);
     let a = worker();
     publish(&mut registry, &source, &a);
-    let original = capture(&registry, channel).before;
+    let original = *capture(&registry, channel).before;
     let b = worker();
     publish(&mut registry, &source, &b);
     let mut ended = original.clone();
@@ -144,7 +144,7 @@ fn natural_completion_and_presentation_preserve_the_original_close_generation() 
     let a = worker();
     publish(&mut registry, &source, &a);
     let original = capture(&registry, channel);
-    let mut ended = original.before.clone();
+    let mut ended = Pane::clone(&original.before);
     if let CardKind::Terminal(s) = &mut ended.kind {
         s.continuity = TerminalContinuity::Exited {
             last_exit: crate::model::TerminalExit {
@@ -158,7 +158,7 @@ fn natural_completion_and_presentation_preserve_the_original_close_generation() 
         &mut registry,
         channel,
         Change::UpdateTerminalSource {
-            before: original.before.clone(),
+            before: Pane::clone(&original.before),
             pane: ended.clone(),
             worker: a,
         },
@@ -298,7 +298,7 @@ fn a_rebased_removal_cannot_borrow_the_replacements_absence_stamp() {
         change: Change::RemoveSource {
             registry: old.registry,
             repository: old.repository.clone(),
-            before: old.before.clone(),
+            before: Pane::clone(&old.before),
             terminal: Some(b),
             capture: Some(old),
         },

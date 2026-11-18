@@ -1150,7 +1150,7 @@ mod tests {
         let mut registry = Registry::at(&directory.path().join("registry")).unwrap();
         let (actor, owner, mut source, scope) = fixture(directory.path());
         let first = source.proof.clone().unwrap();
-        source.terminal = Some(crate::model::TerminalSession {
+        source.terminal = Some(Box::new(crate::model::TerminalSession {
             id: crate::model::TerminalId::new(),
             owned_codex_listener: None,
             recovery_origin: None,
@@ -1163,7 +1163,7 @@ mod tests {
                 boot_id: first.boot_id,
                 host_incarnation: first.host_incarnation,
             },
-        });
+        }));
         registry
             .register_native_actor_ownership(actor, &owner, &source, Ok(&scope))
             .unwrap();

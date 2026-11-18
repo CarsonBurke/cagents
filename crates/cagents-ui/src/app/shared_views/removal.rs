@@ -24,6 +24,8 @@ impl From<TerminalRemovalBasis> for TerminalRemovalReceipt {
     }
 }
 
+// Derived on demand for one Close and used at once, so boxing would only add an allocation.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub(in crate::app) enum TerminalCleanupAuthority {
     Local,
@@ -248,7 +250,7 @@ impl Cagents {
                                 .copied()
                                 .unwrap_or(0),
                         ),
-                        before: before.clone(),
+                        before: Box::new(before.clone()),
                     }
                 }),
             };

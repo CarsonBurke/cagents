@@ -147,7 +147,7 @@ fn pending_converted_cleanup_preserves_independent_terminal_worker() {
     // This constructor represents the issued conversion-startup cutpoint: its historical
     // terminal view remains issued, but the helper has no paired holder or
     // console. The independent terminal remains owned by the original HOST.
-    source.terminal = Some(descriptor.session.clone());
+    source.terminal = Some(Box::new(descriptor.session.clone()));
     let registry = super::super::agent_execution::registry(&original).unwrap();
     registry
         .lock()
@@ -204,7 +204,7 @@ fn pending_converted_cleanup_preserves_independent_terminal_worker() {
     assert!(before_close.execution_console.is_none());
     assert_eq!(
         before_close.source.terminal,
-        Some(descriptor.session.clone())
+        Some(Box::new(descriptor.session.clone()))
     );
     // Keep both original startup owners alive until the actual HOST cleanup
     // completes. Startup EOF or dropping an old context cannot satisfy this.

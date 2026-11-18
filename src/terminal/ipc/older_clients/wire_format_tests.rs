@@ -991,3 +991,54 @@ fn actual_main_178_receives_the_frozen_internal_error_for_store_contention() {
         encode(ProtocolErrorCode::Internal)
     );
 }
+
+/// Protocol 187 has no code for a refusal that came before anything changed,
+/// so it is sent the `InvalidRequest` it would have had, at that position.
+#[test]
+fn actual_main_187_receives_invalid_request_for_a_refusal_before_any_effect() {
+    use crate::terminal_ipc::{ProtocolError, ProtocolErrorCode, ServerEnvelopeRef, write_frame};
+    let frozen = recorded(187);
+    let Some(Container::Enum(variants)) = frozen
+        .containers
+        .get("cagents::terminal::ipc::ProtocolErrorCode")
+    else {
+        panic!("missing frozen error codes")
+    };
+    assert!(!variants.iter().any(|(name, _)| name == "not_admitted"));
+    let invalid = variants
+        .iter()
+        .position(|(name, _)| name == "invalid_request")
+        .unwrap();
+    assert_eq!(
+        super::variant_index(&ProtocolErrorCode::InvalidRequest),
+        Some(invalid as u32)
+    );
+    let proof = crate::model::HostSessionProof {
+        host_session_id: "fixture-host".into(),
+        boot_id: "fixture-boot".into(),
+        host_incarnation: "fixture-daemon".into(),
+    };
+    let encode = |code| {
+        let message = ServerMessage::Error(ProtocolError::new(
+            code,
+            "This conversation has an explicitly pinned account",
+            false,
+        ));
+        let mut bytes = Vec::new();
+        write_frame(
+            &mut bytes,
+            &ServerEnvelopeRef {
+                version: 187,
+                request_id: Some(17),
+                proof: &proof,
+                message: &message,
+            },
+        )
+        .unwrap();
+        bytes
+    };
+    assert_eq!(
+        encode(ProtocolErrorCode::NotAdmitted),
+        encode(ProtocolErrorCode::InvalidRequest)
+    );
+}

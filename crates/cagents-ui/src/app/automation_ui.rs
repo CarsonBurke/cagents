@@ -231,7 +231,7 @@ impl Cagents {
                         if self.sidebar_model.project(channel.project_id).is_none() {
                             return Task::none();
                         }
-                        self.select_channel(*id)
+                        self.navigate_to_channel(*id)
                     }
                     crate::agent_execution::Placement::Worktree { path, .. } => {
                         if self.project_ui.deleting_directory(path)
@@ -242,7 +242,7 @@ impl Cagents {
                             ));
                             return Task::none();
                         }
-                        self.select_worktree(path.clone(), false)
+                        self.navigate_to_worktree(path.clone(), false)
                     }
                 };
                 let adopted = self

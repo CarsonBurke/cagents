@@ -288,8 +288,8 @@ pub enum Action {
     /// a conversation of its own, as it would without one.
     Prepared(
         u64,
-        SavedConversation,
-        Result<Option<chat::Session>, String>,
+        Box<SavedConversation>,
+        Result<Option<Box<chat::Session>>, String>,
     ),
 }
 
@@ -1047,13 +1047,13 @@ impl Cagents {
                             self.resume_error("The service did not prepare this exact saved conversation. Its original identity was retained.");
                             return Task::none();
                         }
-                        entry.session = session;
+                        entry.session = *session;
                         if self.existing_conversation_card(&entry.session).is_some() {
-                            return self.resume_saved_conversation(entry);
+                            return self.resume_saved_conversation(*entry);
                         }
-                        self.insert_resumed_conversation(entry, true)
+                        self.insert_resumed_conversation(*entry, true)
                     }
-                    Ok(None) => self.insert_resumed_conversation(entry, false),
+                    Ok(None) => self.insert_resumed_conversation(*entry, false),
                     Err(error) => {
                         self.resume_error(&error);
                         Task::none()
@@ -1214,6 +1214,7 @@ impl Cagents {
         let existing = self.existing_conversation_card(&entry.session);
         if let Some(card) = existing {
             self.close_resume();
+            // The conversation is already open: going to it is navigation.
             let scope = if let Some(channel) = self
                 .durable
                 .channels
@@ -1221,14 +1222,14 @@ impl Cagents {
                 .find(|channel| channel.cards.contains(&card))
                 .map(|channel| channel.id)
             {
-                self.select_channel(channel)
+                self.navigate_to_channel(channel)
             } else {
                 let owner = self
                     .card_state(card)
                     .and_then(|card| self.card_worktree(card))
                     .map(Path::to_path_buf)
                     .unwrap_or_else(|| entry.session.launch.recipe.working_directory.clone());
-                self.select_worktree(owner, false)
+                self.navigate_to_worktree(owner, false)
             };
             return Task::batch([scope, cosmic::task::message(Message::FocusCard(card))]);
         }
@@ -1262,12 +1263,12 @@ impl Cagents {
                     };
                     client
                         .prepare_chat_resume(source)
-                        .map(Some)
+                        .map(|session| Some(Box::new(session)))
                         .map_err(|error| error.to_string())
                 })
                 .await
                 .unwrap_or_else(|error| Err(error.to_string()));
-                Message::ResumeConversation(Action::Prepared(generation, entry, result))
+                Message::ResumeConversation(Action::Prepared(generation, Box::new(entry), result))
             });
         }
         self.insert_resumed_conversation(entry, false)
@@ -1340,7 +1341,7 @@ impl Cagents {
         let task = self.defer_channel_reopen(
             home,
             channel_ui::Reopen::Conversation {
-                entry: entry.clone(),
+                entry: Box::new(entry.clone()),
                 prepared,
                 generation: self.resume_ui.generation,
                 replace: self.resume_ui.replace,
@@ -2096,8 +2097,8 @@ mod tests {
         let generation = app.resume_ui.generation;
         drop(app.update_resume(Action::Prepared(
             generation,
-            entry,
-            Ok(Some(prepared.clone())),
+            Box::new(entry),
+            Ok(Some(Box::new(prepared.clone()))),
         )));
         let card = app.card_state(app.workspace.focused().unwrap()).unwrap();
         assert_eq!(card.kind, CardKind::Chat(prepared));
@@ -2134,8 +2135,8 @@ mod tests {
         let before_settings = app.settings_save_generation;
         drop(app.update_resume(Action::Prepared(
             generation,
-            entry,
-            Ok(Some(prepared.clone())),
+            Box::new(entry),
+            Ok(Some(Box::new(prepared.clone()))),
         )));
 
         let card = app
@@ -2204,8 +2205,8 @@ mod tests {
         let generation = app.resume_ui.generation;
         drop(app.update_resume(Action::Prepared(
             generation,
-            entry.clone(),
-            Ok(Some(prepared.clone())),
+            Box::new(entry.clone()),
+            Ok(Some(Box::new(prepared.clone()))),
         )));
         let card = app.card_state(app.workspace.focused().unwrap()).unwrap();
         assert_eq!(card.kind, CardKind::Chat(prepared));
@@ -2218,7 +2219,7 @@ mod tests {
         let generation = app.resume_ui.generation;
         drop(app.update_resume(Action::Prepared(
             generation,
-            entry.clone(),
+            Box::new(entry.clone()),
             Err("Another pane may still be writing to this Claude conversation".into()),
         )));
         assert!(app.durable.cards.is_empty());
@@ -2228,7 +2229,7 @@ mod tests {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         drop(app.resume_saved_conversation(entry.clone()));
         let generation = app.resume_ui.generation;
-        drop(app.update_resume(Action::Prepared(generation, entry, Ok(None))));
+        drop(app.update_resume(Action::Prepared(generation, Box::new(entry), Ok(None))));
         let card = app.card_state(app.workspace.focused().unwrap()).unwrap();
         let CardKind::Chat(session) = &card.kind else {
             panic!("the conversation resumes as a chat");
@@ -2400,8 +2401,8 @@ mod tests {
         assert!(!app.resume_ui.loading);
         let _ = app.update_resume(Action::Prepared(
             7,
-            entry.clone(),
-            Ok(Some(entry.session.clone())),
+            Box::new(entry.clone()),
+            Ok(Some(Box::new(entry.session.clone()))),
         ));
         assert!(app.durable.cards.is_empty());
         let _ = app.resume_saved_conversation(entry);
@@ -2419,8 +2420,8 @@ mod tests {
         let generation = app.resume_ui.generation;
         let _ = app.update_resume(Action::Prepared(
             generation,
-            entry.clone(),
-            Ok(Some(entry.session)),
+            Box::new(entry.clone()),
+            Ok(Some(Box::new(entry.session))),
         ));
         assert_eq!(app.durable.cards.len(), 1);
         assert_eq!(app.workspace.focused(), card);

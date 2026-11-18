@@ -3766,10 +3766,10 @@ fn automatic_draft_routing_waits_for_untouched_send_and_same_account_choice_pins
             outcome: account::probe::Outcome::Answered {
                 identity: None,
                 catalog: None,
-                snapshot: account::codex::parse_rate_limits(
+                snapshot: Box::new(account::codex::parse_rate_limits(
                     &serde_json::json!({"ordinaryUsageAllowed": status == account::UsageStatus::Ok}),
                     now,
-                ),
+                )),
             },
         }));
     }
@@ -3838,10 +3838,10 @@ fn limited_automatic_chat(app: &mut Cagents, draft: &str) -> (CardId, Target) {
             outcome: account::probe::Outcome::Answered {
                 identity: None,
                 catalog: None,
-                snapshot: account::codex::parse_rate_limits(
+                snapshot: Box::new(account::codex::parse_rate_limits(
                     &serde_json::json!({"ordinaryUsageAllowed": allowed}),
                     now,
-                ),
+                )),
             },
         }));
     }
@@ -3986,131 +3986,162 @@ fn the_footer_names_the_conversations_account_through_a_pending_switch() {
     }
 }
 
-/// A switch the daemon refused only because it was finishing another
-/// operation moved nothing. The conversation stays on its own account and
-/// attached, offers no restore of an account that was never removed, says
-/// plainly that the message wasn't sent, and sending again retries.
+/// A switch the daemon refused before changing anything moved nothing,
+/// whether it was finishing another operation or refused it for a reason
+/// of its own. The conversation stays on its own account and attached,
+/// offers no restore of an account that was never removed, says plainly
+/// that the message wasn't sent, and sending again retries. A refusal for
+/// a reason of its own keeps the daemon's sentence under Details.
 #[test]
 fn a_busy_daemon_refusing_an_automatic_switch_keeps_the_conversation_on_its_account() {
-    let mut app = crate::app::tests::context_inspector_test_app(false);
-    let (card, target) = limited_automatic_chat(&mut app, "Keep this message");
-    app.chat_runtime_mut(target)
-        .unwrap()
-        .attachments
-        .push(Attachment {
-            path: "kept.png".into(),
-            reference: None,
-        });
-    let source = chat_runtime(&app, card).session.clone();
-    let handle = chat_runtime(&app, card).handle().unwrap().clone();
-    drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send))));
-    let attempt = chat_runtime_attempt(&app, card);
-    assert!(
-        app.chat_ui.attempt(card).unwrap().recovery.is_some(),
-        "sending asked for an account switch"
-    );
-    answer_start(
-        &mut app,
-        attempt,
-        Err(chat::StartFailure {
-            message: crate::terminal_ipc::DAEMON_BUSY.into(),
-            recovery: chat::Recovery::Busy,
-        }),
-    );
-    assert!(!app.chat_start_pending(card));
-    assert!(!app.chat_ui.removed_accounts.contains(&card));
-    assert!(!app.chat_ui.restorable_accounts.contains_key(&card));
-    assert!(app.account_recovery_controls(card).is_none());
-    assert!(
-        app.chat_ui
-            .retiring
+    const REASON: &str = "The conversation history could not be prepared on the alternate account: Transcript diverged from the existing account-switch copy";
+    for (recovery, message, notice, guidance, explained) in [
+        (
+            chat::Recovery::Busy,
+            crate::terminal_ipc::DAEMON_BUSY,
+            chat::failure::delivery::ACCOUNT_SWITCH_BUSY.to_owned(),
+            "Send again in a moment.",
+            true,
+        ),
+        (
+            chat::Recovery::NotAdmitted,
+            REASON,
+            chat::failure::account_switch_refused(REASON),
+            chat::failure::ACCOUNT_SWITCH_REFUSED_ACTION,
+            false,
+        ),
+    ] {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target) = limited_automatic_chat(&mut app, "Keep this message");
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .attachments
+            .push(Attachment {
+                path: "kept.png".into(),
+                reference: None,
+            });
+        let source = chat_runtime(&app, card).session.clone();
+        let handle = chat_runtime(&app, card).handle().unwrap().clone();
+        drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send))));
+        let attempt = chat_runtime_attempt(&app, card);
+        assert!(
+            app.chat_ui.attempt(card).unwrap().recovery.is_some(),
+            "sending asked for an account switch"
+        );
+        answer_start(
+            &mut app,
+            attempt,
+            Err(chat::StartFailure {
+                message: message.into(),
+                recovery,
+            }),
+        );
+        assert!(!app.chat_start_pending(card));
+        assert!(
+            !app.chat_ui.removed_accounts.contains(&card),
+            "{recovery:?}"
+        );
+        assert!(!app.chat_ui.restorable_accounts.contains_key(&card));
+        assert!(app.account_recovery_controls(card).is_none());
+        assert!(
+            app.chat_ui
+                .retiring
+                .iter()
+                .all(|retiring| retiring.card != card),
+            "the daemon admitted nothing, so nothing is given up"
+        );
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Chat(source.clone())
+        );
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.target, target, "the original attachment is kept");
+        assert!(Arc::ptr_eq(runtime.handle().unwrap(), &handle));
+        assert!(!runtime.disconnected);
+        assert_eq!(runtime.session, source);
+        assert_eq!(runtime.error.as_deref(), Some(notice.as_str()));
+        assert_eq!(runtime.composer.text().trim(), "Keep this message");
+        assert_eq!(runtime.attachments.len(), 1, "the attachment is kept too");
+        assert_eq!(runtime.attachments[0].path, PathBuf::from("kept.png"));
+        // It answers the send; the conversation and its last turn are fine.
+        assert_eq!(runtime.reported_errors().next(), None);
+        // As drawn on screen.
+        app.chat_runtime_mut(target).unwrap().reconcile_failure_ui();
+        let notice = chat_runtime(&app, card)
+            .failure_ui
+            .incidents
             .iter()
-            .all(|retiring| retiring.card != card),
-        "the daemon admitted nothing, so nothing is given up"
-    );
-    assert_eq!(
-        app.card_state(card).unwrap().kind,
-        CardKind::Chat(source.clone())
-    );
-    let runtime = chat_runtime(&app, card);
-    assert_eq!(runtime.target, target, "the original attachment is kept");
-    assert!(Arc::ptr_eq(runtime.handle().unwrap(), &handle));
-    assert!(!runtime.disconnected);
-    assert_eq!(runtime.session, source);
-    assert_eq!(
-        runtime.error.as_deref(),
-        Some(chat::failure::delivery::ACCOUNT_SWITCH_BUSY)
-    );
-    assert_eq!(runtime.composer.text().trim(), "Keep this message");
-    assert_eq!(runtime.attachments.len(), 1, "the attachment is kept too");
-    assert_eq!(runtime.attachments[0].path, PathBuf::from("kept.png"));
-    // It answers the send; the conversation and its last turn are fine.
-    assert_eq!(runtime.reported_errors().next(), None);
-    // As drawn on screen.
-    app.chat_runtime_mut(target).unwrap().reconcile_failure_ui();
-    let notice = chat_runtime(&app, card)
-        .failure_ui
-        .incidents
-        .iter()
-        .find(|incident| incident.guidance == "Send again in a moment.")
-        .expect("the refusal is shown");
-    assert!(notice.summary.starts_with("Your message wasn't sent."));
-    assert!(notice.explained, "no details that would only repeat it");
+            .find(|incident| incident.guidance == guidance)
+            .expect("the refusal is shown");
+        assert!(notice.summary.starts_with("Your message wasn't sent."));
+        // A fixed outcome has no details that would only repeat it; the
+        // daemon's own reason is kept under Details.
+        assert_eq!(notice.explained, explained, "{recovery:?}");
+        assert!(!notice.summary.contains("diverged"));
+        if !explained {
+            // Details carry only what the notice doesn't already say.
+            let key = notice.key.clone();
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.failure_ui.expanded.insert(key.clone());
+            runtime.cache_failure_preview(&key);
+            assert_eq!(runtime.failure_preview(&key), Some((REASON, false)));
+        }
 
-    drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send))));
-    assert!(
-        app.chat_ui
-            .attempt(card)
-            .is_some_and(|attempt| attempt.recovery.is_some()),
-        "sending again retries the switch"
-    );
-    assert_eq!(
-        chat_runtime(&app, card).error,
-        None,
-        "the earlier refusal does not stand over the retry"
-    );
+        drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send))));
+        assert!(
+            app.chat_ui
+                .attempt(card)
+                .is_some_and(|attempt| attempt.recovery.is_some()),
+            "sending again retries the switch"
+        );
+        assert_eq!(
+            chat_runtime(&app, card).error,
+            None,
+            "the earlier refusal does not stand over the retry"
+        );
 
-    // The operation the daemon was finishing ended this conversation's
-    // connection during the wait. Its wake arrives while the switch is
-    // pending and goes unread there, so the refusal reads the connection
-    // itself: the card offers its reconnect rather than advice to send
-    // again, which a disconnected card can't, and the account is still
-    // not called removed.
-    handle.disconnect_for_test();
-    drop(app.update(Message::ChatUi(Action::Wake(
-        target,
-        Wake::Disconnected("The daemon stopped".into()),
-    ))));
-    assert!(app.chat_start_pending(card));
-    assert!(
-        !chat_runtime(&app, card).disconnected,
-        "the wake was not read while the switch was pending"
-    );
-    let attempt = chat_runtime_attempt(&app, card);
-    answer_start(
-        &mut app,
-        attempt,
-        Err(chat::StartFailure {
-            message: crate::terminal_ipc::DAEMON_BUSY.into(),
-            recovery: chat::Recovery::Busy,
-        }),
-    );
-    assert!(!app.chat_ui.removed_accounts.contains(&card));
-    assert!(
-        app.chat_ui
-            .retiring
-            .iter()
-            .all(|retiring| retiring.card != card)
-    );
-    let runtime = chat_runtime(&app, card);
-    assert!(runtime.disconnected, "the lost connection is shown");
-    assert_eq!(runtime.error, None, "no advice to send again");
-    assert_eq!(runtime.composer.text().trim(), "Keep this message");
-    assert!(
-        app.automatic_chat_account(target, PromptMode::Send)
-            .is_none(),
-        "a disconnected card starts no switch from its old connection"
-    );
+        // The operation the daemon was finishing ended this conversation's
+        // connection during the wait. Its wake arrives while the switch is
+        // pending and goes unread there, so the refusal reads the connection
+        // itself: the card offers its reconnect rather than advice to send
+        // again, which a disconnected card can't, and the account is still
+        // not called removed.
+        handle.disconnect_for_test();
+        drop(app.update(Message::ChatUi(Action::Wake(
+            target,
+            Wake::Disconnected("The daemon stopped".into()),
+        ))));
+        assert!(app.chat_start_pending(card));
+        assert!(
+            !chat_runtime(&app, card).disconnected,
+            "the wake was not read while the switch was pending"
+        );
+        let attempt = chat_runtime_attempt(&app, card);
+        answer_start(
+            &mut app,
+            attempt,
+            Err(chat::StartFailure {
+                message: message.into(),
+                recovery,
+            }),
+        );
+        assert!(!app.chat_ui.removed_accounts.contains(&card));
+        assert!(
+            app.chat_ui
+                .retiring
+                .iter()
+                .all(|retiring| retiring.card != card)
+        );
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.disconnected, "the lost connection is shown");
+        assert_eq!(runtime.error, None, "no advice to send again");
+        assert_eq!(runtime.composer.text().trim(), "Keep this message");
+        assert!(
+            app.automatic_chat_account(target, PromptMode::Send)
+                .is_none(),
+            "a disconnected card starts no switch from its old connection"
+        );
+    }
 }
 
 /// The conversation's provider exited while the daemon was busy, which
@@ -5909,7 +5940,7 @@ fn placeholders_save_with_the_navigation_that_opens_and_leaves_them() {
     use crate::app::terminal_output_tests::persists;
     let mut app = crate::app::tests::context_inspector_test_app(false);
     let saved = persists();
-    drop(app.navigate_to_worktree(FIXTURE_DIRECTORY.into()));
+    drop(app.navigate_to_worktree(FIXTURE_DIRECTORY.into(), true));
     let automatic = app.workspace.focused().unwrap();
     assert!(app.chat_is_unused_default(automatic));
     assert_eq!(persists(), saved, "opening the placeholder waits");
@@ -5920,17 +5951,17 @@ fn placeholders_save_with_the_navigation_that_opens_and_leaves_them() {
     assert!(written.cards.iter().all(|card| card.id != automatic));
     assert_ne!(written.focused, Some(automatic));
 
-    drop(app.navigate_to_worktree("/workspace/elsewhere".into()));
+    drop(app.navigate_to_worktree("/workspace/elsewhere".into(), true));
     assert!(app.card_state(automatic).is_none());
     assert_eq!(persists(), saved + 1, "discarding the placeholder waits");
     drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
     assert_eq!(persists(), saved + 2);
 
-    drop(app.navigate_to_worktree(FIXTURE_DIRECTORY.into()));
+    drop(app.navigate_to_worktree(FIXTURE_DIRECTORY.into(), true));
     let used = app.workspace.focused().unwrap();
     write(&mut app, used, "keep this message");
     let before = persists();
-    drop(app.navigate_to_worktree("/workspace/elsewhere".into()));
+    drop(app.navigate_to_worktree("/workspace/elsewhere".into(), true));
     assert_eq!(
         persists(),
         before + 1,
@@ -8230,10 +8261,10 @@ fn stepping_through_find_matches_keeps_the_keyboard_in_the_search() {
     );
 }
 
-/// Resting the pointer on another pane leaves the keyboard with a chat
+/// Moving the pointer into another pane leaves the keyboard with a chat
 /// menu that is still open, and follows the pointer again once it closes.
 #[test]
-fn an_open_chat_menu_holds_focus_against_the_resting_pointer() {
+fn an_open_chat_menu_holds_focus_against_the_hovering_pointer() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
     app.settings.focus_follows_mouse = true;
     let first = live_chat(&mut app, Some("menu-first"));
@@ -8242,7 +8273,7 @@ fn an_open_chat_menu_holds_focus_against_the_resting_pointer() {
     let _ = app.apply_viewport(update, false, DurableChange::Content);
     let _ = app.update(Message::Viewport {
         generation: app.workspace_view_generation,
-        event: WorkspaceViewportEvent::PointerRested(second),
+        event: WorkspaceViewportEvent::PointerEntered(second),
     });
     assert_eq!(app.workspace.focused(), Some(second));
     let target = chat_runtime(&app, second).target;
@@ -8250,13 +8281,13 @@ fn an_open_chat_menu_holds_focus_against_the_resting_pointer() {
     assert!(app.chat_menu_open());
     let _ = app.update(Message::Viewport {
         generation: app.workspace_view_generation,
-        event: WorkspaceViewportEvent::PointerRested(first),
+        event: WorkspaceViewportEvent::PointerEntered(first),
     });
     assert_eq!(app.workspace.focused(), Some(second));
     app.chat_runtime_mut(target).unwrap().composer_actions = false;
     let _ = app.update(Message::Viewport {
         generation: app.workspace_view_generation,
-        event: WorkspaceViewportEvent::PointerRested(first),
+        event: WorkspaceViewportEvent::PointerEntered(first),
     });
     assert_eq!(app.workspace.focused(), Some(first));
     // A menu flagged open in a pane without focus is not on screen, and
@@ -8264,7 +8295,7 @@ fn an_open_chat_menu_holds_focus_against_the_resting_pointer() {
     app.chat_runtime_mut(target).unwrap().composer_actions = true;
     let _ = app.update(Message::Viewport {
         generation: app.workspace_view_generation,
-        event: WorkspaceViewportEvent::PointerRested(second),
+        event: WorkspaceViewportEvent::PointerEntered(second),
     });
     assert_eq!(app.workspace.focused(), Some(second));
 }
@@ -11794,11 +11825,11 @@ fn a_conversations_account_report_reaches_its_account() {
         outcome: crate::account::probe::Outcome::Answered {
             catalog: None,
             identity: None,
-            snapshot: crate::account::UsageSnapshot::state(
+            snapshot: Box::new(crate::account::UsageSnapshot::state(
                 crate::account::UsageStatus::Ok,
                 "",
                 now - 1,
-            ),
+            )),
         },
     }));
     assert!(handle.push_account_usage_for_test(report(20), now));
@@ -11876,11 +11907,11 @@ fn a_new_chat_limit_without_usage_frames_forces_one_read_with_usage_views_closed
             outcome: crate::account::probe::Outcome::Answered {
                 identity: None,
                 catalog: None,
-                snapshot: crate::account::UsageSnapshot::state(
+                snapshot: Box::new(crate::account::UsageSnapshot::state(
                     crate::account::UsageStatus::Ok,
                     "cached",
                     now,
-                ),
+                )),
             },
         })),
     );
@@ -11923,11 +11954,11 @@ fn a_new_chat_limit_without_usage_frames_forces_one_read_with_usage_views_closed
             outcome: crate::account::probe::Outcome::Answered {
                 identity: None,
                 catalog: None,
-                snapshot: crate::account::UsageSnapshot::state(
+                snapshot: Box::new(crate::account::UsageSnapshot::state(
                     crate::account::UsageStatus::Limited,
                     "fresh",
                     now + 1,
-                ),
+                )),
             },
         })),
     );
@@ -12109,11 +12140,11 @@ fn revealing_a_cold_disconnected_current_limit_refreshes_once_without_another_cl
                     outcome: crate::account::probe::Outcome::Answered {
                         identity: None,
                         catalog: None,
-                        snapshot: crate::account::UsageSnapshot::state(
+                        snapshot: Box::new(crate::account::UsageSnapshot::state(
                             crate::account::UsageStatus::Limited,
                             "fresh",
                             crate::chat::now_ms().unwrap(),
-                        ),
+                        )),
                     },
                 })),
             );
@@ -13025,7 +13056,7 @@ pub(super) fn fresh_close_answer(
     (target, source, requested): (Target, chat::Session, chat::Session),
     result: Result<(), String>,
 ) -> Action {
-    Action::FreshCloseFinished(target, source, requested, result)
+    Action::FreshCloseFinished(target, Box::new(source), Box::new(requested), result)
 }
 
 /// A fresh start gives up the previous conversation before it starts the
@@ -15515,7 +15546,7 @@ fn upgraded_identity_is_installed_only_after_its_exact_durable_receipt() {
                 };
             } else {
                 let proof = source.proof.clone().unwrap();
-                source.terminal = Some(TerminalSession {
+                source.terminal = Some(Box::new(TerminalSession {
                     id: source.id,
                     launch: source.launch.terminal_recipe().unwrap(),
                     continuity: TerminalContinuity::Live {
@@ -15528,7 +15559,7 @@ fn upgraded_identity_is_installed_only_after_its_exact_durable_receipt() {
                     owned_codex_listener: None,
                     recovery_origin: None,
                     predecessor: None,
-                });
+                }));
             }
             if learns_identity {
                 source.launch.session_id = None;
@@ -15621,7 +15652,7 @@ fn upgraded_identity_is_installed_only_after_its_exact_durable_receipt() {
         let target = app.chat_ui.next_target(card);
         app.chat_ui.phases.insert(
             card,
-            Phase::Starting(Attempt {
+            Phase::Starting(Box::new(Attempt {
                 target,
                 intent: chat::Intent::Restore,
                 session: source.clone(),
@@ -15629,7 +15660,7 @@ fn upgraded_identity_is_installed_only_after_its_exact_durable_receipt() {
                 upgrade_committed: false,
                 resume_committed: false,
                 upgrade_admission: None,
-            }),
+            })),
         );
         app.cards.remove(&card);
         let task = app.update(Message::ChatUi(Action::Ready(
@@ -15680,7 +15711,7 @@ fn upgraded_identity_is_installed_only_after_its_exact_durable_receipt() {
             let next = app.chat_ui.next_target(card);
             app.chat_ui.phases.insert(
                 card,
-                Phase::Starting(Attempt {
+                Phase::Starting(Box::new(Attempt {
                     target: next,
                     intent: chat::Intent::Restore,
                     session: source.clone(),
@@ -15688,7 +15719,7 @@ fn upgraded_identity_is_installed_only_after_its_exact_durable_receipt() {
                     upgrade_committed: false,
                     resume_committed: false,
                     upgrade_admission: None,
-                }),
+                })),
             );
             let _ = app.update(receipt);
             assert_eq!(app.chat_ui.attempt(card).unwrap().target, next);
@@ -16157,13 +16188,13 @@ fn a_never_named_conversation_whose_daemon_is_gone_reopens_as_a_draft() {
     // so it asks, as before.
     let card = live_chat(&mut app, None);
     let mut session = chat_runtime(&app, card).session.clone();
-    session.terminal = Some(crate::app::fresh_terminal_session(LaunchRecipe {
+    session.terminal = Some(Box::new(crate::app::fresh_terminal_session(LaunchRecipe {
         unset_environment: Default::default(),
         program: "codex".into(),
         arguments: Vec::new(),
         working_directory: session.launch.recipe.working_directory.clone(),
         environment: Default::default(),
-    }));
+    })));
     app.chat_forget(card);
     app.cards.insert(card, CardRuntime::Loading);
     let _ = app.open_chat(card, session, chat::Intent::Restore);
@@ -16646,7 +16677,7 @@ fn an_explicit_fresh_start_drops_retained_actor_and_pair_authority() {
         };
         if paired {
             let proof = source.proof.clone().unwrap();
-            source.terminal = Some(TerminalSession {
+            source.terminal = Some(Box::new(TerminalSession {
                 id: source.id,
                 launch: source.launch.recipe.clone(),
                 continuity: TerminalContinuity::Live {
@@ -16659,7 +16690,7 @@ fn an_explicit_fresh_start_drops_retained_actor_and_pair_authority() {
                 owned_codex_listener: source.owned_codex_listener.clone(),
                 recovery_origin: None,
                 predecessor: None,
-            });
+            }));
         }
         assert!(source.has_valid_native_continuity());
         assert_eq!(source.owns_codex_listener(), provider == Provider::Codex);
@@ -18841,7 +18872,11 @@ fn auth_recovery_changed_identity_keeps_sign_in_but_fences_resume() {
                     disputed_by: None,
                 }),
                 catalog: None,
-                snapshot: account::UsageSnapshot::state(account::UsageStatus::Ok, "", now),
+                snapshot: Box::new(account::UsageSnapshot::state(
+                    account::UsageStatus::Ok,
+                    "",
+                    now,
+                )),
             },
         })));
         assert!(
@@ -20667,7 +20702,7 @@ fn retained_live_model_upgrade_does_not_supersede_account_return_or_close_owners
         let mut f = live_shared_recovery_fixture();
         let target = f.app.chat_ui.next_target(f.card);
         let phase = match owner {
-            "account" => Phase::Starting(Attempt {
+            "account" => Phase::Starting(Box::new(Attempt {
                 target,
                 intent: chat::Intent::Restore,
                 session: f.source.clone(),
@@ -20679,7 +20714,7 @@ fn retained_live_model_upgrade_does_not_supersede_account_return_or_close_owners
                 upgrade_committed: false,
                 resume_committed: false,
                 upgrade_admission: None,
-            }),
+            })),
             "return" => Phase::Returning {
                 target,
                 local: None,
@@ -20689,7 +20724,7 @@ fn retained_live_model_upgrade_does_not_supersede_account_return_or_close_owners
                 let mut other = f.source.clone();
                 other.id = TerminalId::new();
                 other.launch.recipe.arguments.push("--other-start".into());
-                Phase::Starting(Attempt {
+                Phase::Starting(Box::new(Attempt {
                     target,
                     intent: chat::Intent::Restore,
                     session: other,
@@ -20697,7 +20732,7 @@ fn retained_live_model_upgrade_does_not_supersede_account_return_or_close_owners
                     upgrade_committed: false,
                     resume_committed: false,
                     upgrade_admission: None,
-                })
+                }))
             }
             _ => Phase::Closing {
                 target,
@@ -20996,7 +21031,7 @@ fn retained_claude_identity_is_installed_only_after_its_exact_durable_receipt() 
         let target = app.chat_ui.next_target(card);
         app.chat_ui.phases.insert(
             card,
-            Phase::Starting(Attempt {
+            Phase::Starting(Box::new(Attempt {
                 target,
                 intent: chat::Intent::Restore,
                 session: source.clone(),
@@ -21004,7 +21039,7 @@ fn retained_claude_identity_is_installed_only_after_its_exact_durable_receipt() 
                 upgrade_committed: false,
                 resume_committed: false,
                 upgrade_admission: None,
-            }),
+            })),
         );
         app.cards.remove(&card);
         let task = app.update(Message::ChatUi(Action::Ready(
@@ -21075,7 +21110,7 @@ fn retained_claude_identity_is_installed_only_after_its_exact_durable_receipt() 
             let next = app.chat_ui.next_target(card);
             app.chat_ui.phases.insert(
                 card,
-                Phase::Starting(Attempt {
+                Phase::Starting(Box::new(Attempt {
                     target: next,
                     intent: chat::Intent::Restore,
                     session: source.clone(),
@@ -21083,7 +21118,7 @@ fn retained_claude_identity_is_installed_only_after_its_exact_durable_receipt() 
                     upgrade_committed: false,
                     resume_committed: false,
                     upgrade_admission: None,
-                }),
+                })),
             );
             let _ = app.update(receipt);
             assert_eq!(app.chat_ui.attempt(card).unwrap().target, next);

@@ -22,15 +22,16 @@ pub(crate) enum RetirementInspection {
     ExitedUnproved,
     Verified(VerifiedRetirement),
 }
+/// Boxed so the inspection, and each owner that carries one, stays small.
 #[derive(Debug)]
-pub(crate) struct VerifiedRetirement(RetirementReceipt);
+pub(crate) struct VerifiedRetirement(Box<RetirementReceipt>);
 impl VerifiedRetirement {
     pub(crate) fn receipt(&self) -> &RetirementReceipt {
         &self.0
     }
     #[cfg(test)]
     pub(crate) fn into_receipt(self) -> RetirementReceipt {
-        self.0
+        *self.0
     }
 }
 
@@ -326,7 +327,7 @@ fn inspect_retirement_with_proof(
         return Ok(RetirementInspection::ExitedUnproved);
     }
     Ok(RetirementInspection::Verified(VerifiedRetirement(
-        saved.receipt,
+        Box::new(saved.receipt),
     )))
 }
 

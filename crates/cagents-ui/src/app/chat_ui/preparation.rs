@@ -1341,17 +1341,17 @@ enum Retirement {
     LocalText(RawLocal),
     Prompt(Box<prompt::Prepared>),
     Literal(literal_content::Prepared),
-    FlowSource(flow_layout::RawSource),
+    FlowSource(Box<flow_layout::RawSource>),
     FlowOutput(flow_layout::OutputRetirement),
     Document(prose_document::Data),
-    Coordination(coordination::Prepared),
+    Coordination(Box<coordination::Prepared>),
     Styles(HashMap<u64, prose::CodeBlock>, Option<prose::Palettes>),
     Geometry(
         Box<flow_layout::Geometry>,
         Option<Arc<flow_layout::OutputAdmission>>,
     ),
-    Presentation(Presentation),
-    Installed(Retired),
+    Presentation(Box<Presentation>),
+    Installed(Box<Retired>),
     // Keep the existing queued-source lease until canonical parser/source
     // destructors finish, including cancelled/hidden sources without output.
     Detached(Arc<Shared>),
@@ -1424,7 +1424,7 @@ pub(super) fn retire_flow_source(source: flow_layout::RawSource) {
     if RECLAIMING_FLOW.with(std::cell::Cell::get) {
         drop(source);
     } else {
-        enqueue_retirement(Retirement::FlowSource(source));
+        enqueue_retirement(Retirement::FlowSource(Box::new(source)));
     }
 }
 pub(super) fn retire_flow_output(output: flow_layout::OutputRetirement) {
@@ -1441,7 +1441,7 @@ pub(super) fn retire_styles(
     enqueue_retirement(Retirement::Styles(blocks, palettes));
 }
 pub(super) fn retire_coordination(prepared: coordination::Prepared) {
-    enqueue_retirement(Retirement::Coordination(prepared));
+    enqueue_retirement(Retirement::Coordination(Box::new(prepared)));
 }
 pub(super) fn retire_document(document: prose_document::Data) {
     enqueue_retirement(Retirement::Document(document));
@@ -1453,13 +1453,13 @@ pub(super) fn retire_geometry(
     enqueue_retirement(Retirement::Geometry(geometry, admission));
 }
 pub(super) fn retire_presentation(presentation: Presentation) {
-    enqueue_retirement(Retirement::Presentation(presentation));
+    enqueue_retirement(Retirement::Presentation(Box::new(presentation)));
 }
 fn retire_shared(shared: Arc<Shared>) {
     enqueue_retirement(Retirement::Detached(shared));
 }
 fn retire(retired: Retired) {
-    enqueue_retirement(Retirement::Installed(retired));
+    enqueue_retirement(Retirement::Installed(Box::new(retired)));
 }
 // Ownership already resident in the active graph may retire as one batch.
 // Worker producers fence reclamation before allocating another generation, so

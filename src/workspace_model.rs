@@ -356,6 +356,8 @@ impl WorkspaceModel {
 /// Every variant is idempotent, because the same edit reaches the registry from
 /// a CLI invocation, from the window that made it and - after a reconnect - from
 /// a window resynchronising against a registry that already has it.
+// Edits are short-lived messages, and boxing `ChangeView`'s change would break dozens of nested `Change::…` patterns.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ModelEdit {
     /// Upsert by path. A repeat updates the name and keeps the kind and rank.

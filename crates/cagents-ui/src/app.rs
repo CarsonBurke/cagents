@@ -347,6 +347,8 @@ enum NoticeKey {
     TerminalSave(CardId, TerminalId),
     /// Starting or restoring the terminal in this card.
     TerminalStart(CardId),
+    /// Restoring this card from the window's saved state at startup.
+    CardRestore(CardId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -647,6 +649,24 @@ fn terminal_handoff_pending_notice(error: String) -> TransientNotice {
     TransientNotice::error(format!(
         "Terminal handoff acknowledgement is pending; it will retry after saving recovers or the window refreshes: {error}"
     ))
+}
+
+/// A card the window's saved state could not restore. The notice stands until
+/// the card opens here anyway, as a pane another window or the daemon still
+/// holds does, and then the copy that arrived replaces the unreadable one.
+fn card_restore_notice(warning: &cagents::persistence::RestoreWarning) -> TransientNotice {
+    use cagents::persistence::RestoreProblem;
+    let title = &warning.title;
+    match &warning.problem {
+        RestoreProblem::Missing => TransientNotice::warning(format!(
+            "Could not restore “{title}”: its saved record is missing."
+        )),
+        RestoreProblem::Unreadable(reason) => TransientNotice::warning(format!(
+            "Could not restore “{title}”. Its saved data is kept."
+        ))
+        .with_details(reason.clone()),
+    }
+    .with_key(NoticeKey::CardRestore(warning.card))
 }
 
 fn chat_return_unsaved_notice(card: CardId) -> TransientNotice {
@@ -1618,7 +1638,7 @@ impl Default for PanePresence {
 
 /// How long a change of where this window is - its focus, channel or
 /// worktree - waits to be saved. Navigation comes in bursts: a held key, a
-/// pointer resting on one pane after another, a person clicking down the
+/// pointer moving across one pane after another, a person clicking down the
 /// sidebar. Each save projects every shared view and copies the workspace and
 /// every chat draft on the UI thread, so a burst is saved once, at its first
 /// move plus this delay. Any other save in between carries it along, and
@@ -1696,6 +1716,14 @@ struct ReplicaSnapshotDebt {
     writer: crate::session::WriterIdentity,
 }
 
+/// Whether a focus change reads the newly focused pane's update at once, or
+/// leaves that to the attention dwell once the pane has stayed visible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FocusRead {
+    Now,
+    AfterDwell,
+}
+
 /// What an update changed in the durable workspace beside focus, which decides
 /// when [`Cagents::apply_viewport`] hands the workspace to the writer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1703,8 +1731,8 @@ enum DurableChange {
     /// Nothing: a change of focus alone is saved within
     /// [`NAVIGATION_SAVE_DELAY`].
     None,
-    /// The channel or worktree this window shows, saved within
-    /// [`NAVIGATION_SAVE_DELAY`] like focus.
+    /// The channel or worktree this window shows, or a utility pane shown in
+    /// it, saved within [`NAVIGATION_SAVE_DELAY`] like focus.
     Navigation,
     /// Anything else, saved now.
     Content,
@@ -2200,10 +2228,10 @@ fn update_workspace_viewport(
         }
         WorkspaceViewportEvent::Resized(width) => (workspace.resize_viewport(width), true),
         // Pointer activation hands the keyboard over itself, through
-        // `focus_pane_keyboard_after_rest` and `_after_press`, which leave a
+        // `focus_pane_keyboard_after_entry` and `_after_press`, which leave a
         // control the person chose where it is. The workspace's own request
         // would focus the pane's control regardless.
-        WorkspaceViewportEvent::PointerRested(card) => {
+        WorkspaceViewportEvent::PointerEntered(card) => {
             let update = workspace
                 .focus_without_scrolling(card)
                 .unwrap_or_else(|_| ViewportUpdate::unchanged());
@@ -2532,7 +2560,7 @@ pub(crate) struct Bootstrap {
     status: Option<String>,
     save_health: Option<SaveHealthState>,
     /// Cards that storage held but could not restore. Advisory, never fatal.
-    restore_warnings: Vec<String>,
+    restore_warnings: Vec<cagents::persistence::RestoreWarning>,
     /// Settings the file holds that this build could not use. Advisory.
     settings_warnings: Vec<String>,
 }
@@ -3198,7 +3226,7 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
             | Message::FocusAdjacent(_)
             | Message::Viewport {
                 event: WorkspaceViewportEvent::PointerFocused { .. }
-                    | WorkspaceViewportEvent::PointerRested(_),
+                    | WorkspaceViewportEvent::PointerEntered(_),
                 ..
             }
             | Message::ToggleContextInspector
@@ -4005,6 +4033,8 @@ impl SettingsDraft {
     }
 }
 
+// A return value its caller consumes at once, so boxing would only add an allocation.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 enum SettingsDecision {
     Invalid(String),
@@ -4810,9 +4840,6 @@ pub enum Message {
     /// Reconcile the repositories whose background loads finished since the
     /// last reconciliation; see [`Cagents::defer_repository_reconciliation`].
     RepositoryReconciliationDue,
-    /// The hold that began at this instant has lasted long enough to draw the
-    /// workspace switcher.
-    WorkspaceSwitcherDue(Instant),
     WorkspaceSwitcherSelected {
         since: Instant,
         index: usize,
@@ -7682,13 +7709,16 @@ impl Cagents {
             && view.selected_number != number
         {
             view.selected_number = number;
+            // Saved now, though it is browsing: a shared view holds the
+            // pane's kind, and an update to that view arriving before a
+            // deferred save would put the previous pull request back.
             self.persist();
         }
         for url in links {
             tasks.push(self.open_clicked_link(url));
         }
         if let Some(path) = checkout_open {
-            tasks.push(self.select_worktree(path, false));
+            tasks.push(self.navigate_to_worktree(path, false));
         }
         if let Some((project, target)) = checkout {
             tasks.push(self.prepare_pr_checkout(card, project, target));
@@ -8754,12 +8784,14 @@ impl Cagents {
         let channel = channels_holding(&self.durable.channels, id)
             .next()
             .map(|channel| channel.id);
+        // Going to a pane that is already open changes only where this
+        // window is.
         let scope = if let Some(channel) = channel {
-            self.select_channel(channel)
+            self.navigate_to_channel(channel)
         } else {
             let directory = self.unchanneled_card_worktree(&card).map(Path::to_path_buf);
             directory.map_or_else(Task::none, |directory| {
-                self.select_worktree(directory, false)
+                self.navigate_to_worktree(directory, false)
             })
         };
         let focus = self.focus_workspace_card(id);
@@ -10091,10 +10123,10 @@ impl Cagents {
         .map(cosmic::Action::App)
     }
 
-    /// The keyboard after the pointer rested on `card` and focused it. It
+    /// The keyboard after the pointer moved into `card` and focused it. It
     /// comes from another pane or from nowhere; a field outside the strip,
     /// such as sidebar search, keeps what is being typed into it.
-    fn focus_pane_keyboard_after_rest(&mut self, card: CardId) -> Task<Message> {
+    fn focus_pane_keyboard_after_entry(&mut self, card: CardId) -> Task<Message> {
         if !self.card_holds_keyboard(card) {
             return Task::none();
         }
@@ -10782,6 +10814,16 @@ impl Cagents {
         synchronize_scroll: bool,
         durable_change: DurableChange,
     ) -> Task<Message> {
+        self.apply_viewport_reading(update, synchronize_scroll, durable_change, FocusRead::Now)
+    }
+
+    fn apply_viewport_reading(
+        &mut self,
+        update: ViewportUpdate,
+        synchronize_scroll: bool,
+        durable_change: DurableChange,
+        read: FocusRead,
+    ) -> Task<Message> {
         // A pane resized too narrow for its inspector closes it before it is
         // drawn squeezed.
         self.sync_pane_inspectors();
@@ -10797,7 +10839,7 @@ impl Cagents {
             Arc::make_mut(&mut self.durable).focused = focused;
         }
         let mut tasks = Vec::new();
-        if focus_changed {
+        if focus_changed && read == FocusRead::Now {
             tasks.push(self.acknowledge_active_pane());
         }
         if self.chrome_ui.tabs_focus != focused {
@@ -13968,7 +14010,9 @@ impl Cagents {
     /// paths - a close, a deleted worktree or channel, a sign-in's terminal
     /// retiring, another client removing a shared pane - so this holds for
     /// all of them in one place, after every update, rather than in each.
-    fn resolve_notices_for_closed_cards(&mut self) {
+    /// Likewise a card that could not be restored at startup may still open
+    /// here, from a shared view that holds it, and its report goes then.
+    fn resolve_card_notices(&mut self) {
         self.prune_terminal_save_notices();
         let closed = self
             .notices
@@ -13991,6 +14035,24 @@ impl Cagents {
             })
             .collect::<Vec<_>>();
         for key in closed {
+            self.notices.resolve(key);
+        }
+        let restored = self
+            .notices
+            .entries
+            .iter()
+            .filter_map(|entry| match entry.notice.key.as_ref() {
+                Some(key @ NoticeKey::CardRestore(card))
+                    if self
+                        .card_state(*card)
+                        .is_some_and(|state| state.existence.is_open()) =>
+                {
+                    Some(key.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for key in restored {
             self.notices.resolve(key);
         }
     }
@@ -14852,8 +14914,9 @@ impl Cagents {
         self.set_presence(id, Exposure::Visible, Residency::Hot);
         self.register_channel_card(id);
         self.cards.insert(id, runtime);
-        self.persist();
-        self.apply_viewport(update, true, DurableChange::None)
+        // No shared view holds a utility pane, so showing one is saved like
+        // any other move of where this window is.
+        self.apply_viewport(update, true, DurableChange::Navigation)
     }
 
     /// Moves an open utility pane into the strip on screen, beside the
@@ -14897,8 +14960,9 @@ impl Cagents {
                 return Task::none();
             }
         };
-        self.persist();
-        self.apply_viewport(update, true, DurableChange::Content)
+        // Leaving a channel takes nothing out of its view, which never held
+        // the pane: this moves only where the window shows it.
+        self.apply_viewport(update, true, DurableChange::Navigation)
     }
 
     fn prune_pane_title_overrides(&mut self) {
@@ -15917,11 +15981,13 @@ impl Application for Cagents {
             lifecycle_sweep_destination: None,
             input_trace: crate::input_trace::InputTrace::default(),
         };
-        // One notice per lost card, not a single joined line: the log dedupes
-        // by message, so distinct failures stay distinct and a repeated one
-        // collapses into a count. The alternative this replaces was losing
+        // One notice per lost card, not a single joined line, so distinct
+        // failures stay distinct. The alternative this replaces was losing
         // cards with no diagnostic anywhere in the UI.
-        for warning in restore_warnings.into_iter().chain(settings_warnings) {
+        for warning in restore_warnings {
+            app.notices.record(card_restore_notice(&warning));
+        }
+        for warning in settings_warnings {
             app.notices.record(TransientNotice::warning(warning));
         }
         app.sidebar_state
@@ -15980,7 +16046,7 @@ impl Application for Cagents {
         for card in &app.durable.cards {
             let terminal = match &card.kind {
                 CardKind::Terminal(terminal) => Some(terminal),
-                CardKind::Chat(chat) => chat.terminal.as_ref(),
+                CardKind::Chat(chat) => chat.terminal.as_deref(),
                 _ => None,
             };
             if let Some(terminal) = terminal {
@@ -17240,12 +17306,12 @@ impl Application for Cagents {
                 if matches!(
                     event,
                     WorkspaceViewportEvent::PointerFocused { .. }
-                        | WorkspaceViewportEvent::PointerRested(_)
+                        | WorkspaceViewportEvent::PointerEntered(_)
                 ) && self.workspace_inputs_blocked()
                 {
                     return Task::none();
                 }
-                if matches!(event, WorkspaceViewportEvent::PointerRested(_))
+                if matches!(event, WorkspaceViewportEvent::PointerEntered(_))
                     && (!self.settings.focus_follows_mouse
                         || self.chat_menu_open()
                         || self.device_ui.menu_open)
@@ -17255,12 +17321,21 @@ impl Application for Cagents {
                 let previous_width = self.workspace.viewport_width();
                 let (update, synchronize_scroll) =
                     update_workspace_viewport(&mut self.workspace, event);
-                let task = self.apply_viewport(update, false, DurableChange::None);
+                // The pointer passing over a pane on its way elsewhere focuses
+                // it, but has not read it: its update is read once it stays
+                // visible for the attention dwell, like any other pane.
+                let read = if matches!(event, WorkspaceViewportEvent::PointerEntered(_)) {
+                    FocusRead::AfterDwell
+                } else {
+                    FocusRead::Now
+                };
+                let task =
+                    self.apply_viewport_reading(update, false, DurableChange::None, read);
                 let keyboard = match event {
-                    WorkspaceViewportEvent::PointerRested(card)
+                    WorkspaceViewportEvent::PointerEntered(card)
                         if self.workspace.focused() == Some(card) =>
                     {
-                        self.focus_pane_keyboard_after_rest(card)
+                        self.focus_pane_keyboard_after_entry(card)
                     }
                     // Another button's press, such as one opening a context
                     // menu over selected text, leaves the keyboard alone.
@@ -17321,14 +17396,6 @@ impl Application for Cagents {
                 } else {
                     Task::none()
                 }
-            }
-            Message::WorkspaceSwitcherDue(since) => {
-                if self.chrome_ui.workspace_preview_since != Some(since)
-                    || self.chrome_ui.workspace_switcher_shown
-                {
-                    return Task::none();
-                }
-                self.show_workspace_switcher()
             }
             Message::ReplicaCaptureDue(generation) => {
                 self.replica_capture_due(generation, Instant::now())
@@ -18287,7 +18354,7 @@ impl Application for Cagents {
         if let Some(notice) = self.status.take() {
             self.report_notice(notice);
         }
-        self.resolve_notices_for_closed_cards();
+        self.resolve_card_notices();
         // A canonical save can arrive before the retry reply. Restore input
         // after either path retires the focused Retry save control.
         let task = Task::batch([task, self.refocus_saved_terminal()]);

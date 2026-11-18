@@ -40,9 +40,9 @@ pub enum WorkspaceViewportEvent {
         card: CardId,
         primary: bool,
     },
-    /// The pointer moved into this pane and rested there for
-    /// [`HOVER_ACTIVATION_DWELL`] without a click or a key press in between.
-    PointerRested(CardId),
+    /// The pointer moved into this pane, and was still over it when the next
+    /// frame was drawn.
+    PointerEntered(CardId),
     Reordered {
         card: CardId,
         before: Option<CardId>,
@@ -160,13 +160,6 @@ pub struct ShortcutDescriptor {
     pub repeatable: bool,
     pub scope: ShortcutScope,
 }
-
-/// How long the pointer must rest in a pane it moved into before hover
-/// activation gives that pane focus. Long enough that sweeping across the
-/// strip - toward the inspector, say - activates nothing on the way; short
-/// enough to read as a response to stopping there. It matches the tooltip
-/// delay, the app's other reading of a pointer that stopped on purpose.
-pub const HOVER_ACTIVATION_DWELL: Duration = Duration::from_millis(300);
 
 pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
     ShortcutDescriptor {
@@ -1187,9 +1180,9 @@ where
                                     primary: false,
                                 }),
                             )
-                            // The active pane has nothing to gain from a rest.
-                            .on_pointer_rest((focus_follows_mouse && !focused).then(|| {
-                                on_viewport(WorkspaceViewportEvent::PointerRested(card.id))
+                            // The active pane has nothing to gain from an entry.
+                            .on_pointer_enter((focus_follows_mouse && !focused).then(|| {
+                                on_viewport(WorkspaceViewportEvent::PointerEntered(card.id))
                             }))
                             .into(),
                     })
@@ -1237,7 +1230,7 @@ struct CardSurface<'a, Message> {
     content: Element<'a, Message>,
     /// Published for a primary press and for any other press.
     on_pointer_focus: Option<(Message, Message)>,
-    on_pointer_rest: Option<Message>,
+    on_pointer_enter: Option<Message>,
     input: InputTrace,
     on_screen: bool,
 }
@@ -1247,7 +1240,7 @@ impl<'a, Message> CardSurface<'a, Message> {
         Self {
             content: content.into(),
             on_pointer_focus: None,
-            on_pointer_rest: None,
+            on_pointer_enter: None,
             input: InputTrace::default(),
             on_screen: false,
         }
@@ -1274,10 +1267,10 @@ impl<'a, Message> CardSurface<'a, Message> {
         self
     }
 
-    /// Published once the pointer has moved into this pane and rested there;
+    /// Published once the pointer has moved into this pane;
     /// see [`CardPointerState`] for what counts.
-    fn on_pointer_rest(mut self, message: Option<Message>) -> Self {
-        self.on_pointer_rest = message;
+    fn on_pointer_enter(mut self, message: Option<Message>) -> Self {
+        self.on_pointer_enter = message;
         self
     }
 
@@ -1301,24 +1294,26 @@ impl<'a, Message> CardSurface<'a, Message> {
 /// returning from a popup surface, the strip scrolling under a still pointer,
 /// or a pane mounting beneath it all leave the pointer where it was.
 ///
-/// An entry must then rest for [`HOVER_ACTIVATION_DWELL`], so sweeping across
-/// the strip activates nothing on the way. A key or button pressed anywhere
-/// before then cancels it, so a pointer that drifts while the reader types or
-/// runs a shortcut leaves their keystrokes going where they were going. The
-/// pointer must still be over the pane when the dwell ends, which a pane the
-/// strip moved away meanwhile is not, and must not be resting on a resize
-/// handle at the pane's edge, nor be composing text with an input method.
-/// Leaving such a handle into the pane starts a dwell of its own.
+/// Hover activation follows the pointer at once, as a window manager's focus
+/// follows the mouse. It is reported at the next frame rather than during
+/// the motion, because only once every widget has seen the motion is it
+/// known whether the pointer stopped on a resize handle at the pane's edge.
+/// The pointer must still be over the pane at that frame, which a pane the
+/// strip moved away meanwhile is not, and must not be on such a handle, nor
+/// be composing text with an input method. A key or button pressed in
+/// between keeps focus where it was. Leaving a handle into the pane counts
+/// as an entry of its own.
 #[derive(Default)]
 struct CardPointerState {
-    /// When a crossing into the pane began the dwell it is still serving.
+    /// When the pointer crossed into the pane, until the next frame reports
+    /// it.
     entered_at: Option<Instant>,
     selecting: bool,
 }
 
-/// How late past its dwell a rest may still be reported. A pane scrolled out
-/// of view receives no frames, so its dwell ends at the first frame it gets
-/// back, however long after the pointer stopped there that is.
+/// How late after the crossing an entry may still be reported. A pane
+/// scrolled out of view receives no frames, and its first frame back may come
+/// long after the pointer passed over it.
 const HOVER_ACTIVATION_LATENESS: Duration = Duration::from_secs(1);
 
 /// The cursor's position in the pane's coordinates, including while the
@@ -1435,30 +1430,24 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for CardSurface<'_, Messag
                             }));
                 if !hovered {
                     pointer.entered_at = None;
-                } else if crossed_in && self.on_pointer_rest.is_some() {
+                } else if crossed_in && self.on_pointer_enter.is_some() {
                     let now = Instant::now();
                     pointer.entered_at = Some(now);
-                    shell.request_redraw_at(now + HOVER_ACTIVATION_DWELL);
+                    shell.request_redraw();
                 }
             }
             Event::Window(window::Event::RedrawRequested(now)) => {
-                if let Some(entered) = pointer.entered_at {
-                    let due = entered + HOVER_ACTIVATION_DWELL;
-                    if *now < due {
-                        shell.request_redraw_at(due);
-                    } else {
-                        pointer.entered_at = None;
-                        let rested = now.saturating_duration_since(due)
-                            <= HOVER_ACTIVATION_LATENESS
-                            && !self.input.pressed_since(entered)
-                            && !self.input.composing()
-                            && !crate::input_trace::on_resize_handle()
-                            && clipped_viewport(layout.bounds(), viewport)
-                                .is_some_and(|clip| cursor.is_over(clip));
-                        // Gone when the pane became active in the meantime.
-                        if rested && let Some(message) = &self.on_pointer_rest {
-                            shell.publish(message.clone());
-                        }
+                if let Some(entered) = pointer.entered_at.take() {
+                    let entered_now = now.saturating_duration_since(entered)
+                        <= HOVER_ACTIVATION_LATENESS
+                        && !self.input.pressed_since(entered)
+                        && !self.input.composing()
+                        && !crate::input_trace::on_resize_handle()
+                        && clipped_viewport(layout.bounds(), viewport)
+                            .is_some_and(|clip| cursor.is_over(clip));
+                    // Gone when the pane became active in the meantime.
+                    if entered_now && let Some(message) = &self.on_pointer_enter {
+                        shell.publish(message.clone());
                     }
                 }
             }

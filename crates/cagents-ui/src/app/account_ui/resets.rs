@@ -2505,7 +2505,7 @@ pub(in crate::app) mod tests {
                 owner,
                 ticket,
                 Outcome::Answered {
-                    snapshot,
+                    snapshot: Box::new(snapshot),
                     identity: None,
                     catalog: None,
                 },
@@ -2617,7 +2617,7 @@ pub(in crate::app) mod tests {
                 ticket,
                 Outcome::Answered {
                     identity: None,
-                    snapshot: complete,
+                    snapshot: Box::new(complete),
                     catalog: None,
                 },
             ));
@@ -2657,7 +2657,7 @@ pub(in crate::app) mod tests {
                 late,
                 Outcome::Answered {
                     identity: None,
-                    snapshot: old,
+                    snapshot: Box::new(old),
                     catalog: None,
                 },
             ));
@@ -2706,7 +2706,7 @@ pub(in crate::app) mod tests {
                 ticket,
                 Outcome::Answered {
                     identity: None,
-                    snapshot: full,
+                    snapshot: Box::new(full),
                     catalog: None,
                 },
             ));

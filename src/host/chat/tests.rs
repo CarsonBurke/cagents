@@ -1457,15 +1457,10 @@ fn missing_claude_directory_restores_a_hosted_history_reader_without_authority()
         .handle
         .clone();
     handle.set_visible(true);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if handle.snapshot(None).unwrap().exited {
-            break;
-        }
-        assert!(Instant::now() < deadline);
-        thread::yield_now();
-    }
-    let snapshot = handle.snapshot(None).unwrap();
+    // The reader's exit ends the saved frame it applies after attach.
+    let snapshot = crate::test_timing::wait_for("the saved reader to apply its frame", || {
+        handle.snapshot(None).filter(|snapshot| snapshot.exited)
+    });
     assert_eq!(snapshot.session_id, saved.launch.session_id);
     assert_eq!(snapshot.items.len(), 1);
     assert!(!handle.owns_work());
@@ -2516,30 +2511,79 @@ done
         .recipe
         .environment
         .remove(crate::account::routing::AUTOMATIC_MARKER);
-    assert!(
-        recover_account(
-            &host,
-            1,
-            pinned,
-            pinned_replacement,
-            Some(generation),
-            Default::default()
-        )
-        .unwrap_err()
-        .message
-        .contains("pinned")
+    // Refusals before the close changed nothing, and say so, with the
+    // daemon's own sentence.
+    let pinned = recover_account(
+        &host,
+        1,
+        pinned,
+        pinned_replacement,
+        Some(generation),
+        Default::default(),
+    )
+    .unwrap_err();
+    assert_eq!(pinned.code, ProtocolErrorCode::NotAdmitted);
+    assert_eq!(
+        pinned.message,
+        "This conversation has an explicitly pinned account"
     );
+    assert!(!handle.is_completed());
+    assert!(host.lock().unwrap().chat_spawning.is_empty());
+    // Another start of the same conversation is under way.
+    host.lock()
+        .unwrap()
+        .chat_spawning
+        .insert(source.id, source.clone());
+    let owned = recover_account(
+        &host,
+        1,
+        source.clone(),
+        replacement.clone(),
+        Some(generation),
+        Default::default(),
+    )
+    .unwrap_err();
+    assert_eq!(owned.code, ProtocolErrorCode::NotAdmitted);
+    assert!(owned.message.contains("another live owner"), "{owned:?}");
+    assert!(!handle.is_completed());
+    host.lock().unwrap().chat_spawning.remove(&source.id);
+    // The other account already holds a different copy of this
+    // conversation, so its history can't be prepared there.
+    let divergent = alternate_home
+        .join("projects")
+        .join(&project)
+        .join(format!("{conversation}.jsonl"));
+    std::fs::create_dir_all(divergent.parent().unwrap()).unwrap();
+    std::fs::write(&divergent, "{\"other\":true}\n").unwrap();
+    let diverged = recover_account(
+        &host,
+        1,
+        source.clone(),
+        replacement.clone(),
+        Some(generation),
+        Default::default(),
+    )
+    .unwrap_err();
+    assert_eq!(diverged.code, ProtocolErrorCode::NotAdmitted);
     assert!(
-        recover_account(
-            &host,
-            1,
-            source.clone(),
-            replacement.clone(),
-            Some(generation + 1),
-            Default::default()
-        )
-        .is_err()
+        diverged.message.contains("could not be prepared"),
+        "{diverged:?}"
     );
+    assert!(!handle.is_completed());
+    assert!(host.lock().unwrap().chat_spawning.is_empty());
+    std::fs::remove_file(&divergent).unwrap();
+    // The close's own refusal is never reported as refused before any
+    // effect: once the actor has taken it, the original may be closing.
+    let stale = recover_account(
+        &host,
+        1,
+        source.clone(),
+        replacement.clone(),
+        Some(generation + 1),
+        Default::default(),
+    )
+    .unwrap_err();
+    assert_ne!(stale.code, ProtocolErrorCode::NotAdmitted, "{stale:?}");
     assert!(!handle.is_completed());
     assert!(host.lock().unwrap().chat_spawning.is_empty());
     let response = recover_account(

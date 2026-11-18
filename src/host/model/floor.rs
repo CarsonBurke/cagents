@@ -346,7 +346,7 @@ mod tests {
         let (registry, mut record, mut agent) = fixture();
         let mut session = record.chats[0].clone();
         let proof = session.proof.as_ref().unwrap();
-        session.terminal = Some(crate::model::TerminalSession {
+        session.terminal = Some(Box::new(crate::model::TerminalSession {
             id: session.id,
             launch: LaunchRecipe::shell("/work".into()).unwrap(),
             transcript_path: None,
@@ -359,7 +359,7 @@ mod tests {
                 boot_id: proof.boot_id.clone(),
                 host_incarnation: proof.host_incarnation.clone(),
             },
-        });
+        }));
         agent.session = Some(HostedSession::Chat(session.clone()));
         registry
             .db

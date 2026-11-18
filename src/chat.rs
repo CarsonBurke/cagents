@@ -369,6 +369,11 @@ pub enum Recovery {
     /// its handshake, or the daemon speaks another protocol. Nothing was
     /// requested, so the conversation it would have moved is untouched.
     Unreached,
+    /// The daemon refused an account switch, or the client gave it up before
+    /// asking, for the reason the message gives, before anything changed
+    /// ([`crate::terminal_ipc::ProtocolErrorCode::NotAdmitted`]). As with
+    /// [`Self::Busy`], the conversation it would have moved is untouched.
+    NotAdmitted,
     /// The daemon refused this start and reported that repeating it cannot help.
     /// Keep the saved conversation and diagnostic without offering a retry.
     Blocked,
@@ -424,6 +429,12 @@ pub fn update_restart_stopped(reason: &str) -> String {
     let reason = reason.trim_end_matches('.');
     format!("{UPDATE_RESTART_STOPPED}. {reason}. It isn't running, and nothing was resent.")
 }
+
+/// How the daemon's refusal under startup recovery's hold on original
+/// ownership begins. The protocol has no code of its own for it, so a client
+/// recognises a non-retryable `TerminalUnavailable` that starts with this
+/// sentence, and can confirm the hold by asking for the startup state.
+pub const STARTUP_RECOVERY_REFUSAL: &str = "Startup recovery retained original ownership";
 
 impl StartFailure {
     pub fn retry(message: impl Into<String>) -> Self {
@@ -648,8 +659,10 @@ pub struct Session {
     pub launch: Launch,
     pub proof: Option<crate::model::HostSessionProof>,
     /// Original terminal identity for an explicit return to the CLI view.
+    /// Boxed because it is rarely present and would otherwise more than double
+    /// every session, and every enum that carries one.
     #[serde(default)]
-    pub terminal: Option<crate::model::TerminalSession>,
+    pub terminal: Option<Box<crate::model::TerminalSession>>,
     /// Daemon-issued allocation evidence, independent of the reader's TMPDIR.
     #[serde(default)]
     pub owned_codex_listener: Option<OwnedCodexListener>,
@@ -3078,7 +3091,7 @@ mod retained_native_pair_tests {
                 session_id: confirmed.then(|| uuid::Uuid::new_v4().to_string()),
             },
             proof: Some(proof.clone()),
-            terminal: Some(TerminalSession {
+            terminal: Some(Box::new(TerminalSession {
                 id,
                 launch: recipe,
                 continuity: live(&proof),
@@ -3087,7 +3100,7 @@ mod retained_native_pair_tests {
                 owned_codex_listener: None,
                 recovery_origin: None,
                 predecessor: None,
-            }),
+            })),
             owned_codex_listener: None,
             native_continuity: NativeContinuity::RetainedClaudeActor { protocol: 2 },
         };

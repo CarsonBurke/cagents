@@ -64,7 +64,7 @@ impl Cagents {
                 match opened {
                     Some(action) => self.update(Message::Sidebar(action)),
                     // A worktree the sidebar has not listed yet still opens.
-                    None => self.select_worktree(path, false),
+                    None => self.navigate_to_worktree(path, false),
                 }
             }
             Effect::OpenPullRequest {

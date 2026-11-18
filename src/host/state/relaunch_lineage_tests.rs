@@ -128,7 +128,7 @@ fn agent_follows_a_relaunched_conversation_whose_view_was_paired_and_relaunched(
     let agent = agent_bound_to(&mut registry, directory.path(), &bound);
 
     let mut checkpointed = bound.clone();
-    checkpointed.terminal = Some(view(id, live(&old)));
+    checkpointed.terminal = Some(Box::new(view(id, live(&old))));
     let mut confirmed = checkpointed.launch.clone();
     confirmed.session_id = Some(THREAD.into());
     let sources = [ChatSource {
@@ -140,18 +140,18 @@ fn agent_follows_a_relaunched_conversation_whose_view_was_paired_and_relaunched(
     started.proof = Some(new.clone());
     started.launch.session_id = Some(THREAD.into());
     let relaunch = view(id, live(&old)).launch;
-    started.terminal = Some(view(
+    started.terminal = Some(Box::new(view(
         id,
         TerminalContinuity::RelaunchAvailable {
             recipe: relaunch,
             last_exit: None,
         },
-    ));
+    )));
     registry
         .fresh_agent_authority(&HostedSession::Chat(started.clone()))
         .unwrap();
     let mut successor = started.clone();
-    successor.terminal = Some(view(id, live(&new)));
+    successor.terminal = Some(Box::new(view(id, live(&new))));
 
     assert!(adopt_relaunched_agent(&mut registry, &sources, successor.clone()).unwrap());
     assert_eq!(

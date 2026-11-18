@@ -770,7 +770,7 @@ pub enum ControlError {
 }
 
 fn remote_display(code: ProtocolErrorCode, message: &str, retryable: bool) -> String {
-    if crate::terminal_ipc::is_daemon_busy(message, retryable) {
+    if Refusal::recognize(message, retryable).is_some() {
         message.to_owned()
     } else {
         format!("daemon rejected the request ({code:?}): {message}")
@@ -782,8 +782,17 @@ impl ControlError {
     /// operation held it past the request's deadline. Nothing was admitted,
     /// so the same request may be sent again.
     pub fn is_daemon_busy(&self) -> bool {
-        matches!(self, Self::Remote { retryable, message, .. }
-            if crate::terminal_ipc::is_daemon_busy(message, *retryable))
+        self.refusal() == Some(Refusal::Busy)
+    }
+
+    /// The daemon's refusal before it did anything, if this is one.
+    pub fn refusal(&self) -> Option<Refusal> {
+        match self {
+            Self::Remote {
+                retryable, message, ..
+            } => Refusal::recognize(message, *retryable),
+            _ => None,
+        }
     }
 
     /// The daemon's own sentence for a person; every other failure as it stands.
@@ -796,22 +805,57 @@ impl ControlError {
 }
 
 /// Why a request a person is waiting on did not complete, separating the
-/// daemon's refusal to admit it while busy, after which nothing was done and
-/// the same request may be sent again, from every other failure.
+/// daemon's refusals before it did anything, after which the same request may
+/// be sent again, from every other failure.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RequestError {
-    #[error("{}", crate::terminal_ipc::DAEMON_BUSY)]
-    Busy,
+    #[error(transparent)]
+    Refused(Refusal),
     #[error("{0}")]
     Failed(String),
 }
 
 impl From<ControlError> for RequestError {
     fn from(error: ControlError) -> Self {
-        if error.is_daemon_busy() {
-            Self::Busy
+        match error.refusal() {
+            Some(refusal) => Self::Refused(refusal),
+            None => Self::Failed(error.to_string()),
+        }
+    }
+}
+
+/// Why the daemon refused a request before it had any effect. Its sentence
+/// is the daemon's own; [`Refusal::cause`] words it for a notice that says
+/// what was not done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum Refusal {
+    /// It was busy finishing another operation.
+    #[error("{}", crate::terminal_ipc::DAEMON_BUSY)]
+    Busy,
+    /// Another process held the account list.
+    #[error(transparent)]
+    AccountList(crate::account::remote::ListHeld),
+}
+
+impl Refusal {
+    /// The refusal a daemon's sentence and retryability carry, if it is one.
+    pub(crate) fn recognize(message: &str, retryable: bool) -> Option<Self> {
+        if crate::terminal_ipc::is_daemon_busy(message, retryable) {
+            Some(Self::Busy)
         } else {
-            Self::Failed(error.to_string())
+            crate::account::remote::ListHeld::recognize(message, retryable).map(Self::AccountList)
+        }
+    }
+
+    /// What was happening, to begin "‹cause›, so ‹what› was not ‹done›."
+    pub fn cause(self) -> &'static str {
+        use crate::account::remote::ListHeld;
+        match self {
+            Self::Busy => "The cagents daemon was busy finishing another operation",
+            Self::AccountList(ListHeld::Registry) => "Another window was saving the account list",
+            Self::AccountList(ListHeld::Lifecycle) => {
+                "Another window was changing accounts, or an agent was starting on one"
+            }
         }
     }
 }
@@ -4291,9 +4335,11 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                 daemon_socket_path().map_err(|error| AppError::new("socket_path", error))?;
             let socket = &selected_socket;
             let mut daemon_version = None;
+            let mut startup = None;
             let running = match ControlClient::connect(socket) {
                 Ok(mut client) => {
                     daemon_version = Some(client.daemon_version().map_err(protocol_error)?);
+                    startup = Some(client.startup_state().map_err(protocol_error)?);
                     true
                 }
                 Err(ControlError::Connect(error))
@@ -4321,6 +4367,7 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                 "daemon_present": daemon_present,
                 "socket": socket,
                 "daemon_version": daemon_version,
+                "startup": startup,
                 "inherited_lease": crate::daemon::lease_handoff::has_inherited_lease()
                     .map_err(|error| AppError::new("daemon_status", error))?,
                 "cli_version": crate::version()
@@ -4347,6 +4394,18 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                     crate::version()
                 )
             };
+            match &startup {
+                Some(terminal::ipc::StartupState::Restoring { awaiting }) => {
+                    human.push_str(&format!(
+                        "\nstartup: restoring; {awaiting} original owners await their outcome"
+                    ))
+                }
+                Some(terminal::ipc::StartupState::Retained { detail }) => {
+                    human.push_str("\nstartup: recovery holds original ownership: ");
+                    human.push_str(detail);
+                }
+                Some(terminal::ipc::StartupState::Ready) | None => {}
+            }
             if let Some((attention, warning)) = upgrade_attention() {
                 data["upgrade_attention"] = attention;
                 human.push_str("\nwarning: ");
@@ -4468,15 +4527,41 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                     "pass --yes to archive the interrupted checkpoint; its conversations will require explicit manual recovery",
                 ));
             }
-            let archive = crate::upgrade::abandon()
+            let abandoned = crate::upgrade::abandon()
                 .map_err(|error| AppError::new("upgrade_recovery", error))?;
+            let mut human = format!(
+                "Archived checkpoint at {}; no processes resumed. Recover exact conversations manually after checking their existing writers",
+                abandoned.archive.display()
+            );
+            match &abandoned.checkpoint_only {
+                Some(identities) if identities.is_empty() => {}
+                Some(identities) => {
+                    human.push_str(&format!(
+                        ".\nOnly the checkpoint records the provider conversation of {} chat(s). The next daemon start saves each to the agent and pane still showing it, and logs any it cannot:",
+                        identities.len()
+                    ));
+                    for identity in identities {
+                        human.push_str(&format!(
+                            "\n  {} {} {} in {}",
+                            identity.id,
+                            identity.provider.label(),
+                            identity.conversation,
+                            identity.working_directory.display()
+                        ));
+                    }
+                }
+                None => human.push_str(
+                    ".\nThe checkpoint could not be read, so conversations only it identified may not reconnect",
+                ),
+            }
             Ok(CommandOutput {
                 command: "daemon.abandon_upgrade",
-                data: json!({ "archive": archive, "resumed": false }),
-                human: format!(
-                    "Archived checkpoint at {}; no processes resumed. Recover exact conversations manually after checking their existing writers",
-                    archive.display()
-                ),
+                data: json!({
+                    "archive": abandoned.archive,
+                    "resumed": false,
+                    "checkpoint_only_identities": abandoned.checkpoint_only,
+                }),
+                human,
             })
         }
         DaemonCommand::StopForRebuild {
@@ -6017,7 +6102,10 @@ mod tests {
         let busy = remote(DAEMON_BUSY, true);
         assert!(busy.is_daemon_busy());
         assert_eq!(busy.to_string(), DAEMON_BUSY);
-        assert_eq!(RequestError::from(busy), RequestError::Busy);
+        assert_eq!(
+            RequestError::from(busy),
+            RequestError::Refused(Refusal::Busy)
+        );
         for other in [
             remote(DAEMON_BUSY, false),
             remote("registry is unavailable", true),
@@ -6033,6 +6121,39 @@ mod tests {
             let shown = other.to_string();
             assert_eq!(RequestError::from(other), RequestError::Failed(shown));
         }
+    }
+
+    /// A daemon that found the account list held refused before it changed
+    /// anything, in its own words, which are neither a busy daemon nor a
+    /// rejected request.
+    #[test]
+    fn a_held_account_list_is_a_refusal_in_its_own_words() {
+        use crate::{account::remote::ListHeld, terminal_ipc::ProtocolErrorCode};
+        let remote = |message: String, retryable| ControlError::Remote {
+            code: ProtocolErrorCode::InvalidRequest,
+            message,
+            retryable,
+        };
+        for held in [ListHeld::Registry, ListHeld::Lifecycle] {
+            let refusal = remote(held.to_string(), true);
+            assert!(!refusal.is_daemon_busy());
+            assert_eq!(refusal.refusal(), Some(Refusal::AccountList(held)));
+            assert_eq!(refusal.to_string(), held.to_string());
+            let error = RequestError::from(refusal);
+            assert_eq!(error, RequestError::Refused(Refusal::AccountList(held)));
+            assert_eq!(error.to_string(), held.to_string());
+            // Only a retryable refusal says nothing was done.
+            let final_answer = remote(held.to_string(), false);
+            assert_eq!(final_answer.refusal(), None);
+            assert!(matches!(
+                RequestError::from(final_answer),
+                RequestError::Failed(_)
+            ));
+        }
+        assert_eq!(
+            Refusal::Busy.cause(),
+            "The cagents daemon was busy finishing another operation"
+        );
     }
 
     /// The installed coordinator, not an older owner's updater, chooses who
@@ -6652,6 +6773,15 @@ mod tests {
                     ServerResponse::BuildInfo {
                         version: "fixture".into(),
                     },
+                );
+                // Status also reports whether startup recovery holds owners.
+                let request: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+                assert!(matches!(request.request, ClientRequest::StartupState));
+                response(
+                    &mut stream,
+                    &pinned,
+                    request.request_id,
+                    ServerResponse::StartupState(terminal::ipc::StartupState::Ready),
                 );
                 assert!(read_frame::<ClientEnvelope>(&mut stream).unwrap().is_none());
             });
@@ -10531,7 +10661,7 @@ mod tests {
                     session_id: None,
                 },
                 proof: None,
-                terminal: Some(terminal("claude")),
+                terminal: Some(Box::new(terminal("claude"))),
                 owned_codex_listener: None,
                 native_continuity: Default::default(),
             },

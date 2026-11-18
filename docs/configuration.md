@@ -144,7 +144,7 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `schema_version` | integer | `3` | Exactly `3`. Required |
 | `max_hot_cards` | integer | `6` | `1` through `9223372036854775807`. The number of panes kept live; extra background panes can hibernate |
 | `hibernation_delay_ms` | integer | `30000` | `0` through `9223372036854775807` milliseconds before a background pane hibernates |
-| `focus_follows_mouse` | boolean | `true` | Activates a pane, and puts the keyboard in its message input, terminal or editor, after the pointer crosses into it and stays for 300 ms. Typing, clicking or dragging cancels the pending activation, and an open chat menu or picker, dialog or palette suppresses it. `false` activates panes only on click or keyboard navigation |
+| `focus_follows_mouse` | boolean | `true` | Activates a pane, and puts the keyboard in its message input, terminal or editor, as soon as the pointer crosses into it. Passing over a pane does not mark it read. An open chat menu or picker, dialog or palette suppresses it. `false` activates panes only on click or keyboard navigation |
 | `app_theme` | string | `"system"` | `"system"`, `"dark"`, `"light"`, `"catppuccin_mocha"`, `"catppuccin_latte"`, `"dracula"`, `"nord"`, `"tokyo_night"`, `"gruvbox_dark"`, or `"solarized_light"`. Colors the application; terminal and syntax colors are set separately |
 | `ui_scale` | float | `1.0` | `0.8` through `1.5`. Multiplies display scaling |
 | `terminal_line_height` | float | `1.286` | `1.0` through `2.0`, relative to the font size |

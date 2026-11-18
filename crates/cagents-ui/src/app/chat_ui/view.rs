@@ -240,6 +240,36 @@ enum Placement<'a> {
     Unplaced(&'a chat::Item),
 }
 
+/// The bubble a user's message is drawn in: the accent wash, or an outline
+/// for an attachment, held to [`PROMPT_MEASURE`].
+///
+/// A message long enough to fold takes the whole measure, so showing more or
+/// less of it changes only its height; any other sizes to what it holds.
+/// Either way the bubble's width is never fluid. A fluid child, such as the
+/// fold's full-width disclosure row, would otherwise make the bubble, and the
+/// row it sits in, fill the transcript, and the bubble would lose its anchor
+/// on the right.
+fn user_bubble<'a>(
+    body: Element<'a, Message>,
+    attachment: bool,
+    folds: bool,
+) -> Element<'a, Message> {
+    widget::container(body)
+        .class(design::surface(
+            (!attachment).then_some(design::accent_wash),
+            [design::RADIUS_M; 4],
+            attachment,
+        ))
+        .padding([step::GAP_S as u16, step::GAP_M as u16])
+        .width(if folds {
+            Length::Fixed(PROMPT_MEASURE)
+        } else {
+            Length::Shrink
+        })
+        .max_width(PROMPT_MEASURE)
+        .into()
+}
+
 /// Reserve an external action row so hovering never shifts the transcript.
 /// The hover also keeps its controls visible while they are keyboard-focused.
 pub(super) fn message_actions<'a>(
@@ -252,7 +282,9 @@ pub(super) fn message_actions<'a>(
             message,
             widget::Space::new().height(MESSAGE_ACTION_HEIGHT).into(),
         ])
-        .spacing(step::GAP_XS),
+        .spacing(step::GAP_XS)
+        // Should the message ever fill the row, it keeps its side.
+        .align_x(alignment),
         widget::container(actions)
             .width(Length::Fill)
             .height(Length::Fill)
@@ -1378,7 +1410,9 @@ fn reasoning_elapsed(
                 .filter(|last| last.id == item.id)
                 .and(finished_at)
         })?;
-    Some(disclosure::duration(end.saturating_sub(start)))
+    // Under a second reads as "0s", which says nothing.
+    let millis = end.saturating_sub(start);
+    (millis >= 1_000).then(|| disclosure::duration(millis))
 }
 
 /// The providers a draft offers, in the order its picker lists them after
@@ -1825,7 +1859,9 @@ impl Runtime {
             .is_some_and(Coordinated::is_card);
         !card
             && (item.content.status() == Some(chat::ToolStatus::Running)
-                || working && matches!(item.content, ItemContent::Text { thinking: true, .. }))
+                || working
+                    && matches!(item.content, ItemContent::Text { thinking: true, .. })
+                    && !reasoning::contentless(&item.content))
     }
 
     /// Whether the lead's closing line spins, as it does while subagents
@@ -2579,6 +2615,11 @@ impl Runtime {
                 let Some(cached) = self.child_cache.get(&item.id) else {
                     continue;
                 };
+                // As in the lead's transcript, a thought with nothing to
+                // read is working time, not a row.
+                if reasoning::contentless(&item.content) {
+                    continue;
+                }
                 let footer = if (item.role == chat::Role::User && !item.content.is_step())
                     || matches!(item.content, ItemContent::Text { .. })
                 {
@@ -5721,17 +5762,7 @@ impl Runtime {
                 .size(design::TEXT_PROSE)
                 .into()
         };
-        let mut rows: Vec<Element<'a, Message>> = vec![
-            widget::container(body)
-                .class(design::surface(
-                    Some(design::accent_wash),
-                    [design::RADIUS_M; 4],
-                    false,
-                ))
-                .padding([step::GAP_S as u16, step::GAP_M as u16])
-                .max_width(PROMPT_MEASURE)
-                .into(),
-        ];
+        let mut rows: Vec<Element<'a, Message>> = vec![user_bubble(body, false, false)];
         for attachment in &queued.attachments {
             rows.push(
                 design::caption(
@@ -5777,12 +5808,8 @@ impl Runtime {
             .into()
     }
 
-    /// The user's own message.
-    ///
-    /// Set on the accent wash and tucked to the right, with the corner nearest
-    /// its author squared off. That asymmetry is what identifies the author
-    /// without printing "You" above every message, and the narrower measure
-    /// keeps a turn's opening findable when scrolling back.
+    /// A user message's shown text, before its prepared form is ready: the
+    /// text, whether it is an attachment, and whether it folds.
     fn prompt_text(&self, item: &chat::Item) -> (String, bool, bool) {
         if let ItemContent::Image {
             reference: Some(reference),
@@ -5807,6 +5834,12 @@ impl Runtime {
         }
     }
 
+    /// The user's own message.
+    ///
+    /// Set on the accent wash and tucked to the right. That placement is what
+    /// identifies the author without printing "You" above every message, and
+    /// the narrower measure keeps a turn's opening findable when scrolling
+    /// back.
     fn prompt_view(&self, item: &chat::Item) -> Element<'static, Message> {
         let prepared = self.prepared_prompt(item);
         let attachment = matches!(item.content, ItemContent::Image { .. });
@@ -5919,15 +5952,7 @@ impl Runtime {
                 text
             }
         };
-        let message = widget::container(body)
-            .class(design::surface(
-                (!attachment).then_some(design::accent_wash),
-                [design::RADIUS_M; 4],
-                attachment,
-            ))
-            .padding([step::GAP_S as u16, step::GAP_M as u16])
-            .max_width(PROMPT_MEASURE)
-            .into();
+        let message = user_bubble(body, attachment, long);
         widget::container(message_actions(
             message,
             self.message_copy(item),
@@ -7096,6 +7121,9 @@ mod user_image_preview_tests;
 
 #[cfg(test)]
 mod figure_tests;
+
+#[cfg(test)]
+mod user_bubble_tests;
 
 #[cfg(test)]
 mod provider_context_tests;

@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::{Account, AccountHome, AccountId, Identity, home::Homes};
+use super::{Account, AccountHome, AccountId, Identity, home::Homes, remote::ListHeld};
 use crate::agent::Provider;
 use crate::model::ProjectId;
 
@@ -36,6 +36,39 @@ const LOCK_NAME: &str = "accounts.toml.lock";
 const VERSION: u32 = 5;
 /// A registry larger than this is not one cagents wrote.
 const MAX_BYTES: u64 = 256 * 1024;
+
+/// How long the daemon keeps asking for a held account-list lock before it
+/// refuses with [`ListHeld`]. The locks are held for the moment it takes to
+/// write the list or start a process, and the person who asked is waiting
+/// for the answer either way.
+#[cfg(feature = "host")]
+pub(crate) const LIST_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Makes `attempt` again while it fails with [`ListHeld`], until `patience`
+/// has passed. Each attempt must take its locks without waiting and release
+/// them all when it fails, so nothing is held between attempts: a request
+/// already admitted to the daemon can wait on these locks.
+#[cfg(feature = "host")]
+pub(crate) fn patiently<T>(
+    patience: std::time::Duration,
+    mut attempt: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + patience;
+    let mut pause = Duration::from_millis(5);
+    loop {
+        let result = attempt();
+        let now = Instant::now();
+        match result {
+            // The last attempt is made at the deadline itself.
+            Err(error) if ListHeld::of(&error).is_some() && now < deadline => {
+                std::thread::sleep(pause.min(deadline - now));
+                pause = (pause * 2).min(Duration::from_millis(100));
+            }
+            result => return result,
+        }
+    }
+}
 
 /// One account cagents added, as the registry records it. An account with
 /// `linked_home` belongs to another application or the reader, not cagents.
@@ -1349,17 +1382,20 @@ impl Store {
         self.directory.join(FILE_NAME)
     }
 
-    fn lock(&self) -> io::Result<crate::instance::OwnedLock> {
+    pub(crate) fn lock(&self) -> io::Result<crate::instance::OwnedLock> {
         crate::secure_file::prepare_private_directory(&self.directory)?;
         crate::instance::owned_lock(&self.directory.join(LOCK_NAME), libc::LOCK_EX)
     }
 
+    /// Refuses with [`ListHeld::Registry`] rather than wait for another
+    /// process.
     fn try_lock(&self) -> io::Result<crate::instance::OwnedLock> {
         crate::secure_file::prepare_private_directory(&self.directory)?;
         crate::instance::owned_lock(
             &self.directory.join(LOCK_NAME),
             libc::LOCK_EX | libc::LOCK_NB,
         )
+        .map_err(|error| ListHeld::Registry.from_flock(error))
     }
 
     #[cfg(feature = "host")]
@@ -1524,6 +1560,73 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn a_held_lock_refuses_in_its_own_words_and_only_it_is_asked_for_again() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::at(root.path().join("registry"));
+        let homes = Homes::at(root.path().join("homes"));
+        let held = store.lock().unwrap();
+        let error = store.try_load().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(ListHeld::of(&error), Some(ListHeld::Registry));
+        assert_eq!(error.to_string(), ListHeld::Registry.to_string());
+        drop(held);
+        let held = homes.lifecycle_lock().unwrap();
+        let error = homes.try_lifecycle_lock().unwrap_err();
+        assert_eq!(ListHeld::of(&error), Some(ListHeld::Lifecycle));
+        drop(held);
+        assert!(store.try_load().is_ok() && homes.try_lifecycle_lock().is_ok());
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn patience_asks_again_only_for_a_held_lock_and_until_its_deadline() {
+        use std::time::{Duration, Instant};
+        let patience = Duration::from_millis(40);
+        let mut attempts = 0;
+        let started = Instant::now();
+        let error = patiently(patience, || -> io::Result<()> {
+            attempts += 1;
+            Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                ListHeld::Lifecycle,
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(ListHeld::of(&error), Some(ListHeld::Lifecycle));
+        assert!(started.elapsed() >= patience);
+        assert!(attempts > 1);
+        // A failure that is not a held lock is answered at once, even one
+        // that would block for another reason.
+        for other in [
+            io::Error::other("damaged"),
+            io::Error::from(io::ErrorKind::WouldBlock),
+        ] {
+            let mut other = Some(other);
+            let mut attempts = 0;
+            patiently(Duration::from_secs(30), || -> io::Result<()> {
+                attempts += 1;
+                Err(other.take().unwrap())
+            })
+            .unwrap_err();
+            assert_eq!(attempts, 1);
+        }
+        // A lock released meanwhile is taken.
+        let mut refusals = 3;
+        patiently(Duration::from_secs(30), || {
+            if refusals == 0 {
+                return Ok(());
+            }
+            refusals -= 1;
+            Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                ListHeld::Registry,
+            ))
+        })
+        .unwrap();
+    }
 
     #[test]
     fn a_copy_supersedes_by_revision_or_by_a_later_file() {

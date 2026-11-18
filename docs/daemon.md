@@ -43,7 +43,9 @@ What a later protocol only added detail to is sent as the CLI knew it: on
 protocols before 166, a subagent waiting on its own background work reads as
 running.
 An admitted CLI from before protocol 179 receives store contention as a
-retryable `Internal` error so it can decode the reply. It keeps the response
+retryable `Internal` error so it can decode the reply. One from before protocol 188
+receives a refusal that came before anything changed (`not_admitted`) as
+`invalid_request`, with the same message. It keeps the response
 timeouts of its original executable.
 Each protocol's postcard wire format is recorded under
 `tests/fixtures/wire-formats/`. A test checks that every listed older protocol
@@ -215,7 +217,7 @@ The candidate drives qualified source daemons through a frozen lifecycle subset:
 the installed builds pinned in `RELEASED_SOURCES` (`src/update/source.rs`),
 protocol 156 (the `991daa43e` desktop build), 173 (`43678f2fb`), 175
 (`c73002744`), 177 (`374370965`), 178 (`3b1e81a4d`, also served by
-`f016f047b`) and 179 (`43f253ef8`), and the
+`f016f047b`), 179 (`43f253ef8`) and 187 (`ccd4134c6`), and the
 matched current protocol. A protocol bump never drops a pinned build; retiring
 one is a deliberate change that `scripts/check-update-sources` enforces.
 Every other source protocol, including 160, 165, 174, 176, the candidate
@@ -427,7 +429,11 @@ startup and keep it replayable.
 An interrupted checkpoint is never blindly replayed. After confirming that every
 previous provider writer has stopped, `cagents daemon abandon-upgrade --yes`
 archives the retained checkpoint without resuming any process. It requires a
-stopped daemon and refuses to overwrite an earlier archive. Reopen the exact
+stopped daemon and refuses to overwrite an earlier archive. A provider may have
+named a conversation's thread only after its pane was saved, leaving the
+checkpoint as the only record of that ID; the command lists those
+conversations, and the next daemon start saves each ID to the agent and pane
+still showing that exact chat, logging any it cannot. Reopen the remaining
 conversations manually from their provider session storage; do not delete
 checkpoint evidence just to get past an ownership error.
 

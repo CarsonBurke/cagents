@@ -278,7 +278,7 @@ enum Provider {
     /// It runs a turn or waits on a question; the prompt waits.
     Busy,
     /// It has no running process, so its conversation must be reopened first.
-    Gone(chat::Session),
+    Gone(Box<chat::Session>),
 }
 
 fn provider(
@@ -296,7 +296,7 @@ fn provider(
         .unwrap_or_else(|p| p.into_inner())
         .agent_process_ended(agent.id)?
     {
-        return Ok(Some(Provider::Gone(session.clone())));
+        return Ok(Some(Provider::Gone(Box::new(session.clone()))));
     }
     let handle = host
         .lock()
@@ -316,7 +316,7 @@ fn provider(
                 Provider::Ready
             }
         }
-        _ => Provider::Gone(session.clone()),
+        _ => Provider::Gone(Box::new(session.clone())),
     }))
 }
 
@@ -1117,6 +1117,15 @@ fn dispatch(
         return Ok(());
     }
     ready?;
+    // A new thread is named before it reports ready. Save that now, so an
+    // agent no run update reaches again still keeps its conversation.
+    save_confirmed_identity(
+        host,
+        &registry,
+        &session,
+        handle.confirmed_session_id(),
+        handle.native_continuity(),
+    );
     if claim.is_none_or(|claim| claim.withdrawn) {
         return Err((State::Cancelled, UNDELIVERED_CANCELLATION.into()));
     }
@@ -1181,7 +1190,7 @@ pub(super) fn observed(
     run: RunId,
     update: Update,
 ) {
-    let source = {
+    let (source, confirmed, continuity) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let Some(record) = state
             .chats
@@ -1190,9 +1199,14 @@ pub(super) fn observed(
         else {
             return;
         };
-        record.session.clone()
+        (
+            record.session.clone(),
+            record.handle.confirmed_session_id(),
+            record.handle.native_continuity(),
+        )
     };
     let Ok(registry) = registry(host) else { return };
+    save_confirmed_identity(host, &registry, &source, confirmed, continuity);
     // The store guard ends with this block: `announce` takes the registry lock
     // and then the host lock, so it must never run while either is held.
     let recorded = {
@@ -1220,6 +1234,77 @@ pub(super) fn observed(
             super::automations::wake(host);
         }
     }
+}
+
+/// Saves the conversation ID a daemon-hosted Codex thread's provider
+/// confirmed to its agent and pane, whether or not any window shows it.
+///
+/// The thread is named only after its descriptor was bound, and without the
+/// saved ID nothing can resume it once this actor is gone: a restart that does
+/// not keep the provider, or an abandoned update, would otherwise leave the
+/// agent and its pane pointing at no conversation. `hosted` is the actor this
+/// daemon is running, so the bound descriptor is authenticated by being the
+/// same process; only the ID and its native continuity change. Retained Claude
+/// helpers save theirs through the outcome broker under their census instead.
+fn save_confirmed_identity(
+    host: &SharedHost,
+    registry: &SharedRegistry,
+    hosted: &chat::Session,
+    confirmed: Option<String>,
+    continuity: chat::NativeContinuity,
+) {
+    // The store guard ends with this statement: `announce` takes the registry
+    // lock and then the host lock.
+    let learned = persist_confirmed_identity(
+        &mut registry.lock().unwrap_or_else(|p| p.into_inner()),
+        hosted,
+        confirmed,
+        continuity,
+    );
+    match learned {
+        Ok(true) => announce(host, registry),
+        Ok(false) => {}
+        Err(error) => tracing::warn!(
+            %error,
+            chat = %hosted.id,
+            "cannot save the provider's confirmed conversation ID"
+        ),
+    }
+}
+
+fn persist_confirmed_identity(
+    store: &mut Registry,
+    hosted: &chat::Session,
+    confirmed: Option<String>,
+    continuity: chat::NativeContinuity,
+) -> Result<bool, String> {
+    let Some(confirmed) = confirmed else {
+        return Ok(false);
+    };
+    if hosted.launch.provider != crate::agent::Provider::Codex {
+        return Ok(false);
+    }
+    let Some(agent) = store.agent_for_session(hosted.id)? else {
+        return Ok(false);
+    };
+    let Some(HostedSession::Chat(bound)) = agent.session.filter(|_| !agent.closed) else {
+        return Ok(false);
+    };
+    if bound.launch.session_id.is_some()
+        || !crate::agent_execution::same_chat_process(&bound, hosted)
+    {
+        return Ok(false);
+    }
+    let mut learned = bound.clone();
+    learned.launch.session_id = Some(confirmed);
+    learned.native_continuity = continuity;
+    if !super::model::confirmed_identity_update(&bound, &learned) {
+        return Ok(false);
+    }
+    store.adopt_authenticated_agent_session(
+        &[HostedSession::Chat(bound)],
+        &HostedSession::Chat(learned),
+    )
 }
 
 fn finish_failure(host: &SharedHost, run: RunId, state: State, diagnostic: String) {
@@ -2192,11 +2277,11 @@ fn create_console(
                 return Err("The exact provider or console changed before pairing".into());
             }
             let record = state.chats.get_mut(&session.id).expect("checked actor");
-            record.session.terminal = Some(descriptor.session.clone());
+            record.session.terminal = Some(Box::new(descriptor.session.clone()));
             record.paired_terminal = Some(console_handle.clone());
         }
         let mut retained = retained_before.clone();
-        retained.terminal = Some(descriptor.session.clone());
+        retained.terminal = Some(Box::new(descriptor.session.clone()));
         handle.update_native_source(
             retained,
             Some(descriptor.session.launch.clone()),
@@ -2216,7 +2301,7 @@ fn create_console(
                 .get_mut(&session.id)
                 .filter(|record| record.handle.same_actor(handle))
                 .ok_or("The provider closed while publishing its console")?;
-            record.session.terminal = Some(descriptor.session.clone());
+            record.session.terminal = Some(Box::new(descriptor.session.clone()));
             record.paired_terminal = Some(console_handle.clone());
         }
         let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());

@@ -5584,7 +5584,7 @@ fn a_narrow_pane_closes_its_inspector_and_one_reopened_there_covers_it_until_esc
         "a pane focus request lands in the inspector, not its hidden content"
     );
     assert_eq!(app.focus_pane_keyboard_after_press(card).units(), 0);
-    assert_eq!(app.focus_pane_keyboard_after_rest(card).units(), 0);
+    assert_eq!(app.focus_pane_keyboard_after_entry(card).units(), 0);
     resize(&mut app, 520.0);
     assert!(
         app.pane_inspectors.is_open(card),
@@ -6872,21 +6872,23 @@ fn workspace_switcher_does_not_commit_an_old_path_for_a_retargeted_identity() {
     assert!(app.durable.cards.is_empty());
 }
 
-/// Stepping moves only the switcher's selection; the preview follows it
-/// once it rests, and a quick run of steps arms a single timer.
+/// The switcher is drawn from the first press. Stepping moves only its
+/// selection; the preview follows it once it rests, and a quick run of steps
+/// arms a single timer.
 #[test]
 fn workspace_switcher_steps_leave_the_workspace_and_rest_before_previewing() {
     let mut app = workspace_switcher_test_app(4);
     let alt = keyboard::Modifiers::ALT;
     drop(app.cycle_workspace(crate::workspace::FocusDirection::Right, alt));
     let since = app.chrome_ui.workspace_preview_since.unwrap();
-    drop(app.update(Message::WorkspaceSwitcherDue(since)));
-    let first = app.workspace_switcher_selection();
-    assert_eq!(app.chrome_ui.workspace_switcher_rested, first);
-    drop(app.cycle_workspace(crate::workspace::FocusDirection::Right, alt));
+    assert!(app.workspace_switcher().is_some());
+    // Its pane waits for the selection to rest, so a tap that goes straight
+    // back to the last workspace brings nothing up.
+    assert_eq!(app.chrome_ui.workspace_switcher_rested, None);
     let moved = app.chrome_ui.workspace_switcher_moved.unwrap();
     drop(app.cycle_workspace(crate::workspace::FocusDirection::Right, alt));
-    // The second step reuses the timer the first armed.
+    drop(app.cycle_workspace(crate::workspace::FocusDirection::Right, alt));
+    // The later steps reuse the timer the first armed.
     assert!(app.chrome_ui.workspace_switcher_moved.unwrap() >= moved);
     assert_eq!(app.chrome_ui.workspace_switcher_rested, None);
     assert_eq!(
@@ -6940,7 +6942,6 @@ fn workspace_switcher_rows_expose_actions_and_the_selected_workspace() {
         crate::workspace::FocusDirection::Right,
         keyboard::Modifiers::ALT,
     ));
-    app.chrome_ui.workspace_switcher_shown = true;
     let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
     let mut element = app.workspace_switcher().unwrap();
     let mut tree = Tree::new(&element);
@@ -7796,6 +7797,10 @@ mod home_admission {
 
 mod repository_clone_lsp_ownership {
     include!("repository_clone_lsp_ownership_tests.rs");
+}
+
+mod navigation_saves {
+    include!("navigation_save_tests.rs");
 }
 
 #[test]
@@ -9147,6 +9152,52 @@ fn a_completion_index_past_the_end_applies_nothing() {
     ));
     assert_eq!(notice(&app), None);
     assert_eq!(app.lsp_contexts[&card].context.completions.len(), 1);
+}
+
+/// A card the saved state could not restore is reported until the card
+/// opens here anyway, from a shared view that still holds it (#3062).
+#[test]
+fn a_card_restore_report_stands_until_the_card_opens() {
+    let mut app = context_inspector_test_app(true);
+    let card = app.durable.cards[0].clone();
+    Arc::make_mut(&mut app.durable)
+        .cards
+        .retain(|held| held.id != card.id);
+    let notice = card_restore_notice(&cagents::persistence::RestoreWarning {
+        card: card.id,
+        title: "git log".into(),
+        problem: cagents::persistence::RestoreProblem::Unreadable(
+            "corrupt stored terminal continuity".into(),
+        ),
+    });
+    assert_eq!(
+        notice.message,
+        "Could not restore “git log”. Its saved data is kept."
+    );
+    assert_eq!(
+        notice.details.as_deref(),
+        Some("corrupt stored terminal continuity")
+    );
+    app.notices.record(notice);
+    let key = NoticeKey::CardRestore(card.id);
+    app.resolve_card_notices();
+    assert!(app.notices.has(key.clone()), "the card is still missing");
+
+    Arc::make_mut(&mut app.durable).cards.push(card);
+    app.resolve_card_notices();
+    assert!(!app.notices.has(key));
+
+    // A missing record leaves nothing kept to claim.
+    let missing = card_restore_notice(&cagents::persistence::RestoreWarning {
+        card: CardId::new(),
+        title: "git log".into(),
+        problem: cagents::persistence::RestoreProblem::Missing,
+    });
+    assert_eq!(
+        missing.message,
+        "Could not restore “git log”: its saved record is missing."
+    );
+    assert_eq!(missing.details, None);
 }
 
 /// Two cards can hold two documents at once, and diagnostics arrive
@@ -11114,7 +11165,7 @@ pub(super) fn context_inspector_test_app(with_focused_card: bool) -> Cagents {
 }
 
 #[test]
-fn pane_attention_tracks_semantic_events_and_a_rested_hover_acknowledges_only_its_pane() {
+fn pane_attention_tracks_semantic_events_and_a_hover_reads_only_the_pane_it_stays_on() {
     use crate::agent::{Activity, ActivityState, Provider};
     let mut app = context_inspector_test_app(true);
     let window = window::Id::RESERVED;
@@ -11150,12 +11201,36 @@ fn pane_attention_tracks_semantic_events_and_a_rested_hover_acknowledges_only_it
     let offset = app.workspace.camera().offset();
     let _ = app.update(Message::Viewport {
         generation: app.workspace_view_generation,
-        event: WorkspaceViewportEvent::PointerRested(second_id),
+        event: WorkspaceViewportEvent::PointerEntered(second_id),
     });
     assert_eq!(app.workspace.focused(), Some(second_id));
     assert_eq!(app.workspace.camera().offset(), offset);
-    // Only the pane the pointer rested on is read; the ones it crossed to
-    // get there are the widget's to filter out, and never arrive here.
+    // Hover focus is immediate, but passing over a pane does not read it.
+    assert!(app.sidebar_state.has_card_update(second_id));
+    // The pointer moves on to the third pane before the attention dwell
+    // ends, and that dwell's timer, stale now, reads neither.
+    let stale = app.attention_focus_epoch;
+    let _ = app.update(Message::Viewport {
+        generation: app.workspace_view_generation,
+        event: WorkspaceViewportEvent::PointerEntered(third_id),
+    });
+    assert_eq!(app.workspace.focused(), Some(third_id));
+    drop(app.update(Message::AcknowledgeVisiblePane {
+        card: second_id,
+        epoch: stale,
+    }));
+    assert!(app.sidebar_state.has_card_update(second_id));
+    assert!(app.sidebar_state.has_card_update(third_id));
+    // Back on the second pane, and it stays there for the dwell.
+    let _ = app.update(Message::Viewport {
+        generation: app.workspace_view_generation,
+        event: WorkspaceViewportEvent::PointerEntered(second_id),
+    });
+    drop(app.update(Message::AcknowledgeVisiblePane {
+        card: second_id,
+        epoch: app.attention_focus_epoch,
+    }));
+    // Only the pane the pointer stayed on is read.
     assert!(!app.sidebar_state.has_card_update(second_id));
     assert!(app.sidebar_state.has_card_update(third_id));
     app.observe_agent_activity_for_card(second_id, activity(ActivityState::Waiting));
@@ -11163,7 +11238,7 @@ fn pane_attention_tracks_semantic_events_and_a_rested_hover_acknowledges_only_it
     app.settings.focus_follows_mouse = false;
     let _ = app.update(Message::Viewport {
         generation: app.workspace_view_generation,
-        event: WorkspaceViewportEvent::PointerRested(third_id),
+        event: WorkspaceViewportEvent::PointerEntered(third_id),
     });
     assert_eq!(app.workspace.focused(), Some(second_id));
     assert!(app.sidebar_state.has_card_update(third_id));
@@ -11191,7 +11266,7 @@ fn focus_only_changes_are_saved_once_per_burst() {
     for card in [second_id, third_id] {
         let _ = app.update(Message::Viewport {
             generation: app.workspace_view_generation,
-            event: WorkspaceViewportEvent::PointerRested(card),
+            event: WorkspaceViewportEvent::PointerEntered(card),
         });
         assert_eq!(app.durable.focused, Some(card));
         assert!(
@@ -11205,7 +11280,7 @@ fn focus_only_changes_are_saved_once_per_burst() {
     // A change that must be saved now takes the pending focus with it.
     let _ = app.update(Message::Viewport {
         generation: app.workspace_view_generation,
-        event: WorkspaceViewportEvent::PointerRested(second_id),
+        event: WorkspaceViewportEvent::PointerEntered(second_id),
     });
     assert!(app.navigation_save.is_some());
     let _ = app.apply_viewport(ViewportUpdate::unchanged(), false, DurableChange::Content);

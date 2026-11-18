@@ -21,6 +21,13 @@ const OVERFLOW_REASON: &str = "Claude holder outcome journal overflowed before t
 pub(crate) struct OutboxEntry {
     pub sequence: u64,
     pub update: Update,
+    /// The conversation the helper had confirmed when it journaled this
+    /// outcome. The daemon publishes it to the actor census before it commits
+    /// the outcome, even if a later reset has since cleared or replaced the
+    /// helper's current conversation. A helper that predates it reports none,
+    /// and the daemon then requires the helper's current conversation instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed_session: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,7 +125,7 @@ impl Journal {
         // into this file after its drained disposition records the file's
         // size and mtime, so the cache could never reclaim it.
         db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=OFF;
-            CREATE TABLE outcomes(sequence INTEGER PRIMARY KEY AUTOINCREMENT,payload BLOB NOT NULL);
+            CREATE TABLE outcomes(sequence INTEGER PRIMARY KEY AUTOINCREMENT,payload BLOB NOT NULL,confirmed_session TEXT);
             CREATE TABLE retained_runs(run TEXT PRIMARY KEY,finished INTEGER);
             CREATE TABLE inputs(sequence INTEGER PRIMARY KEY,id TEXT UNIQUE NOT NULL,hash BLOB NOT NULL,state BLOB NOT NULL);
             CREATE TABLE metadata(key TEXT PRIMARY KEY,value BLOB NOT NULL);
@@ -242,7 +249,12 @@ impl Journal {
         self.last_loss = None;
         Ok(())
     }
-    pub fn append(&mut self, update: &Update) -> Result<(), String> {
+    /// Journal `update`, which followed the provider's `confirmed_session`.
+    pub fn append(
+        &mut self,
+        update: &Update,
+        confirmed_session: Option<&str>,
+    ) -> Result<(), String> {
         // These can change once per streaming frame. Their authoritative
         // bounded state is queried, so only durable outcomes enter the outbox.
         if !matches!(
@@ -315,8 +327,11 @@ impl Journal {
             self.check_run_capacity(*run)?;
         }
         let tx = self.db.transaction().map_err(|error| error.to_string())?;
-        tx.execute("INSERT INTO outcomes(payload) VALUES(?1)", [bytes])
-            .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO outcomes(payload,confirmed_session) VALUES(?1,?2)",
+            params![bytes, confirmed_session],
+        )
+        .map_err(|error| error.to_string())?;
         let sequence = tx.last_insert_rowid() as u64;
         if let Update::Execution { run, update } = update {
             let finished = matches!(update, crate::agent_execution::Update::Finished { .. })
@@ -340,17 +355,21 @@ impl Journal {
             return Err("Outcome cursor predates already committed updates".into());
         }
         let after = i64::try_from(after).map_err(|_| "Outcome cursor is out of range")?;
-        let mut query=self.db.prepare("SELECT sequence,payload FROM outcomes WHERE sequence>?1 ORDER BY sequence LIMIT 64")
+        let mut query=self.db.prepare("SELECT sequence,payload,confirmed_session FROM outcomes WHERE sequence>?1 ORDER BY sequence LIMIT 64")
             .map_err(|error|error.to_string())?;
         let rows = query
             .query_map([after], |row| {
-                Ok((row.get::<_, u64>(0)?, row.get::<_, Vec<u8>>(1)?))
+                Ok((
+                    row.get::<_, u64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
             })
             .map_err(|error| error.to_string())?;
         let mut result = Vec::new();
         let mut bytes = 0usize;
         for row in rows {
-            let (sequence, payload) = row.map_err(|error| error.to_string())?;
+            let (sequence, payload, confirmed_session) = row.map_err(|error| error.to_string())?;
             if !result.is_empty() && bytes.saturating_add(payload.len()) > 1024 * 1024 {
                 break;
             }
@@ -358,9 +377,23 @@ impl Journal {
             result.push(OutboxEntry {
                 sequence,
                 update: serde_json::from_slice(&payload).map_err(|error| error.to_string())?,
+                confirmed_session,
             });
         }
         Ok(result)
+    }
+    /// Every conversation an unacknowledged outcome followed. Each was this
+    /// helper's confirmed conversation when it journaled that outcome, so its
+    /// projections remain issued aliases until the daemon commits the outcome.
+    pub fn followed_sessions(&self) -> Result<Vec<String>, String> {
+        let mut query = self
+            .db
+            .prepare("SELECT DISTINCT confirmed_session FROM outcomes WHERE confirmed_session IS NOT NULL")
+            .map_err(|error| error.to_string())?;
+        query
+            .query_map([], |row| row.get::<_, String>(0))
+            .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
+            .map_err(|error| error.to_string())
     }
     /// The authenticated daemon calls this only after its idempotent durable
     /// registry/notification transaction commits. Socket delivery is not an ACK.
@@ -750,6 +783,50 @@ impl Journal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Retained helpers outlive daemon updates. A page from a helper that
+    /// predates followed conversations still reads, naming none, and an entry
+    /// that followed none keeps the older wire form.
+    #[test]
+    fn outbox_entries_stay_compatible_with_helpers_that_predate_followed_conversations() {
+        let update = Update::Execution {
+            run: crate::model::RunId::new(),
+            update: crate::agent_execution::Update::Started {
+                provider_key: "compatible".into(),
+            },
+        };
+        let older = serde_json::json!({ "sequence": 1, "update": &update });
+        let entry: OutboxEntry = serde_json::from_value(older.clone()).unwrap();
+        assert_eq!(entry.confirmed_session, None);
+        assert_eq!(serde_json::to_value(&entry).unwrap(), older);
+    }
+
+    #[test]
+    fn followed_conversations_cover_exactly_the_unacknowledged_outcomes() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut journal = Journal::open(root.path()).unwrap();
+        let outcome = || {
+            Update::Attention(crate::notifications::Evidence {
+                key: uuid::Uuid::new_v4().to_string(),
+                kind: crate::notifications::Kind::Succeeded,
+            })
+        };
+        journal.append(&outcome(), Some("first")).unwrap();
+        journal.append(&outcome(), None).unwrap();
+        journal.append(&outcome(), Some("second")).unwrap();
+        let page = journal.page(0).unwrap();
+        assert_eq!(
+            page.iter()
+                .map(|entry| entry.confirmed_session.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("first"), None, Some("second")]
+        );
+        let mut followed = journal.followed_sessions().unwrap();
+        followed.sort();
+        assert_eq!(followed, ["first", "second"]);
+        journal.ack(page[0].sequence).unwrap();
+        assert_eq!(journal.followed_sessions().unwrap(), ["second"]);
+    }
     fn durable_sources(directory: &Path) -> Vec<crate::chat::Session> {
         let db = Connection::open_with_flags(
             directory.join("actor-journal.sqlite"),
@@ -905,10 +982,13 @@ mod tests {
         let _cleanup = Cleanup(directory.clone());
         let mut journal = Journal::open(&directory).unwrap();
         journal
-            .append(&Update::Attention(crate::notifications::Evidence {
-                key: "retained-after-drop".into(),
-                kind: crate::notifications::Kind::Succeeded,
-            }))
+            .append(
+                &Update::Attention(crate::notifications::Evidence {
+                    key: "retained-after-drop".into(),
+                    kind: crate::notifications::Kind::Succeeded,
+                }),
+                None,
+            )
             .unwrap();
         assert!(journal.seal_for_retirement().is_err());
         assert!(journal.allow_retired_cache_removal().is_err());
@@ -950,7 +1030,7 @@ mod tests {
             key: "durably-committed".into(),
             kind: crate::notifications::Kind::Succeeded,
         });
-        journal.append(&update).unwrap();
+        journal.append(&update, None).unwrap();
         journal.ack(1).unwrap();
         journal
             .record_loss("explicitly committed continuity loss")
@@ -959,7 +1039,7 @@ mod tests {
         let loss = journal.continuity_loss().unwrap().unwrap();
         journal.ack_loss(loss.id).unwrap();
         journal.seal_for_retirement().unwrap();
-        assert!(journal.append(&update).is_err());
+        assert!(journal.append(&update, None).is_err());
         assert!(journal.record_loss("late mutation").is_err());
         journal.allow_retired_cache_removal().unwrap();
         drop(store);
@@ -977,7 +1057,12 @@ mod tests {
             key: "k".repeat(1024 * 1024),
             kind: crate::notifications::Kind::Succeeded,
         });
-        assert!(journal.append(&large).unwrap_err().contains("overflowed"));
+        assert!(
+            journal
+                .append(&large, None)
+                .unwrap_err()
+                .contains("overflowed")
+        );
         assert_eq!(journal.latest().unwrap(), 0);
         assert!(journal.continuity_loss().unwrap().is_some());
     }
@@ -1021,12 +1106,12 @@ mod tests {
             assert!(encoded.len() > MAX_METADATA_ENTRY_BYTES);
             assert!(encoded.len() <= MAX_FINISHED_ENTRY_BYTES);
             assert!(MAX_FINISHED_ENTRY_BYTES + 4096 < super::super::MAX_FRAME);
-            journal.append(&update).unwrap();
+            journal.append(&update, None).unwrap();
             let following = Update::Attention(crate::notifications::Evidence {
                 key: "following-outcome".into(),
                 kind: crate::notifications::Kind::Succeeded,
             });
-            journal.append(&following).unwrap();
+            journal.append(&following, None).unwrap();
             for _ in 0..2 {
                 let page = journal.page(0).unwrap();
                 assert_eq!(
@@ -1090,7 +1175,12 @@ mod tests {
                     },
                 },
             };
-            assert!(journal.append(&update).unwrap_err().contains("overflowed"));
+            assert!(
+                journal
+                    .append(&update, None)
+                    .unwrap_err()
+                    .contains("overflowed")
+            );
             assert_eq!(journal.latest().unwrap(), 0);
             assert!(journal.page(0).unwrap().is_empty());
             let loss = journal.continuity_loss().unwrap().unwrap();
@@ -1118,7 +1208,7 @@ mod tests {
             evidence: evidence.clone(),
             content: Some(content.clone()),
         };
-        journal.append(&update).unwrap();
+        journal.append(&update, None).unwrap();
         let first = journal.page(0).unwrap();
         let second = journal.page(0).unwrap();
         assert_eq!(
@@ -1140,8 +1230,8 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
             serde_json::to_value(&update).unwrap()
         );
-        journal.append(&Update::PromptAvailable).unwrap();
-        journal.append(&Update::Presentation).unwrap();
+        journal.append(&Update::PromptAvailable, None).unwrap();
+        journal.append(&Update::Presentation, None).unwrap();
         assert_eq!(
             journal.latest().unwrap(),
             1,
@@ -1183,10 +1273,13 @@ mod tests {
                 kind: Kind::Succeeded,
             };
             journal
-                .append(&Update::AttentionContext {
-                    evidence: evidence.clone(),
-                    content: Some(content),
-                })
+                .append(
+                    &Update::AttentionContext {
+                        evidence: evidence.clone(),
+                        content: Some(content),
+                    },
+                    None,
+                )
                 .unwrap();
             let page = journal.page(0).unwrap();
             assert!(
@@ -1197,10 +1290,13 @@ mod tests {
                 "invalid optional display data does not make known execution uncertain"
             );
             journal
-                .append(&Update::Attention(Evidence {
-                    key: "legacy-turn".into(),
-                    kind: Kind::Cancelled,
-                }))
+                .append(
+                    &Update::Attention(Evidence {
+                        key: "legacy-turn".into(),
+                        kind: Kind::Cancelled,
+                    }),
+                    None,
+                )
                 .unwrap();
             assert_eq!(
                 journal.latest().unwrap(),
@@ -1227,23 +1323,29 @@ mod tests {
             .unwrap();
         journal.retire_inputs(1).unwrap();
         journal
-            .append(&Update::Execution {
-                run,
-                update: crate::agent_execution::Update::Started {
-                    provider_key: "turn".into(),
+            .append(
+                &Update::Execution {
+                    run,
+                    update: crate::agent_execution::Update::Started {
+                        provider_key: "turn".into(),
+                    },
                 },
-            })
+                None,
+            )
             .unwrap();
         journal.ack(1).unwrap();
         assert_eq!(journal.retained_runs().unwrap(), vec![run]);
         journal
-            .append(&Update::Execution {
-                run,
-                update: crate::agent_execution::Update::Finished {
-                    state: crate::agent_execution::State::Succeeded,
-                    result: Default::default(),
+            .append(
+                &Update::Execution {
+                    run,
+                    update: crate::agent_execution::Update::Finished {
+                        state: crate::agent_execution::State::Succeeded,
+                        result: Default::default(),
+                    },
                 },
-            })
+                None,
+            )
             .unwrap();
         assert_eq!(
             journal.retained_runs().unwrap(),
@@ -1491,12 +1593,15 @@ mod tests {
         journal.admit_with_run(&identity, Some(run)).unwrap();
         assert!(
             journal
-                .append(&Update::Execution {
-                    run,
-                    update: crate::agent_execution::Update::Started {
-                        provider_key: "turn".into()
-                    }
-                })
+                .append(
+                    &Update::Execution {
+                        run,
+                        update: crate::agent_execution::Update::Started {
+                            provider_key: "turn".into()
+                        }
+                    },
+                    None
+                )
                 .is_err()
         );
         let loss = journal.continuity_loss().unwrap().unwrap();
@@ -1529,7 +1634,7 @@ mod tests {
             key: "turn".into(),
             kind: crate::notifications::Kind::Succeeded,
         });
-        assert!(journal.append(&update).is_err());
+        assert!(journal.append(&update, None).is_err());
         assert!(journal.loss().unwrap().unwrap().contains("overflowed"));
         journal.ack(0).unwrap();
         assert!(journal.loss().unwrap().is_some());
@@ -1539,10 +1644,13 @@ mod tests {
         let dir = tempfile::tempdir_in("/var/tmp").unwrap();
         let mut journal = Journal::with_budget(dir.path(), 4096).unwrap();
         journal
-            .append(&Update::Attention(crate::notifications::Evidence {
-                key: "turn".into(),
-                kind: crate::notifications::Kind::Waiting,
-            }))
+            .append(
+                &Update::Attention(crate::notifications::Evidence {
+                    key: "turn".into(),
+                    kind: crate::notifications::Kind::Waiting,
+                }),
+                None,
+            )
             .unwrap();
         assert_eq!(journal.page(0).unwrap().len(), 1);
         assert_eq!(journal.page(0).unwrap().len(), 1);
@@ -1551,10 +1659,13 @@ mod tests {
         assert!(journal.page(0).is_err());
         assert!(journal.page(1).unwrap().is_empty());
         journal
-            .append(&Update::Attention(crate::notifications::Evidence {
-                key: "next-turn".into(),
-                kind: crate::notifications::Kind::Succeeded,
-            }))
+            .append(
+                &Update::Attention(crate::notifications::Evidence {
+                    key: "next-turn".into(),
+                    kind: crate::notifications::Kind::Succeeded,
+                }),
+                None,
+            )
             .unwrap();
         journal.ack(2).unwrap();
         // A broker can finish a newer overlapping page before the synchronous

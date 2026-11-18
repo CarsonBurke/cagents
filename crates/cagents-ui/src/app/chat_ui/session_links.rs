@@ -3,7 +3,7 @@ use super::*;
 #[derive(Debug, Clone)]
 pub enum Destination {
     Local(TerminalId),
-    Saved(crate::persistence::SavedConversation),
+    Saved(Box<crate::persistence::SavedConversation>),
     Window(String, TerminalId),
 }
 
@@ -102,13 +102,13 @@ impl Cagents {
             {
                 local.push((
                     session.id,
-                    Destination::Saved(crate::persistence::SavedConversation {
+                    Destination::Saved(Box::new(crate::persistence::SavedConversation {
                         card: card.id,
                         title: card.title.clone(),
                         session: session.clone(),
                         open: false,
                         updated_at_unix_ms: 0,
-                    }),
+                    })),
                 ));
             }
         }
@@ -128,7 +128,8 @@ impl Cagents {
                     {
                         if !entry.open && !candidates.iter().any(|(id, _)| *id == entry.session.id)
                         {
-                            candidates.push((entry.session.id, Destination::Saved(entry)));
+                            candidates
+                                .push((entry.session.id, Destination::Saved(Box::new(entry))));
                         }
                     }
                 }
@@ -184,7 +185,7 @@ impl Cagents {
                     self.activate_main_window(None)
                 } else {
                     Task::batch([
-                        self.resume_saved_conversation(entry),
+                        self.resume_saved_conversation(*entry),
                         self.activate_main_window(None),
                     ])
                 }

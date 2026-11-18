@@ -112,7 +112,7 @@ fn complete(
                 .census
                 .chats
                 .iter()
-                .filter_map(|chat| chat.terminal.as_ref()),
+                .filter_map(|chat| chat.terminal.as_deref()),
         )
         .filter(|source| settled.paused_terminals.contains(&source.id))
     {

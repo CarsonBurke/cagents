@@ -298,6 +298,9 @@ pub(crate) struct HostState {
     /// well as its Store handle. This is live custody, not a durable retry or
     /// permission to replay any recipe.
     retained_startup_checkpoint: Option<crate::upgrade::handoff::Checkpoint>,
+    /// What this daemon started while startup recovery held original
+    /// ownership, which that hold therefore does not cover.
+    pub(super) recovery_independence: super::recovery_admission::Independence,
     #[cfg(test)]
     pub(super) test_fail_startup_commit: Option<TerminalId>,
     #[cfg(test)]
@@ -488,6 +491,7 @@ impl HostState {
             paused_update_terminals: BTreeSet::new(),
             startup_recovery: None,
             retained_startup_checkpoint: None,
+            recovery_independence: Default::default(),
             #[cfg(test)]
             test_fail_startup_commit: None,
             #[cfg(test)]
@@ -2168,6 +2172,18 @@ impl HostState {
         })
     }
 
+    pub(super) fn startup_custody_contains(&self, id: TerminalId) -> bool {
+        self.startup_custody.contains(&id)
+    }
+
+    /// The update checkpoint this daemon's restore accepted, which names every
+    /// original its recovery may still hold.
+    pub(super) fn retained_startup_checkpoint(
+        &self,
+    ) -> Option<&crate::upgrade::handoff::Checkpoint> {
+        self.retained_startup_checkpoint.as_ref()
+    }
+
     pub(in crate::host) fn pause_update_terminals(&mut self, ids: &[TerminalId]) {
         self.paused_update_terminals.extend(ids.iter().copied());
     }
@@ -2184,6 +2200,14 @@ impl HostState {
                 awaiting: self.startup_custody.len() as u64,
             },
         }
+    }
+
+    #[cfg(test)]
+    pub(in crate::host) fn retain_startup_checkpoint_for_test(
+        &mut self,
+        checkpoint: crate::upgrade::handoff::Checkpoint,
+    ) {
+        self.retained_startup_checkpoint = Some(checkpoint);
     }
 
     #[cfg(test)]
@@ -2226,13 +2250,19 @@ impl HostState {
         }
     }
 
+    /// Whether an original recovery holds still runs. Work started during
+    /// the hold is independent of it and stops as on any shutdown.
     pub(super) fn recovery_owns_work(&self) -> bool {
+        let held = |id: &TerminalId| !self.recovery_independence.contains(*id);
         self.startup_recovery().is_some()
             && (self
                 .terminals
-                .values()
-                .any(|record| !record.handle.is_completed())
-                || self.chats.values().any(|record| record.handle.owns_work()))
+                .iter()
+                .any(|(id, record)| held(id) && !record.handle.is_completed())
+                || self
+                    .chats
+                    .iter()
+                    .any(|(id, record)| held(id) && record.handle.owns_work()))
     }
 
     pub(super) fn startup_blocks_shutdown(&self) -> bool {
@@ -3731,7 +3761,7 @@ fn restore_upgrade_from(
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             if paired && let Some(chat) = state.chats.get_mut(&terminal.source.id) {
                 chat.returning_terminal = false;
-                chat.session.terminal = Some(descriptor.session);
+                chat.session.terminal = Some(Box::new(descriptor.session));
             }
             state
                 .adopt_upgrade_lineage(
@@ -4635,11 +4665,15 @@ fn start_terminal_view_owned_reserved(
         }
         return Ok((descriptor, handle));
     }
-    let recovery = shared
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .startup_recovery()
-        .map(str::to_owned);
+    let recovery = {
+        let state = shared.lock().unwrap_or_else(|p| p.into_inner());
+        // A terminal admitted as independent of recovery's originals starts
+        // beside them, as a fresh conversation does.
+        state
+            .startup_recovery()
+            .filter(|_| !state.recovery_independence.contains(session.id))
+            .map(str::to_owned)
+    };
     if let Some(message) = recovery {
         return Err(ProtocolError::new(
             ProtocolErrorCode::TerminalUnavailable,

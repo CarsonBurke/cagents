@@ -551,17 +551,11 @@ mod tests {
         // The reader publishes its read-only reason and its exit as separate
         // events of one frame, and a snapshot can fall between them. Release
         // inspection requires both, so wait for the last.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !handle
-            .snapshot(None)
-            .is_some_and(|snapshot| snapshot.read_only_reason.is_some() && snapshot.exited)
-        {
-            assert!(
-                Instant::now() < deadline,
-                "history initialization did not complete"
-            );
-            thread::sleep(Duration::from_millis(10));
-        }
+        crate::test_timing::wait_for("history initialization to complete", || {
+            handle
+                .snapshot(None)
+                .filter(|snapshot| snapshot.read_only_reason.is_some() && snapshot.exited)
+        });
         if close {
             handle.close().unwrap();
         }
@@ -1423,23 +1417,15 @@ exit 0
 
     fn wait_for_client_history(client: &chat::client::ClientHandle, read_only: bool) {
         client.set_visible(true).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
+        crate::test_timing::wait_for("the real client to receive saved history", || {
             let snapshot = client.snapshot();
             // A reader's single initial frame applies its history, read-only
             // reason and exit one event at a time, so a view can attach between
             // them. Release requires the settled reader, so wait for its exit.
-            if (!read_only || (snapshot.read_only_reason.is_some() && snapshot.exited))
-                && snapshot.items.iter().any(|item| matches!(&item.content, chat::ItemContent::Text { text, .. } if text.contains("durable history body")))
-            {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "real client did not receive saved history"
-            );
-            thread::sleep(Duration::from_millis(5));
-        }
+            ((!read_only || (snapshot.read_only_reason.is_some() && snapshot.exited))
+                && snapshot.items.iter().any(|item| matches!(&item.content, chat::ItemContent::Text { text, .. } if text.contains("durable history body"))))
+            .then_some(())
+        });
     }
 
     #[test]
@@ -1964,6 +1950,54 @@ exit 0
         host.lock().unwrap().chats.remove(&live.id);
         let inspection = inspect(&host, source.id).unwrap();
         release(&host, &inspection.proof, false).unwrap();
+    }
+
+    #[test]
+    fn history_preview_waits_for_a_cold_reader_to_announce_its_saved_frame() {
+        use crate::host::upgrade_inspect::InspectionClient;
+        let host = host();
+        let (_directory, source, _) = history_reader(&host, false);
+        // Release the resident reader, so inspection starts a cold one.
+        let inspection = inspect(&host, source.id).unwrap();
+        release(&host, &inspection.proof, false).unwrap();
+        assert!(host.lock().unwrap().chats.is_empty());
+        // Attach returns once the reader runs, before it applies its saved
+        // frame. Hold it there past the 64 reads, 5 ms apart, that inspection
+        // once allowed before leaving the pane out of cold history (#3058).
+        let release_reader =
+            chat::runtime::hold_history_reader(&source.launch.recipe.working_directory);
+        let (stream, socket) = std::os::unix::net::UnixStream::pair().unwrap();
+        let server_host = host.clone();
+        let server =
+            thread::spawn(move || super::super::super::client::serve(socket, 81, server_host));
+        let proof = host.lock().unwrap().proof().clone();
+        let previewed = source.clone();
+        let started = Instant::now();
+        let preview = thread::spawn(move || {
+            InspectionClient::fixture_inspect_history(stream, &previewed, proof)
+        });
+        const POLLING_BUDGET: Duration = Duration::from_millis(64 * 5);
+        crate::test_timing::wait_for(
+            "inspection to wait past the polling budget for the held reader",
+            || {
+                (preview.is_finished()
+                    || (InspectionClient::fixture_awaited_change(source.id)
+                        && started.elapsed() > POLLING_BUDGET))
+                    .then_some(())
+            },
+        );
+        let reader = host.lock().unwrap().chats[&source.id].handle.clone();
+        let held = reader.snapshot(None).unwrap();
+        assert!(
+            !held.exited && held.read_only_reason.is_none(),
+            "the held reader applied its saved frame before release"
+        );
+        drop(release_reader);
+        preview.join().unwrap().unwrap();
+        server.join().unwrap();
+        let settled = reader.snapshot(None).unwrap();
+        assert!(settled.exited && settled.read_only_reason.is_some());
+        assert!(reader.is_read_only_history() && !reader.owns_work());
     }
 }
 

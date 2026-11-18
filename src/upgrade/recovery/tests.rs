@@ -442,7 +442,7 @@ fn paired_census_accepts_only_same_live_owner_attachment_and_hint_projections() 
             session_id: Some("confirmed-thread".into()),
         },
         proof: Some(proof.clone()),
-        terminal: Some(paired),
+        terminal: Some(Box::new(paired)),
         owned_codex_listener: None,
         native_continuity: Default::default(),
     };
@@ -1486,7 +1486,7 @@ fn prepared_recovery_verifies_the_exact_retained_console_replacement_lineage() {
             session_id: Some("retained-conversation".into()),
         },
         proof: Some(preparation.authority.source.clone()),
-        terminal: Some(known.clone()),
+        terminal: Some(Box::new(known.clone())),
         owned_codex_listener: None,
         native_continuity: crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 },
     };
@@ -1517,7 +1517,7 @@ fn prepared_recovery_verifies_the_exact_retained_console_replacement_lineage() {
         });
     let mut chat = source.clone();
     chat.proof = Some(serving.clone());
-    chat.terminal = Some(actual.session.clone());
+    chat.terminal = Some(Box::new(actual.session.clone()));
     assert!(verified_terminal(&census, &actual, &serving, target));
     assert!(verified_chat(
         &census,
@@ -1736,7 +1736,7 @@ fn prepared_recovery_verifies_the_exact_retained_console_replacement_lineage() {
         &[actual.clone()],
         target
     ));
-    chat.terminal = Some(actual.session.clone());
+    chat.terminal = Some(Box::new(actual.session.clone()));
     chat.launch.session_id = Some("different-conversation".into());
     assert!(!verified_chat(&census, &chat, &serving, &[actual], target));
 }
@@ -1799,7 +1799,7 @@ fn recovery_outcome_requires_disjoint_complete_inventory_including_paired_termin
             session_id: Some("thread".into()),
         },
         proof: Some(record.source.clone()),
-        terminal: Some(terminal.clone()),
+        terminal: Some(Box::new(terminal.clone())),
         owned_codex_listener: None,
         native_continuity: Default::default(),
     });

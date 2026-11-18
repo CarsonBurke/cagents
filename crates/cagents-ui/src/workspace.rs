@@ -779,6 +779,13 @@ struct LayoutTransition {
     elapsed: Duration,
 }
 
+/// A geometry revision no workspace in this process has used: a rebuilt
+/// workspace never repeats one its predecessor reported.
+fn next_geometry_revision() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 #[derive(Debug, Clone)]
 pub struct Workspace {
     cards: Vec<WorkspaceCard>,
@@ -814,7 +821,7 @@ impl Workspace {
             focused: None,
             viewport_width: 0.0,
             geometry: StripGeometry::build(&[], 0.0, config),
-            geometry_revision: 0,
+            geometry_revision: next_geometry_revision(),
             layout_transition: None,
             opening: HashSet::new(),
             camera: Camera::new(config.animation_omega)?,
@@ -831,6 +838,13 @@ impl Workspace {
 
     pub fn cards(&self) -> &[WorkspaceCard] {
         &self.cards
+    }
+
+    /// Changes whenever the strip's geometry does, and differs between
+    /// workspaces, so a caller can tell that pane widths it derived still
+    /// hold.
+    pub fn geometry_revision(&self) -> u64 {
+        self.geometry_revision
     }
 
     pub fn order(&self) -> impl ExactSizeIterator<Item = CardId> + '_ {
@@ -1789,7 +1803,7 @@ impl Workspace {
             return;
         }
         self.layout_transition = None;
-        self.geometry_revision = self.geometry_revision.wrapping_add(1);
+        self.geometry_revision = next_geometry_revision();
         self.geometry = geometry;
         self.visibility_bands = None;
         self.camera

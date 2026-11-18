@@ -2467,7 +2467,7 @@ fn activity_application_rejects_replaced_processes_and_expired_results() {
     );
     let (reply, result) = crossbeam_channel::bounded(1);
     worker.handle_command(Command::ApplyAgentActivity {
-        process: process.clone(),
+        process: Box::new(process.clone()),
         activity: None,
         title: None,
         reply,
@@ -2485,7 +2485,7 @@ fn activity_application_rejects_replaced_processes_and_expired_results() {
     let apply = |worker: &mut Worker, process: AgentProcess, deadline| {
         let (reply, result) = crossbeam_channel::bounded(1);
         worker.handle_command(Command::ApplyAgentActivity {
-            process,
+            process: Box::new(process),
             activity: working,
             title: None,
             reply,

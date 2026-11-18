@@ -37,6 +37,20 @@ impl Handle {
             responder.settle_input_fixture(outcome)
         })
     }
+    /// A retained attachment for `source` whose helper is a script the test
+    /// edits; see [`ScriptedHelper`](super::retained_actor::transport::scripted_helper::ScriptedHelper).
+    #[cfg(test)]
+    pub(crate) fn fixture_scripted(
+        source: &crate::chat::Session,
+        scope: Result<crate::account::scope::LaunchAccountScope, String>,
+    ) -> (
+        Self,
+        super::retained_actor::transport::scripted_helper::ScriptedHelper,
+    ) {
+        let (remote, helper) =
+            super::retained_actor::transport::scripted_helper::ScriptedHelper::start(source, scope);
+        (Self(Owner::Remote(remote)), helper)
+    }
     /// A retained attachment whose proxy already recorded a terminal failure.
     #[cfg(test)]
     pub(crate) fn fixture_failed_remote() -> Self {

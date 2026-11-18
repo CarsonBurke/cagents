@@ -706,7 +706,7 @@ fn retained_turn_final_action(action: &str) {
         .and_then(|owner| Handle::inspect_remote(&owner.record, first.clone()).ok())
         .unwrap()
         .source;
-    paired_source.terminal = Some(descriptor.session.clone());
+    paired_source.terminal = Some(Box::new(descriptor.session.clone()));
     handle
         .update_native_source(
             paired_source.clone(),
@@ -914,7 +914,7 @@ fn retained_turn_final_action(action: &str) {
             "the exact original console process must survive"
         );
         assert_eq!(
-            record.session.terminal.as_ref(),
+            record.session.terminal.as_deref(),
             Some(&state.native_terminal_projection(id).unwrap())
         );
         assert!(
@@ -3611,7 +3611,7 @@ fn unattached_claude_cleanup_authenticates_old_alias_and_closes_original_pair() 
         let owner = console.holder_identity().unwrap().clone();
         cleanup.0.push(owner.clone());
         let mut source = confirmed_source.clone();
-        source.terminal = Some(descriptor.session);
+        source.terminal = Some(Box::new(descriptor.session));
         handle
             .update_native_source(source.clone(), Some(recipe), Some(owner.clone()))
             .unwrap();
@@ -4002,7 +4002,7 @@ fn paired_conversation_reopens_after_an_ordinary_or_interrupted_exit() {
     let pair = console.holder_identity().unwrap().clone();
     cleanup.0.push(pair.clone());
     let mut saved = confirmed_source.clone();
-    saved.terminal = Some(descriptor.session);
+    saved.terminal = Some(Box::new(descriptor.session));
     handle
         .update_native_source(saved.clone(), Some(recipe), Some(pair.clone()))
         .unwrap();
@@ -4627,7 +4627,7 @@ fn a_same_boot_claude_actor_killed_without_retirement_closes_once_nothing_surviv
         let _console = Cleanup(pair.clone(), root.clone());
         let mut saved = host.lock().unwrap().chats[&id].session.clone();
         saved.launch.session_id = handle.confirmed_session_id();
-        saved.terminal = Some(descriptor.session);
+        saved.terminal = Some(Box::new(descriptor.session));
         handle
             .update_native_source(saved.clone(), Some(recipe), Some(pair.clone()))
             .unwrap();

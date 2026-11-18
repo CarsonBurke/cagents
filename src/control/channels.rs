@@ -376,7 +376,7 @@ mod tests {
                 session_id: None,
             },
             proof: terminal.continuity.live_proof(),
-            terminal: Some(terminal.clone()),
+            terminal: Some(Box::new(terminal.clone())),
             owned_codex_listener: None,
             native_continuity: Default::default(),
         });
@@ -384,7 +384,7 @@ mod tests {
             unreachable!()
         };
         model.agents[0].session = Some(HostedSession::Chat(session.clone()));
-        model.agents[0].console = session.terminal.clone();
+        model.agents[0].console = session.terminal.as_deref().cloned();
         model.views[0].panes = vec![canonical.clone(), console.clone()];
         for handle in [
             "worker".into(),
