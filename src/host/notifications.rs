@@ -2157,7 +2157,7 @@ async fn run(
     let mut next_attempt = Instant::now();
     let mut retry_delay = RETRY_DELAY;
     let mut snapshot = Snapshot {
-        diagnostic: settings_error,
+        diagnostic: settings_error.clone(),
         ..Default::default()
     };
     match store.journal() {
@@ -2210,8 +2210,10 @@ async fn run(
             && let Ok(journal) = store.journal()
         {
             tracing::info!(error = %recovered, "the notification journal is available again");
+            // The journal error replaced any settings error at startup;
+            // recovering the journal shows that one again.
             if snapshot.diagnostic.as_ref() == Some(&recovered) {
-                snapshot.diagnostic = None;
+                snapshot.diagnostic.clone_from(&settings_error);
             }
             restore(journal, &policy, &mut snapshot, &mut withdrawals);
         }
