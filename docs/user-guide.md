@@ -671,7 +671,10 @@ are skipped, and the finished prompt is never resent. History shows “session
 release pending” during cleanup. Explicitly pausing the schedule stays effective
 after cleanup. Permission requests and uncertain ownership still require attention.
 If you take over the conversation, automatic cleanup and reuse
-stop until ownership is resolved. Removing the chosen account or replacing the
+stop until ownership is resolved. Closing the automation's conversation does not
+stop the schedule: the next occurrence starts a new one. If that removed the
+channel the automation opened, the new conversation opens another channel named
+after the automation. Removing the chosen account or replacing the
 target directory cannot silently redirect a future run to another account or
 directory. Closing a project pauses its schedules.
 
@@ -725,7 +728,9 @@ and cause cannot be recovered from the current enabled state. Prompt bodies,
 launch environment and provider diagnostics are excluded from these receipts.
 Hosted conversations can read only receipts committed in their own project.
 Moving a definition does not move its earlier audit receipts into the new
-project; management inspection retains the complete retained chain.
+project; management inspection retains the complete retained chain. Run history
+follows the same rule: a hosted conversation sees only the runs that ran in its
+project.
 
 Read both revisions from `show`. Reuse the same request UUID when retrying a
 manual request whose response was lost; a new UUID means a new run. History

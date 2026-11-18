@@ -311,6 +311,10 @@ pub struct Draft {
     // Indices are frozen against the options with which this draft opened.
     targets: Vec<TargetChoice>,
     accounts: Vec<AccountChoice>,
+    /// The editor creates chat automations and offers no choice of surface;
+    /// a saved terminal automation keeps its own, so editing it here neither
+    /// converts it nor counts as a change to how it launches.
+    surface: Surface,
 }
 
 impl Draft {
@@ -348,10 +352,12 @@ impl Draft {
             shell: text_editor::Content::new(),
             targets: targets.to_vec(),
             accounts: accounts.to_vec(),
+            surface: Surface::Chat,
         };
         if let Some(automation) = existing {
             let definition = &automation.definition;
             value.base = Some((automation.id, automation.revision));
+            value.surface = definition.agent.surface;
             value.name = definition.name.clone();
             value.model = definition.agent.model.clone().unwrap_or_default();
             value.effort = definition.agent.reasoning_effort.clone();
@@ -617,7 +623,7 @@ impl Draft {
                 provider: provider(self.provider),
                 account: Some(account.id.clone()),
                 target: target.target.clone(),
-                surface: Surface::Chat,
+                surface: self.surface,
                 model: optional(&self.model),
                 permission_mode: optional(&self.permission),
                 reasoning_effort: self.effort.clone(),
@@ -3777,35 +3783,48 @@ mod tests {
 
     #[test]
     fn refreshing_choices_preserves_the_open_drafts_launch_selection() {
-        let existing = automation();
-        let account = AccountChoice {
-            label: "Original account".into(),
-            id: existing.definition.agent.account.clone().unwrap(),
-            provider: Provider::Claude,
-        };
-        let target = TargetChoice {
-            label: "Original target".into(),
-            target: existing.definition.agent.target.clone(),
-            defaults: BTreeMap::new(),
-        };
-        let mut state = State {
-            selected: Some(existing.clone()),
-            ..State::default()
-        };
-        state.set_choices(vec![target], vec![account], Models::new());
-        state.update(Action::Edit);
-        // A refresh may remove or reorder the live catalog while the editor
-        // is open; its numeric selections must retain their original meaning.
-        state.set_choices(Vec::new(), Vec::new(), Models::new());
-        let draft = state.draft.as_ref().unwrap();
-        assert_eq!(
-            draft.definition(&Models::new()).unwrap(),
-            existing.definition
-        );
-        assert_eq!(draft.accounts[0].label, "Original account");
-        assert_eq!(draft.targets[0].label, "Original target");
-        assert!(state.accounts.is_empty());
-        assert!(state.targets.is_empty());
+        for surface in [Surface::Chat, Surface::Terminal] {
+            let mut existing = automation();
+            existing.definition.agent.surface = surface;
+            let account = AccountChoice {
+                label: "Original account".into(),
+                id: existing.definition.agent.account.clone().unwrap(),
+                provider: Provider::Claude,
+            };
+            let target = TargetChoice {
+                label: "Original target".into(),
+                target: existing.definition.agent.target.clone(),
+                defaults: BTreeMap::new(),
+            };
+            let mut state = State {
+                selected: Some(existing.clone()),
+                ..State::default()
+            };
+            state.set_choices(vec![target], vec![account], Models::new());
+            state.update(Action::Edit);
+            // A refresh may remove or reorder the live catalog while the editor
+            // is open; its numeric selections must retain their original meaning.
+            state.set_choices(Vec::new(), Vec::new(), Models::new());
+            let draft = state.draft.as_ref().unwrap();
+            assert_eq!(
+                draft.definition(&Models::new()).unwrap(),
+                existing.definition
+            );
+            assert_eq!(draft.accounts[0].label, "Original account");
+            assert_eq!(draft.targets[0].label, "Original target");
+            assert!(state.accounts.is_empty());
+            assert!(state.targets.is_empty());
+            // Renaming changes only the name; the surface is not an edit.
+            state.update(Action::Field(Field::Name, "Renamed review".into()));
+            let renamed = state
+                .draft
+                .as_ref()
+                .unwrap()
+                .definition(&Models::new())
+                .unwrap();
+            assert_eq!(renamed.name, "Renamed review");
+            assert_eq!(renamed.agent, existing.definition.agent);
+        }
     }
 
     #[test]
