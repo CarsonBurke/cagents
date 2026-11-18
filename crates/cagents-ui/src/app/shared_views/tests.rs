@@ -8588,14 +8588,16 @@ fn a_pane_reopening_in_a_channel_keeps_its_place_until_it_starts() {
     let order = |app: &Cagents| app.workspace.order().collect::<Vec<_>>();
     assert_eq!(order(&app), [first.id, last.id]);
 
-    let session = crate::chat::fresh_session(
+    let mut session = crate::chat::fresh_session(
         crate::agent::Provider::Claude,
         TerminalId::new(),
         "/repo".into(),
         &crate::account::Account::system(crate::agent::Provider::Claude),
     )
     .unwrap();
-    let held = app.place_reopening_beside(first.id, session);
+    // A conversation that ran, so starting it connects rather than drafts.
+    session.launch.session_id = Some("f0e49307-af96-4edd-b23f-60b185fe4fea".into());
+    let held = app.place_reopening_beside(first.id, session.clone());
     assert_eq!(order(&app), [first.id, held, last.id]);
 
     // The view does not list it until it starts, and it stays where it was
@@ -8610,4 +8612,23 @@ fn a_pane_reopening_in_a_channel_keeps_its_place_until_it_starts() {
         .find(|candidate| candidate.id == channel)
         .unwrap();
     assert_eq!(channel.cards, [first.id, held, last.id]);
+
+    // Once it starts, it is published where it is, before the pane after it.
+    drop(app.update(Message::ResumeConversation(
+        crate::app::resume_ui::Action::Prepared(held, 0, Ok(Some(Box::new(session)))),
+    )));
+    assert!(!app.reopen_pending(held));
+    drop(app.reconcile_shared_views());
+    assert!(
+        app.shared_views
+            .pending
+            .iter()
+            .any(|(_, _, change)| matches!(
+                change,
+                Change::Insert { pane, before } if pane.id == held && *before == Some(last.id)
+            )),
+        "{:?}",
+        app.shared_views.pending
+    );
+    assert_eq!(order(&app), [first.id, held, last.id]);
 }

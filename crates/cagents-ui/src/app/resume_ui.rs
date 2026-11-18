@@ -1409,10 +1409,15 @@ impl Cagents {
             if let Some(reopening) = self.resume_ui.reopening.get_mut(&card) {
                 reopening.stage = ReopenStage::Superseded;
             }
-            return Task::batch([
-                self.close_card_unasked(card),
-                self.reveal_conversation_card(existing, &session),
-            ]);
+            // Showing the other pane may leave this strip, which then can no
+            // longer take this pane's close from its widget.
+            let reveal = self.reveal_conversation_card(existing, &session);
+            let close = if self.workspace.order().any(|id| id == card) {
+                self.close_card_unasked(card)
+            } else {
+                self.retire_offstrip_card(card)
+            };
+            return Task::batch([reveal, close]);
         }
         // What may have changed while the service answered.
         if let Some(reason) = self.deleting_card_reason(card) {
@@ -2589,6 +2594,19 @@ mod tests {
             app.card_state(card).unwrap().kind,
             CardKind::Chat(entry.session)
         );
+
+        // Close removes the failed pane, asking nothing of the service, and
+        // it can be reopened again.
+        drop(app.update(Message::CloseCard(card)));
+        drop(app.update(Message::CommitClose(card)));
+        assert!(!app.card_state(card).unwrap().existence.is_open());
+        assert!(!app.reopen_pending(card));
+        assert!(!app.chat_ui.transition_pending());
+        assert!(
+            app.recently_closed
+                .iter()
+                .any(|(closed, _)| closed.id == card)
+        );
     }
 
     #[test]
@@ -2864,6 +2882,70 @@ mod tests {
         assert_eq!(
             app.durable.kept_chat_drafts[&source].text,
             "Unsent question"
+        );
+    }
+
+    #[test]
+    fn a_placeholder_superseded_from_another_channel_closes_with_the_switch() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let entry = retained(directory.path());
+        let prepared = successor(&entry.session);
+        drop(app.resume_saved_conversation(entry));
+        let (card, attempt) = reopening(&app);
+        // Another window put the conversation in a channel meanwhile.
+        let existing = CardId::new();
+        let channel = crate::model::ChannelId::new();
+        let project = ProjectId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "project".into(),
+            directory.path().into(),
+            vec![crate::sidebar::SidebarWorktree::from_durable(
+                crate::model::WorktreeId::new(),
+                directory.path().into(),
+                Some("main".into()),
+            )],
+            Vec::new(),
+        ));
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards.push(CardState {
+            id: existing,
+            generation: durable.generation,
+            title: "Review peripheral Rust modules".into(),
+            width_fraction: 0.5,
+            existence: Existence::Open,
+            kind: CardKind::Chat(prepared.clone()),
+        });
+        durable.channels.push(crate::model::ProjectChannel {
+            id: channel,
+            project_id: project,
+            title: "Parser".into(),
+            title_source: Default::default(),
+            ordinal: 1,
+            shared: false,
+            cards: vec![existing],
+            focused: Some(existing),
+        });
+        app.refresh_sidebar_channels();
+
+        drop(app.update_resume(Action::Prepared(
+            card,
+            attempt,
+            Ok(Some(Box::new(prepared))),
+        )));
+        // The channel holding it is shown, and the placeholder is gone with
+        // the strip it was on, rather than left waiting off screen.
+        assert_eq!(app.durable.active_channel, Some(channel));
+        assert!(app.workspace.order().all(|id| id != card));
+        assert!(!app.card_state(card).unwrap().existence.is_open());
+        assert!(!app.reopen_pending(card));
+        assert!(!app.chat_start_began(card));
+        assert!(
+            app.recently_closed
+                .iter()
+                .all(|(closed, _)| closed.id != card)
         );
     }
 

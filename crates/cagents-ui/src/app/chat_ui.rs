@@ -9668,7 +9668,7 @@ impl Cagents {
         }
         if self.reopen_failed(card) {
             return Some(Cow::Borrowed(
-                "This conversation could not be reopened. Retry before changing views.",
+                "This conversation couldn't be reopened. Retry or close it first.",
             ));
         }
         let Some(state) = self
