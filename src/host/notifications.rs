@@ -145,6 +145,65 @@ struct Pending {
     stopped: bool,
 }
 
+impl Pending {
+    /// This batch's work with `newer`, a later batch, applied after it, as if
+    /// both had been queued as one: a later retirement withdraws an earlier
+    /// event for its session, and a later event replaces an earlier one.
+    fn followed_by(mut self, newer: Pending) -> Pending {
+        for target in &newer.retired {
+            self.events.remove(target);
+        }
+        for target in newer.retired {
+            if self.retired.len() < MAX_PENDING || self.retired.contains(&target) {
+                self.retired.insert(target);
+            }
+        }
+        for (target, event) in newer.events {
+            if self.events.len() < MAX_PENDING || self.events.contains_key(&target) {
+                self.events.insert(target, event);
+            }
+        }
+        for id in newer.acknowledged {
+            if self.acknowledged.len() < MAX_PENDING {
+                self.acknowledged.insert(id);
+            }
+        }
+        self.committed_events.extend(newer.committed_events);
+        if newer.inboxes.is_some() {
+            self.inboxes = newer.inboxes;
+        }
+        self.presence_changed |= newer.presence_changed;
+        self.actions.extend(newer.actions);
+        if newer.portal_owner.is_some() {
+            self.portal_owner = newer.portal_owner;
+        }
+        if newer.reload {
+            self.reload = true;
+            self.preferences = newer.preferences;
+        }
+        self.tests.extend(newer.tests);
+        self.stopped |= newer.stopped;
+        self
+    }
+
+    /// The work that waits for an unavailable journal rather than being lost:
+    /// attention, retirements, acknowledgements and the settings and windows
+    /// they are judged by. Receipts and tests are answered at once, and a
+    /// click on a notice is not replayed long after the person made it.
+    fn deferred(self) -> Pending {
+        Pending {
+            events: self.events,
+            inboxes: self.inboxes,
+            retired: self.retired,
+            acknowledged: self.acknowledged,
+            presence_changed: self.presence_changed,
+            reload: self.reload,
+            preferences: self.preferences,
+            ..Pending::default()
+        }
+    }
+}
+
 fn take_pending(core: &Shared) -> Pending {
     let mut queue = core.pending.lock().unwrap_or_else(|p| p.into_inner());
     let pending = std::mem::take(&mut *queue);
@@ -874,6 +933,39 @@ fn withdraw_target(queue: &mut Withdrawals, id: Uuid, target: &Target) {
 
 /// Desktop revocation must not depend on a successful SQLite rewrite. Preserve
 /// exact attention IDs while removing rich context from the published snapshot.
+/// Reads a journal that just opened into `snapshot`, without the content of
+/// earlier notices when previews are off.
+fn restore(
+    journal: &mut Journal,
+    policy: &Preferences,
+    snapshot: &mut Snapshot,
+    withdrawals: &mut Withdrawals,
+) {
+    if !policy.message_previews {
+        match journal.clear_content() {
+            Ok(notices) => {
+                for (id, target) in notices {
+                    withdraw_target(withdrawals, id, &target);
+                }
+            }
+            Err(error) => snapshot.diagnostic = Some(error),
+        }
+    }
+    match journal.list() {
+        Ok(notices) => snapshot.notices = notices,
+        Err(error) => snapshot.diagnostic = Some(error),
+    }
+    if !policy.message_previews {
+        revoke_previews(snapshot, withdrawals);
+    }
+    withdrawals.protect(
+        snapshot
+            .notices
+            .iter()
+            .map(|notice| batching::desktop_id(&notice.event.target)),
+    );
+}
+
 fn revoke_previews(snapshot: &mut Snapshot, withdrawals: &mut Withdrawals) {
     withdrawals.protect(
         snapshot
@@ -1060,6 +1152,50 @@ mod tests {
                 kind: crate::notifications::Kind::Succeeded,
             },
         )
+    }
+
+    #[test]
+    fn work_deferred_for_an_unavailable_journal_keeps_its_order_with_later_work() {
+        let (shared, _receiver) = shared();
+        let handle = Handle(shared.clone());
+        let (retired, replaced, kept) = (TerminalId::new(), TerminalId::new(), TerminalId::new());
+        let acknowledged = Uuid::new_v4();
+        handle.record(attention_event(retired, "before-retirement"));
+        handle.record(attention_event(replaced, "older"));
+        handle.record(attention_event(kept, "kept"));
+        handle.acknowledge(acknowledged);
+        handle.presence(1, None);
+        let receipt = handle
+            .record_committed(attention_event(kept, "receipt"))
+            .unwrap();
+        let test = handle.test();
+        let mut first = take_pending(&shared);
+        // As the broker does while its journal is unavailable.
+        for (_, receipt) in first.committed_events.drain(..) {
+            receipt.finish(Err("journal unavailable".into()));
+        }
+        answer_tests(&first.tests, &TestOutcome::Unavailable("portal".into()));
+        first.actions.push_back((Uuid::new_v4(), None));
+        let deferred = first.deferred();
+        assert_eq!(
+            receipt.try_recv().unwrap(),
+            Err("journal unavailable".into())
+        );
+        assert!(test.try_recv().is_ok());
+        assert!(deferred.actions.is_empty() && deferred.tests.is_empty());
+
+        handle.retire(retired);
+        handle.record(attention_event(replaced, "newer"));
+        let merged = deferred.followed_by(take_pending(&shared));
+        let keys = merged
+            .events
+            .values()
+            .map(|event| event.evidence.key.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(keys, BTreeSet::from(["kept", "newer"]));
+        assert!(merged.retired.contains(&Target::Session(retired)));
+        assert!(merged.acknowledged.contains(&acknowledged));
+        assert!(merged.presence_changed);
     }
 
     #[test]
@@ -1998,9 +2134,9 @@ async fn run(
 ) {
     let path =
         crate::instance::project_dirs().map(|dirs| dirs.data_dir().join("agent-attention.sqlite3"));
-    let mut journal = path
-        .ok_or_else(|| "Notification data directory is unavailable".to_owned())
-        .and_then(|path| journal::Journal::open(&path));
+    let mut store = journal::Reopening::open(path, Instant::now());
+    // Work held while the journal is unavailable, applied before the next batch.
+    let mut deferred = Pending::default();
     let settings = preferences();
     let settings_error = settings.as_ref().err().cloned();
     let mut policy = settings.unwrap_or_else(|_| Preferences {
@@ -2021,34 +2157,10 @@ async fn run(
         diagnostic: settings_error,
         ..Default::default()
     };
-    match &mut journal {
-        Ok(journal) => {
-            if !policy.message_previews {
-                match journal.clear_content() {
-                    Ok(notices) => {
-                        for (id, target) in notices {
-                            withdraw_target(&mut withdrawals, id, &target);
-                        }
-                    }
-                    Err(error) => snapshot.diagnostic = Some(error),
-                }
-            }
-            match journal.list() {
-                Ok(notices) => snapshot.notices = notices,
-                Err(error) => snapshot.diagnostic = Some(error),
-            }
-        }
+    match store.journal() {
+        Ok(journal) => restore(journal, &policy, &mut snapshot, &mut withdrawals),
         Err(error) => snapshot.diagnostic = Some(error.clone()),
     }
-    if !policy.message_previews {
-        revoke_previews(&mut snapshot, &mut withdrawals);
-    }
-    withdrawals.protect(
-        snapshot
-            .notices
-            .iter()
-            .map(|notice| batching::desktop_id(&notice.event.target)),
-    );
     publish(&shared, &host, snapshot.clone());
     while wait_for_work(
         &mut receiver,
@@ -2062,14 +2174,17 @@ async fn run(
             }
         } else {
             delivery_schedule.deadline()
-        },
+        }
+        .into_iter()
+        .chain(store.retry_at())
+        .min(),
     )
     .await
     {
         let Some(core) = shared.upgrade() else {
             break;
         };
-        let mut pending = take_pending(&core);
+        let mut pending = std::mem::take(&mut deferred).followed_by(take_pending(&core));
         let current_presence = pending.presence_changed.then(|| {
             core.presence
                 .lock()
@@ -2080,7 +2195,7 @@ async fn run(
         if pending.stopped {
             break;
         }
-        if let Some(owner) = pending.portal_owner
+        if let Some(owner) = pending.portal_owner.take()
             && activation.portal_changed(owner)
         {
             // Register with the new portal before anything else calls it, or
@@ -2088,33 +2203,45 @@ async fn run(
             proxy = None;
             next_attempt = Instant::now();
         }
-        let Ok(journal) = &mut journal else {
-            if let Err(error) = &journal {
+        if let Some(recovered) = store.reopen_if_due(Instant::now())
+            && let Ok(journal) = store.journal()
+        {
+            tracing::info!(error = %recovered, "the notification journal is available again");
+            if snapshot.diagnostic.as_ref() == Some(&recovered) {
+                snapshot.diagnostic = None;
+            }
+            restore(journal, &policy, &mut snapshot, &mut withdrawals);
+        }
+        let journal = match store.journal() {
+            Ok(journal) => journal,
+            Err(error) => {
+                let error = error.clone();
                 for (_, receipt) in pending.committed_events.drain(..) {
                     receipt.finish(Err(error.clone()));
                 }
-            }
-            // Without a journal there is no backlog to deliver, but the
-            // portal may be fine, so a test is still answered by the portal
-            // itself rather than dropped as if the broker had stopped.
-            if !pending.tests.is_empty() {
-                if proxy.is_none() {
-                    match connect(shared.clone(), application, &mut activation).await {
-                        Ok(connected) => proxy = Some(connected),
-                        Err(error) => {
-                            answer_tests(&pending.tests, &TestOutcome::Unavailable(error))
+                // Without a journal there is no backlog to deliver, but the
+                // portal may be fine, so a test is still answered by the portal
+                // itself rather than dropped as if the broker had stopped.
+                if !pending.tests.is_empty() {
+                    if proxy.is_none() {
+                        match connect(shared.clone(), application, &mut activation).await {
+                            Ok(connected) => proxy = Some(connected),
+                            Err(error) => {
+                                answer_tests(&pending.tests, &TestOutcome::Unavailable(error))
+                            }
                         }
                     }
-                }
-                if let Some(backend) = &proxy {
-                    let outcome = send_test(backend).await;
-                    if outcome != TestOutcome::Sent {
-                        proxy = None;
+                    if let Some(backend) = &proxy {
+                        let outcome = send_test(backend).await;
+                        if outcome != TestOutcome::Sent {
+                            proxy = None;
+                        }
+                        answer_tests(&pending.tests, &outcome);
                     }
-                    answer_tests(&pending.tests, &outcome);
                 }
+                deferred = pending.deferred();
+                continue;
             }
-            continue;
         };
         if let Some(current) = current_presence {
             for (client, update) in &current {
