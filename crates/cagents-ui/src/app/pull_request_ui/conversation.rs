@@ -368,8 +368,17 @@ impl State {
         self.rows().iter().any(|row| row.relation.worked_on()) || !self.worktrees().is_empty()
     }
 
+    /// A list whose transcript has not been read yet, and so names
+    /// nothing, is still being read, not empty.
     pub(crate) fn phase(&self) -> Phase {
         match (&self.list, self.lost) {
+            (Some(list), _)
+                if list.transcript == TranscriptCoverage::Pending
+                    && list.pull_requests.is_empty()
+                    && list.worktrees.is_empty() =>
+            {
+                Phase::Reading
+            }
             (Some(_), _) => Phase::Listed,
             (None, true) => Phase::Unavailable,
             (None, false) => Phase::Reading,
@@ -1247,6 +1256,42 @@ mod tests {
         // Another conversation starts reading again.
         state.retarget(Some(TerminalId::new()));
         assert_eq!(state.phase(), Phase::Reading);
+    }
+
+    #[test]
+    fn a_list_from_an_unread_transcript_is_still_reading() {
+        let conversation = TerminalId::new();
+        let mut state = State::default();
+        state.retarget(Some(conversation));
+        let pending = |revision, rows| {
+            let Watch::Listed {
+                conversation,
+                revision,
+                list,
+                first,
+            } = listed(conversation, revision, rows, revision == 1)
+            else {
+                unreachable!()
+            };
+            Watch::Listed {
+                conversation,
+                revision,
+                list: Arc::new(ConversationPullRequests {
+                    transcript: TranscriptCoverage::Pending,
+                    ..(*list).clone()
+                }),
+                first,
+            }
+        };
+        // The daemon lists a conversation before it has read its transcript:
+        // that says nothing yet, so it is not "no work".
+        state.update(pending(1, Vec::new()));
+        assert_eq!(state.phase(), Phase::Reading);
+        // What a partly read transcript named is shown while the rest is read.
+        state.update(pending(2, vec![row(4, Relation::Created)]));
+        assert_eq!(state.phase(), Phase::Listed);
+        state.update(listed(conversation, 3, Vec::new(), false));
+        assert_eq!(state.phase(), Phase::Listed, "a read transcript with no work");
     }
 
     fn worktree(path: &str, pull_request: Option<u64>) -> ConversationWorktree {
