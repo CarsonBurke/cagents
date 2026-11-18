@@ -1,10 +1,11 @@
-//! Keeping a finished exchange between frames.
+//! Keeping a transcript row between frames.
 //!
 //! iced rebuilds, diffs and lays out the whole view after every message, so a
 //! streaming answer used to pay for every exchange above it twenty times a
-//! second. A retained exchange is built once for each fingerprint of what it
-//! draws, its widgets are kept in its tree between frames, and its layout is
-//! reused while it is given the same room.
+//! second. A retained row (one prompt, step strip or message of an exchange)
+//! is built once for each fingerprint of what it draws, its widgets are kept
+//! in its tree between frames, and its layout is reused while it is given the
+//! same room.
 //!
 //! A widget inside that changes its own size asks for a new layout through the
 //! shell, which is honored here. An overlay (a tooltip) that asks for one only

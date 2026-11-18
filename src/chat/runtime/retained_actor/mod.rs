@@ -8,6 +8,8 @@ const MAX_FRAME: usize = 34 * 1024 * 1024;
 mod deadline_io;
 pub(super) mod execution_exit;
 mod final_snapshot;
+#[cfg(debug_assertions)]
+mod fixture_refusal;
 #[cfg(test)]
 pub(crate) use final_snapshot::fixture as receipt_fixture;
 pub(super) mod journal;

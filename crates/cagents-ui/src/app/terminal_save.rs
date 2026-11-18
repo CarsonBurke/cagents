@@ -236,23 +236,29 @@ impl Cagents {
         }
     }
 
-    /// Hold the exact canonical reservation until the completion request saves
-    /// it. Runtime titles, proof and resume metadata remain local meanwhile.
+    #[cfg(test)]
     pub(super) fn hold_unsaved_terminal_pane(&self, scope: &Scope, pane: &mut Pane) {
-        if self.terminal_save.entries.contains_key(&pane.id)
-            && let Some(canonical) = self
-                .workspace_model
-                .views
-                .iter()
-                .find(|view| &view.scope == scope)
-                .and_then(|view| {
-                    view.panes
-                        .iter()
-                        .find(|current| current.id == pane.id && current.pending_terminal_start)
-                })
-        {
+        if let Some(canonical) = self.unsaved_terminal_pane(scope, pane.id) {
             *pane = canonical.clone();
         }
+    }
+
+    /// The pane `card` publishes in `scope` while its start is unsaved: the
+    /// exact canonical reservation, held until the completion request saves
+    /// it. Runtime titles, proof and resume metadata remain local meanwhile.
+    pub(super) fn unsaved_terminal_pane(&self, scope: &Scope, card: CardId) -> Option<&Pane> {
+        if !self.terminal_save.entries.contains_key(&card) {
+            return None;
+        }
+        self.workspace_model
+            .views
+            .iter()
+            .find(|view| &view.scope == scope)
+            .and_then(|view| {
+                view.panes
+                    .iter()
+                    .find(|current| current.id == card && current.pending_terminal_start)
+            })
     }
 
     /// A model update can report another window's successful Retry save.
