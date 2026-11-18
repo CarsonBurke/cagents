@@ -213,6 +213,48 @@ fn a_fresh_conversation_sends_and_reopens_while_recovery_holds_retained_owners()
             session: codex.source.clone(),
         },
     );
+    // Nor is a terminal that resumes the original's provider conversation,
+    // or one the provider picks for it, under a new allocation.
+    let codex_terminal = |arguments: &[&str]| {
+        let recipe = LaunchRecipe {
+            program: root.join("bin/codex").to_str().unwrap().into(),
+            arguments: arguments
+                .iter()
+                .map(|argument| (*argument).into())
+                .collect(),
+            working_directory: root.join("project"),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        TerminalSession {
+            id: TerminalId::new(),
+            launch: recipe.clone(),
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+            resume_hint: None,
+            transcript_path: None,
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+        }
+    };
+    let held_thread = codex.launch.session_id.clone().unwrap();
+    for arguments in [
+        vec!["resume", held_thread.as_str()],
+        vec!["exec", "resume", held_thread.as_str()],
+        vec!["resume", "--last"],
+    ] {
+        refused_by_hold(
+            &host,
+            user,
+            ClientRequest::Spawn {
+                session: codex_terminal(&arguments),
+                options: TerminalSpawnOptions::default(),
+            },
+        );
+    }
     // An unstarted draft reusing the checkpointed allocation is no fresh start.
     let mut reused = claude(&root, None);
     reused.id = codex.source.id;
@@ -375,6 +417,7 @@ fn a_fresh_conversation_sends_and_reopens_while_recovery_holds_retained_owners()
         assert!(!state.terminals[&original.id].handle.is_completed());
     }
     // The retained original's explicit Close stays available.
+    let original_handle = host.lock().unwrap().terminals[&original.id].handle.clone();
     process_request(
         &host,
         user,
@@ -384,6 +427,83 @@ fn a_fresh_conversation_sends_and_reopens_while_recovery_holds_retained_owners()
         },
     )
     .unwrap();
+    // Once it has ended, the conversation started beside it does not hold
+    // the daemon open.
+    wait_for("Close did not end the retained original", || {
+        original_handle.is_completed()
+    });
+    let state = host.lock().unwrap();
+    assert!(state.chats[&reopened.id].handle.owns_work());
+    assert!(!state.recovery_owns_work());
+}
+
+/// A terminal names the conversation it opens only through its provider's
+/// own selectors, wherever they appear among its arguments.
+#[test]
+fn a_terminal_launch_names_the_conversation_its_provider_opens() {
+    const ID: &str = "019a0000-0000-7000-8000-000000000001";
+    let launch = |program: &str, arguments: &[&str]| LaunchRecipe {
+        program: program.into(),
+        arguments: arguments
+            .iter()
+            .map(|argument| (*argument).into())
+            .collect(),
+        working_directory: "/nonexistent".into(),
+        environment: Default::default(),
+        unset_environment: Default::default(),
+    };
+    let existing = |provider| Selection::Existing(provider, ID.into());
+    let session_id = format!("--session-id={ID}");
+    for (program, arguments, expected) in [
+        (
+            "/bin/sh",
+            vec!["-c", "claude --resume x"],
+            Selection::Nothing,
+        ),
+        ("/usr/bin/claude", vec![], Selection::Nothing),
+        (
+            "/usr/bin/claude",
+            vec!["--resume", ID],
+            existing(Provider::Claude),
+        ),
+        (
+            "/usr/bin/claude",
+            vec!["-r", ID],
+            existing(Provider::Claude),
+        ),
+        (
+            "/usr/bin/claude",
+            vec![session_id.as_str()],
+            Selection::New(Provider::Claude, ID.into()),
+        ),
+        ("/usr/bin/claude", vec!["--continue"], Selection::Unknown),
+        ("/usr/bin/claude", vec!["--resume"], Selection::Unknown),
+        (
+            "/usr/bin/claude",
+            vec!["--resume", "a-name"],
+            Selection::Unknown,
+        ),
+        (
+            "/usr/bin/claude",
+            vec!["--resume", ID, "--session-id", ID],
+            Selection::Unknown,
+        ),
+        ("codex", vec!["-c", "model=\"o3\""], Selection::Nothing),
+        ("codex", vec!["resume", ID], existing(Provider::Codex)),
+        (
+            "codex",
+            vec!["exec", "resume", ID],
+            existing(Provider::Codex),
+        ),
+        ("codex", vec!["resume", "--last"], Selection::Unknown),
+        ("codex", vec!["exec", "--last"], Selection::Unknown),
+    ] {
+        assert_eq!(
+            selection(&launch(program, &arguments)),
+            expected,
+            "{program} {arguments:?}"
+        );
+    }
 }
 
 /// Only an unstarted session with no terminal, retained provider or listener

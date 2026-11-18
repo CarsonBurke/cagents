@@ -2250,13 +2250,19 @@ impl HostState {
         }
     }
 
+    /// Whether an original recovery holds still runs. Work started during
+    /// the hold is independent of it and stops as on any shutdown.
     pub(super) fn recovery_owns_work(&self) -> bool {
+        let held = |id: &TerminalId| !self.recovery_independence.contains(*id);
         self.startup_recovery().is_some()
             && (self
                 .terminals
-                .values()
-                .any(|record| !record.handle.is_completed())
-                || self.chats.values().any(|record| record.handle.owns_work()))
+                .iter()
+                .any(|(id, record)| held(id) && !record.handle.is_completed())
+                || self
+                    .chats
+                    .iter()
+                    .any(|(id, record)| held(id) && record.handle.owns_work()))
     }
 
     pub(super) fn startup_blocks_shutdown(&self) -> bool {

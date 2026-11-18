@@ -104,14 +104,9 @@ fn access(request: &ClientRequest) -> Access<'_> {
         // Inspects what holds a lost helper's Close, ending only processes
         // the person chose and the daemon proves are that conversation's.
         | R::ChatLostProcesses { .. } => Access::Open,
-        // Edits of the shared model start, attach and close nothing. Replacing
-        // the source of a pane whose conversation still runs, or removing a
-        // terminal pane whose worker lives, is refused by the edit's own
-        // ownership checks; Close itself stays on its explicit requests.
-        R::ApplyWorkspaceEdit { edit } | R::EditWorkspaceModel { edit } => match edit {
-            ModelEdit::AgentsChanged => Access::Held,
-            _ => Access::Open,
-        },
+        R::ApplyWorkspaceEdit { edit } | R::EditWorkspaceModel { edit } => model_access(edit),
+        // Closing an original the reader is still attached to, as when the
+        // hold is raised while it runs, is the Close the refusal offers.
         R::ChatClose { chat_id } => Access::Close(Some(*chat_id)),
         R::CloseTerminalChecked { terminal_id, .. } => Access::Close(Some(*terminal_id)),
         R::CloseTerminalSource { session, .. } => Access::Close(Some(session.id)),
@@ -176,6 +171,34 @@ fn access(request: &ClientRequest) -> Access<'_> {
     }
 }
 
+/// Edits of the shared model start, attach and close nothing. Replacing the
+/// source of a pane whose conversation still runs, or removing a terminal pane
+/// whose worker lives, is refused by the edit's own ownership checks, and
+/// Close itself stays on its explicit requests. Deleting a channel or closing
+/// a project removes many panes at once with no such check, among them those
+/// of originals the restore never reached, which are the reader's way back to
+/// them; those wait for the hold to end.
+fn model_access(edit: &ModelEdit) -> Access<'static> {
+    match edit {
+        ModelEdit::OpenProject { .. }
+        | ModelEdit::ReopenProject { .. }
+        | ModelEdit::CreateChannel { .. }
+        | ModelEdit::ResetNavigation { .. }
+        | ModelEdit::ReorderNavigation { .. }
+        | ModelEdit::RetitleChannel { .. }
+        | ModelEdit::SuggestChannelTitle { .. }
+        | ModelEdit::SeedView { .. }
+        | ModelEdit::ChangeView { .. }
+        | ModelEdit::SuggestConversationTitle { .. }
+        | ModelEdit::RetiredChannelWorkChanged
+        // Only a channel whose view holds no pane.
+        | ModelEdit::RetireEmptyChannel { .. } => Access::Open,
+        ModelEdit::CloseProject { .. }
+        | ModelEdit::DeleteChannel { .. }
+        | ModelEdit::AgentsChanged => Access::Held,
+    }
+}
+
 /// Reads, and the caller's own mailbox, are open. Anything that prompts,
 /// controls or closes an agent can reach a retained conversation.
 fn agent_access(operation: &AgentOperation) -> Access<'static> {
@@ -228,8 +251,10 @@ fn automation_access(request: &crate::automations::Request) -> Access<'static> {
     }
 }
 
-/// A new conversation reads accounts, skills and files. Changing an account
-/// home or removing a worktree can pull them from under an original.
+/// A new conversation reads accounts, skills and files, and may need its
+/// account signed in again first; a login refreshes credentials an original
+/// keeps using. Replacing or removing an account home, or removing a worktree,
+/// can pull them from under an original.
 fn device_access(operation: &DeviceOperation) -> Access<'static> {
     use DeviceOperation as O;
     match operation {
@@ -297,13 +322,22 @@ pub(super) fn admit(host: &SharedHost, request: &ClientRequest) -> Result<(), Pr
             source,
             replacement,
         } => {
-            let admitted = state.recovery_independence.contains(source)
-                && replacement.terminal.is_none()
-                && !held_by_recovery(&state, replacement.id);
-            if admitted {
-                state.recovery_independence.insert(replacement.id);
+            if !state.recovery_independence.contains(source)
+                || replacement.terminal.is_some()
+                || replacement.owned_codex_listener.is_some()
+            {
+                false
+            } else {
+                drop(guard);
+                let owned = super::chat::has_native_owner(replacement)?;
+                guard = host.lock().unwrap_or_else(|p| p.into_inner());
+                state = &mut guard;
+                let admitted = !owned && !held_by_recovery(&state, replacement.id);
+                if admitted {
+                    state.recovery_independence.insert(replacement.id);
+                }
+                admitted
             }
-            admitted
         }
         Access::StartChat(session) => {
             drop(guard);
@@ -323,7 +357,9 @@ pub(super) fn admit(host: &SharedHost, request: &ClientRequest) -> Result<(), Pr
             let fresh = fresh_terminal(session)?;
             guard = host.lock().unwrap_or_else(|p| p.into_inner());
             state = &mut guard;
-            let admitted = fresh && !held_by_recovery(&state, session.id);
+            let admitted = fresh
+                && !held_by_recovery(&state, session.id)
+                && independent_selection(state, &session.launch);
             if admitted {
                 state.recovery_independence.insert(session.id);
             }
@@ -388,9 +424,37 @@ fn checkpoint_names(checkpoint: &crate::upgrade::handoff::Checkpoint, id: Termin
 }
 
 /// Provider conversations recovery holds: those its checkpoint names and
-/// those of conversations this daemon hosts that it did not start during the
-/// hold. A resume of one would be a second writer for an original.
+/// those of conversations and terminals this daemon hosts that it did not
+/// start during the hold. A resume of one would be a second writer for an
+/// original.
 fn conversation_held_by_recovery(state: &HostState, provider: Provider, id: &str) -> bool {
+    let runs = |session: &TerminalSession| {
+        named_by(&session.launch, provider, id)
+            || session
+                .resume_hint
+                .as_deref()
+                .and_then(crate::model::agent_recovery::recipe_from_hint)
+                .is_some_and(|recipe| named_by(&recipe, provider, id))
+    };
+    if state.terminals.iter().any(|(terminal, record)| {
+        !state.recovery_independence.contains(*terminal) && runs(&record.session)
+    }) || state
+        .retained_startup_checkpoint()
+        .is_some_and(|checkpoint| {
+            let lineage = |source, previous: &'_ Vec<TerminalSession>| {
+                std::iter::once(source).chain(previous).any(runs)
+            };
+            checkpoint.terminals.iter().any(|terminal| {
+                lineage(&terminal.source, &terminal.previous_sources)
+                    || named_by(&terminal.recipe, provider, id)
+            }) || checkpoint
+                .carried
+                .iter()
+                .any(|terminal| lineage(&terminal.source, &terminal.previous_sources))
+        })
+    {
+        return true;
+    }
     let named = |session: &Session, launch: &crate::chat::Launch| {
         session.launch.provider == provider
             && (launch.session_id.as_deref() == Some(id)
@@ -441,12 +505,14 @@ fn fresh_chat(host: &SharedHost, session: &Session) -> Result<bool, ProtocolErro
     Ok(!super::chat::has_native_owner(session)?)
 }
 
-/// A terminal start is independent of recovery when it relaunches nothing and
-/// no authenticated holder owns its allocation.
+/// A terminal start is independent of recovery when it relaunches nothing, no
+/// authenticated holder owns its allocation, and the conversation its provider
+/// opens is one [`independent_selection`] admits.
 fn fresh_terminal(session: &TerminalSession) -> Result<bool, ProtocolError> {
     if session.predecessor.is_some()
         || session.recovery_origin.is_some()
         || session.owned_codex_listener.is_some()
+        || session.resume_hint.is_some()
     {
         return Ok(false);
     }
@@ -464,6 +530,89 @@ fn fresh_terminal(session: &TerminalSession) -> Result<bool, ProtocolError> {
             .map_err(unavailable)?
             .is_some();
     Ok(!owned)
+}
+
+/// Which of its provider's conversations a launch opens.
+#[derive(Debug, PartialEq, Eq)]
+enum Selection {
+    /// Not a provider, or a new conversation the provider names itself.
+    Nothing,
+    /// A new conversation under an ID the launch chose.
+    New(Provider, String),
+    /// The saved conversation with this ID.
+    Existing(Provider, String),
+    /// One the provider picks or the launch names inexactly, such as the
+    /// latest one, which could be an original's.
+    Unknown,
+}
+
+/// Reads every argument, not only an interactive launch's: a provider's
+/// subcommands, such as `codex exec resume`, resume conversations too.
+fn selection(launch: &crate::model::LaunchRecipe) -> Selection {
+    let Some((provider, arguments)) = Provider::launched(launch) else {
+        return Selection::Nothing;
+    };
+    let mut selected = Selection::Nothing;
+    let mut arguments = arguments.iter();
+    while let Some(argument) = arguments.next() {
+        let (flag, inline) = argument
+            .split_once('=')
+            .map_or((argument.as_str(), None), |(flag, value)| {
+                (flag, Some(value))
+            });
+        let latest = match provider {
+            Provider::Codex => flag == "--last",
+            _ => matches!(flag, "--continue" | "-c"),
+        };
+        if latest {
+            return Selection::Unknown;
+        }
+        if provider.is_identity_option(flag) {
+            let value = inline.or_else(|| arguments.next().map(String::as_str));
+            let Some(id) = value.filter(|id| id.len() == 36 && uuid::Uuid::parse_str(id).is_ok())
+            else {
+                return Selection::Unknown;
+            };
+            if selected != Selection::Nothing {
+                return Selection::Unknown;
+            }
+            selected = if provider == Provider::Claude && flag == "--session-id" {
+                Selection::New(provider, id.to_owned())
+            } else {
+                Selection::Existing(provider, id.to_owned())
+            };
+        } else if inline.is_none()
+            && (provider.is_value_option(flag) || provider.is_cwd_option(flag))
+        {
+            arguments.next();
+        }
+    }
+    selected
+}
+
+/// Whether `launch` opens the provider conversation `id`, new or saved.
+fn named_by(launch: &crate::model::LaunchRecipe, provider: Provider, id: &str) -> bool {
+    matches!(selection(launch),
+        Selection::New(selected, ref conversation) | Selection::Existing(selected, ref conversation)
+            if selected == provider && conversation == id)
+}
+
+/// Whether the conversation a launch opens is independent of recovery: a new
+/// one under an ID nothing recovery holds uses, or one started during the
+/// hold, as [`fresh_chat`] admits for conversations.
+fn independent_selection(state: &mut HostState, launch: &crate::model::LaunchRecipe) -> bool {
+    match selection(launch) {
+        Selection::Nothing => true,
+        Selection::New(provider, id) => !conversation_held_by_recovery(state, provider, &id),
+        Selection::Existing(provider, id) => {
+            state.recovery_independence.note_live(&state.chats);
+            state
+                .recovery_independence
+                .contains_conversation(provider, &id)
+                && !conversation_held_by_recovery(state, provider, &id)
+        }
+        Selection::Unknown => false,
+    }
 }
 
 /// What this daemon started while startup recovery held original ownership.
