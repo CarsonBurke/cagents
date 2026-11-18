@@ -240,6 +240,36 @@ enum Placement<'a> {
     Unplaced(&'a chat::Item),
 }
 
+/// The bubble a user's message is drawn in: the accent wash, or an outline
+/// for an attachment, held to [`PROMPT_MEASURE`].
+///
+/// A message long enough to fold takes the whole measure, so showing more or
+/// less of it changes only its height; any other sizes to what it holds.
+/// Either way the bubble's width is never fluid. A fluid child, such as the
+/// fold's full-width disclosure row, would otherwise make the bubble, and the
+/// row it sits in, fill the transcript, and the bubble would lose its anchor
+/// on the right.
+fn user_bubble<'a>(
+    body: Element<'a, Message>,
+    attachment: bool,
+    folds: bool,
+) -> Element<'a, Message> {
+    widget::container(body)
+        .class(design::surface(
+            (!attachment).then_some(design::accent_wash),
+            [design::RADIUS_M; 4],
+            attachment,
+        ))
+        .padding([step::GAP_S as u16, step::GAP_M as u16])
+        .width(if folds {
+            Length::Fixed(PROMPT_MEASURE)
+        } else {
+            Length::Shrink
+        })
+        .max_width(PROMPT_MEASURE)
+        .into()
+}
+
 /// Reserve an external action row so hovering never shifts the transcript.
 /// The hover also keeps its controls visible while they are keyboard-focused.
 pub(super) fn message_actions<'a>(
@@ -5721,17 +5751,7 @@ impl Runtime {
                 .size(design::TEXT_PROSE)
                 .into()
         };
-        let mut rows: Vec<Element<'a, Message>> = vec![
-            widget::container(body)
-                .class(design::surface(
-                    Some(design::accent_wash),
-                    [design::RADIUS_M; 4],
-                    false,
-                ))
-                .padding([step::GAP_S as u16, step::GAP_M as u16])
-                .max_width(PROMPT_MEASURE)
-                .into(),
-        ];
+        let mut rows: Vec<Element<'a, Message>> = vec![user_bubble(body, false, false)];
         for attachment in &queued.attachments {
             rows.push(
                 design::caption(
@@ -5919,15 +5939,7 @@ impl Runtime {
                 text
             }
         };
-        let message = widget::container(body)
-            .class(design::surface(
-                (!attachment).then_some(design::accent_wash),
-                [design::RADIUS_M; 4],
-                attachment,
-            ))
-            .padding([step::GAP_S as u16, step::GAP_M as u16])
-            .max_width(PROMPT_MEASURE)
-            .into();
+        let message = user_bubble(body, attachment, long);
         widget::container(message_actions(
             message,
             self.message_copy(item),
@@ -7096,6 +7108,9 @@ mod user_image_preview_tests;
 
 #[cfg(test)]
 mod figure_tests;
+
+#[cfg(test)]
+mod user_bubble_tests;
 
 #[cfg(test)]
 mod provider_context_tests;
