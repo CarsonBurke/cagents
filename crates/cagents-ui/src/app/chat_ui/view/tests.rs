@@ -1395,6 +1395,106 @@ fn long_activity_remains_one_line_in_a_narrow_pane() {
 }
 
 #[test]
+fn contentless_thinking_draws_no_row_and_leaves_the_working_indicator_in_place() {
+    let item = |id: &str, role, content| chat::Item {
+        id: id.into(),
+        role,
+        content,
+        started_at: Some(1_000),
+        at: Some(2_000),
+    };
+    let command = |id: &str, status| {
+        item(
+            id,
+            chat::Role::Assistant,
+            ItemContent::Command {
+                label: String::new(),
+                command: "cargo test".into(),
+                working_directory: "/project".into(),
+                action: chat::CommandAction::Run,
+                status,
+                exit_code: None,
+                duration_ms: None,
+                output: String::new(),
+            },
+        )
+    };
+    // What Claude sends for most thinking: a signature and no text.
+    let thought = item(
+        "thought",
+        chat::Role::Assistant,
+        ItemContent::Text {
+            text: String::new(),
+            thinking: true,
+            phase: chat::Phase::Commentary,
+        },
+    );
+    let prompt = item(
+        "prompt",
+        chat::Role::User,
+        ItemContent::Text {
+            text: "Run the tests".into(),
+            thinking: false,
+            phase: chat::Phase::Final,
+        },
+    );
+    let regroup = |runtime: &mut Runtime| {
+        runtime.turns = turn::group(
+            &runtime.snapshot.items,
+            &runtime.asked_after,
+            crate::app::chat_ui::Presentations(&runtime.cache),
+        );
+    };
+    let (mut runtime, _handle) = frame_cost::live_runtime(&[
+        prompt,
+        command("c1", chat::ToolStatus::Succeeded),
+        thought,
+    ]);
+    Arc::make_mut(&mut runtime.snapshot).busy = true;
+    regroup(&mut runtime);
+    let placed = |runtime: &Runtime| {
+        runtime
+            .turns
+            .iter()
+            .flat_map(|turn| turn.steps.iter().chain(&turn.prose))
+            .map(|placed| placed.index)
+            .collect::<Vec<_>>()
+    };
+    // While the agent thinks with nothing to show, the thought draws no row
+    // and nothing in the transcript claims the work, so the closing line
+    // keeps its glyph and says the agent is thinking.
+    assert_eq!(placed(&runtime), [1], "the thought has no row");
+    assert!(!runtime.work_shown(None));
+    let (glyph, label) = runtime
+        .timeline_activity(false, None)
+        .expect("the lead is working");
+    assert_eq!(
+        runtime.closing_line(glyph, label, false, None),
+        (Some(Icon::AgentWorking), "Thinking".to_owned())
+    );
+
+    // The next command joins the one before the thought: one group.
+    Arc::make_mut(&mut runtime.snapshot)
+        .items
+        .push(Arc::new(command("c2", chat::ToolStatus::Running)));
+    regroup(&mut runtime);
+    assert_eq!(runtime.turns.len(), 1);
+    assert_eq!(
+        runtime.turns[0]
+            .steps
+            .iter()
+            .map(|step| step.index)
+            .collect::<Vec<_>>(),
+        [1, 3]
+    );
+    assert_eq!(placed(&runtime), [1, 3]);
+    assert_eq!(
+        runtime.strip_status(&runtime.turns[0]),
+        Some(chat::ToolStatus::Running)
+    );
+}
+
+#[test]
 fn a_working_turn_shows_one_activity_indicator_on_its_newest_live_row() {
     use iced::advanced::{layout, widget::Tree};
     let item = |id: &str, role, content| chat::Item {
@@ -1420,11 +1520,13 @@ fn a_working_turn_shows_one_activity_indicator_on_its_newest_live_row() {
             },
         )
     };
+    // A thought with words to show is a row of its own; one with nothing to
+    // read is not (see the test below).
     let thought = item(
         "thought",
         chat::Role::Assistant,
         ItemContent::Text {
-            text: String::new(),
+            text: "**Checking the results**".into(),
             thinking: true,
             phase: chat::Phase::Commentary,
         },
