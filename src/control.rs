@@ -663,8 +663,8 @@ pub enum ChannelCommand {
     },
     /// List shared channels, newest first.
     List {
-        /// Only list channels in this repository, or in the project a key
-        /// `project list` prints names.
+        /// Only list channels in this repository, or in the project named by
+        /// a key `project list` prints.
         #[arg(long)]
         repository: Option<PathBuf>,
     },
@@ -5599,7 +5599,20 @@ fn resolve_registered_repository(
     path: Option<PathBuf>,
     model: Option<&WorkspaceModel>,
 ) -> Result<PathBuf, AppError> {
-    let named = registered_project_path(path.clone())?;
+    // Lexically, since a removed checkout has nothing left to resolve: a
+    // `..` in `cagents project close ../old` would otherwise match no key.
+    let named = registered_project_path(path.clone())?.components().fold(
+        PathBuf::new(),
+        |mut named, component| {
+            match component {
+                std::path::Component::ParentDir => {
+                    named.pop();
+                }
+                component => named.push(component),
+            }
+            named
+        },
+    );
     let registered = model.and_then(|model| {
         model.project(&named).or_else(|| {
             // Locally only: a remote device's paths cannot be checked here,
@@ -8005,6 +8018,72 @@ mod tests {
         }
     }
 
+    /// A project whose channels keep changing is not chased forever: after the
+    /// third refused close the command fails, having closed nothing.
+    #[test]
+    fn a_project_close_gives_up_while_its_channels_keep_changing() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let peer_proof = proof("session", "boot", "incarnation");
+        let repository = PathBuf::from("/repo/.git");
+        let empty = model_with_channels(&repository, &[]);
+        let server = thread::spawn(move || {
+            let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            write_frame(
+                &mut server_stream,
+                &connected_envelope(1, peer_proof.clone(), peer_proof.clone()),
+            )
+            .unwrap();
+            for _ in 0..3 {
+                let read: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                assert_eq!(read.request, ClientRequest::ReadWorkspaceModel);
+                write_frame(
+                    &mut server_stream,
+                    &model_envelope(read.request_id, peer_proof.clone(), empty.clone()),
+                )
+                .unwrap();
+                let edit: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                assert!(matches!(
+                    edit.request,
+                    ClientRequest::EditWorkspaceModel {
+                        edit: ModelEdit::CloseConfirmedProject { .. }
+                    }
+                ));
+                write_frame(
+                    &mut server_stream,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(edit.request_id),
+                        proof: peer_proof.clone(),
+                        message: ServerMessage::Error(crate::terminal_ipc::ProtocolError::new(
+                            ProtocolErrorCode::ViewConflict,
+                            "The project's channels changed since they were confirmed",
+                            true,
+                        )),
+                    },
+                )
+                .unwrap();
+            }
+            read_frame::<ClientEnvelope>(&mut server_stream).unwrap()
+        });
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        let result = project_output(
+            &mut client,
+            ResolvedProject::Close {
+                repository,
+                confirmed: true,
+            },
+        );
+        drop(client);
+        assert_eq!(server.join().unwrap(), None, "three attempts, then none");
+        let Err(error) = result else {
+            panic!("a close that never held is not reported as done");
+        };
+        assert_eq!(
+            error.details.unwrap(),
+            json!({"code": ProtocolErrorCode::ViewConflict, "retryable": true})
+        );
+    }
+
     /// A project whose checkout was removed is still closed, and its channels
     /// still listed, by the key `project list` printed for it, or by the
     /// checkout directory that held its `.git`. Nothing on disk is consulted,
@@ -8035,6 +8114,7 @@ mod tests {
                 &repository,
             ),
             (checkout.clone(), &repository),
+            (checkout.join("../removed"), &repository),
             (folder.clone(), &folder),
         ] {
             let ResolvedProject::Close { repository, .. } = (ProjectCommand::Close {

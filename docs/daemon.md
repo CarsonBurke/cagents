@@ -153,8 +153,8 @@ cagents daemon stop --confirm
   closed without `--yes`, and the refusal names the new channel. With `--yes`,
   the output lists every channel that was deleted.
 - `project close` and `channel list --repository` accept the key `project
-  list` prints, or the removed checkout's directory, after the checkout was
-  deleted from disk.
+  list` prints after the project's checkout was deleted from disk. On this
+  computer, the deleted checkout's directory works too.
 
 ## Compatible upgrades
 

@@ -266,6 +266,8 @@ fn apply_delta_guarded<G>(
         if error == Registry::VIEW_REMOVAL_CONFLICT {
             return ProtocolError::new(ProtocolErrorCode::InvalidRequest, error, false);
         }
+        // Stale-precondition refusals the client resolves by reading again,
+        // the confirmed project close's channel set among them.
         if error == Registry::VIEW_SOURCE_CONFLICT
             || error == Registry::VIEW_REVISION_CONFLICT
             || error == Registry::PROJECT_CHANNELS_CONFLICT
