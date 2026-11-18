@@ -5,17 +5,23 @@ use crate::model::TerminalId;
 use crate::terminal_ipc::{ShutdownCapability, ShutdownOutcome, TerminalDescriptor};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub(super) fn terminal_confirmation(state: &Path, job: &UpdateJob) -> Result<String, UpdateError> {
+/// The command that runs this job's update from a terminal, where stopping
+/// live work can be confirmed.
+pub(super) fn terminal_command(state: &Path, job: &UpdateJob) -> Result<String, UpdateError> {
     let request: UpdateRequest = serde_json::from_slice(&read_private(
         &state.join(format!("{}.request", job.id)),
         SMALL_ASSET_LIMIT,
     )?)?;
-    let command = match request {
+    Ok(match request {
         UpdateRequest::Release(release) | UpdateRequest::ReleaseFromTerminal(release) => {
             format!("cagents daemon upgrade --version {}", release.version)
         }
         _ => "cagents daemon upgrade".to_owned(),
-    };
+    })
+}
+
+pub(super) fn terminal_confirmation(state: &Path, job: &UpdateJob) -> Result<String, UpdateError> {
+    let command = terminal_command(state, job)?;
     Ok(format!(
         "Stopping live work needs confirmation in a terminal. Run `{command}` from a system terminal outside cagents."
     ))

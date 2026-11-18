@@ -5641,6 +5641,7 @@ sys.stdin.buffer.read(1)
                 expires_at_unix_ms: u64::MAX,
                 preview,
                 stop: None,
+                terminal_command: None,
             }),
             refusal: None,
         };
