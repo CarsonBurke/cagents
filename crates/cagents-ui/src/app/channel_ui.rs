@@ -2577,8 +2577,15 @@ impl Cagents {
     /// the pane rows they give. Every projection goes through here, so
     /// no caller can leave the pane rows behind the counts.
     pub(super) fn refresh_attention_projection(&mut self) {
-        self.sidebar_state
+        let folded = self
+            .sidebar_state
             .refresh_attention_projection(&self.durable, &self.sidebar_model.projects);
+        #[cfg(any(test, feature = "development"))]
+        if !folded {
+            super::projection_oracle::check_attention_fold(self);
+        }
+        #[cfg(not(any(test, feature = "development")))]
+        let _ = folded;
         self.refresh_attention_card_rows();
     }
 

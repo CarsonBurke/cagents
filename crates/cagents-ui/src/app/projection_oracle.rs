@@ -151,6 +151,24 @@ pub(super) fn assert_projected(app: &mut Cagents) {
     );
 }
 
+/// The sidebar's attention fold is kept while nothing it reads changes,
+/// which the full projection relies on like any narrower one: it reuses
+/// the fold rather than folding again. Checks that a fresh fold agrees with
+/// the one kept.
+pub(super) fn check_attention_fold(app: &Cagents) {
+    if !enabled() {
+        return;
+    }
+    if let Some(difference) = app
+        .sidebar_state
+        .stale_attention_fold(&app.durable, &app.sidebar_model.projects)
+    {
+        report(&format!(
+            "the sidebar's attention fold was kept, but a fresh one differs:\n{difference}"
+        ));
+    }
+}
+
 /// Fails the test, or logs the report in a development build.
 fn report(report: &str) {
     #[cfg(test)]

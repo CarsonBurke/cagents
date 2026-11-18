@@ -3132,6 +3132,99 @@ struct ProjectedCard {
     summary: AttentionSummary,
 }
 
+/// How the attention fold tells an open card's conversation apart: a chat
+/// or terminal by its session, which aliases of one conversation share, and
+/// any other card by itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FoldedCard {
+    Chat(uuid::Uuid),
+    Terminal(uuid::Uuid),
+    Other,
+}
+
+impl FoldedCard {
+    fn of(card: &crate::model::CardState) -> Self {
+        match &card.kind {
+            crate::model::CardKind::Chat(session) => Self::Chat(session.id.as_uuid()),
+            crate::model::CardKind::Terminal(session) => Self::Terminal(session.id.as_uuid()),
+            _ => Self::Other,
+        }
+    }
+}
+
+/// What the attention fold reads from the workspace, and nothing else it
+/// holds: an edit to the rest, such as a title, a draft or focus, gives the
+/// workspace a new address but leaves the fold current.
+#[derive(Debug, Clone, Default)]
+struct AttentionInputs {
+    /// The workspace these were read from, or last found to hold them. Held
+    /// weakly, which keeps its allocation, so its address names no other
+    /// workspace while this lives, and an update that edited nothing is
+    /// recognized without comparing.
+    source: std::sync::Weak<crate::model::WorkspaceState>,
+    /// The open cards in workspace order, each with its recorded scope.
+    cards: Vec<(CardId, FoldedCard, Option<PathBuf>)>,
+    /// Each channel's project and cards, open or not, in workspace order.
+    channels: Vec<(ProjectId, ChannelId, Vec<CardId>)>,
+}
+
+impl AttentionInputs {
+    fn read(durable: &Arc<crate::model::WorkspaceState>) -> Self {
+        Self {
+            source: Arc::downgrade(durable),
+            cards: Self::open_cards(durable)
+                .map(|(card, folded, scope)| (card, folded, scope.map(Path::to_path_buf)))
+                .collect(),
+            channels: durable
+                .channels
+                .iter()
+                .map(|channel| (channel.project_id, channel.id, channel.cards.clone()))
+                .collect(),
+        }
+    }
+
+    fn open_cards(
+        durable: &crate::model::WorkspaceState,
+    ) -> impl Iterator<Item = (CardId, FoldedCard, Option<&Path>)> {
+        durable
+            .cards
+            .iter()
+            .filter(|card| card.existence.is_open())
+            .map(|card| {
+                (
+                    card.id,
+                    FoldedCard::of(card),
+                    durable.card_scopes.get(&card.id).map(PathBuf::as_path),
+                )
+            })
+    }
+
+    /// Whether `durable` holds what these were read from. One that does
+    /// becomes their source, so the next projection of it compares nothing.
+    fn still_hold(&mut self, durable: &Arc<crate::model::WorkspaceState>) -> bool {
+        if std::ptr::eq(self.source.as_ptr(), Arc::as_ptr(durable)) {
+            return true;
+        }
+        let held = self.channels.len() == durable.channels.len()
+            && self
+                .channels
+                .iter()
+                .zip(&durable.channels)
+                .all(|((project, id, cards), channel)| {
+                    *project == channel.project_id && *id == channel.id && *cards == channel.cards
+                })
+            && self
+                .cards
+                .iter()
+                .map(|(card, folded, scope)| (*card, *folded, scope.as_deref()))
+                .eq(Self::open_cards(durable));
+        if held {
+            self.source = Arc::downgrade(durable);
+        }
+        held
+    }
+}
+
 #[derive(Debug, Clone)]
 struct AttentionProjection {
     dirty: bool,
@@ -3142,22 +3235,29 @@ struct AttentionProjection {
     /// conversation in [`Self::cards`]: aliases of one conversation share
     /// their first card's row.
     card_rows: BTreeMap<CardId, CardId>,
-    source: std::sync::Weak<crate::model::WorkspaceState>,
+    inputs: AttentionInputs,
     inventory: Vec<(ProjectId, Vec<(WorktreeId, PathBuf)>)>,
     folders: BTreeSet<ProjectId>,
     projects: BTreeMap<ProjectId, AttentionSummary>,
     worktrees: BTreeMap<(ProjectId, WorktreeId), AttentionSummary>,
 }
+impl AttentionProjection {
+    /// Whether the two give the same rows and counts, however each was
+    /// read.
+    fn folds_alike(&self, other: &Self) -> bool {
+        self.owners == other.owners
+            && self.cards == other.cards
+            && self.card_rows == other.card_rows
+            && self.projects == other.projects
+            && self.worktrees == other.worktrees
+    }
+}
 impl PartialEq for AttentionProjection {
     fn eq(&self, other: &Self) -> bool {
         self.dirty == other.dirty
-            && self.owners == other.owners
-            && self.cards == other.cards
-            && self.card_rows == other.card_rows
+            && self.folds_alike(other)
             && self.inventory == other.inventory
             && self.folders == other.folders
-            && self.projects == other.projects
-            && self.worktrees == other.worktrees
     }
 }
 impl Eq for AttentionProjection {}
@@ -3440,8 +3540,30 @@ impl SidebarState {
     /// Choosing a filter starts a fresh list, so rows kept only because they
     /// were dealt with under Attention go.
     fn set_filter(&mut self, filter: SidebarFilter) {
-        self.retained_attention.clear();
+        self.forget_kept_rows(|_| false);
         self.filter = filter;
+    }
+
+    /// Forgets the kept rows `keep` refuses. The attention fold reads the
+    /// kept pane rows, so forgetting one folds again.
+    fn forget_kept_rows(&mut self, mut keep: impl FnMut(&SelectionRow) -> bool) {
+        let mut forgot_pane = false;
+        self.retained_attention.retain(|row, _| {
+            let kept = keep(row);
+            forgot_pane |= !kept && matches!(row, SelectionRow::Card(_));
+            kept
+        });
+        if forgot_pane {
+            self.mark_attention_dirty();
+        }
+    }
+
+    /// Has the next projection fold attention again, rather than keep the
+    /// last fold, after a change to what it reads in this state.
+    fn mark_attention_dirty(&mut self) {
+        if let Some(projection) = &mut self.attention_projection {
+            projection.dirty = true;
+        }
     }
 
     pub fn saved_view(&self) -> SidebarView {
@@ -3611,15 +3733,23 @@ impl SidebarState {
                     .map(SelectionRow::Channel),
             )
             .filter(|row| placement.listed.contains(row));
+        let mut kept_pane = false;
         for row in rows {
-            self.retained_attention
-                .entry(row)
-                .and_modify(|kept| {
+            match self.retained_attention.entry(row) {
+                std::collections::btree_map::Entry::Occupied(mut kept) => {
                     if listing == Listing::Read {
-                        *kept = listing;
+                        kept.insert(listing);
                     }
-                })
-                .or_insert(listing);
+                }
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    kept_pane |= matches!(row, SelectionRow::Card(_));
+                    entry.insert(listing);
+                }
+            }
+        }
+        // The attention fold reads the kept pane rows.
+        if kept_pane {
+            self.mark_attention_dirty();
         }
     }
 
@@ -3643,7 +3773,7 @@ impl SidebarState {
                     .chain(project.panes.iter().map(|card| SelectionRow::Card(card.id)))
             })
             .collect();
-        self.retained_attention.retain(|row, _| live.contains(row));
+        self.forget_kept_rows(|row| live.contains(row));
     }
 
     /// How the Attention filter keeps `row` listed because it was dealt with
@@ -3795,9 +3925,7 @@ impl SidebarState {
             return;
         }
         self.pane_checkouts = checkouts;
-        if let Some(projection) = &mut self.attention_projection {
-            projection.dirty = true;
-        }
+        self.mark_attention_dirty();
     }
 
     pub fn worktree_has_panes(&self, project: ProjectId, worktree: WorktreeId) -> bool {
@@ -4057,9 +4185,7 @@ impl SidebarState {
                 .or_default()
                 .add(after.1);
         }
-        if let Some(projection) = &mut self.attention_projection {
-            projection.dirty = true;
-        }
+        self.mark_attention_dirty();
     }
 
     /// Whether an attention change since the last projection moved a count
@@ -4102,17 +4228,15 @@ impl SidebarState {
 
     /// Fold open conversation metadata when attention or filing changes.
     /// Drawing reads counters; it never scans transcripts or saved history.
+    /// Returns whether it folded again: the last fold stays while nothing it
+    /// read has changed.
     pub fn refresh_attention_projection(
         &mut self,
         durable: &Arc<crate::model::WorkspaceState>,
         projects: &[SidebarProject],
-    ) {
-        if self.attention_projection.as_ref().is_some_and(|cache| {
+    ) -> bool {
+        if self.attention_projection.as_mut().is_some_and(|cache| {
             !cache.dirty
-                && cache
-                    .source
-                    .upgrade()
-                    .is_some_and(|old| Arc::ptr_eq(&old, durable))
                 && cache.inventory.len() == projects.len()
                 && cache
                     .inventory
@@ -4126,9 +4250,61 @@ impl SidebarState {
                                 .map(|(id, path)| (*id, path.as_path()))
                                 .eq(attention_roots(project))
                     })
+                && cache.inputs.still_hold(durable)
         }) {
-            return;
+            return false;
         }
+        #[cfg(test)]
+        {
+            self.attention_projection_rebuilds += 1;
+        }
+        self.attention_projection =
+            Some(self.fold_attention(AttentionInputs::read(durable), projects));
+        self.follow_projected_card();
+        true
+    }
+
+    /// When the last attention fold is still in use, how a fresh fold of
+    /// the same state differs from it: what reusing it left stale.
+    #[cfg(any(test, feature = "development"))]
+    pub(crate) fn stale_attention_fold(
+        &self,
+        durable: &Arc<crate::model::WorkspaceState>,
+        projects: &[SidebarProject],
+    ) -> Option<String> {
+        let cached = self
+            .attention_projection
+            .as_ref()
+            .filter(|cache| !cache.dirty)?;
+        let fresh = self.fold_attention(AttentionInputs::read(durable), projects);
+        (!cached.folds_alike(&fresh)).then(|| {
+            format!(
+                "reused: {:#?}\nfresh: {:#?}",
+                (
+                    &cached.cards,
+                    &cached.card_rows,
+                    &cached.owners,
+                    &cached.projects,
+                    &cached.worktrees
+                ),
+                (
+                    &fresh.cards,
+                    &fresh.card_rows,
+                    &fresh.owners,
+                    &fresh.projects,
+                    &fresh.worktrees
+                ),
+            )
+        })
+    }
+
+    /// Folds attention over `inputs` alone, so that [`AttentionInputs`]
+    /// holds everything a fold reads from the workspace.
+    fn fold_attention(
+        &self,
+        inputs: AttentionInputs,
+        projects: &[SidebarProject],
+    ) -> AttentionProjection {
         let inventory: Vec<_> = projects
             .iter()
             .map(|project| {
@@ -4140,10 +4316,6 @@ impl SidebarState {
                 )
             })
             .collect();
-        #[cfg(test)]
-        {
-            self.attention_projection_rebuilds += 1;
-        }
         let loaded: BTreeSet<_> = projects.iter().map(|project| project.id).collect();
         let loaded_worktrees: BTreeSet<_> = inventory
             .iter()
@@ -4176,9 +4348,9 @@ impl SidebarState {
             .map(|card| (card.card, (card.project, card.worktree)))
             .collect();
         let mut channels = BTreeMap::new();
-        for channel in &durable.channels {
-            for card in &channel.cards {
-                let owner = (channel.project_id, channel.id);
+        for (project, channel, cards) in &inputs.channels {
+            for card in cards {
+                let owner = (*project, *channel);
                 channels
                     .entry(*card)
                     .and_modify(|old| {
@@ -4209,41 +4381,36 @@ impl SidebarState {
         // Conversations with news that no loaded project could own. A quiet
         // card of one must not give it a row the news could not.
         let mut unowned = BTreeSet::new();
-        for (position, card) in durable
-            .cards
-            .iter()
-            .filter(|card| card.existence.is_open())
-            .enumerate()
-        {
-            let resource = match &card.kind {
-                crate::model::CardKind::Chat(session) => (0, session.id.as_uuid()),
-                crate::model::CardKind::Terminal(session) => (0, session.id.as_uuid()),
-                _ => (1, card.id.as_uuid()),
+        for (position, (card, folded, scope)) in inputs.cards.iter().enumerate() {
+            let card = *card;
+            let resource = match folded {
+                FoldedCard::Chat(session) | FoldedCard::Terminal(session) => (0, *session),
+                FoldedCard::Other => (1, card.as_uuid()),
             };
-            let summary = self.card_attention(card.id);
+            let summary = self.card_attention(card);
             // Inventory-only draft aliases carry no attention evidence. They
             // cannot veto the canonical card selected by journal attribution.
             // A pane row kept after its read has none either, and stays.
             if summary == AttentionSummary::default()
                 && !self
                     .retained_attention
-                    .contains_key(&SelectionRow::Card(card.id))
+                    .contains_key(&SelectionRow::Card(card))
             {
-                quiet.push((position, card, resource));
+                quiet.push((position, card, *folded, scope.as_deref(), resource));
                 continue;
             }
-            let owner = if let Some(channel) = channels.get(&card.id) {
+            let owner = if let Some(channel) = channels.get(&card) {
                 channel.map(|owner| owner.0)
-            } else if let Some(scope) = durable.card_scopes.get(&card.id) {
+            } else if let Some(scope) = scope {
                 roots
                     .get(scope.as_path())
                     .copied()
                     .flatten()
                     .map(|owner| owner.0)
             } else {
-                self.attention_owner(card.id)
+                self.attention_owner(card)
                     .map(|owner| owner.0)
-                    .or_else(|| kept.get(&card.id).map(|(project, _)| *project))
+                    .or_else(|| kept.get(&card).map(|(project, _)| *project))
             };
             let Some(owner) = owner.filter(|owner| loaded.contains(owner)) else {
                 unowned.insert(resource);
@@ -4253,31 +4420,28 @@ impl SidebarState {
             // row; no worktree row shows it, even though it keeps the scope of
             // the checkout its agent runs in. Counting it on that worktree
             // left a bell there that nothing under it could clear.
-            let worktree = if channels.contains_key(&card.id) {
+            let worktree = if channels.contains_key(&card) {
                 None
-            } else if let Some(scope) = durable.card_scopes.get(&card.id) {
+            } else if let Some(scope) = scope {
                 roots.get(scope.as_path()).copied().flatten()
             } else {
-                self.attention_owner(card.id).or_else(|| {
-                    kept.get(&card.id)
+                self.attention_owner(card).or_else(|| {
+                    kept.get(&card)
                         .and_then(|(project, worktree)| Some((*project, (*worktree)?)))
                 })
             }
             .filter(|(project, _)| *project == owner)
             .filter(|owner| loaded_worktrees.contains(owner))
             .map(|(_, worktree)| worktree);
-            card_resources.insert(card.id, resource);
-            if channels.contains_key(&card.id) {
+            card_resources.insert(card, resource);
+            if channels.contains_key(&card) {
                 channeled.insert(resource);
-            } else if let crate::model::CardKind::Chat(_) | crate::model::CardKind::Terminal(_) =
-                &card.kind
-                && seen.insert(resource)
-            {
+            } else if *folded != FoldedCard::Other && seen.insert(resource) {
                 panes.push((
                     position,
                     resource,
-                    card.id,
-                    matches!(card.kind, crate::model::CardKind::Terminal(_)),
+                    card,
+                    matches!(folded, FoldedCard::Terminal(_)),
                 ));
             }
             conversations
@@ -4302,23 +4466,20 @@ impl SidebarState {
         // scope, or else the one the workspace files the launch directory
         // under, as for a plain terminal opened in a checkout.
         let mut idle: BTreeMap<_, Option<(ProjectId, Option<WorktreeId>)>> = BTreeMap::new();
-        for &(position, card, resource) in &quiet {
+        for &(position, card, folded, scope, resource) in &quiet {
             if conversations.contains_key(&resource) || unowned.contains(&resource) {
                 continue;
             }
-            if channels.contains_key(&card.id) {
+            if channels.contains_key(&card) {
                 channeled.insert(resource);
                 continue;
             }
-            if !matches!(
-                card.kind,
-                crate::model::CardKind::Chat(_) | crate::model::CardKind::Terminal(_)
-            ) {
+            if folded == FoldedCard::Other {
                 continue;
             }
-            let placed = match durable.card_scopes.get(&card.id) {
-                Some(scope) => roots.get(scope.as_path()).copied().flatten(),
-                None => self.pane_checkouts.get(&card.id).copied(),
+            let placed = match scope {
+                Some(scope) => roots.get(scope).copied().flatten(),
+                None => self.pane_checkouts.get(&card).copied(),
             };
             let Some((owner, worktree)) = placed.filter(|owner| loaded_worktrees.contains(owner))
             else {
@@ -4339,8 +4500,8 @@ impl SidebarState {
                 panes.push((
                     position,
                     resource,
-                    card.id,
-                    matches!(card.kind, crate::model::CardKind::Terminal(_)),
+                    card,
+                    matches!(folded, FoldedCard::Terminal(_)),
                 ));
             }
         }
@@ -4371,7 +4532,7 @@ impl SidebarState {
         let card_rows = card_resources
             .iter()
             .map(|(card, resource)| (*card, *resource))
-            .chain(quiet.iter().map(|(_, card, resource)| (card.id, *resource)))
+            .chain(quiet.iter().map(|(_, card, .., resource)| (*card, *resource)))
             .filter_map(|(card, resource)| Some((card, *rows.get(&resource)?)))
             .collect();
         let owners = card_resources
@@ -4391,12 +4552,12 @@ impl SidebarState {
                 worktrees.entry((owner, worktree)).or_default().add(summary);
             }
         }
-        self.attention_projection = Some(AttentionProjection {
+        AttentionProjection {
             dirty: false,
             owners,
             cards,
             card_rows,
-            source: Arc::downgrade(durable),
+            inputs,
             inventory,
             folders: projects
                 .iter()
@@ -4404,8 +4565,7 @@ impl SidebarState {
                 .collect(),
             projects: summaries,
             worktrees,
-        });
-        self.follow_projected_card();
+        }
     }
 
     /// Synchronize when editor focus changes outside the file navigator.
@@ -4688,7 +4848,7 @@ impl SidebarState {
         match action {
             SidebarAction::SearchChanged(query) => self.query.clone_from(query),
             SidebarAction::SetFilter(filter) => self.set_filter(*filter),
-            SidebarAction::HideReadAttention => self.retained_attention.clear(),
+            SidebarAction::HideReadAttention => self.forget_kept_rows(|_| false),
             SidebarAction::ToggleInProgress => {
                 self.in_progress_collapsed = !self.in_progress_collapsed;
                 self.in_progress_fold_pending = false;
