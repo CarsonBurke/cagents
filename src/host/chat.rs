@@ -2001,6 +2001,39 @@ fn publication_refusal(
 fn start_with_execution(
     host: &SharedHost,
     client: ClientId,
+    session: Session,
+    source: Option<HostSessionProof>,
+    terminate_source: bool,
+    selection: Option<PendingBinding>,
+    execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
+    execution: Option<Arc<chat::protocol::ExecutionContext>>,
+    restart_launch: Option<&chat::Launch>,
+    pane: Option<crate::terminal_ipc::PaneChatStart>,
+) -> Result<ServerResponse, ProtocolError> {
+    let id = session.id;
+    let response = start_publishing(
+        host,
+        client,
+        session,
+        source,
+        terminate_source,
+        selection,
+        execution_environment,
+        execution,
+        restart_launch,
+        pane,
+    )?;
+    // An update that stopped this conversation's failed restart reported it
+    // as needing a reopen. Starting it again is that reopen.
+    if matches!(&response, ServerResponse::ChatAttached { session, .. } if session.id == id) {
+        super::state::retire_stopped_upgrade_chat(host, id);
+    }
+    Ok(response)
+}
+
+fn start_publishing(
+    host: &SharedHost,
+    client: ClientId,
     mut session: Session,
     source: Option<HostSessionProof>,
     terminate_source: bool,
@@ -5177,7 +5210,9 @@ pub(super) fn restore_upgrade(
             }
             break;
         }
-        if Instant::now() >= deadline {
+        // Time its server spent queued behind another Codex's startup lock is
+        // not this conversation's own startup; its listener wait bounds that.
+        if Instant::now() >= deadline + handle.startup_lock_wait() {
             return Err(
                 "Native provider did not confirm its exact conversation within 30 seconds".into(),
             );
@@ -5196,6 +5231,67 @@ pub(super) fn restore_upgrade(
         launch: saved.launch.clone(),
     });
     state.upgrade_chats.insert(saved.source.id, sources);
+    Ok(())
+}
+
+/// Positively stops whatever [`restore_upgrade`] started for one relaunched
+/// conversation whose restart failed, so that conversation alone is left to
+/// reopen while the rest of the update's restore continues.
+///
+/// Ok means nothing of this restart runs: its actor joined after releasing its
+/// holder, which reaps the provider and everything it started, and its record
+/// and socket allocation are gone. An error means that teardown is unproven,
+/// so nothing may replace the conversation and the caller keeps the whole
+/// checkpoint for explicit recovery.
+pub(super) fn stop_failed_upgrade_restore(
+    host: &SharedHost,
+    saved: &crate::upgrade::handoff::Chat,
+) -> Result<(), String> {
+    let id = saved.source.id;
+    let handle = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .chats
+        .get(&id)
+        .map(|record| record.handle.clone());
+    if let Some(handle) = &handle {
+        handle.close()?;
+        if handle.owns_work() {
+            return Err("The failed restart still owns provider work".into());
+        }
+    }
+    let record = {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        // A start that failed before publishing its record has nothing here,
+        // but a start or handoff still in flight would.
+        if state.chat_spawning.contains_key(&id)
+            || state.native_actor_startups.contains_key(&id)
+            || state.native_closing.contains_key(&id)
+            || state.chat_handoffs.contains_key(&id)
+        {
+            return Err("The failed restart's startup has not settled".into());
+        }
+        match (&handle, state.chats.get(&id)) {
+            (Some(handle), Some(record)) if record.handle.same_attachment(handle) => {}
+            (None, None) => {}
+            _ => return Err("The failed restart's actor changed while it was stopped".into()),
+        }
+        let record = state.chats.remove(&id);
+        if record.is_some() {
+            state.inventory_generation += 1;
+            if let Some(notifications) = &state.notifications {
+                notifications.retire(id);
+            }
+        }
+        record
+    };
+    // Only a holder that outlived its release could still claim this id.
+    if has_native_owner(&saved.source).map_err(|error| error.message)? {
+        return Err("The failed restart left its native holder registered".into());
+    }
+    if let Some(record) = &record {
+        return_listener_allocation(&record.session)?;
+    }
     Ok(())
 }
 

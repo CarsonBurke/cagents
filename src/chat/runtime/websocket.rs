@@ -152,20 +152,97 @@ fn poll(
     Ok(())
 }
 
-/// How long a launched server has to start accepting at its own endpoint.
+/// How long a launched server may spend bringing itself up before it accepts
+/// at its own endpoint. Codex 0.169 binds about 0.1 s after exec with an empty
+/// home and about 1 s against multi-gigabyte production state, so this leaves
+/// more than ten times the slow case for a busy machine.
 const LISTENER_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long a launched server may additionally wait blocked on a file lock
+/// another process holds. Codex serializes every app-server startup on one
+/// `CODEX_HOME` behind a blocking lock it keeps for about a second each with
+/// production state, so restarting many conversations after an update, or
+/// any other Codex starting at the same time, queues later servers through no
+/// fault of their own. A minute admits dozens of such startups ahead of this
+/// one, yet still ends a wait on a holder that never lets go.
+const LOCK_QUEUE_LIMIT: Duration = Duration::from_secs(60);
+
+/// How often the launched server's lock waits are sampled. Each sample reads
+/// `/proc/locks`, and a coarser estimate only shifts either limit by this much.
+const LOCK_SAMPLE: Duration = Duration::from_millis(250);
+
+/// The bounds [`join_launched`] holds a launched server to.
+#[derive(Clone, Copy)]
+struct ListenerLimits {
+    own: Duration,
+    queued: Duration,
+    sample: Duration,
+}
+
+const LISTENER_LIMITS: ListenerLimits = ListenerLimits {
+    own: LISTENER_TIMEOUT,
+    queued: LOCK_QUEUE_LIMIT,
+    sample: LOCK_SAMPLE,
+};
+
+/// A process of the launched server blocked waiting for a file lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LockWait {
+    /// The process holding the lock, when the kernel reports one.
+    holder: Option<i32>,
+}
+
+/// Find a process of `group` that `locks`, in the format of `/proc/locks`,
+/// shows blocked behind another lock. Each blocked request follows the lock
+/// blocking it, marked `->`.
+fn lock_wait_in(locks: &str, mut in_group: impl FnMut(i32) -> bool) -> Option<LockWait> {
+    let mut holder = None;
+    for line in locks.lines() {
+        let mut fields = line.split_whitespace().skip(1).peekable();
+        let blocked = fields.next_if_eq(&"->").is_some();
+        let pid = fields.nth(3).and_then(|pid| pid.parse::<i32>().ok());
+        if !blocked {
+            holder = pid.filter(|pid| *pid > 0);
+        } else if pid.is_some_and(&mut in_group) {
+            return Some(LockWait { holder });
+        }
+    }
+    None
+}
+
+/// Whether a process of the launched server whose process group is `group`
+/// is blocked on a file lock another process holds.
+fn launched_lock_wait(group: i32) -> Option<LockWait> {
+    let locks = std::fs::read_to_string("/proc/locks").ok()?;
+    lock_wait_in(&locks, |pid| {
+        std::fs::read(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| crate::model::agent_recovery::process_identity(&stat))
+            .is_some_and(|(actual, _)| actual == group)
+    })
+}
 
 /// Join the endpoint of a server this conversation launched, once it accepts.
 ///
 /// The socket exists from the moment the server binds it, which is before it
 /// listens, so a refusal there is a launch still in progress rather than a
 /// failure. `halted` reports why waiting any longer is pointless.
+///
+/// Time the server spends blocked behind another process's file lock is
+/// queueing rather than its own startup: `lock_wait` reports it, and it is
+/// charged to `limits.queued` instead of `limits.own` and published in
+/// `queued` for callers that bound the whole startup.
 fn join_launched(
     path: &Path,
+    limits: ListenerLimits,
+    queued: &AtomicU64,
+    mut lock_wait: impl FnMut() -> Option<LockWait>,
     mut halted: impl FnMut() -> Option<&'static str>,
 ) -> Result<UnixStream, String> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
     let started = Instant::now();
+    let mut sampled = started;
+    let mut waited = Duration::ZERO;
     loop {
         if let Ok(metadata) = std::fs::metadata(path)
             && metadata.file_type().is_socket()
@@ -179,10 +256,31 @@ fn join_launched(
         if let Some(reason) = halted() {
             return Err(reason.into());
         }
-        if started.elapsed() >= LISTENER_TIMEOUT {
+        let now = Instant::now();
+        if now.duration_since(sampled) >= limits.sample {
+            if let Some(wait) = lock_wait() {
+                waited += now.duration_since(sampled);
+                queued.store(
+                    u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+                    Ordering::Release,
+                );
+                if waited >= limits.queued {
+                    return Err(format!(
+                        "Codex server waited more than {} seconds for {} to release a lock it needs to start",
+                        limits.queued.as_secs(),
+                        wait.holder.map_or_else(
+                            || "another process".to_owned(),
+                            |pid| format!("process {pid}")
+                        ),
+                    ));
+                }
+            }
+            sampled = now;
+        }
+        if now.duration_since(started).saturating_sub(waited) >= limits.own {
             return Err(format!(
                 "Codex server did not open its local socket within {} seconds",
-                LISTENER_TIMEOUT.as_secs()
+                limits.own.as_secs()
             ));
         }
         thread::sleep(Duration::from_millis(20));
@@ -200,6 +298,22 @@ fn startup_halt_reason(child: Option<&ChildGuard>, cancelled: bool) -> Option<&'
     }
 }
 
+/// Whether the server a native holder launched is gone or a zombie its holder
+/// has not reaped yet.
+fn held_server_exited(server: &crate::daemon::holder_registry::Process) -> bool {
+    let Ok(stat) = std::fs::read(format!("/proc/{}/stat", server.pid)) else {
+        return true;
+    };
+    let zombie = std::str::from_utf8(&stat)
+        .ok()
+        .and_then(|stat| stat.rsplit_once(')'))
+        .and_then(|(_, fields)| fields.split_whitespace().next())
+        .is_some_and(|state| state == "Z");
+    zombie
+        || crate::model::agent_recovery::process_identity(&stat)
+            .is_none_or(|(_, start)| start != server.start)
+}
+
 impl Actor {
     /// Serve the listener this conversation's own server is bringing up.
     pub(super) fn run_launched_websocket(
@@ -207,9 +321,28 @@ impl Actor {
         initial: Step,
         path: &Path,
     ) -> Result<(), String> {
-        let socket = join_launched(path, || {
-            startup_halt_reason(self.child.as_ref(), self.stop.load(Ordering::Acquire))
-        })?;
+        // The provider leads its own process group whether this actor or a
+        // native holder launched it.
+        let (group, held) = match (&self.child, &self.native_holder) {
+            (Some(child), _) => (Some(child.child.id() as i32), None),
+            (None, Some(holder)) => (Some(holder.server().pid), Some(holder.server().clone())),
+            (None, None) => (None, None),
+        };
+        let socket = join_launched(
+            path,
+            LISTENER_LIMITS,
+            &self.startup_lock_wait,
+            || group.and_then(launched_lock_wait),
+            || {
+                startup_halt_reason(self.child.as_ref(), self.stop.load(Ordering::Acquire)).or_else(
+                    || {
+                        held.as_ref()
+                            .is_some_and(held_server_exited)
+                            .then_some("Codex server exited before opening its local socket")
+                    },
+                )
+            },
+        )?;
         self.serve_websocket(initial, socket)
     }
 
@@ -488,6 +621,14 @@ mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
 
+    /// Join without lock waits, under the production limits.
+    fn join(
+        path: &Path,
+        halted: impl FnMut() -> Option<&'static str>,
+    ) -> Result<UnixStream, String> {
+        join_launched(path, LISTENER_LIMITS, &AtomicU64::new(0), || None, halted)
+    }
+
     #[test]
     fn in_flight_response_after_close_keeps_final_events_without_queuing_new_requests() {
         use serde_json::{Value, json};
@@ -676,7 +817,7 @@ mod tests {
                 .not_listening
         );
         let mut polls = 0;
-        let joined = join_launched(&path, || {
+        let joined = join(&path, || {
             polls += 1;
             if polls == 3 {
                 assert_eq!(unsafe { libc::listen(server.as_raw_fd(), 1) }, 0);
@@ -697,7 +838,7 @@ mod tests {
                 .process_group(0),
         );
         assert_eq!(
-            join_launched(&path, || startup_halt_reason(Some(&provider), false)).unwrap_err(),
+            join(&path, || startup_halt_reason(Some(&provider), false)).unwrap_err(),
             "Codex server exited before opening its local socket"
         );
         assert_eq!(
@@ -710,7 +851,7 @@ mod tests {
         let mut provider = ChildGuard::spawn(Process::new("/bin/true").process_group(0));
         provider.child.wait().unwrap();
         assert_eq!(
-            join_launched(&path, || startup_halt_reason(Some(&provider), false)).unwrap_err(),
+            join(&path, || startup_halt_reason(Some(&provider), false)).unwrap_err(),
             "Cannot verify Codex server process identity during startup"
         );
         assert_eq!(
@@ -724,16 +865,158 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("codex.sock");
         assert_eq!(
-            join_launched(&path, || Some("Provider startup cancelled")).unwrap_err(),
+            join(&path, || Some("Provider startup cancelled")).unwrap_err(),
             "Provider startup cancelled"
         );
         let _server = bound(&path);
         assert_eq!(
-            join_launched(&path, || Some(
+            join(&path, || Some(
                 "Codex server exited before opening its local socket"
             ))
             .unwrap_err(),
             "Codex server exited before opening its local socket"
         );
+    }
+
+    #[test]
+    fn lock_waits_are_found_only_for_the_launched_servers_group() {
+        let locks = "\
+1: FLOCK  ADVISORY  WRITE 400 00:1e:77 0 EOF
+1: -> FLOCK  ADVISORY  WRITE 401 00:1e:77 0 EOF
+1: -> FLOCK  ADVISORY  WRITE 402 00:1e:77 0 EOF
+2: POSIX  ADVISORY  WRITE 500 00:1e:78 0 EOF
+3: OFDLCK ADVISORY  WRITE -1 00:1e:79 0 EOF
+3: -> OFDLCK ADVISORY  WRITE 403 00:1e:79 0 EOF
+";
+        // A blocked request names the lock printed above it.
+        assert_eq!(
+            lock_wait_in(locks, |pid| pid == 402),
+            Some(LockWait { holder: Some(400) })
+        );
+        // An open file description lock has no owning process to name.
+        assert_eq!(
+            lock_wait_in(locks, |pid| pid == 403),
+            Some(LockWait { holder: None })
+        );
+        // Holding a lock, or waiting outside the group, is not queueing.
+        assert_eq!(lock_wait_in(locks, |pid| pid == 400 || pid == 500), None);
+        assert_eq!(lock_wait_in("", |_| true), None);
+    }
+
+    #[test]
+    fn a_launched_server_blocked_on_a_held_lock_is_observed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("startup.lock");
+        let lock = std::fs::File::create(&path).unwrap();
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // As with Codex behind its launcher, a child of the group's leader
+        // blocks, so the wait is attributed through the process group. Only
+        // async-signal-safe calls run after fork.
+        let leader = unsafe { libc::fork() };
+        assert!(leader >= 0);
+        if leader == 0 {
+            unsafe {
+                libc::setpgid(0, 0);
+                let blocked = libc::fork();
+                if blocked == 0 {
+                    let descriptor = libc::open(name.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
+                    libc::_exit(i32::from(
+                        descriptor < 0 || libc::flock(descriptor, libc::LOCK_EX) != 0,
+                    ));
+                }
+                let mut status = 0;
+                libc::waitpid(blocked, &mut status, 0);
+                libc::_exit(i32::from(
+                    blocked < 0 || !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0,
+                ));
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let wait = loop {
+            if let Some(wait) = launched_lock_wait(leader) {
+                break wait;
+            }
+            assert!(Instant::now() < deadline, "the server never blocked");
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(wait.holder, Some(std::process::id() as i32));
+        assert_eq!(launched_lock_wait(i32::MAX), None);
+        drop(lock);
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(leader, &mut status, 0) }, leader);
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+        assert_eq!(launched_lock_wait(leader), None);
+    }
+
+    #[test]
+    fn time_queued_behind_another_lock_holder_is_not_charged_to_startup() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("codex.sock");
+        let limits = ListenerLimits {
+            own: Duration::from_millis(300),
+            queued: Duration::from_secs(5),
+            sample: Duration::from_millis(20),
+        };
+        let queued = AtomicU64::new(0);
+        let started = Instant::now();
+        let mut server = None;
+        let joined = join_launched(
+            &path,
+            limits,
+            &queued,
+            || {
+                (started.elapsed() < Duration::from_millis(900))
+                    .then_some(LockWait { holder: Some(7) })
+            },
+            || {
+                if started.elapsed() >= Duration::from_millis(1000) && server.is_none() {
+                    let bound = bound(&path);
+                    assert_eq!(unsafe { libc::listen(bound.as_raw_fd(), 1) }, 0);
+                    server = Some(bound);
+                }
+                None
+            },
+        );
+        assert!(joined.is_ok(), "{joined:?}");
+        // Three times the startup budget passed, nearly all of it queued.
+        assert!(started.elapsed() >= Duration::from_millis(1000));
+        assert!(
+            Duration::from_millis(queued.load(Ordering::Acquire)) >= Duration::from_millis(700)
+        );
+
+        // Without the queue the same wait exceeds the server's own budget.
+        let absent = directory.path().join("absent.sock");
+        let error = join_launched(&absent, limits, &AtomicU64::new(0), || None, || None);
+        assert!(
+            error
+                .unwrap_err()
+                .starts_with("Codex server did not open its local socket within")
+        );
+    }
+
+    #[test]
+    fn a_lock_that_is_never_released_ends_the_wait_naming_its_holder() {
+        let directory = tempfile::tempdir().unwrap();
+        let limits = ListenerLimits {
+            own: Duration::from_secs(5),
+            queued: Duration::from_millis(200),
+            sample: Duration::from_millis(20),
+        };
+        let started = Instant::now();
+        let error = join_launched(
+            &directory.path().join("codex.sock"),
+            limits,
+            &AtomicU64::new(0),
+            || Some(LockWait { holder: Some(4242) }),
+            || None,
+        )
+        .unwrap_err();
+        assert!(
+            error.starts_with("Codex server waited more than")
+                && error.ends_with("for process 4242 to release a lock it needs to start"),
+            "{error}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }

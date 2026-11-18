@@ -1186,6 +1186,245 @@ fn upgrade_restore_isolates_a_retained_conversation_whose_rollout_is_missing() {
     cleanup.0.clear();
 }
 
+const RESTART_TEST: &str = "host::state::native_upgrade_tests::upgrade_restore_stops_only_the_conversations_whose_restart_fails";
+
+#[test]
+fn upgrade_restore_stops_only_the_conversations_whose_restart_fails() {
+    match std::env::var(MODE).as_deref() {
+        Ok("provider") => return provider(),
+        Ok("restart") => {}
+        _ => return run_isolated(RESTART_TEST, "restart"),
+    }
+    let root = std::path::PathBuf::from(std::env::var_os("CAGENTS_UPGRADE_ROOT").unwrap());
+    let program = install_provider(&root);
+    let holders = root.join("holders");
+    let checkpoint_directory = root.join("checkpoint");
+    let empty_proc = root.join("proc");
+    fs::create_dir(&empty_proc).unwrap();
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let daemon = |incarnation: &str| HostSessionProof {
+        host_session_id: HostSessionId::new("restart-upgrade"),
+        host_incarnation: HostIncarnation::new(incarnation),
+        boot_id: crate::daemon::read_boot_id().unwrap(),
+    };
+    let proof = daemon("original");
+    let lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+    let host = Arc::new(crate::host::state::HostLock::new(HostState::new(
+        proof.clone(),
+    )));
+    let native_directory = registry::directory(Kind::Native).unwrap();
+    // Every holder and server this isolated fixture started, by exact
+    // identity, so a failed assertion leaves none running.
+    #[derive(Default)]
+    struct Cleanup(Vec<registry::Process>);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for process in self.0.iter().filter(|process| process.is_current()) {
+                unsafe { libc::kill(process.pid, libc::SIGKILL) };
+            }
+        }
+    }
+    let mut cleanup = Cleanup::default();
+    let mut track = |id: TerminalId| {
+        let socket = registry::socket(&native_directory, id);
+        let record = registry::evidence(&socket, Kind::Native).unwrap().unwrap();
+        cleanup
+            .0
+            .extend([record.holder.clone(), record.root.clone()]);
+        record
+    };
+
+    // One conversation outlives the update in its retained server. The other
+    // three run a Codex newer than cagents has verified, so the update stops
+    // each and the next daemon must start it again.
+    let retained = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    let restarted = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    let stalled = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    let refused = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+    let mut ids = std::collections::BTreeMap::new();
+    for thread in [retained, restarted, stalled, refused] {
+        let mut source = provider_session(&root, &program, &proof);
+        let environment = &mut source.launch.recipe.environment;
+        environment.insert("CAGENTS_UPGRADE_THREAD".into(), thread.into());
+        if thread != retained {
+            environment.insert("CAGENTS_UPGRADE_CODEX_VERSION".into(), "0.169.0".into());
+        }
+        let id = source.id;
+        super::super::chat::start_execution(
+            &host,
+            0,
+            source,
+            Arc::new(crate::chat::protocol::ExecutionContext::default()),
+        )
+        .unwrap();
+        let handle = host.lock().unwrap().chats[&id].handle.clone();
+        wait_until(
+            || {
+                handle.confirmed_session_id().as_deref() == Some(thread)
+                    && handle.check_update_readiness()
+                        == Ok(crate::chat::runtime::UpdateReadiness::Idle)
+            },
+            "a fixture conversation never started",
+        );
+        assert_eq!(
+            matches!(handle.native_continuity(), NativeContinuity::Durable { .. }),
+            thread == retained
+        );
+        track(id);
+        ids.insert(thread, id);
+    }
+    let capability = host
+        .lock()
+        .unwrap()
+        .shutdown_preflight(Instant::now())
+        .unwrap()
+        .capability;
+    prepare_upgrade_with_policy(&host, capability, false, Some(&holders), || {
+        Store::open(&checkpoint_directory)
+    })
+    .unwrap();
+    super::super::finish_chat_shutdown(&host).unwrap();
+    drop(host);
+    let store = || Store::open(&checkpoint_directory).unwrap();
+    let checkpoint = store().load().unwrap().unwrap();
+    assert_eq!(checkpoint.phase, Phase::Ready);
+    assert_eq!(checkpoint.chats.len(), 4);
+    let saved = |thread: &str| {
+        checkpoint
+            .chats
+            .iter()
+            .find(|chat| chat.source.id == ids[thread])
+            .unwrap()
+            .clone()
+    };
+
+    // After the update, one restarted server never opens its socket and
+    // another exits at once, as a Codex does whose socket is taken.
+    fs::write(root.join(format!("stall-{stalled}")), "").unwrap();
+    fs::write(root.join(format!("refuse-{refused}")), "").unwrap();
+    drop(lease);
+    let proof = daemon("updated");
+    let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+    let mut state = HostState::new(proof);
+    state.install_model(crate::host::model::Registry::at(&root.join("updated.sqlite3")).unwrap());
+    let updated = Arc::new(crate::host::state::HostLock::new(state));
+    updated.lock().unwrap().register_client(0);
+    let stalled_server = || {
+        fs::read_to_string(root.join(format!("stalled-{stalled}")))
+            .ok()
+            .and_then(|pid| registry::Process::read(pid.trim().parse().ok()?).ok())
+    };
+    let restored = restore_upgrade_from(&updated, store(), &empty_proc, Some(&holders)).unwrap();
+    assert!(restored.is_empty(), "no retained conversation was refused");
+
+    // The update finished: no checkpoint and no daemon-wide recovery hold,
+    // and every conversation whose restart worked is running.
+    assert!(store().load().unwrap().is_none(), "checkpoint was consumed");
+    assert_eq!(updated.lock().unwrap().startup_recovery(), None);
+    for thread in [retained, restarted] {
+        let handle = updated.lock().unwrap().chats[&ids[thread]].handle.clone();
+        assert_eq!(handle.confirmed_session_id().as_deref(), Some(thread));
+        assert!(handle.failure().is_none());
+        if thread == restarted {
+            track(ids[thread]);
+        }
+    }
+    // The two that failed were stopped, down to the stalled server, and are
+    // left for their panes to reopen with the reason each failed.
+    for thread in [stalled, refused] {
+        assert!(!updated.lock().unwrap().chats.contains_key(&ids[thread]));
+        let socket = registry::socket(&native_directory, ids[thread]);
+        assert!(registry::evidence(&socket, Kind::Native).unwrap().is_none());
+    }
+    assert!(
+        stalled_server().is_none(),
+        "the stalled server was left running"
+    );
+    let unattached = store().unattached().unwrap();
+    assert_eq!(unattached.len(), 2, "{unattached:?}");
+    for (thread, reason) in [
+        (
+            stalled,
+            "Codex server did not open its local socket within 15 seconds",
+        ),
+        (
+            refused,
+            "Codex server exited before opening its local socket",
+        ),
+    ] {
+        let entry = unattached
+            .iter()
+            .find(|entry| entry.id == ids[thread])
+            .unwrap();
+        assert_eq!(
+            entry.disposition,
+            crate::upgrade::handoff::UnattachedDisposition::Stopped
+        );
+        assert_eq!(entry.conversation.as_deref(), Some(thread));
+        assert!(entry.reason.contains(reason), "{:?}", entry.reason);
+        let refusal = super::super::client::process_request(
+            &updated,
+            0,
+            crate::terminal::ipc::ClientRequest::ResolveUpgradeChat {
+                source: saved(thread).source,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            refusal
+                .message
+                .starts_with(crate::chat::UPDATE_RESTART_STOPPED)
+                && refusal.message.contains(reason),
+            "{refusal:?}"
+        );
+    }
+
+    // Reopening a stopped conversation starts it again, and it no longer
+    // needs attention.
+    fs::remove_file(root.join(format!("stall-{stalled}"))).unwrap();
+    let mut reopen = saved(stalled).source;
+    reopen.proof = None;
+    super::super::client::process_request(
+        &updated,
+        0,
+        crate::terminal::ipc::ClientRequest::ChatStart {
+            session: reopen,
+            source: None,
+            terminate_source: false,
+            execution_environment: Default::default(),
+        },
+    )
+    .unwrap();
+    let handle = updated.lock().unwrap().chats[&ids[stalled]].handle.clone();
+    track(ids[stalled]);
+    wait_until(
+        || handle.confirmed_session_id().as_deref() == Some(stalled),
+        "the reopened conversation never confirmed its thread",
+    );
+    let unattached = store().unattached().unwrap();
+    assert_eq!(unattached.len(), 1);
+    assert_eq!(unattached[0].id, ids[refused]);
+
+    for thread in [retained, restarted, stalled] {
+        assert!(matches!(
+            super::super::client::process_request(
+                &updated,
+                0,
+                crate::terminal::ipc::ClientRequest::ChatClose {
+                    chat_id: ids[thread]
+                }
+            )
+            .unwrap()
+            .0,
+            crate::terminal::ipc::ServerResponse::ChatClosed { .. }
+        ));
+    }
+    wait_until(
+        || cleanup.0.iter().all(|process| !process.is_current()),
+        "closing the conversations left a holder or server running",
+    );
+}
+
 /// Runs `test` again in a private runtime, data and provider home, in `mode`.
 fn run_isolated(test: &str, mode: &str) {
     let directory = tempfile::tempdir_in("/var/tmp").unwrap();
@@ -1334,7 +1573,35 @@ fn completed_local_adapter(root: &std::path::Path) -> crate::chat::runtime::Hand
     handle
 }
 
+/// The fixture conversation's thread, which a session may choose with
+/// `CAGENTS_UPGRADE_THREAD` so several can run at once.
+fn fixture_thread() -> String {
+    std::env::var("CAGENTS_UPGRADE_THREAD").unwrap_or_else(|_| THREAD.into())
+}
+
 fn provider() {
+    let thread = fixture_thread();
+    let root = std::path::PathBuf::from(std::env::var_os("CAGENTS_UPGRADE_ROOT").unwrap());
+    if root.join(format!("stall-{thread}")).exists() {
+        // A server that never gets as far as binding its socket, as when
+        // Codex stays blocked starting up.
+        fs::write(
+            root.join(format!("stalled-{thread}")),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+    if root.join(format!("refuse-{thread}")).exists() {
+        eprintln!("app-server control socket is already in use");
+        std::process::exit(1);
+    }
+    // A newer Codex than cagents has verified keeps its conversation only
+    // while the daemon stays connected.
+    let version =
+        std::env::var("CAGENTS_UPGRADE_CODEX_VERSION").unwrap_or_else(|_| "0.157.1".into());
     let socket = std::env::var_os("CAGENTS_UPGRADE_SOCKET").unwrap();
     let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
     // The retained server remains alive after the actor disconnects. Only an
@@ -1364,7 +1631,7 @@ fn provider() {
                 && !std::path::Path::new(&std::env::var("CODEX_HOME").unwrap()).is_dir()
             {
                 // Codex's own refusal once account storage no longer holds the rollout.
-                let message = format!("no rollout found for thread id {THREAD}");
+                let message = format!("no rollout found for thread id {thread}");
                 websocket
                     .send(tungstenite::Message::Text(
                         json!({"id":id,"error":{"code":-32603,"message":message}})
@@ -1376,12 +1643,12 @@ fn provider() {
             }
             let result = match frame["method"].as_str().unwrap() {
                 "initialize" => {
-                    json!({"userAgent":"cagents/0.157.1 (Linux)", "codexHome":std::env::var("CODEX_HOME").unwrap()})
+                    json!({"userAgent":format!("cagents/{version} (Linux)"), "codexHome":std::env::var("CODEX_HOME").unwrap()})
                 }
                 "thread/start" | "thread/resume" => {
-                    json!({"thread":{"id":THREAD,"canAcceptDirectInput":true,"status":{"type":"idle"}},"model":"fixture-model"})
+                    json!({"thread":{"id":thread,"canAcceptDirectInput":true,"status":{"type":"idle"}},"model":"fixture-model"})
                 }
-                "thread/read" => json!({"thread":{"id":THREAD,"turns":[]}}),
+                "thread/read" => json!({"thread":{"id":thread,"turns":[]}}),
                 "thread/turns/list" | "thread/queue/list" | "thread/list" => {
                     json!({"data":[],"nextCursor":null})
                 }

@@ -516,6 +516,14 @@ impl Handle {
             Owner::Remote(remote) => remote.state().ready,
         }
     }
+    /// How long a server this conversation launched has waited behind another
+    /// process's file lock. A retained remote actor launches none here.
+    pub(crate) fn startup_lock_wait(&self) -> std::time::Duration {
+        match &self.0 {
+            Owner::Local(local) => local.startup_lock_wait(),
+            Owner::Remote(_) => std::time::Duration::ZERO,
+        }
+    }
     pub(crate) fn confirmed_session_id(&self) -> Option<String> {
         match &self.0 {
             Owner::Local(local) => local.confirmed_session_id(),

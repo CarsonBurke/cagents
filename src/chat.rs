@@ -411,6 +411,21 @@ impl Recovery {
 /// [`Recovery::AfterRestart`]. The protocol has no code of its own for it.
 pub const UNPROVEN_OWNER_REFUSAL: &str = "This conversation's earlier Claude process ended without recording its close, and cagents cannot prove that nothing else still holds the conversation, so nothing was started in its place. It can be reopened after you restart this computer.";
 
+/// How the daemon's refusal begins for a conversation whose restart after an
+/// update failed and was stopped again. Nothing of it runs and nothing was
+/// resent, so an ordinary start of its saved conversation reopens it; a client
+/// may read this prefix to offer that instead of treating the card as blocked.
+pub const UPDATE_RESTART_STOPPED: &str =
+    "Cagents could not restart this conversation after the update";
+
+/// The daemon's full refusal for [`UPDATE_RESTART_STOPPED`], naming the
+/// provider's own reason.
+pub fn update_restart_stopped(reason: &str) -> String {
+    format!(
+        "{UPDATE_RESTART_STOPPED}: {reason}. It was stopped and nothing was resent; reopen it to start it again."
+    )
+}
+
 impl StartFailure {
     pub fn retry(message: impl Into<String>) -> Self {
         Self {

@@ -273,6 +273,12 @@ impl Holder {
         crate::chat::protocol::validate_launch_directory(&directory, identity)?;
         Ok((identity, directory))
     }
+    /// The provider server this holder launched, which leads its own
+    /// process group.
+    pub(crate) fn server(&self) -> &Process {
+        &self.identity.record.root
+    }
+
     pub fn is_durable(&self) -> bool {
         self.durable
     }

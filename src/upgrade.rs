@@ -1588,6 +1588,24 @@ pub(crate) mod handoff {
         pub working_directory: PathBuf,
         /// Why reattachment was refused, as the daemon reported it.
         pub reason: String,
+        /// Evidence written before this field existed always described a
+        /// retained provider.
+        #[serde(default)]
+        pub disposition: UnattachedDisposition,
+    }
+
+    /// What became of an unattached conversation's provider.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub(crate) enum UnattachedDisposition {
+        /// It outlived the previous daemon and was left exactly as it was:
+        /// nothing was restarted or resent for it.
+        #[default]
+        Retained,
+        /// The previous daemon stopped it for the update. Its restart failed,
+        /// and what that restart started was stopped again, so nothing of it
+        /// runs; reopening the conversation starts it again.
+        Stopped,
     }
 
     #[cfg(any(feature = "host", test))]
@@ -1616,10 +1634,18 @@ pub(crate) mod handoff {
                     conversation: evidence.launch.session_id.clone(),
                     working_directory: evidence.launch.recipe.working_directory.clone(),
                     reason,
+                    disposition: UnattachedDisposition::Retained,
                 },
                 evidence,
                 terminal: None,
             }
+        }
+
+        /// A conversation whose restart this restore started, then stopped.
+        pub fn stopped(evidence: Chat, reason: String) -> Self {
+            let mut chat = Self::new(evidence, reason);
+            chat.summary.disposition = UnattachedDisposition::Stopped;
+            chat
         }
     }
 
@@ -2208,12 +2234,56 @@ pub(crate) mod handoff {
         /// removing the record once nothing in it needs attention.
         #[cfg(any(feature = "host", test))]
         pub fn retire_unattached(&self, id: crate::model::TerminalId) -> Result<(), String> {
+            self.retire_unattached_where(id, |_| true)
+        }
+
+        /// Why this restore stopped the conversation an exact descriptor it
+        /// issued names, if it did. Only a complete issued source retrieves
+        /// the reason, as with a retained conversation's refusal.
+        #[cfg(any(feature = "host", test))]
+        pub fn stopped_reason(&self, source: &crate::chat::Session) -> Option<String> {
+            let _update = self.unattached.lock().unwrap_or_else(|p| p.into_inner());
+            self.read_unattached::<UnattachedChat>()
+                .ok()
+                .flatten()?
+                .into_iter()
+                .find(|entry| {
+                    entry.summary.id == source.id
+                        && entry.summary.disposition == UnattachedDisposition::Stopped
+                        && (entry.evidence.source == *source
+                            || entry
+                                .evidence
+                                .previous_sources
+                                .iter()
+                                .any(|previous| previous.source == *source))
+                })
+                .map(|entry| entry.summary.reason)
+        }
+
+        /// Forgets a stopped conversation once it has been started again. A
+        /// retained entry for the same id still names a provider of its own.
+        #[cfg(any(feature = "host", test))]
+        pub fn retire_stopped_unattached(
+            &self,
+            id: crate::model::TerminalId,
+        ) -> Result<(), String> {
+            self.retire_unattached_where(id, |entry| {
+                entry.summary.disposition == UnattachedDisposition::Stopped
+            })
+        }
+
+        #[cfg(any(feature = "host", test))]
+        fn retire_unattached_where(
+            &self,
+            id: crate::model::TerminalId,
+            retire: impl Fn(&UnattachedChat) -> bool,
+        ) -> Result<(), String> {
             let _update = self.unattached.lock().unwrap_or_else(|p| p.into_inner());
             let Some(mut conversations) = self.read_unattached::<UnattachedChat>()? else {
                 return Ok(());
             };
             let before = conversations.len();
-            conversations.retain(|entry| entry.summary.id != id);
+            conversations.retain(|entry| entry.summary.id != id || !retire(entry));
             if conversations.len() == before {
                 return Ok(());
             }
