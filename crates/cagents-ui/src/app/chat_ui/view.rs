@@ -1374,42 +1374,34 @@ fn items_activity(items: &[Arc<chat::Item>]) -> &'static str {
 }
 
 /// Each item belongs to this transcript's stream; advancing it ends the thought.
-fn reasoning_finished(items: &[Arc<chat::Item>], busy: bool, id: &str) -> bool {
-    !busy
-        || items
-            .iter()
-            .position(|item| item.id == id)
-            .is_some_and(|index| index + 1 < items.len())
+/// `index` is the thought's place in `items`, which every caller already
+/// holds, so asking costs nothing however long the transcript is.
+fn reasoning_finished(items: &[Arc<chat::Item>], busy: bool, index: usize) -> bool {
+    !busy || index + 1 < items.len()
 }
 
 /// The thought's own timestamps describe its work. Older providers without an
 /// end can use the next observation in this same stream, or its recorded end.
+/// `index` is the thought's place in `items`.
 fn reasoning_elapsed(
-    item: &chat::Item,
     items: &[Arc<chat::Item>],
+    index: usize,
     finished: bool,
     finished_at: Option<u64>,
 ) -> Option<String> {
     if !finished {
         return None;
     }
+    let item = items.get(index)?;
     let start = item.started_at?;
     let end = item
         .at
         .or_else(|| {
             items
-                .iter()
-                .skip_while(|candidate| candidate.id != item.id)
-                .skip(1)
-                .next()
-                .and_then(|candidate| candidate.started_at.or(candidate.at))
+                .get(index + 1)
+                .and_then(|next| next.started_at.or(next.at))
         })
-        .or_else(|| {
-            items
-                .last()
-                .filter(|last| last.id == item.id)
-                .and(finished_at)
-        })?;
+        .or_else(|| finished_at.filter(|_| index + 1 == items.len()))?;
     // Under a second reads as "0s", which says nothing.
     let millis = end.saturating_sub(start);
     (millis >= 1_000).then(|| disclosure::duration(millis))
@@ -2368,6 +2360,7 @@ impl Runtime {
     fn child_item_revision(
         &self,
         agent: &chat::Subagent,
+        index: usize,
         item: &chat::Item,
         cached: &CachedItem,
         dark: bool,
@@ -2397,11 +2390,11 @@ impl Runtime {
             let finished = reasoning_finished(
                 &agent.items,
                 agent.status == chat::ToolStatus::Running,
-                &item.id,
+                index,
             );
             (
                 finished,
-                reasoning_elapsed(item, &agent.items, finished, None),
+                reasoning_elapsed(&agent.items, index, finished, None),
             )
                 .hash(&mut revision);
         }
@@ -2599,7 +2592,7 @@ impl Runtime {
                         .push(self.failure_view_with_reset(incident, reset_controls.as_ref()));
                 }
             }
-            for item in &agent.items {
+            for (index, item) in agent.items.iter().enumerate() {
                 if let Some((incident, first)) = self.failure_ui.child_item(&agent.id, &item.id) {
                     if first {
                         transcript.push(
@@ -2630,8 +2623,14 @@ impl Runtime {
                 use std::hash::{Hash, Hasher};
                 let mut key = std::hash::DefaultHasher::new();
                 ("selected-child-item", &item.id).hash(&mut key);
-                let revision =
-                    self.child_item_revision(agent, item, cached, dark, self.source_now_ms());
+                let revision = self.child_item_revision(
+                    agent,
+                    index,
+                    item,
+                    cached,
+                    dark,
+                    self.source_now_ms(),
+                );
                 let estimate = CachedItem::prose(&item.content).map_or(80.0, |body| {
                     (body.len() as f32 / (content_width / 8.0).max(20.0))
                         .ceil()
@@ -2668,6 +2667,7 @@ impl Runtime {
                                 } else {
                                     match &item.content {
                                         ItemContent::Text { .. } => self.prose_view(
+                                            index,
                                             item,
                                             cached,
                                             turn::slot_of(item),
@@ -4984,7 +4984,7 @@ impl Runtime {
     }
 
     pub(super) fn find_turn_matches(&self, key: &str) -> bool {
-        self.find_matches.iter().any(|candidate| candidate == key)
+        self.find_matches.contains(key)
     }
 
     /// Everything an exchange draws, as one value: it changes when any of
@@ -5143,7 +5143,7 @@ impl Runtime {
         let coordinating = match part {
             TurnPart::Prompt(index) => {
                 0u8.hash(&mut hasher);
-                self.hash_turn_item(&items[index], cached, None, now, &mut hasher)
+                self.hash_turn_item(index, cached, None, now, &mut hasher)
             }
             TurnPart::Steps => {
                 1u8.hash(&mut hasher);
@@ -5167,7 +5167,7 @@ impl Runtime {
                     };
                     item.id.hash(&mut hasher);
                     coordinating |= self.hash_turn_item(
-                        item,
+                        placed.index,
                         self.cache.get(&item.id),
                         Some(placed.slot),
                         now,
@@ -5179,13 +5179,7 @@ impl Runtime {
             TurnPart::Card(prose) | TurnPart::Prose(prose) => {
                 2u8.hash(&mut hasher);
                 let placed = &turn.prose[prose];
-                self.hash_turn_item(
-                    &items[placed.index],
-                    cached,
-                    Some(placed.slot),
-                    now,
-                    &mut hasher,
-                )
+                self.hash_turn_item(placed.index, cached, Some(placed.slot), now, &mut hasher)
             }
         };
         if coordinating {
@@ -5213,13 +5207,14 @@ impl Runtime {
     /// them.
     fn hash_turn_item(
         &self,
-        item: &chat::Item,
+        index: usize,
         cached: Option<&CachedItem>,
         slot: Option<turn::Slot>,
         now: Option<u64>,
         hasher: &mut std::hash::DefaultHasher,
     ) -> bool {
         use std::hash::Hash;
+        let item = &self.snapshot.items[index];
         // The latest observation can change at provider heartbeat speed even
         // when the rendered content and elapsed second are unchanged.
         (
@@ -5239,13 +5234,13 @@ impl Runtime {
             let finished = reasoning_finished(
                 &self.snapshot.items,
                 self.snapshot.busy && !self.snapshot.has_later,
-                &item.id,
+                index,
             );
             (
                 finished,
                 reasoning_elapsed(
-                    item,
                     &self.snapshot.items,
+                    index,
                     finished,
                     self.snapshot
                         .finished_at
@@ -5399,7 +5394,9 @@ impl Runtime {
                             .then(|| self.step_detail(item, cached, settings));
                         self.coordination_card(item, coordinated, raw)
                     }
-                    (_, ItemContent::Text { .. }) => self.text_view(item, cached, slot, settings),
+                    (_, ItemContent::Text { .. }) => {
+                        self.text_view(turn.prose[prose].index, item, cached, slot, settings)
+                    }
                     (_, ItemContent::Image { .. }) => self.image_preview(item, cached),
                     // Anything else in the answer slot is a step the grouping
                     // did not recognize, drawn the way a step is.
@@ -6151,6 +6148,7 @@ impl Runtime {
     /// including partial streaming paragraphs.
     fn prose_view<'a>(
         &'a self,
+        index: usize,
         item: &'a chat::Item,
         cached: &'a CachedItem,
         slot: turn::Slot,
@@ -6162,12 +6160,14 @@ impl Runtime {
             // inventing a second treatment for it.
             return self.step_view(item, cached, settings);
         };
-        self.text_view(item, cached, slot, settings)
+        self.text_view(index, item, cached, slot, settings)
     }
 
     /// A text item in its slot, as an element that owns what it draws.
+    /// `index` is the item's place in the transcript it is drawn from.
     fn text_view(
         &self,
+        index: usize,
         item: &chat::Item,
         cached: &CachedItem,
         slot: turn::Slot,
@@ -6207,11 +6207,15 @@ impl Runtime {
                         )
                     },
                 );
-            let finished = reasoning_finished(items, busy, &item.id);
+            debug_assert!(
+                items.get(index).is_none_or(|at| at.id == item.id),
+                "a thought is drawn at its own position in its stream"
+            );
+            let finished = reasoning_finished(items, busy, index);
             let preview = cached.reasoning.as_ref();
             let has_text = preview.is_some_and(|preview| !preview.first.is_empty());
             let expanded = has_text && self.item_expanded(&item.id);
-            let mut elapsed = reasoning_elapsed(item, items, finished, finished_at);
+            let mut elapsed = reasoning_elapsed(items, index, finished, finished_at);
             let label = if has_text {
                 let preview = preview.expect("reasoning text has a prepared preview");
                 if finished {
