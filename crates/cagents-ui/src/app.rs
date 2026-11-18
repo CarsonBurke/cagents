@@ -8001,7 +8001,7 @@ impl Cagents {
         project: ProjectId,
         repository: PathBuf,
         worktree: PathBuf,
-    ) -> Task<Message> {
+    ) -> (CardId, Task<Message>) {
         let card_id = CardId::new();
         let view = RepositoryView {
             selected_file: None,
@@ -8047,7 +8047,8 @@ impl Cagents {
                 ViewportUpdate::unchanged()
             });
         self.persist();
-        Task::batch([self.apply_viewport(update, true, DurableChange::None), load])
+        let task = Task::batch([self.apply_viewport(update, true, DurableChange::None), load]);
+        (card_id, task)
     }
     fn open_link(&mut self, url: Url) -> Task<Message> {
         self.open_link_in(url, self.settings.link_open_destination)
@@ -12827,12 +12828,15 @@ impl Cagents {
         )
     }
 
-    /// The open repository card showing this worktree, if one is open.
-    fn repository_card_for(&self, worktree: &Path) -> Option<CardId> {
+    /// The open repository browsers for this worktree in the active channel,
+    /// in pane order. A browser shows the whole worktree rather than one
+    /// fixed file.
+    fn repository_browsers<'a>(&'a self, worktree: &'a Path) -> impl Iterator<Item = CardId> + 'a {
+        let channel = self.durable.active_channel;
         self.durable
             .cards
             .iter()
-            .find(|card| {
+            .filter(move |card| {
                 card.existence.is_open()
                     && self
                         .durable
@@ -12840,38 +12844,52 @@ impl Cagents {
                         .iter()
                         .find(|channel| channel.cards.contains(&card.id))
                         .map(|channel| channel.id)
-                        == self.durable.active_channel
+                        == channel
                     && matches!(&card.kind, CardKind::Repository(view) if view.selected_file.is_none() && view.worktree == worktree)
             })
             .map(|card| card.id)
     }
 
-    /// Sidebar file navigation follows an eligible focused browser. Other
-    /// callers of `repository_card_for`, including save completion, retain
-    /// their existing first-browser selection.
+    /// The repository browser that sidebar navigation into this worktree
+    /// should drive: the focused browser if it can navigate, otherwise the
+    /// first that can.
+    ///
+    /// A browser holding unsaved edits, a save, editor recovery or a
+    /// durability warning refuses navigation, so routing a click to it would
+    /// only focus it and drop the request. `None` means the caller opens a
+    /// new browser, as a file link does when every file pane is busy.
     fn repository_panel_destination(&self, worktree: &Path) -> Option<CardId> {
+        self.repository_browser_where(worktree, |card| {
+            !matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation())
+        })
+    }
+
+    /// The focused browser for this worktree if it satisfies `accept`,
+    /// otherwise the first that does.
+    fn repository_browser_where(
+        &self,
+        worktree: &Path,
+        accept: impl Fn(CardId) -> bool,
+    ) -> Option<CardId> {
         self.workspace
             .focused()
             .filter(|focused| {
-                self.durable.cards.iter().any(|card| {
-                    card.id == *focused
-                        && card.existence.is_open()
-                        && self
-                            .durable
-                            .channels
-                            .iter()
-                            .find(|channel| channel.cards.contains(&card.id))
-                            .map(|channel| channel.id)
-                            == self.durable.active_channel
-                        && matches!(&card.kind, CardKind::Repository(view) if view.selected_file.is_none() && view.worktree == worktree)
-                })
+                accept(*focused)
+                    && self
+                        .repository_browsers(worktree)
+                        .any(|card| card == *focused)
             })
-            .or_else(|| self.repository_card_for(worktree))
+            .or_else(|| {
+                self.repository_browsers(worktree)
+                    .find(|card| accept(*card))
+            })
     }
 
     /// Routes one panel row to the worktree's repository card.
     ///
-    /// The card is opened if the worktree has none. Either way the navigation
+    /// A browser already editing that file is focused as it is. Otherwise the
+    /// row goes to [`Self::repository_panel_destination`], and a new browser
+    /// opens if no existing one can navigate. Either way the navigation
     /// is parked in [`Self::pending_panel_open`] and performed when that card's
     /// file list lands, because the card resolves a path against the list it
     /// holds and the sidebar's rows come from a snapshot the list may predate.
@@ -12891,6 +12909,20 @@ impl Cagents {
                     .any(|row| row.path == *path && row.ignored)
             });
         let path = path.as_path().to_path_buf();
+        // A browser that refuses navigation because of this very file's
+        // unsaved edits already shows what was asked for. Focus it rather than
+        // opening a second copy that would lack those edits.
+        if let Some(card) = self.repository_browser_where(&key.canonical_path, |card| {
+            matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime))
+                if runtime.blocks_navigation() && runtime.selected_path() == Some(path.as_path()))
+        }) {
+            self.pending_panel_open = None;
+            return self
+                .workspace
+                .focus(card)
+                .map(|update| self.apply_viewport(update, true, DurableChange::None))
+                .unwrap_or_else(|_| Task::none());
+        }
         match self.repository_panel_destination(&key.canonical_path) {
             Some(card) => {
                 self.pending_panel_open = Some(PendingPanelOpen {
@@ -12914,18 +12946,16 @@ impl Cagents {
                 // `add_repository_card` runs the card's own initial load, so
                 // the parked navigation is answered by that list rather than by
                 // a second one requested here.
-                let task = self.add_repository_card(
+                let (card, task) = self.add_repository_card(
                     key.project_id,
                     key.canonical_path.clone(),
                     key.canonical_path.clone(),
                 );
-                if let Some(card) = self.repository_card_for(&key.canonical_path) {
-                    self.pending_panel_open = Some(PendingPanelOpen {
-                        card,
-                        path,
-                        ignored,
-                    });
-                }
+                self.pending_panel_open = Some(PendingPanelOpen {
+                    card,
+                    path,
+                    ignored,
+                });
                 task
             }
         }

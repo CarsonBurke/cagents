@@ -356,20 +356,19 @@ impl Cagents {
         // A historical path may be deleted, renamed, or never exist in the
         // working file list. Do not park behind or emit OpenFile/RefreshFiles.
         self.pending_panel_open = None;
-        let prepare = match self.repository_card_for(&key.canonical_path) {
-            Some(card) => self
-                .workspace
-                .focus(card)
-                .map(|update| self.apply_viewport(update, true, DurableChange::None))
-                .unwrap_or_else(|_| Task::none()),
+        let (card, prepare) = match self.repository_panel_destination(&key.canonical_path) {
+            Some(card) => (
+                card,
+                self.workspace
+                    .focus(card)
+                    .map(|update| self.apply_viewport(update, true, DurableChange::None))
+                    .unwrap_or_else(|_| Task::none()),
+            ),
             None => self.add_repository_card(
                 key.project_id,
                 key.canonical_path.clone(),
                 key.canonical_path.clone(),
             ),
-        };
-        let Some(card) = self.repository_card_for(&key.canonical_path) else {
-            return prepare;
         };
         let open = cosmic::task::message(Message::Repository(open(card)));
         Task::batch([prepare, open])
