@@ -3055,6 +3055,8 @@ impl Runtime {
                                 earlier: snapshot.has_earlier,
                                 later: snapshot.has_later,
                             },
+                            // The store's `middle` cursor is the window's
+                            // item at `len / 2` too (`Store::window_reusing`).
                             pivot: (!snapshot.items.is_empty()).then(|| scroll::Pivot {
                                 index: snapshot.items.len() / 2,
                                 items: snapshot.items.len(),

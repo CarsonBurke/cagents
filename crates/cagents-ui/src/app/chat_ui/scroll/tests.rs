@@ -519,6 +519,26 @@ fn cold_reader_draw_waits_for_more_than_four_actual_virtual_viewport_passes() {
         clicks.get() > 0,
         "coherent content becomes interactive again"
     );
+    let held = |tree: &Tree| {
+        tree.state
+            .downcast_ref::<ReaderState>()
+            .memory
+            .0
+            .borrow()
+            .held
+    };
+    assert!(held(&tree), "a press over the transcript holds it");
+    element.as_widget_mut().update(
+        &mut tree,
+        &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+        Layout::new(&node),
+        mouse::Cursor::Unavailable,
+        &renderer,
+        &mut iced::advanced::clipboard::Null,
+        &mut Shell::new(&mut vec![]),
+        &viewport,
+    );
+    assert!(!held(&tree), "a release anywhere lets it go");
     assert!(
         !element
             .as_widget()
@@ -3562,6 +3582,14 @@ fn the_kept_halves_end_at_the_rows_of_the_items_a_slide_drops() {
     assert!(
         anchor
             .kept(Some("child"), &items, Pivot { index: 2, items: 5 })
+            .is_none()
+    );
+    // A held thumb asks only at the edge: a page landing mid-drag would
+    // move the view under it.
+    anchor.held = true;
+    assert!(
+        anchor
+            .kept(None, &items, Pivot { index: 2, items: 5 })
             .is_none()
     );
 }

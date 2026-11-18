@@ -1239,6 +1239,9 @@ struct Anchor {
     /// The page a wheel last asked for ahead of the reader, and the item
     /// the window it asked from was to slide around.
     prefetched: Option<(view::Page, String)>,
+    /// The primary button is held down over the transcript, as while its
+    /// scrollbar thumb is dragged.
+    held: bool,
 }
 
 impl Anchor {
@@ -1248,12 +1251,19 @@ impl Anchor {
     /// an exchange's steps, and an exchange draws its steps above its prose
     /// whatever their order, so each half ends at the nearest row holding
     /// any item of the other.
+    ///
+    /// Unknown while the primary button is held, as while the thumb is
+    /// dragged: a page that grows the content under a dragged thumb would
+    /// move the view the drag maps to, so a drag asks only at the edge.
     fn kept(
         &self,
         subagent: Option<&str>,
         items: &[(Id, &str)],
         pivot: Pivot,
     ) -> Option<view::Kept> {
+        if self.held {
+            return None;
+        }
         let context = self
             .contexts
             .iter()
@@ -2073,6 +2083,27 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 .0
                 .borrow_mut()
                 .modifiers = *modifiers;
+        }
+        match event {
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+                if cursor.is_over(layout.bounds()) =>
+            {
+                tree.state
+                    .downcast_ref::<ReaderState>()
+                    .memory
+                    .0
+                    .borrow_mut()
+                    .held = true;
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                tree.state
+                    .downcast_ref::<ReaderState>()
+                    .memory
+                    .0
+                    .borrow_mut()
+                    .held = false;
+            }
+            _ => {}
         }
         if let Some(intent) = &self.find_intent
             && (!revealing

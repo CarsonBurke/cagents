@@ -1673,6 +1673,8 @@ impl Store {
             copy_projection.reverse();
             cursors.reverse();
         }
+        // The UI measures the kept halves around the item at the same index
+        // of the window (`scroll::Pivot`), so the two must agree.
         self.middle = cursors.get(cursors.len() / 2).copied();
         self.cached_earlier = match first {
             Some((ordinal, part)) => {
