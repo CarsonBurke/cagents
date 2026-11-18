@@ -3162,6 +3162,18 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
     )
 }
 
+/// Messages that may run while background repository loads wait for their
+/// shared reconciliation: further loads, which join it, and the reconciliation.
+fn defers_repository_reconciliation(message: &Message) -> bool {
+    matches!(
+        message,
+        Message::RepositoryLoaded {
+            open_cards: false,
+            ..
+        } | Message::RepositoryReconciliationDue
+    )
+}
+
 fn completion_navigates(message: &Message) -> bool {
     matches!(
         message,
@@ -4733,6 +4745,9 @@ pub enum Message {
     ReplicaCaptureDue(u64),
     /// The delay on saving runtime-reported card titles has passed.
     ReportedTitleSaveDue,
+    /// Reconcile the repositories whose background loads finished since the
+    /// last reconciliation; see [`Cagents::defer_repository_reconciliation`].
+    RepositoryReconciliationDue,
     /// The hold that began at this instant has lasted long enough to draw the
     /// workspace switcher.
     WorkspaceSwitcherDue(Instant),
@@ -5522,6 +5537,11 @@ pub struct Cagents {
     /// Which timer is the scheduled save's: one armed for a burst that a save
     /// already wrote must not cut the next burst short.
     navigation_save_generation: u64,
+    /// Repositories whose background load finished and whose shared model
+    /// reconciliation waits for [`Message::RepositoryReconciliationDue`], in
+    /// load order. Any message other than another background load reconciles
+    /// them first.
+    pending_repository_reconciliation: Vec<PathBuf>,
     /// Where editors were when a save last dropped them from durable: a
     /// closed editor, or one still loading. A shared view reopening the same
     /// pane, or a retried attach, puts the editor back there.
@@ -15739,6 +15759,7 @@ impl Application for Cagents {
             navigation_save: None,
             replica_capture: ReplicaCapture::default(),
             navigation_save_generation: 0,
+            pending_repository_reconciliation: Vec::new(),
             released_repository_navigation: HashMap::new(),
             keyboard_owed: None,
             reported_title_save: ReportedTitleSave::default(),
@@ -15883,6 +15904,14 @@ impl Application for Cagents {
                 return settled;
             }
             return Task::batch([settled, self.update(message)]);
+        }
+        if !self.pending_repository_reconciliation.is_empty()
+            && !defers_repository_reconciliation(&message)
+        {
+            // Only a run of background repository loads waits for one
+            // reconciliation; every other message sees it done, in order.
+            let reconciled = self.update(Message::RepositoryReconciliationDue);
+            return Task::batch([reconciled, self.update(message)]);
         }
         #[cfg(any(test, feature = "development"))]
         let (_running, settled_projection) = self.settle_projection(&message);
@@ -16033,6 +16062,8 @@ impl Application for Cagents {
             || background_poll(&message)
             || matches!(message, Message::ReplicaCaptureDue(_))
             || self.navigation_save_is_stale(&message)
+            || (matches!(message, Message::RepositoryReconciliationDue)
+                && self.pending_repository_reconciliation.is_empty())
         {
             Projection::Unchanged
         } else {
@@ -16592,7 +16623,15 @@ impl Application for Cagents {
                             pending,
                             pr_enrichment,
                             self.project_avatar_task(project_id),
-                            self.reconcile_workspace_model_for_repository(&loaded.project.repository),
+                            if open_cards {
+                                self.reconcile_workspace_model_for_repository(
+                                    &loaded.project.repository,
+                                )
+                            } else {
+                                self.defer_repository_reconciliation(
+                                    loaded.project.repository.clone(),
+                                )
+                            },
                         ]);
                     }
                     Err(error) => {
@@ -18276,6 +18315,7 @@ impl Application for Cagents {
                 }
                 Task::none()
             }
+            Message::RepositoryReconciliationDue => self.reconcile_pending_repositories(),
             Message::ReportedTitleSaveDue => {
                 self.reported_title_save.scheduled = false;
                 if !self.reported_title_save.cards.is_empty() {
@@ -31758,6 +31798,7 @@ mod tests {
             navigation_save: None,
             replica_capture: ReplicaCapture::default(),
             navigation_save_generation: 0,
+            pending_repository_reconciliation: Vec::new(),
             released_repository_navigation: HashMap::new(),
             keyboard_owed: None,
             reported_title_save: ReportedTitleSave::default(),
