@@ -2402,7 +2402,13 @@ fn merge_changed_fields(base: &toml::Value, desired: &toml::Value, current: &mut
         (base.as_table(), desired.as_table(), current.as_table_mut())
     {
         for (key, value) in desired {
-            match (base.get(key), current.get_mut(key)) {
+            let previous = base.get(key);
+            // An entry this window left alone says nothing about the file,
+            // even when another window has since removed it there.
+            if previous == Some(value) {
+                continue;
+            }
+            match (previous, current.get_mut(key)) {
                 (Some(previous), Some(current)) => merge_changed_fields(previous, value, current),
                 _ => {
                     current.insert(key.clone(), value.clone());
@@ -3855,6 +3861,64 @@ mod tests {
         let restored = load(&path).unwrap();
         assert_eq!(restored.terminal_font_size, 19.0);
         assert_eq!(restored.app_theme, AppTheme::Light);
+    }
+
+    #[test]
+    fn unrelated_save_from_a_stale_window_keeps_another_windows_cleared_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let project = crate::model::ProjectId::new();
+        let other_project = crate::model::ProjectId::new();
+        let mut base = AppSettings {
+            editor_font_size: Some(18.0),
+            ..AppSettings::default()
+        };
+        base.sidebar_worktree_overrides
+            .insert(project, SidebarWorktrees::Expanded);
+        save(&path, &base).unwrap();
+
+        let mut cleared = base.clone();
+        cleared.editor_font_size = None;
+        cleared.sidebar_worktree_overrides.remove(&project);
+        save_merged(&path, &base, &cleared).unwrap();
+
+        let mut stale = base.clone();
+        stale.app_theme = AppTheme::Light;
+        stale
+            .sidebar_worktree_overrides
+            .insert(other_project, SidebarWorktrees::Hidden);
+        save_merged(&path, &base, &stale).unwrap();
+
+        let restored = load(&path).unwrap();
+        assert_eq!(restored.editor_font_size, None);
+        assert!(!restored.sidebar_worktree_overrides.contains_key(&project));
+        assert_eq!(restored.app_theme, AppTheme::Light);
+        assert_eq!(
+            restored.sidebar_worktree_overrides.get(&other_project),
+            Some(&SidebarWorktrees::Hidden)
+        );
+    }
+
+    #[test]
+    fn a_value_this_window_sets_replaces_another_windows_clear() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let base = AppSettings {
+            editor_font_size: Some(18.0),
+            ..AppSettings::default()
+        };
+        save(&path, &base).unwrap();
+        let cleared = AppSettings {
+            editor_font_size: None,
+            ..base.clone()
+        };
+        save_merged(&path, &base, &cleared).unwrap();
+        let resized = AppSettings {
+            editor_font_size: Some(14.0),
+            ..base.clone()
+        };
+        save_merged(&path, &base, &resized).unwrap();
+        assert_eq!(load(&path).unwrap().editor_font_size, Some(14.0));
     }
 
     #[test]
