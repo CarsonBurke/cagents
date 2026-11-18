@@ -1622,6 +1622,8 @@ class Evidence(unittest.TestCase):
                       (self.logs / "magick").read_text().splitlines()[-1])
         self.assertIn("after-edges.webp", (self.task / "shots" / "manifest.tsv").read_text())
         self.assertEqual(self.run_tool("shot", "edges", "--lossy", check=False).returncode, 2)
+        self.assertEqual(
+            self.run_tool("shot", "edges", "--lossless", "extra", check=False).returncode, 2)
 
         second = self.run_tool("start", "after", check=False)
         self.assertEqual(second.returncode, 1)

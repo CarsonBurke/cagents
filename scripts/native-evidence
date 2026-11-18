@@ -1477,6 +1477,7 @@ cmd_shot() {
     local name=${1:-} side encoding=(-quality 92)
     [[ $name =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]] || die 'shot name must use letters, digits and hyphens' 2
     shift
+    [ "$#" -le 1 ] || die 'shot takes a name and at most one option' 2
     case ${1:-} in
     '') ;;
     --lossless) encoding=(-define webp:lossless=true) ;;
