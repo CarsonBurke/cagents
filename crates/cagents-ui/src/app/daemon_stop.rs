@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    control::{ControlClient, StopReport, shutdown_outcome_summary},
+    control::{ControlClient, RequestError, StopReport, shutdown_outcome_summary},
     terminal::ipc::{ShutdownCapability, ShutdownOutcome},
 };
 use std::io::Write;
@@ -11,9 +11,23 @@ pub enum StopMessage {
     Confirm,
     Refresh,
     Cancel,
-    Finished(Result<ShutdownOutcome, String>),
-    Refreshed(Result<ShutdownCapability, String>),
+    Finished(Result<ShutdownOutcome, RequestError>),
+    Refreshed(Result<ShutdownCapability, RequestError>),
     Key(keyboard::Event),
+}
+
+/// What a stop confirmation does, which the dialog keeps saying whenever
+/// Confirm is offered.
+const CONSEQUENCE: &str = "Confirming stops these hosted terminal/chat sessions and all their background subagents. Background work will not resume automatically. Cancel makes no shutdown request.";
+
+/// What the dialog says when a busy daemon refused to count again; the
+/// earlier result and its Refresh stay as they were.
+const REFRESH_REFUSED_BUSY: &str = "The cagents daemon was busy finishing another operation, so the count was not refreshed. Try again in a moment.";
+
+/// What the dialog says after a busy refusal: nothing was stopped, the count
+/// and its capability still stand, and Confirm still does what it did.
+fn busy_detail() -> String {
+    format!("{}\n\n{CONSEQUENCE}", crate::control::STOP_REFUSED_BUSY)
 }
 
 pub struct DaemonStop {
@@ -22,6 +36,9 @@ pub struct DaemonStop {
     pending: bool,
     settled: bool,
     detail: String,
+    /// What the dialog said before the refresh in flight, which it says
+    /// again if a busy daemon refuses that refresh.
+    before_refresh: Option<String>,
     /// What the tray that opened this dialog is told once it closes.
     report: Option<StopReport>,
     failed: Arc<AtomicBool>,
@@ -33,7 +50,20 @@ impl Application for DaemonStop {
     type Message = StopMessage;
     const APP_ID: &'static str = "dev.cagents.Cagents.StopConfirmation";
     fn init(core: Core, (capability, failed): Self::Flags) -> (Self, Task<StopMessage>) {
-        (Self { core, capability, pending: false, settled: false, detail: "Confirming stops these hosted terminal/chat sessions and all their background subagents. Background work will not resume automatically. Cancel makes no shutdown request.".into(), report: None, failed }, iced::widget::operation::focus(widget::Id::new("daemon-stop.cancel")).map(cosmic::Action::App))
+        (
+            Self {
+                core,
+                capability,
+                pending: false,
+                settled: false,
+                detail: CONSEQUENCE.into(),
+                before_refresh: None,
+                report: None,
+                failed,
+            },
+            iced::widget::operation::focus(widget::Id::new("daemon-stop.cancel"))
+                .map(cosmic::Action::App),
+        )
     }
     fn core(&self) -> &Core {
         &self.core
@@ -61,37 +91,47 @@ impl Application for DaemonStop {
                 cosmic::task::future(async move {
                     StopMessage::Finished(
                         tokio::task::spawn_blocking(move || {
-                            client()?
-                                .confirm_shutdown(capability)
-                                .map_err(|error| error.to_string())
+                            Ok(client()?.confirm_shutdown(capability)?)
                         })
                         .await
-                        .map_err(|error| error.to_string())
+                        .map_err(|error| RequestError::Failed(error.to_string()))
                         .and_then(|result| result),
                     )
                 })
             }
             StopMessage::Refresh if !self.pending => {
                 self.pending = true;
-                self.detail = "Refreshing daemon inventory; no shutdown is being requested.".into();
+                self.before_refresh = Some(std::mem::replace(
+                    &mut self.detail,
+                    "Refreshing daemon inventory; no shutdown is being requested.".into(),
+                ));
                 cosmic::task::future(async {
                     StopMessage::Refreshed(
                         tokio::task::spawn_blocking(|| {
-                            client()?
-                                .shutdown_preflight()
-                                .map(|preflight| preflight.capability)
-                                .map_err(|error| error.to_string())
+                            Ok(client()?.shutdown_preflight()?.capability)
                         })
                         .await
-                        .map_err(|error| error.to_string())
+                        .map_err(|error| RequestError::Failed(error.to_string()))
                         .and_then(|result| result),
                     )
                 })
             }
             StopMessage::Finished(result) if self.pending => {
                 self.pending = false;
-                self.settled = true;
                 let report = match result {
+                    Err(RequestError::Busy) => {
+                        // Refused before anything was stopped: the reviewed
+                        // count and its capability still stand, so Confirm
+                        // stays available. A capability that expires
+                        // meanwhile is answered as Expired.
+                        // Focus stays on the safe choice, as when the
+                        // dialog opened; Confirm is one press away.
+                        self.detail = busy_detail();
+                        return iced::widget::operation::focus(widget::Id::new(
+                            "daemon-stop.cancel",
+                        ))
+                        .map(cosmic::Action::App);
+                    }
                     Ok(outcome) => {
                         self.failed.store(
                             !matches!(outcome, ShutdownOutcome::Accepted { .. }),
@@ -100,18 +140,20 @@ impl Application for DaemonStop {
                         self.detail = shutdown_outcome_summary(&outcome);
                         StopReport::Finished { outcome }
                     }
-                    Err(error) => {
+                    Err(RequestError::Failed(error)) => {
                         self.failed.store(true, Ordering::Release);
-                        self.detail = format!("Could not stop the daemon: {error}");
+                        self.detail = format!("Could not stop the cagents daemon: {error}");
                         StopReport::Failed { error }
                     }
                 };
+                self.settled = true;
                 self.report = Some(report);
                 iced::widget::operation::focus(widget::Id::new("daemon-stop.cancel"))
                     .map(cosmic::Action::App)
             }
             StopMessage::Refreshed(result) if self.pending => {
                 self.pending = false;
+                let before = self.before_refresh.take().unwrap_or_default();
                 match result {
                     Ok(capability) => {
                         self.capability = capability;
@@ -119,10 +161,18 @@ impl Application for DaemonStop {
                         self.report = None;
                         self.detail = "Fresh inventory loaded. Confirm the count below; no shutdown has been requested by this refresh.".into();
                     }
-                    Err(error) => {
+                    // The refresh issued nothing, so the dialog stays as it
+                    // was, Refresh and the earlier result's text included;
+                    // the busy sentence follows that text once.
+                    Err(RequestError::Busy) => {
+                        let busy = format!("\n\n{REFRESH_REFUSED_BUSY}");
+                        let earlier = before.strip_suffix(&busy).unwrap_or(&before);
+                        self.detail = format!("{earlier}{busy}");
+                    }
+                    Err(RequestError::Failed(error)) => {
                         self.settled = true;
                         self.failed.store(true, Ordering::Release);
-                        self.detail = format!("Could not refresh the daemon: {error}");
+                        self.detail = format!("Could not refresh the cagents daemon: {error}");
                         self.report = Some(StopReport::Failed { error });
                     }
                 }
@@ -184,9 +234,10 @@ impl Application for DaemonStop {
     }
 }
 
-fn client() -> Result<ControlClient, String> {
-    let socket = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
-    ControlClient::connect(&socket).map_err(|error| error.to_string())
+fn client() -> Result<ControlClient, RequestError> {
+    let socket = crate::terminal::ipc::daemon_socket_path()
+        .map_err(|error| RequestError::Failed(error.to_string()))?;
+    Ok(ControlClient::connect(&socket)?)
 }
 
 pub fn run_daemon_stop_confirmation(
@@ -317,7 +368,7 @@ mod tests {
         for outcome in [
             Ok(ShutdownOutcome::Expired),
             Ok(ShutdownOutcome::DaemonRestarted),
-            Err("connection lost".into()),
+            Err(RequestError::Failed("connection lost".into())),
         ] {
             let mut app = confirmation(3);
             let _cancel = app.update(StopMessage::Cancel);
@@ -328,6 +379,46 @@ mod tests {
             assert!(app.failed.load(Ordering::Acquire));
             assert!(app.settled);
         }
+    }
+
+    /// A busy daemon refused the stop before stopping anything, so the
+    /// reviewed count and capability still stand: Confirm works again at
+    /// once, nothing is reported as failed, and the dialog says why.
+    #[test]
+    fn a_busy_refusal_leaves_confirm_available() {
+        let mut app = confirmation(3);
+        let capability = app.capability.clone();
+        let _unpolled = app.update(StopMessage::Confirm);
+        let _ = app.update(StopMessage::Finished(Err(RequestError::Busy)));
+        assert!(!app.pending);
+        assert!(!app.settled, "Confirm is still available");
+        assert!(!app.failed.load(Ordering::Acquire));
+        assert_eq!(app.report, None, "closing now reports a cancellation");
+        assert_eq!(app.capability, capability);
+        assert_eq!(app.detail, busy_detail());
+        let _unpolled = app.update(StopMessage::Confirm);
+        assert!(app.pending, "the same stop is asked again");
+
+        // A busy refresh after a failed stop leaves that failure and its
+        // Refresh in place, rather than reporting a second failure.
+        let mut app = confirmation(3);
+        let _unpolled = app.update(StopMessage::Confirm);
+        let _ = app.update(StopMessage::Finished(Ok(ShutdownOutcome::Expired)));
+        let report = app.report.clone();
+        let failure = app.detail.clone();
+        let refused = format!("{failure}\n\n{REFRESH_REFUSED_BUSY}");
+        for _ in 0..2 {
+            let _unpolled = app.update(StopMessage::Refresh);
+            let _ = app.update(StopMessage::Refreshed(Err(RequestError::Busy)));
+            assert!(!app.pending && app.settled);
+            assert_eq!(app.report, report);
+            assert_eq!(app.capability, capability);
+            // Why Stop daemon is unavailable stays said, and repeated
+            // refusals do not stack.
+            assert_eq!(app.detail, refused);
+        }
+        let _unpolled = app.update(StopMessage::Refresh);
+        assert!(app.pending, "Refresh can be asked again");
     }
 
     #[test]

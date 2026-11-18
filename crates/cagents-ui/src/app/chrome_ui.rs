@@ -1041,7 +1041,9 @@ mod tests {
                 let _ = app.update(Message::AccountUi(
                     super::super::account_ui::Action::LinkReady {
                         key: uuid::Uuid::new_v4(),
-                        result: Err("no credentials there".into()),
+                        result: Err(crate::control::RequestError::Failed(
+                            "no credentials there".into(),
+                        )),
                     },
                 ));
                 app.update(Message::AccountUi(
