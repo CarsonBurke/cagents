@@ -7014,7 +7014,7 @@ mod tests {
             executable: "cagents".into(),
         })
         .unwrap();
-        crate::device::select(Some("launch-test".into())).unwrap();
+        crate::device::select(Some("launch-test")).unwrap();
         let mut command = Command::new("sh");
         command.args([
             "-c",

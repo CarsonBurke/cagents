@@ -4515,7 +4515,7 @@ fn configured_slash_remotes_support_publish_upstream_and_ref_lookup() {
         cagents::repository::BaseRevision::remote_ref("refs/remotes/te/am/main").unwrap()
     );
     let store = cagents::persistence::StateStore::open(
-        &fixture.root.path().join("state.sqlite3"),
+        fixture.root.path().join("state.sqlite3"),
         cagents::model::BootId::new("slash-remote-test"),
     )
     .unwrap();

@@ -2139,7 +2139,6 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         });
         if let Some(selection) = a11y
             .selection
-            .clone()
             .filter(|s| a11y.valid_selection(s))
             .or(visible_selection)
             .or_else(|| a11y.cursor(&self.snapshot))
@@ -2307,13 +2306,12 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         {
             shell.request_redraw_at(due);
         }
-        if let Event::Mouse(mouse::Event::ButtonReleased(IcedMouseButton::Left)) = event {
-            if state.review_control_pressed {
+        if let Event::Mouse(mouse::Event::ButtonReleased(IcedMouseButton::Left)) = event
+            && state.review_control_pressed {
                 state.review_control_pressed = false;
                 shell.capture_event();
                 return;
             }
-        }
         if matches!(
             event,
             Event::Mouse(mouse::Event::ButtonPressed(IcedMouseButton::Left))
@@ -2393,14 +2391,13 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                         self.publish_review(a11y.review, shell);
                     }
                     Action::SetTextSelection if ours => {
-                        if let Some(ActionData::SetTextSelection(selection)) = &request.data {
-                            if a11y.valid_selection(selection) {
+                        if let Some(ActionData::SetTextSelection(selection)) = &request.data
+                            && a11y.valid_selection(selection) {
                                 a11y.review = true;
-                                a11y.selection = Some(selection.clone());
+                                a11y.selection = Some(*selection);
                                 state.preedit = None;
                                 self.publish_review(true, shell);
                             }
-                        }
                     }
                     _ => {}
                 }
@@ -2526,7 +2523,6 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                         link,
                     ));
                     shell.capture_event();
-                    return;
                 }
             }
             Event::Keyboard(keyboard::Event::KeyPressed {

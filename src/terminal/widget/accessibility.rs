@@ -267,18 +267,16 @@ impl State {
         {
             return true;
         }
-        if let Event::Keyboard(keyboard::Event::KeyReleased { physical_key, .. }) = event {
-            if let Some(i) = barrier.keys.iter().position(|key| key == physical_key) {
+        if let Event::Keyboard(keyboard::Event::KeyReleased { physical_key, .. }) = event
+            && let Some(i) = barrier.keys.iter().position(|key| key == physical_key) {
                 barrier.keys.swap_remove(i);
                 return true;
             }
-        }
-        if let Event::Mouse(mouse::Event::ButtonReleased(button)) = event {
-            if let Some(i) = barrier.buttons.iter().position(|held| held == button) {
+        if let Event::Mouse(mouse::Event::ButtonReleased(button)) = event
+            && let Some(i) = barrier.buttons.iter().position(|held| held == button) {
                 barrier.buttons.swap_remove(i);
                 return true;
             }
-        }
         if !self.review {
             return false;
         }
@@ -290,7 +288,7 @@ impl State {
                 ..
             }) => {
                 if !barrier.keys.contains(physical_key) {
-                    barrier.keys.push(physical_key.clone());
+                    barrier.keys.push(*physical_key);
                 }
                 use keyboard::key::Named;
                 match key.as_ref() {

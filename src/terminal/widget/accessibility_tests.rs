@@ -358,7 +358,7 @@ fn real_widget_assistive_focus_selection_and_navigation_emit_no_pty_commands_on_
         let state = new_tree.state.downcast_ref::<WidgetState>();
         let mut a11y = state.a11y.borrow_mut();
         a11y.move_review(0, 1, false);
-        a11y.selection.clone().unwrap()
+        a11y.selection.unwrap()
     };
     dispatch(
         &mut new_widget,

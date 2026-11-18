@@ -2405,11 +2405,10 @@ impl Drop for UiActivationListener {
                 writeln!(stream, "shutdown")
             })
             .is_ok();
-        if let Some(thread) = self.thread.take() {
-            if woke {
+        if let Some(thread) = self.thread.take()
+            && woke {
                 let _ = thread.join();
             }
-        }
         let _ = fs::remove_file(&self.socket_path);
     }
 }

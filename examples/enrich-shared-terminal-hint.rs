@@ -44,11 +44,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("enrichment must retain a historical hint")?;
     let recipe =
         agent_recovery::observed_launch_from_hint(hint).ok_or("invalid historical resume hint")?;
-    if let Some(existing) = before.resume_hint.as_deref() {
-        if agent_recovery::observed_launch_from_hint(existing).as_ref() != Some(&recipe) {
+    if let Some(existing) = before.resume_hint.as_deref()
+        && agent_recovery::observed_launch_from_hint(existing).as_ref() != Some(&recipe) {
             return Err("hint enrichment cannot replace an exact provider thread".into());
         }
-    }
     let mut expected = request.before.clone();
     let CardKind::Terminal(terminal) = &mut expected.kind else {
         unreachable!()

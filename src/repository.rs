@@ -12770,8 +12770,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 )
                 .into());
             }
-            if let Some(consent) = &journal.pr_checkout {
-                if journal
+            if let Some(consent) = &journal.pr_checkout
+                && journal
                     .existing_branch_oid
                     .as_deref()
                     .is_some_and(|oid| oid != consent.expected_head().as_str())
@@ -12780,7 +12780,6 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                         "The existing local branch is not at the reviewed PR commit. Its history was preserved; choose another branch or explicitly open the local work instead".into(),
                     ).into());
                 }
-            }
             // The durable identity lease must win over changed repository state:
             // a replay is still a conflict after an earlier attempt made a branch.
             if journal.existing_branch_oid.is_some()
