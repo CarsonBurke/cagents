@@ -3550,19 +3550,18 @@ where
             }
         };
     }
-    if crate::device::is_remote() && !matches!(cli.command, TopCommand::Ui { .. })
-        && let Err(error) = crate::device::prepare() {
-            if crate::device::daemon_absent(&error) {
-                if stopping_daemon {
-                    emit_success(cli.global.json, already_stopped());
-                    return ExitCode::SUCCESS;
-                }
-                if reading_daemon_status {
-                    emit_success(cli.global.json, remote_daemon_stopped());
-                    return ExitCode::SUCCESS;
-                }
-                emit_error(cli.global.json, &AppError::new("daemon_not_running", error));
-                return ExitCode::FAILURE;
+    if crate::device::is_remote()
+        && !matches!(cli.command, TopCommand::Ui { .. })
+        && let Err(error) = crate::device::prepare()
+    {
+        if crate::device::daemon_absent(&error) {
+            if stopping_daemon {
+                emit_success(cli.global.json, already_stopped());
+                return ExitCode::SUCCESS;
+            }
+            if reading_daemon_status {
+                emit_success(cli.global.json, remote_daemon_stopped());
+                return ExitCode::SUCCESS;
             }
             emit_error(cli.global.json, &AppError::new("daemon_not_running", error));
             return ExitCode::FAILURE;
