@@ -1736,6 +1736,10 @@ impl RemoteActor {
         if self.0.recovering_inputs.load(Ordering::Acquire) {
             return Err(RECONNECTING_INPUT.into());
         }
+        #[cfg(debug_assertions)]
+        if let Some(outcome) = super::fixture_refusal::take() {
+            return Err(outcome.into());
+        }
         let payload = serde_json::to_value(payload).map_err(|error| error.to_string())?;
         let bytes = serde_json::to_vec(&payload).map_err(|error| error.to_string())?;
         let settle_deadline = Instant::now() + settle;
