@@ -1658,7 +1658,7 @@ fn cancel_at_ordinary_review_wait_policy_review_or_stop_ends_nothing() {
         let worker = thread::spawn(move || {
             let mut current_job = job(&path);
             let result = if prompt == "ordinary" {
-                confirmation::wait(&path, &mut current_job, |policy| {
+                confirmation::wait(&path, &mut current_job, true, |policy| {
                     source.observe_policy(policy)
                 })
                 .map(|_| ())
@@ -2395,7 +2395,7 @@ fn terminal_update_prompts_once_through_idle_wait_and_typed_stop() {
         let settled = source.settled.clone();
         let worker = thread::spawn(move || {
             let result = (|| {
-                let reviewed = confirmation::wait(&path, &mut worker_job, |policy| {
+                let reviewed = confirmation::wait(&path, &mut worker_job, true, |policy| {
                     source.observe_policy(policy)
                 })?;
                 quiesce_source(&path, &mut worker_job, &reviewed, true, &mut source)

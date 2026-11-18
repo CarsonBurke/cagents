@@ -792,7 +792,7 @@ fn quiesce_inner(
             .iter()
             .any(|item| item.disposition == impact::Disposition::WaitsForIdle)
     }) {
-        preview = confirmation::wait_approved(state, job, preview, |policy| {
+        preview = confirmation::wait_approved(state, job, terminal, preview, |policy| {
             source.observe_policy(policy)
         })?;
     }

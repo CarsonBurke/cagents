@@ -127,7 +127,7 @@ pub(super) fn perform(
         .is_some_and(|owner| owner.version_root != root);
     let inspection = reconcile_saved_sources(staged.identity.protocol, replaces_compatible_daemon)?;
     let context = ReviewContext::capture(installation)?;
-    let confirmed = confirmation::wait(state, job, |policy| {
+    let confirmed = confirmation::wait(state, job, terminal, |policy| {
         Ok(context.apply(observe(policy)?.with_inspection(&inspection)))
     })?;
     let mut recovery = recovery::Context::default();
