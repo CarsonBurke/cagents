@@ -11183,15 +11183,10 @@ fn deleted_working_directory_keeps_exact_history_readable_without_a_provider() {
     )
     .unwrap();
     handle.set_visible(true);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        if handle.snapshot(None).unwrap().exited {
-            break;
-        }
-        assert!(std::time::Instant::now() < deadline);
-        std::thread::yield_now();
-    }
-    let snapshot = handle.snapshot(None).unwrap();
+    // The reader's exit ends the saved frame it applies after start.
+    let snapshot = crate::test_timing::wait_for("the history reader to apply its frame", || {
+        handle.snapshot(None).filter(|snapshot| snapshot.exited)
+    });
     assert!(!snapshot.ready);
     assert!(snapshot.detail.contains("read-only"));
     assert_eq!(
