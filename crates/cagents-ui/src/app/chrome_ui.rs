@@ -484,12 +484,13 @@ mod tests {
         Arc::make_mut(&mut app.durable).cards.push(history);
         drop(app.sync_chrome());
         assert_eq!(app.chrome_ui.terminal_ordinals[&history_id], 3);
+        assert!(!app.card_chrome.contains_key(&history_id));
         let chrome = app.card_chrome.len();
         Arc::make_mut(&mut app.durable)
             .cards
             .retain(|card| card.id != history_id);
         drop(app.sync_chrome());
-        assert_eq!(app.card_chrome.len(), chrome, "it had no chrome to drop");
+        assert_eq!(app.card_chrome.len(), chrome);
         assert!(!app.chrome_ui.terminal_ordinals.contains_key(&history_id));
         let added = super::super::tests::terminal_card_state();
         let added_id = added.id;

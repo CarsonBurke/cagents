@@ -878,9 +878,12 @@ fn projection_tail_timing() {
         drop(app.project_workspace(false))
     });
     // Most full projections follow an edit, which gives the workspace a new
-    // address and so rebuilds the card index and prunes terminal numbers.
-    // The copy is the edit's own cost, timed alone so it can be subtracted.
-    timed("workspace copy of an edit", &mut app, &mut |app| {
+    // address, so every cache keyed on it is rebuilt: the card index, the
+    // terminal numbers' pruning and the sidebar's attention fold among them.
+    // With only weak references left, the edit moves the workspace rather
+    // than cloning it; that move is timed alone so it can be subtracted. A
+    // real edit while a save holds the workspace also clones it.
+    timed("workspace move of an edit", &mut app, &mut |app| {
         Arc::make_mut(&mut app.durable);
         app.card_indices_source = Arc::downgrade(&app.durable);
     });
