@@ -1409,6 +1409,7 @@ mod tests {
             after_busy: false,
             duplicate_of: None,
             busy_noticed: false,
+            discard_failures: 0,
         };
         assert!(login_caption(&login).starts_with("Finish signing in in the terminal"));
         // Between asks the phase is `Waiting` again, with the terminal ended.
