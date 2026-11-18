@@ -1124,6 +1124,15 @@ fn draft_start_backend() -> Option<(String, String, String)> {
 
 /// Why sending cannot move a conversation to another account yet: a
 /// background subagent holds it, which the daemon would refuse to close.
+/// Why an agent's card that never saved its provider's conversation ID can't
+/// reopen it. The agent stays open, so Close is how the reader ends it.
+fn unnamed_agent_conversation(session: &chat::Session) -> String {
+    format!(
+        "This agent's {} conversation can't be reopened because its ID was never saved. The agent is still open and nothing new was started. Close it to end the agent.",
+        session.launch.provider.label()
+    )
+}
+
 fn account_switch_hold(snapshot: &chat::Snapshot) -> Option<String> {
     let hold = snapshot.work_hold();
     let held = hold.subagents();
@@ -12501,7 +12510,10 @@ impl Cagents {
                             && matches!(
                                 self.card_state(target.card).map(|state| &state.kind),
                                 Some(CardKind::Chat(_))
-                            ) =>
+                            )
+                            // An agent ran there, and giving up its card
+                            // would end the agent and its conversation.
+                            && !self.chat_runs_as_open_agent(target.card, &attempt.session) =>
                     {
                         // A conversation its provider never named, and that
                         // no CLI terminal of the reader's holds, has nothing
@@ -12525,7 +12537,13 @@ impl Cagents {
                             self.retire_chat(target.card, None, Some(attempt.session)),
                         ]);
                     }
-                    Err(failure) => {
+                    Err(mut failure) => {
+                        if failure.recovery == chat::Recovery::Fresh
+                            && attempt.session.launch.session_id.is_none()
+                            && self.chat_runs_as_open_agent(target.card, &attempt.session)
+                        {
+                            failure.message = unnamed_agent_conversation(&attempt.session);
+                        }
                         let blocked = blocked_recovery::Reopen::of(failure.recovery);
                         if let Some(reopen) = blocked {
                             self.chat_ui.blocked_starts.insert(

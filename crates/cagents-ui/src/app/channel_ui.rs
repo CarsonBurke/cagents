@@ -118,26 +118,31 @@ fn close_sessions_with(sessions: Vec<CardKind>, open_agents: OpenAgents) -> Resu
         return Ok(());
     }
     let socket = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
-    let Some(mut client) = connect(&socket)? else {
+    let Some(client) = connect(&socket)? else {
         return no_daemon_close_result(&sessions);
     };
+    close_sessions_through(client, &socket, &sessions, open_agents)
+}
+
+/// [`close_sessions_with`] on a connected `client`; `socket` reconnects when a
+/// failed request leaves it out of step with the daemon.
+fn close_sessions_through(
+    mut client: crate::control::ControlClient,
+    socket: &std::path::Path,
+    sessions: &[CardKind],
+    open_agents: OpenAgents,
+) -> Result<(), String> {
     // Query live identities: a saved descriptor can predate an upgrade or handoff.
     let terminals = client.list().map_err(|error| error.to_string())?;
     let chats = client.list_chats().map_err(|error| error.to_string())?;
-    let terminal_ids = channel_terminal_ids(&sessions, &chats);
+    let terminal_ids = channel_terminal_ids(sessions, &chats);
     // Read only once a conversation turns out not to be live, the state a
     // daemon stop leaves an open agent's conversation in.
     let mut agents = None;
-    for kind in &sessions {
+    for kind in sessions {
         if let CardKind::Chat(session) = kind {
             let Some(live) = chats.iter().find(|live| live.id == session.id) else {
-                if may_have_retained_owner(session)
-                    || (open_agents == OpenAgents::Retire
-                        && bound_to_open_agent(
-                            session,
-                            read_open_agents(&mut agents, &mut client)?,
-                        ))
-                {
+                if closes_unhosted(session, open_agents, &mut agents, &mut client)? {
                     client
                         .close_retained_chat(session.clone())
                         .map_err(|error| error.reason())?;
@@ -162,11 +167,11 @@ fn close_sessions_with(sessions: Vec<CardKind>, open_agents: OpenAgents) -> Resu
                 // Only a fresh inventory may turn a close error into success,
                 // read on a fresh connection: a failed request can leave this
                 // one out of step with the daemon.
-                let Some(fresh) = connect(&socket)? else {
+                let Some(fresh) = connect(socket)? else {
                     return if may_have_retained_owner(live) {
                         Err(error.reason())
                     } else {
-                        no_daemon_close_result(&sessions)
+                        no_daemon_close_result(sessions)
                     };
                 };
                 client = fresh;
@@ -178,10 +183,7 @@ fn close_sessions_with(sessions: Vec<CardKind>, open_agents: OpenAgents) -> Resu
                 {
                     return Err(error.reason());
                 }
-                if may_have_retained_owner(live)
-                    || (open_agents == OpenAgents::Retire
-                        && bound_to_open_agent(live, read_open_agents(&mut agents, &mut client)?))
-                {
+                if closes_unhosted(live, open_agents, &mut agents, &mut client)? {
                     // Disappearance from actor inventory can mean retained
                     // ownership, not process exit. Demand its close receipt.
                     client
@@ -203,8 +205,8 @@ fn close_sessions_with(sessions: Vec<CardKind>, open_agents: OpenAgents) -> Resu
                 other => Err(format!("Channel terminal could not be closed: {other:?}")),
             });
         if let Err(error) = result {
-            let Some(fresh) = connect(&socket)? else {
-                return no_daemon_close_result(&sessions);
+            let Some(fresh) = connect(socket)? else {
+                return no_daemon_close_result(sessions);
             };
             client = fresh;
             let still_running = client
@@ -221,6 +223,27 @@ fn close_sessions_with(sessions: Vec<CardKind>, open_agents: OpenAgents) -> Resu
         }
     }
     Ok(())
+}
+
+/// Whether a conversation no actor hosts needs the daemon's retained close.
+/// A retained owner may still hold it, and closing for good also retires an
+/// open agent that runs as it. That close always retires such an agent, so
+/// giving the conversation up while keeping agents leaves it to the agent.
+fn closes_unhosted(
+    session: &crate::chat::Session,
+    open_agents: OpenAgents,
+    agents: &mut Option<Vec<crate::agent_execution::Agent>>,
+    client: &mut crate::control::ControlClient,
+) -> Result<bool, String> {
+    let retained = may_have_retained_owner(session);
+    Ok(match open_agents {
+        OpenAgents::Keep => {
+            retained && !bound_to_open_agent(session, read_open_agents(agents, client)?)
+        }
+        OpenAgents::Retire => {
+            retained || bound_to_open_agent(session, read_open_agents(agents, client)?)
+        }
+    })
 }
 
 fn may_have_retained_owner(session: &crate::chat::Session) -> bool {
@@ -4251,6 +4274,22 @@ pub(in crate::app) mod close_tests {
             crate::terminal::ipc::ServerResponse,
         )>,
     ) -> Result<(), String> {
+        let (mut client, server) = scripted_daemon(source, steps);
+        let result = close_captured_chat_with(&mut client, source);
+        drop(client);
+        server.join().unwrap();
+        result
+    }
+
+    /// A daemon that answers exactly `steps`, in order, and fails on any
+    /// request after them.
+    fn scripted_daemon(
+        source: &crate::chat::Session,
+        steps: Vec<(
+            crate::terminal::ipc::ClientRequest,
+            crate::terminal::ipc::ServerResponse,
+        )>,
+    ) -> (crate::control::ControlClient, std::thread::JoinHandle<()>) {
         use crate::terminal::ipc::{
             ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage,
             ServerResponse, read_frame, write_frame,
@@ -4342,11 +4381,66 @@ pub(in crate::app) mod close_tests {
                 );
             }
         });
-        let mut client = crate::control::ControlClient::from_stream(stream).unwrap();
-        let result = close_captured_chat_with(&mut client, source);
-        drop(client);
-        server.join().unwrap();
-        result
+        (
+            crate::control::ControlClient::from_stream(stream).unwrap(),
+            server,
+        )
+    }
+
+    /// #3095: giving up a conversation that failed to start must not retire
+    /// the agent that runs as it, which the daemon's retained close does.
+    #[test]
+    fn giving_up_an_unhosted_conversation_keeps_the_agent_that_runs_as_it() {
+        use crate::terminal::ipc::{ClientRequest, ServerResponse};
+        let mut source = captured_source();
+        source.launch.session_id = None;
+        source.native_continuity = crate::chat::NativeContinuity::Durable {
+            provider_version: "fixture".into(),
+        };
+        let close = |open_agents, steps| {
+            let (client, server) = scripted_daemon(&source, steps);
+            let result = close_sessions_through(
+                client,
+                std::path::Path::new("/nonexistent/daemon.sock"),
+                &[CardKind::Chat(source.clone())],
+                open_agents,
+            );
+            server.join().unwrap();
+            result
+        };
+        let close_retained = || {
+            (
+                ClientRequest::ChatCloseRetained {
+                    session: source.clone(),
+                },
+                ServerResponse::Accepted,
+            )
+        };
+        // The agent keeps its conversation and whatever still holds it.
+        close(
+            OpenAgents::Keep,
+            vec![
+                (ClientRequest::ChatList, listed(vec![])),
+                (read_agents(), model(vec![agent(&source)])),
+            ],
+        )
+        .unwrap();
+        // Without an agent, the retained owner is still closed.
+        close(
+            OpenAgents::Keep,
+            vec![
+                (ClientRequest::ChatList, listed(vec![])),
+                (read_agents(), model(vec![])),
+                close_retained(),
+            ],
+        )
+        .unwrap();
+        // Closing the conversation for good still retires its agent.
+        close(
+            OpenAgents::Retire,
+            vec![(ClientRequest::ChatList, listed(vec![])), close_retained()],
+        )
+        .unwrap();
     }
 
     fn paired_source() -> crate::chat::Session {

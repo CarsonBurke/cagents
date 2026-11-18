@@ -16176,6 +16176,50 @@ fn a_never_named_conversation_whose_daemon_is_gone_reopens_as_a_draft() {
     assert!(app.chat_offers_fresh_conversation(card));
 }
 
+/// #3095: an agent's Codex conversation whose thread ID was never saved
+/// came back from an abandoned update as a draft, and giving up the old
+/// conversation retired the agent. The card keeps the conversation and says
+/// why it can't reopen; the agent stays open.
+#[test]
+fn an_agents_never_named_conversation_stays_its_card_when_its_daemon_is_gone() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = live_chat(&mut app, None);
+    let session = chat_runtime(&app, card).session.clone();
+    assert!(!session.is_unstarted());
+    assert!(session.launch.session_id.is_none());
+    app.workspace_model.agents = vec![crate::app::channel_ui::close_tests::agent(&session)];
+    app.chat_forget(card);
+    app.cards.insert(card, CardRuntime::Loading);
+    let _ = app.open_chat(card, session.clone(), chat::Intent::Restore);
+    let target = chat_runtime_attempt(&app, card);
+    answer_start(
+        &mut app,
+        target,
+        Err(chat::StartFailure::fresh("fixture: daemon gone")),
+    );
+    assert!(
+        app.chat_ui
+            .retiring
+            .iter()
+            .all(|retiring| retiring.card != card),
+        "nothing gives up the agent's conversation"
+    );
+    assert_eq!(
+        app.card_state(card).unwrap().kind,
+        CardKind::Chat(session.clone()),
+        "the card still names the conversation the agent ran"
+    );
+    let runtime = chat_runtime(&app, card);
+    assert!(!runtime.is_draft());
+    assert!(!runtime.session.is_unstarted());
+    assert_eq!(
+        attach_failure_details(&app, card),
+        Some(super::unnamed_agent_conversation(&session))
+    );
+    // Starting over would retire the agent's pane, so Close is its recovery.
+    assert!(!app.chat_offers_fresh_conversation(card));
+}
+
 #[test]
 fn attention_session_click_reveals_the_parent_before_reading_its_notice() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
