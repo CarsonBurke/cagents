@@ -4444,15 +4444,41 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                     "pass --yes to archive the interrupted checkpoint; its conversations will require explicit manual recovery",
                 ));
             }
-            let archive = crate::upgrade::abandon()
+            let abandoned = crate::upgrade::abandon()
                 .map_err(|error| AppError::new("upgrade_recovery", error))?;
+            let mut human = format!(
+                "Archived checkpoint at {}; no processes resumed. Recover exact conversations manually after checking their existing writers",
+                abandoned.archive.display()
+            );
+            match &abandoned.checkpoint_only {
+                Some(identities) if identities.is_empty() => {}
+                Some(identities) => {
+                    human.push_str(&format!(
+                        ".\nOnly the checkpoint records the provider conversation of {} chat(s). The next daemon start saves each to the agent and pane still showing it, and logs any it cannot:",
+                        identities.len()
+                    ));
+                    for identity in identities {
+                        human.push_str(&format!(
+                            "\n  {} {} {} in {}",
+                            identity.id,
+                            identity.provider.label(),
+                            identity.conversation,
+                            identity.working_directory.display()
+                        ));
+                    }
+                }
+                None => human.push_str(
+                    ".\nThe checkpoint could not be read, so conversations only it identified may not reconnect",
+                ),
+            }
             Ok(CommandOutput {
                 command: "daemon.abandon_upgrade",
-                data: json!({ "archive": archive, "resumed": false }),
-                human: format!(
-                    "Archived checkpoint at {}; no processes resumed. Recover exact conversations manually after checking their existing writers",
-                    archive.display()
-                ),
+                data: json!({
+                    "archive": abandoned.archive,
+                    "resumed": false,
+                    "checkpoint_only_identities": abandoned.checkpoint_only,
+                }),
+                human,
             })
         }
         DaemonCommand::StopForRebuild {

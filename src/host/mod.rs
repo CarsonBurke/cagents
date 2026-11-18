@@ -404,6 +404,45 @@ pub(crate) fn observe_fixture_startup(phase: &'static str, error: Option<&str>) 
     exit_drain_tests::observe_startup(phase, error);
 }
 
+/// Saves the conversation IDs an abandoned update's checkpoint alone records,
+/// so the chats they name resume their conversations rather than start new
+/// ones. The archive stays as evidence; a later start finds nothing to save.
+fn save_abandoned_identities(registry: &mut model::Registry) {
+    let checkpoint = crate::upgrade::handoff::Store::existing()
+        .and_then(|store| store.map(|store| store.load_abandoned()).transpose())
+        .map(Option::flatten);
+    let checkpoint = match checkpoint {
+        Ok(Some(checkpoint)) => checkpoint,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(%error, "cannot read the abandoned update's conversation IDs");
+            return;
+        }
+    };
+    match registry.save_checkpoint_identities(&checkpoint.chats) {
+        Ok(saved) => {
+            if !saved.written.is_empty() {
+                tracing::info!(chats = ?saved.written, "saved conversation IDs only the abandoned update recorded");
+            }
+            for chat in saved.unrecoverable {
+                let conversation = checkpoint
+                    .chats
+                    .iter()
+                    .find(|entry| entry.source.id == chat)
+                    .and_then(|entry| entry.launch.session_id.as_deref());
+                tracing::warn!(
+                    %chat,
+                    conversation,
+                    "the chat's pane or agent now shows another process; resume its conversation manually"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "cannot save the abandoned update's conversation IDs");
+        }
+    }
+}
+
 pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("host run entered", None);
@@ -450,10 +489,13 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("opening workspace model", None);
     match model::Registry::open() {
-        Ok(registry) => host
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .install_model(registry),
+        Ok(mut registry) => {
+            // Before any client can restore a chat that would otherwise start over.
+            save_abandoned_identities(&mut registry);
+            host.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .install_model(registry)
+        }
         Err(error) => {
             tracing::error!(%error, "the shared workspace model is unavailable; channels will \
                                     not be shared between windows")

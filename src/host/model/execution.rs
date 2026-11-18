@@ -32,6 +32,18 @@ impl From<&str> for AuthorityError {
     }
 }
 
+/// What [`Registry::save_checkpoint_identities`] did with an abandoned
+/// checkpoint's conversation IDs. Chats already holding theirs, or no longer
+/// shown anywhere, are in neither list.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(in crate::host) struct IdentityWriteback {
+    /// Chats whose agent or pane now holds the provider's ID.
+    pub written: Vec<crate::model::TerminalId>,
+    /// Chats an open agent or pane shows as another process without an ID,
+    /// so the checkpoint's ID could not be attributed to it.
+    pub unrecoverable: Vec<crate::model::TerminalId>,
+}
+
 /// An identity-only projection: `replacement` is `source` with nothing changed
 /// but the conversation ID and native continuity its provider confirmed. It
 /// covers retained Claude helpers and daemon-hosted Codex threads on their own
@@ -554,6 +566,96 @@ impl Registry {
         id: crate::model::TerminalId,
     ) -> Result<Option<Agent>, String> {
         agent_for_session_in(&self.db, id)
+    }
+
+    /// Saves conversation IDs that exist only in an abandoned update's
+    /// checkpoint to the agents and panes still showing the exact process the
+    /// checkpoint issued them for. Without it, a restored chat whose provider
+    /// named its thread after the descriptor was saved finds no ID and starts
+    /// a new conversation. Repeating this changes nothing.
+    pub(in crate::host) fn save_checkpoint_identities(
+        &mut self,
+        chats: &[crate::upgrade::handoff::Chat],
+    ) -> Result<IdentityWriteback, String> {
+        let mut outcome = IdentityWriteback::default();
+        for chat in chats {
+            let Some(confirmed) = chat.launch.session_id.as_deref() else {
+                continue;
+            };
+            // The descriptors the previous daemons issued before the provider
+            // named the thread; one that already had an ID carries it.
+            let issued: Vec<_> = chat
+                .previous_sources
+                .iter()
+                .map(|previous| &previous.source)
+                .chain([&chat.source])
+                .filter(|source| source.id == chat.source.id && source.launch.session_id.is_none())
+                .cloned()
+                .collect();
+            if issued.is_empty() {
+                continue;
+            }
+            match self.save_checkpoint_identity(chat.source.id, &issued, confirmed)? {
+                Some(true) => outcome.written.push(chat.source.id),
+                Some(false) => {}
+                None => outcome.unrecoverable.push(chat.source.id),
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// `Some(changed)` once every open agent and pane naming the chat holds an
+    /// ID, `None` when one shows a different process with none.
+    fn save_checkpoint_identity(
+        &mut self,
+        id: crate::model::TerminalId,
+        issued: &[crate::chat::Session],
+        confirmed: &str,
+    ) -> Result<Option<bool>, String> {
+        let learn = |current: &crate::chat::Session| {
+            let mut learned = current.clone();
+            learned.launch.session_id = Some(confirmed.to_owned());
+            (issued.contains(current) && confirmed_identity_update(current, &learned))
+                .then_some(learned)
+        };
+        let mut changed = false;
+        if let Some(agent) = self.agent_for_session(id)?
+            && !agent.closed
+            && let Some(HostedSession::Chat(bound)) = agent.session
+            && bound.launch.session_id.is_none()
+        {
+            let Some(learned) = learn(&bound) else {
+                return Ok(None);
+            };
+            changed |= self.adopt_authenticated_agent_session(
+                &[HostedSession::Chat(bound)],
+                &HostedSession::Chat(learned),
+            )?;
+        }
+        // A pane no agent owns, or an agent's pane that did not rotate with it.
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let pane = match super::views::chat_pane_session(&tx, id)? {
+            Some(current) if current.launch.session_id.is_none() => {
+                let Some(learned) = learn(&current) else {
+                    return Ok(None);
+                };
+                if !super::views::learn_chat_pane_identity(&tx, &current, &learned)? {
+                    return Ok(None);
+                }
+                tx.execute(
+                    "UPDATE metadata SET sequence = sequence + 1 WHERE key = 0",
+                    [],
+                )
+                .map_err(|error| error.to_string())?;
+                true
+            }
+            _ => false,
+        };
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(Some(changed || pane))
     }
 
     /// Archive a completed execution reference from a kernel boot that cannot
@@ -5671,15 +5773,7 @@ mod tests {
 
     #[test]
     fn confirmed_identity_update_learns_only_an_owned_codex_threads_first_id() {
-        let HostedSession::Chat(mut codex) = source() else {
-            unreachable!()
-        };
-        codex.launch.provider = Provider::Codex;
-        codex.launch.recipe.program = "codex".into();
-        codex.launch.recipe.arguments = vec!["--remote".into(), "unix://".into()];
-        codex.launch.session_id = None;
-        let proof = codex.proof.clone().unwrap();
-        assert!(codex.claim_owned_codex_listener(std::path::Path::new("/run/fixture"), &proof));
+        let codex = owned_codex();
         let thread = uuid::Uuid::new_v4().to_string();
         let learned = |source: &crate::chat::Session| {
             let mut next = source.clone();
@@ -5727,6 +5821,122 @@ mod tests {
         };
         claude.launch.session_id = None;
         assert!(!confirmed_identity_update(&claude, &learned(&claude)));
+    }
+
+    /// A daemon-hosted Codex thread on its own listener, before its provider
+    /// names the thread.
+    fn owned_codex() -> crate::chat::Session {
+        let HostedSession::Chat(mut codex) = source() else {
+            unreachable!()
+        };
+        codex.launch.provider = Provider::Codex;
+        codex.launch.recipe.program = "codex".into();
+        codex.launch.recipe.arguments = vec!["--remote".into(), "unix://".into()];
+        codex.launch.session_id = None;
+        let proof = codex.proof.clone().unwrap();
+        assert!(codex.claim_owned_codex_listener(std::path::Path::new("/run/fixture"), &proof));
+        codex
+    }
+
+    fn with_thread(source: &crate::chat::Session, thread: &str) -> crate::chat::Session {
+        let mut named = source.clone();
+        named.launch.session_id = Some(thread.into());
+        named
+    }
+
+    /// #3095: an abandoned update's checkpoint was the only record of the
+    /// threads its Codex agents had begun, so their restored chats started
+    /// over and retired the agents.
+    #[test]
+    fn abandoned_checkpoint_identities_reach_only_chats_still_showing_their_process() {
+        use crate::{
+            model::{CardId, CardKind},
+            upgrade::handoff,
+            workspace_model::views::{Pane, Scope},
+        };
+        let (mut registry, _directory, mut request) = fixture();
+        if let Destination::New(spec) = &mut request.destination {
+            spec.provider = Provider::Codex;
+        }
+        let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+        let agent_chat = owned_codex();
+        registry
+            .bind_agent(
+                accepted.agent.id,
+                None,
+                HostedSession::Chat(agent_chat.clone()),
+            )
+            .unwrap();
+        // A chat pane no agent owns.
+        let plain = owned_codex();
+        // A pane since reset to a draft that would start a new conversation.
+        let drafted = owned_codex();
+        let mut draft = drafted.clone();
+        draft.proof = None;
+        // A pane that learned its ID from a window already.
+        let known = owned_codex();
+        // A chat no pane or agent shows any more.
+        let closed = owned_codex();
+        let thread = |_| uuid::Uuid::new_v4().to_string();
+        let threads: Vec<String> = (0..5).map(thread).collect();
+        let pane = |id: CardId, chat: &crate::chat::Session| Pane {
+            id,
+            title: "Codex".into(),
+            user_title: None,
+            width_fraction: 0.25,
+            pending_terminal_start: false,
+            kind: CardKind::Chat(chat.clone()),
+            scope: None,
+        };
+        let agent_pane = CardId::from_uuid(accepted.agent.id.as_uuid());
+        registry
+            .apply(&ModelEdit::SeedView {
+                scope: Scope::Channel(accepted.agent.channel().unwrap()),
+                panes: vec![
+                    pane(agent_pane, &agent_chat),
+                    pane(CardId::new(), &plain),
+                    pane(CardId::new(), &draft),
+                    pane(CardId::new(), &with_thread(&known, &threads[3])),
+                ],
+                closed: vec![],
+            })
+            .unwrap();
+        let checkpoint: Vec<_> = [&agent_chat, &plain, &drafted, &known, &closed]
+            .into_iter()
+            .zip(&threads)
+            .map(|(source, thread)| handoff::Chat {
+                source: source.clone(),
+                previous_sources: Vec::new(),
+                launch: with_thread(source, thread).launch,
+            })
+            .collect();
+
+        let saved = registry.save_checkpoint_identities(&checkpoint).unwrap();
+        assert_eq!(
+            saved,
+            IdentityWriteback {
+                written: vec![agent_chat.id, plain.id],
+                unrecoverable: vec![drafted.id],
+            }
+        );
+        let learned = with_thread(&agent_chat, &threads[0]);
+        assert_eq!(
+            registry.agent(accepted.agent.id).unwrap().session,
+            Some(HostedSession::Chat(learned.clone()))
+        );
+        let shown = |id| super::super::views::chat_pane_session(&registry.db, id).unwrap();
+        assert_eq!(shown(agent_chat.id), Some(learned));
+        assert_eq!(shown(plain.id), Some(with_thread(&plain, &threads[1])));
+        assert_eq!(shown(drafted.id), Some(draft));
+        assert_eq!(shown(known.id), Some(with_thread(&known, &threads[3])));
+        // Every later start reads the same archive and changes nothing.
+        assert_eq!(
+            registry.save_checkpoint_identities(&checkpoint).unwrap(),
+            IdentityWriteback {
+                written: Vec::new(),
+                unrecoverable: vec![drafted.id],
+            }
+        );
     }
 
     #[test]

@@ -427,7 +427,11 @@ startup and keep it replayable.
 An interrupted checkpoint is never blindly replayed. After confirming that every
 previous provider writer has stopped, `cagents daemon abandon-upgrade --yes`
 archives the retained checkpoint without resuming any process. It requires a
-stopped daemon and refuses to overwrite an earlier archive. Reopen the exact
+stopped daemon and refuses to overwrite an earlier archive. A provider may have
+named a conversation's thread only after its pane was saved, leaving the
+checkpoint as the only record of that ID; the command lists those
+conversations, and the next daemon start saves each ID to the agent and pane
+still showing that exact chat, logging any it cannot. Reopen the remaining
 conversations manually from their provider session storage; do not delete
 checkpoint evidence just to get past an ownership error.
 
