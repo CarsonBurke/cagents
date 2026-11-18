@@ -5234,6 +5234,11 @@ impl PullRequestPane {
     }
 }
 
+/// Whether a pull request card `width` wide hides its side panel.
+fn review_files_collapsed(pane: &PullRequestPane, width: f32) -> bool {
+    pane.file_panel_collapsed.unwrap_or(width < 640.0)
+}
+
 /// Static chrome strings for a card kind.
 struct CardLabels {
     type_label: &'static str,
@@ -7637,14 +7642,24 @@ impl Cagents {
         id: CardId,
         pane: &'a PullRequestPane,
     ) -> Element<'a, Message> {
-        // The strip already tracks the rendered width, including animations.
-        // Responsive would hide the review and its controls from AccessKit.
-        let width = self
-            .workspace
+        self.pull_request_card_layout(id, pane, self.pull_request_card_width(id))
+    }
+
+    /// The pull request card's width. The strip already tracks the rendered
+    /// width, including animations; Responsive would hide the review and its
+    /// controls from AccessKit.
+    fn pull_request_card_width(&self, id: CardId) -> f32 {
+        self.workspace
             .presentation_geometry()
             .card(id)
-            .map_or(self.workspace.viewport_width(), |card| card.width());
-        self.pull_request_card_layout(id, pane, width)
+            .map_or(self.workspace.viewport_width(), |card| card.width())
+    }
+
+    /// Whether the pull request card shows its side panel, which holds the
+    /// review's header, summary and files: the person's choice, or else
+    /// whether the card is wide enough for it.
+    fn pull_request_side_shown(&self, id: CardId, pane: &PullRequestPane) -> bool {
+        !review_files_collapsed(pane, self.pull_request_card_width(id))
     }
 
     fn pull_request_card_layout<'a>(
@@ -7653,7 +7668,7 @@ impl Cagents {
         pane: &'a PullRequestPane,
         width: f32,
     ) -> Element<'a, Message> {
-        let collapsed = pane.file_panel_collapsed.unwrap_or(width < 640.0);
+        let collapsed = review_files_collapsed(pane, width);
         let max_width = (width - 320.0).clamp(120.0, 600.0);
         let panel_width = pane.file_panel_width.clamp(120.0, max_width);
         let modal_open = self.modal_is_open();
