@@ -11714,10 +11714,12 @@ fn composer_is_one_row_and_offers_stop_while_busy_with_an_empty_draft() {
 
 /// The sequence from #3119: four agents started, a thought with nothing to
 /// read, a fifth agent, then the reply. Every row of the timeline sits the
-/// same distance below the one before it, whether a thought, a group
-/// boundary or nothing at all falls between them; the reply sits the same
-/// distance below the last row however it was reached; and the rows' words,
-/// the agents' names, their states and the reply are set at one size.
+/// same distance below the one before it, whether a hidden thought, a shown
+/// one, a group boundary or nothing at all falls between them, and so do the
+/// reports of agents that finished, though each opens an exchange; the reply
+/// sits the same distance below the last row however it was reached; and the
+/// rows' words, the agents' names, their states and the reply are set at one
+/// size.
 #[test]
 fn a_timeline_keeps_one_pitch_and_one_size_down_to_the_reply() {
     use iced::advanced::{
@@ -11809,7 +11811,22 @@ fn a_timeline_keeps_one_pitch_and_one_size_down_to_the_reply() {
             output: String::new(),
         },
     );
-    let sequence = |between: Option<chat::Item>| {
+    // What a finished background agent reports, which opens an exchange of
+    // its own and is drawn as a row of the timeline.
+    let finished = |n: usize| {
+        item(
+            &format!("report-{n}"),
+            chat::Role::User,
+            ItemContent::Delivery {
+                kind: chat::DeliveryKind::Report,
+                from: String::new(),
+                sender: String::new(),
+                summary: format!("Agent \"Design agent-{n}\" finished"),
+                body: "The design is drafted.".into(),
+            },
+        )
+    };
+    let sequence = |between: Option<chat::Item>, reports: usize| {
         let mut items = vec![text(
             "prompt",
             chat::Role::User,
@@ -11819,26 +11836,46 @@ fn a_timeline_keeps_one_pitch_and_one_size_down_to_the_reply() {
         items.extend((1..=4).map(|n| started(&format!("agent-{n}"), "general-purpose")));
         items.extend(between);
         items.push(started("agent-5", "sol-design2"));
+        items.extend((1..=reports).map(finished));
         items.push(text("reply", chat::Role::Assistant, REPLY, false));
         items
     };
+    // A thought with nothing to read draws no row; one with a headline does.
     let thought = text("thought", chat::Role::Assistant, "", true);
+    let headline = text(
+        "headline",
+        chat::Role::Assistant,
+        "**Weighing the drafts**",
+        true,
+    );
     let scenarios = [
         (
-            "a thought between",
-            sequence(Some(thought.clone())),
+            "a hidden thought between",
+            sequence(Some(thought.clone()), 0),
             false,
             780.0,
         ),
-        ("nothing between", sequence(None), false, 780.0),
+        (
+            "a thought between",
+            sequence(Some(headline), 0),
+            false,
+            780.0,
+        ),
+        ("nothing between", sequence(None, 0), false, 780.0),
         (
             "a group boundary",
-            sequence(Some(command.clone())),
+            sequence(Some(command.clone()), 0),
             false,
             780.0,
         ),
-        ("an open group", sequence(Some(command)), true, 780.0),
-        ("a narrow pane", sequence(Some(thought)), false, 220.0),
+        ("an open group", sequence(Some(command), 0), true, 780.0),
+        (
+            "agents reporting",
+            sequence(Some(thought.clone()), 2),
+            false,
+            780.0,
+        ),
+        ("a narrow pane", sequence(Some(thought), 0), false, 220.0),
     ];
     let renderer = crate::app::tests::headless_renderer();
     let shortcuts = crate::settings::KeyboardShortcuts::default();
@@ -11899,13 +11936,20 @@ fn a_timeline_keeps_one_pitch_and_one_size_down_to_the_reply() {
             .iter()
             .filter(|(text, _)| {
                 text == "Started"
+                    || text.starts_with("Agent \"")
                     || text.starts_with("Thought")
                     || text.starts_with("Thinking")
                     || text.contains("the fixture")
+                    || text.starts_with("Weighing the drafts")
                     || summary.as_deref() == Some(text.as_str())
             })
             .collect();
-        let expected = 5 + usize::from(scenario != "nothing between") + usize::from(open);
+        let expected =
+            5 + usize::from(matches!(
+                scenario,
+                "a thought between" | "a group boundary" | "an open group"
+            )) + usize::from(open)
+                + 2 * usize::from(scenario == "agents reporting");
         assert_eq!(rows.len(), expected, "{scenario}: {rows:?}");
         let tops: Vec<f32> = rows.iter().map(|(_, bounds)| bounds.y).collect();
         for pair in tops.windows(2) {

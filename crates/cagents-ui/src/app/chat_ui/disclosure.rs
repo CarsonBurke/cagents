@@ -110,6 +110,15 @@ fn anchor(path: &str) -> usize {
     if anchor < path.len() { anchor } else { 0 }
 }
 
+/// What a row's trailing cell says.
+pub(super) enum Trailing {
+    /// How long the work took, which is secondary, as a timestamp is.
+    Elapsed(String),
+    /// What became of it, such as "finished": the row's state, read at the
+    /// transcript's size as an agent's state is.
+    Outcome(String),
+}
+
 /// One disclosure row. Its accessible name carries the trailing metadata,
 /// which is drawn in a cell of its own.
 pub(super) fn row(
@@ -125,7 +134,15 @@ pub(super) fn row(
         Some(trailing) => format!("{name} · {trailing}"),
         None => name,
     };
-    row_named(label, name, icon, status, trailing, expanded, toggle)
+    row_named(
+        label,
+        name,
+        icon,
+        status,
+        trailing.map(Trailing::Elapsed),
+        expanded,
+        toggle,
+    )
 }
 
 /// A row whose accessible name already includes its trailing metadata.
@@ -136,7 +153,7 @@ pub(super) fn row_named(
     name: String,
     icon: Icon,
     status: Option<chat::ToolStatus>,
-    trailing: Option<String>,
+    trailing: Option<Trailing>,
     expanded: Option<bool>,
     toggle: Option<Action>,
 ) -> Element<'static, Message> {
@@ -160,8 +177,12 @@ pub(super) fn row_named(
     };
     let mut cells = vec![indicator, text];
     if let Some(trailing) = trailing {
+        let trailing = match trailing {
+            Trailing::Elapsed(elapsed) => design::caption(elapsed),
+            Trailing::Outcome(outcome) => design::transcript(outcome),
+        };
         cells.push(
-            design::caption(trailing)
+            trailing
                 .class(cosmic::theme::Text::Custom(design::muted_text))
                 .wrapping(iced::widget::text::Wrapping::None)
                 .into(),

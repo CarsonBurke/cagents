@@ -1561,6 +1561,26 @@ struct Place {
     branch: Option<String>,
 }
 
+/// A monitor's event, whose body is shown without being opened.
+fn delivery_monitor(kind: chat::DeliveryKind, summary: &str) -> bool {
+    kind == chat::DeliveryKind::Notice && summary.starts_with("Monitor event: ")
+}
+
+/// Whether a delivery has more to show than its heading's first line: a
+/// prepared notice's body, or a message's body, the rest of its heading or
+/// its sender.
+fn delivery_has_body(
+    notice: Option<&literal_content::NoticeData>,
+    body: &str,
+    remainder: &str,
+    sender: &str,
+) -> bool {
+    notice.map_or_else(
+        || !body.is_empty() || !remainder.is_empty() || !sender.is_empty(),
+        |notice| notice.body.full.len() != 0,
+    )
+}
+
 fn delivery_command_outcome(heading: &str) -> Option<(&str, &str)> {
     let (title, outcome) = heading
         .strip_prefix("Background command ")
@@ -2757,7 +2777,16 @@ impl Runtime {
                 if reasoning::contentless(&item.content) {
                     continue;
                 }
-                let footer = if (item.role == chat::Role::User && !item.content.is_step())
+                // Drawn by delivery_view, as in the main transcript.
+                let delivery = item.role == chat::Role::User
+                    && matches!(item.content, ItemContent::Delivery { .. });
+                let footer = if delivery {
+                    if self.delivery_detail_shown(item) {
+                        MESSAGE_ACTION_FOOTER
+                    } else {
+                        0.0
+                    }
+                } else if (item.role == chat::Role::User && !item.content.is_step())
                     || matches!(item.content, ItemContent::Text { .. })
                 {
                     MESSAGE_ACTION_FOOTER
@@ -2784,7 +2813,9 @@ impl Runtime {
                 });
                 // The subagent's own messages to it open its exchanges; the
                 // rest of its work keeps the main transcript's rhythm.
-                let rhythm = if item.role == chat::Role::User && !item.content.is_step() {
+                let rhythm = if delivery {
+                    Rhythm::Line
+                } else if item.role == chat::Role::User && !item.content.is_step() {
                     Rhythm::Opening
                 } else {
                     let card = cached
@@ -5039,7 +5070,11 @@ impl Runtime {
                 TurnPart::Prompt(index) => {
                     let item = &items[index];
                     aliases.push(scroll::item_id(&item.id));
-                    (estimate(item), MESSAGE_ACTION_FOOTER)
+                    let footer = match item.content {
+                        ItemContent::Delivery { .. } if !self.delivery_detail_shown(item) => 0.0,
+                        _ => MESSAGE_ACTION_FOOTER,
+                    };
+                    (estimate(item), footer)
                 }
                 TurnPart::Card(prose) | TurnPart::Prose(prose) => {
                     let placed = &turn.prose[prose];
@@ -5059,6 +5094,13 @@ impl Runtime {
             // and the row above it are, so the timeline reads as one list
             // across the groups it is folded into.
             let rhythm = match part {
+                // What another agent or a background task sent is a line
+                // of the timeline, like the steps that started it.
+                TurnPart::Prompt(index)
+                    if matches!(items[index].content, ItemContent::Delivery { .. }) =>
+                {
+                    Rhythm::Line
+                }
                 _ if rows == 0 && !turn.prompt.is_empty() => Rhythm::Opening,
                 TurnPart::Prompt(_) => Rhythm::Block,
                 TurnPart::Steps | TurnPart::Card(_) => Rhythm::Line,
@@ -6293,11 +6335,8 @@ impl Runtime {
             .map_or((heading.as_str(), ""), |(first, rest)| {
                 (first, rest.trim_start_matches(['\r', '\n']))
             });
-        let monitor = *kind == chat::DeliveryKind::Notice && summary.starts_with("Monitor event: ");
-        let has_body = notice.map_or_else(
-            || !body.is_empty() || !remainder.is_empty() || !sender.is_empty(),
-            |notice| notice.body.full.len() != 0,
-        );
+        let monitor = delivery_monitor(*kind, summary);
+        let has_body = delivery_has_body(notice, body, remainder, sender);
         // Only explicit command/report outcomes are errors. A peer's prose
         // mentioning a failure is ordinary delivered content.
         let report_outcome = (*kind == chat::DeliveryKind::Report)
@@ -6340,11 +6379,12 @@ impl Runtime {
             },
             glyph,
             failed.then_some(chat::ToolStatus::Failed),
-            outcome.map(str::to_owned),
+            outcome.map(|outcome| disclosure::Trailing::Outcome(outcome.to_owned())),
             disclosure.then_some(expanded),
             disclosure.then(|| Action::Toggle(self.target, item.id.clone())),
         );
-        let mut rows = vec![crate::interaction::tooltip(heading_row, heading.clone())];
+        let heading_row = crate::interaction::tooltip(heading_row, heading.clone());
+        let mut rows = Vec::new();
         if (expanded || monitor) && has_body {
             if expanded
                 && *kind != chat::DeliveryKind::Notice
@@ -6412,16 +6452,67 @@ impl Runtime {
                 );
             }
         }
-        widget::container(message_actions(
-            widget::column::with_children(rows)
-                .spacing(step::GAP_XS)
-                .into(),
-            self.message_copy(item),
-            Alignment::Start,
-        ))
-        .max_width(design::READABLE_MEASURE)
-        .width(Length::Fill)
-        .into()
+        // Like a step or a thought, a delivery is a line of the timeline
+        // until its detail is open, and only that detail carries the
+        // message's actions beneath it.
+        let body: Element<'static, Message> = if rows.is_empty() {
+            heading_row
+        } else {
+            widget::column::with_children(vec![
+                heading_row,
+                message_actions(
+                    widget::column::with_children(rows)
+                        .spacing(step::GAP_XS)
+                        .into(),
+                    self.message_copy(item),
+                    Alignment::Start,
+                ),
+            ])
+            .spacing(step::GAP_XS)
+            .into()
+        };
+        widget::container(body)
+            .max_width(design::READABLE_MEASURE)
+            .width(Length::Fill)
+            .into()
+    }
+
+    /// Whether a delivered message shows its detail under its row, which
+    /// then reserves the room for the actions an open detail carries.
+    fn delivery_detail_shown(&self, item: &chat::Item) -> bool {
+        let ItemContent::Delivery {
+            kind,
+            from,
+            sender,
+            summary,
+            body,
+        } = &item.content
+        else {
+            return false;
+        };
+        if !(delivery_monitor(*kind, summary) || self.item_expanded(&item.id)) {
+            return false;
+        }
+        if *kind == chat::DeliveryKind::Notice {
+            return self
+                .prepared_literal(item)
+                .and_then(literal_content::Content::notice)
+                .is_some_and(|notice| delivery_has_body(Some(notice), body, "", sender));
+        }
+        let heading = chat::delivery_heading(
+            *kind,
+            from,
+            sender,
+            if !body.is_empty() && body.trim() == summary.trim() {
+                ""
+            } else {
+                summary
+            },
+        );
+        let remainder = heading
+            .split_once(['\r', '\n'])
+            .map_or("", |(_, rest)| rest.trim_start_matches(['\r', '\n']));
+        delivery_has_body(None, body, remainder, sender)
     }
 
     /// An assistant answer, its reasoning, its narration, or a system notice.

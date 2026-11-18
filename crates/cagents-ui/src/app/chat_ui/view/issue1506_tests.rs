@@ -1669,7 +1669,13 @@ fn task_reports_hide_short_and_huge_bodies_without_losing_outcome_or_exact_copy(
                 .accessible
                 .contains(&format!("Show delivery details: {heading}"))
         );
-        assert!(surface.accessible.contains(&"Copy this message".to_owned()));
+        // A closed report is a line of the timeline, like a closed step: its
+        // message actions come with its detail, and Copy still publishes the
+        // original bytes below.
+        assert!(
+            !surface.accessible.contains(&"Copy this message".to_owned()),
+            "a closed report reserves no action footer"
+        );
         let title = heading.strip_suffix(outcome).unwrap();
         assert_eq!(
             surface
@@ -1848,6 +1854,12 @@ fn report_details_and_late_find_prepare_original_markdown_and_restore_disclosure
             assert!(!cached.source.provisional());
             assert_eq!(cached.source.retained_tail_capacity(), 0);
             let collapsed = report_surface(live, "disclosed-report");
+            assert!(
+                !collapsed
+                    .accessible
+                    .contains(&"Copy this message".to_owned()),
+                "closing the detail takes its actions with it"
+            );
             assert!(
                 !collapsed
                     .text
