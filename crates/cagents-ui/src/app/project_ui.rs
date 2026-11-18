@@ -83,6 +83,9 @@ pub struct State {
     pub(super) closed: HashSet<PathBuf>,
     /// A deliberate reopen outranks a cached close until its model edit lands.
     pub(super) reopening: HashMap<ProjectId, PathBuf>,
+    /// Repositories a load has opened in this window: those whose open the
+    /// window has published, or found the registry already holding.
+    pub(super) opened: HashSet<PathBuf>,
     /// Deletions the user has confirmed, by worktree, until each resolves. A
     /// failed one stays so its row can say why and offer to run it again.
     deletions: HashMap<WorktreeId, Deletion>,

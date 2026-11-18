@@ -3598,6 +3598,74 @@ mod tests {
             .collect()
     }
 
+    /// The vendored editor splices a multiline insertion in once and drains a
+    /// multiline deletion once (#3001). Both must keep every line, its ending,
+    /// their order and the caret, and record a change that undoes exactly.
+    #[test]
+    fn native_multiline_insert_and_delete_keep_lines_order_and_history() {
+        use cosmic::iced::advanced::graphics::text::cosmic_text::{
+            self, Attrs, Buffer, Cursor, Edit as _, LineEnding, Metrics, Shaping,
+        };
+        fn lines(editor: &cosmic_text::Editor<'static>) -> Vec<(String, LineEnding)> {
+            editor.with_buffer(|buffer| {
+                buffer
+                    .lines
+                    .iter()
+                    .map(|line| (line.text().to_owned(), line.ending()))
+                    .collect()
+            })
+        }
+        let source = "head tail\nnext\r\nlast";
+        let mut buffer = Buffer::new_empty(Metrics::new(14.0, 20.0));
+        buffer.set_text(source, &Attrs::new(), Shaping::Advanced, None);
+        let mut editor = cosmic_text::Editor::new(buffer);
+        let original = lines(&editor);
+        let numbered: String = (0..1000).map(|i| format!("{i:04}\n")).collect();
+        let data = format!("A\r\nB\n\rC\r{numbered}D");
+        editor.start_change();
+        let end = editor.insert_at(Cursor::new(0, 4), &data, None);
+        let mut insertion = editor.finish_change().unwrap();
+
+        let mut expected: Vec<(String, LineEnding)> = vec![
+            ("headA".into(), LineEnding::CrLf),
+            ("B".into(), LineEnding::LfCr),
+            ("C".into(), LineEnding::Cr),
+        ];
+        expected.extend((0..1000).map(|i| (format!("{i:04}"), LineEnding::Lf)));
+        expected.extend([
+            ("D tail".into(), LineEnding::Lf),
+            ("next".into(), LineEnding::CrLf),
+            ("last".into(), LineEnding::None),
+        ]);
+        assert_eq!(lines(&editor), expected);
+        assert_eq!((end.line, end.index), (1003, 1));
+        assert_eq!(insertion.items[0].text, data);
+
+        // Delete from inside the first inserted line to inside the last one.
+        editor.start_change();
+        editor.delete_range(Cursor::new(0, 2), Cursor::new(1003, 3));
+        let mut deletion = editor.finish_change().unwrap();
+        assert_eq!(
+            lines(&editor),
+            [
+                ("heail".to_owned(), LineEnding::Lf),
+                ("next".into(), LineEnding::CrLf),
+                ("last".into(), LineEnding::None),
+            ]
+        );
+        assert_eq!(
+            deletion.items[0].text,
+            format!("adA\r\nB\n\rC\r{numbered}D t")
+        );
+
+        deletion.reverse();
+        assert!(editor.apply_change(&deletion));
+        assert_eq!(lines(&editor), expected);
+        insertion.reverse();
+        assert!(editor.apply_change(&insertion));
+        assert_eq!(lines(&editor), original);
+    }
+
     #[test]
     fn large_splices_preserve_native_lines_endings_and_caret() {
         let source = "α token\r\nβ token\n\rγ token\rδ token\n".repeat(100) + "EOF";
@@ -4156,6 +4224,165 @@ mod tests {
         );
         assert!(lines.last().unwrap().shape_opt().is_none());
         assert!(lines.last().unwrap().layout_opt().is_none());
+    }
+
+    /// An overscan lets the native editor draw, and be clicked, past its
+    /// viewport (#2824): the composer's draft runs on into its inset there.
+    /// Scrolling and the visible runs still keep to the viewport.
+    #[test]
+    fn native_overscan_draws_text_past_the_viewport_and_reports_how_far() {
+        use cosmic::iced::advanced::text::editor::Selection;
+        // Five 20 px lines fill the viewport exactly, so a scroll by whole
+        // lines lands exactly on a line.
+        fn lay_out(editor: &mut NativeEditor) {
+            lay_out_at(editor, 700.0);
+        }
+        fn lay_out_at(editor: &mut NativeEditor, width: f32) {
+            editor.update(
+                Size::new(width, 100.0),
+                cosmic::iced::Font::DEFAULT,
+                Pixels(14.0),
+                LineHeight::Absolute(Pixels(20.0)),
+                Wrapping::Word,
+                &mut highlighter::PlainText::new(&()),
+            );
+        }
+        fn lines(runs: cosmic_text::LayoutRunIter<'_>) -> Vec<usize> {
+            runs.map(|run| run.line_i).collect()
+        }
+        use cosmic::iced::advanced::graphics::text::cosmic_text;
+        let text = (0..40)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let mut editor = NativeEditor::with_text(&text);
+        editor.set_overscan(8.0, 8.0);
+        lay_out(&mut editor);
+        assert_eq!(editor.overflow(), (0.0, 8.0));
+        assert_eq!(lines(editor.buffer().layout_runs()), [0, 1, 2, 3, 4]);
+        assert_eq!(lines(editor.buffer().draw_runs()), [0, 1, 2, 3, 4, 5]);
+
+        editor.perform(Action::Scroll { lines: 10 });
+        lay_out(&mut editor);
+        assert_eq!(editor.overflow(), (8.0, 8.0));
+        assert_eq!(lines(editor.buffer().layout_runs()), [10, 11, 12, 13, 14]);
+        assert_eq!(
+            lines(editor.buffer().draw_runs()),
+            [9, 10, 11, 12, 13, 14, 15]
+        );
+        // A new width discards every line's layout; the line above the
+        // viewport is laid out again with the ones in it.
+        lay_out_at(&mut editor, 600.0);
+        assert_eq!(
+            lines(editor.buffer().draw_runs()),
+            [9, 10, 11, 12, 13, 14, 15]
+        );
+        editor.perform(Action::SelectAll);
+        let Selection::Range(regions) = editor.selection() else {
+            panic!("everything is selected");
+        };
+        assert!(regions.iter().any(|region| region.y < 0.0));
+        assert!(regions.iter().any(|region| region.y >= 100.0));
+        // A click on a line drawn in a band lands on it: the one above the
+        // viewport, then the one below it.
+        editor.perform(Action::Click(Point::new(5.0, -4.0)));
+        assert_eq!(editor.cursor().position.line, 9);
+        let mut editor = NativeEditor::with_text(&text);
+        editor.set_overscan(8.0, 8.0);
+        lay_out(&mut editor);
+        editor.perform(Action::Scroll { lines: 10 });
+        lay_out(&mut editor);
+        editor.perform(Action::Click(Point::new(5.0, 104.0)));
+        assert_eq!(editor.cursor().position.line, 15);
+        // Below the band there is nothing drawn, and the click keeps to the
+        // last line drawn, as a click below the text always has.
+        editor.perform(Action::Click(Point::new(5.0, 140.0)));
+        assert_eq!(editor.cursor().position.line, 15);
+
+        // At the end of the text, the line above the viewport is drawn and
+        // nothing is below it.
+        let mut editor = NativeEditor::with_text(&text);
+        editor.set_overscan(8.0, 8.0);
+        lay_out(&mut editor);
+        editor.perform(Action::Move(Motion::DocumentEnd));
+        lay_out(&mut editor);
+        assert_eq!(editor.overflow(), (8.0, 0.0));
+        assert_eq!(lines(editor.buffer().draw_runs())[0], 34);
+
+        // Without an overscan nothing past the viewport is drawn.
+        editor.set_overscan(0.0, 0.0);
+        lay_out(&mut editor);
+        assert_eq!(editor.overflow(), (0.0, 0.0));
+        assert_eq!(
+            lines(editor.buffer().draw_runs()),
+            lines(editor.buffer().layout_runs())
+        );
+    }
+
+    /// An overscan only adds what is drawn: where the editor scrolls, where
+    /// its cursor goes, which runs are in view and how tall it measures are
+    /// the same with or without one (#2824). Long lines wrap, so a line can
+    /// straddle the viewport's edge.
+    #[test]
+    fn native_overscan_leaves_scrolling_and_measurement_alone() {
+        use cosmic::iced::advanced::text::Editor as _;
+        fn lay_out(editor: &mut NativeEditor) {
+            editor.update(
+                Size::new(240.0, 100.0),
+                cosmic::iced::Font::DEFAULT,
+                Pixels(14.0),
+                LineHeight::Relative(1.4),
+                Wrapping::Word,
+                &mut highlighter::PlainText::new(&()),
+            );
+        }
+        fn observe(editor: &NativeEditor) -> impl PartialEq + std::fmt::Debug {
+            let buffer = editor.buffer();
+            (
+                buffer.scroll(),
+                editor.cursor().position,
+                buffer
+                    .layout_runs()
+                    .map(|run| (run.line_i, run.line_top))
+                    .collect::<Vec<_>>(),
+                editor.min_bounds(),
+            )
+        }
+        let text = (0..60)
+            .map(|line| {
+                if line % 7 == 3 {
+                    format!("line {line} runs on long enough to wrap onto a second row and a third")
+                } else {
+                    format!("line {line}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut plain = NativeEditor::with_text(&text);
+        let mut overscanned = NativeEditor::with_text(&text);
+        overscanned.set_overscan(8.2, 8.2);
+        lay_out(&mut plain);
+        lay_out(&mut overscanned);
+        assert_eq!(observe(&plain), observe(&overscanned));
+        for action in [
+            Action::Scroll { lines: 9 },
+            Action::Move(Motion::PageDown),
+            Action::Move(Motion::Down),
+            Action::Move(Motion::PageDown),
+            Action::Click(Point::new(5.0, 50.0)),
+            Action::Move(Motion::PageUp),
+            Action::Scroll { lines: -3 },
+            Action::Move(Motion::DocumentEnd),
+            Action::Move(Motion::PageUp),
+            Action::Move(Motion::DocumentStart),
+        ] {
+            plain.perform(action.clone());
+            overscanned.perform(action.clone());
+            lay_out(&mut plain);
+            lay_out(&mut overscanned);
+            assert_eq!(observe(&plain), observe(&overscanned), "after {action:?}");
+        }
     }
 
     /// iced's own text editor, which the chat composer uses, lays its native

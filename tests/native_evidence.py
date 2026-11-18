@@ -152,6 +152,7 @@ STUBS = {
     "magick": """
         #!/bin/bash
         if [ "$1" = identify ]; then printf '1500x900'; exit 0; fi
+        printf '%s\\n' "$*" >> "$STUB_LOG/magick"
         cp "$1" "${@: -1}"
     """,
     "rustup": """
@@ -820,6 +821,36 @@ class Evidence(unittest.TestCase):
         self.assertIn("already selected another instance", changed.stderr)
         self.run_tool("start", "after")
         self.assertIn("--instance native-review --in-session", (self.logs / "runner").read_text())
+        self.run_tool("stop")
+
+    def test_the_session_cargo_replays_a_build_however_it_reports(self) -> None:
+        self.built()
+        self.run_tool("start", "after")
+        self.wait_for(lambda: (self.logs / "ui-ran").exists(), '(self.logs / "ui-ran").exists()')
+        session_cargo = next(self.task.rglob("session-bin/cargo"))
+        state = session_cargo.parent.parent
+        recorded = subprocess.run(
+            ["bash", "-c", 'eval "$(grep ^recorded= "$1")" && printf %s "$recorded"', "_", str(session_cargo)],
+            capture_output=True, text=True, check=True,
+        ).stdout.splitlines()
+        target = next(path for path in self.task.glob("target-after*") if path.is_dir())
+        # As while the runner starts: replayed, not run.
+        (state / "replaying").touch()
+        try:
+            def replay(*arguments: str) -> subprocess.CompletedProcess:
+                return subprocess.run([str(session_cargo), "build", *arguments], capture_output=True, text=True,
+                                      env={**self.env, "CARGO_TARGET_DIR": str(target)})
+            # scripts/cargo-lane chooses how Cargo reports; that asks for no other build.
+            for report in (["--message-format=json"], ["--message-format", "json"], ["--quiet"]):
+                for request in recorded:
+                    replayed = replay(*report, *request.split())
+                    self.assertEqual(replayed.returncode, 0, (report, request, replayed.stderr))
+            refused = replay("--message-format=json", "--profile", "dev-runtime", "--bin", "elsewhere")
+            self.assertEqual(refused.returncode, 101)
+            self.assertIn("build did not compile that", refused.stderr)
+        finally:
+            (state / "replaying").unlink(missing_ok=True)
+            (state / "failed").unlink(missing_ok=True)
         self.run_tool("stop")
 
     def test_the_repositorys_own_runner_starts_through_the_session_cargo(self) -> None:
@@ -1585,6 +1616,14 @@ class Evidence(unittest.TestCase):
         self.assertEqual(self.run_tool("shot", "bad/name", check=False).returncode, 2)
         self.run_tool("shot", "empty-state")
         self.assertEqual(len((self.task / "shots" / "manifest.tsv").read_text().splitlines()), 1)
+        self.assertIn("-quality 92", (self.logs / "magick").read_text().splitlines()[-1])
+        self.run_tool("shot", "edges", "--lossless")
+        self.assertIn("-define webp:lossless=true",
+                      (self.logs / "magick").read_text().splitlines()[-1])
+        self.assertIn("after-edges.webp", (self.task / "shots" / "manifest.tsv").read_text())
+        self.assertEqual(self.run_tool("shot", "edges", "--lossy", check=False).returncode, 2)
+        self.assertEqual(
+            self.run_tool("shot", "edges", "--lossless", "extra", check=False).returncode, 2)
 
         second = self.run_tool("start", "after", check=False)
         self.assertEqual(second.returncode, 1)
@@ -2304,7 +2343,11 @@ REMOTE_STUBS = {
         host=$1
         shift
         [ "$host" = buildhost ] || { echo "ssh: unknown host $host" >&2; exit 255; }
-        login=(env -i HOME="$STUB_REMOTE_HOME" PATH="$PATH" STUB_LOG="$STUB_LOG" GIT_CONFIG_GLOBAL=/dev/null)
+        # The host runs each command under its own sshd, which the host's
+        # scripts find as their connection. Without one here they would look
+        # further up, and where this suite itself runs over SSH, find that.
+        login=("$(dirname -- "$0")/sshd-session" env -i HOME="$STUB_REMOTE_HOME" PATH="$PATH" STUB_LOG="$STUB_LOG"
+               GIT_CONFIG_GLOBAL=/dev/null)
         # An rsync server speaks its protocol over this connection until the
         # client hangs up, which it does only once ssh has exited.
         case $1 in
@@ -2312,6 +2355,32 @@ REMOTE_STUBS = {
         esac
         # What travels to the host: its arguments, above, and its input.
         tee -a "$STUB_LOG/ssh-input" | "${login[@]}" sh -c "$*"
+    """,
+    # The connection as the host sees it: the parent of what it runs, never
+    # replaced by it, alive while that is and gone once its client is, as an
+    # sshd whose client hangs up. What it ran is left running, as there. It
+    # passes its client's descriptors straight on rather than relaying them,
+    # so the client sees their end only once what it ran ends.
+    "sshd-session": """
+        #!/usr/bin/python3 -I
+        import os
+        import select
+        import subprocess
+        import sys
+        client = os.getppid()
+        lost = os.pidfd_open(client)
+        command = subprocess.Popen(sys.argv[1:])
+        ended = os.pidfd_open(command.pid)
+        if os.getppid() != client:
+            sys.exit(255)
+        watch = select.poll()
+        watch.register(lost, select.POLLIN)
+        watch.register(ended, select.POLLIN)
+        ready = {descriptor for descriptor, _ in watch.poll()}
+        if ended not in ready:
+            sys.exit(255)
+        status = command.wait()
+        sys.exit(status if status >= 0 else 128 - status)
     """,
     # Only to say where a checkout's builds go, as Cargo would.
     "cargo": """
@@ -2360,9 +2429,11 @@ REMOTE_TOOL = """
         stop) [ ! -e "$task/stop-fails" ] || exit 1; rm -f "$task/side"; echo stopped ;;
         # More than one line, written apart, as the real status is: a reader
         # that stops at the first ends it with SIGPIPE.
-        status) [ -e "$task/side" ] && echo "session: $(cat "$task/side"), pid 1, ready" || echo 'session: none'
+        status) [ ! -e "$STUB_LOG/status-holds" ] || exec /usr/bin/python3 "$STUB_LOG/hold.py"
+                [ -e "$task/side" ] && echo "session: $(cat "$task/side"), pid 1, ready" || echo 'session: none'
                 sleep 0.2; echo "native slots: 3 free of 3" ;;
-        shot) printf 'webp' > "$task/shots/$(cat "$task/side")-$2.webp"
+        shot) printf '%s\\n' "$*" > "$task/shot-arguments"
+              printf 'webp' > "$task/shots/$(cat "$task/side")-$2.webp"
               printf '%s\\tREV\\n' "$(cat "$task/side")-$2.webp" >> "$task/shots/manifest.tsv" ;;
         build) [ ! -e "$task/build-fails" ] || exit 1
                printf '%s\\n' "$3" > "$task/built-$2"; ls "$3" > "$task/files-$2"
@@ -2505,7 +2576,7 @@ class RemoteEvidence(unittest.TestCase):
             signal.pause()
         """))
         # Each connection the wrapper makes, held open where it is made, the
-        # host's side of it left to the real sshd and its lifetime watcher.
+        # host's side of it left to the stand-in sshd and its lifetime watcher.
         intercept = """
         if { [ "${STUB_SSH_STAGE:-}" = transport ] && [[ $* = *git-receive-pack* ]]; } ||
             { [ "${STUB_SSH_STAGE:-}" = rsync ] && [[ $* = "rsync --server "* ]]; }; then
@@ -2603,6 +2674,93 @@ class RemoteEvidence(unittest.TestCase):
                             process.kill()
                         process.wait(timeout=HANG_GUARD)
 
+    def test_a_lost_connection_ends_what_it_started_on_the_host(self) -> None:
+        # What the host runs for a connection, holding until a signal ends it,
+        # and naming who sent that.
+        (self.logs / "hold.py").write_text(textwrap.dedent("""\
+            import os
+            import signal
+            from pathlib import Path
+            root = Path(os.environ["STUB_LOG"])
+            signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+            (root / "held").write_text(str(os.getpid()))
+            sent = signal.sigwaitinfo({signal.SIGTERM})
+            (root / "held-ended").write_text(str(sent.si_pid))
+            raise SystemExit(128 + signal.SIGTERM)
+        """))
+        checkout = self.checkout("after", {"src.rs": "fn main() {}\n"})
+        self.run_tool("build", "after", str(checkout))
+        self.run_tool("start", "after")
+        (self.logs / "status-holds").touch()
+        with (self.logs / "lost-output").open("w") as output:
+            process = subprocess.Popen(
+                [str(SCRIPT), "--remote", "buildhost", "--task", str(self.task), "status"],
+                env=self.env, stdin=subprocess.DEVNULL, stdout=output, stderr=output, start_new_session=True,
+            )
+
+        def wait_for(condition) -> None:
+            deadline = time.monotonic() + HANG_GUARD
+            while not condition() and time.monotonic() < deadline:
+                time.sleep(0.02)
+
+        held = None
+        try:
+            wait_for(lambda: (self.logs / "held").exists() or process.poll() is not None)
+            self.assertTrue((self.logs / "held").exists(), (self.logs / "lost-output").read_text())
+            held = int((self.logs / "held").read_text())
+
+            def parent(pid: int) -> int:
+                return int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1])
+
+            # The host script started its work in a process group of its own,
+            # and beside it the watcher: the child pausing in a `sleep`. Until
+            # then its other children may be its search for the connection.
+            main = os.getpgid(held)
+            host = parent(main)
+
+            def children(pid: int) -> set[int]:
+                try:
+                    return set(map(int, Path(f"/proc/{pid}/task/{pid}/children").read_text().split()))
+                except FileNotFoundError:
+                    return set()
+
+            def comm(pid: int) -> str:
+                try:
+                    return Path(f"/proc/{pid}/comm").read_text().strip()
+                except FileNotFoundError:
+                    return ""
+
+            def watchers() -> list[int]:
+                return [pid for pid in children(host) - {main}
+                        if any(comm(nap) == "sleep" for nap in children(pid))]
+
+            wait_for(lambda: len(watchers()) == 1)
+            self.assertEqual(len(watchers()), 1, children(host))
+            watcher = watchers()[0]
+            # The connection is the stand-in sshd above it; its client, the
+            # ssh this machine runs, goes as if the network had.
+            connection = host
+            while Path(f"/proc/{connection}/comm").read_text().strip() != "sshd-session":
+                connection = parent(connection)
+                self.assertGreater(connection, 1, "no stand-in sshd above the host's work")
+            os.kill(parent(connection), signal.SIGKILL)
+            self.assertNotEqual(process.wait(timeout=HANG_GUARD), 0)
+            wait_for(lambda: (self.logs / "held-ended").exists())
+            self.assertTrue((self.logs / "held-ended").exists(), "the host's work outlived its connection")
+            # Ended by the watcher, for its connection's end, not by anything here.
+            self.assertEqual(int((self.logs / "held-ended").read_text()), watcher)
+            self.assertFalse(Path(f"/proc/{connection}").exists() and
+                             Path(f"/proc/{connection}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z")
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=HANG_GUARD)
+            if held is not None and not (self.logs / "held-ended").exists():
+                try:
+                    os.kill(held, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
     def test_a_signal_its_caller_ignores_ends_nothing(self) -> None:
         # As under `nohup … &`, which a long pair or build is run with.
         checkout = self.checkout("after", {"src.rs": "old\n"})
@@ -2663,7 +2821,7 @@ class RemoteEvidence(unittest.TestCase):
         # In one slot, held for the three, as the tool says to build them.
         self.assertEqual([arguments for _, arguments in gate], [
             "exec --hold",
-            *(f"build --profile dev-runtime --bin {name}" for name in ("cagents", "cagentsd", "cagents-ui")),
+            *(f"build --message-format=json --profile dev-runtime --bin {name}" for name in ("cagents", "cagentsd", "cagents-ui")),
         ])
         # The host takes the executables built here, of the edited files, and
         # what they were built with.
@@ -2777,6 +2935,11 @@ class RemoteEvidence(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), str(self.task / "shots" / "after-home.webp"))
         self.assertEqual((self.task / "shots" / "after-home.webp").read_text(), "webp")
         self.assertIn("after-home.webp", (self.task / "shots" / "manifest.tsv").read_text())
+        # Options reach the host's native-evidence, which checks them.
+        result = self.run_tool("shot", "edges", "--lossless")
+        self.assertEqual(result.stdout.strip(), str(self.task / "shots" / "after-edges.webp"))
+        self.assertEqual((self.remote_task / "shot-arguments").read_text().strip(),
+                         "shot edges --lossless")
 
     def test_cli_arguments_name_the_fixture_on_the_host(self) -> None:
         checkout = self.checkout("after", {"src.rs": "\n"})

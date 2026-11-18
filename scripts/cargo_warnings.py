@@ -57,6 +57,29 @@ def workspace_packages(checkout):
         raise WorkspaceUnreadable(error) from error
 
 
+def workspace_root(directory):
+    """The root of the workspace Cargo uses from `directory`: the nearest
+    directory at or above it whose Cargo.toml has a `[workspace]`, or else the
+    nearest with a Cargo.toml. None when there is no manifest above it."""
+    directory = Path(directory).resolve()
+    nearest = None
+    for candidate in (directory, *directory.parents):
+        manifest = candidate / "Cargo.toml"
+        try:
+            text = manifest.read_text()
+        except (OSError, UnicodeDecodeError):
+            continue
+        nearest = nearest or candidate
+        try:
+            if "workspace" in tomllib.loads(text):
+                return candidate
+        except tomllib.TOMLDecodeError:
+            # Cargo stops at a manifest it cannot read; so does this, rather
+            # than judge against some workspace further up.
+            return candidate
+    return nearest
+
+
 def package_name(package_id):
     """The name in a Cargo package ID specification, such as
     `path+file:///src#cagents@0.1.3` or `path+file:///src/cagents-ui#0.1.3`,

@@ -26,6 +26,7 @@ import sys
 import tempfile
 import textwrap
 import time
+import tomllib
 import unittest
 from unittest.mock import patch
 
@@ -33,6 +34,8 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 # Bounds only a hang: every wait it guards returns as soon as its event happens.
 HANG_GUARD = 60
+# The probes live outside the repository, beyond its rust-toolchain.toml.
+TOOLCHAIN = tomllib.loads((ROOT / "rust-toolchain.toml").read_text())["toolchain"]["channel"]
 
 
 # Isolated Python (-I) leaves this directory off sys.path.
@@ -1435,7 +1438,9 @@ fn bounded_allocation() {
 
     def test_cargo_in_an_exec_command_reached_by_path_does_not_compile_here(self):
         cargo = str(self.cargo_bin / "cargo")
-        for command in (f"'{cargo}' build --bin probe", '"$CARGO_PATH" build --bin probe'):
+        for command in (f"'{cargo}' build --bin probe", '"$CARGO_PATH" build --bin probe',
+                        # A print rustc makes while linking does not stop it compiling.
+                        f"RUSTFLAGS=--print=native-static-libs '{cargo}' build --bin probe"):
             with self.subTest(command=command):
                 result = self.gate_run("exec", "sh", "-ec", command,
                                        env=self.remote_env() | {"CARGO_PATH": cargo}, timeout=60)
@@ -1448,6 +1453,35 @@ fn bounded_allocation() {
         result = self.gate_run("exec", "sh", "-ec", f"'{cargo}' metadata --format-version 1 "
                                ">/dev/null && printf ok", env=self.remote_env(), timeout=60)
         self.assertEqual((result.returncode, result.stdout), (0, "ok"), result.stderr)
+
+    def test_a_compiler_run_directly_in_an_exec_command_does_not_compile_here(self):
+        env = self.remote_env()
+        env["PATH"] = os.pathsep.join([str(self.cargo_bin), env["PATH"]])
+        before = sorted(self.crate.iterdir())
+        for command in ("rustc src/main.rs", "rustc --crate-name probe --edition=2021 src/main.rs",
+                        "rustdoc src/main.rs"):
+            with self.subTest(command=command):
+                result = self.gate_run("exec", "sh", "-ec", command, env=env, timeout=60)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("would compile on this host", result.stderr)
+                # Neither `main` nor `doc` was made.
+                self.assertEqual(sorted(self.crate.iterdir()), before)
+        # Cargo reached by path documents through the `rustdoc` on PATH,
+        # which no RUSTC_WRAPPER covers: rustup's own, were it beside the
+        # guard's `rustc`, would have Cargo run the toolchain's by path.
+        cargo = str(self.cargo_bin / "cargo")
+        result = self.gate_run("exec", "sh", "-ec", f"PATH=\"$PATH:{self.cargo_bin}\" '{cargo}' doc --no-deps",
+                               env=self.remote_env(), timeout=60)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("`rustdoc` run directly inside `cargo-gate exec` would compile on this host", result.stderr)
+        self.assertEqual(list(self.root.rglob("probe/index.html")), [])
+        # What only asks the compiler something still answers, from the
+        # compiler that would have run.
+        result = self.gate_run("exec", "sh", "-ec", "rustc -vV; rustdoc --version; rustc --print sysroot",
+                               env=env, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("host: ", result.stdout)
+        self.assertIn("rustdoc ", result.stdout)
 
     def shell_program(self):
         # Exercise Offload.launch with a real Cargo-built program, which runs
@@ -1499,6 +1533,17 @@ fn bounded_allocation() {
         queries = (self.root / "wrapper-log").read_text()
         self.assertIn("-vV", queries)
         self.assertNotIn("--crate-name probe ", queries)
+
+    def test_a_program_run_inside_exec_cannot_run_a_compiler_directly(self):
+        self.shell_program()
+        env = self.remote_env()
+        env["PATH"] = os.pathsep.join([str(self.cargo_bin), env["PATH"]])
+        result = self.gate_run("exec", "cargo", "run", "--quiet", "--", "-ec",
+                               "rustc -vV >/dev/null; rustc src/main.rs -o built-here", env=env)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("`rustc` run directly inside `cargo-gate exec` would compile on this host",
+                      result.stderr)
+        self.assertFalse((self.crate / "built-here").exists())
 
     def test_a_program_run_outside_exec_keeps_the_callers_environment(self):
         self.shell_program()
@@ -1966,7 +2011,8 @@ def incremental_session(slot, crate, *, age, size=64 * 1024, profile="debug"):
 
 
 # What a gate sends the build host to run each command with.
-TOOLS = {name: (ROOT / "scripts" / name).read_text() for name in ("build-host", "memory-capped")}
+TOOLS = {name: (ROOT / "scripts" / name).read_text()
+         for name in ("build-host", "memory-capped", "cargo-gate-rustc-guard")}
 
 
 def wait_until(condition, timeout=HANG_GUARD):
@@ -2424,6 +2470,50 @@ class Trim(unittest.TestCase):
         self.trim(2**40, pressed=True)
         self.assertFalse(any(path.exists() for path in later))
 
+    def test_from_cargo_1_100_a_stale_unit_directory_goes_whole(self):
+        """Cargo 1.100 keeps each unit in <profile>/build/<package>/<hash>,
+        its fingerprint beside its outputs, with no .fingerprint or deps."""
+        profile = self.slot / "src/target/debug"
+        def written(path, days):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"output")
+            then = time.time() - days * 86400
+            os.utime(path, (then, then))
+            return path
+        def unit(package, unit_hash, fingerprint, outputs, *, looked, built=4):
+            """A unit whose fingerprint a build read `looked` days ago."""
+            directory = profile / "build" / package / unit_hash
+            if fingerprint:
+                written(directory / "fingerprint" / fingerprint, looked)
+            for output in outputs:
+                written(directory / output, built)
+            return directory
+        library = ["out/libold_crate-1a1a1a1a1a1a1a1a.rlib", "out/old_crate-1a1a1a1a1a1a1a1a.d"]
+        stale = unit("old-crate", "1a1a1a1a1a1a1a1a", "lib-old_crate", library, looked=4)
+        # A build script's run: its OUT_DIR and what it printed.
+        ran = unit("old-crate", "2b2b2b2b2b2b2b2b", "run-build-script-build-script-build",
+                   ["out/generated.rs", "run/stdout"], looked=4)
+        # Every build looks at a build dependency's fingerprint, though none
+        # reads its rlib until it changes.
+        needed = unit("build-helper", "3c3c3c3c3c3c3c3c", "lib-build_helper",
+                      ["out/libbuild_helper-3c3c3c3c3c3c3c3c.rlib"], looked=1)
+        # An output a build wrote since keeps its unit.
+        rebuilt = unit("rebuilt", "4d4d4d4d4d4d4d4d", "lib-rebuilt",
+                       ["out/librebuilt-4d4d4d4d4d4d4d4d.rlib"], looked=4, built=1)
+        # Nothing dates what no fingerprint names, and a build script
+        # directory of Cargo up to 1.99 is no unit, whatever its OUT_DIR holds.
+        unnamed = unit("loose", "5e5e5e5e5e5e5e5e", None, ["out/libloose-5e5e5e5e5e5e5e5e.rlib"], looked=4)
+        older = written(profile / "build/older-6f6f6f6f6f6f6f6f/out/fingerprint/generated", 4).parents[1]
+        moved = self.agent["sweep_dependencies"](str(self.slot), time.time() - 3 * 86400)
+        self.assertEqual([path.exists() for path in (stale, ran, needed, rebuilt, unnamed, older)],
+                         [False, False, True, True, True, True])
+        # Each went in one rename, whole.
+        evicted = list((self.slot / "evicted").iterdir())
+        self.assertEqual(sorted(path.name.rpartition("-")[2] for path in evicted),
+                         ["1a1a1a1a1a1a1a1a", "2b2b2b2b2b2b2b2b"])
+        self.assertTrue(all((path / "fingerprint").is_dir() for path in evicted))
+        self.assertGreater(moved, 0)
+
     def test_a_removal_a_build_waits_for_does_not_wait_behind_an_idle_one(self):
         evicted = self.slot / "evicted"
         (evicted / "1-1-crate-1" / "s-1").mkdir(parents=True)
@@ -2473,6 +2563,98 @@ class Trim(unittest.TestCase):
                                 env=environment | {"CAGENTS_BUILD_REMOTE_INCREMENTAL_GIB": "-1"})
         self.assertEqual(result.returncode, 2)
         self.assertIn("must be a nonnegative integer", result.stderr)
+
+
+class SweptUnderCargo(unittest.TestCase):
+    """Real Cargo: a unit the sweep moves out is built again, and one whose
+    fingerprint a build looked at keeps its outputs."""
+
+    toolchain = TOOLCHAIN
+    # The pinned toolchain's Cargo, which may be rustup's proxy or not.
+    command = ("cargo",)
+
+    def setUp(self):
+        if shutil.which(self.command[0]) is None:
+            self.skipTest(f"no {self.command[0]}")
+        # On disk: /tmp is often RAM-backed.
+        temporary = tempfile.TemporaryDirectory(prefix="cagents-sweep-", dir="/var/tmp")
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name).resolve()
+        self.slot = root / "slot-0"
+        self.checkout = self.slot / "src"
+        files = {
+            "Cargo.toml": """
+                [package]
+                name = "probe"
+                version = "0.1.0"
+                edition = "2021"
+                build = "build.rs"
+                [dependencies]
+                vendored = { path = "vendored" }
+                [workspace]
+            """,
+            "build.rs": 'fn main() { println!("cargo:rerun-if-changed=build.rs"); }\n',
+            "src/main.rs": 'fn main() { println!("{}", vendored::NAME); }\n',
+            "vendored/Cargo.toml": """
+                [package]
+                name = "vendored"
+                version = "0.1.0"
+                edition = "2021"
+            """,
+            "vendored/src/lib.rs": 'pub const NAME: &str = "vendored";\n',
+        }
+        for name, text in files.items():
+            path = self.checkout / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(textwrap.dedent(text))
+        # A private Cargo home, without the user's `build-dir`; no registry.
+        self.env = cargo_fixture.private_cargo_environment(root / "cargo-home", {
+            key: value for key, value in os.environ.items() if not key.startswith("CAGENTS_BUILD_")})
+        self.env["RUSTUP_TOOLCHAIN"] = self.toolchain
+        self.cargo()
+        self.profile = self.checkout / "target/debug"
+
+    def cargo(self):
+        return subprocess.run([*self.command, "build"], cwd=self.checkout, env=self.env, capture_output=True,
+                              text=True, timeout=240, check=True).stderr
+
+    def test_a_stale_unit_is_built_again_and_a_looked_at_one_is_kept(self):
+        then = time.time() - 4 * 86400
+        for path in self.profile.rglob("*"):
+            if path.is_file() and not path.is_symlink():
+                os.utime(path, (then, then))
+        # A build has since looked at the dependency's fingerprint, wherever
+        # this Cargo keeps it, but read none of its outputs.
+        looked = [*self.profile.glob(".fingerprint/vendored-*/*"),
+                  *self.profile.glob("build/vendored/*/fingerprint/*")]
+        self.assertTrue(looked)
+        for path in looked:
+            os.utime(path)
+        moved = agent_scope()["sweep_dependencies"](str(self.slot), time.time() - 3 * 86400)
+        self.assertGreater(moved, 0)
+        rebuilt = self.cargo()
+        self.assertIn("Compiling probe", rebuilt)
+        self.assertNotIn("Compiling vendored", rebuilt)
+        ran = subprocess.run([self.profile / "probe"], capture_output=True, text=True, check=True)
+        self.assertEqual(ran.stdout, "vendored\n")
+
+
+class SweptUnderCargo1100(SweptUnderCargo):
+    """The same under Cargo 1.100, the first to keep each unit in its own
+    <profile>/build/<package>/<hash>, while the pinned toolchain is older.
+    Runs where that toolchain is installed; it is never installed for this."""
+
+    toolchain = "1.100.0"
+    # Through rustup, whatever Cargo comes first on PATH.
+    command = ("rustup", "run", toolchain, "cargo")
+
+    def setUp(self):
+        if TOOLCHAIN == self.toolchain:
+            self.skipTest("the pinned toolchain is this one")
+        if not cargo_fixture.toolchain_installed(self.toolchain):
+            self.skipTest(f"Rust {self.toolchain} is not installed")
+        super().setUp()
+        self.assertFalse((self.profile / ".fingerprint").exists(), "this Cargo keeps the older layout")
 
 
 class WrittenInTheCheckout(unittest.TestCase):

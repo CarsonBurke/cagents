@@ -33,6 +33,10 @@ file.
   font/fallback/mod.rs asks it after the family test. Selection order and
   results are unchanged: src/font/system/fallback_choice_tests.rs compares
   every choice over the repository fonts with upstream's.
+- cagents#3002 adds a line strut in shape.rs: every visual line reserves
+  its default font's ascent and descent unless its own line height is
+  shorter. LOCAL_CHANGES.md ("Line strut") records why, and
+  tests/richtext_layout.rs covers it.
 
 The union retains PR1316's complete eight upstream integration-test targets,
 two benchmarks, development dependencies, test profile, source/fonts and

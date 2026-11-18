@@ -132,7 +132,12 @@ class Classification(unittest.TestCase):
             (root / "crates/ui/Cargo.toml").write_text('[package]\nname = "cagents-ui"\n')
             (root / "crates/empty").mkdir()
             self.assertEqual(cargo_warnings.workspace_packages(root), {"cagents", "cagents-ui"})
+            self.assertEqual(cargo_warnings.workspace_root(root / "crates/ui"), root.resolve())
+            self.assertEqual(cargo_warnings.workspace_root(root / "crates/empty"), root.resolve())
             (root / "Cargo.toml").write_text("[workspace\n")
+            # A manifest that does not parse is where Cargo stops, too.
+            (root / "crates/ui/Cargo.toml").write_text("[package\n")
+            self.assertEqual(cargo_warnings.workspace_root(root / "crates/ui"), (root / "crates/ui").resolve())
             with self.assertRaises(cargo_warnings.WorkspaceUnreadable):
                 cargo_warnings.workspace_packages(root)
 
@@ -195,6 +200,48 @@ class Lane(unittest.TestCase):
         self.assertTrue(result.stderr.endswith(
             "cargo-lane: 1 warning from the workspace's crates (crates/cagents-ui/src/a.rs:9); "
             "main's build check fails on them\n"), result.stderr)
+
+    def test_a_build_that_allows_warnings_shows_them_and_keeps_cargos_status(self):
+        own = diagnostic(OWN_UI, "warning", "function `probe` is never used", "crates/cagents-ui/src/a.rs", 9)
+        result = self.lane("--allow-warnings", "build", "--bin", "cagents-ui",
+                           messages=[own, diagnostic(VENDORED, "warning", "vendored")])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr.count("function `probe` is never used"), 1)
+        self.assertNotIn("warning: vendored", result.stderr)
+        self.assertIn("1 warning from vendored crates not shown", result.stderr)
+        self.assertIn("1 warning from the workspace's crates (crates/cagents-ui/src/a.rs:9)", result.stderr)
+        self.assertEqual(self.recorded(), [["build", "--message-format=json", "--bin", "cagents-ui"]])
+        failed = self.lane("--allow-warnings", "build", status=101, messages=[own])
+        self.assertEqual(failed.returncode, 101)
+
+    def test_another_gate_can_run_the_build(self):
+        other = self.root / "other-gate"
+        shutil.copy(self.root / "scripts/cargo-gate", other)
+        result = self.lane("--allow-warnings", "--gate", str(other), "build", "--bin", "cagents",
+                           messages=[diagnostic(VENDORED, "warning", "vendored")])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("warning: vendored", result.stderr)
+        self.assertEqual(self.recorded(), [["build", "--message-format=json", "--bin", "cagents"]])
+        (self.root / "scripts/cargo-gate").unlink()
+        self.assertEqual(self.lane("--gate", str(other), "check").returncode, 0)
+        self.assertEqual(self.lane("--gate").returncode, 2)
+
+    def test_the_workspace_is_the_one_cargo_uses_from_the_current_directory(self):
+        # Another checkout, as native-evidence builds a side with this one's tools.
+        other = self.root / "other"
+        (other / "src").mkdir(parents=True)
+        (other / "Cargo.toml").write_text('[workspace]\n[package]\nname = "older"\n')
+        own = diagnostic("path+file:///other#older@0.1.0", "warning", "unused import: `Old`")
+        self.messages.write_text(own + diagnostic(OWN_LIB, "warning", "unused import: `Lane`"))
+        env = {key: value for key, value in os.environ.items() if key != "CAGENTS_VENDORED_WARNINGS"}
+        env |= {"LANE_MESSAGES": str(self.messages), "LANE_CALLS": str(self.calls)}
+        result = subprocess.run([str(self.root / "scripts/cargo-lane"), "--allow-warnings", "build"],
+                                cwd=other / "src", env=env, stdin=subprocess.DEVNULL, capture_output=True,
+                                text=True, timeout=HANG_GUARD)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("unused import: `Old`", result.stderr)
+        self.assertNotIn("unused import: `Lane`", result.stderr)
+        self.assertIn("1 warning from vendored crates not shown", result.stderr)
 
     def test_errors_from_every_crate_show_and_keep_cargos_status(self):
         result = self.lane("check", status=101, messages=[

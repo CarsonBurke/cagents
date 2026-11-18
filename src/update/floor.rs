@@ -1028,10 +1028,22 @@ fn quiesce_inner(
         if completed.is_empty() {
             confirmation::prepared(state, job)?;
         }
-        source.prepare(daemon)?;
+        match source.prepare(daemon) {
+            Ok(()) => (),
+            // The busy refusal says nothing was stopped, which is only true
+            // before the first end; the ended conversations are listed after.
+            Err(source::PrepareError::Busy(_)) if !completed.is_empty() => {
+                return Err(invalid(PREPARE_BUSY_AFTER_ENDS));
+            }
+            Err(error) => return Err(error.into()),
+        }
         return source.stopped(state, job, false);
     }
 }
+
+/// A preparation still refused as busy after the reviewed conversations ended.
+/// The terminal service and its terminals kept running.
+const PREPARE_BUSY_AFTER_ENDS: &str = "The source daemon stayed busy finishing another operation, so it did not checkpoint. The terminal service and its terminals were not stopped; the conversations below had already ended. Retry the update once it finishes.";
 
 fn settle_interrupts(
     state: &Path,
@@ -1297,8 +1309,9 @@ impl Survivors {
             ));
         }
         let socket = crate::terminal_ipc::daemon_socket_path()?;
-        let source::Client { mut client, peer } =
-            source::Client::connect(&socket).map_err(|error| invalid(error.to_string()))?;
+        let source::Client {
+            mut client, peer, ..
+        } = source::Client::connect(&socket).map_err(|error| invalid(error.to_string()))?;
         if client.protocol() != crate::terminal_ipc::PROTOCOL_VERSION {
             return Err(invalid(
                 "The confirmed successor does not serve this update's matched protocol",

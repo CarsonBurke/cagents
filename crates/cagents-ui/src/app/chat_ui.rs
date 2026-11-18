@@ -106,6 +106,7 @@ mod logical_prose;
 mod markdown;
 mod markdown_source;
 mod monospace;
+mod opening_name;
 mod pending_admission;
 mod permissions;
 mod preparation;
@@ -307,6 +308,9 @@ pub enum Action {
     /// a terminal can take its place.
     ReturnedLocally(Target, Result<(), ReturnRefused>),
     Wake(Target, Wake),
+    /// What the opening of a pane's conversation names its channel, read
+    /// once because the chat's loaded window starts after it.
+    OpeningName(CardId, String, Option<String>),
     UpdatesAcknowledged(Target, Result<(), String>),
     Reconnect(Target),
     DraftStartCheckpointed(Target, uuid::Uuid, Result<(), String>),
@@ -751,6 +755,7 @@ impl Action {
             Self::Retired(..) => "Retired",
             Self::ReturnedLocally(..) => "ReturnedLocally",
             Self::Wake(..) => "Wake",
+            Self::OpeningName(..) => "OpeningName",
             Self::UpdatesAcknowledged(..) => "UpdatesAcknowledged",
             Self::Reconnect(..) => "Reconnect",
             Self::DraftStartCheckpointed(..) => "DraftStartCheckpointed",
@@ -1181,6 +1186,10 @@ impl Resend {
 
 pub(super) struct State {
     channel_names: HashMap<Target, ChannelNameObservation>,
+    /// What the opening of each pane's conversation named, read at most once
+    /// while the window runs for a channel with no name: `None` while the
+    /// read runs, then the name it found, if any.
+    opening_names: HashMap<(CardId, String), Option<Option<String>>>,
     pub(super) image_viewer: Option<images::Gallery>,
     files: HashMap<PathBuf, Arc<Vec<String>>>,
     sender: async_channel::Sender<(Target, Wake)>,
@@ -1257,6 +1266,7 @@ impl Default for State {
         Self {
             image_viewer: None,
             channel_names: HashMap::new(),
+            opening_names: HashMap::new(),
             files: HashMap::new(),
             sender,
             receiver,
@@ -10356,6 +10366,35 @@ impl Cagents {
         }
     }
 
+    /// Names an unnamed channel from the first prompt its primary chat
+    /// delivered, and keeps that name as the chat's observation. The
+    /// suggestion can be refused, as when the pane has not yet recorded its
+    /// conversation; a chat on no screen reads no snapshot, so only the kept
+    /// observation offers the name again at the channel's next view.
+    pub(super) fn name_channel_from_prompt(&mut self, target: Target, prompt: &str) {
+        if !self.channel_lacks_name(target.card) {
+            return;
+        }
+        let Some(title) = crate::workspace_model::channel_title_from_prompt(prompt) else {
+            return;
+        };
+        if !self.chat_ui.channel_names.contains_key(&target) {
+            self.chat_ui
+                .channel_names
+                .retain(|previous, _| previous.card != target.card);
+        }
+        let observation = self.chat_ui.channel_names.entry(target).or_default();
+        // A name the conversation already reported is published by its own
+        // observation.
+        if observation.title.is_some() {
+            return;
+        }
+        let source = crate::model::ChannelTitleSource::Prompt;
+        observation.title = Some((title.clone(), source));
+        observation.pending = true;
+        self.publish_observed_channel_name(target, title, source);
+    }
+
     pub(super) fn defer_channel_title_suggestion(
         &mut self,
         edit: &crate::workspace_model::ModelEdit,
@@ -10387,7 +10426,7 @@ impl Cagents {
 
     /// A title may precede its pane's first shared-view acknowledgement. Retry
     /// the retained candidate after projection, with the newly accepted proof.
-    pub(super) fn refresh_channel_title_suggestions(&mut self) {
+    pub(super) fn refresh_channel_title_suggestions(&mut self) -> Task<Message> {
         for target in self
             .chat_ui
             .channel_names
@@ -10413,6 +10452,7 @@ impl Cagents {
         // A refused original revision is never rewritten in the publisher.
         // A newly accepted projection can make a fresh suggestion from the
         // current runtime; unchanged proofs do not create a retry loop.
+        let mut openings = Vec::new();
         for (card, proof) in &proofs {
             if !self.channel_needs_name(*card) {
                 continue;
@@ -10444,6 +10484,9 @@ impl Cagents {
                 observation.pending = observation.title.is_some();
                 observation.last_view = Some(*proof);
             }
+            // A pane that became a channel's primary chat, or a channel that
+            // lost its name, may need its conversation's opening.
+            openings.extend(self.request_opening_name(target));
         }
         let candidates = self
             .chat_ui
@@ -10463,6 +10506,11 @@ impl Cagents {
             } else {
                 self.chat_ui.channel_names.remove(&target);
             }
+        }
+        if openings.is_empty() {
+            Task::none()
+        } else {
+            Task::batch(openings)
         }
     }
 
@@ -10985,7 +11033,7 @@ impl Cagents {
         }
         runtime.refresh();
         if let Some(prompt) = first_prompt {
-            self.name_channel_from_prompt(target.card, &prompt);
+            self.name_channel_from_prompt(target, &prompt);
         }
         Task::none()
     }
@@ -11572,6 +11620,9 @@ impl Cagents {
             Action::RestoreAccount(card) => return self.restore_chat_account(card),
             Action::AccountRestored(card, result) => {
                 return self.chat_account_restored(card, result);
+            }
+            Action::OpeningName(card, conversation, title) => {
+                self.opening_name_read(card, conversation, title);
             }
             Action::DraftSkills(target, launch, skills) => {
                 if let Some(runtime) = self.chat_card_runtime_mut(target)
@@ -12272,6 +12323,8 @@ impl Cagents {
                         if let Some((name, source)) = channel_name {
                             self.publish_observed_channel_name(target, name, source);
                         }
+                        let opening_name =
+                            self.request_opening_name(target).unwrap_or_else(Task::none);
                         self.observe_agent_activity_for_card(target.card, Some(activity));
                         // A new request can reject before its first Changed
                         // wake reaches this window. Historical reopen alone
@@ -12315,6 +12368,7 @@ impl Cagents {
                             submitted,
                             usage,
                             limits,
+                            opening_name,
                             self.list_chat_models(target.card),
                             self.dispatch_queued(target),
                         ]);
@@ -14052,7 +14106,7 @@ impl Cagents {
                     self.persist();
                 }
                 if let Some(prompt) = first_prompt {
-                    self.name_channel_from_prompt(target.card, &prompt);
+                    self.name_channel_from_prompt(target, &prompt);
                 }
                 // Idle may have arrived while this command was awaiting its
                 // acknowledgement. No later provider event is guaranteed to
@@ -24018,6 +24072,93 @@ pub(in crate::app) mod tests {
     }
 
     #[test]
+    fn a_refused_first_prompt_name_is_offered_again_from_a_chat_on_no_screen() {
+        use crate::model::{ChannelId, ChannelTitleSource, ProjectChannel, ProjectId};
+        use crate::workspace_model::{
+            ModelEdit,
+            views::{Pane, Scope, View},
+        };
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        // A chat whose provider has not reported its conversation, and whose
+        // window has moved on: it reads no snapshot, so nothing it shows
+        // can name the channel.
+        let card = live_chat_for_provider(&mut app, Provider::Claude, None);
+        let target = chat_runtime(&app, card).target;
+        let id = ChannelId::new();
+        Arc::make_mut(&mut app.durable).channels = vec![ProjectChannel {
+            id,
+            project_id: ProjectId::new(),
+            title: String::new(),
+            title_source: ChannelTitleSource::Manual,
+            ordinal: 0,
+            shared: true,
+            cards: vec![card],
+            focused: Some(card),
+        }];
+        let pane = Pane::from_card(
+            app.card_state(card).unwrap(),
+            app.durable.card_scopes.get(&card).cloned(),
+        )
+        .unwrap();
+        let view = move |revision| View {
+            scope: Scope::Channel(id),
+            revision,
+            retired: Vec::new(),
+            panes: vec![pane.clone()],
+        };
+        app.workspace_model.views = vec![view(5)];
+        let (tx, requests) = super::super::workspace_model_sync::test_model_channel();
+        app.workspace_model_tx = tx;
+        let suggested = |revision| {
+            std::iter::from_fn(|| requests.try_recv().ok()).any(|edit| {
+                matches!(
+                    edit,
+                    ModelEdit::SuggestConversationTitle {
+                        id: channel,
+                        card: pane,
+                        expected_revision,
+                        title,
+                        source: ChannelTitleSource::Prompt,
+                    } if channel == id
+                        && pane == card
+                        && expected_revision == revision
+                        && title == "Plan the quarterly roadmap review"
+                )
+            })
+        };
+
+        app.name_channel_from_prompt(target, "Plan the quarterly roadmap review");
+        assert!(suggested(5));
+        assert_eq!(
+            app.durable.channels[0].title,
+            "Plan the quarterly roadmap review"
+        );
+        // The registry refuses it and the window restores the stored name.
+        Arc::make_mut(&mut app.durable).channels[0].title = String::new();
+
+        // The same view proof does not retry.
+        drop(app.refresh_channel_title_suggestions());
+        assert!(!suggested(5));
+        // The channel's next view offers the name again.
+        app.workspace_model.views = vec![view(6)];
+        drop(app.refresh_channel_title_suggestions());
+        assert!(suggested(6));
+        assert_eq!(
+            app.durable.channels[0].title,
+            "Plan the quarterly roadmap review"
+        );
+
+        // A later prompt never renames a named channel.
+        app.chat_ui.channel_names.clear();
+        app.name_channel_from_prompt(target, "A later prompt must not replace it");
+        assert!(app.chat_ui.channel_names.is_empty());
+        assert_eq!(
+            app.durable.channels[0].title,
+            "Plan the quarterly roadmap review"
+        );
+    }
+
+    #[test]
     fn presentation_projection_retries_a_deferred_title_with_the_ahead_scope_proof() {
         use super::super::workspace_model_sync::{EdgeChanges, ModelUpdate};
         use crate::model::{ChannelId, ChannelTitleSource, ProjectChannel, ProjectId};
@@ -24210,7 +24351,7 @@ pub(in crate::app) mod tests {
         channel.cards = vec![b, a];
         channel.title.clear();
         channel.title_source = ChannelTitleSource::Prompt;
-        app.refresh_channel_title_suggestions();
+        drop(app.refresh_channel_title_suggestions());
         assert_eq!(app.durable.channels[0].title, "Secondary encryption review");
         assert_eq!(
             app.durable.channels[0].title_source,

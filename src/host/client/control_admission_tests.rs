@@ -187,6 +187,49 @@ fn an_exclusive_request_refuses_retryably_at_its_deadline() {
     ));
 }
 
+/// A confirmed stop refused as busy was refused before the daemon read its
+/// capability, so the update can offer the same capability again: the daemon
+/// accepts it once the operation it was finishing ends.
+#[test]
+fn a_confirmed_stop_refused_as_busy_is_accepted_with_the_same_capability() {
+    let fixture = fixture("busy-confirm");
+    let Ok((ServerResponse::ShutdownPreflight(preflight), _, _)) =
+        process_request(&fixture.host, OPERATOR, self::preflight())
+    else {
+        panic!("the preflight was not issued");
+    };
+    let confirm = ClientRequest::ShutdownV1 {
+        version: SHUTDOWN_VERSION,
+        operation: ShutdownOperation::Confirm {
+            capability: preflight.capability,
+        },
+    };
+    let gate = control_gate(&fixture.host);
+    let operation = gate.shared();
+    let refusal = process_request(&fixture.host, OPERATOR, confirm.clone())
+        .map(|(response, _, _)| response)
+        .expect_err("a confirmed stop was admitted beside a shared holder");
+    assert_eq!(refusal.message, crate::terminal_ipc::DAEMON_BUSY);
+    assert!(refusal.retryable);
+
+    drop(operation);
+    let accepted = process_request(&fixture.host, OPERATOR, confirm);
+    assert!(
+        matches!(
+            accepted,
+            Ok((
+                ServerResponse::ShutdownOutcome(crate::terminal_ipc::ShutdownOutcome::Accepted {
+                    live_terminals_before: 1,
+                    termination_requested: true,
+                }),
+                _,
+                true,
+            ))
+        ),
+        "the same capability was not accepted after the busy refusal: {accepted:?}"
+    );
+}
+
 #[test]
 fn an_exclusive_request_is_admitted_under_steady_request_traffic() {
     let fixture = fixture("exclusive-under-traffic");
@@ -389,4 +432,23 @@ mod pipelined {
         let admitted = exclusive.recv_timeout(Duration::from_secs(10)).unwrap();
         assert!(matches!(admitted, Ok(ServerResponse::ShutdownPreflight(_))));
     }
+}
+
+#[test]
+fn a_busy_account_operation_refuses_as_the_gate_does() {
+    use crate::account::remote::LifecycleError;
+    let busy = super::lifecycle_refusal(LifecycleError::Busy);
+    assert_eq!(busy, super::control_gate::busy());
+    assert!(
+        crate::control::ControlError::Remote {
+            code: busy.code,
+            message: busy.message,
+            retryable: busy.retryable,
+        }
+        .is_daemon_busy()
+    );
+    let failed = super::lifecycle_refusal(LifecycleError::Failed("no CLI".into()));
+    assert_eq!(failed.code, ProtocolErrorCode::InvalidRequest);
+    assert_eq!(failed.message, "no CLI");
+    assert!(!failed.retryable);
 }

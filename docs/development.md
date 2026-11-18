@@ -102,6 +102,19 @@ tests' own build reports for what it compiles; `check:host` covers the daemon's
 whole build. Both the task and the sentinel judge a warning with
 `scripts/cargo_warnings.py`.
 
+The development runner (`mise run dev`) and `scripts/native-evidence build`,
+on the build host or in your checkout with `--remote`, run their three
+builds through `scripts/cargo-lane --allow-warnings`: the same rule for
+what shows, but a workspace warning, still named on the closing line, does
+not fail a build that has to start the app. Without it,
+each build of the UI replayed the vendored crates' warnings, about 17,000
+tokens, even when it compiled only `cagents`. The policy is applied to
+what Cargo reports rather than by capping the vendored crates' lints when
+they compile: lints capped at compile time would leave a unit already
+built replaying its old warnings until it was rebuilt, and
+`CAGENTS_VENDORED_WARNINGS=1` could not show them again without rebuilding
+the UI's dependencies.
+
 The scripts remain the lower-level entry points, documented in the sections
 below, for options a task does not forward, other build profiles, and callers
 that cannot run mise: GitHub CI, `scripts/native-evidence` sessions, and the
@@ -186,7 +199,9 @@ Each task runs one `scripts/cargo-gate check --locked` command with its lane's
 features, `--no-default-features --features host` for the daemon for example;
 `mise.toml` defines the lanes once. The `ui` lane selects both packages,
 `--package cagents --package cagents-ui --features cagents/ui`, and `browser`
-selects `--package cagents-ui --features integrated-browser`.
+selects `--package cagents-ui --features browser-protocol-fixture`: the
+integrated browser with the Wayland registry test server its tests use, as main's
+build check selects it.
 
 Every lane compiles the workspace's crates without warnings, tests included,
 and a new warning is a regression to fix in the change that adds it. An item
@@ -210,6 +225,20 @@ browserless UI lanes' tests (`scripts/cargo-gate test ... --all-targets`,
 [below](#testing)) type-check everything the lane's check does, so when you are
 about to run them, skip that check. The integrated UI has no test lane; keep
 its check.
+
+A test lane narrowed with arguments, such as `mise run test:ui -- --lib`, and
+`mise run test:lib` may build the lane's library only under `cfg(test)`,
+where an item only tests use looks used. So once their tests pass, these tasks
+also check the lane's library, binaries and examples, as main's build check
+does, and their status is that check's. A method only tests called reached
+main that way (#3006, fixed by #3035): its author ran a narrowed test lane and
+no check. On fw16 this check took about 20 s to compile where the slot had
+checked before and 70 to 95 s where it had not, after a narrowed UI test build
+of about 3 minutes, and it waits for its own build slot. It does not check the
+test targets the narrowed run skipped, so before review still run the lane's
+check, or its tests with every target. `scripts/cargo-gate check --features ui`
+without `--package cagents-ui` checks only the shared library, not the
+application; `mise run check:ui` checks both.
 
 Changes to ceditor or shared UI, editor, or notification public contracts also
 require the standalone editor check above. The workspace's
@@ -637,6 +666,26 @@ not passed over by builds that need one. The shares are the lock files
 `/var/tmp/cagents-cargo.lock`, `.1`, `.2`, ... (`CAGENTS_BUILD_LOCK` names
 the first), and builds offloaded to the host take them too.
 
+A build with nothing to compile does not wait in that queue. When its shares
+are not free at once, a `build`, `check`, `clippy`, `--no-run` or the build
+phase of `test`, `bench` or `run` first runs as a probe: Cargo with one job,
+its output held back, under a compiler wrapper (`scripts/cargo-gate-rustc-guard`)
+that passes the compiler's queries and ends the probe at the first compile.
+If Cargo finds everything fresh, or fails, the probe was the build: its output
+is shown and no shares are taken. Otherwise it is discarded and the build waits
+for its shares as before, so every compile still runs within them. At most
+four probes run at once, each holding one of the slots
+`/var/tmp/cagents-cargo.lock.probe.0` to `.3`; with none free, a build queues
+without one. A probe runs in the build slice described below, so the cap on
+builds' memory covers it too, and is ended, its build queued, if its
+processes outgrow 1 GiB (as a build script rerunning without a compile
+might), after 60 seconds, or at the admission deadline. Cargo alone needs
+about 180 MiB to find this workspace fresh. Doctests and `doc`, whose rustdoc
+no compiler wrapper sees, are not probed, nor is an `exec` on the host that
+compiles, which holds its shares throughout; each Cargo command of an `exec`
+offloaded from elsewhere is admitted, and probed, on its own.
+`CAGENTS_BUILD_PROBE=0` turns probing off.
+
 Once admitted, a build runs in its own systemd scope in
 `background-cagents.slice`, inside the user manager's `background.slice`.
 systemd gives that a `CPUWeight` of 30, below the 100 of `app.slice`, where
@@ -837,11 +886,19 @@ between its builds would keep the slot leased while it ran, so leave `--hold`
 off for such a script. A Cargo
 reached any other way inside COMMAND, by path, through `$CARGO`, `rustup run`
 or `mise exec`, would compile here, so `exec` also sets `RUSTC_WRAPPER` to
-`scripts/cargo-gate-rustc-guard`, which refuses to compile a crate and says
-why; Cargo's queries of rustc pass, and a wrapper the caller set still runs.
-Programs launched by `cargo run` inside that `exec` inherit the same Cargo
-shim and guard. Their named `cargo` reenters the gate after the program's
-build releases its slot; their absolute `$CARGO` cannot compile here.
+`scripts/cargo-gate-rustc-guard`, which refuses to compile and says why;
+Cargo's queries of rustc pass, and a wrapper the caller set still runs. The
+same guard is the `rustc`, `rustdoc` and `clippy-driver` beside the shim's
+`cargo` on `PATH`: a compiler run by name gets through only to answer what it
+is asked (its version, help, or a print it makes without compiling), from the
+next one on `PATH`.
+Programs launched by `cargo run` inside that `exec` inherit the same shims and
+guard. Their named `cargo` reenters the gate after the program's build
+releases its slot; their absolute `$CARGO` cannot compile here. Outside the
+guard's reach are a compiler run by its path, as `rustup run TOOLCHAIN rustc`
+does, or found on a `PATH` that puts a toolchain's directory ahead of the
+shims, any other driver, and a compiler run by anything the command leaves
+running after the shims are removed.
 On the build host itself, or with
 `CAGENTS_BUILD_REMOTE=local`, commands build here through the local slots
 above. With `CAGENTS_BUILD_REMOTE_LOOPBACK=1`, the build host's own commands
@@ -933,12 +990,14 @@ included, and moves the rest out of the target; with `0` it keeps none. Every
 6 hours it also moves out compiled units no build has looked at for 3 days,
 such as old versions after a dependency update. Cargo reads the fingerprint
 of every unit in a build's graph, even one it doesn't compile, so a unit is
-dated by its `.fingerprint/<package>-<hash>` directory and its outputs: a
-build dependency's rlib or a compiled build script is read only when it is
-rebuilt, so judged alone it would look unused in a lane that builds daily.
-A stale unit's fingerprint goes first, then its `deps/<crate>-<hash>` files
-and `build/<package>-<hash>` directory, so a unit moved out only in part is
-rebuilt. It skips this where the file system keeps no access times. Below twice the host's floor, the larger of
+dated by its fingerprint and its outputs: a build dependency's rlib or a
+compiled build script is read only when it is rebuilt, so judged alone it
+would look unused in a lane that builds daily. In Cargo's layout up to 1.99,
+a stale unit's `.fingerprint/<package>-<hash>` goes first, then its
+`deps/<crate>-<hash>` files and `build/<package>-<hash>` directory, so a unit
+moved out only in part is rebuilt. From 1.100, a unit is one
+`build/<package>/<hash>/` directory holding its fingerprint and outputs, and
+goes in one rename. It skips this where the file system keeps no access times. Below twice the host's floor, the larger of
 `CAGENTS_BUILD_REMOTE_FREE_FLOOR_GIB` and the [guard's](#compilation-jobs-and-shared-build-directories)
 default, a slot keeps a quarter of the budget, its dependencies are looked
 through at once, and the lease does the same to every other slot no lease
@@ -1075,7 +1134,7 @@ local build, removes them with `scripts/prune-build-dirs` in two ways:
 
 The pruner searches the repository's main checkout first, then the mirrored `/var/tmp/cargo-build`, then `~/.cache`, `~/.local/state` and `/var/tmp`, six levels deep. `CAGENTS_BUILD_PRUNE_ROOTS` replaces the last three. `~` is the account's home from the password database, because a test fixture's builds run under a private `HOME` that holds none of the account's build output, and a search of only that would find nothing yet count as a complete run. When `HOME` differs, its `~/.cache` and `~/.local/state` are searched as well, for a user who keeps builds under a `HOME` of their own. `~/.local/share` and the offload slots are never touched under either: their leases bound them, as [described above](#building-on-another-host), and before each of the guard's background runs and its run below the floor, `scripts/cargo-offload --trim-slots` beside it bounds the slots under the account's `~/.cache/cagents-offload` (`CAGENTS_BUILD_OFFLOAD_SLOTS`; empty for none) that no lease holds, under their leases' locks, as a lease would. A background run's account of it is in `/var/tmp/cagents-prune-build-dirs-UID.slots.log`. Below the floor the build waits for that trim and its removals beside the pruner, within the same budget. A `CAGENTS_BUILD_PRUNE` command replaces both. It skips a checkout's committed directories, which hold only sources.
 
-It recognizes build output by Cargo's own markers, not by name or place: a root `.rustc_info.json`, or a `CACHEDIR.TAG` beside a profile's `.fingerprint`. A [native-evidence](#native-evidence) task's `target-before` and `target-after`, beside the task's `.native-evidence` marker, are build output too. It removes a build directory only when all of these hold:
+It recognizes build output by Cargo's own markers, not by name or place: a root `.rustc_info.json`, or a `CACHEDIR.TAG` beside a profile's fingerprints, in `.fingerprint/` up to Cargo 1.99 or in `build/<package>/<hash>/fingerprint/` from 1.100. A [native-evidence](#native-evidence) task's `target-before` and `target-after`, beside the task's `.native-evidence` marker, are build output too. It removes a build directory only when all of these hold:
 
 - nothing inside it has been written or changed for `CAGENTS_BUILD_PRUNE_IDLE_DAYS` (default 7), or four times that for another main checkout's own build, which seeds that checkout's worktrees, or 12 hours for a native-evidence task's, 1 hour while running low;
 - every Cargo lock in it is free;
@@ -1469,6 +1528,21 @@ scripts/test-lib host --prefix terminal:: --test-threads 1
 scripts/test-lib ui --profile dev-runtime --prefix app::chat_ui::
 scripts/test-lib shared-ui --prefix settings::
 ```
+
+Prefer `test-lib` while iterating on UI library tests.
+`mise run test:ui -- --lib MODULE::` builds both the `cagents-ui` and the shared library's test harnesses on
+every edit, whatever the filter matches, so an edit to the shared library
+recompiles roughly twice as much as `scripts/test-lib ui` does
+([#2319](https://github.com/CarsonBurke/cagents/issues/2319)). The two commands
+unify the shared library's dependency features differently, because `test:ui`
+also selects `cagents` and its dev-dependencies, so the shared library and the
+dependencies whose features differ are built once for each command: the first
+switch builds that second set, and alternating rebuilds the shared library
+both ways. The same holds between `test:ui` and `scripts/test-lib shared-ui`,
+which builds the shared library's harness without `test-support`. Keep to one
+while iterating.
+`test-lib` runs Cargo without the lane tasks' warnings check, so finish with the
+lane task.
 
 Use actual full test names, or repeat `--prefix MODULE::` for literal module
 groups. Prefixes expand to ordinary full names and overlapping selections run
@@ -1926,9 +2000,11 @@ the branch has uncommitted changes or a merge in progress, any worktree is
 rebasing the branch, or another landing of the same PR is running. It waits
 for CI on the head through `scripts/gh-pr-status`, reading again only when the
 shared cache can refresh, about every two minutes, or later when `retry_at`
-says so. Unknown or missing checks count as not passed. A read from before the
-head was known, or one that has not yet caught up with the script's own push,
-cannot report that the head moved.
+says so. Unknown or missing checks count as not passed. A stale or failed read
+decides nothing, even about the same head, because checks can be rerun on it;
+the script waits for a read that succeeds. A read from before the head was
+known, or one that has not yet caught up with the script's own push, cannot
+report that the head moved.
 When GitHub refuses the merge because `main` moved while it was merging
 (`Base branch was modified`, HTTP 405), it reads the PR again after a short
 pause: a conflict now takes the conflict path above, and otherwise it merges
@@ -2081,7 +2157,9 @@ harness, it provides:
   startup; a saved descriptor whose provider was killed is not a live chat.
 - **Matching evidence.** `start` refuses a checkout that changed since its build.
   `shots/manifest.tsv` records each image's revision, source state, requested
-  width and size, so a pair can be compared and named in the PR.
+  width and size, so a pair can be compared and named in the PR. Shots are
+  lossy WebP; `shot NAME --lossless` keeps every pixel, for comparing borders,
+  edges and fades pixel by pixel.
 - **A shared path caveat.** With no worktree selected, the Workspace page shows
   the app's working directory, which is the checkout and so differs between
   sides. Select the fixture project's worktree before capturing a pair.

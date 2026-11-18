@@ -69,12 +69,14 @@ REHEARSAL_FIXTURES = tuple(f"tests/fixtures/{fixture}" for fixture in (
 JOBS = (
     Job("native evidence", shards=3, suites=(
         Suite("native evidence", "tests/native_evidence.py",
-              sources=("scripts/native-evidence", "scripts/native-evidence-remote", "scripts/native_slots.py"),
+              sources=("scripts/native-evidence", "scripts/native-evidence-remote", "scripts/native_slots.py",
+                       "scripts/run-development", "scripts/cargo-lane", "scripts/cargo_warnings.py"),
               syntax=(("bash", "scripts/native-evidence"), ("bash", "scripts/native-evidence-remote"))),
     )),
     Job("build offload", shards=2, suites=(
         Suite("build offload", "tests/cargo_offload.py",
-              sources=("scripts/cargo-offload", "scripts/cargo_artifacts.py", "scripts/build-host")),
+              sources=("scripts/cargo-offload", "scripts/cargo_artifacts.py", "scripts/build-host",
+                       "scripts/cargo-gate-rustc-guard")),
     )),
     Job("cargo gate", suites=(
         Suite("held-command cancellation", "tests/cargo_gate.py",
@@ -82,7 +84,7 @@ JOBS = (
                        "scripts/build-host", "scripts/memory-capped"),
               syntax=(("sh", "scripts/cargo-gate"),)),
         Suite("build host admission and jobserver", "tests/build_host.py",
-              sources=("scripts/build-host", "scripts/memory-capped")),
+              sources=("scripts/build-host", "scripts/memory-capped", "scripts/cargo-gate-rustc-guard")),
     )),
     Job("build directories", suites=(
         Suite("build directory pruning", "tests/prune_build_dirs.py", sources=("scripts/prune-build-dirs",)),
@@ -95,7 +97,7 @@ JOBS = (
         Suite("native slots", "tests/native_slots.py", sources=("scripts/native_slots.py",)),
         Suite("memory limit", "tests/memory_capped.py", sources=("scripts/memory-capped",)),
         Suite("workload time limit", "tests/bounded.py", sources=("scripts/bounded",)),
-        Suite("focused lib tests", "tests/test_lib.py", sources=("scripts/test-lib",)),
+        Suite("focused lib tests", "tests/test_lib.py", sources=("scripts/test-lib", "mise.toml")),
         Suite("HOST test helper", "tests/cargo_host_test_helper.py",
               sources=("scripts/cargo-host-test-helper.py", "scripts/cargo_artifacts.py")),
         Suite("main build sentinel", "tests/main_build_sentinel.py",
@@ -105,7 +107,7 @@ JOBS = (
         Suite("Cargo artifacts", "tests/cargo_artifacts.py", sources=("scripts/cargo_artifacts.py",)),
         Suite("lane warnings", "tests/cargo_lane.py", sources=("scripts/cargo-lane", "scripts/cargo_warnings.py")),
         Suite("script contracts", "tests/script_contracts.py", sources=("scripts/script-contracts",)),
-        Suite("mise tasks", "tests/mise_tasks.py", sources=("mise.toml",)),
+        Suite("mise tasks", "tests/mise_tasks.py", sources=("mise.toml", "scripts/main-build-sentinel")),
         Suite("doctor", "tests/doctor.py", sources=("scripts/doctor",)),
         Suite("Zig discovery", "tests/run-development-zig.py", sources=("scripts/run-development",), isolated=False),
         Suite("installer coordinator extraction", "tests/installer_coordinator.py", isolated=False),

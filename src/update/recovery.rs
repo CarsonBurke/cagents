@@ -5,9 +5,19 @@ use crate::{
     model::{HostSessionProof, TerminalContinuity, TerminalSession},
     terminal_ipc::{StartupState, TerminalDescriptor},
 };
+use source::BusyPatience;
 use std::collections::BTreeSet;
 
 const VERSION: u8 = 1;
+/// How long the update lets `verify-update-census` run before stopping it.
+const VERIFIER_LIMIT: Duration = Duration::from_secs(20);
+/// The deadline, from the start of one verifier run, that every inventory
+/// fence of that run shares. No fence is sent unless its admission wait and a
+/// prompt reply fit before this deadline, so a daemon that is busy, steadily
+/// or on and off, is reported in the run's own receipt. The rest of
+/// [`VERIFIER_LIMIT`] covers starting, connecting and the ordinary reads, which
+/// need no exclusive admission.
+const VERIFIER_BUSY_PATIENCE: Duration = Duration::from_secs(10);
 pub(crate) const CENSUS_ENV: &str = "CAGENTS_INSTALL_CENSUS_PATH";
 pub(crate) const OUTCOME_ENV: &str = "CAGENTS_INSTALL_OUTCOME_PATH";
 
@@ -134,13 +144,14 @@ impl Census {
         Ok(census)
     }
 
-    pub(crate) fn capture(transaction: String) -> Result<Self, UpdateError> {
-        Self::capture_with_candidate(transaction, None)
+    pub(crate) fn capture(transaction: String, busy: BusyPatience) -> Result<Self, UpdateError> {
+        Self::capture_with_candidate(transaction, None, busy)
     }
 
     fn capture_with_candidate(
         transaction: String,
         candidate_cli: Option<&Path>,
+        busy: BusyPatience,
     ) -> Result<Self, UpdateError> {
         if crate::device::is_remote() {
             return Err(invalid("Update census requires the local service"));
@@ -150,8 +161,8 @@ impl Census {
         }
         // A retained checkpoint is a source, even after its process exits.
         // Never replace that inventory with an empty socket observation.
-        let handled = inspect_capture_source(candidate_cli)?;
-        match observe() {
+        let handled = inspect_capture_source(candidate_cli, busy)?;
+        match observe(busy) {
             Ok((source, terminals, chats, readiness)) => {
                 require_captured_owner(handled.as_ref(), Some(&source))?;
                 if readiness != StartupState::Ready {
@@ -168,7 +179,7 @@ impl Census {
                     // A preparation may have appeared during the socket read.
                     // Admit its serving replacement under the same strict
                     // rule before recording the current source inventory.
-                    let now_handled = inspect_capture_source(candidate_cli)?;
+                    let now_handled = inspect_capture_source(candidate_cli, busy)?;
                     require_captured_owner(now_handled.as_ref(), Some(&source))?;
                     if now_handled.is_none() {
                         return Err(invalid(
@@ -194,7 +205,7 @@ impl Census {
                 if checkpoint_status()?
                     .is_some_and(|status| status.phase == crate::upgrade::handoff::Phase::Prepared)
                 {
-                    inspect_capture_source(candidate_cli)?;
+                    inspect_capture_source(candidate_cli, busy)?;
                     return Err(invalid(
                         "The recovered daemon changed or exited during census capture; its retained source inventory was kept, and no empty census was created",
                     ));
@@ -213,7 +224,7 @@ impl Census {
                     if checkpoint.as_ref().is_some_and(|status| {
                         status.phase == crate::upgrade::handoff::Phase::Prepared
                     }) {
-                        inspect_capture_source(candidate_cli)?;
+                        inspect_capture_source(candidate_cli, busy)?;
                         return Err(invalid(
                             "A Prepared checkpoint appeared during census capture; its source inventory was kept, and no empty census was created",
                         ));
@@ -285,6 +296,24 @@ impl Census {
             checkpoint_before: self.checkpoint_before.clone(),
         })
     }
+    /// The receipt for a verification that `error` ended before the inventory
+    /// was read. A daemon that answered only that it was busy is recorded as
+    /// serving, with no terminal verified; it was not observed to lose any.
+    pub(crate) fn unobserved(&self, error: &UpdateError) -> Result<Receipt, UpdateError> {
+        match error {
+            UpdateError::SourceBusy { serving, message } => self.receipt(Outcome::Unverified {
+                serving: Some(serving.as_ref().clone()),
+                readiness: None,
+                surviving_terminals: 0,
+                expected_terminals: self.terminals.len(),
+                missing: vec![],
+                unexpected: vec![],
+                changed: vec![],
+                detail: message.clone(),
+            }),
+            error => self.unverified(error.to_string()),
+        }
+    }
     pub(crate) fn unverified(&self, detail: String) -> Result<Receipt, UpdateError> {
         self.receipt(Outcome::Unverified {
             serving: None,
@@ -297,8 +326,9 @@ impl Census {
             detail,
         })
     }
-    pub(crate) fn verify(&self) -> Result<Receipt, UpdateError> {
-        match observe_with(|proof, terminals, chats, target| {
+    /// Reads the serving inventory, asking a busy daemon again within `busy`.
+    pub(crate) fn verify(&self, busy: BusyPatience) -> Result<Receipt, UpdateError> {
+        match observe_with(busy, |proof, terminals, chats, target| {
             // Evidence failure must not discard the independently observed
             // serving owner or skip the closing readiness/inventory fences.
             let evidence = (|| -> Result<_, UpdateError> {
@@ -359,16 +389,7 @@ impl Census {
             Ok((observation, Err(error))) => {
                 self.receipt(unverified_evidence(self, observation, error))
             }
-            Err(error) => self.receipt(Outcome::Unverified {
-                serving: None,
-                readiness: None,
-                surviving_terminals: 0,
-                expected_terminals: self.terminals.len(),
-                missing: self.terminals.iter().map(|t| t.id).collect(),
-                unexpected: vec![],
-                changed: vec![],
-                detail: error.to_string(),
-            }),
+            Err(error) => self.unobserved(&error),
         }
     }
     /// A release worker may predate the replacement's wire protocol. Ask the
@@ -403,10 +424,11 @@ impl Census {
         let before = match fs::symlink_metadata(&executable) {
             Ok(m) => m,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                let receipt = self.verify()?;
+                let busy = BusyPatience::shared_for(VERIFIER_BUSY_PATIENCE);
+                let receipt = self.verify(busy)?;
                 if retire && receipt.usable() {
-                    retire_current_service()?;
-                    return self.verify();
+                    retire_current_service(busy)?;
+                    return self.verify(busy);
                 }
                 return Ok(receipt);
             }
@@ -447,7 +469,7 @@ impl Census {
             &mut command,
             "Recovery readiness verification",
             SMALL_ASSET_LIMIT,
-            Duration::from_secs(20),
+            VERIFIER_LIMIT,
             &CancellationToken::new(),
         );
         let after = fs::symlink_metadata(&executable)?;
@@ -496,6 +518,24 @@ impl Census {
 }
 
 impl Receipt {
+    /// The busy refusal a census recorded through [`Census::unobserved`]: the
+    /// only receipt naming a serving daemon without its readiness. That shape,
+    /// rather than a new field, marks it, because the coordinator that reads a
+    /// verifier's receipt may be an older build that refuses unknown fields.
+    pub(crate) fn still_busy(&self) -> Option<UpdateError> {
+        match &self.outcome {
+            Outcome::Unverified {
+                serving: Some(serving),
+                readiness: None,
+                detail,
+                ..
+            } => Some(UpdateError::SourceBusy {
+                serving: Box::new(serving.clone()),
+                message: detail.clone(),
+            }),
+            _ => None,
+        }
+    }
     pub(crate) fn usable(&self) -> bool {
         matches!(self.outcome, Outcome::Usable { .. })
     }
@@ -623,11 +663,12 @@ impl InventorySource for source::Client {
     }
 }
 
-fn observe() -> Result<Observation, UpdateError> {
-    observe_with(|_, _, _, _| Ok(())).map(|(inventory, ())| inventory)
+fn observe(busy: BusyPatience) -> Result<Observation, UpdateError> {
+    observe_with(busy, |_, _, _, _| Ok(())).map(|(inventory, ())| inventory)
 }
 
 fn observe_with<E>(
+    busy: BusyPatience,
     read_evidence: impl FnOnce(
         &HostSessionProof,
         &[TerminalDescriptor],
@@ -639,8 +680,9 @@ fn observe_with<E>(
         return Err(invalid("Update recovery requires the local daemon"));
     }
     let socket = crate::terminal_ipc::daemon_socket_path()?;
-    let mut client =
-        source::Client::connect(&socket).map_err(|error| invalid(error.to_string()))?;
+    let mut client = source::Client::connect(&socket)
+        .map_err(|error| invalid(error.to_string()))?
+        .with_busy_patience(busy);
     read_inventory_with(&mut client, read_evidence)
 }
 
@@ -926,15 +968,21 @@ pub(crate) fn capture_file_with_candidate(
     output: &Path,
     candidate_cli: Option<&Path>,
 ) -> Result<(), UpdateError> {
-    Census::capture_with_candidate(uuid::Uuid::new_v4().to_string(), candidate_cli)?.save(output)
+    Census::capture_with_candidate(
+        uuid::Uuid::new_v4().to_string(),
+        candidate_cli,
+        BusyPatience::for_one_run(),
+    )?
+    .save(output)
 }
 
 fn inspect_capture_source(
     candidate_cli: Option<&Path>,
+    busy: BusyPatience,
 ) -> Result<Option<HostSessionProof>, UpdateError> {
     match candidate_cli {
-        Some(candidate) => inspect_pending_source(candidate, None),
-        None => inspect_pending_source_inner(&std::env::current_exe()?, None, true),
+        Some(candidate) => inspect_pending_source_inner(candidate, None, false, busy),
+        None => inspect_pending_source_inner(&std::env::current_exe()?, None, true, busy),
     }
 }
 
@@ -943,7 +991,7 @@ pub(super) fn inspect_pending_current() -> Result<(), UpdateError> {
 }
 
 pub(super) fn inspect_pending_caller(caller: &Path) -> Result<(), UpdateError> {
-    inspect_pending_source_inner(caller, None, true).map(|_| ())
+    inspect_pending_source_inner(caller, None, true, BusyPatience::for_one_run()).map(|_| ())
 }
 
 pub(super) struct PendingCommandScope<'a> {
@@ -982,20 +1030,15 @@ pub(super) fn inspect_pending(
     candidate_cli: &Path,
     census: Option<&Path>,
 ) -> Result<(), UpdateError> {
-    inspect_pending_source(candidate_cli, census).map(|_| ())
-}
-
-fn inspect_pending_source(
-    candidate_cli: &Path,
-    census: Option<&Path>,
-) -> Result<Option<HostSessionProof>, UpdateError> {
-    inspect_pending_source_inner(candidate_cli, census, false)
+    inspect_pending_source_inner(candidate_cli, census, false, BusyPatience::for_one_run())
+        .map(|_| ())
 }
 
 fn inspect_pending_source_inner(
     candidate_hint: &Path,
     census: Option<&Path>,
     require_retained_job: bool,
+    busy: BusyPatience,
 ) -> Result<Option<HostSessionProof>, UpdateError> {
     if crate::device::is_remote() {
         return Err(invalid("Update recovery requires the local service"));
@@ -1005,7 +1048,7 @@ fn inspect_pending_source_inner(
     else {
         return Ok(None);
     };
-    match serving_prepared(&pending) {
+    match serving_prepared(&pending, busy) {
         PreparedService::HandledVerified { serving } => return Ok(Some(serving)),
         PreparedService::RetainedUnverified(detail) => {
             return Err(invalid(format!(
@@ -1064,13 +1107,16 @@ enum PreparedService {
 
 /// Read settled history only through the actual kernel-authenticated serving
 /// executable. The history classifier supplies no replay or adoption authority.
-fn serving_prepared(pending: &crate::upgrade::recovery::PendingRecovery) -> PreparedService {
+fn serving_prepared(
+    pending: &crate::upgrade::recovery::PendingRecovery,
+    busy: BusyPatience,
+) -> PreparedService {
     let claim_before = match pending.has_recovery_claim() {
         Ok(present) => present,
         Err(error) => return PreparedService::RetainedUnverified(error),
     };
     let mut classified = false;
-    let observed = observe_with(|_, _, _, target| {
+    let observed = observe_with(busy, |_, _, _, target| {
         let Some(store) = crate::upgrade::handoff::Store::existing().map_err(invalid)? else {
             return Ok(None);
         };
@@ -1090,7 +1136,7 @@ fn serving_prepared(pending: &crate::upgrade::recovery::PendingRecovery) -> Prep
             ));
         }
         Census::from_pending(uuid::Uuid::new_v4().to_string(), pending)?
-            .verify()
+            .verify(busy)
             .map(Some)
     });
     // A claim can appear while a daemon is settling. Recheck before offering
@@ -1158,14 +1204,19 @@ fn require_captured_owner(
 
 /// Complete immutable Prepared evidence only after the sole original-census
 /// verifier proves a fresh Ready socket and its complete live/paused inventory.
-/// This never starts, stops, attaches or replays any owner.
-pub(crate) fn retire_current_service() -> Result<RetirementStatus, UpdateError> {
-    retire_service(RetirementTrigger::CurrentJob)
+/// This never starts, stops, attaches or replays any owner. A daemon busy
+/// finishing another operation is asked again within `busy`.
+pub(crate) fn retire_current_service(busy: BusyPatience) -> Result<RetirementStatus, UpdateError> {
+    retire_service(RetirementTrigger::CurrentJob, busy)
 }
 
+/// Run by the daemon itself, through its own socket, once it serves. A busy
+/// refusal means one of its own clients holds an operation; waiting for it
+/// would only hold those clients back, and this optional completion is
+/// attempted again by the next update, so it is asked once.
 #[cfg(feature = "host")]
 pub(crate) fn refresh_completed_service() -> Result<RetirementStatus, UpdateError> {
-    retire_service(RetirementTrigger::ColdStart)
+    retire_service(RetirementTrigger::ColdStart, BusyPatience::ONCE)
 }
 
 /// Mechanical evidence status, not another daemon usability outcome.
@@ -1196,7 +1247,10 @@ enum RetirementWork {
     },
 }
 
-fn retire_service(trigger: RetirementTrigger) -> Result<RetirementStatus, UpdateError> {
+fn retire_service(
+    trigger: RetirementTrigger,
+    busy: BusyPatience,
+) -> Result<RetirementStatus, UpdateError> {
     let result = (|| {
         let Some(store) = crate::upgrade::handoff::Store::existing().map_err(invalid)? else {
             return Ok(RetirementStatus::NotRequired);
@@ -1223,7 +1277,9 @@ fn retire_service(trigger: RetirementTrigger) -> Result<RetirementStatus, Update
             }
         }
         let socket = crate::terminal_ipc::daemon_socket_path()?;
-        let mut client = source::Client::connect(&socket).map_err(|e| invalid(e.to_string()))?;
+        let mut client = source::Client::connect(&socket)
+            .map_err(|e| invalid(e.to_string()))?
+            .with_busy_patience(busy);
         let generation = client.inventory_generation()?;
         let ((proof, terminals, chats, readiness), retirement) = read_inventory_with(
             &mut client,
@@ -1276,7 +1332,7 @@ fn retire_service(trigger: RetirementTrigger) -> Result<RetirementStatus, Update
                 }
                 let original =
                     Census::from_recovered(uuid::Uuid::new_v4().to_string(), &recovered)?;
-                let receipt = original.verify()?;
+                let receipt = original.verify(busy)?;
                 let (paused_terminals, paused_chats) =
                     retirement_partition(&receipt, proof, &StartupState::Ready, terminals, chats)?;
                 recovered
@@ -1337,7 +1393,7 @@ fn retire_service(trigger: RetirementTrigger) -> Result<RetirementStatus, Update
             .map_err(invalid)?;
         // Independently open the archived evidence through the same root
         // verifier. A planned pointer alone is not durable completion.
-        let refreshed = original.verify()?;
+        let refreshed = original.verify(busy)?;
         retirement_partition(&refreshed, &proof, &StartupState::Ready, &terminals, &chats)?;
         if client.inventory_generation()? != generation
             || client.startup_state()? != StartupState::Ready
@@ -1360,7 +1416,14 @@ fn retire_service(trigger: RetirementTrigger) -> Result<RetirementStatus, Update
             );
         }
     }
-    result.map_err(|error: UpdateError| invalid(format!("Recovery completion could not be durably verified: {error}. Any serving daemon was kept running and its checkpoint/outcome evidence was preserved. Run `cagents --no-start daemon status` and `cagents --no-start terminal list` before another update")))
+    result.map_err(|error: UpdateError| {
+        let message = format!("Recovery completion could not be durably verified: {error}. Any serving daemon was kept running and its checkpoint/outcome evidence was preserved. Run `cagents --no-start daemon status` and `cagents --no-start terminal list` before another update");
+        match error {
+            // Still a busy daemon, so a receipt can say that it is serving.
+            UpdateError::SourceBusy { serving, .. } => UpdateError::SourceBusy { serving, message },
+            _ => invalid(message),
+        }
+    })
 }
 
 #[cfg(feature = "host")]
@@ -1418,7 +1481,8 @@ fn retirement_partition(
         Outcome::Usable { .. } => Err(invalid(
             "The root recovery receipt does not match this Ready serving proof and current inventory; completion was not authorized",
         )),
-        _ => Err(receipt.failure()),
+        // Keep a busy census busy, so its caller still records a serving daemon.
+        _ => Err(receipt.still_busy().unwrap_or_else(|| receipt.failure())),
     }
 }
 
@@ -1580,6 +1644,9 @@ pub(crate) fn verify_file_with_candidate(
     verify_file(census, outcome, true, false, false, false)
 }
 
+/// One verifier run, as `verify-update-census` performs it. Every inventory
+/// fence shares one [`VERIFIER_BUSY_PATIENCE`] deadline, so a busy daemon
+/// cannot keep the run from writing its receipt within [`VERIFIER_LIMIT`].
 pub(crate) fn verify_file(
     census: &Path,
     outcome: &Path,
@@ -1588,19 +1655,34 @@ pub(crate) fn verify_file(
     require_original: bool,
     require_absent: bool,
 ) -> Result<Receipt, UpdateError> {
+    verify_file_within(
+        census,
+        outcome,
+        inspect,
+        allow_absent,
+        require_original,
+        require_absent,
+        BusyPatience::shared_for(VERIFIER_BUSY_PATIENCE),
+    )
+}
+
+fn verify_file_within(
+    census: &Path,
+    outcome: &Path,
+    inspect: bool,
+    allow_absent: bool,
+    require_original: bool,
+    require_absent: bool,
+    busy: BusyPatience,
+) -> Result<Receipt, UpdateError> {
     if crate::device::is_remote() {
         return Err(invalid("Update recovery requires the local service"));
     }
     let census = Census::load(census)?;
-    let mut receipt = if require_absent {
-        match census.verify_absence() {
+    let mut receipt = if require_absent || (allow_absent && census.source.is_none()) {
+        match census.verify_absence(busy) {
             Ok(receipt) => receipt,
-            Err(error) => census.unverified(error.to_string())?,
-        }
-    } else if allow_absent && census.source.is_none() {
-        match census.verify_absence() {
-            Ok(receipt) => receipt,
-            Err(error) => census.unverified(error.to_string())?,
+            Err(error) => census.unobserved(&error)?,
         }
     } else if inspect {
         match census.inspect_restart() {
@@ -1608,10 +1690,13 @@ pub(crate) fn verify_file(
             Err(e) => census.unverified(e.to_string())?,
         }
     } else {
-        census.verify()?
+        census.verify(busy)?
     };
     if require_original {
-        let unchanged = matches!(&receipt.outcome,Outcome::Usable{serving,..} if census.source.as_ref()==Some(serving));
+        // A busy receipt naming the original daemon says it is still serving.
+        let unchanged = matches!(&receipt.outcome,
+            Outcome::Usable { serving, .. } | Outcome::Unverified { serving: Some(serving), readiness: None, .. }
+                if census.source.as_ref() == Some(serving));
         if !unchanged
             && !((allow_absent || require_absent) && matches!(receipt.outcome, Outcome::NoSource))
         {
@@ -1635,7 +1720,9 @@ pub(crate) fn verify_file(
 }
 
 /// Final post-window verification may complete archival through the target
-/// CLI, including when the coordinator predates its wire protocol.
+/// CLI, including when the coordinator predates its wire protocol. Its census
+/// reads, retirement fences and refreshed census share one busy patience, as
+/// in [`verify_file`].
 pub(crate) fn verify_file_retiring(
     census: &Path,
     outcome: &Path,
@@ -1643,24 +1730,26 @@ pub(crate) fn verify_file_retiring(
     require_original: bool,
     require_absent: bool,
 ) -> Result<Receipt, UpdateError> {
-    let receipt = verify_file(
+    let busy = BusyPatience::shared_for(VERIFIER_BUSY_PATIENCE);
+    let receipt = verify_file_within(
         census,
         outcome,
         false,
         allow_absent,
         require_original,
         require_absent,
+        busy,
     )?;
     if !receipt.usable() {
         // A file-only installation has no recovery to retire.
         return Ok(receipt);
     }
     let original = Census::load(census)?;
-    if let Err(error) = retire_current_service() {
-        original.unverified(error.to_string())?.save(outcome)?;
+    if let Err(error) = retire_current_service(busy) {
+        original.unobserved(&error)?.save(outcome)?;
         return Err(error);
     }
-    let refreshed = original.verify()?;
+    let refreshed = original.verify(busy)?;
     refreshed.save(outcome)?;
     if refreshed.usable() {
         Ok(refreshed)
@@ -1670,8 +1759,8 @@ pub(crate) fn verify_file_retiring(
 }
 
 impl Census {
-    pub(super) fn verify_absence(&self) -> Result<Receipt, UpdateError> {
-        let fresh = Self::capture(self.transaction.clone())?;
+    pub(super) fn verify_absence(&self, busy: BusyPatience) -> Result<Receipt, UpdateError> {
+        let fresh = Self::capture(self.transaction.clone(), busy)?;
         if !proves_absent(self, &fresh) {
             return Err(invalid(
                 "A daemon or pending recovery exists; a fresh installation without a source daemon was not proven",
@@ -1698,7 +1787,7 @@ pub(super) struct Context {
 }
 impl Context {
     pub fn capture(&mut self, state: &Path, job: &UpdateJob) -> Result<(), UpdateError> {
-        let census = Census::capture(job.id.clone())?;
+        let census = Census::capture(job.id.clone(), BusyPatience::for_one_run())?;
         census.save(&census_path(state, &job.id))?;
         self.census = Some(census);
         Ok(())
@@ -1996,6 +2085,71 @@ mod tests {
         }
     }
 
+    /// A daemon that answered only that it stayed busy is serving: its
+    /// receipt keeps the listener and lists no terminal as missing, although
+    /// none was verified. Any other failure keeps the unobserved receipt.
+    #[test]
+    fn update_recovery_busy_daemon_is_recorded_as_serving_without_losses() {
+        let census = census(&terminal());
+        let busy = UpdateError::SourceBusy {
+            serving: Box::new(proof()),
+            message: source::STILL_BUSY_TO_CHECK.into(),
+        };
+        let receipt = census.unobserved(&busy).unwrap();
+        assert!(receipt.has_listener() && !receipt.usable());
+        assert!(matches!(
+            &receipt.outcome,
+            Outcome::Unverified {
+                serving: Some(serving),
+                readiness: None,
+                surviving_terminals: 0,
+                expected_terminals: 1,
+                missing,
+                ..
+            } if *serving == proof() && missing.is_empty()
+        ));
+        assert!(matches!(
+            receipt.still_busy(),
+            Some(UpdateError::SourceBusy { serving, message })
+                if *serving == proof() && message == source::STILL_BUSY_TO_CHECK
+        ));
+        let failure = receipt.failure().to_string();
+        assert!(failure.contains(source::STILL_BUSY_TO_CHECK), "{failure}");
+        assert!(
+            failure.contains("before retrying the staged update"),
+            "{failure}"
+        );
+
+        let other = census.unobserved(&invalid("connection refused")).unwrap();
+        assert!(!other.has_listener() && other.still_busy().is_none());
+        assert!(
+            matches!(&other.outcome, Outcome::Unverified { missing, .. } if missing.len() == 1)
+        );
+    }
+
+    /// Retirement reads its root receipt through the same census. A daemon
+    /// that stayed busy there is still reported busy and serving, not as a
+    /// failed recovery with every terminal missing.
+    #[test]
+    fn update_recovery_retirement_keeps_a_busy_census_busy() {
+        let census = census(&terminal());
+        let receipt = census
+            .unobserved(&UpdateError::SourceBusy {
+                serving: Box::new(proof()),
+                message: source::STILL_BUSY_TO_CHECK.into(),
+            })
+            .unwrap();
+        let error =
+            retirement_partition(&receipt, &proof(), &StartupState::Ready, &[], &[]).unwrap_err();
+        assert!(
+            matches!(&error, UpdateError::SourceBusy { serving, message }
+                if **serving == proof() && message == source::STILL_BUSY_TO_CHECK),
+            "{error:?}"
+        );
+        let saved = census.unobserved(&error).unwrap();
+        assert!(saved.has_listener() && saved.still_busy().is_some());
+    }
+
     #[test]
     fn update_recovery_require_absent_rejects_serving_inventory_and_pending_checkpoint() {
         let mut empty = census(&terminal());
@@ -2202,7 +2356,7 @@ mod tests {
         original.terminals.clear();
         let path = root.join("original-census.json");
         original.save(&path).unwrap();
-        let observed = Census::capture(original.transaction.clone()).unwrap();
+        let observed = Census::capture(original.transaction.clone(), BusyPatience::ONCE).unwrap();
         assert!(observed.source.is_none());
         assert!(observed.checkpoint_before.is_some());
         let outcome = root.join("outcome.json");

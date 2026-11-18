@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 mod catalog;
 mod scan;
+pub(super) use scan::{HEAD_BYTES, first_prompt};
 
 /// Conversations read before the first found ones are listed, so the newest
 /// appear at once, and between later listings.

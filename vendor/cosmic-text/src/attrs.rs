@@ -223,6 +223,27 @@ impl Hash for LetterSpacing {
     }
 }
 
+/// Horizontal room in EM reserved at a span's start and end, like CSS inline padding.
+///
+/// It widens the span's first and last glyph boxes, so the span takes the room in
+/// layout and its glyph bounds include it.
+#[derive(Clone, Copy, Debug)]
+pub struct InlinePadding(pub f32);
+
+impl PartialEq for InlinePadding {
+    fn eq(&self, other: &Self) -> bool {
+        LetterSpacing(self.0) == LetterSpacing(other.0)
+    }
+}
+
+impl Eq for InlinePadding {}
+
+impl Hash for InlinePadding {
+    fn hash<H: Hasher>(&self, hasher: &mut H) {
+        LetterSpacing(self.0).hash(hasher);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum UnderlineStyle {
     #[default]
@@ -295,6 +316,8 @@ pub struct Attrs<'a> {
     pub metrics_opt: Option<CacheMetrics>,
     /// Letter spacing (tracking) in EM
     pub letter_spacing_opt: Option<LetterSpacing>,
+    /// Room reserved at the span's start and end, in EM
+    pub inline_padding_opt: Option<InlinePadding>,
     pub font_features: FontFeatures,
     pub text_decoration: TextDecoration,
 }
@@ -314,6 +337,7 @@ impl<'a> Attrs<'a> {
             cache_key_flags: CacheKeyFlags::empty(),
             metrics_opt: None,
             letter_spacing_opt: None,
+            inline_padding_opt: None,
             font_features: FontFeatures::new(),
             text_decoration: TextDecoration::new(),
         }
@@ -370,6 +394,12 @@ impl<'a> Attrs<'a> {
     /// Set letter spacing (tracking) in EM
     pub const fn letter_spacing(mut self, letter_spacing: f32) -> Self {
         self.letter_spacing_opt = Some(LetterSpacing(letter_spacing));
+        self
+    }
+
+    /// Reserve room in EM at the span's start and end, like CSS inline padding
+    pub const fn inline_padding(mut self, inline_padding: f32) -> Self {
+        self.inline_padding_opt = Some(InlinePadding(inline_padding));
         self
     }
 
@@ -452,6 +482,8 @@ pub struct AttrsOwned {
     pub metrics_opt: Option<CacheMetrics>,
     /// Letter spacing (tracking) in EM
     pub letter_spacing_opt: Option<LetterSpacing>,
+    /// Room reserved at the span's start and end, in EM
+    pub inline_padding_opt: Option<InlinePadding>,
     pub font_features: FontFeatures,
     pub text_decoration: TextDecoration,
 }
@@ -468,6 +500,7 @@ impl AttrsOwned {
             cache_key_flags: attrs.cache_key_flags,
             metrics_opt: attrs.metrics_opt,
             letter_spacing_opt: attrs.letter_spacing_opt,
+            inline_padding_opt: attrs.inline_padding_opt,
             font_features: attrs.font_features.clone(),
             text_decoration: attrs.text_decoration,
         }
@@ -484,6 +517,7 @@ impl AttrsOwned {
             cache_key_flags: self.cache_key_flags,
             metrics_opt: self.metrics_opt,
             letter_spacing_opt: self.letter_spacing_opt,
+            inline_padding_opt: self.inline_padding_opt,
             font_features: self.font_features.clone(),
             text_decoration: self.text_decoration,
         }

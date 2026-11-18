@@ -2341,19 +2341,14 @@ impl Cagents {
         })
     }
 
-    /// Names a new channel from its first submitted prompt or conversation name.
-    ///
-    /// Prompt fallbacks may later improve to provider titles. Manual and legacy
-    /// titles remain authoritative, including renames from another window.
-    pub(super) fn name_channel_from_prompt(&mut self, card: CardId, prompt: &str) {
-        // Later messages do not replace an established task. Restored snapshots
-        // may repair a poor historical fallback using the first substantive prompt.
-        if self.durable.channels.iter().any(|channel| {
+    /// Whether `card` is the primary chat of a channel with no name, which
+    /// its conversation may fill. An empty title is unnamed whatever its
+    /// source: a new channel starts empty and manual, and the reader names a
+    /// channel only with a title (see `channel_is_named`).
+    pub(super) fn channel_lacks_name(&self, card: CardId) -> bool {
+        self.durable.channels.iter().any(|channel| {
             channel.title.is_empty() && self.channel_primary_chat(channel) == Some(card)
-        }) && let Some(title) = channel_title_from_prompt(prompt)
-        {
-            self.suggest_channel_title(card, title, crate::model::ChannelTitleSource::Prompt);
-        }
+        })
     }
 
     pub(super) fn suggest_channel_title(
@@ -2605,10 +2600,6 @@ impl Cagents {
         self.sidebar_model
             .set_panes(&self.sidebar_state, &stale, |id| titles.remove(&id));
     }
-}
-
-fn channel_title_from_prompt(prompt: &str) -> Option<String> {
-    crate::workspace_model::channel_title_from_prompt(prompt)
 }
 
 /// What the delete confirmation says about unsaved editors, naming each.
@@ -3036,14 +3027,19 @@ pub(in crate::app) mod tests {
                 retired: Vec::new(),
             });
         let prompt = format!("Explain the parser {}", "with detailed context ".repeat(12));
-        let expected = channel_title_from_prompt(&prompt).expect("prompt has a title");
-        app.name_channel_from_prompt(card, &prompt);
+        let expected =
+            crate::workspace_model::channel_title_from_prompt(&prompt).expect("prompt has a title");
+        let target = super::super::chat_ui::Target {
+            card,
+            generation: 0,
+        };
+        app.name_channel_from_prompt(target, &prompt);
         assert_eq!(app.durable.channels[0].title, expected);
         assert_eq!(app.sidebar_model.projects[0].channels[0].title, expected);
 
         let durable = Arc::make_mut(&mut app.durable);
         durable.cards[0].title = "A later conversation title".into();
-        app.name_channel_from_prompt(card, "A later prompt must not replace it");
+        app.name_channel_from_prompt(target, "A later prompt must not replace it");
         app.refresh_sidebar_channels();
         assert_eq!(app.sidebar_model.projects[0].channels[0].title, expected);
         assert_eq!(app.durable.channels[0].title, expected);

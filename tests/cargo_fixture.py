@@ -11,6 +11,8 @@ registry to fill it.
 
 import os
 from pathlib import Path
+import shutil
+import subprocess
 
 
 def user_cargo_home(environment=os.environ):
@@ -26,3 +28,11 @@ def private_cargo_environment(home, environment=os.environ):
     caller's CARGO_* variables, which Cargo also reads as configuration."""
     return {name: value for name, value in environment.items()
             if not name.startswith("CARGO_")} | {"CARGO_HOME": str(home)}
+
+
+def toolchain_installed(toolchain):
+    """Whether rustup has `toolchain`, such as "1.100.0", installed here."""
+    if shutil.which("rustup") is None:
+        return False
+    listed = subprocess.run(["rustup", "toolchain", "list"], capture_output=True, text=True)
+    return any(line.startswith(f"{toolchain}-") for line in listed.stdout.splitlines())

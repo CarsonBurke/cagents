@@ -33,3 +33,29 @@ Coverage: vendor/iced-core's text::blink tests cover the schedule. The app's
 terminal tests cover the rest and its restart, and docs/performance.md records
 the native measurement ("Idle UI wakeups"). Remove this copy when the pinned
 upstream widgets stop blinking on their own.
+
+Local change: inline code styling (src/markdown.rs)
+
+`Style::inline_code` styles a span as inline code. The app's own Markdown
+renderer and this one share it, so chat prose and every `markdown::view`
+surface draw inline code the same way. `Style` gains
+`inline_code_relative_size`, the size of inline code relative to the text
+around it, set through `Span::relative_size`, and
+`inline_code_inline_padding`, room laid out before and after inline code
+inside its background, set through `Span::inline_padding`. The defaults of
+1.0 and 0.0 keep upstream's size and layout. `inline_code_color` becomes an `Option`, where `None`
+leaves inline code in the color of the text around it. The default stays
+upstream's white.
+
+Why: monospace letters at the prose's size read larger and heavier than
+the sentence around them, and full-strength ink made code brighter than the
+prose (cagents#3002). The app's regressions are in
+crates/cagents-ui/src/app/chat_ui/selectable_prose.rs and flow_layout.rs.
+
+## Text editor overscan (cagents #2824)
+
+`TextEditor::overscan(above, below)` lets text draw into the editor's top and bottom padding, up to the padding itself. The widget sets the overscan on its editor during layout, and clips the text, caret and selection to the text area plus that band. `overscan_bounds` computes that area: each extended edge moves inward onto a whole device pixel at the renderer style's scale factor. The renderer rounds clip rectangles to device pixels, so a fractional edge next to an antialiased border would otherwise take in a row of that border and paint over it. The placeholder still uses the text area. `Content::overflow` reports how far drawn text reaches into each band, so the app can fade it out (`ui_controls::editable::editor`, `fade_into_padding`).
+
+Why: a scrolled composer draft was sliced at the padding's inner edge (#2824). Remove this when upstream editors can draw into their padding.
+
+Dragging a selection into a band selects the line drawn there, and cursor reveal then scrolls it into view. The drag therefore scrolls one line for each pointer move inside the band, and stops while the pointer is still. iced still reports drags only within the widget's bounds.

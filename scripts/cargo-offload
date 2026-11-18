@@ -601,14 +601,14 @@ def real_cargo(environment):
 # command ends with what it started when its standard input closes: the
 # connection to this host dropped or the gate here was cancelled.
 # What runs a build on the build host, sent with each command: build-host and
-# the helpers beside it. The host test helper and its artifact reader travel
+# the helpers beside it, including the compiler wrapper of its probes. The host test helper and its artifact reader travel
 # when this checkout has them.
-TOOLS = ("build-host", "memory-capped")
+TOOLS = ("build-host", "memory-capped", "cargo-gate-rustc-guard")
 OPTIONAL_TOOLS = ("cargo-host-test-helper.py", "cargo_artifacts.py")
 
 
 REMOTE_AGENT = r'''
-import base64, fcntl, glob, hashlib, json, os, resource, shutil, signal, stat, subprocess, sys, threading, time
+import base64, fcntl, glob, hashlib, json, os, re, resource, shutil, signal, stat, subprocess, sys, threading, time
 command, base = sys.argv[1], os.path.expanduser(sys.argv[2])
 DIRECTORIES_MARKER = "cargo-offload-directories "
 
@@ -894,13 +894,18 @@ def sweep_dependencies(slot, cutoff):
     """Moves out of each profile of the slot's target the compiled units
     that no build has looked at since `cutoff`, and returns the bytes moved.
     Cargo reads the fingerprint of every unit in a build's graph, whether
-    or not it compiles it, so `.fingerprint/<package>-<hash>` dates a unit:
-    the rlib of a build dependency or a compiled build script is read only
-    when it is built again, and judged by itself would look unused in a
-    lane that builds daily. A stale unit goes with its fingerprint first,
-    so one moved out only in part is built again, then with the
-    `deps/<crate>-<hash>` files and `build/<package>-<hash>` directory
-    sharing its hash. Cargo builds again whatever a build needs of it."""
+    or not it compiles it, so a unit's fingerprint dates it: the rlib of a
+    build dependency or a compiled build script is read only when it is
+    built again, and judged by itself would look unused in a lane that
+    builds daily. Cargo builds again whatever a build needs of what goes.
+
+    Cargo up to 1.99 keeps a unit's fingerprint in
+    `.fingerprint/<package>-<hash>`, beside the `deps/<crate>-<hash>` files
+    and `build/<package>-<hash>` directory sharing its hash. A stale unit
+    goes with its fingerprint first, so one moved out only in part is built
+    again, then with those. From 1.100 each unit is a directory of its own,
+    `build/<package>/<hash>`, holding its `fingerprint`, its `out`puts and a
+    build script's `run`, and goes whole, in one rename."""
     moved = 0
     for fingerprints in target_directories(slot, ".fingerprint"):
         profile = os.path.dirname(fingerprints)
@@ -940,7 +945,45 @@ def sweep_dependencies(slot, cutoff):
                         break
                     continue
                 moved += held
+    for packages in target_directories(slot, "build"):
+        for unit in cargo_units(packages):
+            fingerprint = os.path.join(unit, "fingerprint")
+            if os.path.islink(fingerprint) or not os.path.isdir(fingerprint):
+                continue
+            newest, size = newest_file(unit)
+            if newest >= cutoff:
+                continue
+            try:
+                evict(slot, unit)
+            except OSError:
+                continue
+            moved += size
     return moved
+
+
+# The hash naming a unit's directory in Cargo's layout from 1.100.
+UNIT_HASH = re.compile(r"[0-9a-f]{16}")
+
+
+def cargo_units(packages):
+    """The unit directories, `<package>/<hash>`, in a profile's `build`
+    directory as Cargo lays it out from 1.100. Up to 1.99 that directory
+    holds `<package>-<hash>` directories of build-script output, none of
+    whose entries is named by a hash alone."""
+    try:
+        listed = list(os.scandir(packages))
+    except OSError:
+        return []
+    units = []
+    for package in listed:
+        if not package.is_dir(follow_symlinks=False):
+            continue
+        try:
+            units.extend(unit.path for unit in os.scandir(package.path)
+                         if UNIT_HASH.fullmatch(unit.name) and unit.is_dir(follow_symlinks=False))
+        except OSError:
+            continue
+    return sorted(units)
 
 
 # Removes what trim moved out of each slot named after its first argument
