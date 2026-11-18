@@ -33,12 +33,12 @@ impl From<&str> for AuthorityError {
 }
 
 /// An identity-only projection: `replacement` is `source` with nothing changed
-/// but the conversation ID its provider confirmed. It covers retained Claude
-/// helpers and daemon-hosted Codex threads on their own listener, the two
-/// actors whose first identity arrives after the descriptor was saved. This
-/// shape grants no authority: callers must authenticate the exact source
-/// lineage (the hosted actor, or the helper's census) before updating a saved
-/// agent or pane.
+/// but the conversation ID and native continuity its provider confirmed. It
+/// covers retained Claude helpers and daemon-hosted Codex threads on their own
+/// listener, the two actors whose first identity arrives after the descriptor
+/// was saved. This shape grants no authority: callers must authenticate the
+/// exact source lineage (the hosted actor, or the helper's census) before
+/// updating a saved agent or pane.
 pub(in crate::host) fn confirmed_identity_update(
     source: &crate::chat::Session,
     replacement: &crate::chat::Session,
@@ -59,6 +59,7 @@ pub(in crate::host) fn confirmed_identity_update(
     };
     if !learns
         || !source.has_valid_native_continuity()
+        || !replacement.has_valid_native_continuity()
         || !source
             .proof
             .as_ref()
@@ -73,6 +74,14 @@ pub(in crate::host) fn confirmed_identity_update(
     }
     let mut projected = source.clone();
     projected.launch.session_id = replacement.launch.session_id.clone();
+    if source.launch.provider == crate::agent::Provider::Codex
+        && matches!(
+            replacement.native_continuity,
+            crate::chat::NativeContinuity::Durable { .. }
+        )
+    {
+        projected.native_continuity = replacement.native_continuity.clone();
+    }
     projected == *replacement
 }
 
@@ -1671,6 +1680,7 @@ impl Registry {
                 && confirmed_identity_update(current, learned)
             {
                 current.launch.session_id = learned.launch.session_id.clone();
+                current.native_continuity = learned.native_continuity.clone();
             }
         }
         require_placement(&tx, &agent.placement, &agent.spec.target.repository)?;
@@ -5677,6 +5687,19 @@ mod tests {
             next
         };
         assert!(confirmed_identity_update(&codex, &learned(&codex)));
+        let mut durable = learned(&codex);
+        durable.native_continuity = crate::chat::NativeContinuity::Durable {
+            provider_version: "0.157.1".into(),
+        };
+        assert!(confirmed_identity_update(&codex, &durable));
+        let mut invalid_continuity = durable.clone();
+        invalid_continuity.native_continuity = crate::chat::NativeContinuity::Durable {
+            provider_version: String::new(),
+        };
+        assert!(!confirmed_identity_update(&codex, &invalid_continuity));
+        invalid_continuity.native_continuity =
+            crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+        assert!(!confirmed_identity_update(&codex, &invalid_continuity));
         // A begun thread never changes its ID.
         let mut begun = codex.clone();
         begun.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
@@ -5708,31 +5731,49 @@ mod tests {
 
     #[test]
     fn binding_preserves_identity_confirmed_during_pending_launch() {
-        let (mut registry, _directory, request) = fixture();
-        let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
-        let HostedSession::Chat(mut initial) = source() else {
-            unreachable!()
-        };
-        initial.native_continuity =
-            crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
-        let confirmed = initial.launch.session_id.take().unwrap();
-        let initial = HostedSession::Chat(initial);
-        registry
-            .reserve_agent_launch(accepted.agent.id, &initial)
-            .unwrap();
-        let mut learned = initial.clone();
-        let HostedSession::Chat(chat) = &mut learned else {
-            unreachable!()
-        };
-        chat.launch.session_id = Some(confirmed);
-        registry
-            .adopt_authenticated_agent_session(std::slice::from_ref(&initial), &learned)
-            .unwrap();
-        // The startup reply was captured before the daemon persisted confirmation.
-        let bound = registry
-            .bind_agent(accepted.agent.id, None, initial)
-            .unwrap();
-        assert_eq!(bound.session, Some(learned));
+        for provider in [Provider::Claude, Provider::Codex] {
+            let (mut registry, _directory, request) = fixture();
+            let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+            let HostedSession::Chat(mut initial) = source() else {
+                unreachable!()
+            };
+            let confirmed = initial.launch.session_id.take().unwrap();
+            if provider == Provider::Codex {
+                initial.launch.provider = provider;
+                initial.launch.recipe.program = "codex".into();
+                initial.launch.recipe.arguments = vec!["--remote".into(), "unix://".into()];
+                let proof = initial.proof.clone().unwrap();
+                assert!(
+                    initial
+                        .claim_owned_codex_listener(std::path::Path::new("/run/fixture"), &proof)
+                );
+            } else {
+                initial.native_continuity =
+                    crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+            }
+            let initial = HostedSession::Chat(initial);
+            registry
+                .reserve_agent_launch(accepted.agent.id, &initial)
+                .unwrap();
+            let mut learned = initial.clone();
+            let HostedSession::Chat(chat) = &mut learned else {
+                unreachable!()
+            };
+            chat.launch.session_id = Some(confirmed);
+            if provider == Provider::Codex {
+                chat.native_continuity = crate::chat::NativeContinuity::Durable {
+                    provider_version: "0.157.1".into(),
+                };
+            }
+            registry
+                .adopt_authenticated_agent_session(std::slice::from_ref(&initial), &learned)
+                .unwrap();
+            // The startup reply was captured before the daemon persisted confirmation.
+            let bound = registry
+                .bind_agent(accepted.agent.id, None, initial)
+                .unwrap();
+            assert_eq!(bound.session, Some(learned));
+        }
     }
 
     #[test]

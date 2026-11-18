@@ -1119,7 +1119,13 @@ fn dispatch(
     ready?;
     // A new thread is named before it reports ready. Save that now, so an
     // agent no run update reaches again still keeps its conversation.
-    save_confirmed_identity(host, &registry, &session, handle.confirmed_session_id());
+    save_confirmed_identity(
+        host,
+        &registry,
+        &session,
+        handle.confirmed_session_id(),
+        handle.native_continuity(),
+    );
     if claim.is_none_or(|claim| claim.withdrawn) {
         return Err((State::Cancelled, UNDELIVERED_CANCELLATION.into()));
     }
@@ -1184,7 +1190,7 @@ pub(super) fn observed(
     run: RunId,
     update: Update,
 ) {
-    let (source, confirmed) = {
+    let (source, confirmed, continuity) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let Some(record) = state
             .chats
@@ -1193,10 +1199,14 @@ pub(super) fn observed(
         else {
             return;
         };
-        (record.session.clone(), record.handle.confirmed_session_id())
+        (
+            record.session.clone(),
+            record.handle.confirmed_session_id(),
+            record.handle.native_continuity(),
+        )
     };
     let Ok(registry) = registry(host) else { return };
-    save_confirmed_identity(host, &registry, &source, confirmed);
+    save_confirmed_identity(host, &registry, &source, confirmed, continuity);
     // The store guard ends with this block: `announce` takes the registry lock
     // and then the host lock, so it must never run while either is held.
     let recorded = {
@@ -1234,13 +1244,14 @@ pub(super) fn observed(
 /// not keep the provider, or an abandoned update, would otherwise leave the
 /// agent and its pane pointing at no conversation. `hosted` is the actor this
 /// daemon is running, so the bound descriptor is authenticated by being the
-/// same process; only the ID changes. Retained Claude helpers save theirs
-/// through the outcome broker under their census instead.
+/// same process; only the ID and its native continuity change. Retained Claude
+/// helpers save theirs through the outcome broker under their census instead.
 fn save_confirmed_identity(
     host: &SharedHost,
     registry: &SharedRegistry,
     hosted: &chat::Session,
     confirmed: Option<String>,
+    continuity: chat::NativeContinuity,
 ) {
     // The store guard ends with this statement: `announce` takes the registry
     // lock and then the host lock.
@@ -1248,6 +1259,7 @@ fn save_confirmed_identity(
         &mut registry.lock().unwrap_or_else(|p| p.into_inner()),
         hosted,
         confirmed,
+        continuity,
     );
     match learned {
         Ok(true) => announce(host, registry),
@@ -1264,6 +1276,7 @@ fn persist_confirmed_identity(
     store: &mut Registry,
     hosted: &chat::Session,
     confirmed: Option<String>,
+    continuity: chat::NativeContinuity,
 ) -> Result<bool, String> {
     let Some(confirmed) = confirmed else {
         return Ok(false);
@@ -1284,6 +1297,7 @@ fn persist_confirmed_identity(
     }
     let mut learned = bound.clone();
     learned.launch.session_id = Some(confirmed);
+    learned.native_continuity = continuity;
     if !super::model::confirmed_identity_update(&bound, &learned) {
         return Ok(false);
     }
