@@ -766,7 +766,7 @@ impl RemoteActor {
     pub fn refresh_state(&self) -> Result<(), String> {
         self.refresh_state_until(Instant::now() + TIMEOUT)
     }
-    fn refresh_state_until(&self, deadline: Instant) -> Result<(), String> {
+    pub fn refresh_state_until(&self, deadline: Instant) -> Result<(), String> {
         let closed = self
             .0
             .final_snapshot
