@@ -62,7 +62,8 @@ for _ in 1 2 3 4 5 6 7 8; do
     "$ne" drive click "$row" >/dev/null 2>&1
     sleep 3
     observed=$("$ne" drive observe 2>/dev/null)
-    printf '%s\n' "$observed" | grep -q 'soak test is under way' || continue
+    # The screen is read by OCR, which splits and misreads words.
+    printf '%s\n' "$observed" | grep -qiE 'soak|reviewers' || continue
     composer=$(printf '%s\n' "$observed" | grep -E 'Message' | tail -1 |
         sed -E 's/^ *\[t[0-9]+\] +([0-9]+), +([0-9]+) +([0-9]+)x([0-9]+).*/\1 \2 \3 \4/' |
         awk '{printf "%d,%d", $1 + $3 / 2, $2 + $4 / 2}')
