@@ -34,7 +34,7 @@ const SECOND: &[u8] = b"SECOND_AFTER_AUTH\n";
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Operation {
     Authenticate,
-    List,
+    ListPage(Option<TerminalId>),
     Spawn(TerminalId),
     Attach(TerminalId),
     Visibility(TerminalId),
@@ -73,7 +73,7 @@ fn observed_request(
 ) -> Result<RequestOutcome, ProtocolError> {
     let operation = match &request {
         ClientRequest::Authenticate { .. } => Operation::Authenticate,
-        ClientRequest::List => Operation::List,
+        ClientRequest::ListPage { after } => Operation::ListPage(*after),
         ClientRequest::Spawn { session, .. } => Operation::Spawn(session.id),
         ClientRequest::Attach { terminal_id, .. } => Operation::Attach(*terminal_id),
         ClientRequest::SetVisibility { terminal_id, .. } => Operation::Visibility(*terminal_id),
@@ -485,7 +485,7 @@ fn actual_server_reauthenticates_the_issued_caller_and_never_replays_accepted_pt
             .collect::<Vec<_>>(),
         vec![
             Operation::Authenticate,
-            Operation::List,
+            Operation::ListPage(None),
             Operation::Attach(child.id)
         ]
     );
@@ -510,7 +510,7 @@ fn actual_server_reauthenticates_the_issued_caller_and_never_replays_accepted_pt
         .map(|event| &event.operation)
         .collect::<Vec<_>>();
     assert_eq!(resumed[0], &Operation::Authenticate);
-    assert_eq!(resumed[1], &Operation::List);
+    assert_eq!(resumed[1], &Operation::ListPage(None));
     assert_eq!(resumed[2], &Operation::Attach(child.id));
     assert!(
         !resumed
@@ -733,7 +733,7 @@ fn actual_server_refuses_foreign_input_and_reused_or_changed_original_sources_be
     let new = &after[before..];
     assert_eq!(
         new.iter().map(|event| &event.operation).collect::<Vec<_>>(),
-        vec![&Operation::Authenticate, &Operation::List]
+        vec![&Operation::Authenticate, &Operation::ListPage(None)]
     );
     assert!(!sibling.launch.working_directory.join("input").exists());
     drop(mismatch);

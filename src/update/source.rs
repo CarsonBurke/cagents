@@ -776,6 +776,10 @@ pub(crate) const RETIRED_SOURCES: &[(u16, &str)] = &[
         188,
         "intermediate #3075 protocol; superseded by 189 without a qualified installed update source",
     ),
+    (
+        189,
+        "intermediate #3149 protocol; superseded by 190 without a qualified installed update source",
+    ),
 ];
 
 #[cfg(test)]

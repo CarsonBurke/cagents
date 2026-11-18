@@ -271,7 +271,10 @@ use crate::{
 /// Version 189 appends `ModelEdit::CloseConfirmedProject`, which `project
 /// close` sends with the channels it confirmed so the daemon refuses the close
 /// if they changed. A daemon before it could not decode the edit.
-pub const PROTOCOL_VERSION: u16 = 189;
+/// Version 190 appends `ListPage` and its `ListedPage` reply, which return the
+/// terminal inventory in pages that each fit a frame. `List` answers an older
+/// CLI as before, or refuses when the whole inventory no longer fits one.
+pub const PROTOCOL_VERSION: u16 = 190;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";
@@ -312,6 +315,13 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_CLIENT_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
 pub const MAX_RESUME_TERMINALS: usize = 1024;
+/// Encoded descriptor bytes a `ListedPage` fills before it ends, leaving the
+/// rest of the frame for the envelope. A descriptor larger than this still
+/// gets a page of its own, as every descriptor must fit `Attached`.
+pub const LIST_PAGE_BYTES: usize = 1024 * 1024;
+/// The first protocol that lists terminals in pages. A client speaking an
+/// earlier source's protocol during an update lists with `List`.
+pub const LIST_PAGES_PROTOCOL: u16 = 190;
 /// Maximum scalar values retained in a descriptor's observed terminal title.
 pub const MAX_TERMINAL_TITLE_CHARACTERS: usize = 256;
 /// Production full and browserless builds retain the runtime namespace; a
@@ -727,6 +737,12 @@ pub enum ClientRequest {
         pane: PaneChatStart,
         session: crate::chat::Session,
         execution_environment: ChatExecutionEnvironment,
+    },
+    /// The terminal inventory in identity order, starting after `after`. A
+    /// terminal present for the whole listing appears exactly once; one
+    /// spawned or closed meanwhile may or may not.
+    ListPage {
+        after: Option<TerminalId>,
     },
 }
 
@@ -1184,6 +1200,12 @@ pub enum ServerResponse {
     WorkspaceEdit(crate::workspace_model::delta::EditReceipt),
     WorkspaceMetadata(crate::workspace_model::metadata::Reply),
     TerminalRemovalBasis(crate::workspace_model::views::TerminalRemovalBasis),
+    /// One page of a `ListPage` listing; `complete` when nothing follows its
+    /// last terminal.
+    ListedPage {
+        terminals: Vec<TerminalDescriptor>,
+        complete: bool,
+    },
 }
 
 /// The daemon's startup recovery, as [`ClientRequest::StartupState`] reports it.

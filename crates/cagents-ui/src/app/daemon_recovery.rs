@@ -1165,8 +1165,9 @@ mod tests {
             while let Some(request) = read_frame::<ClientEnvelope>(&mut stream).unwrap() {
                 assert_eq!(request.proof, Some(proof.clone()));
                 let response = match request.request {
-                    ClientRequest::List => ServerResponse::Listed {
+                    ClientRequest::ListPage { after: None } => ServerResponse::ListedPage {
                         terminals: terminals.clone(),
+                        complete: true,
                     },
                     ClientRequest::StartupState => ServerResponse::StartupState(state.clone()),
                     other => panic!("recovery sent {other:?}"),
@@ -2405,8 +2406,9 @@ mod tests {
                                     StartupState::Ready
                                 })
                             }
-                            ClientRequest::List => ServerResponse::Listed {
+                            ClientRequest::ListPage { after: None } => ServerResponse::ListedPage {
                                 terminals: inventory.terminals.clone(),
+                                complete: true,
                             },
                             ClientRequest::ChatList => ServerResponse::ChatListed {
                                 sessions: inventory.chats.clone(),
