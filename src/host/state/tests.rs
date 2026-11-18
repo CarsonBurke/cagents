@@ -26,7 +26,7 @@ fn startup_state_is_answered_while_startup_recovery_refuses_other_requests() {
             response => panic!("unexpected startup state response: {response:?}"),
         };
     let refused = || {
-        crate::host::client::process_request(&host, 0, ClientRequest::BuildInfo)
+        crate::host::client::process_request(&host, 0, ClientRequest::ChatCapacitySet { limit: 1 })
             .unwrap_err()
             .code
     };

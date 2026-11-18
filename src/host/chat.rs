@@ -4416,6 +4416,7 @@ fn process_inner(
                 record.returning_terminal = true;
                 record.completion_observed = false;
                 state.inventory_generation += 1;
+                state.recovery_independence.extend(chat_id, terminal_id);
             }
             // Closing interrupts active work and waits for confirmed teardown.
             // Never start a second writer before teardown has been proved.

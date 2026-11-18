@@ -4311,9 +4311,11 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                 daemon_socket_path().map_err(|error| AppError::new("socket_path", error))?;
             let socket = &selected_socket;
             let mut daemon_version = None;
+            let mut startup = None;
             let running = match ControlClient::connect(socket) {
                 Ok(mut client) => {
                     daemon_version = Some(client.daemon_version().map_err(protocol_error)?);
+                    startup = Some(client.startup_state().map_err(protocol_error)?);
                     true
                 }
                 Err(ControlError::Connect(error))
@@ -4341,6 +4343,7 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                 "daemon_present": daemon_present,
                 "socket": socket,
                 "daemon_version": daemon_version,
+                "startup": startup,
                 "inherited_lease": crate::daemon::lease_handoff::has_inherited_lease()
                     .map_err(|error| AppError::new("daemon_status", error))?,
                 "cli_version": crate::version()
@@ -4367,6 +4370,18 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                     crate::version()
                 )
             };
+            match &startup {
+                Some(terminal::ipc::StartupState::Restoring { awaiting }) => {
+                    human.push_str(&format!(
+                        "\nstartup: restoring; {awaiting} original owners await their outcome"
+                    ))
+                }
+                Some(terminal::ipc::StartupState::Retained { detail }) => {
+                    human.push_str("\nstartup: recovery holds original ownership: ");
+                    human.push_str(detail);
+                }
+                Some(terminal::ipc::StartupState::Ready) | None => {}
+            }
             if let Some((attention, warning)) = upgrade_attention() {
                 data["upgrade_attention"] = attention;
                 human.push_str("\nwarning: ");
@@ -6734,6 +6749,15 @@ mod tests {
                     ServerResponse::BuildInfo {
                         version: "fixture".into(),
                     },
+                );
+                // Status also reports whether startup recovery holds owners.
+                let request: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+                assert!(matches!(request.request, ClientRequest::StartupState));
+                response(
+                    &mut stream,
+                    &pinned,
+                    request.request_id,
+                    ServerResponse::StartupState(terminal::ipc::StartupState::Ready),
                 );
                 assert!(read_frame::<ClientEnvelope>(&mut stream).unwrap().is_none());
             });
