@@ -89,6 +89,7 @@ pub mod recovery_authority;
 pub mod repository;
 #[cfg(feature = "ui")]
 pub mod review_cache;
+pub mod revision;
 #[doc(hidden)]
 pub mod secure_file;
 mod selected_file_path;

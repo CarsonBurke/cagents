@@ -1732,7 +1732,7 @@ impl StateStore {
         let mut state = WorkspaceState::default();
         state.id = copy.workspace;
         state.channels = manifest.channels;
-        state.card_scopes = manifest.card_scopes;
+        state.card_scopes = manifest.card_scopes.into();
         copy.project(&mut state)?;
         for (name, value) in [
             ("chat_drafts", ordered_map_json(&manifest.chat_drafts)?),
@@ -2181,7 +2181,7 @@ impl StateStore {
             project_order: manifest.project_order,
             channels: manifest.channels,
             active_channel: manifest.active_channel,
-            card_scopes: manifest.card_scopes,
+            card_scopes: manifest.card_scopes.into(),
             chat_drafts: manifest.chat_drafts,
             chat_draft_attachments: manifest.chat_draft_attachments,
             chat_waiting_messages: manifest.chat_waiting_messages,
@@ -6731,7 +6731,7 @@ mod tests {
             project_order: Vec::new(),
             channels: Vec::new(),
             active_channel: None,
-            card_scopes: HashMap::new(),
+            card_scopes: Default::default(),
             chat_drafts: HashMap::new(),
             chat_draft_attachments: HashMap::new(),
             chat_waiting_messages: HashMap::new(),

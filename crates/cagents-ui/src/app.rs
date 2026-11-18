@@ -5747,7 +5747,9 @@ pub struct Cagents {
     worktree_focus: HashMap<PathBuf, CardId>,
     worktree_offsets: HashMap<PathBuf, f32>,
     channel_offsets: HashMap<crate::model::ChannelId, f32>,
-    worktree_owners: HashMap<CardId, PathBuf>,
+    /// Revisioned so a save can tell in one comparison that no card's owner
+    /// changed since the last.
+    worktree_owners: crate::revision::Revisioned<HashMap<CardId, PathBuf>>,
     /// The worktrees the last protection sync asked to protect, which the
     /// projection check compares.
     #[cfg(any(test, feature = "development"))]
@@ -15823,7 +15825,7 @@ impl Application for Cagents {
             worktree_focus: HashMap::new(),
             worktree_offsets: HashMap::new(),
             channel_offsets: HashMap::new(),
-            worktree_owners: HashMap::new(),
+            worktree_owners: Default::default(),
             #[cfg(any(test, feature = "development"))]
             projected_protections: Default::default(),
             known_worktree_roots: worktrees

@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 use uuid::Uuid;
 
+use crate::revision::Revisioned;
+
 macro_rules! id_type {
     ($name:ident) => {
         #[derive(
@@ -1614,8 +1616,11 @@ pub struct WorkspaceState {
     /// Cloning and reopening preserve that ownership, including editors whose
     /// descriptor points into a nested directory, so startup projection keeps
     /// them in the workspace where they were opened.
+    ///
+    /// Revisioned so a save can tell in one comparison that no card's filing
+    /// changed since the last.
     #[serde(default)]
-    pub card_scopes: HashMap<CardId, PathBuf>,
+    pub card_scopes: Revisioned<HashMap<CardId, PathBuf>>,
     /// Unsent native-chat composer text, keyed by the card that owns it.
     #[serde(default)]
     pub chat_drafts: HashMap<CardId, String>,
@@ -1674,7 +1679,7 @@ impl Default for WorkspaceState {
             project_order: Vec::new(),
             channels: Vec::new(),
             active_channel: None,
-            card_scopes: HashMap::new(),
+            card_scopes: Revisioned::default(),
             chat_drafts: HashMap::new(),
             chat_draft_attachments: HashMap::new(),
             chat_waiting_messages: HashMap::new(),

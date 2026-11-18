@@ -380,7 +380,7 @@ fn attention_cache_refiles_unchanged_workspace_when_root_inventory_changes() {
     let original = projects[0].worktrees[1].clone();
     let card = compact_attention_terminal(CardId::new());
     let durable = Arc::new(crate::model::WorkspaceState {
-        card_scopes: std::collections::HashMap::from([(card.id, original.path.clone())]),
+        card_scopes: std::collections::HashMap::from([(card.id, original.path.clone())]).into(),
         cards: vec![card.clone()].into(),
         ..Default::default()
     });
@@ -446,7 +446,7 @@ fn attention_cache_tracks_folder_binding_without_a_new_workspace() {
     let root = folder.repository.clone();
     let card = compact_attention_terminal(CardId::new());
     let durable = Arc::new(crate::model::WorkspaceState {
-        card_scopes: std::collections::HashMap::from([(card.id, root.clone())]),
+        card_scopes: std::collections::HashMap::from([(card.id, root.clone())]).into(),
         cards: vec![card.clone()].into(),
         ..Default::default()
     });
@@ -505,7 +505,7 @@ fn channel_pane_attention_stays_off_the_worktree_it_runs_in() {
     let channel_only = Arc::new(crate::model::WorkspaceState {
         cards: vec![scoped.clone(), remembered.clone()].into(),
         channels: vec![channel.clone()],
-        card_scopes: std::collections::HashMap::from([(scoped.id, main.path.clone())]),
+        card_scopes: std::collections::HashMap::from([(scoped.id, main.path.clone())]).into(),
         ..Default::default()
     });
     let projects = vec![project.clone()];
@@ -523,7 +523,7 @@ fn channel_pane_attention_stays_off_the_worktree_it_runs_in() {
     // A pane in no channel is listed under its worktree, so it counts.
     let with_unchanneled = Arc::new(crate::model::WorkspaceState {
         cards: vec![scoped, remembered, unchanneled.clone()].into(),
-        card_scopes: std::collections::HashMap::from([(unchanneled.id, main.path.clone())]),
+        card_scopes: std::collections::HashMap::from([(unchanneled.id, main.path.clone())]).into(),
         channels: vec![channel],
         ..Default::default()
     });
@@ -9509,7 +9509,7 @@ fn folder_root_panes_list_as_pane_rows_in_attention() {
     let durable = Arc::new(crate::model::WorkspaceState {
         cards: vec![root.clone(), child.clone()].into(),
         channels: vec![channel.clone()],
-        card_scopes: std::collections::HashMap::from([(root.id, folder.repository.clone())]),
+        card_scopes: std::collections::HashMap::from([(root.id, folder.repository.clone())]).into(),
         ..Default::default()
     });
     *sidebar.model.projects = vec![folder.clone()];
@@ -9734,7 +9734,7 @@ fn folder_root_attention_is_rendered_and_filtered_without_a_child_worktree() {
     let terminal = compact_attention_terminal(CardId::new());
     let card = terminal.id;
     let durable = Arc::new(crate::model::WorkspaceState {
-        card_scopes: std::collections::HashMap::from([(card, folder.repository.clone())]),
+        card_scopes: std::collections::HashMap::from([(card, folder.repository.clone())]).into(),
         cards: vec![terminal].into(),
         ..Default::default()
     });
@@ -9928,7 +9928,7 @@ fn folder_root_attention_does_not_duplicate_children_or_change_git_headers() {
     let durable = Arc::new(crate::model::WorkspaceState {
         cards: vec![root.clone(), child.clone()].into(),
         channels: vec![channel],
-        card_scopes: std::collections::HashMap::from([(root.id, folder.repository.clone())]),
+        card_scopes: std::collections::HashMap::from([(root.id, folder.repository.clone())]).into(),
         ..Default::default()
     });
     *sidebar.model.projects = vec![folder.clone()];

@@ -580,7 +580,7 @@ fn scope_descriptor(
         channels: Vec::new(),
         active_channel: None,
         // A projected strip is a view, never a place to file a card.
-        card_scopes: HashMap::new(),
+        card_scopes: Default::default(),
         chat_drafts: HashMap::new(),
         chat_draft_attachments: HashMap::new(),
         chat_waiting_messages: HashMap::new(),
@@ -886,7 +886,7 @@ impl Cagents {
                 .unwrap_or_else(|| directory.into())
         };
         let mut directories = HashMap::<&Path, PathBuf>::new();
-        self.worktree_owners = self
+        let owners = self
             .durable
             .cards
             .iter()
@@ -903,7 +903,12 @@ impl Cagents {
                     .or_insert_with(|| resolve(directory));
                 Some((card.id, owner.clone()))
             })
-            .collect();
+            .collect::<HashMap<_, _>>();
+        // Most refreshes find the owners they already had; keeping those
+        // keeps their revision, which saves compare instead of the owners.
+        if *self.worktree_owners != owners {
+            *self.worktree_owners = owners;
+        }
         selected.map(resolve)
     }
 
@@ -1538,6 +1543,7 @@ impl Cagents {
 mod tests {
     use super::*;
     use crate::model::{BrowserId, BrowserRestoreFidelity, ProjectChannel};
+    use crate::revision::Revisioned;
 
     #[test]
     fn selected_worktrees_and_channels_never_mix_unrelated_panes() {
@@ -2585,7 +2591,8 @@ mod tests {
     }
 
     /// Switching worktrees resolves only the panes' directories and the
-    /// selection, never the roots already known.
+    /// selection, never the roots already known, and keeps the owners'
+    /// revision while they stay the same, so a save can tell they did.
     #[cfg(unix)]
     #[test]
     fn switching_worktrees_reuses_the_known_roots_canonical_forms() {
@@ -2606,10 +2613,26 @@ mod tests {
         let _ = app.select_worktree(nested.clone(), false);
         let resolved = app.known_worktree_roots.canonical.resolutions;
         assert!(resolved >= 2, "both rows were resolved once");
+        let owners = Revisioned::revision(&app.worktree_owners);
         let _ = app.select_worktree(root.clone(), false);
         let _ = app.select_worktree(nested.clone(), false);
         assert_eq!(app.known_worktree_roots.canonical.resolutions, resolved);
         assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![shell.id]);
+        assert_eq!(
+            Revisioned::revision(&app.worktree_owners),
+            owners,
+            "the same owners keep their revision"
+        );
+        Arc::make_mut(&mut app.durable)
+            .card_scopes
+            .insert(shell.id, root.clone());
+        let _ = app.select_worktree(root.clone(), false);
+        assert_eq!(app.worktree_owners[&shell.id], root);
+        assert_ne!(
+            Revisioned::revision(&app.worktree_owners),
+            owners,
+            "changed owners take a new one"
+        );
     }
 
     #[test]
@@ -2700,7 +2723,7 @@ mod tests {
             cards: vec![source.clone()].into(),
             focused: Some(source.id),
             active_worktree: Some(root.clone()),
-            card_scopes: HashMap::from([(source.id, root.clone())]),
+            card_scopes: HashMap::from([(source.id, root.clone())]).into(),
             ..WorkspaceState::default()
         });
         *app.sidebar_model.projects = vec![SidebarProject::new(

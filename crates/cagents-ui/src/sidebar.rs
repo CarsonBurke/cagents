@@ -49,8 +49,7 @@ pub use members::{MemberState as ChannelMemberState, Members as ChannelMembers};
 
 mod rail;
 
-mod revisioned;
-pub use revisioned::Revisioned;
+pub use crate::revision::Revisioned;
 
 mod selection;
 pub use selection::{Intent as SelectionIntent, Row as SelectionRow};

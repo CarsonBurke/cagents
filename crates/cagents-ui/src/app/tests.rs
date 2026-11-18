@@ -11052,7 +11052,7 @@ pub(super) fn context_inspector_test_app(with_focused_card: bool) -> Cagents {
         worktree_focus: HashMap::new(),
         channel_offsets: HashMap::new(),
         worktree_offsets: HashMap::new(),
-        worktree_owners: HashMap::new(),
+        worktree_owners: Default::default(),
         #[cfg(any(test, feature = "development"))]
         projected_protections: Default::default(),
         known_worktree_roots: worktree_ui::KnownWorktreeRoots::default(),

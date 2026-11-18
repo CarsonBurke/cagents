@@ -14,13 +14,14 @@
 //!
 //! The topology is derived again when the projects or the known roots
 //! change, and everything after it with it. Otherwise a pass follows what
-//! changed: a card's worktree is resolved again when its own inputs differ, a
-//! worktree gaining its first card or losing its last adds or drops its
-//! scope, the listed views are compared with those last seen, and the seeded
-//! and settled key sets journal the scopes that joined or left them. Seeding
-//! one worktree therefore touches one scope. Inputs are compared by value or
-//! by a revision their owner takes on every change, never by counting on each
-//! writer to report one.
+//! changed: a card's worktree is resolved again when its own inputs differ
+//! (while the owners, the filing and the channels' cards are as they were,
+//! only its directory can), a worktree gaining its first card or losing its
+//! last adds or drops its scope, the listed views are compared with those
+//! last seen, and the seeded and settled key sets journal the scopes that
+//! joined or left them. Seeding one worktree therefore touches one scope.
+//! Inputs are compared by value or by a revision their owner takes on every
+//! change, never by counting on each writer to report one.
 //!
 //! Channels are few and every one is offered, so they are not kept. Nor is
 //! the active workspace, which navigation changes on most saves: its scope
@@ -111,20 +112,38 @@ impl Topology {
 }
 
 /// Each card's worktree, as `unchanneled_card_worktree_indexed` resolves it
-/// for a card no channel lists, with what it was resolved from.
+/// for a card no channel lists, with what it was resolved from, in the order
+/// of the cards the last pass read.
 #[derive(Default)]
 struct CardWorktrees {
-    cards: HashMap<CardId, CardWorktree>,
+    cards: Vec<CardWorktree>,
+    /// What every entry was resolved with besides its own card, as the last
+    /// pass read it.
+    read: Option<CardInputs>,
     /// How many cards resolve to each worktree.
     paths: HashMap<PathBuf, usize>,
     /// The worktrees that gained their first card or lost their last since
     /// the kept scopes last followed them.
     changed: Vec<PathBuf>,
-    pass: u64,
+    /// Passes that found every input but the cards as the last pass read
+    /// them, so tests can tell the shortcut was exercised.
+    #[cfg(test)]
+    unchanged: usize,
+}
+
+/// What a card's worktree is resolved from besides the card itself.
+#[derive(PartialEq)]
+struct CardInputs {
+    topology: u64,
+    /// The revisions of the cards' owners and of their filing.
+    owners: u64,
+    filed: u64,
+    /// The cards a channel lists.
+    channeled: HashSet<CardId>,
 }
 
 struct CardWorktree {
-    pass: u64,
+    id: CardId,
     topology: u64,
     channeled: bool,
     owner: Option<PathBuf>,
@@ -344,8 +363,14 @@ impl Cagents {
             .flat_map(|channel| channel.cards.iter().copied())
             .collect::<HashSet<_>>();
         let topology = discovery.topology.as_ref().expect("refreshed above");
+        phase.mark("discover_topology");
         let (shown, channeled) =
-            self.refresh_card_worktrees(&mut discovery.cards, topology, &channel_cards);
+            self.refresh_card_worktrees(&mut discovery.cards, topology, channel_cards);
+        #[cfg(test)]
+        if !discovery.unchecked {
+            self.assert_card_worktrees_agree(&discovery.cards, topology, &shown, &channeled);
+        }
+        phase.mark("discover_cards");
         let followed = match discovery.worktrees.as_mut() {
             Some(worktrees) => {
                 self.follow_worktrees(worktrees, topology, &mut discovery.cards, &settlement)
@@ -368,6 +393,7 @@ impl Cagents {
             discovery.worktrees =
                 Some(self.discover_worktrees(topology, &discovery.cards, revision, &settlement));
         }
+        phase.mark("discover_follow");
         let ViewDiscovery {
             topology: Some(topology),
             cards,
@@ -380,9 +406,9 @@ impl Cagents {
         // Only the cards a worktree shows: the rest are no pane of one.
         let worktree_cards = shown
             .into_iter()
-            .filter_map(|card| {
-                let worktree = cards.cards.get(&card.id)?.worktree.as_deref()?;
-                Some((card, worktree))
+            .filter_map(|place| {
+                let worktree = cards.cards[place].worktree.as_deref()?;
+                Some((self.durable.cards.get(place)?, worktree))
             })
             .collect::<Vec<_>>();
         // Every worktree scope the publishable filter can keep: those not
@@ -500,42 +526,43 @@ impl Cagents {
 
     /// Resolves again each card whose directory, owner, filing or channel
     /// changed, or that is new, and forgets the cards that are gone. Returns
-    /// the cards a worktree shows that resolve to one, and every card a
-    /// channel lists, by identity.
+    /// the places of the cards a worktree shows that resolve to one, and
+    /// every card a channel lists, by identity.
+    ///
+    /// While the topology, the owners, the filing and the channels' cards are
+    /// those the last pass read, an entry still holds for its card unless the
+    /// card's directory changed, and the pass reads nothing else of it.
     fn refresh_card_worktrees<'a>(
         &'a self,
         cards: &mut CardWorktrees,
-        kept: &Topology,
-        channel_cards: &HashSet<CardId>,
-    ) -> (Vec<&'a CardState>, HashMap<CardId, &'a CardState>) {
-        let topology = kept.revision;
-        cards.pass = cards.pass.wrapping_add(1);
-        let pass = cards.pass;
+        kept: &'a Topology,
+        channel_cards: HashSet<CardId>,
+    ) -> (Vec<usize>, HashMap<CardId, &'a CardState>) {
+        let inputs = CardInputs {
+            topology: kept.revision,
+            owners: Revisioned::revision(&self.worktree_owners),
+            filed: Revisioned::revision(&self.durable.card_scopes),
+            channeled: channel_cards,
+        };
+        let unchanged = cards.read.as_ref() == Some(&inputs);
+        #[cfg(test)]
+        {
+            cards.unchanged += usize::from(unchanged);
+        }
         let mut roots = None;
-        let mut shown = Vec::new();
-        let mut channeled = HashMap::with_capacity(channel_cards.len());
-        // Distinct cards seen this pass: when that is every one kept, none
-        // is gone.
-        let mut seen = 0;
-        for card in self.durable.cards.iter() {
-            let listed = channel_cards.contains(&card.id);
-            if listed {
-                channeled.insert(card.id, card);
+        // The card's entry resolved again, or `None` while `entry` holds.
+        let mut resolve = |entry: Option<&CardWorktree>, card: &'a CardState| {
+            let directory = worktree_ui::card_directory(card);
+            if unchanged && entry.is_some_and(|entry| entry.directory.as_deref() == directory) {
+                return None;
             }
+            let listed = inputs.channeled.contains(&card.id);
             let owner = self.worktree_owners.get(&card.id).map(PathBuf::as_path);
             let filed = self.durable.card_scopes.get(&card.id).map(PathBuf::as_path);
-            let directory = worktree_ui::card_directory(card);
-            if let Some(entry) = cards.cards.get_mut(&card.id)
-                && entry.resolved_from(topology, listed, owner, filed, directory)
-            {
-                if entry.pass != pass {
-                    entry.pass = pass;
-                    seen += 1;
-                }
-                if entry.worktree.is_some() && shows_in_worktree(card) {
-                    shown.push(card);
-                }
-                continue;
+            if entry.is_some_and(|entry| {
+                entry.resolved_from(inputs.topology, listed, owner, filed, directory)
+            }) {
+                return None;
             }
             let roots =
                 roots.get_or_insert_with(|| worktree_ui::WorktreeRoots::indexed(&kept.roots));
@@ -543,45 +570,76 @@ impl Cagents {
                 .then(|| self.unchanneled_card_worktree_indexed(card, roots))
                 .flatten()
                 .map(Path::to_owned);
-            cards.count(worktree.as_deref(), true);
-            if worktree.is_some() && shows_in_worktree(card) {
-                shown.push(card);
-            }
-            let previous = cards.cards.insert(
-                card.id,
-                CardWorktree {
-                    pass,
-                    topology,
-                    channeled: listed,
-                    owner: owner.map(Path::to_owned),
-                    filed: filed.map(Path::to_owned),
-                    directory: directory.map(Path::to_owned),
-                    worktree,
-                },
-            );
-            if previous
-                .as_ref()
-                .is_none_or(|previous| previous.pass != pass)
+            Some(CardWorktree {
+                id: card.id,
+                topology: inputs.topology,
+                channeled: listed,
+                owner: owner.map(Path::to_owned),
+                filed: filed.map(Path::to_owned),
+                directory: directory.map(Path::to_owned),
+                worktree,
+            })
+        };
+        let mut shown = Vec::new();
+        let mut channeled = HashMap::with_capacity(inputs.channeled.len());
+        // The entries from the first card not where it was, found by card
+        // from there on, with where each was.
+        let mut moved = None::<(Vec<Option<CardWorktree>>, HashMap<CardId, usize>)>;
+        for (place, card) in self.durable.cards.iter().enumerate() {
+            if moved.is_none()
+                && cards
+                    .cards
+                    .get(place)
+                    .is_none_or(|entry| entry.id != card.id)
             {
-                seen += 1;
+                let rest = cards.cards.split_off(place);
+                let index = rest
+                    .iter()
+                    .enumerate()
+                    .map(|(at, entry)| (entry.id, at))
+                    .collect();
+                moved = Some((rest.into_iter().map(Some).collect(), index));
             }
-            if let Some(previous) = previous {
-                cards.count(previous.worktree.as_deref(), false);
-            }
-        }
-        if seen != cards.cards.len() {
-            let gone = cards
-                .cards
-                .iter()
-                .filter(|(_, entry)| entry.pass != pass)
-                .map(|(id, _)| *id)
-                .collect::<Vec<_>>();
-            for id in gone {
-                if let Some(entry) = cards.cards.remove(&id) {
-                    cards.count(entry.worktree.as_deref(), false);
+            match &mut moved {
+                None => {
+                    if let Some(entry) = resolve(Some(&cards.cards[place]), card) {
+                        cards.count(entry.worktree.as_deref(), true);
+                        let previous = std::mem::replace(&mut cards.cards[place], entry);
+                        cards.count(previous.worktree.as_deref(), false);
+                    }
+                }
+                Some((rest, index)) => {
+                    let previous = index.get(&card.id).and_then(|at| rest[*at].take());
+                    let entry = match resolve(previous.as_ref(), card) {
+                        None => previous.expect("only a kept entry holds"),
+                        Some(entry) => {
+                            cards.count(entry.worktree.as_deref(), true);
+                            if let Some(previous) = previous {
+                                cards.count(previous.worktree.as_deref(), false);
+                            }
+                            entry
+                        }
+                    };
+                    cards.cards.push(entry);
                 }
             }
+            let entry = &cards.cards[place];
+            if entry.channeled {
+                channeled.insert(card.id, card);
+            }
+            if entry.worktree.is_some() && shows_in_worktree(card) {
+                shown.push(place);
+            }
         }
+        // The cards that are gone.
+        let gone = match moved {
+            Some((rest, _)) => rest.into_iter().flatten().collect(),
+            None => cards.cards.split_off(self.durable.cards.len()),
+        };
+        for entry in gone {
+            cards.count(entry.worktree.as_deref(), false);
+        }
+        cards.read = Some(inputs);
         (shown, channeled)
     }
 
@@ -657,6 +715,82 @@ impl Cagents {
             }
         }
         worktrees
+    }
+
+    /// Every pass in tests checks the kept card worktrees against resolving
+    /// every card afresh: each entry must name its card, in order, hold what
+    /// its card's inputs now are and resolve as they do.
+    #[cfg(test)]
+    fn assert_card_worktrees_agree(
+        &self,
+        cards: &CardWorktrees,
+        topology: &Topology,
+        shown: &[usize],
+        channeled: &HashMap<CardId, &CardState>,
+    ) {
+        let roots = worktree_ui::WorktreeRoots::indexed(&topology.roots);
+        let listed = self
+            .durable
+            .channels
+            .iter()
+            .flat_map(|channel| channel.cards.iter().copied())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            cards.cards.len(),
+            self.durable.cards.len(),
+            "one entry a card"
+        );
+        let mut paths = HashMap::<PathBuf, usize>::new();
+        let mut expected_shown = Vec::new();
+        for (place, (card, entry)) in self.durable.cards.iter().zip(&cards.cards).enumerate() {
+            assert_eq!(entry.id, card.id, "the entry at {place}");
+            let is_listed = listed.contains(&card.id);
+            assert!(
+                entry.resolved_from(
+                    topology.revision,
+                    is_listed,
+                    self.worktree_owners.get(&card.id).map(PathBuf::as_path),
+                    self.durable.card_scopes.get(&card.id).map(PathBuf::as_path),
+                    worktree_ui::card_directory(card),
+                ),
+                "{:?} holds stale inputs",
+                card.id
+            );
+            let worktree = (!is_listed)
+                .then(|| self.unchanneled_card_worktree_indexed(card, &roots))
+                .flatten();
+            assert_eq!(
+                entry.worktree.as_deref(),
+                worktree,
+                "{:?} worktree",
+                card.id
+            );
+            if let Some(worktree) = worktree {
+                *paths.entry(worktree.to_owned()).or_default() += 1;
+                if shows_in_worktree(card) {
+                    expected_shown.push(place);
+                }
+            }
+        }
+        assert_eq!(cards.paths, paths, "cards at each worktree");
+        assert_eq!(shown, expected_shown, "cards a worktree shows");
+        let mut expected_channeled = HashMap::new();
+        for card in self.durable.cards.iter() {
+            if listed.contains(&card.id) {
+                expected_channeled.insert(card.id, card);
+            }
+        }
+        assert_eq!(
+            channeled
+                .iter()
+                .map(|(id, card)| (*id, std::ptr::from_ref(*card)))
+                .collect::<HashMap<_, _>>(),
+            expected_channeled
+                .into_iter()
+                .map(|(id, card)| (id, std::ptr::from_ref(card)))
+                .collect::<HashMap<_, _>>(),
+            "listed cards"
+        );
     }
 
     /// Every pass in tests checks itself against a complete rediscovery,
@@ -898,7 +1032,7 @@ mod tests {
             .map(|card| card.id)
             .collect::<Vec<_>>();
         let card_id = rng.pick(&card_ids).copied();
-        match rng.below(27) {
+        match rng.below(29) {
             0 => {
                 let Some(id) = card_id else { return "none" };
                 let durable = Arc::make_mut(&mut app.durable);
@@ -1225,6 +1359,14 @@ mod tests {
                 app.sidebar_model.projects = app.sidebar_model.projects.to_vec().into();
                 "list the same projects again"
             }
+            26 => {
+                let Some(id) = card_id else { return "none" };
+                let durable = Arc::make_mut(&mut app.durable);
+                let card = durable.cards.iter_mut().find(|card| card.id == id).unwrap();
+                card.title.push('!');
+                "retitle a card"
+            }
+            27 => "change nothing",
             _ => {
                 app.shared_views = State::for_workspace(&app.durable);
                 "join a new workspace model"
@@ -1238,7 +1380,7 @@ mod tests {
     /// publication seed and settle the scopes it acts on.
     #[test]
     fn kept_discovery_agrees_with_rediscovery_across_random_edits() {
-        let (mut passes, mut followed) = (0, 0);
+        let (mut passes, mut followed, mut unchanged) = (0, 0, 0);
         for seed in 0..12 {
             let (mut app, _, _directory) = large_workspace(&SMALL);
             let mut rng = Rng(seed);
@@ -1246,6 +1388,7 @@ mod tests {
                 let edit = edit(&mut app, &mut rng);
                 // A new model replaces the kept discovery with it.
                 let before = app.shared_views.discovery.reused;
+                let unchanged_before = app.shared_views.discovery.cards.unchanged;
                 let run = || {
                     if rng.below(3) == 0 {
                         project(&mut app);
@@ -1259,11 +1402,19 @@ mod tests {
                 }
                 passes += 1;
                 followed += app.shared_views.discovery.reused - before;
+                unchanged += app.shared_views.discovery.cards.unchanged - unchanged_before;
             }
         }
         eprintln!("{followed} of {passes} passes followed the kept scopes");
+        eprintln!("{unchanged} of {passes} passes read only the cards");
         // Most edits leave the topology and both key sets in place.
         assert!(followed * 2 > passes, "{followed} of {passes}");
+        // Many leave the owners, filing and channels too, so a pass reads
+        // only the cards; the rest exercise the complete resolution.
+        assert!(
+            unchanged * 4 > passes && unchanged * 4 < passes * 3,
+            "{unchanged} of {passes}"
+        );
     }
 
     /// One edit of what a scope's panes are made of, chosen by `rng`.
@@ -1758,6 +1909,7 @@ mod tests {
         }
         app.shared_views.scope_discovery_count.set(0);
         let reused = app.shared_views.discovery.reused;
+        let unchanged = app.shared_views.discovery.cards.unchanged;
         for &channel_id in same_project.iter().cycle().take(4) {
             drop(app.update(Message::Sidebar(SidebarAction::OpenChannel { channel_id })));
             drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
@@ -1765,5 +1917,9 @@ mod tests {
         }
         assert_eq!(app.shared_views.scope_discovery_count.get(), 0);
         assert!(app.shared_views.discovery.reused >= reused + 4);
+        assert!(
+            app.shared_views.discovery.cards.unchanged >= unchanged + 4,
+            "each save read only the cards"
+        );
     }
 }

@@ -187,7 +187,7 @@ pub(crate) fn seed_store(
                     .map(|scope| (*id, scope))
                     .ok_or_else(|| format!("Card {id} has a scope entry but no scope"))
             })
-            .collect::<Result<HashMap<_, _>, String>>()?,
+            .collect::<Result<_, String>>()?,
         chat_drafts: window
             .drafts
             .iter()

@@ -1,26 +1,42 @@
-//! A value that can say cheaply that it has not changed.
+//! One counter for every cache that tells states apart by a revision.
 //!
-//! The navigation list is rebuilt only when its inputs change, and the check
-//! runs on every frame. Comparing every project, worktree and channel to a
-//! saved copy costs time in proportion to the workspace, even when nothing
-//! moved, which is nearly always. A [`Revisioned`] value carries a revision
-//! that is new whenever anything could have changed it, so an unchanged value
-//! is recognised by one comparison.
-//!
-//! Revisions come from one counter shared by every value, so two values with
-//! the same revision hold equal contents: a value cannot reach a revision
-//! another value had unless it was cloned from it. The value is only
-//! reachable for writing through [`DerefMut`], which takes a new revision
-//! before handing out the reference, so a change can never keep the revision
-//! it had before. A mutable borrow that changes nothing still takes one; a
-//! revision says "may have changed", and the caller compares contents to tell.
+//! A value that takes a new revision on each change can be recognised as
+//! unchanged by one comparison. Drawing every revision from the same counter
+//! means two values hold the same revision only if one was copied from the
+//! other, whichever kind of value they are.
 
 use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::revision::next_revision;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+static NEXT_REVISION: AtomicU64 = AtomicU64::new(1);
+
+/// A revision no earlier call returned.
+pub fn next_revision() -> u64 {
+    NEXT_REVISION.fetch_add(1, Ordering::Relaxed)
+}
+
+/// A value that can say cheaply that it has not changed.
+///
+/// A cache derived from a large value, such as the navigation list from the
+/// sidebar's projects, is checked far more often than the value changes.
+/// Comparing every entry to a saved copy costs time in proportion to the
+/// value, even when nothing moved, which is nearly always. A [`Revisioned`]
+/// value carries a revision that is new whenever anything could have changed
+/// it, so an unchanged value is recognised by one comparison.
+///
+/// Revisions come from one counter shared by every value, so two values with
+/// the same revision hold equal contents: a value cannot reach a revision
+/// another value had unless it was cloned from it. The value is only
+/// reachable for writing through [`DerefMut`], which takes a new revision
+/// before handing out the reference, so a change can never keep the revision
+/// it had before. A mutable borrow that changes nothing still takes one; a
+/// revision says "may have changed", and the caller compares contents to tell.
+///
 /// Clones keep the revision, since they hold the same contents; equality
-/// compares the contents alone.
+/// compares the contents alone. Only the contents are saved, and a value read
+/// back takes a new revision.
 #[derive(Clone)]
 pub struct Revisioned<T> {
     value: T,
@@ -83,6 +99,33 @@ impl<T: PartialEq> PartialEq for Revisioned<T> {
 
 impl<T: Eq> Eq for Revisioned<T> {}
 
+impl<T: Serialize> Serialize for Revisioned<T> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.value.serialize(serializer)
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Revisioned<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        T::deserialize(deserializer).map(Self::new)
+    }
+}
+
+impl<T: IntoIterator> IntoIterator for Revisioned<T> {
+    type Item = T::Item;
+    type IntoIter = T::IntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.value.into_iter()
+    }
+}
+
+impl<A, T: FromIterator<A>> FromIterator<A> for Revisioned<T> {
+    fn from_iter<I: IntoIterator<Item = A>>(items: I) -> Self {
+        Self::new(T::from_iter(items))
+    }
+}
+
 impl<'a, T> IntoIterator for &'a Revisioned<T>
 where
     &'a T: IntoIterator,
@@ -143,5 +186,15 @@ mod tests {
             first,
             "equal contents built anew never reuse a revision"
         );
+    }
+
+    #[test]
+    fn a_saved_value_reads_back_with_its_contents_and_a_new_revision() {
+        let value = Revisioned::new(vec![1, 2]);
+        let saved = serde_json::to_string(&value).unwrap();
+        assert_eq!(saved, "[1,2]", "only the contents are saved");
+        let read = serde_json::from_str::<Revisioned<Vec<i32>>>(&saved).unwrap();
+        assert_eq!(read, value);
+        assert_ne!(Revisioned::revision(&read), Revisioned::revision(&value));
     }
 }

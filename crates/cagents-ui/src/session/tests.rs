@@ -223,7 +223,7 @@ fn workspace() -> WorkspaceState {
         project_order: Vec::new(),
         channels: Vec::new(),
         active_channel: None,
-        card_scopes: HashMap::new(),
+        card_scopes: Default::default(),
         chat_drafts: HashMap::new(),
         chat_draft_attachments: HashMap::new(),
         chat_waiting_messages: HashMap::new(),

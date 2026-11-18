@@ -31,7 +31,6 @@ pub mod operation_recovery;
 pub mod pull_request_review;
 pub mod reorder;
 pub mod repository_widget;
-pub(crate) mod revision;
 pub mod session;
 pub mod settings_widgets;
 pub mod sidebar;
