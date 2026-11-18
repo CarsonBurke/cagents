@@ -1236,7 +1236,10 @@ impl Store {
         let newest = self
             .newest
             .ok_or("No newer cached transcript is available")?;
-        let pivot = self.middle.filter(|pivot| *pivot < newest).unwrap_or(newest);
+        let pivot = self
+            .middle
+            .filter(|pivot| *pivot < newest)
+            .unwrap_or(newest);
         self.forward = Some(pivot);
         self.slide = Some(Slide::Later { from: newest });
         self.paging = true;
@@ -2497,7 +2500,10 @@ mod tests {
             .apply(Event::Item(history_item("older", &"o".repeat(PART_BYTES))))
             .unwrap();
         store
-            .apply(Event::Item(history_item("big", &"b".repeat(23 * PART_BYTES))))
+            .apply(Event::Item(history_item(
+                "big",
+                &"b".repeat(23 * PART_BYTES),
+            )))
             .unwrap();
         for n in 0..30 {
             store
