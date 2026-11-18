@@ -113,11 +113,41 @@ pub fn is_notice(message: &str) -> bool {
     message.trim_start().starts_with(COMMAND_OUT_OF_MEMORY) || answers_one_send(message)
 }
 
-/// Whether `message` is a [`DeliveryOutcome`] that answers one send and
-/// leaves the conversation as it was. The next attempt, whether the reader's
-/// or an automatic one, replaces it.
+/// Whether `message` answers one send and leaves the conversation as it
+/// was: a [`DeliveryOutcome`] that does, or an [`account_switch_refused`]
+/// report. The next attempt, whether the reader's or an automatic one,
+/// replaces it.
 pub fn answers_one_send(message: &str) -> bool {
     DeliveryOutcome::parse(message).is_some_and(|outcome| outcome.notice)
+        || account_switch_refusal_reason(message).is_some()
+}
+
+/// What a send's notice says when its automatic account switch was refused
+/// before anything changed for a reason of the daemon's own, such as another
+/// owner of the conversation or a history the other account can't take. The
+/// reason varies, so it follows in [`account_switch_refused`] and the notice
+/// keeps it under Details.
+pub const ACCOUNT_SWITCH_REFUSED: &str = "Your message wasn't sent. This conversation's account can't be used right now, and cagents couldn't move the conversation to another account.";
+/// The next step under [`ACCOUNT_SWITCH_REFUSED`]: the message is still in the
+/// composer, and whether sending again can help depends on the reason.
+pub const ACCOUNT_SWITCH_REFUSED_ACTION: &str = "Check the details before sending again.";
+
+/// The report of a send whose automatic account switch was refused before
+/// anything changed, for the refusal's own `reason`.
+pub fn account_switch_refused(reason: &str) -> String {
+    format!("{ACCOUNT_SWITCH_REFUSED}\n\n{reason}")
+}
+
+/// The refusal's own reason, when `message` is an [`account_switch_refused`]
+/// report. Only a report that opens with the summary is one, never text that
+/// quotes it.
+pub fn account_switch_refusal_reason(message: &str) -> Option<&str> {
+    message
+        .trim_start()
+        .strip_prefix(ACCOUNT_SWITCH_REFUSED)?
+        .strip_prefix("\n\n")
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
 }
 
 /// What a runtime exit report says happened to the provider, in words: the
@@ -695,6 +725,31 @@ mod tests {
             DeliveryOutcome::parse(&format!("Claude said: {}", delivery::UNCONFIRMED_INPUT)),
             None
         );
+    }
+
+    /// A refused switch's report keeps the daemon's reason after its summary,
+    /// is a notice rather than the conversation's error, and is recognised
+    /// only when it opens the text.
+    #[test]
+    fn a_refused_switch_report_keeps_its_reason_after_the_summary() {
+        let reason = "The original conversation changed or has another live owner; account switching was paused";
+        let report = account_switch_refused(reason);
+        assert_eq!(account_switch_refusal_reason(&report), Some(reason));
+        assert!(answers_one_send(&report));
+        assert!(is_notice(&report));
+        assert!(DeliveryOutcome::parse(&report).is_none());
+        for provider in [Provider::Claude, Provider::Codex, Provider::Omp] {
+            assert!(Failure::parse(provider, ACCOUNT_SWITCH_REFUSED).is_none());
+        }
+        for other in [
+            format!("Claude said: {report}"),
+            ACCOUNT_SWITCH_REFUSED.to_owned(),
+            account_switch_refused("  "),
+            format!("{ACCOUNT_SWITCH_REFUSED} {reason}"),
+        ] {
+            assert_eq!(account_switch_refusal_reason(&other), None, "{other}");
+            assert!(!answers_one_send(&other), "{other}");
+        }
     }
 
     /// An outcome that answers one send is a notice: the conversation is as

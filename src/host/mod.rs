@@ -53,7 +53,8 @@ use crate::{
     },
 };
 
-use self::state::{HostState, SharedHost};
+use self::state::HostState;
+pub(crate) use self::state::SharedHost;
 
 // A card, a chat and every CLI or tray invocation each hold their own
 // connection for its lifetime, so this must never be the limit that binds

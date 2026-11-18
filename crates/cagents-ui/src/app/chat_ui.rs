@@ -12457,6 +12457,7 @@ impl Cagents {
                             chat::Recovery::Busy
                                 | chat::Recovery::Unresponsive
                                 | chat::Recovery::Unreached
+                                | chat::Recovery::NotAdmitted
                         ) && account_source.is_some()
                             && automatic_submit.is_some() =>
                     {
@@ -12484,18 +12485,18 @@ impl Cagents {
                             }
                         }
                         if !runtime.disconnected && !runtime.snapshot.exited {
-                            runtime.error = Some(
-                                match failure.recovery {
-                                    chat::Recovery::Busy => {
-                                        chat::failure::delivery::ACCOUNT_SWITCH_BUSY
-                                    }
-                                    chat::Recovery::Unresponsive => {
-                                        chat::failure::delivery::ACCOUNT_SWITCH_UNANSWERED
-                                    }
-                                    _ => chat::failure::delivery::ACCOUNT_SWITCH_UNREACHED,
+                            runtime.error = Some(match failure.recovery {
+                                chat::Recovery::Busy => {
+                                    chat::failure::delivery::ACCOUNT_SWITCH_BUSY.to_owned()
                                 }
-                                .to_owned(),
-                            );
+                                chat::Recovery::Unresponsive => {
+                                    chat::failure::delivery::ACCOUNT_SWITCH_UNANSWERED.to_owned()
+                                }
+                                chat::Recovery::NotAdmitted => {
+                                    chat::failure::account_switch_refused(&failure.message)
+                                }
+                                _ => chat::failure::delivery::ACCOUNT_SWITCH_UNREACHED.to_owned(),
+                            });
                         }
                         // As a wake read now would have left it.
                         let session = runtime.session.clone();

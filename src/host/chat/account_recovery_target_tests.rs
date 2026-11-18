@@ -257,6 +257,7 @@ done
     // than accidentally passing via an earlier source-account refusal.
     check_launch_account(&source.launch).unwrap();
     let registry_before = std::fs::read(&registry_path).unwrap();
+    let replacement_launch = replacement.launch.clone();
     let result = recover_account(
         &host,
         1,
@@ -285,14 +286,20 @@ done
         .unwrap();
     } else {
         let failure = result.unwrap_err();
+        // A missing or unreadable replacement is refused before anything
+        // changed, so it is never read as the original account's removal.
+        // The registry's own sentence still says which.
+        assert_eq!(failure.code, ProtocolErrorCode::NotAdmitted);
+        let expected = check_launch_account(&replacement_launch).unwrap_err();
         assert_eq!(
-            failure.code,
+            expected.code,
             if matches!(target, Target::Removed) {
                 ProtocolErrorCode::AccountRemoved
             } else {
                 ProtocolErrorCode::TerminalUnavailable
             }
         );
+        assert_eq!(failure.message, expected.message);
         assert!(!failure.retryable);
         assert!(!handle.is_completed());
         assert!(

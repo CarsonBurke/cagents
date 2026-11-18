@@ -7707,16 +7707,6 @@ pub(crate) fn is_primary_worktree(repository: &Path, worktree: &Path) -> bool {
             && repository.parent() == Some(worktree))
 }
 
-/// The side of a [`project_chip`], for a glyph that stands in its column.
-pub(crate) const PROJECT_CHIP_SIZE: f32 = rail::PROJECT_CHIP;
-
-/// A project's identity chip as the sidebar draws it: its avatar, or its
-/// initials on a colour of its own, for showing the project elsewhere.
-pub fn project_chip<'a, Message: 'a>(project: &SidebarProject) -> Element<'a, Message> {
-    let (initials, color) = project_identity(&project.name);
-    rail::project_chip(project.avatar.as_ref(), initials, color, false)
-}
-
 /// Stable identity independent of process hashes, theme, load order, and IDs.
 fn project_identity(name: &str) -> (String, cosmic::iced::Color) {
     let letters: Vec<_> = name.chars().filter(|ch| ch.is_alphanumeric()).collect();
@@ -8135,7 +8125,7 @@ fn channel_ink(channel: &SidebarChannel, listing: Listing) -> RowInk {
 /// The kind of workspace a row stands for, which decides the glyph it leads
 /// with wherever it is drawn.
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum WorkspaceGlyph<'a> {
+enum WorkspaceGlyph<'a> {
     Channel,
     Worktree(&'a SidebarWorktree),
 }
@@ -8165,10 +8155,10 @@ impl WorkspaceGlyph<'_> {
     }
 }
 
-/// The glyph a channel or worktree row leads with, in the row's `ink`. The
-/// sidebar and the workspace switcher both draw their rows' glyphs with it, so
-/// a workspace looks the same in each.
-pub(crate) fn row_glyph<'a, Message: 'a>(
+/// The glyph a channel or worktree row leads with, in the row's `ink`. Every
+/// row and mark for a workspace draws its glyph with it, so a workspace looks
+/// the same wherever it is drawn.
+fn row_glyph<'a, Message: 'a>(
     kind: WorkspaceGlyph<'_>,
     ink: RowInk,
     size: u16,
@@ -8176,8 +8166,48 @@ pub(crate) fn row_glyph<'a, Message: 'a>(
     toned_glyph(kind.icon(), kind.tone(ink), size)
 }
 
+/// A workspace the sidebar lists, for drawing its row's glyph elsewhere.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum WorkspaceMark<'a> {
+    /// A folder project, opened as a whole.
+    Project(&'a SidebarProject),
+    /// A folder outside any project.
+    Folder,
+    /// A worktree, or `None` for one no longer in the model, which keeps
+    /// the plain worktree glyph.
+    Worktree(Option<&'a SidebarWorktree>),
+    /// A channel, or `None` for one no longer in the model, which keeps the
+    /// plain channel glyph.
+    Channel(Option<&'a SidebarChannel>),
+}
+
+/// The glyph the expanded sidebar leads a workspace's row with, in its
+/// column: a folder project's avatar, a worktree's pull request or branch,
+/// and a channel's members or else its chat glyph. The workspace switcher
+/// draws its rows with it, so a workspace is recognised by the same mark in
+/// both places.
+pub(crate) fn workspace_mark<Message: 'static>(
+    mark: WorkspaceMark<'_>,
+    ink: RowInk,
+) -> Element<'static, Message> {
+    let glyph = match mark {
+        WorkspaceMark::Project(project) => project_icon(project, ROW_ICON_SIZE),
+        WorkspaceMark::Folder => folder_icon(ROW_ICON_SIZE),
+        WorkspaceMark::Worktree(Some(worktree)) => worktree_status_glyph(worktree, false, ink),
+        WorkspaceMark::Worktree(None) => {
+            ink_glyph(worktree_icon(), ink, CHILD_ROW_ICON_SIZE).into()
+        }
+        WorkspaceMark::Channel(channel) => channel
+            .and_then(|channel| members::view(&channel.members, members::Ground::Row, ink))
+            .unwrap_or_else(|| row_glyph(WorkspaceGlyph::Channel, ink, CHILD_ROW_ICON_SIZE).into()),
+    };
+    widget::container(glyph)
+        .center_x(Length::Fixed(ROW_ICON_WIDTH))
+        .into()
+}
+
 /// Any other glyph that stands in a row's glyph column, in the row's `ink`.
-pub(crate) fn ink_glyph<'a, Message: 'a>(
+fn ink_glyph<'a, Message: 'a>(
     icon: widget::icon::Handle,
     ink: RowInk,
     size: u16,
@@ -9235,21 +9265,29 @@ fn worktree_primary_action(
     }
 }
 
-fn project_icon(project: &SidebarProject, size: u16) -> Element<'static, SidebarAction> {
+fn project_icon<Message: 'static>(
+    project: &SidebarProject,
+    size: u16,
+) -> Element<'static, Message> {
     match &project.avatar {
         Some(handle) => cosmic::iced::widget::image(handle.clone())
             .width(size)
             .height(size)
             .into(),
-        None => widget::container(Icon::Folder.handle().icon().size(size))
-            .class(theme::Container::custom(move |theme| {
-                cosmic::iced::widget::container::Style {
-                    icon_color: Some(design::muted_icon_color(theme)),
-                    ..Default::default()
-                }
-            }))
-            .into(),
+        None => folder_icon(size),
     }
+}
+
+/// A folder with no avatar of its own.
+fn folder_icon<Message: 'static>(size: u16) -> Element<'static, Message> {
+    widget::container(Icon::Folder.handle().icon().size(size))
+        .class(theme::Container::custom(move |theme| {
+            cosmic::iced::widget::container::Style {
+                icon_color: Some(design::muted_icon_color(theme)),
+                ..Default::default()
+            }
+        }))
+        .into()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9706,6 +9744,30 @@ fn worktree_status_icon(
     update: bool,
     ink: RowInk,
 ) -> Element<'static, SidebarAction> {
+    crate::interaction::tooltip(
+        worktree_status_glyph(worktree, update, ink),
+        if update {
+            "Unread agent update"
+        } else if let Some(pr) = &worktree.chrome.pull_request {
+            match pr.state {
+                Some(WorktreePullRequestState::Merged) => "Merged pull request",
+                Some(WorktreePullRequestState::Closed) => "Closed pull request",
+                Some(WorktreePullRequestState::Draft) => "Draft pull request",
+                Some(WorktreePullRequestState::Open) => "Open pull request",
+                None => "Pull request status",
+            }
+        } else {
+            "Worktree status"
+        },
+    )
+}
+
+/// A worktree row's glyph, with the dot beside it that marks an update.
+fn worktree_status_glyph<Message: 'static>(
+    worktree: &SidebarWorktree,
+    update: bool,
+    ink: RowInk,
+) -> Element<'static, Message> {
     let glyph = row_glyph(WorkspaceGlyph::Worktree(worktree), ink, CHILD_ROW_ICON_SIZE);
     let dot = widget::container(cosmic::iced::widget::Space::new().width(4).height(4)).class(
         theme::Container::Custom(Box::new(move |theme| {
@@ -9721,22 +9783,9 @@ fn worktree_status_icon(
             }
         })),
     );
-    crate::interaction::tooltip(
-        widget::row::with_children(vec![glyph.into(), dot.into()]).align_y(Alignment::Center),
-        if update {
-            "Unread agent update"
-        } else if let Some(pr) = &worktree.chrome.pull_request {
-            match pr.state {
-                Some(WorktreePullRequestState::Merged) => "Merged pull request",
-                Some(WorktreePullRequestState::Closed) => "Closed pull request",
-                Some(WorktreePullRequestState::Draft) => "Draft pull request",
-                Some(WorktreePullRequestState::Open) => "Open pull request",
-                None => "Pull request status",
-            }
-        } else {
-            "Worktree status"
-        },
-    )
+    widget::row::with_children(vec![glyph.into(), dot.into()])
+        .align_y(Alignment::Center)
+        .into()
 }
 
 /// The selected worktree's Git surface, independent of the focused card kind.

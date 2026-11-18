@@ -265,10 +265,13 @@ use crate::{
 /// fresh conversation cannot take a pane another window already started.
 /// Version 187 lets a transcript query's `before` name its entry by the short
 /// cursor `cagents transcript` prints, which a daemon before it cannot match.
-/// Version 188 appends `ModelEdit::CloseConfirmedProject`, which `project
+/// Version 188 appends `ProtocolErrorCode::NotAdmitted`, which an automatic
+/// account switch is refused with when nothing was changed yet. Older clients
+/// cannot decode it; an admitted older CLI is sent `InvalidRequest` instead.
+/// Version 189 appends `ModelEdit::CloseConfirmedProject`, which `project
 /// close` sends with the channels it confirmed so the daemon refuses the close
 /// if they changed. A daemon before it could not decode the edit.
-pub const PROTOCOL_VERSION: u16 = 188;
+pub const PROTOCOL_VERSION: u16 = 189;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";
@@ -1339,6 +1342,13 @@ impl Serialize for ProtocolError {
             {
                 ProtocolErrorCode::Internal
             }
+            // Which refusal it was is in the message; what an older client
+            // loses is only the proof that nothing changed.
+            ProtocolErrorCode::NotAdmitted
+                if older_clients::encoding_before(older_clients::NOT_ADMITTED_ERROR) =>
+            {
+                ProtocolErrorCode::InvalidRequest
+            }
             code => code,
         };
         let mut error = serializer.serialize_struct("ProtocolError", 3)?;
@@ -1355,6 +1365,16 @@ impl ProtocolError {
             code,
             message: message.into(),
             retryable,
+        }
+    }
+
+    /// The same refusal, marked as one that came before the request changed
+    /// anything ([`ProtocolErrorCode::NotAdmitted`]). Its sentence and
+    /// retryability are kept.
+    pub fn not_admitted(self) -> Self {
+        Self {
+            code: ProtocolErrorCode::NotAdmitted,
+            ..self
         }
     }
 
@@ -1390,6 +1410,11 @@ pub enum ProtocolErrorCode {
     ViewConflict,
     ChatCapacity,
     StoreBusy,
+    /// The request was refused before it changed anything, for the reason
+    /// its message gives. Only an automatic account switch is refused this
+    /// way, so the conversation it would have moved is still where it was.
+    /// Postcard encodes the variant's position, so it stays last.
+    NotAdmitted,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

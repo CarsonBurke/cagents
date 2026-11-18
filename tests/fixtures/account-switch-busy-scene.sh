@@ -15,6 +15,10 @@
 # captures where the message went. With VARIANT=exit, the
 # conversation's own Codex process exits during the wait instead, and the
 # scene ends at the refusal. VARIANT=exclusive holds the daemon exclusively.
+# VARIANT=diverged leaves the daemon free, but gives the other account a
+# different copy of the conversation's history, so the daemon refuses the
+# switch for that reason before changing anything; the scene then removes the
+# copy and sends again.
 set -euo pipefail
 scene=${1:?usage: account-switch-busy-scene.sh prepare|wide|narrow}
 case $scene in prepare|wide|narrow) ;; *) exit 2 ;; esac
@@ -106,6 +110,19 @@ refresh() { # Ask the app to check the system Codex account again now.
     step limited
     "$ne" drive key Escape >/dev/null
 }
+diverge() { # Give the other account a different copy of each rollout.
+    "$ne" env sh -c 'set -e; cd "$HOME/.codex"
+        find sessions -type f -name "*.jsonl" | while IFS= read -r rollout; do
+            mkdir -p "$HOME/$1/${rollout%/*}"
+            printf "{\"fixture\":\"diverged\"}\n" >"$HOME/$1/$rollout"
+        done' sh "$alternate"
+}
+converge() { # Remove those copies, so the switch can copy the history.
+    "$ne" env sh -c 'set -e; cd "$HOME/.codex"
+        find sessions -type f -name "*.jsonl" | while IFS= read -r rollout; do
+            rm -f "$HOME/$1/$rollout"
+        done' sh "$alternate"
+}
 peer_exits() { # End the conversation's own Codex process on the first account.
     "$ne" env sh -c 'for pid in $(pgrep -f "[c]odex-tool-rows[.]py .*--listen"); do
         tr "\0" "\n" </proc/$pid/environ | grep -qx "CODEX_HOME=$HOME/.codex" && kill "$pid"
@@ -126,8 +143,22 @@ fi
 step draft
 composer
 "$ne" drive type 'Summarize the project layout.' >/dev/null
+# The model chooser can still hold focus after the pick, so the message
+# lands in its search instead; close it and type into the composer.
+if "$ne" drive observe 2>/dev/null | rg -F 'No model matches' >/dev/null; then
+    "$ne" drive key Escape >/dev/null
+    "$ne" drive wait 'No model matches' --gone --timeout 10 >/dev/null
+    composer
+    "$ne" drive type 'Summarize the project layout.' >/dev/null
+fi
 "$ne" drive key Return >/dev/null
-"$ne" drive wait 'Done' --timeout 45 >/dev/null
+if ! "$ne" drive wait 'Done' --timeout 45 >/dev/null; then
+    # Keep what the window showed, so an unsent first turn can be told
+    # from one the peer never finished.
+    step first-turn-missing
+    echo "The first turn never finished; see $notes/first-turn-missing.txt" >&2
+    exit 1
+fi
 sleep 2
 shot first-turn
 
@@ -137,6 +168,24 @@ refresh
 
 composer
 "$ne" drive type 'Now list the open questions.' >/dev/null
+if [ "${VARIANT:-}" = diverged ]; then
+    # Nothing holds the daemon, so its refusal arrives at once.
+    diverge
+    "$ne" drive key Return >/dev/null
+    sleep 5
+    shot refused
+    # Open the report's details, which carry the daemon's own reason.
+    at=$(locate 'Details')
+    [ -n "$at" ] || { echo 'Could not locate the report details.' >&2; exit 1; }
+    "$ne" drive click "$at" >/dev/null
+    shot refused-details
+    converge
+    composer
+    "$ne" drive key Return >/dev/null
+    sleep 15
+    shot sent-again
+    exit 0
+fi
 hold
 "$ne" drive key Return >/dev/null
 sleep 5

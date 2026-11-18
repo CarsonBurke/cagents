@@ -73,6 +73,61 @@ fn recovery_chat_requests_preserve_ordinary_exit_and_committed_shutdown_fences()
     }
 }
 
+/// The daemon's admission refuses an automatic account switch before it
+/// changes anything, so the switch is marked as refused before any effect
+/// and keeps the sentence; an explicit recovery keeps the refusal as is.
+#[test]
+fn admission_refusing_an_automatic_switch_marks_it_not_admitted() {
+    let (proof, host) = panic_test_host("automatic-switch-admission");
+    let source = crate::chat::Session {
+        id: TerminalId::new(),
+        proof: Some(proof),
+        terminal: None,
+        native_continuity: Default::default(),
+        owned_codex_listener: None,
+        launch: crate::chat::Launch {
+            provider: crate::agent::Provider::Codex,
+            session_id: Some("12345678-1234-4234-8234-123456789abc".into()),
+            recipe: crate::model::LaunchRecipe {
+                program: "/must-not-execute".into(),
+                arguments: Vec::new(),
+                working_directory: "/".into(),
+                environment: Default::default(),
+                unset_environment: Default::default(),
+            },
+        },
+    };
+    let mut replacement = source.clone();
+    replacement.id = TerminalId::new();
+    replacement.proof = None;
+    host.lock().unwrap().request_shutdown();
+    for (idle_generation, code) in [
+        (Some(3), ProtocolErrorCode::NotAdmitted),
+        (None, ProtocolErrorCode::TerminalUnavailable),
+    ] {
+        let failure = process_request(
+            &host,
+            0,
+            ClientRequest::ChatRecoverAccount {
+                source: source.clone(),
+                replacement: replacement.clone(),
+                idle_generation,
+                execution_environment: Default::default(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(failure.code, code, "{idle_generation:?}");
+        assert_eq!(
+            failure.message,
+            "Daemon upgrade/shutdown is committed; no further control mutations are accepted"
+        );
+        assert!(!failure.retryable);
+        let state = host.lock().unwrap();
+        assert!(state.chats.is_empty());
+        assert!(state.chat_spawning.is_empty());
+    }
+}
+
 fn wait_client_retirement(mut ready: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !ready() {

@@ -452,3 +452,23 @@ fn a_busy_account_operation_refuses_as_the_gate_does() {
     assert_eq!(failed.message, "no CLI");
     assert!(!failed.retryable);
 }
+
+#[test]
+fn a_held_account_list_refuses_retryably_in_its_own_words() {
+    use crate::account::remote::{LifecycleError, ListHeld};
+    for held in [ListHeld::Registry, ListHeld::Lifecycle] {
+        let refusal = super::lifecycle_refusal(LifecycleError::ListHeld(held));
+        assert_eq!(refusal.code, ProtocolErrorCode::InvalidRequest);
+        assert_eq!(refusal.message, held.to_string());
+        assert!(refusal.retryable);
+        assert!(
+            !crate::control::ControlError::Remote {
+                code: refusal.code,
+                message: refusal.message,
+                retryable: refusal.retryable,
+            }
+            .is_daemon_busy(),
+            "{held:?} is not the daemon being busy"
+        );
+    }
+}

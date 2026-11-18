@@ -369,6 +369,11 @@ pub enum Recovery {
     /// its handshake, or the daemon speaks another protocol. Nothing was
     /// requested, so the conversation it would have moved is untouched.
     Unreached,
+    /// The daemon refused an account switch, or the client gave it up before
+    /// asking, for the reason the message gives, before anything changed
+    /// ([`crate::terminal_ipc::ProtocolErrorCode::NotAdmitted`]). As with
+    /// [`Self::Busy`], the conversation it would have moved is untouched.
+    NotAdmitted,
     /// The daemon refused this start and reported that repeating it cannot help.
     /// Keep the saved conversation and diagnostic without offering a retry.
     Blocked,

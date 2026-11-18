@@ -1156,15 +1156,44 @@ fn terminal_io_request(request: &ClientRequest) -> bool {
     )
 }
 
-/// A busy refusal stays the gate's own retryable one, so a client tells the
-/// person to wait and retry rather than reporting a failed operation.
-fn lifecycle_refusal(error: crate::account::remote::LifecycleError) -> ProtocolError {
+/// An account operation's failure as the daemon's reply. Both refusals left
+/// everything as it was and say so with `retryable`, so a client tells the
+/// person to wait and retry rather than reporting a failed operation. Only a
+/// busy control gate is the daemon's own busy sentence.
+pub(super) fn lifecycle_refusal(error: crate::account::remote::LifecycleError) -> ProtocolError {
     match error {
         crate::account::remote::LifecycleError::Busy => control_gate::busy(),
+        crate::account::remote::LifecycleError::ListHeld(held) => {
+            ProtocolError::new(ProtocolErrorCode::InvalidRequest, held.to_string(), true)
+        }
         crate::account::remote::LifecycleError::Failed(message) => {
             ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
         }
     }
+}
+
+/// Runs checks that admit `request` before it changes anything. An automatic
+/// account switch they refuse is marked as refused before any effect, so its
+/// client keeps the conversation on its account; the switch's own checks are
+/// marked the same way in `chat::recover_account`. Every other request keeps
+/// the refusal as it is.
+fn admission(
+    request: &ClientRequest,
+    checks: impl FnOnce() -> Result<(), ProtocolError>,
+) -> Result<(), ProtocolError> {
+    checks().map_err(|failure| {
+        if matches!(
+            request,
+            ClientRequest::ChatRecoverAccount {
+                idle_generation: Some(_),
+                ..
+            }
+        ) {
+            failure.not_admitted()
+        } else {
+            failure
+        }
+    })
 }
 
 fn process_wire_request(
@@ -1172,8 +1201,10 @@ fn process_wire_request(
     client_id: ClientId,
     request: ClientRequest,
 ) -> Result<RequestOutcome<crate::terminal_ipc::PreparedResponse>, ProtocolError> {
-    ensure_request_open(host, &request)?;
-    ensure_startup_recovery_request(host, &request)?;
+    admission(&request, || {
+        ensure_request_open(host, &request)?;
+        ensure_startup_recovery_request(host, &request)
+    })?;
     let gate = control_gate(host);
     // The GitHub read must not monopolize the exclusive admission fence. All
     // authorizing local state is checked again only after that fence is held.
@@ -1274,11 +1305,13 @@ fn process_wire_request(
         None if terminal_io_request(&request) => (None, Some(gate.terminal_io())),
         None => (None, Some(gate.shared())),
     };
-    ensure_request_open(host, &request)?;
-    ensure_startup_recovery_request(host, &request)?;
-    super::agent_execution::terminals::admit(host, client_id, &request)?;
-    super::account_lifecycle::admit(host, &request)?;
-    super::worktree_removal::admit(host, &request)?;
+    admission(&request, || {
+        ensure_request_open(host, &request)?;
+        ensure_startup_recovery_request(host, &request)?;
+        super::agent_execution::terminals::admit(host, client_id, &request)?;
+        super::account_lifecycle::admit(host, &request)?;
+        super::worktree_removal::admit(host, &request)
+    })?;
     // Retained originals are outside the session inventory. Refuse before
     // publishing a preflight capability or requesting termination. This only
     // observes custody already published now; quarantine can publish later.
@@ -1472,9 +1505,24 @@ fn process_admitted_request(
                 }
                 _ => {}
             }
-            let reply = crate::device_service::execute(operation).map_err(|message| {
-                ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
-            })?;
+            let reply = match operation {
+                crate::device_service::Operation::AccountDefault {
+                    expected_revision,
+                    provider,
+                    selection,
+                } => {
+                    crate::device_service::account_default(expected_revision, provider, &selection)
+                        .map_err(lifecycle_refusal)?
+                }
+                crate::device_service::Operation::AccountsUpdate {
+                    expected_revision,
+                    registry,
+                } => crate::device_service::update_accounts(expected_revision, registry)
+                    .map_err(lifecycle_refusal)?,
+                operation => crate::device_service::execute(operation).map_err(|message| {
+                    ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
+                })?,
+            };
             Ok((ServerResponse::DeviceOperation { reply }, Vec::new(), false))
         }
         ClientRequest::Authenticate { authority } => {

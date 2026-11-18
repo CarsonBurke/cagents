@@ -237,3 +237,57 @@ fn unanswered_calls_are_bounded() {
     reader.line(b"not json", &mut found);
     assert!(found.is_empty());
 }
+
+/// The native-evidence conversation in `tests/fixtures/conversation-work`
+/// replays these frames; what they point at is what its Work list shows.
+#[test]
+fn the_conversation_work_fixture_reads_as_its_documented_work() {
+    let template = include_str!("../../../../tests/fixtures/conversation-work/frames.jsonl");
+    let lines = template
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<Value>(&line.replace("@PROJECT@", "/w/app"))
+                .expect("a frame is JSON")
+        })
+        .filter(|frame| frame["type"] == "assistant" || frame["type"] == "user")
+        .collect::<Vec<_>>();
+    let repository = RepoKeyOrd {
+        host: "github.com".into(),
+        port: None,
+        owner: "octo-org".into(),
+        name: "fixture-app".into(),
+    };
+    let pull_request = |number| {
+        Reference::PullRequest(PullRequestKeyOrd {
+            repository: repository.clone(),
+            number,
+        })
+    };
+    let pushed = |name: &str| Reference::Branch {
+        repository: Some(repository.clone()),
+        name: name.into(),
+    };
+    let edited = |directory: &str| Reference::CurrentBranch {
+        directory: Some(format!("/w/app/.worktrees/{directory}")),
+    };
+    let found = read(Format::Claude, false, &lines)
+        .into_iter()
+        .map(|(reference, relation, _)| (reference, relation))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        found,
+        vec![
+            (pull_request(12), Relation::Mentioned),
+            (Reference::Number(29), Relation::Mentioned),
+            (edited("cache-key/src"), Relation::Edited),
+            (pull_request(41), Relation::Created),
+            (pushed("fix/cache-key"), Relation::Pushed),
+            (edited("cache-key/src"), Relation::Edited),
+            (edited("retry-budget/src"), Relation::Edited),
+            (pushed("feat/retry-budget"), Relation::Pushed),
+            (Reference::Number(35), Relation::Updated),
+            (edited("locale-notes/docs"), Relation::Edited),
+            (pull_request(41), Relation::Mentioned),
+        ]
+    );
+}

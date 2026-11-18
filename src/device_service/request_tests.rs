@@ -300,7 +300,7 @@ fn only_the_daemons_busy_refusal_reads_as_busy() {
                 crate::terminal_ipc::DAEMON_BUSY,
                 true,
             )),
-            crate::control::RequestError::Busy,
+            crate::control::RequestError::Refused(crate::control::Refusal::Busy),
         ),
         (
             denied(),

@@ -9130,6 +9130,10 @@
         [
           "store_busy",
           "Unit"
+        ],
+        [
+          "not_admitted",
+          "Unit"
         ]
       ]
     },
@@ -13055,23 +13059,6 @@
               [
                 "expected_view_revision",
                 "U64"
-              ]
-            ]
-          }
-        ],
-        [
-          "CloseConfirmedProject",
-          {
-            "Struct": [
-              [
-                "repository",
-                "Str"
-              ],
-              [
-                "channels",
-                {
-                  "Seq": "Bytes"
-                }
               ]
             ]
           }

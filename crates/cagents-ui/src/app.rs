@@ -4840,9 +4840,6 @@ pub enum Message {
     /// Reconcile the repositories whose background loads finished since the
     /// last reconciliation; see [`Cagents::defer_repository_reconciliation`].
     RepositoryReconciliationDue,
-    /// The hold that began at this instant has lasted long enough to draw the
-    /// workspace switcher.
-    WorkspaceSwitcherDue(Instant),
     WorkspaceSwitcherSelected {
         since: Instant,
         index: usize,
@@ -17392,14 +17389,6 @@ impl Application for Cagents {
                 } else {
                     Task::none()
                 }
-            }
-            Message::WorkspaceSwitcherDue(since) => {
-                if self.chrome_ui.workspace_preview_since != Some(since)
-                    || self.chrome_ui.workspace_switcher_shown
-                {
-                    return Task::none();
-                }
-                self.show_workspace_switcher()
             }
             Message::ReplicaCaptureDue(generation) => {
                 self.replica_capture_due(generation, Instant::now())
