@@ -98,6 +98,42 @@ pub(super) struct PaneInspectors {
     legacy_open: bool,
     /// The pane whose inspector draws the window's source control and files.
     source_control: Option<CardId>,
+    /// Every pane that may be narrowed, hidden or opened narrow: at least
+    /// each one with any of those set. Only these, the strip's panes and the
+    /// panes whose kind is an exception can change those flags, so an
+    /// incremental sync looks at them alone.
+    constrained: HashSet<CardId>,
+    /// The window's cards, in order, as the last incremental sync admitted
+    /// them.
+    known: Vec<CardId>,
+    /// The cards whose inspectors are not simply available, as the last
+    /// incremental sync found them: the few application pages and browsers.
+    exceptions: Vec<(CardId, Availability)>,
+    /// What the last incremental sync caught up with, until the inspectors
+    /// themselves change.
+    synced: Option<Synced>,
+}
+
+/// What an incremental sync of the inspectors depends on besides the durable
+/// cards. Equal inputs over the same durable cards leave every pane's state
+/// as it was; only the pane drawing source control is chosen again, from the
+/// panes on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SyncInputs {
+    pub(super) focused: Option<CardId>,
+    /// Whether a browser has a worktree to show: the window is scoped.
+    pub(super) browsers_available: bool,
+    /// The strip's geometry, which says how wide each pane is.
+    pub(super) geometry: u64,
+}
+
+#[derive(Debug)]
+struct Synced {
+    /// The durable workspace the cards came from. Copy-on-write gives every
+    /// changed workspace a new address, and the weak reference keeps the old
+    /// one from being reused.
+    cards: std::sync::Weak<WorkspaceState>,
+    inputs: SyncInputs,
 }
 
 impl PaneInspectors {
@@ -151,6 +187,7 @@ impl PaneInspectors {
     pub(super) fn inherit(&mut self, source: CardId, copy: CardId) {
         if self.is_open(source) {
             self.restored_open.insert(copy);
+            self.synced = None;
         }
     }
 
@@ -213,6 +250,8 @@ impl PaneInspectors {
         if open {
             pane.opened_narrow = narrow;
         }
+        self.constrained.insert(card);
+        self.synced = None;
         // Closing keeps its mounting mode until the panel has slid away.
         pane.transition = Some(InspectorTransition {
             started_at: now,
@@ -237,6 +276,8 @@ impl PaneInspectors {
                 finished = true;
             }
         }
+        // Only the slides changed, and the pane drawing source control is
+        // chosen on every sync, so the sync's inputs still hold.
         finished
     }
 
@@ -259,6 +300,10 @@ impl PaneInspectors {
     /// one inspector rather than opening it on some later pane. An open
     /// inspector with nothing to show here is hidden at once, and comes back
     /// when it has.
+    ///
+    /// This visits every pane. [`Self::sync_incremental`] reaches the same
+    /// state visiting only what its inputs say may have changed.
+    #[cfg(test)]
     pub(super) fn sync(
         &mut self,
         cards: &[CardId],
@@ -266,6 +311,113 @@ impl PaneInspectors {
         availability: impl Fn(CardId) -> Availability,
         narrow: impl Fn(CardId) -> bool,
         on_screen: impl Fn(CardId) -> bool,
+    ) {
+        self.synced = None;
+        self.admit(cards, focused, &availability);
+        let panes: Vec<CardId> = self.panes.keys().copied().collect();
+        self.constrain(panes, &availability, &narrow);
+        self.forget_closed(cards);
+        self.follow_focus(focused, &on_screen, |shown| {
+            cards.iter().copied().find(|card| shown(*card))
+        });
+    }
+
+    /// [`Self::sync`] for a window whose durable workspace is `source`,
+    /// visiting only what may have changed since the last call.
+    ///
+    /// `cards` lists the window's cards and what each has, and is read only
+    /// when `source` or whether browsers are available has changed. Every
+    /// other input is in `inputs`: while they and `source` hold, no pane's
+    /// state can change, and only the pane drawing source control is chosen
+    /// again. When they change, only the panes `strip` lists, the
+    /// exceptions among `cards` and the panes already constrained can be
+    /// narrowed or hidden: a pane outside the strip has no width. `mounted`
+    /// lists at least the panes `on_screen` accepts, and `index` gives a
+    /// card's place among `cards`.
+    pub(super) fn sync_incremental<I: IntoIterator<Item = CardId>>(
+        &mut self,
+        source: &Arc<WorkspaceState>,
+        inputs: SyncInputs,
+        cards: impl FnOnce() -> Vec<(CardId, Availability)>,
+        strip: impl FnOnce() -> I,
+        narrow: impl Fn(CardId) -> bool,
+        mounted: impl Iterator<Item = CardId>,
+        on_screen: impl Fn(CardId) -> bool,
+        index: impl Fn(CardId) -> Option<usize>,
+    ) {
+        let synced = self.synced.as_ref();
+        let cards_changed = synced.is_none_or(|synced| {
+            synced.cards.as_ptr() != Arc::as_ptr(source)
+                || synced.inputs.browsers_available != inputs.browsers_available
+        });
+        let changed = cards_changed || synced.is_none_or(|synced| synced.inputs != inputs);
+        if changed {
+            let mut admitted = Vec::new();
+            if cards_changed {
+                let cards = cards();
+                self.exceptions.clear();
+                self.exceptions.extend(
+                    cards
+                        .iter()
+                        .copied()
+                        .filter(|(_, availability)| *availability != Availability::Available),
+                );
+                if !self
+                    .known
+                    .iter()
+                    .copied()
+                    .eq(cards.iter().map(|(card, _)| *card))
+                {
+                    self.known.clear();
+                    self.known.extend(cards.iter().map(|(card, _)| *card));
+                    admitted.clone_from(&self.known);
+                }
+            }
+            let exceptions = std::mem::take(&mut self.exceptions);
+            let availability = |card: CardId| {
+                exceptions
+                    .iter()
+                    .find(|(id, _)| *id == card)
+                    .map_or(Availability::Available, |(_, availability)| *availability)
+            };
+            // Unchanged cards hold no pane this has not seen, so only the
+            // legacy inspector's focus is settled.
+            self.admit(&admitted, inputs.focused, &availability);
+            let candidates: Vec<CardId> = strip()
+                .into_iter()
+                .chain(exceptions.iter().map(|(card, _)| *card))
+                .chain(self.constrained.iter().copied())
+                .collect();
+            self.constrain(candidates, &availability, &narrow);
+            if cards_changed {
+                let known = std::mem::take(&mut self.known);
+                self.forget_closed(&known);
+                self.known = known;
+            }
+            self.exceptions = exceptions;
+            self.synced = Some(Synced {
+                cards: Arc::downgrade(source),
+                inputs,
+            });
+        }
+        // The panes on screen are few, and the first open one among the
+        // window's cards is the one with the lowest place there.
+        self.follow_focus(inputs.focused, &on_screen, |shown| {
+            mounted
+                .filter(|card| shown(*card))
+                .filter_map(|card| Some((index(card)?, card)))
+                .min()
+                .map(|(_, card)| card)
+        });
+    }
+
+    /// Opens each of `cards` this has not seen as it was saved, and settles
+    /// a legacy window's one inspector on the focused pane.
+    fn admit(
+        &mut self,
+        cards: &[CardId],
+        focused: Option<CardId>,
+        availability: &dyn Fn(CardId) -> Availability,
     ) {
         if self.legacy_open && focused.is_some_and(|card| availability(card) == Availability::Never)
         {
@@ -297,19 +449,33 @@ impl PaneInspectors {
             pane.open = true;
             self.legacy_open = false;
         }
-        // Only open inspectors care whether they have anything to show and
-        // how wide their panes are.
-        for (card, pane) in &mut self.panes {
+    }
+
+    /// Hides each open pane among `candidates` that has nothing to show here,
+    /// and closes, until it widens, each that `narrow` says is too narrow,
+    /// unless it was opened there. Only open inspectors care whether they
+    /// have anything to show and how wide their panes are.
+    fn constrain(
+        &mut self,
+        candidates: impl IntoIterator<Item = CardId>,
+        availability: &dyn Fn(CardId) -> Availability,
+        narrow: &dyn Fn(CardId) -> bool,
+    ) {
+        for card in candidates {
+            let Some(pane) = self.panes.get_mut(&card) else {
+                self.constrained.remove(&card);
+                continue;
+            };
             if !pane.open {
                 continue;
             }
-            let unavailable = availability(*card) == Availability::Unavailable;
+            let unavailable = availability(card) == Availability::Unavailable;
             if unavailable && !pane.unavailable {
                 // At once, without a slide.
                 pane.transition = None;
             }
             pane.unavailable = unavailable;
-            if !narrow(*card) {
+            if !narrow(card) {
                 pane.narrowed = false;
                 pane.opened_narrow = false;
             } else if !pane.opened_narrow && !pane.narrowed {
@@ -317,20 +483,40 @@ impl PaneInspectors {
                 pane.narrowed = true;
                 pane.transition = None;
             }
+            if pane.unavailable || pane.narrowed || pane.opened_narrow {
+                self.constrained.insert(card);
+            } else {
+                self.constrained.remove(&card);
+            }
         }
-        // Panes closed for good, here or in another window. Every pane in
-        // `cards` is known by now, so any more are gone.
+    }
+
+    /// Drops the panes closed for good, here or in another window. Every
+    /// pane in `cards` is known by now, so any more are gone.
+    fn forget_closed(&mut self, cards: &[CardId]) {
         if !cards.is_empty() && self.panes.len() > cards.len() {
             let present: HashSet<CardId> = cards.iter().copied().collect();
             self.panes.retain(|card, _| present.contains(card));
+            self.constrained.retain(|card| present.contains(card));
         }
+    }
+
+    /// Source control follows the focused pane's open inspector, or stays
+    /// with the one that last drew it while that is on screen, else goes to
+    /// the open inspector on screen that `first` finds among those `shown`.
+    fn follow_focus(
+        &mut self,
+        focused: Option<CardId>,
+        on_screen: &dyn Fn(CardId) -> bool,
+        first: impl FnOnce(&dyn Fn(CardId) -> bool) -> Option<CardId>,
+    ) {
         self.source_control = match focused {
             Some(focused) if self.is_visible(focused) => Some(focused),
             _ => {
-                let shown = |card: &CardId| self.is_visible(*card) && on_screen(*card);
+                let shown = |card: CardId| self.is_visible(card) && on_screen(card);
                 self.source_control
-                    .filter(shown)
-                    .or_else(|| cards.iter().copied().find(shown))
+                    .filter(|card| shown(*card))
+                    .or_else(|| first(&shown))
             }
         };
     }
@@ -400,15 +586,7 @@ impl Cagents {
     }
 
     fn kind_availability(&self, kind: &CardKind) -> Availability {
-        match kind {
-            _ if !offers_inspector(kind) => Availability::Never,
-            // A browser names no worktree; it shows the one a worktree's or
-            // channel's workspace is scoped to, as `sidebar_focus` binds it.
-            // Only the unscoped home strip leaves it nothing to show: a
-            // browser a strip owns is never on screen there.
-            CardKind::Browser(_) if self.active_workspace.is_none() => Availability::Unavailable,
-            _ => Availability::Available,
-        }
+        kind_availability(kind, self.active_workspace.is_some())
     }
 
     /// Whether the pane has an inspector to open and show now.
@@ -509,32 +687,41 @@ impl Cagents {
     /// Runs at the tail of every update, before the source-control rebind;
     /// see [`PaneInspectors::sync`].
     pub(super) fn sync_pane_inspectors(&mut self) {
-        let mut cards = Vec::with_capacity(self.durable.cards.len());
-        // The few application pages and browsers, so a scan is cheapest.
-        let mut exceptions = Vec::new();
-        for card in &self.durable.cards {
-            cards.push(card.id);
-            match self.kind_availability(&card.kind) {
-                Availability::Available => {}
-                availability => exceptions.push((card.id, availability)),
-            }
-        }
-        let focused = self.workspace.focused();
+        let browsers_available = self.active_workspace.is_some();
+        let inputs = SyncInputs {
+            focused: self.workspace.focused(),
+            browsers_available,
+            geometry: self.workspace.geometry_revision(),
+        };
+        let durable = &self.durable;
         let workspace = &self.workspace;
-        self.pane_inspectors.sync(
-            &cards,
-            focused,
-            |card| {
-                exceptions
+        let card_indices = &self.card_indices;
+        self.pane_inspectors.sync_incremental(
+            durable,
+            inputs,
+            || {
+                durable
+                    .cards
                     .iter()
-                    .find(|(id, _)| *id == card)
-                    .map_or(Availability::Available, |(_, availability)| *availability)
+                    .map(|card| (card.id, kind_availability(&card.kind, browsers_available)))
+                    .collect()
             },
+            || workspace.order(),
             |card| pane_too_narrow(workspace, card),
+            workspace.mounted_visibility().map(|(card, _)| card),
             |card| {
                 workspace
                     .visibility(card)
                     .is_some_and(crate::workspace::VisibilityClass::is_mounted)
+            },
+            |card| {
+                // The index is rebuilt as the projection begins; a stale
+                // entry falls back to a scan, as `card_index` does.
+                card_indices
+                    .get(&card)
+                    .copied()
+                    .filter(|index| durable.cards.get(*index).is_some_and(|c| c.id == card))
+                    .or_else(|| durable.cards.iter().position(|c| c.id == card))
             },
         );
     }
@@ -719,6 +906,20 @@ impl Cagents {
     }
 }
 
+/// Whether a pane of `kind` has an inspector where the window shows it now.
+/// `browsers_available` says whether the window is scoped to a worktree.
+fn kind_availability(kind: &CardKind, browsers_available: bool) -> Availability {
+    match kind {
+        _ if !offers_inspector(kind) => Availability::Never,
+        // A browser names no worktree; it shows the one a worktree's or
+        // channel's workspace is scoped to, as `sidebar_focus` binds it.
+        // Only the unscoped home strip leaves it nothing to show: a browser
+        // a strip owns is never on screen there.
+        CardKind::Browser(_) if !browsers_available => Availability::Unavailable,
+        _ => Availability::Available,
+    }
+}
+
 /// The width the strip gives the pane, once it has measured it.
 fn pane_width(workspace: &crate::workspace::Workspace, card: CardId) -> Option<f32> {
     workspace
@@ -752,6 +953,183 @@ fn floating_toggle_style(theme: &cosmic::Theme) -> iced::widget::container::Styl
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a card is, for [`an_incremental_sync_reaches_what_a_full_one_does`].
+    #[derive(Clone, Copy, PartialEq)]
+    enum Kind {
+        Page,
+        Browser,
+        Pane,
+    }
+
+    /// The window an incremental and a full sync both catch up with.
+    struct Window {
+        cards: Vec<(CardId, Kind)>,
+        strip: Vec<CardId>,
+        narrow: HashSet<CardId>,
+        on_screen: HashSet<CardId>,
+        focused: Option<CardId>,
+        browsers_available: bool,
+        source: Arc<WorkspaceState>,
+        geometry: u64,
+    }
+
+    impl Window {
+        fn availability(&self, card: CardId) -> Availability {
+            match self.cards.iter().find(|(id, _)| *id == card) {
+                Some((_, Kind::Page)) => Availability::Never,
+                Some((_, Kind::Browser)) if !self.browsers_available => Availability::Unavailable,
+                _ => Availability::Available,
+            }
+        }
+
+        fn sync_incremental(&self, inspectors: &mut PaneInspectors) {
+            inspectors.sync_incremental(
+                &self.source,
+                SyncInputs {
+                    focused: self.focused,
+                    browsers_available: self.browsers_available,
+                    geometry: self.geometry,
+                },
+                || {
+                    self.cards
+                        .iter()
+                        .map(|(card, _)| (*card, self.availability(*card)))
+                        .collect()
+                },
+                || self.strip.iter().copied(),
+                |card| self.narrow.contains(&card),
+                self.on_screen.iter().copied(),
+                |card| self.on_screen.contains(&card),
+                |card| self.cards.iter().position(|(id, _)| *id == card),
+            );
+        }
+
+        fn sync(&self, inspectors: &mut PaneInspectors) {
+            let cards: Vec<CardId> = self.cards.iter().map(|(card, _)| *card).collect();
+            inspectors.sync(
+                &cards,
+                self.focused,
+                |card| self.availability(card),
+                |card| self.narrow.contains(&card),
+                |card| self.on_screen.contains(&card),
+            );
+        }
+
+        /// The durable cards changed, as copy-on-write gives them a new
+        /// address.
+        fn cards_changed(&mut self) {
+            self.source = Arc::new(WorkspaceState::default());
+        }
+    }
+
+    #[test]
+    fn an_incremental_sync_reaches_what_a_full_one_does() {
+        // SplitMix64, so a failing sequence replays from its seed.
+        let mut seed: u64 = 0x5eed_1a5e;
+        let mut next = move |bound: usize| {
+            seed = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = seed;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            ((z ^ (z >> 31)) % bound as u64) as usize
+        };
+        for run in 0..40 {
+            let saved = cards(6);
+            let kinds = [Kind::Pane, Kind::Pane, Kind::Browser, Kind::Page];
+            let mut window = Window {
+                cards: saved.iter().map(|card| (*card, kinds[next(4)])).collect(),
+                strip: Vec::new(),
+                narrow: HashSet::new(),
+                on_screen: HashSet::new(),
+                focused: None,
+                browsers_available: next(2) == 0,
+                source: Arc::new(WorkspaceState::default()),
+                geometry: 0,
+            };
+            window.strip = window.cards.iter().map(|(card, _)| *card).take(4).collect();
+            window.focused = window.strip.first().copied();
+            let (open, legacy) = match run % 3 {
+                0 => (Some(saved[..3].to_vec()), false),
+                1 => (None, true),
+                _ => (None, false),
+            };
+            let mut incremental = PaneInspectors::restore(open.clone(), legacy);
+            let mut full = PaneInspectors::restore(open, legacy);
+            let now = Instant::now();
+            for step in 0..200 {
+                match next(10) {
+                    0 => {
+                        let card = CardId::new();
+                        let source = window.cards[next(window.cards.len())].0;
+                        incremental.inherit(source, card);
+                        full.inherit(source, card);
+                        window.cards.push((card, kinds[next(4)]));
+                        if next(2) == 0 {
+                            window.strip.push(card);
+                            window.geometry += 1;
+                        }
+                        window.cards_changed();
+                    }
+                    1 if window.cards.len() > 2 => {
+                        let (card, _) = window.cards.remove(next(window.cards.len()));
+                        if let Some(index) = window.strip.iter().position(|id| *id == card) {
+                            window.strip.remove(index);
+                            window.geometry += 1;
+                        }
+                        window.narrow.remove(&card);
+                        window.on_screen.remove(&card);
+                        if window.focused == Some(card) {
+                            window.focused = window.strip.first().copied();
+                        }
+                        window.cards_changed();
+                    }
+                    2 => {
+                        window.focused = (next(5) > 0)
+                            .then(|| window.cards[next(window.cards.len())].0)
+                            .filter(|card| window.strip.contains(card));
+                    }
+                    3 if !window.strip.is_empty() => {
+                        let card = window.strip[next(window.strip.len())];
+                        if !window.narrow.remove(&card) {
+                            window.narrow.insert(card);
+                        }
+                        window.geometry += 1;
+                    }
+                    4 if !window.strip.is_empty() => {
+                        let card = window.strip[next(window.strip.len())];
+                        if !window.on_screen.remove(&card) {
+                            window.on_screen.insert(card);
+                        }
+                    }
+                    5 => window.browsers_available = !window.browsers_available,
+                    6 | 7 => {
+                        let card = window.cards[next(window.cards.len())].0;
+                        if window.availability(card) == Availability::Available {
+                            let open = next(3) > 0;
+                            let narrow = window.narrow.contains(&card);
+                            let at = now + Duration::from_millis(step);
+                            incremental.set_open(card, open, narrow, None, at);
+                            full.set_open(card, open, narrow, None, at);
+                        }
+                    }
+                    8 => {
+                        let at = now + Duration::from_millis(step) + DIALOG_TRANSITION_DURATION;
+                        incremental.advance(at);
+                        full.advance(at);
+                    }
+                    _ => window.cards_changed(),
+                }
+                window.sync_incremental(&mut incremental);
+                window.sync(&mut full);
+                assert_eq!(
+                    incremental.projection_view(),
+                    full.projection_view(),
+                    "run {run}, step {step}",
+                );
+            }
+        }
+    }
 
     fn cards(count: usize) -> Vec<CardId> {
         (0..count).map(|_| CardId::new()).collect()
