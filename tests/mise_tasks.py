@@ -127,14 +127,16 @@ class Structure(unittest.TestCase):
 
     def test_every_lane_holds_the_workspace_to_main_build_checks_warning_rule(self):
         # scripts/cargo-lane fails on the workspace's own warnings, as the
-        # main build sentinel does, and runs the gate itself.
+        # main build sentinel does, and runs the gate itself. A check lints:
+        # Clippy type-checks as `cargo check` does and adds the workspace lints.
         for lane in LANES:
-            for kind in ("check", "test"):
+            for kind, subcommand in (("check", "clippy"), ("test", "test")):
                 task = self.tasks.get(f"{kind}:{lane}")
                 if task is None:
                     continue
                 with self.subTest(task=f"{kind}:{lane}"):
-                    self.assertRegex(commands(task)[0], rf"\bexec scripts/cargo-lane {kind} \{{\{{vars\.{lane}\}}\}}")
+                    self.assertRegex(commands(task)[0],
+                                     rf"\bexec scripts/cargo-lane {subcommand} \{{\{{vars\.{lane}\}}\}}")
                     for command in commands(task):
                         # Each step execs it, so mise's TERM, sent to the step
                         # alone, reaches the gate; and stays in its own lane.
@@ -248,7 +250,7 @@ class Behavior(unittest.TestCase):
         result = self.mise_run("check:host")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.calls(), [
-            ["cargo-lane", "check", "--locked", "--no-default-features", "--features", "host", "--all-targets"],
+            ["cargo-lane", "clippy", "--locked", "--no-default-features", "--features", "host", "--all-targets"],
         ])
 
     def test_forwarded_arguments_replace_the_target_selection_and_keep_quoting(self):
@@ -258,8 +260,8 @@ class Behavior(unittest.TestCase):
                 "--features", "cagents/ui"]
         self.assertEqual(self.calls(), [
             ["cargo-lane", "test", *lane, "--lib", "app::chat ui", "--", "--exact"],
-            # Narrowed, it then checks what its tests' build may have hidden.
-            ["cargo-lane", "check", *lane, "--lib", "--bins", "--examples"],
+            # Narrowed, it then lints what its tests' build may have hidden.
+            ["cargo-lane", "clippy", *lane, "--lib", "--bins", "--examples"],
         ])
 
     def test_a_narrowed_test_lane_checks_the_lanes_other_targets_once_its_tests_pass(self):
@@ -274,10 +276,10 @@ class Behavior(unittest.TestCase):
         self.assertEqual(self.mise_run("test:cli", "--", "--lib", status=4).returncode, 4)
         self.assertEqual([call[1] for call in self.calls()], ["test"])
         self.log.unlink()
-        self.assertEqual(self.mise_run("test:cli", "--", "--test", "cli", check=1).returncode, 1)
+        self.assertEqual(self.mise_run("test:cli", "--", "--test", "cli", clippy=1).returncode, 1)
         self.assertEqual(self.calls(), [
             ["cargo-lane", "test", "--locked", "--no-default-features", "--test", "cli"],
-            ["cargo-lane", "check", "--locked", "--no-default-features", "--lib", "--bins", "--examples"],
+            ["cargo-lane", "clippy", "--locked", "--no-default-features", "--lib", "--bins", "--examples"],
         ])
 
     def test_lane_arguments_without_the_separator_are_refused_before_anything_runs(self):
@@ -292,9 +294,9 @@ class Behavior(unittest.TestCase):
         self.assertEqual(self.mise_run("check:browser").returncode, 0)
         self.assertEqual(self.mise_run("check:editor").returncode, 0)
         self.assertEqual(self.calls(), [
-            ["cargo-lane", "check", "--locked", "--no-default-features", "--package", "cagents-ui",
+            ["cargo-lane", "clippy", "--locked", "--no-default-features", "--package", "cagents-ui",
              "--features", "browser-protocol-fixture", "--all-targets"],
-            ["cargo-lane", "check", "--locked", "--package", "ceditor", "--bin=ceditor"],
+            ["cargo-lane", "clippy", "--locked", "--package", "ceditor", "--bin=ceditor"],
         ])
 
     def test_a_failure_keeps_its_exit_status(self):

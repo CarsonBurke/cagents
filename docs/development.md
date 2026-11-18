@@ -43,8 +43,8 @@ dependencies and compiles. Run tasks from anywhere in the checkout.
 | `doctor` | Report each missing prerequisite with its fix, and whether the build host answers |
 | `dev` | Run the browserless [development UI](#development-runner) |
 | `dev:browser` | Run the development UI with the embedded browser |
-| `check:cli`, `check:host`, `check:ui`, `check:browser` | Type-check one [lane](#feature-boundaries), all targets by default |
-| `check:editor` | Type-check ceditor |
+| `check:cli`, `check:host`, `check:ui`, `check:browser` | Type-check and lint one [lane](#feature-boundaries), all targets by default |
+| `check:editor` | Type-check and lint ceditor |
 | `check` | `check:cli`, `check:host` and `check:ui`, each admitted to the build host on its own |
 | `check:protocol` | The [IPC source contract](#testing) and its companion checks, against the merge base with `origin/main` or `--base REF` |
 | `test:cli`, `test:host`, `test:ui` | Test one lane, all targets by default |
@@ -195,13 +195,18 @@ check all targets, tests included, and `check` runs the first three: what a
 change needs before review. The integrated-browser lane compiles the
 application's tests too, so a test that uses a browserless-only fixture must be
 gated like that fixture.
-Each task runs one `scripts/cargo-gate check --locked` command with its lane's
+Each task runs one `scripts/cargo-gate clippy --locked` command with its lane's
 features, `--no-default-features --features host` for the daemon for example;
 `mise.toml` defines the lanes once. The `ui` lane selects both packages,
 `--package cagents --package cagents-ui --features cagents/ui`, and `browser`
 selects `--package cagents-ui --features browser-protocol-fixture`: the
 integrated browser with the Wayland registry test server its tests use, as main's
-build check selects it.
+build check selects it. Clippy type-checks exactly as `cargo check` does and
+adds its lints; `[workspace.lints]` in the root `Cargo.toml` configures them for
+every workspace crate, and a lint warning fails the task like a compiler
+warning. Allow a lint there, with the reason, only when its rewrite is wrong or
+worse for this code base; allow one site with `#[allow(clippy::LINT, reason =
+"...")]` when only that site is the exception.
 
 Every lane compiles the workspace's crates without warnings, tests included,
 and a new warning is a regression to fix in the change that adds it. An item
@@ -229,7 +234,7 @@ its check.
 A test lane narrowed with arguments, such as `mise run test:ui -- --lib`, and
 `mise run test:lib` may build the lane's library only under `cfg(test)`,
 where an item only tests use looks used. So once their tests pass, these tasks
-also check the lane's library, binaries and examples, as main's build check
+also lint the lane's library, binaries and examples, as main's build check
 does, and their status is that check's. A method only tests called reached
 main that way (#3006, fixed by #3035): its author ran a narrowed test lane and
 no check. On fw16 this check took about 20 s to compile where the slot had
@@ -781,14 +786,14 @@ GitHub's script checks do not compile Rust. On fw16,
 `scripts/main-build-sentinel --repository /absolute/path/to/cagents` fetches main
 at most once every two minutes and checks every new first-parent commit in
 order. Its first run checks the current tip. Each commit gets five separate
-`scripts/cargo-gate check --locked --no-default-features --all-targets` commands:
+`scripts/cargo-gate clippy --locked --no-default-features --all-targets` commands:
 CLI, `--features host`, `--features ui`, `-p cagents-ui`, and
 `-p cagents-ui --features browser-protocol-fixture`, the integrated-browser
 graph with its Wayland registry test server. These use the ordinary shared queue
 and the persistent sentinel worktree cache, without a held slot between lanes.
 The sentinel neither merges nor modifies another checkout or native session.
 A lane fails when it does not compile or when a workspace crate prints a
-warning; it reads Cargo's JSON messages to tell the workspace's crates, the
+compiler or Clippy warning; it reads Cargo's JSON messages to tell the workspace's crates, the
 checked commit's `[workspace] members`, from vendored path dependencies, whose
 warnings do not count. The lane tasks apply the same rule with the same code,
 `scripts/cargo_warnings.py`, so the rule an author checks a branch against is
