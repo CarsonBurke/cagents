@@ -346,6 +346,9 @@ pub(super) struct State {
     /// Scopes complete publications left settled, publishing nothing.
     #[cfg(test)]
     pub(super) settled_publications: usize,
+    /// Settled scopes a transfer reached, published from their baseline.
+    #[cfg(test)]
+    pub(super) transfer_unsettled: usize,
     #[cfg(test)]
     pub(super) chrome_cards_visited: std::cell::Cell<usize>,
     #[cfg(test)]
@@ -516,6 +519,7 @@ impl State {
             publisher_index_entries: _,
             publisher_scope_comparisons: _,
             settled_publications: _,
+            transfer_unsettled: _,
             chrome_cards_visited: _,
             order_rewrites: _,
             held_descriptor_clones: _,
@@ -2297,6 +2301,10 @@ impl Cagents {
             }
             for scope in moving {
                 if settled.remove(&scope) {
+                    #[cfg(test)]
+                    {
+                        self.shared_views.transfer_unsettled += 1;
+                    }
                     panes.insert(scope.clone(), self.shared_views.baseline[&scope].clone());
                 }
             }

@@ -1283,7 +1283,7 @@ mod tests {
                 set.insert(id);
             }
         };
-        match rng.below(9) {
+        match rng.below(15) {
             0 => {
                 app.card_state_mut(id).unwrap().title = format!("title {}", rng.below(3));
                 "retitle a card"
@@ -1329,9 +1329,104 @@ mod tests {
                 channel.cards.swap(a, b);
                 "reorder a channel's panes"
             }
-            _ => {
+            8 => {
                 app.reported_title_save.cards.clear();
                 "save reported titles"
+            }
+            9 | 10 => {
+                // The registry acknowledges what this window published: its
+                // view lists the baseline at a later revision.
+                let listed = app
+                    .workspace_model
+                    .views
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, view)| {
+                        app.shared_views
+                            .baseline
+                            .get(&view.scope)
+                            .map(|baseline| (index, baseline.clone()))
+                    })
+                    .collect::<Vec<_>>();
+                let Some((index, baseline)) = rng.pick(&listed).cloned() else {
+                    return "none";
+                };
+                let view = &mut app.workspace_model.views[index];
+                view.panes = baseline;
+                view.revision += 1 + rng.below(3) as u64;
+                "list a scope's published panes"
+            }
+            11 => {
+                // A terminal listed with its start pending, or settled.
+                let listed = app
+                    .workspace_model
+                    .views
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(view, entry)| {
+                        entry
+                            .panes
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, pane)| matches!(pane.kind, CardKind::Terminal(_)))
+                            .map(move |(pane, _)| (view, pane))
+                    })
+                    .collect::<Vec<_>>();
+                let Some(&(view, pane)) = rng.pick(&listed) else {
+                    return "none";
+                };
+                let pane = &mut app.workspace_model.views[view].panes[pane];
+                pane.pending_terminal_start = !pane.pending_terminal_start;
+                "list a terminal's start as pending or settled"
+            }
+            12 => {
+                // A browser, which shares no scroll, then scrolled.
+                let card = app.card_state_mut(id).unwrap();
+                match &mut card.kind {
+                    CardKind::Browser(session) => {
+                        session.scroll_y = [0., 120., 480.][rng.below(3)];
+                        "scroll a browser"
+                    }
+                    kind => {
+                        *kind = CardKind::Browser(crate::model::BrowserSession {
+                            id: crate::model::BrowserId::new(),
+                            current_url: "https://example.com".parse().unwrap(),
+                            history: Vec::new(),
+                            history_index: 0,
+                            scroll_x: 0.,
+                            scroll_y: 40.,
+                            fidelity: crate::model::BrowserRestoreFidelity::UrlOnly,
+                        });
+                        "turn a card into a scrolled browser"
+                    }
+                }
+            }
+            13 => {
+                let scopes = app
+                    .shared_views
+                    .baseline
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let Some(scope) = rng.pick(&scopes).cloned() else {
+                    return "none";
+                };
+                let blocked = &mut app.shared_views.blocked;
+                if !blocked.remove(&scope) {
+                    blocked.insert(scope);
+                }
+                "block or unblock a scope"
+            }
+            _ => {
+                let CardKind::Terminal(session) = &app.card_state(id).unwrap().kind else {
+                    return "none";
+                };
+                let session = session.clone();
+                let defaults = &mut app.shared_views.defaults;
+                if defaults.remove(&id).is_none() {
+                    defaults.insert(id, session);
+                }
+                "start or settle a default terminal"
             }
         }
     }
@@ -1391,9 +1486,24 @@ mod tests {
             .map(|(_, scope, change)| format!("{scope:?} {change:?}"))
             .collect::<Vec<_>>();
         pending.sort();
+        let mut transfers = views
+            .requested_transfers
+            .values()
+            .copied()
+            .collect::<Vec<_>>();
+        transfers.sort();
+        let mut source_bases = views
+            .source_bases
+            .values()
+            .map(|(_, repository)| repository.clone())
+            .collect::<Vec<_>>();
+        source_bases.sort();
         (
             (*views.baseline).clone(),
+            (*views.initialized).clone(),
             pending,
+            transfers,
+            source_bases,
             views.attached.clone(),
             views.seeding.clone(),
             views.seed_attempts.keys().cloned().collect::<HashSet<_>>(),
@@ -1409,7 +1519,7 @@ mod tests {
     /// discovery reads and of what panes are made of.
     #[test]
     fn settled_publication_agrees_with_a_complete_projection_across_random_edits() {
-        let (mut compared, mut settled) = (0, 0);
+        let (mut compared, mut settled, mut reached) = (0, 0, 0);
         for seed in 0..10 {
             let (mut app, _, _directory) = large_workspace(&SMALL);
             let (tx, requests) = crate::app::workspace_model_sync::test_model_channel();
@@ -1435,6 +1545,7 @@ mod tests {
                     let expected = published(&requests);
                     let complete = std::mem::replace(&mut app.shared_views, original);
                     let before = app.shared_views.settled_publications;
+                    let reached = app.shared_views.transfer_unsettled;
                     app.publish_view_changes();
                     assert_eq!(published(&requests), expected, "published edits");
                     assert_eq!(
@@ -1442,10 +1553,16 @@ mod tests {
                         publication_state(&complete),
                         "publication state"
                     );
-                    app.shared_views.settled_publications - before
+                    (
+                        app.shared_views.settled_publications - before,
+                        app.shared_views.transfer_unsettled - reached,
+                    )
                 };
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
-                    Ok(count) => settled += count,
+                    Ok((count, transfers)) => {
+                        settled += count;
+                        reached += transfers;
+                    }
                     Err(panic) => {
                         eprintln!("seed {seed}, step {step}: after {edit}");
                         std::panic::resume_unwind(panic);
@@ -1454,8 +1571,11 @@ mod tests {
                 compared += 1;
             }
         }
-        eprintln!("{settled} scopes settled over {compared} publications");
+        eprintln!(
+            "{settled} scopes settled over {compared} publications, {reached} reached by a transfer"
+        );
         assert!(settled > compared, "{settled} over {compared}");
+        assert!(reached > 0, "no transfer reached a settled scope");
     }
 
     /// Settles every seed as the daemon would, acknowledging it and listing
