@@ -17,7 +17,7 @@ use std::{
 #[cfg(test)]
 mod no_start_tests;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Device {
     pub name: String,
@@ -153,6 +153,10 @@ pub fn list() -> io::Result<Vec<Device>> {
     list_from_path(&configuration_path()?)
 }
 
+/// The reader refuses a larger registry, so the writer must never produce one.
+const MAX_DEVICES: usize = 64;
+const MAX_CONFIGURATION_BYTES: usize = 64 * 1024;
+
 fn list_from_path(path: &Path) -> io::Result<Vec<Device>> {
     use std::{io::Read, os::unix::fs::OpenOptionsExt};
     // A configuration source must be a regular file. Open nonblocking before
@@ -170,16 +174,17 @@ fn list_from_path(path: &Path) -> io::Result<Vec<Device>> {
                 ));
             }
             let mut bytes = Vec::new();
-            file.take(64 * 1024 + 1).read_to_end(&mut bytes)?;
+            file.take(MAX_CONFIGURATION_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)?;
             Ok(bytes)
         });
     match bytes {
         Ok(bytes) => {
-            if bytes.len() > 64 * 1024 {
+            if bytes.len() > MAX_CONFIGURATION_BYTES {
                 return Err(io::Error::other("devices.json exceeds 64 KiB"));
             }
             let config: Devices = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-            if config.devices.len() > 64 {
+            if config.devices.len() > MAX_DEVICES {
                 return Err(io::Error::other("configure at most 64 devices"));
             }
             for device in &config.devices {
@@ -1654,6 +1659,73 @@ mod tests {
             io::ErrorKind::InvalidData
         );
     }
+    fn profile(name: &str, host: &str, executable: &str) -> Device {
+        Device {
+            name: name.into(),
+            host: host.into(),
+            executable: executable.into(),
+        }
+    }
+
+    #[test]
+    fn device_save_never_writes_a_registry_its_reader_refuses() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("devices.json");
+        for index in 0..MAX_DEVICES {
+            save_to_path(&path, profile(&format!("d{index}"), "host", "cagents")).unwrap();
+        }
+        let error = save_to_path(&path, profile("extra", "host", "cagents")).unwrap_err();
+        assert!(error.to_string().contains("64 devices"), "{error}");
+        assert_eq!(list_from_path(&path).unwrap().len(), MAX_DEVICES);
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("devices.json");
+        save_to_path(&path, profile("kept", "host", "cagents")).unwrap();
+        let long = format!("/{}", "x".repeat(MAX_CONFIGURATION_BYTES));
+        let error = save_to_path(&path, profile("long", "host", &long)).unwrap_err();
+        assert!(error.to_string().contains("64 KiB"), "{error}");
+        assert_eq!(
+            list_from_path(&path).unwrap(),
+            [profile("kept", "host", "cagents")]
+        );
+    }
+
+    #[test]
+    fn device_save_refuses_to_repoint_a_name_and_accepts_the_same_profile() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("devices.json");
+        save_to_path(&path, profile("build", "fw16", "cagents")).unwrap();
+        save_to_path(&path, profile("build", "fw16", "cagents")).unwrap();
+        let error = save_to_path(&path, profile("build", "other", "cagents")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            list_from_path(&path).unwrap(),
+            [profile("build", "fw16", "cagents")]
+        );
+    }
+
+    #[test]
+    fn concurrent_device_saves_keep_every_profile() {
+        const WINDOWS: usize = 16;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("devices.json");
+        let start = Arc::new(std::sync::Barrier::new(WINDOWS));
+        let saves = (0..WINDOWS)
+            .map(|index| {
+                let path = path.clone();
+                let start = start.clone();
+                thread::spawn(move || {
+                    start.wait();
+                    save_to_path(&path, profile(&format!("w{index}"), "host", "cagents"))
+                })
+            })
+            .collect::<Vec<_>>();
+        for save in saves {
+            save.join().unwrap().unwrap();
+        }
+        assert_eq!(list_from_path(&path).unwrap().len(), WINDOWS);
+    }
+
     #[test]
     fn bridge_runtime_fallback_requires_owned_private_real_directory() {
         use std::os::unix::fs::symlink;
@@ -2032,21 +2104,50 @@ pub fn environment(
     }
 }
 
-/// Save one local connection profile. Provider credentials remain exclusively
+/// Add one local connection profile. Provider credentials remain exclusively
 /// with their daemon host; this file contains only SSH routing information.
+/// Saving an identical profile again changes nothing; a name already used by
+/// another connection is refused rather than repointed.
 pub fn save(device: Device) -> io::Result<()> {
+    save_to_path(&configuration_path()?, device)
+}
+
+fn save_to_path(path: &Path, device: Device) -> io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     validate(&device)?;
-    let mut devices = list()?;
-    devices.retain(|existing| existing.name != device.name);
-    devices.push(device);
-    devices.sort_by(|a, b| a.name.cmp(&b.name));
-    let path = configuration_path()?;
     let directory = path
         .parent()
         .ok_or_else(|| io::Error::other("configuration has no parent directory"))?;
     crate::secure_file::prepare_private_directory(directory)?;
+    // Another window may be saving too: read, check and replace the registry
+    // as one step so neither save drops the other's profile.
+    let _lock = crate::instance::owned_lock(&directory.join("devices.json.lock"), libc::LOCK_EX)?;
+    let mut devices = list_from_path(path)?;
+    if let Some(existing) = devices.iter().find(|existing| existing.name == device.name) {
+        return if *existing == device {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "That device name belongs to another connection. Use a new name.",
+            ))
+        };
+    }
+    devices.push(device);
+    devices.sort_by(|a, b| a.name.cmp(&b.name));
+    if devices.len() > MAX_DEVICES {
+        return Err(io::Error::other(
+            "cagents keeps at most 64 devices; remove one from devices.json before adding another.",
+        ));
+    }
+    let mut bytes = serde_json::to_vec_pretty(&Devices { devices }).map_err(io::Error::other)?;
+    bytes.push(b'\n');
+    if bytes.len() > MAX_CONFIGURATION_BYTES {
+        return Err(io::Error::other(
+            "Saving this device would make devices.json larger than 64 KiB. Use a shorter SSH host or executable path.",
+        ));
+    }
     let temporary = directory.join(format!(".devices-{}.json", uuid::Uuid::new_v4().simple()));
     let result = (|| {
         let mut file = fs::OpenOptions::new()
@@ -2054,12 +2155,9 @@ pub fn save(device: Device) -> io::Result<()> {
             .create_new(true)
             .mode(0o600)
             .open(&temporary)?;
-        file.write_all(
-            &serde_json::to_vec_pretty(&Devices { devices }).map_err(io::Error::other)?,
-        )?;
-        file.write_all(b"\n")?;
+        file.write_all(&bytes)?;
         file.sync_all()?;
-        fs::rename(&temporary, &path)?;
+        fs::rename(&temporary, path)?;
         fs::File::open(directory)?.sync_all()
     })();
     if result.is_err() {

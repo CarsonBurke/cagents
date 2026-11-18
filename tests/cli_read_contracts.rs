@@ -375,6 +375,43 @@ fn remote_stop_is_idempotent_and_no_start_reads_report_remote_absence() {
 }
 
 #[test]
+fn remote_status_reports_a_stopped_daemon_without_starting_it() {
+    if !user_fixture::enter() {
+        return;
+    }
+    let fixture = Fixture::new();
+    configure_remote_fixture(&fixture, false);
+    let path = format!(
+        "{}:/usr/bin:/bin",
+        fixture.root.path().join("bin").display()
+    );
+    for policy in ["none", "flag"] {
+        let mut command = fixture.command(&["--device", "fixture", "daemon", "status"]);
+        if policy == "flag" {
+            command = command.arg("--no-start");
+        }
+        let output = fixture.run(command.env("PATH", &path));
+        assert!(output.success, "{policy}: {output:?}");
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["command"], "daemon.status", "{value}");
+        assert_eq!(value["data"]["device"], "fixture", "{value}");
+        assert_eq!(value["data"]["running"], false, "{value}");
+        assert_eq!(value["data"]["daemon_present"], false, "{value}");
+        assert!(
+            !fixture.root.path().join("spawned").exists(),
+            "{policy}: status started the remote daemon"
+        );
+    }
+    let calls = fs::read_to_string(fixture.root.path().join("ssh-calls")).unwrap();
+    assert!(
+        calls
+            .lines()
+            .all(|line| line.contains(" --no-start daemon bridge")),
+        "{calls}"
+    );
+}
+
+#[test]
 fn a_genuine_ssh_failure_is_not_an_already_stopped_remote_daemon() {
     if !user_fixture::enter() {
         return;
