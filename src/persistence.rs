@@ -4819,6 +4819,17 @@ fn save_card(
             content_hash: write.content_hash,
         });
     }
+    if stored.is_some_and(|stored| stored.unreadable) {
+        // The record restore could not decode is about to be replaced, which
+        // the restore warning promised to keep until now; say so for every
+        // kind of card, whether or not any check was skipped on the way.
+        tracing::warn!(
+            card = %card.id,
+            kind = kind.as_str(),
+            stored_generation = expected,
+            "replacing a card record that could not be restored with the copy offered for it"
+        );
+    }
 
     let card_generation = next_generation(expected, "card", card.id)?;
     transaction.prepare_cached(UPSERT_CARD)?.execute(params![
@@ -13952,7 +13963,12 @@ mod tests {
             .unwrap();
         assert_eq!(restored.warnings.len(), 1, "{:?}", restored.warnings);
         assert!(!restored.state.cards.iter().any(|card| card.id == broken.id));
-        let stored_generation = stored_card_row(&store, broken.id).0;
+        let stored_generation = restored.unrestored[&broken.id];
+        assert_eq!(
+            i64::try_from(stored_generation).unwrap(),
+            stored_card_row(&store, broken.id).0,
+            "the restore reports the generation the unreadable row carries"
+        );
         let mut lane = SaveLane {
             workspace: restored.state.generation,
             cards: restored
@@ -13960,7 +13976,7 @@ mod tests {
                 .cards
                 .iter()
                 .map(|card| (card.id, card.generation))
-                .chain([(broken.id, u64::try_from(stored_generation).unwrap())])
+                .chain(restored.unrestored.clone())
                 .collect(),
         };
         lane.save(&store, &restored.state).unwrap();
@@ -13987,7 +14003,7 @@ mod tests {
             .expect("the projected copy replaces the unreadable row");
         assert!(replaced.refused.is_empty(), "{:?}", replaced.refused);
         assert!(
-            replaced.card_generations[&broken.id] > u64::try_from(stored_generation).unwrap(),
+            replaced.card_generations[&broken.id] > stored_generation,
             "the copy is written even though its fingerprint matches the row"
         );
         // Nothing is refused or rewritten after that.
