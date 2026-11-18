@@ -422,16 +422,19 @@ fn a_genuine_ssh_failure_is_not_an_already_stopped_remote_daemon() {
         "{}:/usr/bin:/bin",
         fixture.root.path().join("bin").display()
     );
-    let output = fixture.run(
-        fixture
-            .command(&["--device", "fixture", "daemon", "stop"])
-            .env("PATH", path),
-    );
-    assert_eq!(output.exit_code, Some(1), "{output:?}");
-    assert!(output.stdout.is_empty());
-    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
-    assert_eq!(error["error"]["kind"], "device");
-    assert!(!fixture.root.path().join("spawned").exists());
+    // Neither stop nor status may read a broken connection as a stopped daemon.
+    for command in ["stop", "status"] {
+        let output = fixture.run(
+            fixture
+                .command(&["--device", "fixture", "daemon", command])
+                .env("PATH", &path),
+        );
+        assert_eq!(output.exit_code, Some(1), "{command}: {output:?}");
+        assert!(output.stdout.is_empty(), "{command}: {output:?}");
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["error"]["kind"], "device", "{command}: {error}");
+        assert!(!fixture.root.path().join("spawned").exists());
+    }
 }
 
 #[test]
