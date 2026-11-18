@@ -194,6 +194,7 @@ fn model_access(edit: &ModelEdit) -> Access<'static> {
         // Only a channel whose view holds no pane.
         | ModelEdit::RetireEmptyChannel { .. } => Access::Open,
         ModelEdit::CloseProject { .. }
+        | ModelEdit::CloseConfirmedProject { .. }
         | ModelEdit::DeleteChannel { .. }
         | ModelEdit::AgentsChanged => Access::Held,
     }
