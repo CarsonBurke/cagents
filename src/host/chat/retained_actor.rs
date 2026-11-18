@@ -420,9 +420,10 @@ fn require_execution_owner(
 /// A run transition requires the conversation the helper has confirmed to be
 /// durable in the actor census first: `persist_confirmed_identity` publishes
 /// it, and this refuses a transition that would outrun it. The helper confirms
-/// before it publishes the outcomes that follow, and every outcome read
-/// refreshes that identity after reading its page, so a terminal outcome is
-/// never acknowledged while its conversation is absent from the census.
+/// before it journals the outcomes that follow, and every outcome read
+/// refreshes that identity after reading its page, so no run settles while the
+/// helper's current conversation is absent from the census. Close-only cleanup
+/// attachments publish no identity and require none.
 fn require_published_identity(
     registry: &super::super::model::Registry,
     actor: uuid::Uuid,
@@ -474,11 +475,12 @@ impl SemanticTarget {
         confirmed_projection(&self.handle, &self.source)
     }
 
-    /// The conversation `require_published_identity` requires before a run
-    /// transition: the one `persist_confirmed_identity` publishes. A
-    /// close-only cleanup attachment publishes none.
-    fn required_identity(&self) -> Option<String> {
-        if self.handle.is_close_only() {
+    /// The conversation `require_published_identity` requires before an
+    /// `execution` transition: the one `persist_confirmed_identity` publishes.
+    /// A close-only cleanup attachment publishes none. Read it before taking
+    /// the Registry lock.
+    fn required_identity(&self, execution: bool) -> Option<String> {
+        if !execution || self.handle.is_close_only() {
             return None;
         }
         self.handle.confirmed_session_id()
@@ -745,7 +747,7 @@ fn drain(host: &SharedHost, id: TerminalId) -> Result<bool, String> {
             &mut execution_owner,
         )?;
         let confirmed = target.confirmed_projection();
-        let required = execution.then(|| target.required_identity()).flatten();
+        let required = target.required_identity(execution);
         let changed = {
             let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
             require_execution_owner(&registry, owner, execution, confirmed.as_ref())?;
@@ -892,7 +894,7 @@ fn commit_semantic_entry(
     )?;
     let authenticated = execution || execution_owner.is_some();
     let confirmed = target.confirmed_projection();
-    let required = execution.then(|| target.required_identity()).flatten();
+    let required = target.required_identity(execution);
     let (changed, automation) = {
         let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
         require_execution_owner(
@@ -3034,11 +3036,26 @@ pub(in crate::host) fn reconcile_startup_losses(host: &SharedHost) -> Result<(),
             .collect::<Vec<_>>()
     };
     let registry = super::super::agent_execution::registry(host)?;
+    let notifications = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .notifications
+        .clone();
     for (handle, source, identity) in actors {
         let mut execution_owner = None;
         handle.refresh_retained_state()?;
         if let Some(loss) = handle.continuity_loss() {
             let execution = !loss.affected_runs.is_empty();
+            let target = SemanticTarget {
+                handle: handle.clone(),
+                source: source.clone(),
+                identity: identity.clone(),
+                notifications: notifications.clone(),
+            };
+            if execution {
+                // The loss settles runs; their conversation must be durable.
+                persist_confirmed_identity(host, &target, &registry)?;
+            }
             let owner = capture_execution_owner(
                 &registry,
                 &handle,
@@ -3048,9 +3065,11 @@ pub(in crate::host) fn reconcile_startup_losses(host: &SharedHost) -> Result<(),
                 &mut execution_owner,
             )?;
             let confirmed = confirmed_projection(&handle, &source);
+            let required = target.required_identity(execution);
             let changed = {
                 let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
                 require_execution_owner(&registry, owner, execution, confirmed.as_ref())?;
+                require_published_identity(&registry, identity.instance, required.as_deref())?;
                 registry.commit_native_actor_loss(
                     identity.instance,
                     &identity.record,
@@ -3508,7 +3527,7 @@ pub(in crate::host) fn finish_close(
             &mut execution_owner,
         )?;
         let confirmed = target.confirmed_projection();
-        let required = execution.then(|| target.required_identity()).flatten();
+        let required = target.required_identity(execution);
         let changed = {
             let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
             require_execution_owner(&registry, owner, execution, confirmed.as_ref())?;
@@ -3571,7 +3590,7 @@ pub(in crate::host) fn finish_close(
                 &mut execution_owner,
             )?;
             let confirmed = target.confirmed_projection();
-            let required = execution.then(|| target.required_identity()).flatten();
+            let required = target.required_identity(execution);
             let (changed, automation) = {
                 let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
                 require_execution_owner(&registry, owner, execution, confirmed.as_ref())?;

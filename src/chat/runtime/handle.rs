@@ -201,16 +201,10 @@ impl Handle {
             remote.wake_outcomes();
         }
     }
-    /// The helper's unacknowledged outcome page, then its resident state.
-    /// The helper confirms a conversation before publishing the outcomes that
-    /// follow it, so the refreshed identity is at least as new as the page.
+    /// See [`RemoteActor::uncommitted_outcomes`].
     pub(crate) fn uncommitted_outcomes(&self) -> Result<Vec<OutboxEntry>, String> {
         match &self.0 {
-            Owner::Remote(remote) => {
-                let page = remote.call("outbox_unacked", serde_json::Value::Null)?;
-                remote.refresh_state()?;
-                Ok(page)
-            }
+            Owner::Remote(remote) => remote.uncommitted_outcomes(),
             _ => Err("This actor has no retained outcome outbox".into()),
         }
     }
@@ -223,18 +217,13 @@ impl Handle {
         };
         remote.outcome_clock_until(deadline)
     }
-    /// [`Self::uncommitted_outcomes`], bounded by `deadline`.
+    /// See [`RemoteActor::uncommitted_outcomes_until`].
     pub(crate) fn uncommitted_outcomes_until(
         &self,
         deadline: std::time::Instant,
     ) -> Result<Vec<OutboxEntry>, String> {
         match &self.0 {
-            Owner::Remote(remote) => {
-                let page =
-                    remote.call_until("outbox_unacked", serde_json::Value::Null, deadline)?;
-                remote.refresh_state_until(deadline)?;
-                Ok(page)
-            }
+            Owner::Remote(remote) => remote.uncommitted_outcomes_until(deadline),
             _ => Err("This actor has no retained outcome outbox".into()),
         }
     }
