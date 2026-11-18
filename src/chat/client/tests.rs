@@ -289,6 +289,140 @@ fn a_switch_whose_handshake_timed_out_is_unanswered_not_busy() {
     );
 }
 
+/// A refusal the daemon marks as coming before any effect is typed as
+/// such whatever its sentence or retryability, and keeps the sentence.
+/// The daemon's busy refusal stays busy.
+#[test]
+fn a_refusal_before_any_effect_is_typed_not_admitted_with_its_reason() {
+    use super::super::Recovery;
+    use ipc::ProtocolErrorCode;
+
+    for retryable in [false, true] {
+        let failure = start_failure(ipc::ProtocolError::new(
+            ProtocolErrorCode::NotAdmitted,
+            "This conversation has an explicitly pinned account",
+            retryable,
+        ));
+        assert_eq!(failure.recovery, Recovery::NotAdmitted, "{retryable}");
+        assert_eq!(
+            failure.message,
+            "This conversation has an explicitly pinned account"
+        );
+    }
+    assert!(!Recovery::NotAdmitted.is_blocked());
+    // The same sentence under the code an older daemon sent proves
+    // nothing about what changed.
+    assert_eq!(
+        start_failure(ipc::ProtocolError::new(
+            ProtocolErrorCode::InvalidRequest,
+            "This conversation has an explicitly pinned account",
+            false,
+        ))
+        .recovery,
+        Recovery::Blocked
+    );
+    assert_eq!(
+        start_failure(ipc::ProtocolError::new(
+            ProtocolErrorCode::NotAdmitted,
+            ipc::DAEMON_BUSY,
+            true,
+        ))
+        .recovery,
+        Recovery::Busy
+    );
+}
+
+/// A switch's connection that fails before its request is written asked
+/// the daemon nothing, so no outcome of it reads as a removed account or
+/// a plain retry: a timed out handshake is unanswered, a dropped or
+/// mismatched one unreached, a busy refusal busy, and any other refusal
+/// of the handshake keeps its reason.
+#[test]
+fn a_switch_that_failed_before_its_request_asked_nothing() {
+    use super::super::Recovery;
+    use ipc::{ProtocolError, ProtocolErrorCode};
+
+    let unanswered = switch_unasked(HandshakeError::Unanswered(
+        "the daemon did not answer within 70 s".into(),
+    ));
+    assert_eq!(unanswered.recovery, Recovery::Unresponsive);
+    assert_eq!(unanswered.message, "the daemon did not answer within 70 s");
+    for unreached in [
+        HandshakeError::Transport("Daemon disconnected".into()),
+        HandshakeError::Transport(
+            "Daemon version mismatch; use matched cagents executables".into(),
+        ),
+        HandshakeError::ProofChanged(None),
+        HandshakeError::Protocol(ProtocolError::new(
+            ProtocolErrorCode::UnsupportedVersion,
+            "unsupported protocol",
+            false,
+        )),
+    ] {
+        assert_eq!(switch_unasked(unreached).recovery, Recovery::Unreached);
+    }
+    assert_eq!(
+        switch_unasked(HandshakeError::Protocol(ProtocolError::new(
+            ProtocolErrorCode::Internal,
+            ipc::DAEMON_BUSY,
+            true,
+        )))
+        .recovery,
+        Recovery::Busy
+    );
+    for code in [
+        ProtocolErrorCode::InvalidRequest,
+        ProtocolErrorCode::TerminalUnavailable,
+        // The handshake names no account, so this is not the source's.
+        ProtocolErrorCode::AccountRemoved,
+    ] {
+        let refused = switch_unasked(HandshakeError::Protocol(ProtocolError::new(
+            code,
+            "the daemon's exact reason",
+            true,
+        )));
+        assert_eq!(refused.recovery, Recovery::NotAdmitted, "{code:?}");
+        assert_eq!(refused.message, "the daemon's exact reason");
+    }
+    // Any other start keeps the existing classification of the same
+    // failures.
+    assert_eq!(
+        connect_failure(
+            HandshakeError::Unanswered("the daemon did not answer within 70 s".into()),
+            false
+        )
+        .recovery,
+        Recovery::Retry
+    );
+    assert_eq!(
+        connect_failure(HandshakeError::ProofChanged(None), true).recovery,
+        Recovery::Blocked
+    );
+}
+
+/// A switch's handshake that the daemon leaves unanswered past its read
+/// timeout is unresponsive, and one whose connection closes first is
+/// unreached.
+#[test]
+fn a_switch_handshake_that_times_out_or_closes_is_typed_by_how_it_ended() {
+    use super::super::Recovery;
+
+    for (closes, expected) in [(false, Recovery::Unresponsive), (true, Recovery::Unreached)] {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        if closes {
+            drop(server);
+        }
+        let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+        let failure = receive_handshake(&mut client, &mut codec, 1, None)
+            .map_err(switch_unasked)
+            .unwrap_err();
+        assert_eq!(failure.recovery, expected, "{failure:?}");
+    }
+}
+
 #[test]
 fn only_the_daemons_whole_unproven_owner_refusal_waits_for_a_restart() {
     use super::super::{Recovery, UNPROVEN_OWNER_REFUSAL};

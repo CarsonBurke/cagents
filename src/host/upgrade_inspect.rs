@@ -1961,6 +1961,7 @@ mod tests {
                 177,
                 178,
                 179,
+                187,
                 crate::terminal_ipc::PROTOCOL_VERSION
             ]
         );

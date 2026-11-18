@@ -373,6 +373,12 @@ free the daemon. Release builds and any other home ignore it.
 prepares both accounts and plays the refused switch, sending again once the
 daemon is free; see the script for its seed and the exit variant.
 
+A switch the daemon refuses for a reason of its own needs no hold. Its
+`diverged` variant writes a different copy of each rollout under the second
+account's `sessions/`, as a conversation already continued on that account
+would leave, so the daemon refuses to overwrite it before closing anything.
+The scene then removes the copies and sends again.
+
 ## Usage reset evidence
 
 `tests/fixtures/usage-reset-scene.sh` prepares invented Claude and Codex

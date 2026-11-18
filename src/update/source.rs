@@ -728,6 +728,10 @@ pub(crate) const RELEASED_SOURCES: &[ReleasedSource] = &[
         protocol: 179,
         release: "0.1.3+local.43f253ef8",
     },
+    ReleasedSource {
+        protocol: 187,
+        release: "0.1.3+local.ccd4134c6",
+    },
 ];
 
 /// Protocols main served since the oldest pinned source that live updates
@@ -1434,6 +1438,7 @@ mod admission_message_tests {
                 177,
                 178,
                 179,
+                187,
                 crate::terminal_ipc::PROTOCOL_VERSION
             ]
         );
@@ -1452,7 +1457,7 @@ mod admission_message_tests {
                 "live updates support only protocol 156 (desktop 0.1.3+local.991daa43e), \
                  protocol 173 (0.1.3+local.43678f2fb), protocol 175 (0.1.3+local.c73002744), \
                  protocol 177 (0.1.3+local.374370965), protocol 178 (0.1.3+local.3b1e81a4d), \
-                 protocol 179 (0.1.3+local.43f253ef8) \
+                 protocol 179 (0.1.3+local.43f253ef8), protocol 187 (0.1.3+local.ccd4134c6) \
                  and protocol {}.",
                 crate::terminal_ipc::PROTOCOL_VERSION
             )));
