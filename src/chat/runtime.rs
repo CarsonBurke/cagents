@@ -60,6 +60,42 @@ const PRESENT_INTERVAL: Duration = Duration::from_millis(50);
 const FRAMES_PER_POLL: usize = 256;
 /// Queued stdin bytes above which new commands wait for the provider to read.
 const QUEUE_BACKPRESSURE: usize = QUEUE_LIMIT / 2;
+
+/// History readers to hold before their first frame, by working directory.
+/// Start returns once the worker is running, before it applies that frame, so
+/// a caller can observe a reader with nothing applied yet. Holding one makes
+/// that interleaving certain rather than occasional.
+#[cfg(test)]
+static HELD_HISTORY_READERS: Mutex<Vec<(std::path::PathBuf, std::sync::mpsc::Receiver<()>)>> =
+    Mutex::new(Vec::new());
+
+/// Hold the next history reader started in `directory` before it applies its
+/// initial frame, until the returned sender sends or is dropped.
+#[cfg(test)]
+pub(crate) fn hold_history_reader(directory: &std::path::Path) -> std::sync::mpsc::Sender<()> {
+    let (release, held) = std::sync::mpsc::channel();
+    HELD_HISTORY_READERS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push((directory.to_owned(), held));
+    release
+}
+
+#[cfg(test)]
+fn await_history_release(directory: &std::path::Path) {
+    let held = {
+        let mut held = HELD_HISTORY_READERS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        held.iter()
+            .position(|(held, _)| held == directory)
+            .map(|index| held.remove(index).1)
+    };
+    if let Some(held) = held {
+        let _ = held.recv();
+    }
+}
+
 enum ActorCommand {
     RetainedProvider {
         run: Option<crate::model::RunId>,
@@ -647,7 +683,11 @@ impl LocalHandle {
                         let _ = started.send(child.as_ref().map(|_| ()).map_err(Clone::clone));
                         actor.child = child?;
                         match spec.transport {
-                            TransportSpec::History => actor.run_history(initial),
+                            TransportSpec::History => {
+                                #[cfg(test)]
+                                await_history_release(&spec.working_directory);
+                                actor.run_history(initial)
+                            }
                             TransportSpec::JsonLines => actor.run(initial),
                             TransportSpec::UnixWebSocket {
                                 socket,

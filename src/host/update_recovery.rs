@@ -1087,6 +1087,10 @@ mod tests {
         assert!(host.lock().unwrap().chats.is_empty());
         assert!(!sentinel.exists());
 
+        // Restore returns once the paused page's reader is running, before it
+        // applies its saved frame. Hold the reader there so this test always
+        // observes that interleaving rather than only on a busy host (#2964).
+        let release_reader = crate::chat::runtime::hold_history_reader(&root.join("project"));
         let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
         let server_host = host.clone();
         let server =
@@ -1099,8 +1103,19 @@ mod tests {
         );
         assert_eq!(client.session().proof, Some(proof("cold-start")));
         let handle = host.lock().unwrap().chats[&source.id].handle.clone();
-        let page = handle.snapshot(None).unwrap();
-        assert!(page.exited && page.read_only_reason.is_some());
+        let unapplied = handle.snapshot(None).unwrap();
+        assert!(
+            !unapplied.exited && unapplied.read_only_reason.is_none(),
+            "the held reader applied its saved frame before release"
+        );
+        drop(release_reader);
+        // The frame ends with the reader's exit; wait for that, then check
+        // everything the frame carries.
+        let page = crate::test_timing::wait_for(
+            "the paused page's reader to apply its saved frame",
+            || handle.snapshot(None).filter(|page| page.exited),
+        );
+        assert!(page.read_only_reason.is_some(), "{:?}", page.error);
         assert!(page.items.iter().any(|item| matches!(&item.content, chat::ItemContent::Text { text, .. } if text == "The captured page survived")));
         assert!(handle.is_read_only_history() && !handle.owns_work());
         assert!(!sentinel.exists());
