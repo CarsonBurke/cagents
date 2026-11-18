@@ -12,7 +12,7 @@ fn context(body: &str) -> chat::Item {
             kind: chat::DeliveryKind::Notice,
             from: String::new(),
             sender: String::new(),
-            summary: "Claude context".into(),
+            summary: "Added to Claude's context".into(),
             body: body.into(),
         },
         started_at: None,
@@ -25,7 +25,7 @@ fn rendered(runtime: &mut Runtime, width: f32, expanded: bool) {
     let item = runtime.active_item("provider-context").unwrap();
     let cached = &runtime.presentation_cache()[&item.id];
     assert_eq!(turn::slot_of(item), turn::Slot::Commentary);
-    assert_eq!(cached.preview.text, "Claude context");
+    assert_eq!(cached.preview.text, "Added to Claude's context");
     assert!(cached.preview.tail.is_empty());
     let mut element = runtime.step_view(
         item,
@@ -53,7 +53,7 @@ fn rendered(runtime: &mut Runtime, width: f32, expanded: bool) {
             .chain(accessible.children())
             .any(
                 |node| node.node().role() == iced_accessibility::accesskit::Role::Button
-                    && node.node().label() == Some("Claude context")
+                    && node.node().label() == Some("Added to Claude's context")
             )
     );
     #[derive(Default)]
