@@ -26,8 +26,10 @@
 #
 #   wide    rhythm-working (the turn mid-way, its rows live) and
 #           rhythm-finished (the same turn answered)
-#   narrow  rhythm-narrow-working and rhythm-narrow-finished: the same, in
-#           one of three panes, in a window started 920 pixels wide
+#   narrow  rhythm-narrow-working and rhythm-narrow-finished: the same, at
+#           two thirds of the strip beside a draft, in a window started 920
+#           pixels wide; then rhythm-narrow-pane-finished, the conversation
+#           at a third of it, about 220 pixels
 #   theme   KEY: writes the theme into the task's seed, which every later
 #           session starts from
 set -euo pipefail
@@ -117,9 +119,11 @@ start_turn() {
     open_channel
 }
 
-# Two drafts beside the conversation, and each of the three panes cycled
-# from the whole strip to a third of it. In a window 920 pixels wide that
-# leaves the conversation 220.
+# Two drafts beside the conversation, each cycled to a third of the strip.
+# A preset is judged by the width it draws, so after one press each the
+# conversation sits at two thirds, beside one draft: the split pane. Two
+# more presses take it through the whole strip to a third, which in a
+# window 920 pixels wide leaves it about 220.
 split_three() {
     evidence drive key ctrl+t >/dev/null
     sleep 2
@@ -133,6 +137,15 @@ split_three() {
     done
     evidence drive click 330,22 >/dev/null
     sleep 1
+}
+
+narrowest() {
+    evidence drive click 330,22 >/dev/null
+    sleep 1
+    for _ in 1 2; do
+        evidence drive key alt+r >/dev/null
+        sleep 1
+    done
 }
 
 # Shoots the turn while it works, once its last commands are recorded, and
@@ -157,6 +170,10 @@ narrow)
     start_turn
     split_three
     working_and_finished narrow-
+    narrowest
+    sleep 1
+    scroll_top
+    shot "rhythm-${label}narrow-pane-finished"
     ;;
 *) exit 2 ;;
 esac
