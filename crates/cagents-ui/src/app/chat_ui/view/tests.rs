@@ -11557,22 +11557,35 @@ fn a_group_of_one_step_draws_the_step_alone() {
 }
 
 /// A lone step the reader opened stays open when a second step joins it:
-/// the strip the two now share opens by default, unless the reader closed
-/// it. A lone step's own text is always selectable, as its row is drawn.
+/// the strip the two now share opens, and closing the first step later
+/// folds only that step. A lone step's own text is always selectable, as
+/// its row is drawn.
 #[test]
 fn a_group_opens_over_the_step_the_reader_opened_before_it_grew() {
     let first = bash("toolu_first", "", "cargo check --workspace", "");
-    let (runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&first));
+    let (mut runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&first));
+    let key = runtime.turns[0].key.clone();
     assert!(runtime.steps_shown(&runtime.turns[0]));
+    assert!(!runtime.group_open(&runtime.turns[0]));
+    runtime.expanded.insert("toolu_first".into());
+    runtime.follow_lone_step("toolu_first", true);
+    assert_eq!(runtime.opened.get(&key), Some(&true));
+    // The group grows; its key is its first step's.
     let mut second = bash("toolu_second", "", "cargo test -q", "");
     second.started_at = Some(5_000);
     second.at = Some(6_000);
     let (mut grown, _handle) = frame_cost::live_runtime(&[first, second]);
     let turn = grown.turns[0].clone();
-    assert!(!grown.group_open(&turn));
+    assert_eq!(turn.key, key);
+    grown.opened = runtime.opened.clone();
     grown.expanded.insert("toolu_first".into());
     assert!(grown.group_open(&turn));
+    // A step inside a strip of several leaves the strip alone.
+    grown.expanded.remove("toolu_first");
+    grown.follow_lone_step("toolu_first", false);
     assert!(grown.steps_shown(&turn));
-    grown.opened.insert(turn.key.clone(), false);
-    assert!(!grown.steps_shown(&turn));
+    // Closing a lone step returns its group to the setting.
+    runtime.expanded.remove("toolu_first");
+    runtime.follow_lone_step("toolu_first", false);
+    assert_eq!(runtime.opened.get(&key), None);
 }

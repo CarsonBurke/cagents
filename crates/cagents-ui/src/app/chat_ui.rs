@@ -14177,8 +14177,12 @@ impl Cagents {
                         runtime.find_disclosure.manual_item(&id);
                         &mut runtime.expanded
                     };
-                    if !expanded.remove(&id) {
+                    let open = !expanded.remove(&id);
+                    if open {
                         expanded.insert(id.clone());
+                    }
+                    if runtime.selected_subagent.is_none() {
+                        runtime.follow_lone_step(&id, open);
                     }
                     if runtime.active_item(&id).is_some_and(|item| {
                         matches!(

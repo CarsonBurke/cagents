@@ -288,20 +288,38 @@ impl Runtime {
         }
     }
 
-    /// Whether a group's strip is open. The reader's choice comes first.
-    /// Without one, it follows the setting, and is open where the reader
-    /// already opened one of its steps: a lone step is drawn as its own row,
-    /// and a second step arriving must not fold away the first one the
-    /// reader was reading.
+    /// Whether a group's strip is open: the reader's choice, or else the
+    /// setting.
     pub(super) fn group_open(&self, turn: &turn::Turn) -> bool {
-        self.opened.get(&turn.key).copied().unwrap_or_else(|| {
-            self.tool_groups_expanded
-                || turn.steps.iter().any(|placed| {
-                    self.step_items()
-                        .get(placed.index)
-                        .is_some_and(|item| self.item_expanded(&item.id))
-                })
-        })
+        self.opened
+            .get(&turn.key)
+            .copied()
+            .unwrap_or(self.tool_groups_expanded)
+    }
+
+    /// Carries the reader opening or closing a group's only step, drawn as
+    /// its own row, to the group: when a second step joins it, the strip the
+    /// two share opens over the step the reader was reading, and closing
+    /// that step later folds only the step.
+    pub(super) fn follow_lone_step(&mut self, id: &str, open: bool) {
+        let items = &self.snapshot.items;
+        let Some(key) = self
+            .turns
+            .iter()
+            .find(|turn| match turn.steps.as_slice() {
+                [only] => items.get(only.index).is_some_and(|item| item.id == id),
+                _ => false,
+            })
+            .map(|turn| turn.key.clone())
+        else {
+            return;
+        };
+        self.find_disclosure.manual_turn(&key);
+        if open {
+            self.opened.insert(key, true);
+        } else {
+            self.opened.remove(&key);
+        }
     }
 
     /// Whether a group's steps are on screen: a lone step always is, as its

@@ -410,6 +410,11 @@ fn cli(line: &str, output: &str) -> Option<Coordination> {
             .iter()
             .take_while(|after| after.stdin == shell::Stdin::Pipe)
             .count();
+    // What is piped in reaches the CLI only as a message or a prompt read
+    // from `-`; piped into anything else, it is a command of its own.
+    if feeds && !reads_stdin(argv) {
+        return None;
+    }
     let incidental = commands.iter().enumerate().all(|(at, other)| match at {
         at if at == index => true,
         at if at < first => sets_up(other),
@@ -444,6 +449,17 @@ fn cli(line: &str, output: &str) -> Option<Coordination> {
     })
 }
 
+/// Whether the invocation `argv` reads standard input, as a message or a
+/// prompt given as `-`.
+fn reads_stdin(argv: &[String]) -> bool {
+    let probe = Text::Inline("\0standard input".into());
+    match crate::control::invocation::coordination(argv, probe.clone()) {
+        Some(Kind::Message(message)) => message.body == probe,
+        Some(Kind::Spawn(spawn)) => spawn.agents.iter().any(|agent| agent.prompt == probe),
+        _ => false,
+    }
+}
+
 /// The program `simple` runs, by its name rather than its path.
 fn program(simple: &shell::Simple) -> &str {
     simple
@@ -467,48 +483,161 @@ fn sets_up(simple: &shell::Simple) -> bool {
 /// trims, filters or formats what it printed. One that names a file to read
 /// as well, as `head -50 build.log` does, reads something else.
 fn trims(simple: &shell::Simple) -> bool {
-    // The program's operands besides its input files: a pattern, a script or
-    // a filter. `tee` writes its files, so they are not input.
-    let (programs, valued): (usize, &[&str]) = match program(simple) {
-        "tee" => return true,
-        "head" | "tail" => (0, &["-n", "-c"]),
-        "sort" => (0, &["-k", "-t", "-o"]),
-        "wc" | "cat" | "nl" | "less" | "more" => (0, &[]),
-        "uniq" | "fold" => (0, &["-w"]),
-        "column" => (0, &["-s", "-c"]),
-        "cut" => (0, &["-d", "-f", "-c", "-b"]),
-        "tr" => (2, &[]),
-        "grep" | "egrep" | "fgrep" | "rg" => (1, &["-m", "-A", "-B", "-C", "-e", "-f"]),
-        "sed" => (1, &["-e", "-f"]),
-        "awk" => (1, &["-F", "-v", "-f"]),
-        "jq" => (1, &["--arg", "--argjson", "--indent"]),
-        _ => return false,
+    let Some(filter) = Filter::of(program(simple)) else {
+        return false;
     };
+    // `tee` writes its files, so they are no input.
+    if filter.program == usize::MAX {
+        return true;
+    }
+    let mut programs = filter.program;
     let mut operands = 0;
-    // A pattern or script given by option leaves no operand for one.
-    let mut programs = programs;
     let mut words = simple.argv[1..].iter();
     while let Some(word) = words.next() {
         if word == "--" {
             operands += words.len();
             break;
         }
-        if word.starts_with('-') && word.len() > 1 {
-            if valued.contains(&word.as_str()) {
-                if matches!(word.as_str(), "-e" | "-f") {
+        if let Some(long) = word.strip_prefix("--") {
+            let (name, attached) = match long.split_once('=') {
+                Some((name, _)) => (name, true),
+                None => (long, false),
+            };
+            if filter.supplies_program.contains(&name) {
+                programs = 0;
+            }
+            let values = filter
+                .long
+                .iter()
+                .find(|(option, _)| *option == name)
+                .map_or(0, |(_, values)| *values);
+            for _ in 0..values.saturating_sub(usize::from(attached)) {
+                words.next();
+            }
+            continue;
+        }
+        if let Some(cluster) = word.strip_prefix('-').filter(|cluster| !cluster.is_empty()) {
+            // `-ne PATTERN`, `-n5`, `-eerror`: a short option taking a value
+            // takes the rest of its word, or the next word.
+            for (at, option) in cluster.char_indices() {
+                if !filter.short.contains(option) {
+                    continue;
+                }
+                if filter.supplies_program.contains(&&cluster[at..at + 1]) {
                     programs = 0;
                 }
-                words.next();
-                // `--arg NAME VALUE` takes two.
-                if matches!(word.as_str(), "--arg" | "--argjson") {
+                if at + option.len_utf8() == cluster.len() {
                     words.next();
                 }
+                break;
             }
             continue;
         }
         operands += 1;
     }
     operands <= programs
+}
+
+/// How a program that filters its input reads its command line.
+struct Filter {
+    /// How many operands are its program (a pattern, a script, a filter)
+    /// rather than files to read; `usize::MAX` for one whose operands are
+    /// files it writes.
+    program: usize,
+    /// Short options that take a value.
+    short: &'static str,
+    /// Long options that take values, and how many.
+    long: &'static [(&'static str, usize)],
+    /// Options, short or long, that give the program, so no operand does.
+    supplies_program: &'static [&'static str],
+}
+
+impl Filter {
+    fn of(program: &str) -> Option<Self> {
+        let filter = |program, short, long, supplies_program| Self {
+            program,
+            short,
+            long,
+            supplies_program,
+        };
+        Some(match program {
+            "tee" => filter(usize::MAX, "", &[], &[]),
+            "head" | "tail" => filter(0, "nc", &[("lines", 1), ("bytes", 1)], &[]),
+            "wc" | "cat" | "nl" | "less" | "more" => filter(0, "", &[], &[]),
+            "sort" => filter(
+                0,
+                "ktoST",
+                &[
+                    ("key", 1),
+                    ("field-separator", 1),
+                    ("output", 1),
+                    ("buffer-size", 1),
+                ],
+                &[],
+            ),
+            "uniq" => filter(
+                0,
+                "fsw",
+                &[("skip-fields", 1), ("skip-chars", 1), ("check-chars", 1)],
+                &[],
+            ),
+            "fold" => filter(0, "w", &[("width", 1)], &[]),
+            "column" => filter(0, "sco", &[("separator", 1), ("output-width", 1)], &[]),
+            "cut" => filter(
+                0,
+                "dfcb",
+                &[
+                    ("delimiter", 1),
+                    ("fields", 1),
+                    ("characters", 1),
+                    ("bytes", 1),
+                ],
+                &[],
+            ),
+            "tr" => filter(2, "", &[], &[]),
+            "grep" | "egrep" | "fgrep" | "rg" => filter(
+                1,
+                "efmABC",
+                &[
+                    ("regexp", 1),
+                    ("file", 1),
+                    ("max-count", 1),
+                    ("after-context", 1),
+                    ("before-context", 1),
+                    ("context", 1),
+                    ("glob", 1),
+                    ("type", 1),
+                ],
+                &["e", "f", "regexp", "file"],
+            ),
+            "sed" => filter(
+                1,
+                "ef",
+                &[("expression", 1), ("file", 1)],
+                &["e", "f", "expression", "file"],
+            ),
+            "awk" => filter(
+                1,
+                "Fvf",
+                &[("field-separator", 1), ("assign", 1), ("file", 1)],
+                &["f", "file"],
+            ),
+            "jq" => filter(
+                1,
+                "f",
+                &[
+                    ("arg", 2),
+                    ("argjson", 2),
+                    ("slurpfile", 2),
+                    ("rawfile", 2),
+                    ("indent", 1),
+                    ("from-file", 1),
+                ],
+                &["f", "from-file"],
+            ),
+            _ => return None,
+        })
+    }
 }
 
 /// Whether `simple`, piped into an invocation, is `cat` of one file: the
@@ -1012,6 +1141,10 @@ mod tests {
             // A filter that also reads a file of its own.
             "cagents sessions | head -50 build.log",
             "cagents inbox | grep -n error notes.md",
+            "cagents sessions | grep -eerror build.log",
+            "cagents sessions | grep --regexp=error build.log",
+            // What is piped into a command that does not read it.
+            "cat review.md | cagents sessions",
         ] {
             assert!(cli(line, output).is_none(), "{line}");
         }
@@ -1032,6 +1165,9 @@ mod tests {
             "bash -lc 'cagents sessions | tail -5'",
             "cagents --json sessions | jq -r --arg d fw16 '.[] | select(.device == $d) | .id' | head -n 3",
             "cagents sessions 2>&1 | grep -E 'Relocate|Review' | cut -d ' ' -f 1",
+            "cagents sessions | head --lines 5",
+            "cagents sessions | grep -A3 -e Relocate -e Review",
+            "cagents sessions | sort -k 2 | uniq -c",
         ] {
             assert_eq!(
                 cli(line, "").map(|step| step.kind),
