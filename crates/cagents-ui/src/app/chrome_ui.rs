@@ -38,12 +38,9 @@ pub(super) struct State {
     pub(super) tabs_focus: Option<CardId>,
     rename: Option<(RenameTarget, String)>,
     pub(super) workspace_preview: Option<SidebarAction>,
-    /// When the hold that opened the workspace switcher began, which also
-    /// names the timer that reveals it.
+    /// When the hold that opened the workspace switcher began, which names
+    /// the hold to the messages and timers that belong to it.
     pub(super) workspace_preview_since: Option<Instant>,
-    /// A tap between the two most recent workspaces ends before the switcher
-    /// would be read, so it is drawn only once the hold outlasts one.
-    pub(super) workspace_switcher_shown: bool,
     /// Where the switcher's list was last scrolled to, so following the
     /// selection moves it no further than the selection requires.
     pub(super) workspace_switcher_scroll: f32,
