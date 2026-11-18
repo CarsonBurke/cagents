@@ -326,6 +326,8 @@ enum NoticeKey {
     SignIn(uuid::Uuid),
     /// Adding an existing account home from the accounts table.
     AccountLink,
+    /// Removing or forgetting this account.
+    AccountRemove(crate::account::AccountId),
     /// Telling panes whether they are on screen.
     SurfaceVisibility,
     /// Committing this exact project/worktree/path identity.
