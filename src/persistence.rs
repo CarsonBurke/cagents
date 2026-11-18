@@ -4041,12 +4041,12 @@ fn reconcile_startup(connection: &mut Connection, boot_id: &BootId) -> Result<Re
             statement
                 .query_map([], |row| {
                     Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
+                        column_bytes(row, 0)?,
+                        column_bytes(row, 1)?,
+                        column_bytes(row, 2)?,
                     ))
                 })?
-                .collect::<std::result::Result<Vec<_>, _>>()?
+                .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?
         };
 
         for (terminal_id, recipe_json, continuity_json) in terminal_rows {
@@ -4056,18 +4056,26 @@ fn reconcile_startup(connection: &mut Connection, boot_id: &BootId) -> Result<Re
             // stays on disk. It is left exactly as written instead; its card,
             // if one is still open, fails to restore on its own and is
             // reported to the user then.
-            let decoded = from_json::<crate::model::LaunchRecipe>("terminal recipe", &recipe_json)
-                .and_then(|recipe| {
+            let decoded = String::from_utf8(terminal_id.clone())
+                .map_err(|error| StoreError::corrupt_row("terminal id", error))
+                .and_then(|terminal_id| {
                     Ok((
-                        recipe,
-                        from_json::<TerminalContinuity>("terminal continuity", &continuity_json)?,
+                        from_json_bytes::<crate::model::LaunchRecipe>(
+                            "terminal recipe",
+                            &recipe_json,
+                        )?,
+                        from_json_bytes::<TerminalContinuity>(
+                            "terminal continuity",
+                            &continuity_json,
+                        )?,
+                        terminal_id,
                     ))
                 });
-            let (recipe, continuity) = match decoded {
+            let (recipe, continuity, terminal_id) = match decoded {
                 Ok(decoded) => decoded,
                 Err(error) => {
                     tracing::error!(
-                        terminal = %terminal_id,
+                        terminal = %String::from_utf8_lossy(&terminal_id),
                         %error,
                         "terminal record could not be decoded during startup recovery and was left unchanged"
                     );
@@ -6535,6 +6543,22 @@ fn to_json(value: &impl Serialize) -> Result<String> {
 
 fn from_json<T: DeserializeOwned>(kind: &str, value: &str) -> Result<T> {
     serde_json::from_str(value).map_err(|error| StoreError::corrupt_row(kind, error))
+}
+
+/// Decodes JSON read with [`column_bytes`].
+fn from_json_bytes<T: DeserializeOwned>(kind: &str, value: &[u8]) -> Result<T> {
+    serde_json::from_slice(value).map_err(|error| StoreError::corrupt_row(kind, error))
+}
+
+/// The bytes of a TEXT or BLOB column. SQLite does not check that TEXT is
+/// UTF-8, so reading a column as `String` fails on a row that is not, and with
+/// it the whole query. Read as bytes, the row is left for its own decode to
+/// reject.
+fn column_bytes(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Vec<u8>> {
+    let value = row.get_ref(index)?;
+    value.as_bytes().map(<[u8]>::to_vec).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(index, value.data_type(), Box::new(error))
+    })
 }
 
 fn parse_id<T>(kind: &'static str, value: &str) -> Result<T>
@@ -12839,19 +12863,26 @@ mod tests {
     fn startup_recovery_isolates_an_unreadable_terminal_row() {
         struct Corruption {
             column: &'static str,
+            /// An SQL expression for the stored value.
             value: &'static str,
             reopen_boot: &'static str,
         }
         let cases = [
             Corruption {
                 column: "continuity_json",
-                value: "{not json",
+                value: "'{not json'",
                 reopen_boot: "boot-a",
             },
             Corruption {
                 column: "recipe_json",
-                value: r#"{"program":7}"#,
+                value: r#"'{"program":7}'"#,
                 reopen_boot: "boot-b",
+            },
+            // SQLite does not check that TEXT is UTF-8.
+            Corruption {
+                column: "continuity_json",
+                value: "CAST(x'7b22ff' AS TEXT)",
+                reopen_boot: "boot-a",
             },
         ];
         for case in cases {
@@ -12878,10 +12909,10 @@ mod tests {
                 .unwrap()
                 .execute(
                     &format!(
-                        "UPDATE terminal_recipes SET {} = ?1 WHERE terminal_id = ?2",
-                        case.column
+                        "UPDATE terminal_recipes SET {} = {} WHERE terminal_id = ?1",
+                        case.column, case.value
                     ),
-                    params![case.value, broken_terminal.to_string()],
+                    [broken_terminal.to_string()],
                 )
                 .unwrap();
 
@@ -12936,18 +12967,23 @@ mod tests {
             );
 
             let inner = store.lock_inner().unwrap();
-            let preserved: String = inner
+            let preserved: bool = inner
                 .connection
                 .query_row(
                     &format!(
-                        "SELECT {} FROM terminal_recipes WHERE terminal_id = ?1",
-                        case.column
+                        "SELECT CAST({} AS BLOB) = CAST({} AS BLOB)
+                         FROM terminal_recipes WHERE terminal_id = ?1",
+                        case.column, case.value
                     ),
                     [broken_terminal.to_string()],
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert_eq!(preserved, case.value);
+            assert!(
+                preserved,
+                "{}: the unreadable row must be left as written",
+                case.value
+            );
         }
     }
 
