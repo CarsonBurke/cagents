@@ -154,6 +154,7 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::chat_ui::tests::visible_text;
     use crate::workspace_model::views::{Pane, Scope, View};
     use cosmic::iced::futures::{FutureExt, StreamExt};
 
@@ -283,7 +284,7 @@ mod tests {
         assert!(app.card_state(target.card).unwrap().existence.is_open());
         app.chat_runtime_mut(target).unwrap().error =
             Some("Exact native chat is not hosted; explicit recovery is required".into());
-        let text = crate::app::chat_ui::tests::visible_text(&app, target.card).join("\n");
+        let text = visible_text(&app, target.card).join("\n");
         // The footer no longer repeats the state; the closed card says it.
         assert!(text.contains("Closed in another window"), "{text}");
         assert!(!text.contains("Closed · draft retained"), "{text}");
@@ -324,7 +325,7 @@ mod tests {
         assert!(runtime.queued.is_none());
         assert_eq!(runtime.unsent_text(), "the first message");
         assert!(app.chat_working_session(target.card).is_none());
-        let text = crate::app::chat_ui::tests::visible_text(&app, target.card).join("\n");
+        let text = visible_text(&app, target.card).join("\n");
         assert!(!text.contains("Starting"), "{text}");
     }
 
@@ -341,7 +342,7 @@ mod tests {
         );
         assert!(!runtime(&app, target).expected_remote_close_error(error));
         assert!(
-            crate::app::chat_ui::tests::visible_text(&app, target.card)
+            visible_text(&app, target.card)
                 .join("\n")
                 .contains("Finished with error")
         );

@@ -19485,7 +19485,9 @@ pub(in crate::app) mod tests {
         assert!(!app.chat_start_pending(card), "no switch was attempted");
     }
 
-    /// The text `card`'s view lays out in a 900 by 980 pane, in order.
+    /// The text `card`'s view lays out within 900 by 980, in order. The
+    /// footer's fit follows the workspace's geometry for the card, not this
+    /// limit, so a test of the wide footer resizes the workspace first.
     pub(super) fn visible_text(app: &Cagents, card: CardId) -> Vec<String> {
         use iced::advanced::{
             Layout, layout,
@@ -19532,11 +19534,23 @@ pub(in crate::app) mod tests {
             // avatar, rather than only to assistive technology.
             let _ = app.workspace.resize_viewport(1200.0);
             let launch = &chat_runtime(&app, card).session.launch;
-            let current = app
+            let accounts = app
                 .chat_accounts(launch.provider, &launch.recipe)
-                .expect("two accounts to choose between")
-                .current;
-            let named = |app: &Cagents| visible_text(app, card).contains(&current);
+                .expect("two accounts to choose between");
+            let current = accounts.current;
+            let candidate = accounts
+                .choices
+                .into_iter()
+                .find(|choice| !choice.selected)
+                .expect("an account to switch to")
+                .label;
+            assert_ne!(current, candidate);
+            // Names the conversation's account, and not the one it may move
+            // to, which it has not reached.
+            let named = |app: &Cagents| {
+                let text = visible_text(app, card);
+                text.contains(&current) && !text.contains(&candidate)
+            };
             assert!(
                 named(&app),
                 "{current} before sending: {:?}",
