@@ -379,35 +379,56 @@ fn names_program(line: &str) -> bool {
     })
 }
 
-/// A shell line's one `cagents` invocation. A line running several is left as
-/// the command it is: a card for its first would misreport the rest.
+/// A shell line that is one `cagents` invocation, read as what it did.
+///
+/// The whole line has to be that invocation: a step is labelled by what it
+/// is, not by a command it contains. Around it the line may only set up where
+/// and when it runs (`cd`, `export`, `set`, `sleep`), feed it a message the
+/// line itself holds (`cat <<EOF |`, `echo … |`), trim what it printed
+/// (`| tail -1`, `| jq …`), or say how it went (`|| echo failed`). A line that
+/// also lists a directory, searches files or runs a second invocation is a
+/// command of its own, and its row says so.
 fn cli(line: &str, output: &str) -> Option<Coordination> {
     if !names_program(line) {
         return None;
     }
     let commands = shell::commands(line)?;
-    let mut found = None;
-    for (index, simple) in commands.iter().enumerate() {
-        let Some(argv) = invocation(&simple.argv) else {
-            continue;
-        };
-        // One that may not have run reads as nothing it did.
-        if found.is_some() || simple.guarded {
-            return None;
-        }
-        let stdin = match &simple.stdin {
-            shell::Stdin::Text(text) => Text::Inline(text.clone()),
-            shell::Stdin::File(path) => Text::File(path.clone()),
-            shell::Stdin::Pipe => index
-                .checked_sub(1)
-                .and_then(|before| commands.get(before))
-                .and_then(piped_text)
-                .map_or(Text::Unseen, Text::Inline),
-            shell::Stdin::Unknown => Text::Unseen,
-        };
-        found = Some((argv, stdin));
+    let index = commands
+        .iter()
+        .position(|simple| invocation(&simple.argv).is_some())?;
+    let simple = &commands[index];
+    // One that may not have run reads as nothing it did.
+    if simple.guarded {
+        return None;
     }
-    let (argv, stdin) = found?;
+    let argv = invocation(&simple.argv)?;
+    // The invocation's own pipeline: what feeds it, and what reads it.
+    let feeds = simple.stdin == shell::Stdin::Pipe;
+    let first = if feeds { index.checked_sub(1)? } else { index };
+    let last = index
+        + commands[index + 1..]
+            .iter()
+            .take_while(|after| after.stdin == shell::Stdin::Pipe)
+            .count();
+    let incidental = commands.iter().enumerate().all(|(at, other)| match at {
+        at if at == index => true,
+        at if at < first => sets_up(other),
+        at if at < index => piped_text(other).is_some(),
+        at if at <= last => trims(other),
+        _ => reports(other),
+    });
+    if !incidental {
+        return None;
+    }
+    let stdin = match &simple.stdin {
+        shell::Stdin::Text(text) => Text::Inline(text.clone()),
+        shell::Stdin::File(path) => Text::File(path.clone()),
+        shell::Stdin::Pipe => commands
+            .get(first)
+            .and_then(piped_text)
+            .map_or(Text::Unseen, Text::Inline),
+        shell::Stdin::Unknown => Text::Unseen,
+    };
     let mut kind = crate::control::invocation::coordination(argv, stdin)?;
     let outcome = crate::control::invocation::outcome(&kind, output);
     crate::control::invocation::enrich(&mut kind, &outcome);
@@ -417,6 +438,60 @@ fn cli(line: &str, output: &str) -> Option<Coordination> {
         subagents: Vec::new(),
         cli: true,
     })
+}
+
+/// The program `simple` runs, by its name rather than its path.
+fn program(simple: &shell::Simple) -> &str {
+    simple
+        .argv
+        .first()
+        .and_then(|program| program.rsplit('/').next())
+        .unwrap_or_default()
+}
+
+/// Whether `simple`, run before an invocation, only sets up where and when
+/// it runs. `cd repo || exit 1` gives up when it cannot.
+fn sets_up(simple: &shell::Simple) -> bool {
+    match program(simple) {
+        "cd" | "pushd" | "export" | "set" | "unset" | "sleep" | "true" | ":" => true,
+        "exit" => simple.guarded,
+        _ => false,
+    }
+}
+
+/// Whether `simple`, reading an invocation's output through a pipe, only
+/// trims, filters or formats what it printed.
+fn trims(simple: &shell::Simple) -> bool {
+    matches!(
+        program(simple),
+        "head"
+            | "tail"
+            | "jq"
+            | "grep"
+            | "egrep"
+            | "fgrep"
+            | "rg"
+            | "sed"
+            | "awk"
+            | "cut"
+            | "sort"
+            | "uniq"
+            | "wc"
+            | "tee"
+            | "cat"
+            | "column"
+            | "tr"
+            | "fold"
+            | "nl"
+            | "less"
+            | "more"
+    )
+}
+
+/// Whether `simple`, run after an invocation's pipeline, only reports how it
+/// went, as `|| echo failed` or `; echo "exit $?"` do.
+fn reports(simple: &shell::Simple) -> bool {
+    matches!(program(simple), "echo" | "printf" | "true" | ":")
 }
 
 /// `argv` from the `cagents` word on, past the wrappers that only change how
@@ -874,6 +949,8 @@ mod tests {
         assert!(cli("true || cagents send x hi", "").is_none());
         assert!(cli("for s in a b; do\n  cagents send \"$s\" hi\ndone", "").is_none());
         assert!(cli("cagents send x hi || echo failed", "").is_some());
+        // A line that only contains an invocation is not that invocation.
+        assert!(cli("git diff | cagents send reviewer -", "").is_none());
         // A checkout named for the program puts it in paths, not commands.
         assert!(!names_program(
             "cd ~/src/cagents/.worktrees/x && cargo test"
@@ -882,6 +959,54 @@ mod tests {
             "~/src/cagents/target/debug/cagents send x hi"
         ));
         assert!(names_program("echo hi|cagents"));
+    }
+
+    /// The line from the issue that labelled a look around the
+    /// configuration directory "Listed live sessions", and the compound
+    /// commands agents run alongside an invocation. A step is what the
+    /// whole line is.
+    #[test]
+    fn a_compound_command_is_not_the_invocation_it_contains() {
+        let output = r#"[{"id":"95fcd1b9","title":"Relocate the repo"}]"#;
+        for line in [
+            "ls ~/.config/cagents/ 2>/dev/null; find ~/.config/cagents -maxdepth 2 -name '*.toml' 2>/dev/null; timeout 20 cagents --device fw16 --no-start sessions --json 2>&1 | head -50",
+            "cat ~/.config/cagents/devices.toml && cagents --device fw16 sessions",
+            "cagents sessions --json | jq length; git status --short",
+            "cargo build -q && cagents send parent 'build passed'",
+            "cagents whoami && cagents inbox",
+            "gh pr view 3110 --json title | cagents send reviewer -",
+            "/bin/bash -lc 'ls -la && cagents sessions'",
+            "for host in fw16 local; do cagents --device \"$host\" sessions; done",
+        ] {
+            assert!(cli(line, output).is_none(), "{line}");
+        }
+    }
+
+    /// What may surround an invocation without changing what the line is:
+    /// where and when it runs, the message it is fed, how its output is
+    /// trimmed, and how its failure is reported.
+    #[test]
+    fn an_invocation_keeps_its_meaning_through_setup_and_plumbing() {
+        let sessions = Kind::Act(Act::Sessions);
+        for line in [
+            "timeout 20 cagents --device fw16 --no-start sessions --json",
+            "cd /repo && timeout 20 cagents --device fw16 --no-start sessions --json 2>&1 | head -50",
+            "set -euo pipefail; cagents sessions | jq -r '.[].id' | sort",
+            "sleep 30; cagents sessions 2>/dev/null || echo 'daemon unreachable'",
+            "cd /repo || exit 1; export CAGENTS_DEVICE=fw16; cagents sessions",
+            "bash -lc 'cagents sessions | tail -5'",
+        ] {
+            assert_eq!(
+                cli(line, "").map(|step| step.kind),
+                Some(sessions.clone()),
+                "{line}"
+            );
+        }
+        let fed = cli("cat <<'EOF' | cagents send parent -\nDone.\nEOF\n", "").unwrap();
+        let Kind::Message(message) = fed.kind else {
+            panic!("a message");
+        };
+        assert_eq!(message.body, Text::Inline("Done.\n".into()));
     }
 
     #[test]

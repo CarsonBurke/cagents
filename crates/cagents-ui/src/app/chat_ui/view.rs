@@ -5308,6 +5308,19 @@ impl Runtime {
                 scroll::item(&item.id, body)
             }
             TurnPart::Steps => {
+                // A group of one step is that step. `for_each_turn_part`
+                // places the strip only when a step is not drawn as a
+                // failure, so a lone one here is drawn as a row.
+                if let [only] = turn.steps.as_slice()
+                    && let Some((item, cached)) = placed(only.index)
+                {
+                    return widget::container(scroll::item(
+                        &item.id,
+                        self.lone_step_view(turn, item, cached, settings),
+                    ))
+                    .id(scroll::steps_id(&item.id))
+                    .into();
+                }
                 let strip = self.step_strip(turn, || {
                     turn.steps
                         .iter()

@@ -3997,45 +3997,50 @@ fn message_phase(value: &Value) -> Phase {
         _ => Phase::Final,
     }
 }
-/// Codex's own best-effort parse of a shell command, which may decompose into
-/// several actions because a command can be a pipeline. The first classified
-/// action is what the invocation was for; `unknown` entries carry nothing the
-/// view cannot already read off the command itself. The label is what the
-/// action was applied to; the view supplies the verb, from the action.
+/// Codex's own best-effort parse of a shell command, which decomposes a
+/// compound command into an action for each part it kept. A command is a
+/// read, a search or a listing only when that is all of it: every part the
+/// same kind of action on the same target. `cat a.md; cat b.md`, `ls; rg x`
+/// and anything with an `unknown` part run several things, which a label for
+/// one of them would misreport, so they are commands the view names by what
+/// ran. The label is what the action was applied to; the view supplies the
+/// verb, from the action.
 fn command_intent(actions: &Value) -> (CommandAction, String) {
+    let unclassified = (CommandAction::Run, String::new());
     let Some(actions) = actions.as_array() else {
-        return (CommandAction::Run, String::new());
+        return unclassified;
     };
-    for action in actions {
+    let mut intents = actions.iter().map(|action| {
         let path = action["path"].as_str();
         match action["type"].as_str() {
-            Some("read") => {
-                return (
-                    CommandAction::Read,
-                    path.map(str::to_owned).unwrap_or_default(),
-                );
-            }
-            Some("search") => {
-                return (
-                    CommandAction::Search,
-                    match (action["query"].as_str(), path) {
-                        (Some(query), Some(path)) => format!("{query} in {path}"),
-                        (Some(query), None) => query.to_owned(),
-                        (None, Some(path)) => path.to_owned(),
-                        (None, None) => String::new(),
-                    },
-                );
-            }
-            Some("listFiles") => {
-                return (
-                    CommandAction::List,
-                    path.map(str::to_owned).unwrap_or_default(),
-                );
-            }
-            _ => {}
+            Some("read") => Some((
+                CommandAction::Read,
+                path.map(str::to_owned).unwrap_or_default(),
+            )),
+            Some("search") => Some((
+                CommandAction::Search,
+                match (action["query"].as_str(), path) {
+                    (Some(query), Some(path)) => format!("{query} in {path}"),
+                    (Some(query), None) => query.to_owned(),
+                    (None, Some(path)) => path.to_owned(),
+                    (None, None) => String::new(),
+                },
+            )),
+            Some("listFiles") => Some((
+                CommandAction::List,
+                path.map(str::to_owned).unwrap_or_default(),
+            )),
+            _ => None,
         }
+    });
+    let Some(Some(first)) = intents.next() else {
+        return unclassified;
+    };
+    if intents.all(|intent| intent.as_ref() == Some(&first)) {
+        first
+    } else {
+        unclassified
     }
-    (CommandAction::Run, String::new())
 }
 /// Codex keys a patch by the file it read, so an update's `move_path` is where
 /// the file ended up while the entry's own `path` is where it came from.

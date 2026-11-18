@@ -392,8 +392,31 @@ impl Runtime {
         cached: &CachedItem,
         settings: markdown::Settings,
     ) -> Element<'static, Message> {
+        self.step_row(item, cached, settings, self.step_status(item))
+    }
+
+    /// A group's only step, drawn in place of the group. A strip over one
+    /// row would repeat that row's title and icon above it, so the row
+    /// stands alone, and carries the activity indicator the strip would have.
+    pub(super) fn lone_step_view(
+        &self,
+        turn: &turn::Turn,
+        item: &chat::Item,
+        cached: &CachedItem,
+        settings: markdown::Settings,
+    ) -> Element<'static, Message> {
+        self.step_row(item, cached, settings, self.strip_status(turn))
+    }
+
+    fn step_row(
+        &self,
+        item: &chat::Item,
+        cached: &CachedItem,
+        settings: markdown::Settings,
+        status: Option<ToolStatus>,
+    ) -> Element<'static, Message> {
         let open = self.item_expanded(&item.id);
-        let mut rows = vec![self.step_header(item, cached, open)];
+        let mut rows = vec![self.step_button(item, cached, open, status)];
         if open {
             rows.push(
                 widget::container(super::view::message_actions(
@@ -414,13 +437,14 @@ impl Runtime {
 
     /// The header occupies the whole row; copy and time-stamp controls remain
     /// available with the expanded detail instead of shifting its chevron.
+    #[cfg(test)]
     pub(super) fn step_header(
         &self,
         item: &chat::Item,
         cached: &CachedItem,
         open: bool,
     ) -> Element<'static, Message> {
-        self.step_button(item, cached, open)
+        self.step_button(item, cached, open, self.step_status(item))
     }
 
     /// The verb and file of a step on one file, the file named the way the
@@ -451,6 +475,7 @@ impl Runtime {
         item: &chat::Item,
         cached: &CachedItem,
         open: bool,
+        status: Option<ToolStatus>,
     ) -> Element<'static, Message> {
         let target = self.target;
         // A step that worked with another agent says what it did in the
@@ -504,7 +529,7 @@ impl Runtime {
             headline,
             name,
             glyph,
-            self.step_status(item),
+            status,
             elapsed,
             Some(open),
             Some(Action::Toggle(target, item.id.clone())),

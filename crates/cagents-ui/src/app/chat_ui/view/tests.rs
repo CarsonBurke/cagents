@@ -11438,3 +11438,120 @@ fn composer_is_one_row_and_offers_stop_while_busy_with_an_empty_draft() {
         }
     }
 }
+
+/// The text an exchange's rows draw, every row mounted.
+fn turn_texts(runtime: &Runtime) -> Vec<String> {
+    use iced::advanced::{
+        Layout, layout,
+        widget::{Operation, Tree},
+    };
+    #[derive(Default)]
+    struct Texts(Vec<String>);
+    impl Operation for Texts {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, text: &str) {
+            self.0.push(text.to_owned());
+        }
+    }
+    let renderer = crate::app::tests::headless_renderer();
+    let mut element = runtime.find_turn_view_for_test();
+    let mut tree = Tree::new(element.as_widget());
+    let node = element.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &layout::Limits::new(iced::Size::ZERO, iced::Size::new(900.0, 2000.0)),
+    );
+    let mut texts = Texts::default();
+    element
+        .as_widget_mut()
+        .operate(&mut tree, Layout::new(&node), &renderer, &mut texts);
+    texts.0
+}
+
+/// A Claude `Bash` call as the adapter stores one.
+fn bash(id: &str, description: &str, command: &str, output: &str) -> chat::Item {
+    chat::Item {
+        id: id.into(),
+        role: chat::Role::Assistant,
+        content: ItemContent::Command {
+            label: description.into(),
+            command: command.into(),
+            working_directory: "/project".into(),
+            action: chat::CommandAction::Run,
+            status: chat::ToolStatus::Succeeded,
+            exit_code: Some(0),
+            duration_ms: Some(3_000),
+            output: output.into(),
+        },
+        started_at: Some(1_000),
+        at: Some(4_000),
+    }
+}
+
+/// The compound command from #3110 looked around the configuration
+/// directory and then asked another device for its sessions. It is a
+/// command, not "Listed live sessions"; the one invocation on its own is.
+#[test]
+fn a_compound_command_is_prepared_as_the_command_it_is() {
+    let compound = "ls ~/.config/cagents/ 2>/dev/null; find ~/.config/cagents -maxdepth 2 -name '*.toml' 2>/dev/null; timeout 20 cagents --device fw16 --no-start sessions --json 2>&1 | head -50";
+    let (runtime, _handle) = frame_cost::live_runtime(&[bash(
+        "toolu_compound",
+        "Check fw16 device availability in cagents",
+        compound,
+        "[]",
+    )]);
+    assert!(runtime.cache["toolu_compound"].coordination.is_none());
+    let texts = turn_texts(&runtime);
+    assert!(
+        texts.iter().all(|text| !text.contains("live sessions")),
+        "{texts:?}"
+    );
+    assert!(
+        texts
+            .iter()
+            .any(|text| text.starts_with("Ran ls ~/.config/cagents/")),
+        "{texts:?}"
+    );
+
+    let (runtime, _handle) = frame_cost::live_runtime(&[bash(
+        "toolu_sessions",
+        "List fw16 sessions",
+        "timeout 20 cagents --device fw16 --no-start sessions --json",
+        "[]",
+    )]);
+    assert!(runtime.cache["toolu_sessions"].coordination.is_some());
+    let texts = turn_texts(&runtime);
+    assert!(
+        texts.iter().any(|text| text.contains("live sessions")),
+        "{texts:?}"
+    );
+}
+
+/// A group of one step draws that step once, whether groups open by
+/// default or the reader opened this one: no header above it repeating its
+/// title and icon (#3110). Two steps keep their summary strip.
+#[test]
+fn a_group_of_one_step_draws_the_step_alone() {
+    let item = bash("toolu_lone", "", "cargo check --workspace", "");
+    for open in [false, true] {
+        let (mut runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
+        runtime.tool_groups_expanded = open;
+        let texts = turn_texts(&runtime);
+        let titles = texts
+            .iter()
+            .filter(|text| text.contains("cargo check --workspace"))
+            .count();
+        assert_eq!(titles, 1, "open={open}: {texts:?}");
+    }
+    let mut second = bash("toolu_second", "", "cargo test -q", "");
+    second.started_at = Some(5_000);
+    second.at = Some(6_000);
+    let (runtime, _handle) = frame_cost::live_runtime(&[item, second]);
+    let texts = turn_texts(&runtime);
+    assert!(
+        texts.iter().any(|text| text.starts_with("Ran 2 commands")),
+        "{texts:?}"
+    );
+}
