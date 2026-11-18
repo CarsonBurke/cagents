@@ -138,6 +138,13 @@ the request after it goes through. Production's own refusals usually come with
 more: an unavailable conversation's process has also stopped, which this
 fixture does not reproduce.
 
+To see a send while it is still on its way, write a number of seconds, up to
+8, to `.cagents-fixture-delay-input` in the fixture `HOME`:
+`scripts/native-evidence env sh -c 'echo 5 >"$HOME/.cagents-fixture-delay-input"'`.
+A debug build holds the next request to Claude that long before admitting it,
+then removes the file. With `.cagents-fixture-refuse-input` as well, the
+request is held and then refused, as a send that fails after a wait is.
+
 To check where a failure is drawn after delivered work, write a diagnostic to
 `fixture-delivery-error` instead. Every prompt then gets a reply, a background
 command's completion notice, a follow-up, and that error. The notice must
