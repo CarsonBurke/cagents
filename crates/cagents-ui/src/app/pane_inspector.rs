@@ -231,12 +231,13 @@ impl PaneInspectors {
 
     /// The panes to save as open, in a stable order, among the cards `known`
     /// says still exist and can have an inspector: what a version that saves
-    /// no [`Choices`] reads back.
+    /// no [`Choices`] reads back. Only those the user opened: that version
+    /// reads every pane listed as opened by choice.
     pub(super) fn saved(&self, known: impl Fn(CardId) -> bool) -> Vec<CardId> {
         let mut open: Vec<CardId> = self
             .panes
             .iter()
-            .filter(|(_, pane)| pane.open)
+            .filter(|(_, pane)| pane.open && pane.chosen)
             .map(|(card, _)| *card)
             .chain(
                 self.restored
@@ -802,6 +803,24 @@ impl Cagents {
 
     /// Runs at the tail of every update, before the source-control rebind;
     /// see [`PaneInspectors::sync`].
+    /// Opens or closes every inspector the user has not opened or closed,
+    /// as the open-by-default setting now says.
+    pub(super) fn set_inspectors_open_by_default(&mut self, open: bool) {
+        let browsers_available = self.active_workspace.is_some();
+        let durable = &self.durable;
+        let card_indices = &self.card_indices;
+        self.pane_inspectors.set_open_by_default(open, |card| {
+            card_indices
+                .get(&card)
+                .and_then(|index| durable.cards.get(*index))
+                .filter(|state| state.id == card)
+                .or_else(|| durable.cards.iter().find(|state| state.id == card))
+                .map_or(Availability::Never, |state| {
+                    kind_availability(&state.kind, browsers_available)
+                })
+        });
+    }
+
     pub(super) fn sync_pane_inspectors(&mut self) {
         let browsers_available = self.active_workspace.is_some();
         let inputs = SyncInputs {

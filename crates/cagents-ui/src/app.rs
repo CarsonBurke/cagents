@@ -14409,11 +14409,17 @@ impl Cagents {
     fn handle_context_inspector_action(&mut self, action: InspectorAction) -> Task<Message> {
         match action {
             InspectorAction::Resize { width } => {
-                self.settings.inspector_width =
-                    width.clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH);
+                // Whole pixels, as Settings shows and steps them.
+                self.settings.inspector_width = width
+                    .round()
+                    .clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH);
                 Task::none()
             }
-            InspectorAction::ResizeFinished => self.save_settings_task(false),
+            InspectorAction::ResizeFinished => {
+                // Settings, if open, steps from the dragged width.
+                self.settings_draft.inspector_width = self.settings.inspector_width.to_string();
+                self.save_settings_task(false)
+            }
             InspectorAction::CopyLspDiagnostic(diagnostic) => {
                 chat_ui::invalidate_copy_intent();
                 iced::clipboard::write(diagnostic.copy_text()).map(cosmic::Action::App)
@@ -15447,11 +15453,7 @@ impl Cagents {
         if previous.inspector_open_by_default != self.settings.inspector_open_by_default {
             // Panes whose inspector the user never opened or closed follow
             // the default; the rest keep what was chosen for them.
-            let mut inspectors = std::mem::take(&mut self.pane_inspectors);
-            inspectors.set_open_by_default(self.settings.inspector_open_by_default, |card| {
-                self.inspector_availability(card)
-            });
-            self.pane_inspectors = inspectors;
+            self.set_inspectors_open_by_default(self.settings.inspector_open_by_default);
             self.sync_pane_inspectors();
             tasks.push(self.rebind_source_control());
         }
@@ -16002,23 +16004,22 @@ impl Application for Cagents {
             latency_fixture,
             #[cfg(feature = "latency-harness")]
             latency_fixture_started: false,
-            // A window saved before each pane had its own inspector, or none
-            // saved at all, opens the focused pane's as the window's was.
-            // Every pane nobody opened or closed one in follows the default.
+            // A window saved before each pane had its own inspector opens the
+            // focused pane's as the window's was. Every pane nobody opened or
+            // closed one in, as in a window never saved, follows the default.
             pane_inspectors: window_view
                 .as_ref()
-                .map_or_else(
-                    || pane_inspector::PaneInspectors::restore(None, true),
-                    |view| match &view.inspector_choices {
-                        Some(choices) => {
-                            pane_inspector::PaneInspectors::restore_choices(choices.clone())
-                        }
-                        None => pane_inspector::PaneInspectors::restore(
-                            view.open_inspectors.clone(),
-                            view.context_inspector_open,
-                        ),
-                    },
-                )
+                .map_or_else(pane_inspector::PaneInspectors::default, |view| match &view
+                    .inspector_choices
+                {
+                    Some(choices) => {
+                        pane_inspector::PaneInspectors::restore_choices(choices.clone())
+                    }
+                    None => pane_inspector::PaneInspectors::restore(
+                        view.open_inspectors.clone(),
+                        view.context_inspector_open,
+                    ),
+                })
                 .with_default(inspector_open_by_default),
             context_sections: window_view
                 .as_ref()

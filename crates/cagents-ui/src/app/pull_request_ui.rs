@@ -80,6 +80,9 @@ pub(super) const WORK_LIST_PADDING: f32 = space::XS;
 pub(super) struct WorkSummary {
     /// The pieces of work the Work section lists, for its header.
     pub count: usize,
+    /// Whether the Work section has rows, counted or not: the worktree the
+    /// conversation runs in has one too.
+    pub lists_work: bool,
     /// How tall the Work list draws, which bounds its section's height.
     pub height: conversation::Height,
     /// The pull requests the Mentioned section lists, for its header.
@@ -142,6 +145,10 @@ impl Cagents {
         }
         match action {
             Action::Conversation(watch) => {
+                // An inspector mounted by scrolling alone is watched before
+                // a projection follows its conversation; follow it now, or
+                // its first list would be dropped and it would read forever.
+                self.sync_pull_request_inspector();
                 for state in self.pull_request_inspector.conversations.values_mut() {
                     state.update(watch.clone());
                 }
@@ -318,6 +325,11 @@ impl Cagents {
     /// What `card`'s Work and Mentioned sections and the section beneath
     /// them need of its conversation's work, worked out once per use.
     pub(super) fn work_summary(&self, card: CardId) -> WorkSummary {
+        // With neither section shown there is no work to choose, so none
+        // scopes the changes and files.
+        if !self.work_reserved(card) && !self.mentions_reserved(card) {
+            return WorkSummary::default();
+        }
         let Some(conversation) = self.pull_request_inspector.conversation(card) else {
             return WorkSummary::default();
         };
@@ -360,6 +372,7 @@ impl Cagents {
                 .iter()
                 .filter(|work| !matches!(work, conversation::Work::Here(_)))
                 .count(),
+            lists_work: listed,
             height,
             mentioned: mentioned.len(),
             mentioned_height,
@@ -674,6 +687,21 @@ mod tests {
         assert!(!app.work_reserved(terminal));
         app.settings.inspector_show_work = false;
         assert!(!app.work_reserved(chat));
+    }
+
+    #[test]
+    fn a_list_arriving_before_a_projection_follows_its_inspector_is_kept() {
+        let (
+            mut app,
+            Panes {
+                conversation, chat, ..
+            },
+        ) = conversation_app();
+        // Mounted and watched, but not yet followed by a projection.
+        assert!(app.pull_request_inspector.conversation(chat).is_none());
+        drop(app.handle_pull_request_ui(listed(conversation, 1, &[(4, Relation::Created)], true)));
+        assert_eq!(app.work_phase(chat), WorkPhase::Listed);
+        assert_eq!(app.work_summary(chat).count, 1);
     }
 
     #[test]

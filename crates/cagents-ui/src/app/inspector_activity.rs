@@ -76,13 +76,16 @@ impl Cagents {
         } else {
             crate::ui_controls::passive_icon(status.glyph, design::ROW_ICON_SIZE)
         };
+        let caption = crate::ui_controls::FadeText::caption(place.label)
+            .class(cosmic::theme::Text::Custom(design::muted_text));
+        let caption: Element<'a, Message> = if place.path.is_empty() {
+            caption.into()
+        } else {
+            crate::interaction::tooltip(caption, place.path)
+        };
         let text = widget::column::with_children(vec![
-            crate::ui_controls::fade_text(status.label.clone()).into(),
-            crate::interaction::tooltip(
-                crate::ui_controls::FadeText::caption(place.label.clone())
-                    .class(cosmic::theme::Text::Custom(design::muted_text)),
-                place.path,
-            ),
+            crate::ui_controls::fade_text(status.label).into(),
+            caption,
         ])
         .width(Length::Fill);
         let first = grid_row(
@@ -133,7 +136,15 @@ impl Cagents {
             parts.push(format!("{} working", tally.working));
         }
         if tally.attention > 0 {
-            parts.push(format!("{} need attention", tally.attention));
+            parts.push(format!(
+                "{} {} attention",
+                tally.attention,
+                if tally.attention == 1 {
+                    "needs"
+                } else {
+                    "need"
+                }
+            ));
         }
         let label = parts.join(" · ");
         let content = widget::row::with_children(vec![
@@ -220,13 +231,16 @@ impl Cagents {
                 .file_name()
                 .map_or_else(|| path.clone(), |name| name.to_string_lossy().into_owned())
         };
-        let listed = self.sidebar_model.worktree_at(directory).and_then(|key| {
-            let project = self.sidebar_model.project(key.project_id)?;
-            let worktree = project
+        // One pass over Projects, as each frame draws this.
+        let listed = self.sidebar_model.projects.iter().find_map(|project| {
+            match project
                 .worktrees
                 .iter()
-                .find(|worktree| worktree.id == key.worktree_id)?;
-            Some((project.name.clone(), worktree.branch.clone()))
+                .find(|worktree| worktree.path == directory)
+            {
+                Some(worktree) => Some((project.name.as_str(), worktree.branch.as_deref())),
+                None => (project.repository == directory).then_some((project.name.as_str(), None)),
+            }
         });
         let label = match listed {
             Some((project, Some(branch))) => format!("{branch} · {project}"),

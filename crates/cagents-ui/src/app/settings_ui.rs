@@ -582,7 +582,7 @@ fn settings_category_controls<'a>(
         SettingsCategory::Inspector => vec![
             settings_group(
                 "Inspector",
-                "The panel beside a chat, terminal or editor that shows what its agent is doing, where, and what it changed.",
+                "The panel beside a pane that shows what its agent is doing, where it works and what it changed.",
                 vec![
                     crate::settings_widgets::toggle(
                         "Open with each pane",

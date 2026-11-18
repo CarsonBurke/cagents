@@ -308,10 +308,10 @@ impl Runtime {
         action(Action::SubagentPicker(self.target, true))
     }
 
-    /// What the conversation is doing, in the glyph and words its own
-    /// status line uses.
+    /// What the conversation itself is doing, in the glyph and words its
+    /// status line uses; its subagents are summed up apart.
     pub(in crate::app) fn inspector_status(&self) -> (Option<Icon>, String) {
-        self.conversation_status(false)
+        self.own_conversation_status()
     }
 
     /// While a subagent's transcript is open, the main conversation's own

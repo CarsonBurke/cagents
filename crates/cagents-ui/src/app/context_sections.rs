@@ -506,7 +506,9 @@ impl Cagents {
                     + 2.0 * pull_request_ui::WORK_LIST_PADDING,
             },
             body: open.then(|| match phase {
-                pull_request_ui::WorkPhase::Listed if count > 0 => self.work_section(card, work),
+                pull_request_ui::WorkPhase::Listed if work.lists_work => {
+                    self.work_section(card, work)
+                }
                 pull_request_ui::WorkPhase::Listed => list_notice(
                     "No pull requests or worktrees yet",
                     "Pull requests this chat creates or pushes, and worktrees it edits, show here.",
@@ -515,10 +517,9 @@ impl Cagents {
                     "Reading this chat's work…",
                     "Its pull requests and worktrees show here.",
                 ),
-                pull_request_ui::WorkPhase::Unavailable => list_notice(
-                    "Work isn't available right now",
-                    "The background service didn't answer. This tries again on its own.",
-                ),
+                pull_request_ui::WorkPhase::Unavailable => {
+                    list_notice("Couldn't load this chat's work", "Retrying automatically.")
+                }
             }),
         }
     }
@@ -535,7 +536,8 @@ impl Cagents {
 
     fn mentioned_pane(&self, card: CardId, work: &pull_request_ui::WorkSummary) -> Pane<'_> {
         let open = self.context_sections.is_open(Section::Mentioned);
-        let listed = self.work_phase(card) == pull_request_ui::WorkPhase::Listed;
+        let phase = self.work_phase(card);
+        let listed = phase == pull_request_ui::WorkPhase::Listed;
         let count = work.mentioned;
         Pane {
             section: Section::Mentioned,
@@ -554,17 +556,21 @@ impl Cagents {
                     + work.mentioned_height.expanded
                     + 2.0 * pull_request_ui::WORK_LIST_PADDING,
             },
-            body: open.then(|| {
-                if count > 0 {
+            body: open.then(|| match phase {
+                pull_request_ui::WorkPhase::Listed if count > 0 => {
                     self.mentioned_section(card, work)
-                } else if listed {
-                    list_notice(
-                        "No mentions",
-                        "Pull requests this chat only names show here.",
-                    )
-                } else {
+                }
+                pull_request_ui::WorkPhase::Listed => list_notice(
+                    "No mentions",
+                    "Pull requests this chat only names show here.",
+                ),
+                pull_request_ui::WorkPhase::Reading => {
                     list_notice("Reading this chat's mentions…", "")
                 }
+                pull_request_ui::WorkPhase::Unavailable => list_notice(
+                    "Couldn't load this chat's mentions",
+                    "Retrying automatically.",
+                ),
             }),
         }
     }

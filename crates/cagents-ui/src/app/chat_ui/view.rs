@@ -1558,6 +1558,21 @@ impl Runtime {
         transitioning: bool,
         include_failures: bool,
     ) -> (Option<Icon>, String) {
+        self.conversation_status_of(transitioning, include_failures, true)
+    }
+
+    /// The conversation's own status, leaving its subagents to whoever
+    /// shows them separately.
+    pub(super) fn own_conversation_status(&self) -> (Option<Icon>, String) {
+        self.conversation_status_of(false, false, false)
+    }
+
+    fn conversation_status_of(
+        &self,
+        transitioning: bool,
+        include_failures: bool,
+        include_subagents: bool,
+    ) -> (Option<Icon>, String) {
         let (glyph, label) = self.conversation_status_base(transitioning);
         let snapshot = &self.snapshot;
         if self.closed_elsewhere
@@ -1571,10 +1586,16 @@ impl Runtime {
             return (glyph, label.to_owned());
         }
         let activity = snapshot.subagent_activity();
-        let working = activity.working;
-        let waiting = activity.waiting;
-        let on_background_work = activity.on_background_work;
-        let failed = activity.failed.len();
+        let (working, waiting, on_background_work, failed) = if include_subagents {
+            (
+                activity.working,
+                activity.waiting,
+                activity.on_background_work,
+                activity.failed.len(),
+            )
+        } else {
+            (0, 0, 0, 0)
+        };
         let active = self.reported_errors().find_map(|message| {
             chat::failure::Failure::parse(self.session.launch.provider, message)
         });

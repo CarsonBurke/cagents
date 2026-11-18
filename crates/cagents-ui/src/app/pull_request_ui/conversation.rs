@@ -137,9 +137,6 @@ pub struct State {
     pub(super) conversation: Option<TerminalId>,
     revision: u64,
     list: Option<Arc<ConversationPullRequests>>,
-    /// The previous conversation listed pull requests, so the section stays
-    /// while this one's list is on its way rather than flickering away.
-    listed_before: bool,
     /// The daemon could not be asked for a list, and none has arrived. The
     /// watch keeps trying.
     lost: bool,
@@ -195,7 +192,6 @@ impl State {
                 error,
             } => {
                 if self.conversation == Some(conversation) {
-                    self.listed_before = false;
                     self.lost = self.list.is_none();
                 }
                 tracing::debug!(%conversation, %error, "conversation pull requests unavailable")
@@ -215,8 +211,6 @@ impl State {
         }
         *self = Self {
             conversation,
-            listed_before: conversation.is_some()
-                && (!self.rows().is_empty() || !self.worktrees().is_empty()),
             ..Self::default()
         };
         true
@@ -369,16 +363,9 @@ impl State {
             .filter(move |worktree| !shown.contains(&worktree.path.as_path()))
     }
 
-    /// Whether the Work section lists anything, or the previous
-    /// conversation did and this one's list has not arrived.
+    /// Whether the Work section lists anything.
     pub(super) fn lists_work(&self) -> bool {
-        match &self.list {
-            Some(_) => {
-                self.rows().iter().any(|row| row.relation.worked_on())
-                    || !self.worktrees().is_empty()
-            }
-            None => self.listed_before,
-        }
+        self.rows().iter().any(|row| row.relation.worked_on()) || !self.worktrees().is_empty()
     }
 
     pub(crate) fn phase(&self) -> Phase {
@@ -1230,10 +1217,11 @@ mod tests {
         // Another conversation's list is not this one's.
         state.update(listed(TerminalId::new(), 9, Vec::new(), true));
         assert_eq!(state.rows().len(), 2);
-        // The next conversation's section stays while its list is on its way.
+        // The next conversation's list is read afresh.
         assert!(state.retarget(Some(TerminalId::new())));
         assert!(state.rows().is_empty());
-        assert!(state.lists_work());
+        assert!(!state.lists_work());
+        assert_eq!(state.phase(), Phase::Reading);
         assert!(state.retarget(None));
         assert!(state.conversation.is_none());
         assert!(!state.lists_work());
