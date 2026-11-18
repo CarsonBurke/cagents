@@ -527,7 +527,7 @@ impl Registry {
                 if removed || recorded {
                     automations::close_project(
                         &transaction,
-                        &key,
+                        key,
                         crate::chat::now_ms().unwrap_or(0),
                     )?;
                 }

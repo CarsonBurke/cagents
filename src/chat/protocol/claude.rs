@@ -128,7 +128,7 @@ fn trailing_record(line: &[u8]) -> Option<(usize, Value)> {
                 while escapes > 0 && line[escapes - 1] == b'\\' {
                     escapes -= 1;
                 }
-                if (position - escapes) % 2 == 0 {
+                if (position - escapes).is_multiple_of(2) {
                     quoted = !quoted;
                 }
                 // Count every escape run only once during the reverse scan.
@@ -1133,7 +1133,7 @@ impl Claude {
             return Err("A Claude prompt cannot be empty".into());
         }
         if matches!(
-            text.trim().split_whitespace().next(),
+            text.split_whitespace().next(),
             Some("/resume" | "/fork")
         ) {
             return Err(
@@ -1619,7 +1619,7 @@ impl Claude {
                 let mut aliases: Vec<_> = self
                     .resolved
                     .iter()
-                    .filter_map(|(alias, resolved)| (resolved == id).then(|| alias.clone()))
+                    .filter(|&(_alias, resolved)| resolved == id).map(|(alias, _resolved)| alias.clone())
                     .collect();
                 aliases.sort_unstable();
                 aliases.dedup();
@@ -2115,11 +2115,10 @@ impl Claude {
                             // conversation, so only its launch is known.
                             let launched = child.is_none() && async_launch(frame);
                             let ended = self.ended_agent(&tool_id);
-                            if launched {
-                                if ended.is_none() {
+                            if launched
+                                && ended.is_none() {
                                     self.background_agents.insert(tool_id.clone());
                                 }
-                            }
                             let background = self.background_agents.contains(&tool_id);
                             let status = if let Some(ended) =
                                 ended.filter(|ended| launched || *ended == ToolStatus::Stopped)
@@ -2763,14 +2762,12 @@ impl Claude {
                 .get(&ScopedId::new(None, tool))
                 .and_then(|item| item.content.status())
                 .is_some_and(|status| status != ToolStatus::Running)
-            {
-                if !self.restarted_agents.iter().any(|known| known == tool) {
+                && !self.restarted_agents.iter().any(|known| known == tool) {
                     self.restarted_agents.push_back(tool.into());
                     if self.restarted_agents.len() > MAX_TOOLS {
                         self.restarted_agents.pop_front();
                     }
                 }
-            }
             ToolStatus::Running
         } else if ended.is_some() && self.ended_agent(tool) == Some(ToolStatus::Stopped) {
             ToolStatus::Stopped
@@ -3606,14 +3603,14 @@ impl Adapter for Claude {
                 )
             }
             Command::ReadTextCopy { .. } => {
-                return Err("Text copies are served by the transcript cache".into());
+                Err("Text copies are served by the transcript cache".into())
             }
             Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. } => {
-                return Err("File changes are served by the transcript cache".into());
+                Err("File changes are served by the transcript cache".into())
             }
             Command::LoadLater => Err("Newer history is served by the transcript cache".into()),
             Command::ResumeAfterLogin { .. } => {
-                return Err("Live login verification is available for Codex chats".into());
+                Err("Live login verification is available for Codex chats".into())
             }
             Command::Refresh => self.control(json!({"subtype":"get_context_usage"})),
             Command::LoadEarlier => {
@@ -5713,8 +5710,8 @@ fn task_notification(inner: &str) -> ItemContent {
         },
         None => (DeliveryKind::Notice, element("event").unwrap_or_default()),
     };
-    if kind == DeliveryKind::Notice {
-        if let Some((heading, command)) = command_notification(
+    if kind == DeliveryKind::Notice
+        && let Some((heading, command)) = command_notification(
             &summary,
             &element("status").unwrap_or_default(),
             "",
@@ -5724,7 +5721,6 @@ fn task_notification(inner: &str) -> ItemContent {
             summary = heading;
             body = command;
         }
-    }
     ItemContent::Delivery {
         kind,
         from: String::new(),

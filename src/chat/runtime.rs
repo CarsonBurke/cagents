@@ -754,7 +754,7 @@ impl LocalHandle {
                     });
                     *failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error.clone());
                     let stderr =
-                        String::from_utf8_lossy(&actor.stderr.make_contiguous()).into_owned();
+                        String::from_utf8_lossy(actor.stderr.make_contiguous()).into_owned();
                     let message = if stderr.is_empty() {
                         error
                     } else {
@@ -2826,8 +2826,8 @@ impl Actor {
                 while self.wake.read(&mut buffer).is_ok_and(|n| n != 0) {}
             }
             self.report_command_stops();
-            if fds[3].revents != 0 {
-                if let Some(line) = self.pending.front() {
+            if fds[3].revents != 0
+                && let Some(line) = self.pending.front() {
                     match stdin.write(&line[self.offset..]) {
                         Ok(0) => return Err("Provider closed stdin".into()),
                         Ok(n) => {
@@ -2856,7 +2856,6 @@ impl Actor {
                         Err(e) => return Err(format!("Provider stdin: {e}")),
                     }
                 }
-            }
             if fds[1].revents != 0 {
                 let available = buffer.len().min(FRAME_LIMIT + 1 - self.output.len());
                 match stdout.read(&mut buffer[..available]) {
@@ -3303,14 +3302,13 @@ impl Actor {
     /// provider left the frame with, when the frame changed it.
     fn apply_step(&mut self, step: Step, confirmed: Option<Option<String>>) -> Result<(), String> {
         let suppress_current_notification = step.suppress_current_notification;
-        if !suppress_current_notification {
-            if let Some(preview) = &step.notification_preview {
+        if !suppress_current_notification
+            && let Some(preview) = &step.notification_preview {
                 self.state
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .notification_preview = Arc::new(preview.clone());
             }
-        }
         // A new Codex thread is created asynchronously after initialize; check
         // its RPC boundary too. Interrupts, denials and cleanup remain usable
         // even if the approved directory disappears or is replaced.

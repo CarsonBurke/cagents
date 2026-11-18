@@ -396,11 +396,10 @@ impl PendingInput {
         let written_start = frame.offset;
         frame.offset += count;
         self.bytes -= count;
-        if let Kind::Press(token) | Kind::Repeat(token) = frame.kind {
-            if let Some(owner) = self.owners.iter_mut().find(|owner| owner.token == token) {
+        if let Kind::Press(token) | Kind::Repeat(token) = frame.kind
+            && let Some(owner) = self.owners.iter_mut().find(|owner| owner.token == token) {
                 owner.escaped = true;
             }
-        }
         if frame.paired
             // Even one complete master write does not prove the reader has
             // consumed a whole scalar. A kernel flush could split its bytes.
@@ -434,7 +433,7 @@ impl PendingInput {
     fn retire_closed_owners(&mut self) {
         self.owners.retain(|owner| {
             let keep = !owner.releasing || self.frames.iter().any(|frame| matches!(frame.kind, Kind::Press(id) | Kind::Repeat(id) | Kind::Release(id) if id == owner.token));
-            if !keep { if let Some(claim) = &owner.claim { claim.released(); } }
+            if !keep && let Some(claim) = &owner.claim { claim.released(); }
             keep
         });
     }
@@ -442,11 +441,10 @@ impl PendingInput {
         // Keep only owners whose press may have reached the original child.
         // Unsent press+release pairs disappear together, never as phantom ups.
         self.owners.retain(|owner| {
-            if !owner.escaped {
-                if let Some(claim) = &owner.claim {
+            if !owner.escaped
+                && let Some(claim) = &owner.claim {
                     claim.canceled();
                 }
-            }
             owner.escaped
         });
         self.frames.retain_mut(|frame| match frame.kind {

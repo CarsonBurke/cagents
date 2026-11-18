@@ -79,11 +79,10 @@ pub(in crate::host) fn confirmed_identity_update(
             .proof
             .as_ref()
             .is_some_and(|proof| proof.is_complete())
-        || !replacement
+        || replacement
             .launch
             .session_id
-            .as_ref()
-            .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+            .as_ref().is_none_or(|id| uuid::Uuid::parse_str(id).is_err())
     {
         return false;
     }
@@ -1336,7 +1335,7 @@ impl Registry {
                 );
             }
             let run: Run = decode(&run)?;
-            let agent = read_agent(&tx, run.agent)?;
+            let agent = read_agent(tx, run.agent)?;
             return Ok(Accepted {
                 agent,
                 run,
@@ -1371,7 +1370,7 @@ impl Registry {
         }
         let agent = match &request.destination {
             Destination::Existing(id) => {
-                let agent = read_agent(&tx, *id)?;
+                let agent = read_agent(tx, *id)?;
                 if &agent.origin != origin {
                     return Err("This caller does not own the agent".into());
                 }
@@ -1380,7 +1379,7 @@ impl Registry {
                 }
                 // An interrupted run's effects are unknown; more work waits
                 // until someone has looked. Unfinished runs only queue it.
-                if has_unverified_run(&tx, *id)? {
+                if has_unverified_run(tx, *id)? {
                     return Err(UNVERIFIED_REFUSAL.into());
                 }
                 // An automation's schedule decides when it runs; nothing waits
@@ -1420,7 +1419,7 @@ impl Registry {
                     return Err(EARLIER_MESSAGES.into());
                 }
                 // A removed channel must never be resurrected by a follow-up.
-                require_placement(&tx, &agent.placement, &agent.spec.target.repository)?;
+                require_placement(tx, &agent.placement, &agent.spec.target.repository)?;
                 agent
             }
             Destination::New(spec) => {
@@ -1465,12 +1464,12 @@ impl Registry {
                 }
                 let placement = match &spec.target.placement {
                     Some(placement) => {
-                        require_placement(&tx, placement, &spec.target.repository)?;
+                        require_placement(tx, placement, &spec.target.repository)?;
                         placement.clone()
                     }
                     None => {
                         let channel = ChannelId::new();
-                        let ordinal = take_ordinal(&tx, "next_channel_ordinal")?;
+                        let ordinal = take_ordinal(tx, "next_channel_ordinal")?;
                         tx.execute(
                             "INSERT INTO channels(id, repository, title, ordinal, title_source) VALUES (?1, ?2, ?3, ?4, 0)",
                             params![channel.to_string(), repository, crate::workspace_model::channel_title_from_prompt(&request.prompt).unwrap_or_else(|| format!("{} agent", spec.provider.label())), ordinal],

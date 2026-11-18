@@ -290,14 +290,13 @@ pub(super) mod legacy {
         let plain = text.strip_suffix(&suffix)?;
         let mut ids = std::collections::HashSet::new();
         for (reference, source) in references.iter().zip(sources) {
-            if let Some(reference) = reference {
-                if !ids.insert(reference.id)
+            if let Some(reference) = reference
+                && (!ids.insert(reference.id)
                     || crate::chat::attachment_assets::restore_reference(reference, source)
-                        .is_none()
+                        .is_none())
                 {
                     return None;
                 }
-            }
         }
         Some((plain, references))
     }

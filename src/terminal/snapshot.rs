@@ -969,8 +969,8 @@ pub(crate) fn capture_viewport(
                 }
                 result => result.unwrap_or(0),
             };
-            if let Ok(link) = std::str::from_utf8(&uri[..length]) {
-                if !link.is_empty() {
+            if let Ok(link) = std::str::from_utf8(&uri[..length])
+                && !link.is_empty() {
                     if let Some(last) = hyperlinks
                         .last_mut()
                         .filter(|last| last.end == column && last.uri == link)
@@ -984,7 +984,6 @@ pub(crate) fn capture_viewport(
                         });
                     }
                 }
-            }
         }
         localize_file_links(&mut hyperlinks, &local_host);
         lines.push(Arc::new(RowSnapshot {

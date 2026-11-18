@@ -275,12 +275,11 @@ fn simple_commands(text: &str) -> Vec<Vec<String>> {
                 }
             }
             '\\' => {
-                if let Some(next) = chars.next() {
-                    if next != '\n' {
+                if let Some(next) = chars.next()
+                    && next != '\n' {
                         in_word = true;
                         word.push(next);
                     }
-                }
             }
             ';' | '&' | '|' | '\n' | '(' | ')' => {
                 finish_word(&mut word, &mut in_word, &mut words);

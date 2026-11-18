@@ -341,8 +341,8 @@ impl Snapshot {
             preview: String::new(),
             request: None,
         };
-        if kind == Kind::Waiting {
-            if let Some(request) = self.requests.first() {
+        if kind == Kind::Waiting
+            && let Some(request) = self.requests.first() {
                 content.request = Some(match request.kind {
                     super::RequestKind::Approval => RequestType::Approval,
                     super::RequestKind::Question => RequestType::Question,
@@ -356,7 +356,6 @@ impl Snapshot {
                     content.preview = presentation::preview(&request.title);
                 }
             }
-        }
         if content.preview.is_empty() {
             content.preview =
                 response_preview(&self.notification_preview, self.error.as_deref(), kind);

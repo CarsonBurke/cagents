@@ -156,8 +156,8 @@ fn completed_retained_automation_retires_only_after_exact_idle_close() {
     }
     impl Drop for Cleanup {
         fn drop(&mut self) {
-            if self.host.lock().unwrap().chats.contains_key(&self.id) {
-                if let Err(error) = crate::host::chat::process(
+            if self.host.lock().unwrap().chats.contains_key(&self.id)
+                && let Err(error) = crate::host::chat::process(
                     &self.host,
                     EXECUTION_CLIENT,
                     ClientRequest::ChatClose { chat_id: self.id },
@@ -167,7 +167,6 @@ fn completed_retained_automation_retires_only_after_exact_idle_close() {
                         error.message
                     );
                 }
-            }
         }
     }
     let _cleanup = Cleanup {

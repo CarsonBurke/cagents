@@ -342,8 +342,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         journal: &WorktreeJournal,
         mut report: WorktreeOperationReport,
     ) -> WorktreeOperationReport {
-        if report.state == WorktreeOperationState::Created && journal.pr_checkout.is_some() {
-            if let Err(error) = self.validate_created_pr_checkout(journal) {
+        if report.state == WorktreeOperationState::Created && journal.pr_checkout.is_some()
+            && let Err(error) = self.validate_created_pr_checkout(journal) {
                 // Applied remains a description of the original creation. A
                 // changed current checkout cannot authorize a new UI opening.
                 report.state = WorktreeOperationState::OutcomeUnknown;
@@ -352,7 +352,6 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     "The recorded PR checkout no longer matches its reviewed source or commit: {error}; inspect it before opening"
                 );
             }
-        }
         report
     }
 

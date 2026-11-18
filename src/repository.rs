@@ -2096,7 +2096,7 @@ fn fixed_fields(field: &[u8], index: usize, count: usize) -> Result<Vec<&[u8]>, 
 }
 
 /// The path of a `?` or `!` record, which is one space-separated field.
-fn path_record<'a>(field: &'a [u8], index: usize) -> Result<&'a [u8], GitParseError> {
+fn path_record(field: &[u8], index: usize) -> Result<&[u8], GitParseError> {
     if field.len() < 3 || field[1] != b' ' {
         Err(malformed("git status", index, "path is missing"))
     } else {
@@ -6369,11 +6369,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .into());
         }
         let tag = format!("refs/tags/{name}");
-        if explicit_remote.is_none() && ValidatedRefName::parse(tag.clone()).is_ok() {
-            if let Some(oid) = self.resolve_optional_ref(repository, &tag, cancellation)? {
+        if explicit_remote.is_none() && ValidatedRefName::parse(tag.clone()).is_ok()
+            && let Some(oid) = self.resolve_optional_ref(repository, &tag, cancellation)? {
                 return Ok(BaseRevision::object_id(oid.to_string())?);
             }
-        }
         let remote_name = explicit_remote.unwrap_or(name);
         if let Some((remote, branch)) = remotes
             .iter()
@@ -6430,15 +6429,13 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 .remote_heads
                 .iter()
                 .find(|head| head.remote == remote.name)
-            {
-                if refs
+                && refs
                     .remote
                     .iter()
                     .any(|reference| reference.name == head.target)
                 {
                     return Ok(BaseRevision::remote_ref(head.target.as_str())?);
                 }
-            }
             for branch in ["main", "master"] {
                 if let Some(reference) = refs.remote.iter().find(|reference| {
                     reference.name.as_str() == format!("refs/remotes/{}/{branch}", remote.name)

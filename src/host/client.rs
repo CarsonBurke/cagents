@@ -604,13 +604,13 @@ fn retention_pin_generation(
     host: &SharedHost,
     terminal: crate::model::TerminalId,
 ) -> Result<Option<String>, String> {
-    let result = super::agent_execution::registry(host).and_then(|registry| {
+    
+    super::agent_execution::registry(host).and_then(|registry| {
         registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .retention_pin_generation(terminal)
-    });
-    result
+    })
 }
 
 /// Capture the exact native pair before stopping the PTY. Re-resolving only

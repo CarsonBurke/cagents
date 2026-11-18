@@ -219,7 +219,7 @@ mod tests {
         store.apply(Event::Item(context("same", &body))).unwrap();
         let window = store.window().unwrap();
         assert!(window.items.iter().all(|item| item.id != "same"));
-        let descriptors: Vec<_> = store.copy_projection.iter().cloned().collect();
+        let descriptors: Vec<_> = store.copy_projection.to_vec();
         assert!(descriptors.len() > 1);
         let descriptor = descriptors[0]
             .clone()

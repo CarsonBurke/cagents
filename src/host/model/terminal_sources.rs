@@ -142,14 +142,13 @@ impl SourceAdmission<'_> {
                 }
             }
 
-            if let Some(pending) = pending {
-                if old.id != pending
+            if let Some(pending) = pending
+                && (old.id != pending
                     || !old.pending_terminal_start
-                    || !matches!(&old.kind, CardKind::Terminal(s) if s.launch == session.launch)
+                    || !matches!(&old.kind, CardKind::Terminal(s) if s.launch == session.launch))
                 {
                     return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
                 }
-            }
             view.panes[index].kind = CardKind::Terminal(session.clone());
             view.panes[index].pending_terminal_start = false;
             views::update_terminal_source(

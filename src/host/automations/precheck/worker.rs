@@ -513,11 +513,10 @@ impl Worker {
             Ok(_lease) => {
                 // The owner can publish between the first read and releasing its
                 // lease. Check again while excluding a still-starting owner.
-                if let Ok(receipt) = read_record::<Receipt>(&self.directory.join("receipt")) {
-                    if receipt.firing == self.firing && receipt.revision == self.revision {
+                if let Ok(receipt) = read_record::<Receipt>(&self.directory.join("receipt"))
+                    && receipt.firing == self.firing && receipt.revision == self.revision {
                         return Ok(Status::Complete(receipt.outcome));
                     }
-                }
                 if let Ok(started) = read_record::<Started>(&self.directory.join("started")) {
                     if started.firing != self.firing || started.revision != self.revision {
                         return Err(io::Error::other(

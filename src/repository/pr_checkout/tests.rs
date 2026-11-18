@@ -23,11 +23,10 @@ impl ProcessExecutor for NativeExecutor {
         if let Some(interceptor) = &mut *self.interceptor.lock().unwrap() {
             interceptor(command);
         }
-        if command.arguments.iter().any(|argument| argument == "fetch") {
-            if let Some(failure) = self.fetch_failure.lock().unwrap().take() {
+        if command.arguments.iter().any(|argument| argument == "fetch")
+            && let Some(failure) = self.fetch_failure.lock().unwrap().take() {
                 return failure;
             }
-        }
         let inherited_count = command
             .environment
             .get(OsStr::new("GIT_CONFIG_COUNT"))
@@ -859,8 +858,7 @@ fn deny_populated_directory_access(path: &Path) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
     assert_eq!(
         fs::read_dir(path)
-            .err()
-            .expect("permission fixture must actually deny directory reads; run as an ordinary UID")
+            .expect_err("permission fixture must actually deny directory reads; run as an ordinary UID")
             .kind(),
         io::ErrorKind::PermissionDenied
     );

@@ -114,13 +114,11 @@ struct FrozenProcess {
 /// Already stopped/traced processes are never resumed by this operation.
 impl Drop for FrozenProcess {
     fn drop(&mut self) {
-        if self.resume {
-            if let Err(error) = signal(&self.pidfd, libc::SIGCONT) {
-                if error.raw_os_error() != Some(libc::ESRCH) {
+        if self.resume
+            && let Err(error) = signal(&self.pidfd, libc::SIGCONT)
+                && error.raw_os_error() != Some(libc::ESRCH) {
                     tracing::error!(pid = self.identity.pid, %error, "failed to resume terminal process after close inspection");
                 }
-            }
-        }
     }
 }
 

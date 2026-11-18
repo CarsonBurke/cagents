@@ -5021,8 +5021,8 @@ fn start_terminal_view_owned_reserved(
     let redraw_handle = handle.clone();
     {
         let mut state = shared.lock().unwrap_or_else(|p| p.into_inner());
-        if !adopting {
-            if let Err(error) = state.install_startup_parent(
+        if !adopting
+            && let Err(error) = state.install_startup_parent(
                 client_id,
                 registered_session,
                 handle.clone(),
@@ -5034,7 +5034,6 @@ fn start_terminal_view_owned_reserved(
                 let _ = handle.shutdown();
                 return Err(error);
             }
-        }
         let record = state
             .terminals
             .get_mut(&terminal_id)

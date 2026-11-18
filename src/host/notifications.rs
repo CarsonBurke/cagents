@@ -1046,6 +1046,477 @@ impl JournalTestBridge {
     }
 }
 
+async fn run(
+    shared: Weak<Shared>,
+    host: Weak<HostLock>,
+    mut receiver: mpsc::Receiver<()>,
+    application: crate::notifications::Application,
+) {
+    let path =
+        crate::instance::project_dirs().map(|dirs| dirs.data_dir().join("agent-attention.sqlite3"));
+    let mut journal = path
+        .ok_or_else(|| "Notification data directory is unavailable".to_owned())
+        .and_then(|path| journal::Journal::open(&path));
+    let settings = preferences();
+    let settings_error = settings.as_ref().err().cloned();
+    let mut policy = settings.unwrap_or_else(|_| Preferences {
+        enabled: false,
+        ..Default::default()
+    });
+    let mut presence = BTreeMap::<ClientId, Presence>::new();
+    let mut proxy = None;
+    let mut activation = Activation::default();
+    // Only events observed during this daemon lifetime are eligible for retry.
+    // Restored attention stays visible in the UI without announcing old backlog.
+    let mut delivery = BTreeMap::<Target, Notice>::new();
+    let mut delivery_schedule = batching::Schedule::default();
+    let mut withdrawals = Withdrawals::default();
+    let mut next_attempt = Instant::now();
+    let mut retry_delay = RETRY_DELAY;
+    let mut snapshot = Snapshot {
+        diagnostic: settings_error,
+        ..Default::default()
+    };
+    match &mut journal {
+        Ok(journal) => {
+            if !policy.message_previews {
+                match journal.clear_content() {
+                    Ok(notices) => {
+                        for (id, target) in notices {
+                            withdraw_target(&mut withdrawals, id, &target);
+                        }
+                    }
+                    Err(error) => snapshot.diagnostic = Some(error),
+                }
+            }
+            match journal.list() {
+                Ok(notices) => snapshot.notices = notices,
+                Err(error) => snapshot.diagnostic = Some(error),
+            }
+        }
+        Err(error) => snapshot.diagnostic = Some(error.clone()),
+    }
+    if !policy.message_previews {
+        revoke_previews(&mut snapshot, &mut withdrawals);
+    }
+    withdrawals.protect(
+        snapshot
+            .notices
+            .iter()
+            .map(|notice| batching::desktop_id(&notice.event.target)),
+    );
+    publish(&shared, &host, snapshot.clone());
+    while wait_for_work(
+        &mut receiver,
+        if proxy.is_none() {
+            if !withdrawals.is_empty() {
+                Some(next_attempt)
+            } else {
+                delivery_schedule
+                    .deadline()
+                    .map(|due| due.max(next_attempt))
+            }
+        } else {
+            delivery_schedule.deadline()
+        },
+    )
+    .await
+    {
+        let Some(core) = shared.upgrade() else {
+            break;
+        };
+        let mut pending = take_pending(&core);
+        let current_presence = pending.presence_changed.then(|| {
+            core.presence
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+        });
+        drop(core);
+        if pending.stopped {
+            break;
+        }
+        if let Some(owner) = pending.portal_owner
+            && activation.portal_changed(owner)
+        {
+            // Register with the new portal before anything else calls it, or
+            // it identifies this connection without the application ID.
+            proxy = None;
+            next_attempt = Instant::now();
+        }
+        let Ok(journal) = &mut journal else {
+            if let Err(error) = &journal {
+                for (_, receipt) in pending.committed_events.drain(..) {
+                    receipt.finish(Err(error.clone()));
+                }
+            }
+            // Without a journal there is no backlog to deliver, but the
+            // portal may be fine, so a test is still answered by the portal
+            // itself rather than dropped as if the broker had stopped.
+            if !pending.tests.is_empty() {
+                if proxy.is_none() {
+                    match connect(shared.clone(), application, &mut activation).await {
+                        Ok(connected) => proxy = Some(connected),
+                        Err(error) => {
+                            answer_tests(&pending.tests, &TestOutcome::Unavailable(error))
+                        }
+                    }
+                }
+                if let Some(backend) = &proxy {
+                    let outcome = send_test(backend).await;
+                    if outcome != TestOutcome::Sent {
+                        proxy = None;
+                    }
+                    answer_tests(&pending.tests, &outcome);
+                }
+            }
+            continue;
+        };
+        if let Some(current) = current_presence {
+            for (client, update) in &current {
+                if stopped(&shared) {
+                    return;
+                }
+                if presence.is_empty() {
+                    next_attempt = Instant::now();
+                    retry_delay = RETRY_DELAY;
+                }
+                let changed = presence.get(client).is_none_or(|old| {
+                    old.sessions != update.sessions || old.destination() != update.destination()
+                });
+                let sessions = if changed {
+                    update.sessions.clone()
+                } else {
+                    update.focused.into_iter().collect()
+                };
+                if let Err(error) = journal.remember_window(sessions, &update.window) {
+                    snapshot.diagnostic = Some(error);
+                }
+            }
+            presence = current;
+        }
+        if pending.reload {
+            match pending.preferences.map_or_else(preferences, Ok) {
+                Ok(settings) => policy = settings,
+                Err(error) => {
+                    policy.enabled = false;
+                    snapshot.diagnostic = Some(error);
+                }
+            }
+            if !policy.message_previews {
+                revoke_previews(&mut snapshot, &mut withdrawals);
+                match journal.clear_content() {
+                    Ok(notices) => {
+                        for (id, target) in notices {
+                            withdraw_target(&mut withdrawals, id, &target);
+                        }
+                    }
+                    Err(error) => snapshot.diagnostic = Some(error),
+                }
+                for notice in delivery.values_mut() {
+                    notice.event.content = None;
+                }
+            }
+            // Disabling delivery or a category also retracts its already
+            // published desktop group. Attention remains in the journal;
+            // preferences never manufacture an acknowledgement.
+            for notice in &snapshot.notices {
+                let focused = presence.values().any(|window| {
+                    notice
+                        .event
+                        .source_session()
+                        .is_some_and(|session| window.focused == Some(session))
+                        || window.focused_target.as_ref() == Some(&notice.event.target)
+                });
+                if !policy.allows(notice.event.evidence.kind, focused) {
+                    withdraw_notice(&mut withdrawals, notice);
+                }
+            }
+            next_attempt = Instant::now();
+            retry_delay = RETRY_DELAY;
+        }
+        if let Some(inboxes) = pending.inboxes.take() {
+            // A complete durable pending snapshot retires inbox attention only
+            // when mail is gone; offline recipients keep existing attention.
+            match journal.list() {
+                Ok(notices) => {
+                    for notice in notices {
+                        if let Target::SessionInbox(lineage) = notice.event.target
+                            && !inboxes.pending.contains(&lineage)
+                        {
+                            pending.retired.insert(Target::SessionInbox(lineage));
+                        }
+                    }
+                }
+                Err(error) => snapshot.diagnostic = Some(error),
+            }
+            pending.events.extend(inboxes.events);
+        }
+        for session in pending.retired {
+            if stopped(&shared) {
+                return;
+            }
+            delivery.remove(&session);
+            if let Some(old) = snapshot
+                .notices
+                .iter()
+                .find(|notice| notice.event.target() == session)
+            {
+                withdraw_notice(&mut withdrawals, old);
+            }
+            if let Err(error) = journal.retire(session) {
+                snapshot.diagnostic = Some(error);
+            }
+        }
+        for id in pending.acknowledged {
+            if stopped(&shared) {
+                return;
+            }
+            delivery.retain(|_, notice| notice.id != id);
+            if let Err(error) = journal.acknowledge(id) {
+                snapshot.diagnostic = Some(error);
+            }
+            if let Some(notice) = snapshot.notices.iter().find(|notice| notice.id == id) {
+                withdraw_notice(&mut withdrawals, notice);
+            }
+        }
+        let events = pending
+            .events
+            .into_values()
+            .map(|event| (event, None))
+            .chain(
+                pending
+                    .committed_events
+                    .into_iter()
+                    .map(|(event, receipt)| (event, Some(receipt))),
+            );
+        for (event, receipt) in events {
+            if stopped(&shared) {
+                return;
+            }
+            let focused = presence.values().any(|window| {
+                event
+                    .source_session()
+                    .is_some_and(|session| window.focused == Some(session))
+                    || window.focused_target.as_ref() == Some(&event.target)
+            });
+            let suppressed = !policy.allows(event.evidence.kind, focused);
+            match record_attention_committed_policy(journal, event, suppressed, receipt, &policy) {
+                Ok(Some(notice)) => {
+                    delivery.remove(&notice.event.target());
+                    if let Some(old) = snapshot.notices.iter().find(|old| {
+                        old.event.target.storage_key() == notice.event.target.storage_key()
+                    }) {
+                        if suppressed {
+                            withdraw_notice(&mut withdrawals, old);
+                        } else {
+                            queue_withdrawal(&mut withdrawals, old.id);
+                        }
+                    }
+                    if !suppressed {
+                        delivery_schedule.update(
+                            notice.event.target(),
+                            notice.event.evidence.kind,
+                            Instant::now(),
+                        );
+                        delivery.insert(notice.event.target(), notice);
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => snapshot.diagnostic = Some(error),
+            }
+        }
+        match journal.list() {
+            Ok(notices) => snapshot.notices = notices,
+            Err(error) => snapshot.diagnostic = Some(error),
+        }
+        if !policy.message_previews {
+            for notice in &mut snapshot.notices {
+                notice.event.content = None;
+            }
+        }
+        withdrawals.protect(
+            snapshot
+                .notices
+                .iter()
+                .map(|notice| batching::desktop_id(&notice.event.target)),
+        );
+        for notice in delivery.values_mut() {
+            if let Some(current) = snapshot
+                .notices
+                .iter()
+                .find(|current| current.id == notice.id)
+            {
+                *notice = current.clone();
+            }
+        }
+        // Journal eviction also bounds retries across multiple disconnected
+        // batches. Never announce an event whose durable identity was evicted.
+        let retained = snapshot
+            .notices
+            .iter()
+            .map(|notice| notice.id)
+            .collect::<BTreeSet<_>>();
+        delivery.retain(|_, notice| retained.contains(&notice.id));
+        // A delayed completion stops being a desktop alert once the user has
+        // returned to that pane or disabled its category.
+        delivery.retain(|_, notice| {
+            let focused = presence.values().any(|window| {
+                notice
+                    .event
+                    .source_session()
+                    .is_some_and(|session| window.focused == Some(session))
+                    || window.focused_target.as_ref() == Some(&notice.event.target)
+            });
+            policy.allows(notice.event.evidence.kind, focused)
+        });
+        let backlog_due = (delivery
+            .keys()
+            .any(|target| delivery_schedule.ready(target, Instant::now()))
+            || !withdrawals.is_empty())
+            && Instant::now() >= next_attempt;
+        // A test is a person asking right now, so it retries a portal that
+        // the backlog is still backing off from. Its failure is answered to
+        // that person rather than raised as every window's diagnostic, and
+        // leaves the backlog's schedule alone.
+        if proxy.is_none() && (backlog_due || !pending.tests.is_empty()) {
+            match connect(shared.clone(), application, &mut activation).await {
+                Ok(connected) => {
+                    proxy = Some(connected);
+                    snapshot.diagnostic = None;
+                    retry_delay = RETRY_DELAY;
+                }
+                Err(error) => {
+                    answer_tests(&pending.tests, &TestOutcome::Unavailable(error.clone()));
+                    if backlog_due {
+                        snapshot.diagnostic = Some(error);
+                        next_attempt = Instant::now() + retry_delay;
+                        retry_delay = (retry_delay * 2).min(Duration::from_secs(300));
+                    }
+                }
+            }
+        }
+        if let Some(backend) = &proxy {
+            let mut failed = false;
+            // Ahead of the backlog, so the answer is not held behind it.
+            if !pending.tests.is_empty() {
+                let outcome = send_test(backend).await;
+                failed = outcome != TestOutcome::Sent;
+                answer_tests(&pending.tests, &outcome);
+            }
+            // Yield to coalesced lifecycle/focus/acknowledgment work between
+            // bounded batches, rather than delaying it behind thousands of alerts.
+            // A portal that just failed the test is dropped below, not
+            // handed the backlog as well.
+            let batch: Vec<_> = if failed {
+                Vec::new()
+            } else {
+                delivery_batch(&delivery, &delivery_schedule, &withdrawals, Instant::now())
+            };
+            for notice in batch {
+                if stopped(&shared) {
+                    return;
+                }
+                match send(backend, &notice, activation.receives_actions()).await {
+                    Ok(()) => {
+                        delivery.remove(&notice.event.target());
+                        if let Err(error) = journal.delivered(notice.id) {
+                            snapshot.diagnostic = Some(error);
+                        }
+                    }
+                    Err(error) => {
+                        snapshot.diagnostic = Some(error);
+                        failed = true;
+                        break;
+                    }
+                }
+            }
+            // Cleanup is bounded like delivery. A desktop that stops answering
+            // cannot hold daemon shutdown behind thousands of remove calls.
+            for _ in 0..8 {
+                if stopped(&shared) {
+                    return;
+                }
+                if failed {
+                    break;
+                }
+                let Some(entry) = withdrawals.pop_first() else {
+                    break;
+                };
+                if let Err(error) = remove(backend, entry.id()).await {
+                    withdrawals.requeue(entry);
+                    snapshot.diagnostic = Some(error);
+                    failed = true;
+                    break;
+                }
+            }
+            if failed {
+                proxy = None;
+                next_attempt = Instant::now() + retry_delay;
+                retry_delay = (retry_delay * 2).min(Duration::from_secs(300));
+            } else if (delivery
+                .keys()
+                .any(|target| delivery_schedule.ready(target, Instant::now()))
+                || !withdrawals.is_empty())
+                && let Some(shared) = shared.upgrade()
+            {
+                let _ = shared.wake.try_send(());
+            }
+        }
+        match journal.list() {
+            Ok(notices) => snapshot.notices = notices,
+            Err(error) => snapshot.diagnostic = Some(error),
+        }
+        if !policy.message_previews {
+            for notice in &mut snapshot.notices {
+                notice.event.content = None;
+            }
+        }
+        for (action, token) in pending.actions {
+            if let Some(notice) = action_notice(&snapshot, action)
+                && let Some(host) = host.upgrade() {
+                    let window = host
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .activate_notification_destination(
+                            notice.event.target(),
+                            notice.event.source_session(),
+                            notice.window.as_deref(),
+                            notice.event.destination.as_ref(),
+                        );
+                    // Activation and the matched executable handshake can wait;
+                    // they never run under the daemon's session lock.
+                    match crate::instance::activate_destination(&window, token.as_deref()) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            if let Err(error) = crate::instance::launch_notification_destination(
+                                &window,
+                                token.as_deref(),
+                            ) {
+                                tracing::warn!(%error, "could not launch notification destination");
+                                snapshot.diagnostic = Some(format!(
+                                    "Could not open the notification's window: {error}"
+                                ));
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "could not activate notification destination");
+                            snapshot.diagnostic = Some(format!(
+                                "Could not activate the notification's window: {error}"
+                            ))
+                        }
+                    }
+                }
+        }
+        let delivery_groups = delivery
+            .keys()
+            .map(batching::desktop_id)
+            .collect::<BTreeSet<_>>();
+        delivery_schedule.retain(|group| delivery_groups.contains(group));
+        publish(&shared, &host, snapshot.clone());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1987,477 +2458,5 @@ mod tests {
                 "old exact ACK does not consume successor attention"
             );
         }
-    }
-}
-
-async fn run(
-    shared: Weak<Shared>,
-    host: Weak<HostLock>,
-    mut receiver: mpsc::Receiver<()>,
-    application: crate::notifications::Application,
-) {
-    let path =
-        crate::instance::project_dirs().map(|dirs| dirs.data_dir().join("agent-attention.sqlite3"));
-    let mut journal = path
-        .ok_or_else(|| "Notification data directory is unavailable".to_owned())
-        .and_then(|path| journal::Journal::open(&path));
-    let settings = preferences();
-    let settings_error = settings.as_ref().err().cloned();
-    let mut policy = settings.unwrap_or_else(|_| Preferences {
-        enabled: false,
-        ..Default::default()
-    });
-    let mut presence = BTreeMap::<ClientId, Presence>::new();
-    let mut proxy = None;
-    let mut activation = Activation::default();
-    // Only events observed during this daemon lifetime are eligible for retry.
-    // Restored attention stays visible in the UI without announcing old backlog.
-    let mut delivery = BTreeMap::<Target, Notice>::new();
-    let mut delivery_schedule = batching::Schedule::default();
-    let mut withdrawals = Withdrawals::default();
-    let mut next_attempt = Instant::now();
-    let mut retry_delay = RETRY_DELAY;
-    let mut snapshot = Snapshot {
-        diagnostic: settings_error,
-        ..Default::default()
-    };
-    match &mut journal {
-        Ok(journal) => {
-            if !policy.message_previews {
-                match journal.clear_content() {
-                    Ok(notices) => {
-                        for (id, target) in notices {
-                            withdraw_target(&mut withdrawals, id, &target);
-                        }
-                    }
-                    Err(error) => snapshot.diagnostic = Some(error),
-                }
-            }
-            match journal.list() {
-                Ok(notices) => snapshot.notices = notices,
-                Err(error) => snapshot.diagnostic = Some(error),
-            }
-        }
-        Err(error) => snapshot.diagnostic = Some(error.clone()),
-    }
-    if !policy.message_previews {
-        revoke_previews(&mut snapshot, &mut withdrawals);
-    }
-    withdrawals.protect(
-        snapshot
-            .notices
-            .iter()
-            .map(|notice| batching::desktop_id(&notice.event.target)),
-    );
-    publish(&shared, &host, snapshot.clone());
-    while wait_for_work(
-        &mut receiver,
-        if proxy.is_none() {
-            if !withdrawals.is_empty() {
-                Some(next_attempt)
-            } else {
-                delivery_schedule
-                    .deadline()
-                    .map(|due| due.max(next_attempt))
-            }
-        } else {
-            delivery_schedule.deadline()
-        },
-    )
-    .await
-    {
-        let Some(core) = shared.upgrade() else {
-            break;
-        };
-        let mut pending = take_pending(&core);
-        let current_presence = pending.presence_changed.then(|| {
-            core.presence
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .clone()
-        });
-        drop(core);
-        if pending.stopped {
-            break;
-        }
-        if let Some(owner) = pending.portal_owner
-            && activation.portal_changed(owner)
-        {
-            // Register with the new portal before anything else calls it, or
-            // it identifies this connection without the application ID.
-            proxy = None;
-            next_attempt = Instant::now();
-        }
-        let Ok(journal) = &mut journal else {
-            if let Err(error) = &journal {
-                for (_, receipt) in pending.committed_events.drain(..) {
-                    receipt.finish(Err(error.clone()));
-                }
-            }
-            // Without a journal there is no backlog to deliver, but the
-            // portal may be fine, so a test is still answered by the portal
-            // itself rather than dropped as if the broker had stopped.
-            if !pending.tests.is_empty() {
-                if proxy.is_none() {
-                    match connect(shared.clone(), application, &mut activation).await {
-                        Ok(connected) => proxy = Some(connected),
-                        Err(error) => {
-                            answer_tests(&pending.tests, &TestOutcome::Unavailable(error))
-                        }
-                    }
-                }
-                if let Some(backend) = &proxy {
-                    let outcome = send_test(backend).await;
-                    if outcome != TestOutcome::Sent {
-                        proxy = None;
-                    }
-                    answer_tests(&pending.tests, &outcome);
-                }
-            }
-            continue;
-        };
-        if let Some(current) = current_presence {
-            for (client, update) in &current {
-                if stopped(&shared) {
-                    return;
-                }
-                if presence.is_empty() {
-                    next_attempt = Instant::now();
-                    retry_delay = RETRY_DELAY;
-                }
-                let changed = presence.get(client).is_none_or(|old| {
-                    old.sessions != update.sessions || old.destination() != update.destination()
-                });
-                let sessions = if changed {
-                    update.sessions.clone()
-                } else {
-                    update.focused.into_iter().collect()
-                };
-                if let Err(error) = journal.remember_window(sessions, &update.window) {
-                    snapshot.diagnostic = Some(error);
-                }
-            }
-            presence = current;
-        }
-        if pending.reload {
-            match pending.preferences.map_or_else(preferences, Ok) {
-                Ok(settings) => policy = settings,
-                Err(error) => {
-                    policy.enabled = false;
-                    snapshot.diagnostic = Some(error);
-                }
-            }
-            if !policy.message_previews {
-                revoke_previews(&mut snapshot, &mut withdrawals);
-                match journal.clear_content() {
-                    Ok(notices) => {
-                        for (id, target) in notices {
-                            withdraw_target(&mut withdrawals, id, &target);
-                        }
-                    }
-                    Err(error) => snapshot.diagnostic = Some(error),
-                }
-                for notice in delivery.values_mut() {
-                    notice.event.content = None;
-                }
-            }
-            // Disabling delivery or a category also retracts its already
-            // published desktop group. Attention remains in the journal;
-            // preferences never manufacture an acknowledgement.
-            for notice in &snapshot.notices {
-                let focused = presence.values().any(|window| {
-                    notice
-                        .event
-                        .source_session()
-                        .is_some_and(|session| window.focused == Some(session))
-                        || window.focused_target.as_ref() == Some(&notice.event.target)
-                });
-                if !policy.allows(notice.event.evidence.kind, focused) {
-                    withdraw_notice(&mut withdrawals, notice);
-                }
-            }
-            next_attempt = Instant::now();
-            retry_delay = RETRY_DELAY;
-        }
-        if let Some(inboxes) = pending.inboxes.take() {
-            // A complete durable pending snapshot retires inbox attention only
-            // when mail is gone; offline recipients keep existing attention.
-            match journal.list() {
-                Ok(notices) => {
-                    for notice in notices {
-                        if let Target::SessionInbox(lineage) = notice.event.target
-                            && !inboxes.pending.contains(&lineage)
-                        {
-                            pending.retired.insert(Target::SessionInbox(lineage));
-                        }
-                    }
-                }
-                Err(error) => snapshot.diagnostic = Some(error),
-            }
-            pending.events.extend(inboxes.events);
-        }
-        for session in pending.retired {
-            if stopped(&shared) {
-                return;
-            }
-            delivery.remove(&session);
-            if let Some(old) = snapshot
-                .notices
-                .iter()
-                .find(|notice| notice.event.target() == session)
-            {
-                withdraw_notice(&mut withdrawals, old);
-            }
-            if let Err(error) = journal.retire(session) {
-                snapshot.diagnostic = Some(error);
-            }
-        }
-        for id in pending.acknowledged {
-            if stopped(&shared) {
-                return;
-            }
-            delivery.retain(|_, notice| notice.id != id);
-            if let Err(error) = journal.acknowledge(id) {
-                snapshot.diagnostic = Some(error);
-            }
-            if let Some(notice) = snapshot.notices.iter().find(|notice| notice.id == id) {
-                withdraw_notice(&mut withdrawals, notice);
-            }
-        }
-        let events = pending
-            .events
-            .into_values()
-            .map(|event| (event, None))
-            .chain(
-                pending
-                    .committed_events
-                    .into_iter()
-                    .map(|(event, receipt)| (event, Some(receipt))),
-            );
-        for (event, receipt) in events {
-            if stopped(&shared) {
-                return;
-            }
-            let focused = presence.values().any(|window| {
-                event
-                    .source_session()
-                    .is_some_and(|session| window.focused == Some(session))
-                    || window.focused_target.as_ref() == Some(&event.target)
-            });
-            let suppressed = !policy.allows(event.evidence.kind, focused);
-            match record_attention_committed_policy(journal, event, suppressed, receipt, &policy) {
-                Ok(Some(notice)) => {
-                    delivery.remove(&notice.event.target());
-                    if let Some(old) = snapshot.notices.iter().find(|old| {
-                        old.event.target.storage_key() == notice.event.target.storage_key()
-                    }) {
-                        if suppressed {
-                            withdraw_notice(&mut withdrawals, old);
-                        } else {
-                            queue_withdrawal(&mut withdrawals, old.id);
-                        }
-                    }
-                    if !suppressed {
-                        delivery_schedule.update(
-                            notice.event.target(),
-                            notice.event.evidence.kind,
-                            Instant::now(),
-                        );
-                        delivery.insert(notice.event.target(), notice);
-                    }
-                }
-                Ok(None) => {}
-                Err(error) => snapshot.diagnostic = Some(error),
-            }
-        }
-        match journal.list() {
-            Ok(notices) => snapshot.notices = notices,
-            Err(error) => snapshot.diagnostic = Some(error),
-        }
-        if !policy.message_previews {
-            for notice in &mut snapshot.notices {
-                notice.event.content = None;
-            }
-        }
-        withdrawals.protect(
-            snapshot
-                .notices
-                .iter()
-                .map(|notice| batching::desktop_id(&notice.event.target)),
-        );
-        for notice in delivery.values_mut() {
-            if let Some(current) = snapshot
-                .notices
-                .iter()
-                .find(|current| current.id == notice.id)
-            {
-                *notice = current.clone();
-            }
-        }
-        // Journal eviction also bounds retries across multiple disconnected
-        // batches. Never announce an event whose durable identity was evicted.
-        let retained = snapshot
-            .notices
-            .iter()
-            .map(|notice| notice.id)
-            .collect::<BTreeSet<_>>();
-        delivery.retain(|_, notice| retained.contains(&notice.id));
-        // A delayed completion stops being a desktop alert once the user has
-        // returned to that pane or disabled its category.
-        delivery.retain(|_, notice| {
-            let focused = presence.values().any(|window| {
-                notice
-                    .event
-                    .source_session()
-                    .is_some_and(|session| window.focused == Some(session))
-                    || window.focused_target.as_ref() == Some(&notice.event.target)
-            });
-            policy.allows(notice.event.evidence.kind, focused)
-        });
-        let backlog_due = (delivery
-            .keys()
-            .any(|target| delivery_schedule.ready(target, Instant::now()))
-            || !withdrawals.is_empty())
-            && Instant::now() >= next_attempt;
-        // A test is a person asking right now, so it retries a portal that
-        // the backlog is still backing off from. Its failure is answered to
-        // that person rather than raised as every window's diagnostic, and
-        // leaves the backlog's schedule alone.
-        if proxy.is_none() && (backlog_due || !pending.tests.is_empty()) {
-            match connect(shared.clone(), application, &mut activation).await {
-                Ok(connected) => {
-                    proxy = Some(connected);
-                    snapshot.diagnostic = None;
-                    retry_delay = RETRY_DELAY;
-                }
-                Err(error) => {
-                    answer_tests(&pending.tests, &TestOutcome::Unavailable(error.clone()));
-                    if backlog_due {
-                        snapshot.diagnostic = Some(error);
-                        next_attempt = Instant::now() + retry_delay;
-                        retry_delay = (retry_delay * 2).min(Duration::from_secs(300));
-                    }
-                }
-            }
-        }
-        if let Some(backend) = &proxy {
-            let mut failed = false;
-            // Ahead of the backlog, so the answer is not held behind it.
-            if !pending.tests.is_empty() {
-                let outcome = send_test(backend).await;
-                failed = outcome != TestOutcome::Sent;
-                answer_tests(&pending.tests, &outcome);
-            }
-            // Yield to coalesced lifecycle/focus/acknowledgment work between
-            // bounded batches, rather than delaying it behind thousands of alerts.
-            // A portal that just failed the test is dropped below, not
-            // handed the backlog as well.
-            let batch: Vec<_> = if failed {
-                Vec::new()
-            } else {
-                delivery_batch(&delivery, &delivery_schedule, &withdrawals, Instant::now())
-            };
-            for notice in batch {
-                if stopped(&shared) {
-                    return;
-                }
-                match send(backend, &notice, activation.receives_actions()).await {
-                    Ok(()) => {
-                        delivery.remove(&notice.event.target());
-                        if let Err(error) = journal.delivered(notice.id) {
-                            snapshot.diagnostic = Some(error);
-                        }
-                    }
-                    Err(error) => {
-                        snapshot.diagnostic = Some(error);
-                        failed = true;
-                        break;
-                    }
-                }
-            }
-            // Cleanup is bounded like delivery. A desktop that stops answering
-            // cannot hold daemon shutdown behind thousands of remove calls.
-            for _ in 0..8 {
-                if stopped(&shared) {
-                    return;
-                }
-                if failed {
-                    break;
-                }
-                let Some(entry) = withdrawals.pop_first() else {
-                    break;
-                };
-                if let Err(error) = remove(backend, entry.id()).await {
-                    withdrawals.requeue(entry);
-                    snapshot.diagnostic = Some(error);
-                    failed = true;
-                    break;
-                }
-            }
-            if failed {
-                proxy = None;
-                next_attempt = Instant::now() + retry_delay;
-                retry_delay = (retry_delay * 2).min(Duration::from_secs(300));
-            } else if (delivery
-                .keys()
-                .any(|target| delivery_schedule.ready(target, Instant::now()))
-                || !withdrawals.is_empty())
-                && let Some(shared) = shared.upgrade()
-            {
-                let _ = shared.wake.try_send(());
-            }
-        }
-        match journal.list() {
-            Ok(notices) => snapshot.notices = notices,
-            Err(error) => snapshot.diagnostic = Some(error),
-        }
-        if !policy.message_previews {
-            for notice in &mut snapshot.notices {
-                notice.event.content = None;
-            }
-        }
-        for (action, token) in pending.actions {
-            if let Some(notice) = action_notice(&snapshot, action) {
-                if let Some(host) = host.upgrade() {
-                    let window = host
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .activate_notification_destination(
-                            notice.event.target(),
-                            notice.event.source_session(),
-                            notice.window.as_deref(),
-                            notice.event.destination.as_ref(),
-                        );
-                    // Activation and the matched executable handshake can wait;
-                    // they never run under the daemon's session lock.
-                    match crate::instance::activate_destination(&window, token.as_deref()) {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            if let Err(error) = crate::instance::launch_notification_destination(
-                                &window,
-                                token.as_deref(),
-                            ) {
-                                tracing::warn!(%error, "could not launch notification destination");
-                                snapshot.diagnostic = Some(format!(
-                                    "Could not open the notification's window: {error}"
-                                ));
-                            }
-                        }
-                        Err(error) => {
-                            tracing::warn!(%error, "could not activate notification destination");
-                            snapshot.diagnostic = Some(format!(
-                                "Could not activate the notification's window: {error}"
-                            ))
-                        }
-                    }
-                }
-            }
-        }
-        let delivery_groups = delivery
-            .keys()
-            .map(batching::desktop_id)
-            .collect::<BTreeSet<_>>();
-        delivery_schedule.retain(|group| delivery_groups.contains(group));
-        publish(&shared, &host, snapshot.clone());
     }
 }

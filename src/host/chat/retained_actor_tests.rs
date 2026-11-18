@@ -2258,8 +2258,8 @@ fn sigkill_host_fixture(semantic_held: bool) {
                 true
             };
             let helper = coordinator.helper.as_mut().unwrap();
-            if !helper_collected && release && helper.exited() {
-                if let Some(status) = helper.reap() {
+            if !helper_collected && release && helper.exited()
+                && let Some(status) = helper.reap() {
                     assert!(libc::WIFEXITED(status));
                     assert_eq!(
                         libc::WEXITSTATUS(status),
@@ -2272,7 +2272,6 @@ fn sigkill_host_fixture(semantic_held: bool) {
                         &SigkillMarker::for_actor(&case, &receipt.identity),
                     );
                 }
-            }
             if let Some(status) = coordinator.successor.as_mut().unwrap().poll() {
                 break status;
             }
@@ -4409,8 +4408,7 @@ fn abandoned_claude_actor_resumes_only_without_a_surviving_group_member() {
             .parse()
             .unwrap();
         let refused = prepare()
-            .err()
-            .expect("a process left in the provider's group may still write the conversation");
+            .expect_err("a process left in the provider's group may still write the conversation");
         assert!(
             refused.message.contains("without verified retirement"),
             "{}",
@@ -4923,8 +4921,7 @@ fn unnamed_claude_card_resumes_only_what_its_ended_actor_confirmed() {
     );
     if mode == "abandoned" {
         let refused = prepared
-            .err()
-            .expect("an actor that may have confirmed a conversation never starts a new one");
+            .expect_err("an actor that may have confirmed a conversation never starts a new one");
         assert!(
             refused
                 .message
@@ -5052,8 +5049,7 @@ fn unnamed_claude_card_resumes_only_what_its_ended_actor_confirmed() {
             client,
             ClientRequest::ChatPrepareResume { source },
         )
-        .err()
-        .expect("a running conversation is never prepared again");
+        .expect_err("a running conversation is never prepared again");
         assert!(
             refused
                 .message

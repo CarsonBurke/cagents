@@ -1662,11 +1662,11 @@ pub(super) fn preflight_retirement(
     let Ok(registry) = registry(host) else {
         return Ok(());
     };
-    let result = registry
+    
+    registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .preflight_agent_retirement(&HostedSession::Chat(session.clone()));
-    result
+        .preflight_agent_retirement(&HostedSession::Chat(session.clone()))
 }
 
 /// Serializes an agent's operations. The value is the run whose dispatcher
@@ -2609,9 +2609,8 @@ fn console_line(item: &chat::Item, now: u64) -> Option<String> {
     use chat::{ChangeKind, CommandAction, DeliveryKind, ItemContent, ToolStatus};
     let running = item.content.status() == Some(ToolStatus::Running);
     if running
-        && !item
-            .started_at
-            .is_some_and(|started| now.saturating_sub(started) >= CONSOLE_RUNNING_AFTER_MILLIS)
+        && item
+            .started_at.is_none_or(|started| now.saturating_sub(started) < CONSOLE_RUNNING_AFTER_MILLIS)
     {
         return None;
     }

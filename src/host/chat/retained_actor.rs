@@ -1541,14 +1541,13 @@ pub(super) fn publish_authenticated_source_for_start(
         return Err("Pending publication changed its exact authenticated actor".into());
     }
     let install = !matches!(publication, Publication::Close);
-    if let Publication::Console(intent) = publication {
-        if handle.actor_identity().is_none_or(|identity| {
+    if let Publication::Console(intent) = publication
+        && (handle.actor_identity().is_none_or(|identity| {
             identity.instance != intent.actor || identity.record != intent.owner
-        }) || pair.as_ref() != intent.replacement_holder.as_ref()
+        }) || pair.as_ref() != intent.replacement_holder.as_ref())
         {
             return Err("Console publication lost its exact provider or replacement holder".into());
         }
-    }
     if install == handle.is_close_only() {
         return Err("Retained publication mode does not match its authenticated attachment".into());
     }
@@ -3453,8 +3452,8 @@ pub(in crate::host) fn reconcile_retired_actors(host: &SharedHost) -> Result<(),
                             .actor_identity()
                             .is_some_and(|identity| identity.instance == ownership.actor())
                     });
-                if pending && !attached {
-                    if let Err(error) =
+                if pending && !attached
+                    && let Err(error) =
                         close_unattached(host, ownership.source(), Some(ownership.owner().clone()))
                     {
                         // Actor-local notification/retirement failures keep the
@@ -3492,7 +3491,6 @@ pub(in crate::host) fn reconcile_retired_actors(host: &SharedHost) -> Result<(),
                         tracing::warn!(actor=%ownership.actor(), error=%diagnostic,
                             "Pending retained actor cleanup remains retryable; durable ownership was preserved");
                     }
-                }
                 continue;
             }
             // Execution exit and parent wait collection are distinct. Only the
@@ -3620,7 +3618,7 @@ pub(in crate::host) fn finish_close(
         let execution = !loss.affected_runs.is_empty();
         let owner = capture_execution_owner(
             &registry,
-            &handle,
+            handle,
             &identity,
             &source,
             execution,
@@ -3685,7 +3683,7 @@ pub(in crate::host) fn finish_close(
             target.publish_required(host, &registry, required.as_deref(), &mut execution_owner)?;
             let owner = capture_execution_owner(
                 &registry,
-                &handle,
+                handle,
                 &identity,
                 &source,
                 execution,

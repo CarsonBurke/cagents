@@ -505,11 +505,10 @@ pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, St
             if libc::setsid() == -1 || libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
                 return Err(io::Error::last_os_error());
             }
-            if let Some(directory) = directory_fd {
-                if libc::fcntl(directory, libc::F_SETFD, 0) == -1 {
+            if let Some(directory) = directory_fd
+                && libc::fcntl(directory, libc::F_SETFD, 0) == -1 {
                     return Err(io::Error::last_os_error());
                 }
-            }
             Ok(())
         });
     }

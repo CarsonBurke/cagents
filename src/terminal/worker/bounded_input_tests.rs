@@ -1122,8 +1122,7 @@ fn wrapped_handoff_retains_coalesced_input_and_refuses_before_transfer() {
                         result
                             .recv_timeout(crate::test_timing::EVENTUALLY)
                             .unwrap()
-                            .err()
-                            .expect("Carry must refuse pending input")
+                            .expect_err("Carry must refuse pending input")
                     }),
                 )
             }
@@ -1135,8 +1134,7 @@ fn wrapped_handoff_retains_coalesced_input_and_refuses_before_transfer() {
                         result
                             .recv_timeout(crate::test_timing::EVENTUALLY)
                             .unwrap()
-                            .err()
-                            .expect("Preserve must refuse pending input")
+                            .expect_err("Preserve must refuse pending input")
                     }),
                 )
             }
@@ -1505,9 +1503,8 @@ fn inactive_pty_and_exited_child_still_observe_capture_cancellation() {
         commands.send(Command::Shutdown).unwrap();
     }
     waiter.join().unwrap();
-    assert_eq!(
+    assert!(
         observed.unwrap(),
-        true,
         "queued exact cancellation was ignored"
     );
 }

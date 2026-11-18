@@ -735,9 +735,9 @@ fn prepare_with_checkpoints(
         // Establish anonymous-file support before creating copy directories.
         // Its inode stays unnamed until exact-FD no-replace publication; a
         // shared parent cannot replace a temporary source or cleanup target.
-        let mut output = fs_safety::create_anonymous_in(&target, 0o600).map_err(error)?;
+        let mut output = fs_safety::create_anonymous_in(target, 0o600).map_err(error)?;
         let parent = fs_safety::create_directories_beneath(
-            &target,
+            target,
             path.parent().unwrap_or(Path::new("")),
             0o700,
         )

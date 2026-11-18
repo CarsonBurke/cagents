@@ -205,9 +205,8 @@ impl Inputs {
             }
             let entry = entry.ok()?;
             let name = entry.file_name();
-            if !Path::new(&name)
-                .extension()
-                .is_some_and(|extension| extension == "json")
+            if Path::new(&name)
+                .extension().is_none_or(|extension| extension != "json")
             {
                 continue;
             }

@@ -714,7 +714,7 @@ fn an_open_pane_whose_holder_died_names_what_runs_then_closes() {
     };
     kill(&record.holder);
     assert!(record.root.is_current(), "the provider outlived its holder");
-    let refusal = close().err().expect("Close refused").message;
+    let refusal = close().expect_err("Close refused").message;
     assert!(
         refusal.contains("Codex is still running for this conversation"),
         "{refusal}"
@@ -855,8 +855,7 @@ fn a_conversation_whose_listener_is_served_does_not_reopen() {
             source: fixture.source.clone(),
         },
     )
-    .err()
-    .expect("a served conversation was reopened");
+    .expect_err("a served conversation was reopened");
 }
 
 /// #2426: a turn finished and its provider exited with it, taking the holder
@@ -1096,11 +1095,10 @@ fn assert_codex_started(fixture: &Fixture, root: &std::path::Path) {
     );
     let deadline = Instant::now() + Duration::from_secs(5);
     let argv = loop {
-        if let Ok(argv) = std::fs::read_to_string(root.join("started-argv")) {
-            if argv == expected {
+        if let Ok(argv) = std::fs::read_to_string(root.join("started-argv"))
+            && argv == expected {
                 break argv;
             }
-        }
         assert!(
             Instant::now() < deadline,
             "the fake app-server never launched"

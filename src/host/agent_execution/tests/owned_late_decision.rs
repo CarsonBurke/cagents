@@ -101,14 +101,13 @@ struct Evidence {
 }
 impl Drop for Evidence {
     fn drop(&mut self) {
-        if !self.success || thread::panicking() {
-            if let Some(directory) = self.directory.take() {
+        if (!self.success || thread::panicking())
+            && let Some(directory) = self.directory.take() {
                 eprintln!(
                     "late-decision failure evidence retained: {}",
                     directory.keep().display()
                 );
             }
-        }
     }
 }
 struct Capture(thread::JoinHandle<io::Result<()>>);
@@ -268,11 +267,11 @@ impl ControllerChild {
         let deadline = *self
             .cleanup_deadline
             .get_or_insert_with(|| Instant::now() + Duration::from_secs(3));
-        if let Some(_) = self
+        if self
             .child
             .as_mut()
             .expect("owned original child")
-            .try_wait()?
+            .try_wait()?.is_some()
         {
             self.reaped = true;
             return Ok(());

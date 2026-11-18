@@ -212,10 +212,9 @@ impl Omp {
         outcome: crate::notifications::Kind,
         step: &mut Step,
     ) {
-        if !self
+        if self
             .execution
-            .as_ref()
-            .is_some_and(|execution| execution.request == request)
+            .as_ref().is_none_or(|execution| execution.request != request)
         {
             return;
         }
@@ -1911,8 +1910,7 @@ mod tests {
                 attachments,
                 mode: PromptMode::Send,
             })
-            .err()
-            .expect("129 managed images must fail");
+            .expect_err("129 managed images must fail");
         assert!(
             error.contains("Too many image mappings"),
             "mapping cap must precede the sentinel path/receipt error: {error}"
@@ -1945,8 +1943,7 @@ mod tests {
                     attachments,
                     mode: PromptMode::Send,
                 })
-                .err()
-                .expect("mixed129-image mapping must fail");
+                .expect_err("mixed129-image mapping must fail");
             assert!(
                 error.contains("Too many image mappings"),
                 "count refusal must precede the missing managed blob read: {error}"

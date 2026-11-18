@@ -4535,7 +4535,7 @@ fn orchestrating_turn_outlives_the_live_tool_bound() {
     // running until its turn ends, whether it arrives in the turn's
     // history or as it starts.
     let auxiliary = |index: usize| {
-        if index % 2 == 0 {
+        if index.is_multiple_of(2) {
             json!({"id":format!("aux-{index}"),"type":"sleep","durationMs":1000})
         } else {
             json!({"id":format!("aux-{index}"),"type":"subAgentActivity","kind":"started","agentThreadId":"child","agentPath":"/root/review"})

@@ -461,7 +461,7 @@ mod tests {
         let reset = polling::now() + 120;
         executor.outputs.lock().unwrap().push_back(ProcessOutput {
             success: false, exit_code: Some(1), signal: None,
-            stdout: format!("HTTP/2.0 403 Forbidden\r\nRetry-After: 120\r\nX-RateLimit-Remaining: 4000\r\n\r\n{{\"message\":\"secondary rate limit\"}}").into_bytes(),
+            stdout: "HTTP/2.0 403 Forbidden\r\nRetry-After: 120\r\nX-RateLimit-Remaining: 4000\r\n\r\n{\"message\":\"secondary rate limit\"}".to_string().into_bytes(),
             stderr: vec![],
         });
         let service = GitHubService::new("gh", executor.clone());

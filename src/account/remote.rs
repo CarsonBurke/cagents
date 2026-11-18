@@ -124,11 +124,10 @@ pub(crate) fn affected_accounts(
     // Register reads the pending home and probes System for duplicate login
     // identity. Reserve both before either probe; an idempotent completed
     // registration has no probe and therefore needs no System reservation.
-    if let Operation::Register { provider, .. } = operation {
-        if !accounts.is_empty() {
+    if let Operation::Register { provider, .. } = operation
+        && !accounts.is_empty() {
             accounts.push(super::Account::system(*provider));
         }
-    }
     Ok(accounts)
 }
 

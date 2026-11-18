@@ -666,7 +666,7 @@ impl Store {
         (1..=count)
             .map(|index| {
                 let ordinal = start + index * step;
-                (ordinal.abs() <= i128::from(ORDINAL_LIMIT)).then(|| ordinal as i64)
+                (ordinal.abs() <= i128::from(ORDINAL_LIMIT)).then_some(ordinal as i64)
             })
             .collect()
     }
@@ -1013,11 +1013,10 @@ impl Store {
                         || pending.1 != role
                         || pending.2 != thinking
                         || pending.3.len() + delta.len() > 64 * 1024
-                }) {
-                    if let Some(warning) = self.flush_text()? {
+                })
+                    && let Some(warning) = self.flush_text()? {
                         out.push(nonfatal(warning));
                     }
-                }
                 if delta.len() > 64 * 1024 {
                     if let Some(warning) = self.append(&id, role, thinking, &delta)? {
                         out.push(nonfatal(warning));
@@ -2548,11 +2547,10 @@ mod tests {
         let mut bytes = 0;
         loop {
             for item in &page.items {
-                if seen.insert(item.id.clone()) {
-                    if let ItemContent::Text { text, .. } = &item.content {
+                if seen.insert(item.id.clone())
+                    && let ItemContent::Text { text, .. } = &item.content {
                         bytes += text.len();
                     }
-                }
             }
             if !page.has_later {
                 break;
@@ -2906,11 +2904,10 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         let mut restored = String::new();
         for item in pages.into_iter().flatten() {
-            if seen.insert(item.id.clone()) {
-                if let ItemContent::Text { text, .. } = &item.content {
+            if seen.insert(item.id.clone())
+                && let ItemContent::Text { text, .. } = &item.content {
                     restored.push_str(text);
                 }
-            }
         }
         assert!(
             restored == original,

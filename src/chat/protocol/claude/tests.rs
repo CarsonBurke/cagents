@@ -7792,7 +7792,7 @@ fn real_notice_orders_show_the_latest_state_at_every_step() {
             frame["uuid"] = json!(format!("{order}-{index}"));
             let step = adapter.receive(frame).unwrap();
             let label = format!("{order} at {index}");
-            let repeated = order[..index].chars().last() == Some(kind);
+            let repeated = order[..index].ends_with(kind);
             if repeated && kind != 'i' {
                 assert!(
                     notification_agent_statuses(&step, "tool-one").is_empty(),
