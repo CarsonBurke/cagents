@@ -746,7 +746,10 @@ mod tests {
         // while one only partly scrolled out still keeps its edge clear.
         assert_eq!(fade(line(text.y + text.height + 30.0)).1, full);
         assert_eq!(fade(line(text.y - 50.0)).1, full);
+        assert_eq!(fade(line(text.y + text.height)).1, full);
+        assert_eq!(fade(line(text.y - 20.0)).1, full);
         assert_eq!(fade(line(text.y - 5.0)).1, (band.0, full.1));
+        assert_eq!(fade(line(text.y + text.height - 5.0)).1, (full.0, band.1));
     }
     #[test]
     fn multiline_selection_maps_unicode_bytes_and_replacement_uses_existing_edit_action() {
