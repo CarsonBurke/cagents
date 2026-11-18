@@ -64,7 +64,9 @@ or underscores, names the task on HOST: ~/.local/state/cev/NAME there.
                   executables go to HOST; a revision builds on HOST.
                   --integrated builds the UI with the embedded browser, on
                   HOST, as it does for both sides of a pair.
-  shot NAME       Capture on HOST and bring back shots/SIDE-NAME.webp.
+  shot NAME [--lossless]
+                  Capture on HOST and bring back shots/SIDE-NAME.webp;
+                  --lossless keeps every pixel.
   fetch           Bring back every shot and the manifest.
   where           Print the task and checkouts on HOST.
   clean           Remove the task's session, checkouts, refs and directory
@@ -171,6 +173,13 @@ SCRIPT
 # the script, so what a connection started is gone once it closes.
 remote_lifetime=$(cat <<'LIFETIME'
 watcher=
+# Whether a process runs: one that exited is gone, though until its parent
+# reaps it, `kill -0` still finds it.
+running() {
+    case $(sed 's/.*) //' "/proc/$1/stat" 2>/dev/null) in
+        '' | Z* | X*) return 1 ;;
+    esac
+}
 end_with_connection() {
     local main=$1 connection=$$
     while [ "$connection" -gt 1 ]; do
@@ -186,7 +195,7 @@ end_with_connection() {
         # for whoever adopts the orphans here.
         nap=
         trap '[ -z "$nap" ] || kill "$nap" 2>/dev/null; wait; exit 0' TERM
-        while kill -0 "$connection" 2>/dev/null && kill -0 "$main" 2>/dev/null; do
+        while running "$connection" && kill -0 "$main" 2>/dev/null; do
             sleep 2 &
             nap=$!
             wait "$nap" || :
@@ -598,8 +607,9 @@ case $command in
     clean) cmd_clean ;;
     build) cmd_build "$@" ;;
     shot)
-        [ "$#" -eq 1 ] || die 'shot needs a name' 2
-        forward shot "$1" >/dev/null
+        [ "$#" -ge 1 ] || die 'shot needs a name' 2
+        # The host's native-evidence checks the name and any options.
+        forward shot "$@" >/dev/null
         fetch_shots
         side=$(forward status | sed -n 's/^session: \(before\|after\),.*/\1/p') || side=
         if [ -n "$side" ]; then

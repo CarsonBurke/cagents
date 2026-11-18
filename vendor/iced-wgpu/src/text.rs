@@ -619,7 +619,8 @@ fn prepare(
             )?;
 
             Some(cryoglyph::TextArea {
-                text: buffer.layout_runs(),
+                // cagents: an editor's overscan is drawn too.
+                text: buffer.draw_runs(),
                 left: position.x,
                 top: position.y,
                 scale: transformation.scale_factor()

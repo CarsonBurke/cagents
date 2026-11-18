@@ -199,7 +199,9 @@ Each task runs one `scripts/cargo-gate check --locked` command with its lane's
 features, `--no-default-features --features host` for the daemon for example;
 `mise.toml` defines the lanes once. The `ui` lane selects both packages,
 `--package cagents --package cagents-ui --features cagents/ui`, and `browser`
-selects `--package cagents-ui --features integrated-browser`.
+selects `--package cagents-ui --features browser-protocol-fixture`: the
+integrated browser with the Wayland registry test server its tests use, as main's
+build check selects it.
 
 Every lane compiles the workspace's crates without warnings, tests included,
 and a new warning is a regression to fix in the change that adds it. An item
@@ -223,6 +225,20 @@ browserless UI lanes' tests (`scripts/cargo-gate test ... --all-targets`,
 [below](#testing)) type-check everything the lane's check does, so when you are
 about to run them, skip that check. The integrated UI has no test lane; keep
 its check.
+
+A test lane narrowed with arguments, such as `mise run test:ui -- --lib`, and
+`mise run test:lib` may build the lane's library only under `cfg(test)`,
+where an item only tests use looks used. So once their tests pass, these tasks
+also check the lane's library, binaries and examples, as main's build check
+does, and their status is that check's. A method only tests called reached
+main that way (#3006, fixed by #3035): its author ran a narrowed test lane and
+no check. On fw16 this check took about 20 s to compile where the slot had
+checked before and 70 to 95 s where it had not, after a narrowed UI test build
+of about 3 minutes, and it waits for its own build slot. It does not check the
+test targets the narrowed run skipped, so before review still run the lane's
+check, or its tests with every target. `scripts/cargo-gate check --features ui`
+without `--package cagents-ui` checks only the shared library, not the
+application; `mise run check:ui` checks both.
 
 Changes to ceditor or shared UI, editor, or notification public contracts also
 require the standalone editor check above. The workspace's
@@ -649,6 +665,26 @@ the one at its head takes shares as they free, so a build that needs two is
 not passed over by builds that need one. The shares are the lock files
 `/var/tmp/cagents-cargo.lock`, `.1`, `.2`, ... (`CAGENTS_BUILD_LOCK` names
 the first), and builds offloaded to the host take them too.
+
+A build with nothing to compile does not wait in that queue. When its shares
+are not free at once, a `build`, `check`, `clippy`, `--no-run` or the build
+phase of `test`, `bench` or `run` first runs as a probe: Cargo with one job,
+its output held back, under a compiler wrapper (`scripts/cargo-gate-rustc-guard`)
+that passes the compiler's queries and ends the probe at the first compile.
+If Cargo finds everything fresh, or fails, the probe was the build: its output
+is shown and no shares are taken. Otherwise it is discarded and the build waits
+for its shares as before, so every compile still runs within them. At most
+four probes run at once, each holding one of the slots
+`/var/tmp/cagents-cargo.lock.probe.0` to `.3`; with none free, a build queues
+without one. A probe runs in the build slice described below, so the cap on
+builds' memory covers it too, and is ended, its build queued, if its
+processes outgrow 1 GiB (as a build script rerunning without a compile
+might), after 60 seconds, or at the admission deadline. Cargo alone needs
+about 180 MiB to find this workspace fresh. Doctests and `doc`, whose rustdoc
+no compiler wrapper sees, are not probed, nor is an `exec` on the host that
+compiles, which holds its shares throughout; each Cargo command of an `exec`
+offloaded from elsewhere is admitted, and probed, on its own.
+`CAGENTS_BUILD_PROBE=0` turns probing off.
 
 Once admitted, a build runs in its own systemd scope in
 `background-cagents.slice`, inside the user manager's `background.slice`.
@@ -1493,6 +1529,21 @@ scripts/test-lib ui --profile dev-runtime --prefix app::chat_ui::
 scripts/test-lib shared-ui --prefix settings::
 ```
 
+Prefer `test-lib` while iterating on UI library tests.
+`mise run test:ui -- --lib MODULE::` builds both the `cagents-ui` and the shared library's test harnesses on
+every edit, whatever the filter matches, so an edit to the shared library
+recompiles roughly twice as much as `scripts/test-lib ui` does
+([#2319](https://github.com/CarsonBurke/cagents/issues/2319)). The two commands
+unify the shared library's dependency features differently, because `test:ui`
+also selects `cagents` and its dev-dependencies, so the shared library and the
+dependencies whose features differ are built once for each command: the first
+switch builds that second set, and alternating rebuilds the shared library
+both ways. The same holds between `test:ui` and `scripts/test-lib shared-ui`,
+which builds the shared library's harness without `test-support`. Keep to one
+while iterating.
+`test-lib` runs Cargo without the lane tasks' warnings check, so finish with the
+lane task.
+
 Use actual full test names, or repeat `--prefix MODULE::` for literal module
 groups. Prefixes expand to ordinary full names and overlapping selections run
 once. The command rejects missing names, duplicate exact names, empty groups,
@@ -1949,9 +2000,11 @@ the branch has uncommitted changes or a merge in progress, any worktree is
 rebasing the branch, or another landing of the same PR is running. It waits
 for CI on the head through `scripts/gh-pr-status`, reading again only when the
 shared cache can refresh, about every two minutes, or later when `retry_at`
-says so. Unknown or missing checks count as not passed. A read from before the
-head was known, or one that has not yet caught up with the script's own push,
-cannot report that the head moved.
+says so. Unknown or missing checks count as not passed. A stale or failed read
+decides nothing, even about the same head, because checks can be rerun on it;
+the script waits for a read that succeeds. A read from before the head was
+known, or one that has not yet caught up with the script's own push, cannot
+report that the head moved.
 When GitHub refuses the merge because `main` moved while it was merging
 (`Base branch was modified`, HTTP 405), it reads the PR again after a short
 pause: a conflict now takes the conflict path above, and otherwise it merges
@@ -2104,7 +2157,9 @@ harness, it provides:
   startup; a saved descriptor whose provider was killed is not a live chat.
 - **Matching evidence.** `start` refuses a checkout that changed since its build.
   `shots/manifest.tsv` records each image's revision, source state, requested
-  width and size, so a pair can be compared and named in the PR.
+  width and size, so a pair can be compared and named in the PR. Shots are
+  lossy WebP; `shot NAME --lossless` keeps every pixel, for comparing borders,
+  edges and fades pixel by pixel.
 - **A shared path caveat.** With no worktree selected, the Workspace page shows
   the app's working directory, which is the checkout and so differs between
   sides. Select the fixture project's worktree before capturing a pair.

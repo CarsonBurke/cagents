@@ -324,7 +324,7 @@ pub(super) struct State {
     #[cfg(test)]
     local_projection_count: std::cell::Cell<usize>,
     #[cfg(test)]
-    topology_build_count: std::cell::Cell<usize>,
+    pub(super) topology_build_count: std::cell::Cell<usize>,
     #[cfg(test)]
     view_projection_count: std::cell::Cell<usize>,
     #[cfg(test)]
@@ -354,6 +354,9 @@ pub(super) struct State {
     held_descriptor_clones: std::cell::Cell<usize>,
     /// The daemon answered this window without a shared model to give.
     pub(super) registry_unavailable: bool,
+    /// This window joined the registry and has not yet told it which projects
+    /// it has open; the next complete reconciliation does.
+    pub(super) unintroduced_projects: bool,
     baseline: settlement::ScopeMap<Vec<Pane>>,
     initialized: settlement::ScopeSet,
     seeding: HashSet<Scope>,
@@ -2978,21 +2981,24 @@ impl Cagents {
         additional: &HashSet<Scope>,
     ) -> HashSet<Scope> {
         let topology = self.borrowed_view_scope_topology();
-        self.repository_view_scopes_with_topology(repository, additional, &topology)
+        self.repository_view_scopes_with_topology(&[repository], additional, &topology)
     }
 
+    /// The scopes [`Self::repository_view_scopes`] selects for each of
+    /// `repositories`, followed through ownership together.
     fn repository_view_scopes_with_topology(
         &self,
-        repository: &Path,
+        repositories: &[&Path],
         additional: &HashSet<Scope>,
         topology: &ViewScopeTopology<'_>,
     ) -> HashSet<Scope> {
         let discovery = self.discover_view_scopes_with(topology);
+        let repositories = repositories.iter().copied().collect::<HashSet<_>>();
         let projects = self
             .sidebar_model
             .projects
             .iter()
-            .filter(|project| project.repository == repository)
+            .filter(|project| repositories.contains(project.repository.as_path()))
             .map(|project| project.id)
             .collect::<HashSet<_>>();
         let channels = self
@@ -3005,14 +3011,14 @@ impl Cagents {
                 self.workspace_model
                     .channels
                     .iter()
-                    .filter(|channel| channel.repository == repository)
+                    .filter(|channel| repositories.contains(channel.repository.as_path()))
                     .map(|channel| channel.id),
             )
             .collect::<HashSet<_>>();
         let belongs = |scope: &Scope| match scope {
             Scope::Worktree {
                 repository: owner, ..
-            } => owner == repository,
+            } => repositories.contains(owner.as_path()),
             Scope::Channel(id) => channels.contains(id),
         };
         let mut selected = discovery
@@ -3130,17 +3136,28 @@ impl Cagents {
         self.reconcile_shared_views_with(ViewProjection::Selected(scopes), None)
     }
 
+    #[cfg(test)]
     pub(super) fn reconcile_shared_views_for_repository(
         &mut self,
         repository: &Path,
         adopted: &HashSet<Scope>,
     ) -> Task<Message> {
-        self.reconcile_shared_views_in(Some((repository, adopted)))
+        self.reconcile_shared_views_for_repositories(&[repository], adopted)
+    }
+
+    /// One structural pass over the scopes of every repository in
+    /// `repositories`, as each would select alone.
+    pub(super) fn reconcile_shared_views_for_repositories(
+        &mut self,
+        repositories: &[&Path],
+        adopted: &HashSet<Scope>,
+    ) -> Task<Message> {
+        self.reconcile_shared_views_in(Some((repositories, adopted)))
     }
 
     fn reconcile_shared_views_in(
         &mut self,
-        repository: Option<(&Path, &HashSet<Scope>)>,
+        repository: Option<(&[&Path], &HashSet<Scope>)>,
     ) -> Task<Message> {
         self.publish_unpublished_local_chats();
         // A watcher snapshot can announce the destination before the explicit
@@ -4600,6 +4617,7 @@ mod tests {
     mod removal_tests;
     #[cfg(not(feature = "integrated-browser"))]
     mod replica_capture;
+    mod repository_loads;
     mod seed_refusal;
     mod startup_admission;
     mod startup_terminals;
@@ -6466,13 +6484,25 @@ mod tests {
         }
         assert_eq!(
             app.shared_views.topology_build_count.get(),
+            0,
+            "a run of background loads waits for one reconciliation"
+        );
+        assert_eq!(
+            app.pending_repository_reconciliation.len(),
             6,
-            "each repository pass builds its immutable root and authority indexes once"
+            "each load joins the pending reconciliation"
+        );
+        drop(app.update(Message::RepositoryReconciliationDue));
+        assert!(app.pending_repository_reconciliation.is_empty());
+        assert_eq!(
+            app.shared_views.topology_build_count.get(),
+            1,
+            "the loads share one pass, which builds its immutable root and authority indexes once"
         );
         assert_eq!(
             app.shared_views.view_projection_count.get(),
             6 * 8,
-            "loading each repository must not project every other repository's views"
+            "loading repositories must not project any other repository's views"
         );
         assert!(
             app.durable

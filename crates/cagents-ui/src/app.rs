@@ -326,6 +326,8 @@ enum NoticeKey {
     SignIn(uuid::Uuid),
     /// Adding an existing account home from the accounts table.
     AccountLink,
+    /// Removing or forgetting this account.
+    AccountRemove(crate::account::AccountId),
     /// Telling panes whether they are on screen.
     SurfaceVisibility,
     /// Committing this exact project/worktree/path identity.
@@ -3162,6 +3164,18 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
     )
 }
 
+/// Messages that may run while background repository loads wait for their
+/// shared reconciliation: further loads, which join it, and the reconciliation.
+fn defers_repository_reconciliation(message: &Message) -> bool {
+    matches!(
+        message,
+        Message::RepositoryLoaded {
+            open_cards: false,
+            ..
+        } | Message::RepositoryReconciliationDue
+    )
+}
+
 fn completion_navigates(message: &Message) -> bool {
     matches!(
         message,
@@ -4733,6 +4747,9 @@ pub enum Message {
     ReplicaCaptureDue(u64),
     /// The delay on saving runtime-reported card titles has passed.
     ReportedTitleSaveDue,
+    /// Reconcile the repositories whose background loads finished since the
+    /// last reconciliation; see [`Cagents::defer_repository_reconciliation`].
+    RepositoryReconciliationDue,
     /// The hold that began at this instant has lasted long enough to draw the
     /// workspace switcher.
     WorkspaceSwitcherDue(Instant),
@@ -5217,6 +5234,11 @@ impl PullRequestPane {
     }
 }
 
+/// Whether a pull request card `width` wide hides its side panel.
+fn review_files_collapsed(pane: &PullRequestPane, width: f32) -> bool {
+    pane.file_panel_collapsed.unwrap_or(width < 640.0)
+}
+
 /// Static chrome strings for a card kind.
 struct CardLabels {
     type_label: &'static str,
@@ -5522,6 +5544,11 @@ pub struct Cagents {
     /// Which timer is the scheduled save's: one armed for a burst that a save
     /// already wrote must not cut the next burst short.
     navigation_save_generation: u64,
+    /// Repositories whose background load finished and whose shared model
+    /// reconciliation waits for [`Message::RepositoryReconciliationDue`], in
+    /// load order. Any message other than another background load reconciles
+    /// them first.
+    pending_repository_reconciliation: Vec<PathBuf>,
     /// Where editors were when a save last dropped them from durable: a
     /// closed editor, or one still loading. A shared view reopening the same
     /// pane, or a retried attach, puts the editor back there.
@@ -7480,7 +7507,7 @@ impl Cagents {
     /// nothing, so it counts as any other pane.
     fn focused_pane(&self) -> workspace_widget::FocusedPane {
         let Some(card) = self.workspace.focused() else {
-            return workspace_widget::FocusedPane::Other;
+            return workspace_widget::FocusedPane::None;
         };
         match self.cards.get(&card) {
             Some(CardRuntime::Terminal(_))
@@ -7493,6 +7520,7 @@ impl Cagents {
             Some(CardRuntime::Repository(runtime)) if runtime.shows_diff() => {
                 workspace_widget::FocusedPane::Review
             }
+            _ if !self.pane_has_inspector(card) => workspace_widget::FocusedPane::NoInspector,
             _ => workspace_widget::FocusedPane::Other,
         }
     }
@@ -7614,14 +7642,24 @@ impl Cagents {
         id: CardId,
         pane: &'a PullRequestPane,
     ) -> Element<'a, Message> {
-        // The strip already tracks the rendered width, including animations.
-        // Responsive would hide the review and its controls from AccessKit.
-        let width = self
-            .workspace
+        self.pull_request_card_layout(id, pane, self.pull_request_card_width(id))
+    }
+
+    /// The pull request card's width. The strip already tracks the rendered
+    /// width, including animations; Responsive would hide the review and its
+    /// controls from AccessKit.
+    fn pull_request_card_width(&self, id: CardId) -> f32 {
+        self.workspace
             .presentation_geometry()
             .card(id)
-            .map_or(self.workspace.viewport_width(), |card| card.width());
-        self.pull_request_card_layout(id, pane, width)
+            .map_or(self.workspace.viewport_width(), |card| card.width())
+    }
+
+    /// Whether the pull request card shows its side panel, which holds the
+    /// review's header, summary and files: the person's choice, or else
+    /// whether the card is wide enough for it.
+    fn pull_request_side_shown(&self, id: CardId, pane: &PullRequestPane) -> bool {
+        !review_files_collapsed(pane, self.pull_request_card_width(id))
     }
 
     fn pull_request_card_layout<'a>(
@@ -7630,7 +7668,7 @@ impl Cagents {
         pane: &'a PullRequestPane,
         width: f32,
     ) -> Element<'a, Message> {
-        let collapsed = pane.file_panel_collapsed.unwrap_or(width < 640.0);
+        let collapsed = review_files_collapsed(pane, width);
         let max_width = (width - 320.0).clamp(120.0, 600.0);
         let panel_width = pane.file_panel_width.clamp(120.0, max_width);
         let modal_open = self.modal_is_open();
@@ -11578,7 +11616,10 @@ impl Cagents {
         // A pane whose content starts with a toolbar keeps the closed
         // inspector's toggle at the toolbar's end rather than over its
         // controls.
-        let inspector_closed = card.is_some() && self.pane_inspector_layout(id).is_none();
+        // A pane with no inspector here, such as an application page, has
+        // no toggle either.
+        let inspector = card.is_some() && self.pane_has_inspector(id);
+        let inspector_closed = inspector && self.pane_inspector_layout(id).is_none();
         let toolbar_toggle = || inspector_closed.then(|| self.pane_inspector_toggle(id, false));
         let toolbar_hosts_toggle = browser_session.is_some()
             || matches!(
@@ -11971,11 +12012,6 @@ impl Cagents {
                     accounts: self.default_account_choices(),
                     updates: self.update_summary(),
                     testing_notification: self.notification_ui.testing,
-                    trailing_clearance: if self.pane_inspector_layout(id).is_none() {
-                        pane_inspector::TOGGLE_CLEARANCE
-                    } else {
-                        0.0
-                    },
                 },
             ),
             Some(CardRuntime::Accounts) => self.accounts_pane(),
@@ -12299,7 +12335,7 @@ impl Cagents {
         };
         // Beside the browser's surface rather than inside it, so a native
         // page never draws over the inspector.
-        let surface = if card.is_some() {
+        let surface = if inspector {
             self.with_pane_inspector(id, surface, toolbar_hosts_toggle)
         } else {
             surface
@@ -12499,9 +12535,10 @@ impl Cagents {
     }
 
     /// The focused card, reduced to what binding the source-control panel
-    /// needs. A card that names no worktree directory - a browser, a
-    /// pull-request list - is [`SidebarFocus::None`], which leaves the panel
-    /// where it is rather than tearing it down.
+    /// needs. A scoped workspace binds its worktree whatever is focused. A
+    /// card that names no worktree directory - a browser, an application
+    /// page - is [`SidebarFocus::None`], which leaves the panel where it is
+    /// rather than tearing it down.
     fn sidebar_focus(&self) -> SidebarFocus {
         if let Some(worktree) = &self.active_workspace {
             return SidebarFocus::Repository {
@@ -12521,8 +12558,12 @@ impl Cagents {
             CardKind::Chat(session) => SidebarFocus::Terminal {
                 working_directory: session.launch.recipe.working_directory.clone(),
             },
+            // The repository whose pull requests it lists, so its inspector
+            // shows that repository's work rather than another's.
+            CardKind::PullRequests(view) => SidebarFocus::Repository {
+                worktree: view.repository.clone(),
+            },
             CardKind::Browser(_)
-            | CardKind::PullRequests(_)
             | CardKind::Settings
             | CardKind::Accounts
             | CardKind::Automations
@@ -14765,10 +14806,7 @@ impl Cagents {
                 .workspace
                 .focused()
                 .is_some_and(|card| self.pane_inspectors.is_open(card)),
-            open_inspectors: Some(
-                self.pane_inspectors
-                    .saved(|card| self.durable.cards.iter().any(|known| known.id == card)),
-            ),
+            open_inspectors: Some(self.saved_open_inspectors()),
             context_sections: self.context_sections,
             sidebar: self.sidebar_state.saved_view(),
             worktree_offsets: self.worktree_offsets.clone(),
@@ -15739,6 +15777,7 @@ impl Application for Cagents {
             navigation_save: None,
             replica_capture: ReplicaCapture::default(),
             navigation_save_generation: 0,
+            pending_repository_reconciliation: Vec::new(),
             released_repository_navigation: HashMap::new(),
             keyboard_owed: None,
             reported_title_save: ReportedTitleSave::default(),
@@ -15883,6 +15922,14 @@ impl Application for Cagents {
                 return settled;
             }
             return Task::batch([settled, self.update(message)]);
+        }
+        if !self.pending_repository_reconciliation.is_empty()
+            && !defers_repository_reconciliation(&message)
+        {
+            // Only a run of background repository loads waits for one
+            // reconciliation; every other message sees it done, in order.
+            let reconciled = self.update(Message::RepositoryReconciliationDue);
+            return Task::batch([reconciled, self.update(message)]);
         }
         #[cfg(any(test, feature = "development"))]
         let (_running, settled_projection) = self.settle_projection(&message);
@@ -16033,6 +16080,8 @@ impl Application for Cagents {
             || background_poll(&message)
             || matches!(message, Message::ReplicaCaptureDue(_))
             || self.navigation_save_is_stale(&message)
+            || (matches!(message, Message::RepositoryReconciliationDue)
+                && self.pending_repository_reconciliation.is_empty())
         {
             Projection::Unchanged
         } else {
@@ -16592,7 +16641,15 @@ impl Application for Cagents {
                             pending,
                             pr_enrichment,
                             self.project_avatar_task(project_id),
-                            self.reconcile_workspace_model_for_repository(&loaded.project.repository),
+                            if open_cards {
+                                self.reconcile_workspace_model_for_repository(
+                                    &loaded.project.repository,
+                                )
+                            } else {
+                                self.defer_repository_reconciliation(
+                                    loaded.project.repository.clone(),
+                                )
+                            },
                         ]);
                     }
                     Err(error) => {
@@ -18276,6 +18333,7 @@ impl Application for Cagents {
                 }
                 Task::none()
             }
+            Message::RepositoryReconciliationDue => self.reconcile_pending_repositories(),
             Message::ReportedTitleSaveDue => {
                 self.reported_title_save.scheduled = false;
                 if !self.reported_title_save.cards.is_empty() {
@@ -22673,7 +22731,8 @@ mod tests {
         app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
         app.context_sections
             .set_open(context_sections::Section::Workspace, true);
-        drop(app.add_utility_card(CardKind::Settings));
+        // A second pane with an inspector of its own.
+        drop(app.clone_focused_pane());
         let other = app.workspace.focused().unwrap();
         assert_ne!(card, other);
         draw_frames(&mut app, 7, |app, frame| match frame {
@@ -22872,7 +22931,13 @@ mod tests {
             legacy.open_inspectors,
             legacy.context_inspector_open,
         );
-        inspectors.sync(&[card], Some(card), |_| false, |_| true);
+        inspectors.sync(
+            &[card],
+            Some(card),
+            |_| pane_inspector::Availability::Available,
+            |_| false,
+            |_| true,
+        );
         assert!(inspectors.is_open(card));
     }
 
@@ -28885,16 +28950,27 @@ mod tests {
 
     fn repository_card(app: &mut Cagents, worktree: &str) -> CardId {
         let card = CardId::new();
+        let view = RepositoryView {
+            selected_file: None,
+            project: ProjectId::new(),
+            repository: PathBuf::from(worktree),
+            worktree: PathBuf::from(worktree),
+        };
+        // The durable card names its kind, which decides whether it has an
+        // inspector.
+        Arc::make_mut(&mut app.durable).cards.push(CardState {
+            id: card,
+            generation: 0,
+            title: "Repository".into(),
+            width_fraction: 0.7,
+            existence: Existence::Open,
+            kind: CardKind::Repository(view.clone()),
+        });
         app.cards.insert(
             card,
             CardRuntime::Repository(Box::new(
                 repository_widget::RepositoryRuntime::file_list_fixture(
-                    RepositoryView {
-                        selected_file: None,
-                        project: ProjectId::new(),
-                        repository: PathBuf::from(worktree),
-                        worktree: PathBuf::from(worktree),
-                    },
+                    view,
                     &["src/main.rs", "src/other.rs"],
                 ),
             )),
@@ -28963,19 +29039,8 @@ mod tests {
     #[test]
     fn closing_a_card_retires_everything_it_held_at_the_lsp_boundary() {
         let mut app = lsp_test_app();
+        // The fixture's durable card is the one the workspace closes.
         let card = repository_card(&mut app, "/repo");
-        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
-            unreachable!()
-        };
-        let descriptor = runtime.descriptor.clone();
-        Arc::make_mut(&mut app.durable).cards.push(CardState {
-            id: card,
-            generation: 0,
-            title: "Repository".into(),
-            width_fraction: 0.7,
-            existence: Existence::Open,
-            kind: CardKind::Repository(descriptor),
-        });
         app.workspace
             .add_card(
                 WorkspaceCard::new(card, "Repository", CardWidth::Fraction(0.7)).unwrap(),
@@ -31758,6 +31823,7 @@ mod tests {
             navigation_save: None,
             replica_capture: ReplicaCapture::default(),
             navigation_save_generation: 0,
+            pending_repository_reconciliation: Vec::new(),
             released_repository_navigation: HashMap::new(),
             keyboard_owed: None,
             reported_title_save: ReportedTitleSave::default(),

@@ -1668,6 +1668,22 @@ pub fn request_for_reader(operation: Operation) -> Result<Reply, String> {
     )
 }
 
+/// [`request`] for a caller that leaves its state as it was, and says so,
+/// when the daemon was too busy to admit the operation.
+#[cfg(feature = "ui")]
+pub fn request_unless_busy(operation: Operation) -> Result<Reply, crate::control::RequestError> {
+    let authority = crate::agent_execution::Authority::from_environment();
+    request_described(
+        operation,
+        authority,
+        crate::control::daemon_autostart_disabled(),
+        crate::device::is_remote(),
+        || crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string()),
+        || crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string()),
+        crate::control::RequestError::from,
+    )
+}
+
 #[cfg(any(feature = "ui", test))]
 fn reader_message(error: crate::control::ControlError) -> String {
     match error {
@@ -1695,23 +1711,23 @@ fn request_as(
     )
 }
 
-fn request_described(
+fn request_described<E: From<String>>(
     operation: Operation,
     authority: crate::agent_execution::Authority,
     no_start: bool,
     remote: bool,
     selected_socket: impl FnOnce() -> Result<PathBuf, String>,
     ready_socket: impl FnOnce() -> Result<PathBuf, String>,
-    describe: impl FnOnce(crate::control::ControlError) -> String,
-) -> Result<Reply, String> {
+    describe: impl FnOnce(crate::control::ControlError) -> E,
+) -> Result<Reply, E> {
     // Resolving a remote socket can launch its SSH bridge before authentication.
     // Device operations are reserved for User, so refuse scoped remote callers
     // before either resolver can create transport or start a remote daemon.
     if remote && authority.token().is_some() {
-        return Err(
-            "Device operations from an agent session require a user terminal on the remote device"
-                .into(),
-        );
+        return Err(String::from(
+            "Device operations from an agent session require a user terminal on the remote device",
+        )
+        .into());
     }
     // Presence, including an empty/invalid capability, must never become User
     // startup or scope. Use the same captured authority after resolving a socket.

@@ -21,3 +21,7 @@ relative size is shaped at that size on the paragraph's line height, and it
 converts `Span::inline_padding` to EM at the span's size.
 `Paragraph::with_spans` and the app's own shaping for long paragraphs both use
 it, so they agree. Spans without these are shaped as upstream shapes them.
+
+# Editor overscan (#2824)
+
+`Editor::set_overscan` forwards to cosmic-text's `Buffer::set_overscan`, and `Editor::overflow` reports how far the drawn runs reach above and below the text area, clamped to the overscan. Selection regions, the caret and the highlighter window cover the overscan bands too, so a selection or highlight continues into the padding. See vendor/cosmic-text/LOCAL_CHANGES.md; the app regression is `editor_widget::tests::native_overscan_draws_text_past_the_viewport_and_reports_how_far`.

@@ -120,3 +120,25 @@ inline_padding_of_ltr_code_in_an_rtl_paragraph cover it. Monospace width matchin
 room is not meant for monospace-matched editors.
 
 All upstream targets and reference images still pass.
+
+Linear multiline insertion and deletion (cagents #3001)
+
+Upstream Editor::insert_at inserts each new line at the same index of
+Buffer::lines, which moves every line inserted before it, and delete_range
+removes lines one at a time while collecting them at the front of the change.
+Both are quadratic in the number of lines. Pasting 600 KiB of 80-byte lines
+into the chat composer took about 170 ms, and deleting a selection that size
+about 150 ms, while iced held the font system lock. insert_at now builds the
+new lines and splices them in once, and delete_range drains the removed lines
+once. Lines, endings, attribute splits, the returned cursor and the recorded
+change are the same as upstream's. The application test
+repository_widget::text_editor::tests::native_multiline_insert_and_delete_keep_lines_order_and_history
+checks them, including undoing both changes.
+
+Overscan for edge fades (cagents #2824)
+
+`Buffer::set_overscan(above, below)` adds bands above and below the viewport. The lines in those bands are shaped and laid out, and `Buffer::draw_runs` yields them along with the visible runs, with negative `line_top` above the viewport and values past the height below it. `hit` uses `draw_runs`, so a click in a band lands on the line drawn there. `layout_runs`, scrolling, cursor reveal, PageUp/Down and the measured content height still use only the viewport, so the overscan never changes where the editor scrolls or how large it measures. The default overscan is zero, which keeps upstream behavior.
+
+Why: an editor inside padding cut its text at the padding's inner edge, so a scrolled draft looked sliced in half (#2824). Drawing the neighboring lines into the padding lets the app fade them out instead.
+
+Coverage: `editor_widget::tests::native_overscan_draws_text_past_the_viewport_and_reports_how_far` in cagents-ui. Remove this patch when upstream can draw text past the scroll viewport.

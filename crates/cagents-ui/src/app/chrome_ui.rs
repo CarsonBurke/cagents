@@ -943,7 +943,9 @@ mod tests {
                 let _ = app.update(Message::AccountUi(
                     super::super::account_ui::Action::LinkReady {
                         key: uuid::Uuid::new_v4(),
-                        result: Err("no credentials there".into()),
+                        result: Err(crate::control::RequestError::Failed(
+                            "no credentials there".into(),
+                        )),
                     },
                 ));
                 app.update(Message::AccountUi(
@@ -2826,12 +2828,17 @@ impl Cagents {
     }
 
     /// Where focus lands when the notices control it was on goes away: the
-    /// focused pane's inspector toggle, the nearest control below the header.
+    /// focused pane's inspector toggle, the nearest control below the header,
+    /// or, on a page without an inspector, the pane's title.
     fn notice_focus_fallback(&self) -> widget::Id {
         self.workspace
             .focused()
             .map_or_else(widget::Id::unique, |card| {
-                card_control_id(card, "inspector.toggle")
+                if self.pane_has_inspector(card) {
+                    card_control_id(card, "inspector.toggle")
+                } else {
+                    self.card_header_widget_id(card)
+                }
             })
     }
 

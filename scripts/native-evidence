@@ -96,7 +96,10 @@ both use the same fixture data and selected providers.
   nested CMD...   Run a command in the nested compositor's environment, on the
                   app's bus, so with --portal, gsettings set changes what the
                   session's portal reports to the app.
-  shot NAME       Capture shots/SIDE-NAME.webp and record its source revision.
+  shot NAME [--lossless]
+                  Capture shots/SIDE-NAME.webp and record its source revision.
+                  --lossless keeps every pixel, for comparing edges, borders
+                  and fades pixel by pixel; the default is smaller and lossy.
   open-window SLOT
                   Open a saved secondary window in this session through the
                   matched development runner. Waits for a new mapped window,
@@ -1471,8 +1474,15 @@ cmd_nested() {
 }
 
 cmd_shot() {
-    local name=${1:-} side
+    local name=${1:-} side encoding=(-quality 92)
     [[ $name =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]] || die 'shot name must use letters, digits and hyphens' 2
+    shift
+    [ "$#" -le 1 ] || die 'shot takes a name and at most one option' 2
+    case ${1:-} in
+    '') ;;
+    --lossless) encoding=(-define webp:lossless=true) ;;
+    *) die "unknown shot option: $1" 2 ;;
+    esac
     side=$(current_side)
     load_side "$side" "$state/source"
     (
@@ -1495,7 +1505,7 @@ if w > width + 2 or h > height + 2:
         timeout -k 5 60 niri-harness --no-heal --session "$session_name" shot "$side-$name" >/dev/null
     )
     local webp="$shots/$side-$name.webp" manifest="$shots/manifest.tsv"
-    magick "$harness_root/shots/$side-$name.png" -quality 92 "$webp"
+    magick "$harness_root/shots/$side-$name.png" "${encoding[@]}" "$webp"
     # A retake replaces its row, so each image has one record of its source.
     {
         grep -vF -- "$side-$name.webp"$'\t' "$manifest" 2>/dev/null || true

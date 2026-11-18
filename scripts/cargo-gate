@@ -32,7 +32,7 @@ fi
 # checkout whose gate is older than the installed one runs the installed one,
 # so a worktree that has fallen behind main does not keep main's fixes from its
 # builds.
-gate_version=33
+gate_version=34
 installed=${CAGENTS_BUILD_INSTALLED_GATE-/var/tmp/cagents-cargo-gate}
 # The helpers this gate runs are the ones beside the file it is, so an
 # installed gate keeps its own while a newer installation takes its name.
@@ -103,6 +103,9 @@ With CAGENTS_BUILD_REMOTE=local, or on the build host itself, commands build
 here through scripts/build-host. A build waits for its share of the memory
 set aside for builds (three quarters of the host's, in shares of 4 GiB; a
 check or CLI build takes one, a host or UI build two), then starts at once.
+While they are taken, a build that only builds first asks Cargo, in a short
+probe that compiles nothing, whether there is anything to compile; one that
+has nothing to compile then finishes without waiting.
 Builds run in background-cagents.slice, below interactive work, and share one
 jobserver, so a lone build uses every CPU and several share them. For
 `test`, `bench` and `run`, only the build (`--no-run`, or `build`) holds its

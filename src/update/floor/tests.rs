@@ -22,6 +22,7 @@ struct FakeSource {
     outcomes: VecDeque<ShutdownOutcome>,
     prepare_refusals: usize,
     prepare_busy: bool,
+    shutdown_busy: bool,
     lose_prepare_ack: bool,
     predicted_service: bool,
     fail_inventory: bool,
@@ -268,6 +269,15 @@ impl FloorSource for FakeSource {
         capability: ShutdownCapability,
     ) -> Result<ShutdownOutcome, UpdateError> {
         assert_eq!(daemon.capability.proof, capability.proof);
+        if self.shutdown_busy {
+            // What `source::Client::confirm_shutdown` says once the source
+            // refused the stop as busy past its patience.
+            self.event("ShutdownV1 Confirm busy");
+            return Err(UpdateError::SourceBusy {
+                serving: Box::new(capability.proof),
+                message: source::STILL_BUSY_TO_STOP.into(),
+            });
+        }
         self.event("ShutdownV1 Confirm");
         let outcome = self
             .outcomes
@@ -417,6 +427,7 @@ fn fixture() -> FakeSource {
         outcomes: VecDeque::new(),
         prepare_refusals: 1,
         prepare_busy: false,
+        shutdown_busy: false,
         lose_prepare_ack: false,
         predicted_service: false,
         fail_inventory: false,
@@ -1824,6 +1835,56 @@ fn late_prepare_failure_reports_ended_chats_without_a_second_confirmation() {
             .any(|event| event == "ShutdownV1 Confirm")
     );
     source.assert_running_panes_are_unmarked();
+}
+
+/// A preparation refused as busy after a conversation ended must not claim
+/// that nothing was stopped above the list of what was.
+#[test]
+fn a_late_busy_prepare_names_the_conversations_already_ended() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut source = fixture();
+    source.prepare_busy = true;
+    let ended = add_chat(&mut source, impact::Disposition::Blocked, false);
+    let worker = spawn_source(source, directory.path(), true);
+    let published = await_stop(directory.path());
+    confirm_stop(directory.path(), &published);
+    let (result, source) = finish(worker);
+    let error = result.unwrap_err().to_string();
+    assert!(error.starts_with(PREPARE_BUSY_AFTER_ENDS), "{error}");
+    assert!(!error.contains("nothing was stopped"), "{error}");
+    assert!(error.contains("Ended or stopped:"), "{error}");
+    assert_eq!(source.ledger().records[0].chats[0].id, ended);
+    assert!(
+        source
+            .events
+            .lock()
+            .unwrap()
+            .ends_with(&["PrepareConfirmedUpgrade busy".to_owned()])
+    );
+    source.assert_running_panes_are_unmarked();
+}
+
+/// A service stop the source kept refusing as busy ends the update with the
+/// source's own words: nothing was stopped, recorded or archived.
+#[test]
+fn a_stop_refused_as_busy_ends_the_update_without_stopping_anything() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut source, _) = pending_source();
+    source.shutdown_busy = true;
+    let worker = spawn_source(source, directory.path(), true);
+    let published = await_stop(directory.path());
+    confirm_stop(directory.path(), &published);
+    let (result, source) = finish(worker);
+    assert_eq!(result.unwrap_err().to_string(), source::STILL_BUSY_TO_STOP);
+    assert!(
+        source
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event == "ShutdownV1 Confirm busy")
+    );
+    assert_no_destructive_actions(&source);
 }
 
 #[test]
