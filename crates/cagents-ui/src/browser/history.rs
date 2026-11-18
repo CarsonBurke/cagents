@@ -54,6 +54,9 @@ struct PendingLoad {
     /// which Servo then keeps in front of the new entry. Without it, Servo's
     /// report starts a new window at the committed entry.
     window_start: Option<usize>,
+    /// The entry of Servo's list the load was issued from. Servo commits it
+    /// as the entry after that one, discarding any after it.
+    from: usize,
 }
 
 impl NavigationState {
@@ -76,6 +79,7 @@ impl NavigationState {
             pending: Some(PendingLoad {
                 url: url.clone(),
                 window_start: None,
+                from: 0,
             }),
             url,
             restore_scroll: true,
@@ -142,6 +146,7 @@ impl NavigationState {
         self.pending = Some(PendingLoad {
             url: self.url.clone(),
             window_start: None,
+            from: self.servo_index,
         });
         Some(HistoryStep::Load(self.url.clone()))
     }
@@ -164,6 +169,7 @@ impl NavigationState {
         self.pending = Some(PendingLoad {
             url,
             window_start: Some(self.window_start),
+            from: self.servo_index,
         });
     }
 
@@ -185,9 +191,16 @@ impl NavigationState {
                 });
         // While a load is pending, Servo still reports the page it replaces:
         // a Back that was already under way, or that page's own script. Only
-        // a new entry, or the first report of a new webview, commits the load.
+        // the entry the load adds after the one it was issued from, or the
+        // first report of a new webview, commits it. That entry can repeat
+        // the URL Servo held there before, so the list may look unchanged.
         let committed = match self.pending.take() {
-            Some(pending) if self.servo.is_empty() || !same_list => Some(pending),
+            Some(pending)
+                if self.servo.is_empty()
+                    || (current == pending.from + 1 && entries.len() == current + 1) =>
+            {
+                Some(pending)
+            }
             pending => {
                 self.pending = pending;
                 None
@@ -236,14 +249,14 @@ impl NavigationState {
         self.servo_index = current;
     }
 
-    /// Whether the page that just finished loading is the restored one, whose
-    /// saved scroll offset should now be applied. True once per webview.
     /// Servo's history as last reported.
     #[cfg(test)]
     pub(super) fn servo_entries(&self) -> &[Url] {
         &self.servo
     }
 
+    /// Whether the page that just finished loading is the restored one, whose
+    /// saved scroll offset should now be applied. True once per webview.
     pub(super) fn take_restore_scroll(&mut self) -> bool {
         std::mem::take(&mut self.restore_scroll)
     }
@@ -442,6 +455,26 @@ mod tests {
         state.servo_history_changed(urls(&["a", "x", "y"]), 2);
         assert_eq!(shown(&state), (urls(&["a", "x", "y"]), 2));
         assert_eq!(state.traverse(-1), Some(HistoryStep::Back));
+        assert_eq!(state.traverse(-1), Some(HistoryStep::Back));
+    }
+
+    #[test]
+    fn a_load_servo_commits_over_an_identical_entry_still_commits() {
+        // A restored page links back to the entry saved before it.
+        let mut state = restored(&urls(&["home", "article"]), 1);
+        state.servo_history_changed(urls(&["article"]), 0);
+        state.servo_history_changed(urls(&["article", "home"]), 1);
+        assert_eq!(shown(&state), (urls(&["home", "article", "home"]), 2));
+        assert_eq!(state.traverse(-1), Some(HistoryStep::Back));
+        state.servo_history_changed(urls(&["article", "home"]), 0);
+        assert_eq!(state.traverse(-1), Some(HistoryStep::Load(url("home"))));
+        // Servo's list after the load equals the one before it.
+        state.servo_history_changed(urls(&["article", "home"]), 1);
+        assert_eq!(shown(&state), (urls(&["home", "article", "home"]), 0));
+
+        // The load committed, so a link from it starts a fresh forward.
+        state.servo_history_changed(urls(&["article", "home", "x"]), 2);
+        assert_eq!(shown(&state), (urls(&["home", "x"]), 1));
         assert_eq!(state.traverse(-1), Some(HistoryStep::Back));
     }
 
