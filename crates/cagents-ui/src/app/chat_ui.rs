@@ -19485,6 +19485,90 @@ pub(in crate::app) mod tests {
         assert!(!app.chat_start_pending(card), "no switch was attempted");
     }
 
+    /// The text `card`'s view lays out in a 900 by 980 pane, in order.
+    pub(super) fn visible_text(app: &Cagents, card: CardId) -> Vec<String> {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree},
+        };
+        #[derive(Default)]
+        struct Texts(Vec<String>);
+        impl Operation for Texts {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, text: &str) {
+                self.0.push(text.to_owned());
+            }
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        let mut element = app.chat_view(card);
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(900.0, 980.0)),
+        );
+        let mut text = Texts::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut text);
+        text.0
+    }
+
+    /// The footer keeps naming the account the conversation is on while an
+    /// automatic switch away from it waits, and after the daemon refuses it,
+    /// as the conversation never left that account.
+    #[test]
+    fn the_footer_names_the_conversations_account_through_a_pending_switch() {
+        for refusal in [
+            chat::Recovery::Busy,
+            chat::Recovery::Unresponsive,
+            chat::Recovery::Unreached,
+        ] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let (card, target) = limited_automatic_chat(&mut app, "Keep this message");
+            // Wide enough that the footer names the account beside its
+            // avatar, rather than only to assistive technology.
+            let _ = app.workspace.resize_viewport(1200.0);
+            let launch = &chat_runtime(&app, card).session.launch;
+            let current = app
+                .chat_accounts(launch.provider, &launch.recipe)
+                .expect("two accounts to choose between")
+                .current;
+            let named = |app: &Cagents| visible_text(app, card).contains(&current);
+            assert!(
+                named(&app),
+                "{current} before sending: {:?}",
+                visible_text(&app, card)
+            );
+
+            drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send))));
+            assert!(app.chat_start_pending(card), "sending asked for a switch");
+            assert!(
+                named(&app),
+                "{current} while the switch waits: {:?}",
+                visible_text(&app, card)
+            );
+
+            let attempt = chat_runtime_attempt(&app, card);
+            answer_start(
+                &mut app,
+                attempt,
+                Err(chat::StartFailure {
+                    message: crate::terminal_ipc::DAEMON_BUSY.into(),
+                    recovery: refusal,
+                }),
+            );
+            assert!(!app.chat_start_pending(card));
+            assert!(
+                named(&app),
+                "{current} once {refusal:?} refused the switch: {:?}",
+                visible_text(&app, card)
+            );
+        }
+    }
+
     /// A switch the daemon refused only because it was finishing another
     /// operation moved nothing. The conversation stays on its own account and
     /// attached, offers no restore of an account that was never removed, says

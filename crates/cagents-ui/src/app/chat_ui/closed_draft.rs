@@ -261,36 +261,6 @@ mod tests {
         result
     }
 
-    fn visible_text(app: &Cagents, card: CardId) -> Vec<String> {
-        use iced::advanced::{
-            Layout, layout,
-            widget::{Operation, Tree},
-        };
-        #[derive(Default)]
-        struct Texts(Vec<String>);
-        impl Operation for Texts {
-            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
-                visit(self);
-            }
-            fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, text: &str) {
-                self.0.push(text.to_owned());
-            }
-        }
-        let renderer = crate::app::tests::headless_renderer();
-        let mut element = app.chat_view(card);
-        let mut tree = Tree::new(element.as_widget());
-        let node = element.as_widget_mut().layout(
-            &mut tree,
-            &renderer,
-            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(900.0, 980.0)),
-        );
-        let mut text = Texts::default();
-        element
-            .as_widget_mut()
-            .operate(&mut tree, Layout::new(&node), &renderer, &mut text);
-        text.0
-    }
-
     #[test]
     fn remote_closed_draft_retains_report_and_draft_without_reporting_execution_failure() {
         let (mut app, target, channel, _) = fixture("unsent\nkeep exact spaces  ");
@@ -313,7 +283,7 @@ mod tests {
         assert!(app.card_state(target.card).unwrap().existence.is_open());
         app.chat_runtime_mut(target).unwrap().error =
             Some("Exact native chat is not hosted; explicit recovery is required".into());
-        let text = visible_text(&app, target.card).join("\n");
+        let text = crate::app::chat_ui::tests::visible_text(&app, target.card).join("\n");
         // The footer no longer repeats the state; the closed card says it.
         assert!(text.contains("Closed in another window"), "{text}");
         assert!(!text.contains("Closed · draft retained"), "{text}");
@@ -354,7 +324,7 @@ mod tests {
         assert!(runtime.queued.is_none());
         assert_eq!(runtime.unsent_text(), "the first message");
         assert!(app.chat_working_session(target.card).is_none());
-        let text = visible_text(&app, target.card).join("\n");
+        let text = crate::app::chat_ui::tests::visible_text(&app, target.card).join("\n");
         assert!(!text.contains("Starting"), "{text}");
     }
 
@@ -371,7 +341,7 @@ mod tests {
         );
         assert!(!runtime(&app, target).expected_remote_close_error(error));
         assert!(
-            visible_text(&app, target.card)
+            crate::app::chat_ui::tests::visible_text(&app, target.card)
                 .join("\n")
                 .contains("Finished with error")
         );
