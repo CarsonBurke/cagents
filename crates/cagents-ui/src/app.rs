@@ -1696,8 +1696,6 @@ struct ReplicaSnapshotDebt {
     writer: crate::session::WriterIdentity,
 }
 
-/// What an update changed in the durable workspace beside focus, which decides
-/// when [`Cagents::apply_viewport`] hands the workspace to the writer.
 /// Whether a focus change reads the newly focused pane's update at once, or
 /// leaves that to the attention dwell once the pane has stayed visible.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1706,6 +1704,8 @@ enum FocusRead {
     AfterDwell,
 }
 
+/// What an update changed in the durable workspace beside focus, which decides
+/// when [`Cagents::apply_viewport`] hands the workspace to the writer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DurableChange {
     /// Nothing: a change of focus alone is saved within

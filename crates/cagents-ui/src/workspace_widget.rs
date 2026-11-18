@@ -1180,7 +1180,7 @@ where
                                     primary: false,
                                 }),
                             )
-                            // The active pane has nothing to gain from a rest.
+                            // The active pane has nothing to gain from an entry.
                             .on_pointer_enter((focus_follows_mouse && !focused).then(|| {
                                 on_viewport(WorkspaceViewportEvent::PointerEntered(card.id))
                             }))
