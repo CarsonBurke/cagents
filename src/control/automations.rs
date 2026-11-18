@@ -664,8 +664,22 @@ fn request(command: AutomationCommand) -> Result<(&'static str, Request), AppErr
     })
 }
 
+impl AutomationCommand {
+    /// Whether the command reads its definition from standard input, as
+    /// [`read_definition`] does for `--definition -`.
+    #[cfg(feature = "ui")]
+    pub(super) fn reads_stdin(&self) -> bool {
+        match self {
+            Self::Propose { definition, .. }
+            | Self::Create { definition }
+            | Self::Edit { definition, .. } => standard_input(definition),
+            _ => false,
+        }
+    }
+}
+
 fn read_definition(path: &Path) -> Result<Definition, AppError> {
-    let reader: Box<dyn Read> = if path == Path::new("-") {
+    let reader: Box<dyn Read> = if standard_input(path) {
         Box::new(io::stdin())
     } else {
         Box::new(std::fs::File::open(path).map_err(|e| AppError::new("automation_definition", e))?)

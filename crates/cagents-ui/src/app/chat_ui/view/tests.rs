@@ -11557,35 +11557,108 @@ fn a_group_of_one_step_draws_the_step_alone() {
 }
 
 /// A lone step the reader opened stays open when a second step joins it:
-/// the strip the two now share opens, and closing the first step later
-/// folds only that step. A lone step's own text is always selectable, as
-/// its row is drawn.
+/// the strip the two now share opens over it, and closing that step later
+/// folds only the step. Closing a lone step returns its group to the
+/// setting.
 #[test]
 fn a_group_opens_over_the_step_the_reader_opened_before_it_grew() {
-    let first = bash("toolu_first", "", "cargo check --workspace", "");
-    let (mut runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&first));
+    let first = bash("toolu_first", "", "cargo check --workspace", "Finished");
+    let (runtime, handle) = frame_cost::live_runtime(std::slice::from_ref(&first));
+    let target = runtime.target;
     let key = runtime.turns[0].key.clone();
-    assert!(runtime.steps_shown(&runtime.turns[0]));
-    assert!(!runtime.group_open(&runtime.turns[0]));
-    runtime.expanded.insert("toolu_first".into());
-    runtime.follow_lone_step("toolu_first", true);
-    assert_eq!(runtime.opened.get(&key), Some(&true));
-    // The group grows; its key is its first step's.
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    app.cards
+        .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+    let toggle = |app: &mut Cagents| {
+        drop(app.handle_chat_ui(Action::Toggle(target, "toolu_first".into())));
+    };
+
+    toggle(&mut app);
+    toggle(&mut app);
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    assert!(!runtime.item_expanded("toolu_first"));
+    assert_eq!(runtime.opened.get(&key), None);
+
+    toggle(&mut app);
     let mut second = bash("toolu_second", "", "cargo test -q", "");
     second.started_at = Some(5_000);
     second.at = Some(6_000);
-    let (mut grown, _handle) = frame_cost::live_runtime(&[first, second]);
-    let turn = grown.turns[0].clone();
-    assert_eq!(turn.key, key);
-    grown.opened = runtime.opened.clone();
-    grown.expanded.insert("toolu_first".into());
-    assert!(grown.group_open(&turn));
-    // A step inside a strip of several leaves the strip alone.
-    grown.expanded.remove("toolu_first");
-    grown.follow_lone_step("toolu_first", false);
-    assert!(grown.steps_shown(&turn));
-    // Closing a lone step returns its group to the setting.
-    runtime.expanded.remove("toolu_first");
-    runtime.follow_lone_step("toolu_first", false);
-    assert_eq!(runtime.opened.get(&key), None);
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    let mut snapshot = (*handle.snapshot()).clone();
+    snapshot.permission_mode = runtime.snapshot.permission_mode.clone();
+    snapshot.generation += 1;
+    snapshot.items.push(Arc::new(second));
+    handle.publish_delta_snapshot_for_test(snapshot);
+    runtime.refresh();
+    preparation::drain_fixture(runtime);
+    let turn = runtime.turns[0].clone();
+    assert_eq!((turn.key.as_str(), turn.steps.len()), (key.as_str(), 2));
+    assert!(runtime.group_open(&turn));
+    let texts = turn_texts(runtime);
+    // The first step's detail, with its output, is open.
+    for shown in ["Ran 2 commands", "Output"] {
+        assert!(
+            texts.iter().any(|text| text.contains(shown)),
+            "{shown}: {texts:?}"
+        );
+    }
+
+    toggle(&mut app);
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    assert!(!runtime.item_expanded("toolu_first"));
+    assert!(runtime.group_open(&runtime.turns[0]));
+    let texts = turn_texts(runtime);
+    assert!(texts.iter().all(|text| text != "Output"), "{texts:?}");
+    assert!(
+        texts.iter().any(|text| text.contains("cargo test -q")),
+        "{texts:?}"
+    );
+}
+
+/// A coordinating step reads in the past tense, so one still running
+/// without the spinner says it is working, as its group's strip did. The
+/// spinner moves on to newer work once the agent writes again.
+#[test]
+fn a_lone_coordinating_step_still_running_says_so() {
+    let mut item = bash("toolu_sessions", "", "cagents sessions", "");
+    if let ItemContent::Command {
+        status,
+        exit_code,
+        duration_ms,
+        ..
+    } = &mut item.content
+    {
+        *status = chat::ToolStatus::Running;
+        *exit_code = None;
+        *duration_ms = None;
+    }
+    item.at = None;
+    let later = chat::Item {
+        id: "later".into(),
+        role: chat::Role::Assistant,
+        at: Some(5_000),
+        started_at: Some(5_000),
+        content: ItemContent::Text {
+            text: "Meanwhile, the build.".into(),
+            thinking: false,
+            phase: chat::Phase::Commentary,
+        },
+    };
+    let (mut runtime, handle) = frame_cost::live_runtime(&[item, later]);
+    let mut snapshot = (*handle.snapshot()).clone();
+    snapshot.permission_mode = runtime.snapshot.permission_mode.clone();
+    snapshot.generation += 1;
+    snapshot.busy = true;
+    handle.publish_delta_snapshot_for_test(snapshot);
+    runtime.refresh();
+    preparation::drain_fixture(&mut runtime);
+    assert!(runtime.cache["toolu_sessions"].coordination.is_some());
+    assert_eq!(runtime.strip_status(&runtime.turns[0]), None);
+    let texts = turn_texts(&runtime);
+    assert!(
+        texts
+            .iter()
+            .any(|text| text.contains("live sessions · working")),
+        "{texts:?}"
+    );
 }

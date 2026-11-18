@@ -410,9 +410,10 @@ fn cli(line: &str, output: &str) -> Option<Coordination> {
             .iter()
             .take_while(|after| after.stdin == shell::Stdin::Pipe)
             .count();
-    // What is piped in reaches the CLI only as a message or a prompt read
-    // from `-`; piped into anything else, it is a command of its own.
-    if feeds && !reads_stdin(argv) {
+    // What is piped in reaches the CLI only where it reads standard input,
+    // as a message, a prompt, a ticket body or a definition given as `-`;
+    // piped into anything else, it is a command of its own.
+    if feeds && !crate::control::invocation::reads_stdin(argv) {
         return None;
     }
     let incidental = commands.iter().enumerate().all(|(at, other)| match at {
@@ -449,17 +450,6 @@ fn cli(line: &str, output: &str) -> Option<Coordination> {
     })
 }
 
-/// Whether the invocation `argv` reads standard input, as a message or a
-/// prompt given as `-`.
-fn reads_stdin(argv: &[String]) -> bool {
-    let probe = Text::Inline("\0standard input".into());
-    match crate::control::invocation::coordination(argv, probe.clone()) {
-        Some(Kind::Message(message)) => message.body == probe,
-        Some(Kind::Spawn(spawn)) => spawn.agents.iter().any(|agent| agent.prompt == probe),
-        _ => false,
-    }
-}
-
 /// The program `simple` runs, by its name rather than its path.
 fn program(simple: &shell::Simple) -> &str {
     simple
@@ -481,7 +471,8 @@ fn sets_up(simple: &shell::Simple) -> bool {
 
 /// Whether `simple`, reading an invocation's output through a pipe, only
 /// trims, filters or formats what it printed. One that names a file to read
-/// as well, as `head -50 build.log` does, reads something else.
+/// as well, as `head -50 build.log` or `jq --slurpfile seen seen.json` do,
+/// or searches a directory, as `grep -r` does, reads something else.
 fn trims(simple: &shell::Simple) -> bool {
     let Some(filter) = Filter::of(program(simple)) else {
         return false;
@@ -503,6 +494,9 @@ fn trims(simple: &shell::Simple) -> bool {
                 Some((name, _)) => (name, true),
                 None => (long, false),
             };
+            if filter.reads_more.contains(&name) {
+                return false;
+            }
             if filter.supplies_program.contains(&name) {
                 programs = 0;
             }
@@ -520,6 +514,12 @@ fn trims(simple: &shell::Simple) -> bool {
             // `-ne PATTERN`, `-n5`, `-eerror`: a short option taking a value
             // takes the rest of its word, or the next word.
             for (at, option) in cluster.char_indices() {
+                if filter
+                    .reads_more
+                    .contains(&&cluster[at..at + option.len_utf8()])
+                {
+                    return false;
+                }
                 if !filter.short.contains(option) {
                     continue;
                 }
@@ -550,6 +550,9 @@ struct Filter {
     long: &'static [(&'static str, usize)],
     /// Options, short or long, that give the program, so no operand does.
     supplies_program: &'static [&'static str],
+    /// Options, short or long, that read input besides the piped output: a
+    /// file of data, or a directory searched in place of standard input.
+    reads_more: &'static [&'static str],
 }
 
 impl Filter {
@@ -559,11 +562,29 @@ impl Filter {
             short,
             long,
             supplies_program,
+            reads_more: &[],
         };
         Some(match program {
             "tee" => filter(usize::MAX, "", &[], &[]),
             "head" | "tail" => filter(0, "nc", &[("lines", 1), ("bytes", 1)], &[]),
-            "wc" | "cat" | "nl" | "less" | "more" => filter(0, "", &[], &[]),
+            "wc" | "cat" | "less" | "more" => filter(0, "", &[], &[]),
+            "nl" => filter(
+                0,
+                "bdfhilnsvw",
+                &[
+                    ("body-numbering", 1),
+                    ("section-delimiter", 1),
+                    ("footer-numbering", 1),
+                    ("header-numbering", 1),
+                    ("line-increment", 1),
+                    ("join-blank-lines", 1),
+                    ("number-format", 1),
+                    ("number-separator", 1),
+                    ("starting-line-number", 1),
+                    ("number-width", 1),
+                ],
+                &[],
+            ),
             "sort" => filter(
                 0,
                 "ktoST",
@@ -582,7 +603,25 @@ impl Filter {
                 &[],
             ),
             "fold" => filter(0, "w", &[("width", 1)], &[]),
-            "column" => filter(0, "sco", &[("separator", 1), ("output-width", 1)], &[]),
+            "column" => filter(
+                0,
+                "scoNRWTEHOnl",
+                &[
+                    ("separator", 1),
+                    ("output-separator", 1),
+                    ("output-width", 1),
+                    ("table-columns", 1),
+                    ("table-right", 1),
+                    ("table-wrap", 1),
+                    ("table-truncate", 1),
+                    ("table-noextreme", 1),
+                    ("table-hide", 1),
+                    ("table-order", 1),
+                    ("table-name", 1),
+                    ("table-columns-limit", 1),
+                ],
+                &[],
+            ),
             "cut" => filter(
                 0,
                 "dfcb",
@@ -595,9 +634,29 @@ impl Filter {
                 &[],
             ),
             "tr" => filter(2, "", &[], &[]),
-            "grep" | "egrep" | "fgrep" | "rg" => filter(
+            // With no file, `grep -r` searches the working directory, not
+            // what it is piped.
+            "grep" | "egrep" | "fgrep" => Self {
+                reads_more: &["r", "R", "recursive", "dereference-recursive"],
+                ..filter(
+                    1,
+                    "efmABCd",
+                    &[
+                        ("regexp", 1),
+                        ("file", 1),
+                        ("max-count", 1),
+                        ("after-context", 1),
+                        ("before-context", 1),
+                        ("context", 1),
+                        ("label", 1),
+                    ],
+                    &["e", "f", "regexp", "file"],
+                )
+            },
+            // Piped input with no path, `rg` searches that input.
+            "rg" => filter(
                 1,
-                "efmABC",
+                "efmABCgtTrM",
                 &[
                     ("regexp", 1),
                     ("file", 1),
@@ -606,7 +665,11 @@ impl Filter {
                     ("before-context", 1),
                     ("context", 1),
                     ("glob", 1),
+                    ("iglob", 1),
                     ("type", 1),
+                    ("type-not", 1),
+                    ("replace", 1),
+                    ("max-columns", 1),
                 ],
                 &["e", "f", "regexp", "file"],
             ),
@@ -622,19 +685,16 @@ impl Filter {
                 &[("field-separator", 1), ("assign", 1), ("file", 1)],
                 &["f", "file"],
             ),
-            "jq" => filter(
-                1,
-                "f",
-                &[
-                    ("arg", 2),
-                    ("argjson", 2),
-                    ("slurpfile", 2),
-                    ("rawfile", 2),
-                    ("indent", 1),
-                    ("from-file", 1),
-                ],
-                &["f", "from-file"],
-            ),
+            // `--slurpfile` and `--rawfile` bind a file's contents.
+            "jq" => Self {
+                reads_more: &["slurpfile", "rawfile"],
+                ..filter(
+                    1,
+                    "fL",
+                    &[("arg", 2), ("argjson", 2), ("indent", 1), ("from-file", 1)],
+                    &["f", "from-file"],
+                )
+            },
             _ => return None,
         })
     }
@@ -1143,8 +1203,16 @@ mod tests {
             "cagents inbox | grep -n error notes.md",
             "cagents sessions | grep -eerror build.log",
             "cagents sessions | grep --regexp=error build.log",
-            // What is piped into a command that does not read it.
+            "cagents sessions --json | jq --slurpfile seen seen.json '.'",
+            "cagents sessions --json | jq --rawfile notes notes.md '.'",
+            // With no file, a recursive grep searches the working directory.
+            "cagents sessions | grep -r Relocate",
+            "cagents inbox | grep -rn error",
+            "cagents sessions | grep --recursive Relocate",
+            // What is piped into a command that does not read it: `--file -`
+            // opens a file called `-`.
             "cat review.md | cagents sessions",
+            "echo hi | cagents send reviewer --file -",
         ] {
             assert!(cli(line, output).is_none(), "{line}");
         }
@@ -1168,6 +1236,11 @@ mod tests {
             "cagents sessions | head --lines 5",
             "cagents sessions | grep -A3 -e Relocate -e Review",
             "cagents sessions | sort -k 2 | uniq -c",
+            "cagents sessions | nl -w 3 -s ': '",
+            "cagents sessions | column -t -N ID,TITLE -R ID",
+            "cagents --json sessions | jq -L lib -r '.[].id'",
+            "cagents sessions | rg -g '*.rs' -t rust -M 80 Relocate",
+            "cagents sessions | rg -r X Relocate",
         ] {
             assert_eq!(
                 cli(line, "").map(|step| step.kind),
@@ -1186,6 +1259,30 @@ mod tests {
             panic!("a message");
         };
         assert_eq!(message.body, Text::File("review.md".into()));
+        // A ticket body or a definition read from `-` takes what is piped.
+        let commented = cli(
+            "cat <<'EOF' | cagents linear comment add --current --body-file -\nLooks right.\nEOF\n",
+            "",
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                commented.kind,
+                Kind::Act(Act::Linear {
+                    verb: "Commented on",
+                    ..
+                })
+            ),
+            "{:?}",
+            commented.kind
+        );
+        assert!(
+            cli(
+                "cat automation.json | cagents automation create --definition -",
+                ""
+            )
+            .is_some()
+        );
     }
 
     #[test]

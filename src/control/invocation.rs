@@ -17,18 +17,43 @@ thread_local! {
     static GRAMMAR: RefCell<clap::Command> = RefCell::new(Cli::command());
 }
 
+/// `argv`, starting at the `cagents` word, as the CLI parses it. `None` for
+/// a command the CLI would reject.
+fn parse_cli(argv: &[String]) -> Option<Cli> {
+    GRAMMAR.with_borrow_mut(|grammar| {
+        let matches = grammar.try_get_matches_from_mut(argv).ok()?;
+        Cli::from_arg_matches(&matches).ok()
+    })
+}
+
+/// Whether `argv`, starting at the `cagents` word, reads standard input, as
+/// each command that reads text, a body or a definition decides it does.
+pub(crate) fn reads_stdin(argv: &[String]) -> bool {
+    let Some(cli) = parse_cli(argv) else {
+        return false;
+    };
+    match &cli.command {
+        TopCommand::Send(send) => send.message.reads_stdin(),
+        TopCommand::Ask(ask) => ask.send.message.reads_stdin(),
+        TopCommand::Reply(reply) => reply.message.reads_stdin(),
+        TopCommand::Agent {
+            command: AgentCommand::Spawn { prompt, .. } | AgentCommand::Send { prompt, .. },
+        } => prompt.reads_stdin(),
+        TopCommand::Linear(linear) => linear.reads_stdin(),
+        TopCommand::Automation { command } => command.reads_stdin(),
+        _ => false,
+    }
+}
+
 /// What `argv`, starting at the `cagents` word, does, `stdin` being what the
 /// shell line shows it reading. `None` for a command the CLI would reject.
 pub(crate) fn coordination(argv: &[String], stdin: Text) -> Option<Kind> {
-    let cli = GRAMMAR.with_borrow_mut(|grammar| {
-        let matches = grammar.try_get_matches_from_mut(argv).ok()?;
-        Cli::from_arg_matches(&matches).ok()
-    })?;
-    // As the CLI's `read_text` reads it: standard input only for a lone `-`.
+    let cli = parse_cli(argv)?;
+    // As the CLI's `read_text` reads it: standard input only for a lone `-`
+    // given as the text itself; a file is opened by its name, `-` included.
     let text = |inline: Option<String>, file: Option<PathBuf>| match (inline, file) {
-        (Some(inline), _) if inline == "-" => stdin.clone(),
+        (Some(inline), _) if standard_input(&inline) => stdin.clone(),
         (Some(inline), _) => Text::Inline(inline),
-        (None, Some(path)) if path.as_os_str() == "-" => stdin.clone(),
         (None, Some(path)) => Text::File(path.display().to_string()),
         (None, None) => Text::Unseen,
     };

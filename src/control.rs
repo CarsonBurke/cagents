@@ -56,6 +56,12 @@ pub use work::{WorkCommand, WorkListArgs};
 #[cfg(feature = "ui")]
 pub(crate) mod invocation;
 
+/// Whether a command's text, file or definition argument names standard
+/// input: a lone `-`, wherever a command reads one.
+pub(crate) fn standard_input(word: impl AsRef<std::ffi::OsStr>) -> bool {
+    word.as_ref() == "-"
+}
+
 use crate::{
     agent_execution::Authority,
     instance::{
