@@ -492,6 +492,30 @@ impl ScopedId {
 /// message that resumes one, and a skill that forks.
 const SPAWNING_TOOLS: &[&str] = &["Agent", "Task", "SendMessage", "Skill"];
 
+/// The spawning calls an assistant frame makes, whole or as a streamed
+/// block, by name and call ID.
+fn spawning_calls(frame: &Value) -> Vec<(&str, &str)> {
+    let spawning = |block: &&Value| {
+        string(block, "type") == "tool_use" && SPAWNING_TOOLS.contains(&string(block, "name"))
+    };
+    let blocks: Vec<&Value> = match string(frame, "type") {
+        "assistant" => frame["message"]["content"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .collect(),
+        "stream_event" if string(&frame["event"], "type") == "content_block_start" => {
+            vec![&frame["event"]["content_block"]]
+        }
+        _ => Vec::new(),
+    };
+    blocks
+        .into_iter()
+        .filter(spawning)
+        .map(|block| (string(block, "name"), string(block, "id")))
+        .collect()
+}
+
 /// How many nested calls or tasks are remembered. They are agents and forked
 /// skills only, so this outlasts any team's helpers by far while bounding a
 /// conversation that runs for weeks.
@@ -518,38 +542,6 @@ impl NestedIds {
             && let Some(oldest) = self.order.pop_front()
         {
             self.known.remove(&oldest);
-        }
-    }
-
-    /// Remember the spawning calls a frame from inside an agent makes, whole
-    /// or as a streamed block, whatever depth that agent is at.
-    fn observe(&mut self, frame: &Value) {
-        let spawning = |block: &Value| {
-            string(block, "type") == "tool_use" && SPAWNING_TOOLS.contains(&string(block, "name"))
-        };
-        match string(frame, "type") {
-            "assistant" => {
-                for block in frame["message"]["content"].as_array().into_iter().flatten() {
-                    if spawning(block) {
-                        self.insert(string(block, "id"));
-                    }
-                }
-            }
-            "stream_event" => {
-                let block = &frame["event"]["content_block"];
-                if string(&frame["event"], "type") == "content_block_start" && spawning(block) {
-                    self.insert(string(block, "id"));
-                }
-            }
-            // An agent's task says how deep it was spawned; the lead's own
-            // agents are at depth one.
-            "system"
-                if string(frame, "subtype") == "task_started"
-                    && frame["spawn_depth"].as_u64().is_some_and(|depth| depth > 1) =>
-            {
-                self.insert(string(frame, "tool_use_id"));
-            }
-            _ => {}
         }
     }
 }
@@ -781,12 +773,18 @@ struct Claude {
     /// conversation. Kept apart from the tool cache, which a busy team of
     /// workers turns over long before their helpers finish.
     nested_calls: NestedIds,
-    /// The tasks of those helpers. Their lifecycle frames reach this
-    /// conversation too, the later ones naming only the task.
+    /// Messages sent inside another agent, which can resume a helper under
+    /// that call. Only its forwarded conversation is set aside by them: a
+    /// worker can also message one of this conversation's own agents, whose
+    /// lifecycle then names that call.
+    nested_messages: NestedIds,
+    /// The tasks of those helpers, and the tasks they start. Their lifecycle
+    /// frames reach this conversation too, the later ones naming only the
+    /// task.
     nested_tasks: NestedIds,
     /// Agents the background level ended before their notice arrived. That
     /// notice, when it comes, still says how they went.
-    unreported_agents: HashSet<String>,
+    unreported_agents: VecDeque<String>,
     /// Every live background task, by task ID, as Claude Code's last
     /// `background_tasks_changed` level reported it in this process; `None`
     /// until the first one. A task that leaves it is no longer running,
@@ -2534,7 +2532,11 @@ impl Claude {
                         }
                     } else if ended.is_none() && !waiting && self.background_agents.contains(&owner)
                     {
-                        self.unreported_agents.insert(owner.clone());
+                        self.unreported_agents.retain(|known| known != &owner);
+                        self.unreported_agents.push_back(owner.clone());
+                        if self.unreported_agents.len() > MAX_TOOLS {
+                            self.unreported_agents.pop_front();
+                        }
                         self.update_task_agent(
                             &task,
                             Some(&owner),
@@ -2582,6 +2584,25 @@ impl Claude {
 
     /// Whether a call started a conversation inside one of this
     /// conversation's agents, rather than one of its own.
+    /// Remember what a frame from inside an agent, or a task's lifecycle,
+    /// says runs nested, whatever depth that agent is at.
+    fn observe_nested(&mut self, frame: &Value) {
+        for (name, call) in spawning_calls(frame) {
+            if name == "SendMessage" {
+                self.nested_messages.insert(call);
+            } else {
+                self.nested_calls.insert(call);
+            }
+        }
+        // An agent's task says how deep it was spawned; the lead's own
+        // agents are at depth one.
+        if string(frame, "subtype") == "task_started"
+            && frame["spawn_depth"].as_u64().is_some_and(|depth| depth > 1)
+        {
+            self.nested_calls.insert(string(frame, "tool_use_id"));
+        }
+    }
+
     fn nested_call(&self, tool: &str) -> bool {
         !self.tools.contains_key(&ScopedId::new(None, tool))
             && (self.nested_calls.contains(tool) || self.nested_agent_tool(tool))
@@ -2705,7 +2726,12 @@ impl Claude {
         let Some(tool) = owner else { return status };
         // The level ended this agent unseen; its notice now says how it went.
         let reported = (started || ended.is_some_and(|ended| ended != ToolStatus::Ended))
-            && self.unreported_agents.remove(tool);
+            && self
+                .unreported_agents
+                .iter()
+                .position(|known| known == tool)
+                .and_then(|index| self.unreported_agents.remove(index))
+                .is_some();
         let background = self.background_agents.contains(tool)
             || self
                 .agent_calls
@@ -3301,7 +3327,7 @@ impl Adapter for Claude {
                 });
                 for mut frame in frames {
                     frame["parent_tool_use_id"] = json!(parent);
-                    self.nested_calls.observe(&frame);
+                    self.observe_nested(&frame);
                     let mut child_step = Step::default();
                     if self
                         .message_with_tools(&frame, &mut child_step, &HashMap::new(), true)
@@ -3672,9 +3698,13 @@ impl Claude {
             .as_str()
             .filter(|parent| !parent.is_empty());
         if parent.is_some() || string(&frame, "type") == "system" {
-            self.nested_calls.observe(&frame);
+            self.observe_nested(&frame);
         }
-        if parent.is_some_and(|parent| self.nested_call(parent)) {
+        if parent.is_some_and(|parent| {
+            self.nested_call(parent)
+                || (self.nested_messages.contains(parent)
+                    && !self.tools.contains_key(&ScopedId::new(None, parent)))
+        }) {
             // Forwarded grandchildren have no independent transcript in the
             // lead conversation. Their launch/result tool row is retained in
             // the direct worker's transcript; their own stream and outcome
@@ -6735,8 +6765,15 @@ impl Claude {
             "background_tasks_changed" => self.background_level(frame, step),
             "task_started" | "task_progress" | "task_notification" | "task_updated" => {
                 let task = required(frame, "task_id")?;
-                if self.nested_tasks.contains(task) {
-                    // A worker's helper: its own transcript shows it.
+                // A worker's helper, or work a helper started: its own
+                // transcript shows it.
+                if self.nested_tasks.contains(task)
+                    || frame["spawn_depth"].as_u64().is_some_and(|depth| depth > 1)
+                    || frame["parent_task_id"]
+                        .as_str()
+                        .is_some_and(|parent| self.nested_tasks.contains(parent))
+                {
+                    self.nested_tasks.insert(task);
                     return Ok(());
                 }
                 let started = string(frame, "subtype") == "task_started";
@@ -6745,9 +6782,10 @@ impl Claude {
                     // Contradictory advisory identities do not retarget an
                     // existing owner or make the conversation fail. A helper's
                     // later frames name only its task, so remember that too.
-                    if frame["tool_use_id"]
-                        .as_str()
-                        .is_some_and(|tool| self.nested_call(tool))
+                    if frame["spawn_depth"].as_u64() != Some(1)
+                        && frame["tool_use_id"]
+                            .as_str()
+                            .is_some_and(|tool| self.nested_call(tool))
                     {
                         self.nested_tasks.insert(task);
                     }

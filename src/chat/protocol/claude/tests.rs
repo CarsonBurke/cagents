@@ -7173,6 +7173,33 @@ fn a_resumed_background_agent_settles_from_a_receipt_naming_send_message() {
 }
 
 #[test]
+fn a_worker_messaging_one_of_the_leads_agents_resumes_that_agent_here() {
+    let mut adapter = Claude::default();
+    notification_agent(&mut adapter, "worker-call", "worker-task", true);
+    notification_agent(&mut adapter, "agent-call", "agent-task", true);
+    adapter
+        .receive(notification_frame(
+            "first-receipt",
+            "agent-call",
+            "agent-task",
+            "completed",
+        ))
+        .unwrap();
+    // The worker, not the lead, sends the message that resumes it.
+    adapter.receive(json!({"type":"assistant","uuid":"resume-call","parent_tool_use_id":"worker-call","message":{"id":"resume-message","content":[{"type":"tool_use","id":"send-call","name":"SendMessage","input":{"to":"agent-task","message":"Check again"}}]}})).unwrap();
+    let started = adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"agent-task","tool_use_id":"send-call","task_type":"local_agent","spawn_depth":1})).unwrap();
+    assert_eq!(
+        notification_agent_statuses(&started, "agent-call"),
+        [ToolStatus::Running]
+    );
+    let settled = adapter.receive(json!({"type":"system","subtype":"task_notification","uuid":"second-receipt","task_id":"agent-task","tool_use_id":"send-call","status":"completed","summary":"Done"})).unwrap();
+    assert_eq!(
+        notification_agent_statuses(&settled, "agent-call"),
+        [ToolStatus::Succeeded]
+    );
+}
+
+#[test]
 fn a_send_message_alias_never_settles_the_agent_it_resumed_for_another_task() {
     let mut adapter = Claude::default();
     notification_agent(&mut adapter, "call-a", "task-a", true);
@@ -13045,6 +13072,11 @@ fn helpers_stay_nested_after_the_tool_cache_turns_over() {
     lead.receive(
         json!({"type":"assistant","uuid":"late-text","parent_tool_use_id":"late",
         "message":{"id":"m-late","role":"assistant","content":[{"type":"text","text":"Late"}]}}),
+    );
+    // A command it starts is its own work too.
+    lead.receive(
+        json!({"type":"system","subtype":"task_started","uuid":"s2","session_id":"00000000-0000-4000-8000-000000000001","task_id":"b-late",
+        "tool_use_id":"late-bash","task_type":"local_bash","description":"Wait","is_backgrounded":true,"parent_task_id":"a-late"}),
     );
     // Its later lifecycle frames name only the task.
     lead.receive(
