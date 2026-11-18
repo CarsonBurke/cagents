@@ -1675,15 +1675,20 @@ impl Codex {
             self.cursor = page["nextCursor"].as_str().map(str::to_owned);
             self.history_initialized = true;
         }
+        // Codex pages its turns by cursor alone and never says how many are
+        // left, so the reader is shown that earlier history exists, not how
+        // much of it.
         step.events.push(if earlier {
             Event::History {
                 items,
                 has_earlier: self.cursor.is_some(),
+                unfetched: None,
             }
         } else {
             Event::LatestHistory {
                 items,
                 has_earlier: self.cursor.is_some(),
+                unfetched: None,
             }
         });
         step.events
@@ -2235,6 +2240,7 @@ impl Adapter for Codex {
             Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. } =>
                 return Err("File changes are served by the transcript cache".into()),
             Command::LoadLater => return Err("Newer history is served by the transcript cache".into()),
+            Command::Seek { .. } => return Err("History positions are served by the transcript cache".into()),
             Command::LoadEarlier => {
                 let cursor = self.cursor.clone().ok_or("No earlier Codex history is available")?;
                 self.history(&mut step, Some(cursor))?;

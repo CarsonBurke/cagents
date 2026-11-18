@@ -145,6 +145,7 @@ pub(super) struct Window {
     pub changes: Vec<crate::chat::presentation::ItemChange>,
     pub has_earlier: bool,
     pub has_later: bool,
+    pub history: crate::chat::HistoryExtent,
 }
 pub(crate) struct Store {
     db: Connection,
@@ -172,6 +173,12 @@ pub(crate) struct Store {
     paging: bool,
     cached_earlier: bool,
     provider_earlier: bool,
+    /// How many items the provider said it holds before its latest page,
+    /// when it can tell.
+    provider_unfetched: Option<u64>,
+    /// Where the oldest item of that page is. The cache can hold older items,
+    /// from earlier runs of the provider, that it counts among those.
+    provider_floor: Option<i64>,
     pending_earlier: Option<Cursor>,
     /// Where the window will end once the provider's earlier page arrives.
     pending_pivot: Option<Cursor>,
@@ -426,6 +433,8 @@ impl Store {
                 paging: false,
                 cached_earlier: false,
                 provider_earlier: false,
+                provider_unfetched: None,
+                provider_floor: None,
                 pending_earlier: None,
                 pending_pivot: None,
                 latest_boundary: None,
@@ -1019,10 +1028,12 @@ impl Store {
             Event::History {
                 mut items,
                 has_earlier,
+                unfetched,
             }
             | Event::LatestHistory {
                 mut items,
                 has_earlier,
+                unfetched,
             } => {
                 if !earlier {
                     // A latest reread cannot satisfy an outstanding older
@@ -1031,9 +1042,14 @@ impl Store {
                     self.pending_pivot = None;
                 }
                 self.provider_earlier = has_earlier;
+                self.provider_unfetched = unfetched.filter(|_| has_earlier);
                 let mut seen = std::collections::BTreeSet::new();
                 items.retain(|item| seen.insert(item.id.clone()));
+                let oldest = items.first().map(|item| item.id.clone());
                 let warnings = self.merge_history(items, earlier)?;
+                if let Some(oldest) = oldest {
+                    self.provider_floor = self.ordinal(&oldest)?;
+                }
                 if !earlier {
                     self.latest_boundary = None;
                 }
@@ -1108,6 +1124,8 @@ impl Store {
                 self.slide = None;
                 self.paging = false;
                 self.provider_earlier = false;
+                self.provider_unfetched = None;
+                self.provider_floor = None;
                 self.cached_earlier = false;
                 self.pending_earlier = None;
                 self.pending_pivot = None;
@@ -1268,6 +1286,40 @@ impl Store {
             .unwrap_or(newest);
         self.forward = Some(pivot);
         self.slide = Some(Slide::Later { from: newest });
+        self.paging = true;
+        self.pending_earlier = None;
+        self.pending_pivot = None;
+        self.dirty = true;
+        Ok(true)
+    }
+    /// Present the window around the item at `index` of the cached
+    /// conversation, for a reader who moved straight there. The window
+    /// starts a quarter of a window before it, so the item is in the window
+    /// even when the items around it are large, with room both ways to
+    /// read on before the next page. Near the end this is the latest window,
+    /// which keeps following the conversation.
+    pub fn seek(&mut self, index: u64) -> Result<bool, String> {
+        let _ = self.flush_text()?;
+        let total: i64 = self
+            .db
+            .query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
+            .map_err(|e| e.to_string())?;
+        let start = index.saturating_sub(WINDOW_ITEMS as u64 / 4);
+        if index.saturating_add(WINDOW_ITEMS as u64 / 2) >= total as u64 {
+            self.latest();
+            return Ok(true);
+        }
+        let ordinal: i64 = self
+            .db
+            .query_row(
+                "SELECT ordinal FROM items ORDER BY ordinal LIMIT 1 OFFSET ?1",
+                [start as i64],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        self.forward = Some((ordinal, 0));
+        self.end = None;
+        self.slide = None;
         self.paging = true;
         self.pending_earlier = None;
         self.pending_pivot = None;
@@ -1782,6 +1834,37 @@ impl Store {
             self.forward = None;
             self.end = None;
         }
+        let count = |query: &str, ordinal: i64| {
+            self.db
+                .query_row(query, [ordinal], |row| row.get::<_, i64>(0))
+                .map(|count| count as u64)
+                .map_err(|e| e.to_string())
+        };
+        let history = crate::chat::HistoryExtent {
+            before: match first {
+                Some((ordinal, _)) => {
+                    count("SELECT COUNT(*) FROM items WHERE ordinal<?1", ordinal)?
+                }
+                None => 0,
+            },
+            after: match newest.filter(|_| has_later) {
+                Some((ordinal, _)) => {
+                    count("SELECT COUNT(*) FROM items WHERE ordinal>?1", ordinal)?
+                }
+                None => 0,
+            },
+            unfetched: match self.provider_unfetched {
+                _ if !self.provider_earlier => Some(0),
+                None => None,
+                // What earlier runs cached before the provider's latest page
+                // is among what it has not handed over in this one, and is
+                // already counted before the window.
+                Some(unfetched) => Some(unfetched.saturating_sub(match self.provider_floor {
+                    Some(floor) => count("SELECT COUNT(*) FROM items WHERE ordinal<?1", floor)?,
+                    None => 0,
+                })),
+            },
+        };
         let changes = items
             .iter()
             .filter(|item| !reused.contains(&item.id))
@@ -1805,6 +1888,7 @@ impl Store {
             changes,
             has_earlier: self.cached_earlier || self.provider_earlier,
             has_later,
+            history,
         })
     }
 }
@@ -1973,6 +2057,7 @@ mod tests {
         let event = Event::History {
             items: vec![history_item("saved", "The exact saved body")],
             has_earlier: false,
+            unfetched: None,
         };
         store.read_only_for_test().unwrap();
         assert!(matches!(
@@ -2228,6 +2313,7 @@ mod tests {
             .apply(Event::History {
                 items: vec![old.clone(), large.clone()],
                 has_earlier: false,
+                unfetched: None,
             })
             .unwrap();
         let window = resident.window().unwrap();
@@ -2244,6 +2330,7 @@ mod tests {
             .apply(Event::History {
                 items: vec![large.clone()],
                 has_earlier: false,
+                unfetched: None,
             })
             .unwrap();
         assert!(!resident.is_covered_by(&missing_old).unwrap());
@@ -2256,6 +2343,7 @@ mod tests {
             .apply(Event::History {
                 items: vec![old.clone(), changed],
                 has_earlier: false,
+                unfetched: None,
             })
             .unwrap();
         assert!(!resident.is_covered_by(&changed_hidden_chunk).unwrap());
@@ -2264,6 +2352,7 @@ mod tests {
             .apply(Event::History {
                 items: vec![large.clone(), old.clone()],
                 has_earlier: false,
+                unfetched: None,
             })
             .unwrap();
         assert!(!resident.is_covered_by(&reordered).unwrap());
@@ -2276,6 +2365,7 @@ mod tests {
                     history_item("additional", "new provider history"),
                 ],
                 has_earlier: false,
+                unfetched: None,
             })
             .unwrap();
         assert!(resident.is_covered_by(&unchanged).unwrap());
@@ -2291,6 +2381,7 @@ mod tests {
                 .apply(Event::History {
                     items: vec![parent.clone()],
                     has_earlier: false,
+                    unfetched: None,
                 })
                 .unwrap();
         }
@@ -2572,6 +2663,119 @@ mod tests {
         panic!("forward paging never reached cached live end");
     }
 
+    /// Each window says how much cached history lies on either side of it,
+    /// and a seek moves it straight to an item anywhere in that history.
+    #[test]
+    fn windows_count_the_history_around_them_and_seek_reaches_any_item() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        for n in 0..400 {
+            store
+                .apply(Event::Item(history_item(&format!("row-{n:03}"), "message")))
+                .unwrap();
+        }
+        let latest = store.window().unwrap();
+        assert_eq!(
+            latest.history,
+            crate::chat::HistoryExtent {
+                before: 400 - WINDOW_ITEMS as u64,
+                after: 0,
+                // Items cached live have no provider history before them.
+                unfetched: Some(0),
+            }
+        );
+        store.seek(100).unwrap();
+        let middle = store.window().unwrap();
+        let first = 100 - WINDOW_ITEMS / 4;
+        assert_eq!(middle.items[0].id, format!("row-{first:03}"));
+        assert!(middle.items.iter().any(|item| item.id == "row-100"));
+        assert!(middle.has_later);
+        assert_eq!(middle.history.before, first as u64);
+        assert_eq!(
+            middle.history.total(middle.items.len()),
+            400,
+            "the window and the history around it are the whole conversation"
+        );
+        // Paging on from a seek slides as from any other window.
+        store.earlier().unwrap();
+        let earlier = store.window().unwrap();
+        assert!(earlier.history.before < middle.history.before);
+        assert_eq!(earlier.history.total(earlier.items.len()), 400);
+        store.seek(0).unwrap();
+        let start = store.window().unwrap();
+        assert_eq!(start.items[0].id, "row-000");
+        assert_eq!(start.history.before, 0);
+        // Near the end, a seek is the latest window, which follows new items.
+        store.seek(390).unwrap();
+        let end = store.window().unwrap();
+        assert!(!end.has_later);
+        assert_eq!(end.items.last().unwrap().id, "row-399");
+        assert_eq!(end.history.after, 0);
+    }
+
+    /// History the provider has not handed over is counted as it reported
+    /// it, after what the cache already holds of it from an earlier run.
+    #[test]
+    fn windows_count_the_history_the_provider_still_holds() {
+        let messages = |start, end| {
+            (start..end)
+                .map(|n| history_item(&format!("row-{n:03}"), "message"))
+                .collect::<Vec<_>>()
+        };
+        let page = |items, unfetched| Event::History {
+            items,
+            has_earlier: true,
+            unfetched,
+        };
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        store.apply(page(messages(300, 400), Some(300))).unwrap();
+        let newest = store.window().unwrap();
+        assert_eq!(newest.history.unfetched, Some(300));
+        assert_eq!(
+            newest.history.earlier(),
+            newest.history.before + 300,
+            "the history before the window is what is cached and what is not"
+        );
+        // A provider that cannot tell still says that there is more.
+        store.apply(page(messages(250, 300), None)).unwrap();
+        let unknown = store.window().unwrap();
+        assert_eq!(unknown.history.unfetched, None);
+        assert!(unknown.has_earlier);
+        store.apply(page(messages(200, 250), Some(200))).unwrap();
+        assert_eq!(store.window().unwrap().history.unfetched, Some(200));
+
+        // A later run of the provider starts again from its newest page,
+        // and counts the history this cache already holds as not handed over.
+        store.apply(page(messages(300, 400), Some(300))).unwrap();
+        store.latest();
+        let resumed = store.window().unwrap();
+        assert_eq!(
+            resumed.history.unfetched,
+            Some(200),
+            "the 100 rows before the newest page that are cached are not counted twice"
+        );
+        assert_eq!(
+            resumed.history.earlier() + resumed.items.len() as u64,
+            400,
+            "the window and the history before it are the whole conversation"
+        );
+        // A provider that says it has nothing more holds nothing unfetched,
+        // and neither does one that is reset.
+        store
+            .apply(Event::History {
+                items: messages(0, 200),
+                has_earlier: false,
+                unfetched: Some(7),
+            })
+            .unwrap();
+        assert_eq!(store.window().unwrap().history.unfetched, Some(0));
+        store
+            .apply(Event::Reset {
+                reason: String::new(),
+            })
+            .unwrap();
+        assert_eq!(store.window().unwrap().history.unfetched, Some(0));
+    }
+
     /// A slide whose kept half fills the byte budget would hold nothing new,
     /// so it pages from the old edge instead and still reaches earlier rows.
     #[test]
@@ -2687,6 +2891,7 @@ mod tests {
             .apply(Event::History {
                 items: messages(200, 250),
                 has_earlier: true,
+                unfetched: None,
             })
             .unwrap();
         let initial = store.window().unwrap();
@@ -2695,6 +2900,7 @@ mod tests {
             .apply(Event::History {
                 items: messages(0, 200),
                 has_earlier: false,
+                unfetched: None,
             })
             .unwrap();
         let older = store.window().unwrap();
@@ -2775,6 +2981,7 @@ mod tests {
                     .map(|id| history_item(id, "replay"))
                     .to_vec(),
                 has_earlier: false,
+                unfetched: None,
             })
             .unwrap();
         assert_eq!(ids(&mut store), ["prefix", "A", "B", "C", "D"]);
@@ -2792,6 +2999,7 @@ mod tests {
                     .map(|id| history_item(id, "stale"))
                     .to_vec(),
                 has_earlier: false,
+                unfetched: None,
             })
             .unwrap();
         assert_eq!(ids(&mut store), ["prefix", "A", "B", "C", "D", "E"]);
@@ -2814,6 +3022,7 @@ mod tests {
             .apply(Event::LatestHistory {
                 items: vec![prompt, answer],
                 has_earlier: false,
+                unfetched: None,
             })
             .unwrap();
         assert_eq!(ids(&mut store), ["prompt", "codex-notice:test", "answer"]);
@@ -2832,12 +3041,14 @@ mod tests {
             .apply(Event::LatestHistory {
                 items: ["D", "E"].map(|id| history_item(id, id)).to_vec(),
                 has_earlier: true,
+                unfetched: None,
             })
             .unwrap();
         store
             .apply(Event::History {
                 items: ["Y", "Z"].map(|id| history_item(id, id)).to_vec(),
                 has_earlier: false,
+                unfetched: None,
             })
             .unwrap();
         assert_eq!(ids(&mut store), ["Y", "Z", "A", "B", "D", "E"]);
@@ -2850,6 +3061,7 @@ mod tests {
             .apply(Event::History {
                 items: vec![history_item("A", "A")],
                 has_earlier: true,
+                unfetched: None,
             })
             .unwrap();
         store.window().unwrap();
@@ -2859,6 +3071,7 @@ mod tests {
             .apply(Event::LatestHistory {
                 items: vec![history_item("B", "B")],
                 has_earlier: false,
+                unfetched: None,
             })
             .unwrap();
         assert!(store.pending_earlier.is_none());
@@ -2888,6 +3101,7 @@ mod tests {
                 .apply(Event::LatestHistory {
                     items: ["D", "E"].map(|id| history_item(id, id)).to_vec(),
                     has_earlier: false,
+                    unfetched: None,
                 })
                 .unwrap();
             assert_eq!(
@@ -2926,6 +3140,7 @@ mod tests {
             .apply(Event::LatestHistory {
                 items: ["D", "E"].map(|id| history_item(id, id)).to_vec(),
                 has_earlier: false,
+                unfetched: None,
             })
             .unwrap();
         assert_eq!(store.end, Some((2 * ORDINAL_STRIDE, 0)));
@@ -2951,6 +3166,7 @@ mod tests {
             .apply(Event::LatestHistory {
                 items: vec![history_item("D", "D")],
                 has_earlier: false,
+                unfetched: None,
             })
             .unwrap();
         assert_eq!(ids(&mut store), ["A", "D", "F"]);
@@ -3042,6 +3258,7 @@ mod tests {
                 .apply(Event::History {
                     items: vec![text("current")],
                     has_earlier: true,
+                    unfetched: None,
                 })
                 .unwrap();
             assert!(store.window().unwrap().has_earlier);
@@ -3057,6 +3274,7 @@ mod tests {
                 .apply(Event::History {
                     items: vec![text("older")],
                     has_earlier: false,
+                    unfetched: None,
                 })
                 .unwrap();
             let window = store.window().unwrap();
@@ -3883,6 +4101,7 @@ mod tests {
             .apply(Event::History {
                 items: vec![text, tool],
                 has_earlier: false,
+                unfetched: None,
             })
             .unwrap();
         assert!(
@@ -3930,6 +4149,7 @@ mod tests {
                         })
                         .collect(),
                     has_earlier: false,
+                    unfetched: None,
                 })
                 .unwrap();
             let replayed = store.window().unwrap().items;
@@ -4101,6 +4321,7 @@ mod tests {
             .apply(Event::History {
                 items: vec![text("older", "replay")],
                 has_earlier: false,
+                unfetched: None,
             })
             .unwrap();
         let items = store.window().unwrap().items;
@@ -4142,6 +4363,7 @@ mod tests {
             .apply(Event::History {
                 items: vec![recovered.clone()],
                 has_earlier: false,
+                unfetched: None,
             })
             .unwrap();
         let mut snapshot = crate::chat::Snapshot::default();
@@ -4158,6 +4380,7 @@ mod tests {
             .apply(Event::History {
                 items: vec![recovered],
                 has_earlier: false,
+                unfetched: None,
             })
             .unwrap();
         store.publish_files(&mut snapshot).unwrap();
@@ -4233,6 +4456,7 @@ mod tests {
                 .apply(Event::History {
                     items: vec![recovered],
                     has_earlier: false,
+                    unfetched: None,
                 })
                 .unwrap();
             let after = store.window().unwrap().items[0].clone();
@@ -4257,6 +4481,7 @@ mod tests {
             .apply(Event::History {
                 items: vec![replacement],
                 has_earlier: false,
+                unfetched: None,
             })
             .unwrap();
         assert_eq!(store.window().unwrap().items[0].as_ref(), &original);

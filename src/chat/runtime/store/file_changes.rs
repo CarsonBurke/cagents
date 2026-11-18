@@ -754,6 +754,7 @@ mod tests {
             .apply(Event::History {
                 items: vec![edit, succeeded],
                 has_earlier: false,
+                unfetched: None,
             })
             .unwrap();
         let result = summary(&mut store);
@@ -807,6 +808,7 @@ mod tests {
                     ChangeKind::Updated,
                 )],
                 has_earlier: true,
+                unfetched: None,
             })
             .unwrap();
         store
@@ -1016,6 +1018,7 @@ mod tests {
                     ),
                 ],
                 has_earlier: false,
+                unfetched: None,
             })
             .unwrap();
         let current = page(&mut store, key("a.rs"), None, 0);
@@ -1188,6 +1191,7 @@ mod tests {
                     ChangeKind::Updated,
                 )],
                 has_earlier: false,
+                unfetched: None,
             })
             .unwrap();
         for n in 0..500 {

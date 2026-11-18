@@ -986,7 +986,7 @@ impl LocalHandle {
         if exiting
             && matches!(
                 command,
-                Command::LoadEarlier | Command::LoadLater | Command::Refresh
+                Command::LoadEarlier | Command::LoadLater | Command::Refresh | Command::Seek { .. }
             )
         {
             let cached = page_command(&self.0.store, &command).map_err(Rejection::Refused)?;
@@ -1261,6 +1261,7 @@ impl LocalHandle {
                     state.items = window.items;
                     state.has_earlier = window.has_earlier;
                     state.has_later = window.has_later;
+                    state.history = window.history;
                 }
                 Err(error) => {
                     state.error = Some(format!("Cannot page owned transcript cache: {error}"))
@@ -1308,6 +1309,7 @@ impl LocalHandle {
                         state.items = window.items;
                         state.has_earlier = window.has_earlier;
                         state.has_later = window.has_later;
+                        state.history = window.history;
                         window.changes
                     }
                     Err(error) => {
@@ -3140,7 +3142,7 @@ impl Actor {
             };
             if matches!(
                 command,
-                Command::LoadEarlier | Command::LoadLater | Command::Refresh
+                Command::LoadEarlier | Command::LoadLater | Command::Refresh | Command::Seek { .. }
             ) {
                 match page_command(&self.store, &command) {
                     Ok(cached) => {
@@ -3754,6 +3756,7 @@ fn page_command(store: &Mutex<Store>, command: &Command) -> Result<bool, String>
     match command {
         Command::LoadEarlier => store.earlier(),
         Command::LoadLater => store.later(),
+        Command::Seek { index } => store.seek(*index),
         Command::Refresh => {
             store.latest();
             Ok(false)
@@ -3970,6 +3973,7 @@ fn apply_projected_event(
             state.title = None;
             state.has_earlier = false;
             state.has_later = false;
+            state.history = Default::default();
             state.history_loading = false;
             state.detail = reason;
             state.busy = false;
@@ -4191,7 +4195,12 @@ fn apply_projected_event(
                 agent.items.retain(|item| !ids.contains(&item.id));
             }
         }
-        Event::History { items, has_earlier } | Event::LatestHistory { items, has_earlier } => {
+        Event::History {
+            items, has_earlier, ..
+        }
+        | Event::LatestHistory {
+            items, has_earlier, ..
+        } => {
             state.history_loading = false;
             let mut run = Vec::new();
             let mut after = None;

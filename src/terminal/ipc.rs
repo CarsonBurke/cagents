@@ -279,7 +279,12 @@ use crate::{
 /// as terminals. An older client has no encoding for either: an optional value
 /// naming one reaches it as absent, and any other message naming one is
 /// refused or withheld.
-pub const PROTOCOL_VERSION: u16 = 191;
+///
+/// Version 192 adds a chat snapshot's count of history before and after its
+/// loaded window, cached or still with the provider, and appends the `Seek`
+/// chat command that moves the window to any cached item. An older CLI is sent
+/// snapshots without the count, and an older update source is read without it.
+pub const PROTOCOL_VERSION: u16 = 192;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";

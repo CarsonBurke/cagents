@@ -136,6 +136,7 @@ mod thumbnails;
 mod tool_text;
 mod tool_title;
 mod turn;
+mod unloaded;
 mod update_recovery;
 mod view;
 mod virtualized;
@@ -2820,6 +2821,8 @@ enum HistoryNavigation {
     EarlierExplicit,
     NewerEdge,
     Latest,
+    /// The reader moved into history outside the loaded window.
+    Seek,
 }
 
 #[derive(Clone, Copy)]
@@ -3320,6 +3323,11 @@ pub(super) struct Runtime {
     >,
     selection_document: std::cell::RefCell<Option<(view::SelectionKey, Arc<selection::Catalog>)>>,
     scroll: view::Scroll,
+    /// The height each unloaded item of the main transcript is given.
+    history_estimate: std::cell::Cell<view::HistoryEstimate>,
+    /// The conversation index the window was last moved to, while the
+    /// reader is still in the unloaded history around it.
+    sought: Option<u64>,
     subagent_scroll: HashMap<String, view::Scroll>,
     page_request: Option<(view::Page, u64)>,
     deferred_page: Option<HistoryNavigation>,
@@ -4462,6 +4470,8 @@ impl Runtime {
             selection_bookmarks: Default::default(),
             selection_document: Default::default(),
             scroll: view::Scroll::default(),
+            history_estimate: Default::default(),
+            sought: None,
             subagent_scroll: HashMap::new(),
             page_request: None,
             deferred_page: None,
@@ -4491,6 +4501,8 @@ impl Runtime {
         self.page_request = None;
         self.deferred_page = None;
         self.scroll = view::Scroll::default();
+        self.history_estimate.take();
+        self.sought = None;
         self.observed_scroll.borrow_mut().clear();
         self.scroll_memory.clear();
         self.selection_document.get_mut().take();
@@ -8638,6 +8650,12 @@ impl Cagents {
                     },
                 )
             }
+            // End of a window that is not the conversation's newest is not
+            // the end: it is the newest history the reader wants.
+            Named::End if runtime.selected_subagent.is_none() && runtime.snapshot.has_later => {
+                let target = runtime.target;
+                return Some(self.handle_chat_action(Action::Latest(target)));
+            }
             Named::Home | Named::End => {
                 let edge = if *key == Named::Home {
                     scroll::Edge::Start
@@ -8648,15 +8666,28 @@ impl Cagents {
                 runtime
                     .scroll_memory
                     .request_edge(runtime.selected_subagent.as_deref(), edge);
-                return Some(
-                    scroll::snap_to_edge(
-                        runtime.target,
-                        edge,
-                        runtime.find_navigation.guard(),
-                        runtime.find_navigation.document_epoch(),
-                    )
-                    .map(cosmic::Action::App),
-                );
+                let snap = scroll::snap_to_edge(
+                    runtime.target,
+                    edge,
+                    runtime.find_navigation.guard(),
+                    runtime.find_navigation.document_epoch(),
+                )
+                .map(cosmic::Action::App);
+                // The conversation's start is outside the window: move the
+                // window there, and the reader to its first item.
+                if edge == scroll::Edge::Start
+                    && runtime.selected_subagent.is_none()
+                    && runtime.snapshot.history.earlier() > 0
+                {
+                    let target = runtime.target;
+                    let start = if runtime.snapshot.history.unfetched.unwrap_or(0) > 0 {
+                        view::Sought::Unfetched
+                    } else {
+                        view::Sought::Cached { index: 0, at: 0.0 }
+                    };
+                    return Some(Task::batch([snap, self.follow_into_history(target, start)]));
+                }
+                return Some(snap);
             }
             _ => return None,
         };
@@ -11609,8 +11640,73 @@ impl Cagents {
             {
                 self.chat_send(target, Command::LoadEarlier, false)
             }
+            HistoryNavigation::Seek => match runtime.history_index(runtime.parent_scroll()) {
+                Some(sought) => self.follow_into_history(target, sought),
+                None => Task::none(),
+            },
             _ => Task::none(),
         }
+    }
+
+    /// Brings the history the reader moved to, outside the loaded window,
+    /// into it.
+    fn follow_into_history(&mut self, target: Target, sought: view::Sought) -> Task<Message> {
+        let Some(runtime) = self.chat_runtime_mut(target) else {
+            return Task::none();
+        };
+        match sought {
+            view::Sought::Cached { index, at } => {
+                runtime.scroll_memory.land(index, at);
+                self.seek_history(target, index)
+            }
+            // The provider hands history over a page at a time, back from
+            // the oldest it has handed over. The window goes there, and each
+            // page that arrives is followed by the next until it reaches the
+            // reader, who waits in the space standing for it.
+            view::Sought::Unfetched => {
+                if !runtime.snapshot.has_earlier {
+                    return Task::none();
+                }
+                if runtime
+                    .deferred_page
+                    .is_none_or(|page| page != HistoryNavigation::Latest)
+                {
+                    runtime.deferred_page = Some(HistoryNavigation::Seek);
+                }
+                if runtime.snapshot.history.before > 0 {
+                    return self.seek_history(target, 0);
+                }
+                if runtime.pending.is_some()
+                    || runtime.disconnected
+                    || runtime.snapshot.history_loading
+                {
+                    return Task::none();
+                }
+                self.chat_send(target, Command::LoadEarlier, false)
+            }
+        }
+    }
+
+    /// Moves the transcript window to the conversation's item at `index`,
+    /// unless that is where it is already being moved.
+    fn seek_history(&mut self, target: Target, index: u64) -> Task<Message> {
+        let Some(runtime) = self.chat_runtime_mut(target) else {
+            return Task::none();
+        };
+        if runtime.sought == Some(index) {
+            return Task::none();
+        }
+        if runtime.pending.is_some() || runtime.disconnected {
+            if runtime
+                .deferred_page
+                .is_none_or(|page| page != HistoryNavigation::Latest)
+            {
+                runtime.deferred_page = Some(HistoryNavigation::Seek);
+            }
+            return Task::none();
+        }
+        runtime.sought = Some(index);
+        self.chat_send(target, Command::Seek { index }, false)
     }
 
     fn chat_send(&mut self, target: Target, command: Command, clear_draft: bool) -> Task<Message> {
@@ -14660,6 +14756,13 @@ impl Cagents {
                             runtime.page_request = None;
                             runtime.earlier_asked = None;
                             runtime.later_asked = None;
+                            // A reader waiting in history that could not be
+                            // brought in is not asked for again until they
+                            // move.
+                            runtime.sought = None;
+                            if runtime.deferred_page == Some(HistoryNavigation::Seek) {
+                                runtime.deferred_page = None;
+                            }
                         }
                         // A message the provider did not take goes back to
                         // the composer, and so does any written after it:
@@ -15956,6 +16059,27 @@ impl Cagents {
                 runtime.scroll = scroll;
                 if scroll.at_bottom() && !runtime.snapshot.has_later {
                     runtime.unseen_activity = false;
+                }
+                let sought = runtime.history_index(scroll);
+                if sought.is_none() {
+                    runtime.sought = None;
+                    if runtime.deferred_page == Some(HistoryNavigation::Seek) {
+                        runtime.deferred_page = None;
+                    }
+                }
+                // A track click, a drag of the thumb or a fast fling can take
+                // the reader past what is loaded. A page from the window's
+                // edge would not reach them, so the window moves to them.
+                if let Some(sought) = sought.filter(|_| {
+                    // The newest history is already on its way, and the
+                    // reader at its edge is waiting for it there.
+                    runtime
+                        .page_request
+                        .is_none_or(|(page, _)| page != view::Page::Latest)
+                }) {
+                    runtime.earlier_asked = None;
+                    runtime.later_asked = None;
+                    return self.follow_into_history(target, sought);
                 }
                 // Pages are fetched ahead of the reader, within a couple of
                 // screens of a loaded edge rather than at it.

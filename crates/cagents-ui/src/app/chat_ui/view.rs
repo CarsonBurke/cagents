@@ -290,6 +290,9 @@ thread_local! {
 
 /// Sets a gap's key apart from the key of the row it precedes.
 const GAP_KEY: u64 = 0x9e37_79b9_7f4a_7c15;
+/// The rows standing for unloaded history before and after the window.
+const HISTORY_BEFORE_KEY: u64 = 0x6869_7374_6f72_7900;
+const HISTORY_AFTER_KEY: u64 = 0x6869_7374_6f72_7901;
 
 /// One row an exchange contributes to the transcript.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -1123,6 +1126,10 @@ pub enum Page {
 /// The transcript is anchored to its bottom, because a conversation grows at
 /// the newest end. The anchoring wrapper measures the actual top offset and
 /// reports it even when the loaded page fits entirely inside the viewport.
+///
+/// The content can begin and end with [`Unloaded`] space standing for the
+/// history outside the loaded window, so the scrollbar spans the whole
+/// conversation. The loaded window is what lies between them.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Scroll {
     from_top: f32,
@@ -1131,6 +1138,8 @@ pub struct Scroll {
     /// What of the window a page keeps, where it was last laid out. Unknown
     /// until the transcript has laid out its rows.
     kept: Option<Kept>,
+    /// The space standing for history before and after the loaded window.
+    unloaded: Unloaded,
 }
 
 /// Where the halves a page keeps end, in the transcript's laid-out
@@ -1146,6 +1155,34 @@ pub(super) struct Kept {
     pub newer_start: f32,
 }
 
+/// The heights of the space that stands for unloaded history before and
+/// after the loaded window, at an estimated height per item.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Unloaded {
+    pub before: f32,
+    pub after: f32,
+}
+
+/// What a reader in history outside the loaded window is looking at.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum Sought {
+    /// The item at `index` of the cached conversation, which starts `at`
+    /// below the viewport's top.
+    Cached { index: u64, at: f32 },
+    /// History the provider has still to hand over, a page at a time back
+    /// from the newest of it.
+    Unfetched,
+}
+
+/// Where in the unloaded history the reader is looking.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum Unseen {
+    /// This fraction of the way through the history before the window.
+    Before(f32),
+    /// This fraction of the way through the history after the window.
+    After(f32),
+}
+
 impl Scroll {
     pub(super) fn new(from_top: f32, content: f32, window: f32) -> Self {
         Self {
@@ -1153,10 +1190,14 @@ impl Scroll {
             content,
             window,
             kept: None,
+            unloaded: Unloaded::default(),
         }
     }
     pub(super) fn with_kept(self, kept: Option<Kept>) -> Self {
         Self { kept, ..self }
+    }
+    pub(super) fn with_unloaded(self, unloaded: Unloaded) -> Self {
+        Self { unloaded, ..self }
     }
     /// How far the transcript can be scrolled.
     fn travel(self) -> f32 {
@@ -1202,16 +1243,31 @@ impl Scroll {
         (self.window * 0.9).max(1.0)
     }
 
+    /// The loaded window's height, between the unloaded space around it.
+    pub(super) fn loaded(self) -> f32 {
+        (self.content - self.unloaded.before - self.unloaded.after).max(0.0)
+    }
+
+    /// How far the viewport's top is below the loaded window's top.
+    fn into_loaded(self) -> f32 {
+        self.from_top - self.unloaded.before
+    }
+
+    /// How far the viewport's bottom is above the loaded window's bottom.
+    fn short_of_loaded_end(self) -> f32 {
+        self.content - self.unloaded.after - (self.from_top + self.window)
+    }
+
     /// Whether the next earlier page should be fetched now, ahead of the
-    /// reader. Short of the very top this waits until the whole viewport is
-    /// in the half the page keeps, so what is on screen never leaves the
-    /// window. Items differ in height and are not drawn in item order within
-    /// an exchange, so that half is where its rows were drawn. Until they
-    /// have been, only the edge asks.
+    /// reader. Short of the conversation's very top this waits until the
+    /// whole viewport is in the half the page keeps, so what is on screen
+    /// never leaves the window. Items differ in height and are not drawn in
+    /// item order within an exchange, so that half is where its rows were
+    /// drawn. Until they have been, only the conversation's top asks.
     pub(super) fn prefetch_earlier(self) -> bool {
-        self.at_top()
+        (self.unloaded.before <= 0.0 && self.at_top())
             || self.kept.is_some_and(|kept| {
-                self.from_top <= self.prefetch_reach()
+                self.into_loaded() <= self.prefetch_reach()
                     && self.from_top + self.window <= kept.older_end
             })
     }
@@ -1219,17 +1275,123 @@ impl Scroll {
     /// Whether the next newer page should be fetched now, the mirror of
     /// [`Self::prefetch_earlier`].
     pub(super) fn prefetch_later(self) -> bool {
-        self.at_bottom()
+        (self.unloaded.after <= 0.0 && self.at_bottom())
             || self.kept.is_some_and(|kept| {
-                self.travel() - self.from_top <= self.prefetch_reach()
+                self.short_of_loaded_end() <= self.prefetch_reach()
                     && self.from_top >= kept.newer_start
             })
+    }
+
+    /// Where the reader is looking when it is at history that is not
+    /// loaded, rather than at the window or its edge: the middle of the
+    /// viewport is in the space that stands for it. A slide cannot keep
+    /// what is on screen, so the window has to move there instead.
+    pub(super) fn unseen(self) -> Option<Unseen> {
+        let middle = self.from_top + self.window * 0.5;
+        let after_top = self.content - self.unloaded.after;
+        if self.unloaded.before > 0.0 && middle < self.unloaded.before {
+            Some(Unseen::Before(
+                (middle / self.unloaded.before).clamp(0.0, 1.0),
+            ))
+        } else if self.unloaded.after > 0.0 && middle > after_top {
+            Some(Unseen::After(
+                ((middle - after_top) / self.unloaded.after).clamp(0.0, 1.0),
+            ))
+        } else {
+            None
+        }
     }
 
     /// How far from a loaded edge a page is fetched: far enough that wheel
     /// and Page Up reading does not reach the edge before the page arrives.
     fn prefetch_reach(self) -> f32 {
         self.window * PREFETCH_SCREENS
+    }
+}
+
+/// The height given to each unloaded item: the average of what the loaded
+/// windows measured.
+///
+/// A window is measured once, when the next one replaces it, or once it has
+/// been laid out if it was the first: an estimate that followed every layout
+/// would move the scrollbar's thumb while the reader holds still. Averaging
+/// every window measured lets each new one move the estimate less, so the
+/// space for history far from the reader barely changes as they read on.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct HistoryEstimate {
+    /// The window the estimate is for: the items before it, and its length.
+    window: Option<(u64, usize)>,
+    /// What the windows before it measured, together.
+    measured: Sample,
+    /// What the window measured, when it is the first and nothing else has.
+    early: Option<Sample>,
+    /// The estimate for the window is decided.
+    settled: bool,
+}
+
+/// The height of some laid-out items, and how many they were.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Sample {
+    height: f64,
+    items: u64,
+}
+
+impl Sample {
+    fn add(self, other: Option<Self>) -> Self {
+        other.map_or(self, |other| Self {
+            height: self.height + other.height,
+            items: self.items + other.items,
+        })
+    }
+}
+
+impl HistoryEstimate {
+    /// About a short answer with its gap, before anything is measured.
+    const DEFAULT: f32 = 160.0;
+    const MIN: f32 = 40.0;
+    const MAX: f32 = 2_000.0;
+
+    /// The estimate for `window`, given that `loaded` is the height of the
+    /// window last laid out.
+    pub(super) fn update(self, window: (u64, usize), loaded: f32) -> Self {
+        let changed = self.window != Some(window);
+        if !changed && self.settled {
+            return self;
+        }
+        // The layout observed is that of the window the estimate was taken
+        // for, which is the previous one when the window has just changed.
+        let sample = self
+            .window
+            .map(|(_, count)| count)
+            .filter(|count| *count > 0 && loaded > 0.0)
+            .map(|count| Sample {
+                height: f64::from(loaded),
+                items: count as u64,
+            });
+        if !changed {
+            return Self {
+                early: sample,
+                settled: sample.is_some(),
+                ..self
+            };
+        }
+        // A window measured early is measured again as it is replaced, and
+        // counted once.
+        let measured = self.measured.add(sample.or(self.early));
+        Self {
+            window: Some(window),
+            measured,
+            early: None,
+            settled: measured.items > 0,
+        }
+    }
+
+    pub(super) fn per_item(self) -> f32 {
+        let sample = self.measured.add(self.early);
+        if sample.items == 0 {
+            return Self::DEFAULT;
+        }
+        ((sample.height / sample.items as f64) as f32).clamp(Self::MIN, Self::MAX)
     }
 }
 
@@ -1681,6 +1843,68 @@ pub(super) struct SelectionKey {
 }
 
 impl Runtime {
+    /// The space standing for the main transcript's history outside the
+    /// loaded window, so its scrollbar spans the whole conversation.
+    ///
+    /// That includes the history the provider has not handed over, when it
+    /// says how much there is, so the scrollbar stands for the conversation
+    /// from when it is opened.
+    pub(super) fn unloaded_history(&self) -> Unloaded {
+        let history = self.snapshot.history;
+        let (before, after) = (history.earlier(), history.after);
+        if before == 0 && after == 0 {
+            return Unloaded::default();
+        }
+        let estimate = self.history_estimate.get().update(
+            (history.before, self.snapshot.items.len()),
+            self.parent_scroll().loaded(),
+        );
+        self.history_estimate.set(estimate);
+        Unloaded {
+            before: super::unloaded::height(before, estimate.per_item()),
+            after: super::unloaded::height(after, estimate.per_item()),
+        }
+    }
+
+    /// Where `scroll` has the reader in history outside the loaded window.
+    pub(super) fn history_index(&self, scroll: Scroll) -> Option<Sought> {
+        let history = self.snapshot.history;
+        let unfetched = history.unfetched.unwrap_or(0);
+        let (first, count, fraction) = match scroll.unseen()? {
+            Unseen::Before(fraction) => (0, history.earlier(), fraction),
+            Unseen::After(fraction) => (
+                unfetched + history.before + self.snapshot.items.len() as u64,
+                history.after,
+                fraction,
+            ),
+        };
+        if count == 0 {
+            return None;
+        }
+        let position = f64::from(fraction) * count as f64;
+        let offset = (position.floor() as u64).min(count - 1);
+        // The oldest history is the provider's, before what is cached.
+        let Some(index) = (first + offset).checked_sub(unfetched) else {
+            return Some(Sought::Unfetched);
+        };
+        let within = (position - offset as f64) as f32 * self.history_estimate.get().per_item();
+        Some(Sought::Cached {
+            index,
+            at: scroll.window_height() * 0.5 - within,
+        })
+    }
+
+    /// The loaded item the reader asked to land on in history that was not
+    /// loaded, once the window holds it.
+    pub(super) fn landing_item(&self) -> Option<&str> {
+        let index = self.scroll_memory.landing()?;
+        let offset = index.checked_sub(self.snapshot.history.before)?;
+        self.snapshot
+            .items
+            .get(usize::try_from(offset).ok()?)
+            .map(|item| item.id.as_str())
+    }
+
     pub(super) fn document_link_origin(&self) -> Option<PathBuf> {
         self.selected_subagent
             .is_none()
@@ -2693,6 +2917,11 @@ impl Runtime {
             .as_ref()
             .and_then(|id| snapshot.subagents.iter().find(|agent| &agent.id == id));
         let anchors = Vec::new();
+        let unloaded = if selected.is_none() {
+            self.unloaded_history()
+        } else {
+            Unloaded::default()
+        };
         let mut transcript = VirtualRows::new();
         let mut selected_identity: Option<Element<'_, Message>> = None;
         if let Some(agent) = selected {
@@ -2917,7 +3146,22 @@ impl Runtime {
                 let _ = row_index; // Virtual placeholder bounds supply item anchors.
             }
         } else {
-            if snapshot.has_earlier {
+            // History the transcript cache holds is space the scrollbar
+            // spans; only history the provider still has to send is asked
+            // for with a control.
+            if unloaded.before > 0.0 {
+                let height = unloaded.before;
+                transcript.lazy(
+                    HISTORY_BEFORE_KEY,
+                    u64::from(height.to_bits()),
+                    height,
+                    Vec::new(),
+                    // Set apart as the paging control it stands in for.
+                    Some(Rhythm::Opening),
+                    0.0,
+                    move || super::unloaded::space(height),
+                );
+            } else if snapshot.has_earlier {
                 transcript.push(paging_view(
                     target,
                     Page::Earlier,
@@ -3017,7 +3261,19 @@ impl Runtime {
                     .into(),
                 );
             }
-            if snapshot.has_later {
+            if unloaded.after > 0.0 {
+                let height = unloaded.after;
+                transcript.lazy(
+                    HISTORY_AFTER_KEY,
+                    u64::from(height.to_bits()),
+                    height,
+                    Vec::new(),
+                    // Set apart as the paging control it stands in for.
+                    Some(Rhythm::Opening),
+                    0.0,
+                    move || super::unloaded::space(height),
+                );
+            } else if snapshot.has_later {
                 transcript.push(paging_view(
                     target,
                     Page::Newer,
@@ -3286,6 +3542,8 @@ impl Runtime {
                                 index: snapshot.items.len() / 2,
                                 items: snapshot.items.len(),
                             }),
+                            unloaded,
+                            landing: self.landing_item(),
                         }
                     } else {
                         scroll::History::default()

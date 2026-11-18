@@ -13,6 +13,15 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::of(
+            130,
+            |index| json!({"type":"user","message":{"role":"user","content":format!("Saved prompt {index}")}}),
+        )
+    }
+
+    /// A conversation of `count` records, each `record` given its place in
+    /// the chain.
+    fn of(count: usize, record: impl Fn(usize) -> Value) -> Self {
         let root = tempfile::tempdir().unwrap();
         let cwd = root.path().join("removed-project");
         std::fs::create_dir(&cwd).unwrap();
@@ -27,15 +36,12 @@ impl Fixture {
         std::fs::create_dir_all(&directory).unwrap();
         let path = directory.join(format!("{SESSION}.jsonl"));
         let mut bytes = Vec::new();
-        for index in 0..130 {
-            writeln!(
-                bytes,
-                "{}",
-                json!({"type":"user","uuid":format!("row-{index}"),
-                "parentUuid":(index>0).then(||format!("row-{}",index-1)),"sessionId":SESSION,
-                "message":{"role":"user","content":format!("Saved prompt {index}")}})
-            )
-            .unwrap();
+        for index in 0..count {
+            let mut frame = record(index);
+            frame["uuid"] = json!(format!("row-{index}"));
+            frame["parentUuid"] = json!((index > 0).then(|| format!("row-{}", index - 1)));
+            frame["sessionId"] = json!(SESSION);
+            writeln!(bytes, "{frame}").unwrap();
         }
         std::fs::write(&path, &bytes).unwrap();
         std::fs::remove_dir(&cwd).unwrap();
@@ -88,7 +94,7 @@ fn earlier_history_refuses_changed_session_and_can_retry_the_original_source() {
     let (_, mut adapter) = create(&fixture.launch).unwrap();
     let initial = adapter.initialize().unwrap();
     assert!(initial.events.iter().any(
-        |event| matches!(event, Event::History { items, has_earlier: true } if items.len() == 100)
+        |event| matches!(event, Event::History { items, has_earlier: true, .. } if items.len() == 100)
     ));
     fixture.replace_session();
     let error = adapter
@@ -98,7 +104,7 @@ fn earlier_history_refuses_changed_session_and_can_retry_the_original_source() {
     std::fs::write(&fixture.path, &fixture.bytes).unwrap();
     let earlier = adapter.command(Command::LoadEarlier).unwrap();
     assert!(earlier.events.iter().any(
-        |event| matches!(event, Event::History { items, has_earlier: false } if items.len() == 30)
+        |event| matches!(event, Event::History { items, has_earlier: false, .. } if items.len() == 30)
     ));
     assert!(earlier.events.iter().any(|event| matches!(event, Event::History { items, .. } if items.iter().any(|item| matches!(&item.content, ItemContent::Text { text, .. } if text == "Saved prompt 0")))));
 }
@@ -147,12 +153,78 @@ fn legacy_history_without_record_session_ids_remains_readable() {
     let (_, mut adapter) = create(&fixture.launch).unwrap();
     let initial = adapter.initialize().unwrap();
     assert!(initial.events.iter().any(
-        |event| matches!(event, Event::History { items, has_earlier: true } if items.len() == 100)
+        |event| matches!(event, Event::History { items, has_earlier: true, .. } if items.len() == 100)
     ));
     let earlier = adapter.command(Command::LoadEarlier).unwrap();
     assert!(earlier.events.iter().any(
-        |event| matches!(event, Event::History { items, has_earlier: false } if items.len() == 30)
+        |event| matches!(event, Event::History { items, has_earlier: false, .. } if items.len() == 30)
     ));
+}
+
+/// The size and the item counts of each page handed over, from the newest.
+fn pages(adapter: &mut dyn Adapter) -> Vec<(usize, Option<u64>)> {
+    let mut step = adapter.initialize().unwrap();
+    let mut pages = Vec::new();
+    loop {
+        let (items, has_earlier, unfetched) = step
+            .events
+            .into_iter()
+            .find_map(|event| match event {
+                Event::History {
+                    items,
+                    has_earlier,
+                    unfetched,
+                } => Some((items, has_earlier, unfetched)),
+                _ => None,
+            })
+            .expect("each step hands over a page");
+        pages.push((items.len(), unfetched));
+        if !has_earlier {
+            return pages;
+        }
+        step = adapter.command(Command::LoadEarlier).unwrap();
+    }
+}
+
+/// Each page says how many items the transcript holds before it, so the
+/// reader's scrollbar can stand for the whole conversation from the start.
+/// Where every record is an item the count is exact.
+#[test]
+fn history_pages_count_the_items_before_them() {
+    let fixture = Fixture::new();
+    let (_, mut adapter) = create(&fixture.launch).unwrap();
+    assert_eq!(pages(adapter.as_mut()), [(100, Some(30)), (30, Some(0))]);
+}
+
+/// Records hold items at different rates, as a tool's result joins its call
+/// in one item. The count before a page is estimated at the rate of what was
+/// handed over, and is exact once nothing is left.
+#[test]
+fn history_pages_estimate_the_items_before_them_at_the_rate_handed_over() {
+    // A hundred prompts, then a hundred tool calls, each with its result.
+    let fixture = Fixture::of(300, |index| match index {
+        0..100 => {
+            json!({"type":"user","message":{"role":"user","content":format!("Saved prompt {index}")}})
+        }
+        _ if index % 2 == 0 => json!({"type":"assistant","message":{"role":"assistant","content":[
+            {"type":"tool_use","id":format!("call-{index}"),"name":"Read","input":{"file_path":"/f"}}
+        ]}}),
+        _ => json!({"type":"user","message":{"role":"user","content":[
+            {"type":"tool_result","tool_use_id":format!("call-{}", index - 1),"content":"read"}
+        ]}}),
+    });
+    let (_, mut adapter) = create(&fixture.launch).unwrap();
+    assert_eq!(
+        pages(adapter.as_mut()),
+        [
+            // 150 items are before the newest page: 100 prompts and 50 calls.
+            // It held half an item a record, as its 200 records are thought to.
+            (50, Some(100)),
+            // 100 are before the next: so far a record has held half an item.
+            (50, Some(50)),
+            (100, Some(0)),
+        ]
+    );
 }
 
 #[test]

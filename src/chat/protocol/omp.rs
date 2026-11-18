@@ -908,6 +908,7 @@ impl Adapter for Omp {
             Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. } =>
                 return Err("File changes are served by the transcript cache".into()),
             Command::LoadLater => return Err("Newer history is served by the transcript cache".into()),
+            Command::Seek { .. } => return Err("History positions are served by the transcript cache".into()),
             Command::LoadEarlier => return Err("OMP history is loaded completely during connection.".into()),
             Command::DismissPermissionDenial { tool_use_id } => step.events.push(Event::PermissionDenialDismissed { tool_use_id }),
             Command::RefreshPermissions | Command::UpdatePermissionSettings { .. } => return Err("Permission rule settings are available for Claude sessions".into()),

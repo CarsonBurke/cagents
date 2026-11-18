@@ -4052,3 +4052,92 @@ fn entirely_replaced_window_starts_at_its_newest_boundary() {
         Some(0.0)
     );
 }
+
+/// A reader who moved into unloaded history lands on the item they asked
+/// for once a window holds it, unless rows they still see place them. With
+/// no such item, their distance into the conversation is kept rather than
+/// sending them to its end (#3102).
+#[test]
+fn moving_into_unloaded_history_lands_where_the_reader_asked() {
+    let spaced = |landing| History {
+        unloaded: view::Unloaded {
+            before: 8_000.0,
+            after: 0.0,
+        },
+        landing,
+        ..History::default()
+    };
+    fn settle(
+        anchor: &mut Anchor,
+        rows: &[(&str, Rectangle)],
+        top: Option<f32>,
+        history: History<'_>,
+    ) -> Option<f32> {
+        match anchor.layout_following(
+            None,
+            rows,
+            &HashSet::new(),
+            geometry(10_000.0),
+            top,
+            false,
+            true,
+            history,
+        ) {
+            Placement::Settled(bottom) => bottom,
+            Placement::Estimated(_) => unreachable!("a settling pass decides"),
+        }
+    }
+    let window = rows(&[("a", 8_000.0, 1_000.0), ("b", 9_000.0, 1_000.0)]);
+    let reader = |top| {
+        let mut anchor = Anchor::default();
+        settle(&mut anchor, &window, None, spaced(None));
+        settle(&mut anchor, &window, Some(top), spaced(None));
+        anchor
+    };
+    // The thumb took the reader to 4000, in the space; the window arrived.
+    let mut anchor = reader(4_000.0);
+    anchor.landing = Some(Landing {
+        index: 40,
+        at: 200.0,
+    });
+    let arrived = rows(&[("x", 3_000.0, 1_000.0), ("y", 4_000.0, 1_000.0)]);
+    assert_eq!(
+        settle(&mut anchor, &arrived, Some(4_000.0), spaced(Some("y"))),
+        Some(9_600.0 - 3_800.0)
+    );
+    assert!(anchor.landing.is_none());
+
+    // A row the reader still sees places them instead of the estimate.
+    let mut anchor = reader(8_500.0);
+    anchor.landing = Some(Landing {
+        index: 40,
+        at: 200.0,
+    });
+    let slid = rows(&[("y", 6_000.0, 1_000.0), ("a", 7_000.0, 1_000.0)]);
+    assert_eq!(
+        settle(&mut anchor, &slid, Some(8_500.0), spaced(Some("y"))),
+        Some(9_600.0 - 7_500.0)
+    );
+    assert!(anchor.landing.is_none());
+
+    // Nothing survives and nothing was asked for: keep the distance.
+    let mut anchor = reader(4_000.0);
+    settle(&mut anchor, &arrived, Some(4_000.0), spaced(None));
+    assert_eq!(anchor.contexts[0].top, Some(4_000.0));
+
+    // A page arrives below a reader who sees only the space. It held more
+    // than the space it took was estimated at, and the rows below the
+    // reader take that, not the space they see: they stay put.
+    let mut anchor = reader(4_000.0);
+    let prepended = rows(&[
+        ("p", 7_500.0, 1_500.0),
+        ("a", 9_000.0, 1_000.0),
+        ("b", 10_000.0, 0.0),
+    ]);
+    settle(&mut anchor, &prepended, Some(4_000.0), spaced(None));
+    assert_eq!(anchor.contexts[0].top, Some(4_000.0));
+    // Once they see rows, the rows keep them still as the space changes.
+    let mut anchor = reader(7_800.0);
+    settle(&mut anchor, &prepended, Some(7_800.0), spaced(None));
+    assert_eq!(anchor.contexts[0].top, Some(8_800.0));
+}
