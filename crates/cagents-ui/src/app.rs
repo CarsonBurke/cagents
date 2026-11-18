@@ -1613,11 +1613,10 @@ const NAVIGATION_SAVE_DELAY: Duration = Duration::from_secs(1);
 /// snapshots the strip into the active channel, which can reorder its panes
 /// and drops closed cards from every channel, and prunes pending terminal
 /// creations; worktree protections read where editors are
-/// (`repository_navigation`). It also writes where the window is (`active_worktree`,
-/// `worktree_focus`), its history, drafts and shared-view bookkeeping, none of
-/// which a projection reads. When none of these changed, the save leaves
-/// nothing to project.
-#[derive(PartialEq)]
+/// (`repository_navigation`). It also writes where the window is
+/// (`active_worktree`, `worktree_focus`), its history, drafts and shared-view
+/// bookkeeping, none of which a projection reads. When none of these changed,
+/// the save leaves nothing to project.
 struct SavedProjectionInputs {
     channels: Vec<crate::model::ProjectChannel>,
     focused: Option<CardId>,
@@ -1636,7 +1635,11 @@ impl SavedProjectionInputs {
     }
 
     fn unchanged(&self, app: &Cagents) -> bool {
-        *self == Self::capture(app)
+        let durable = &app.durable;
+        self.channels == durable.channels
+            && self.focused == durable.focused
+            && self.pending_terminal_creations == durable.pending_terminal_creations
+            && self.repository_navigation == durable.repository_navigation
     }
 }
 
@@ -17741,7 +17744,7 @@ impl Application for Cagents {
             Message::AcknowledgeVisiblePane { card, epoch } => {
                 let due = epoch == self.attention_focus_epoch && self.pane_is_active(card);
                 // A dwell that marks nothing read records only that it ended,
-                // which the notification presence after the projection reads.
+                // which only the notification presence reads.
                 if (!due || self.visible_dwell_reads_nothing())
                     && !self.update_tail_may_close_or_commit()
                 {
