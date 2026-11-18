@@ -331,11 +331,9 @@ impl Cagents {
             staged: staged.is_some(),
             unstaged: unstaged.is_some(),
             staged_old_path: staged
-                .and_then(|row| row.entry.old_path.as_ref())
-                .map(|path| path.as_path().to_owned()),
+                .and_then(|row| crate::repository_widget::OldPath::from_changed_path(&row.entry)),
             unstaged_old_path: unstaged
-                .and_then(|row| row.entry.old_path.as_ref())
-                .map(|path| path.as_path().to_owned()),
+                .and_then(|row| crate::repository_widget::OldPath::from_changed_path(&row.entry)),
             ..Default::default()
         };
         let basis = if area == ChangeArea::Staged {

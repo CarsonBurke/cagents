@@ -52,17 +52,64 @@ use crate::{
     },
     model::{CardId, RepositoryView},
     repository::{
-        CancellationToken, DiffBasis, DiffContent, DiffSide, HistoryRequest, HistoryRevision,
-        MAX_DIFF_SIDE_BYTES, RepoPath, RepositoryService, RepositorySnapshot, ValidatedRefName,
+        CancellationToken, ChangeKind, ChangedPath, DiffBasis, DiffContent, DiffSide,
+        HistoryRequest, HistoryRevision, MAX_DIFF_SIDE_BYTES, RepoPath, RepositoryService,
+        RepositorySnapshot, ValidatedRefName,
     },
     ui_controls::{Icon, icon_button},
 };
 
+/// The other path Git paired with a changed file in one area.
+///
+/// The old side of that area's comparison reads it either way. Only a rename
+/// makes it part of the change: a copy's source is an independent file whose
+/// own staged or unstaged changes a mutation of the copy must leave alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OldPath {
+    Renamed(PathBuf),
+    Copied(PathBuf),
+}
+
+impl OldPath {
+    /// The pairing a source-control status row reports, by its change kind.
+    pub fn from_changed_path(entry: &ChangedPath) -> Option<Self> {
+        let path = entry.old_path.as_ref()?.as_path().to_owned();
+        match entry.kind {
+            ChangeKind::Renamed => Some(Self::Renamed(path)),
+            ChangeKind::Copied => Some(Self::Copied(path)),
+            _ => None,
+        }
+    }
+
+    /// The pairing a porcelain status code reports for one area.
+    fn from_status_code(code: u8, path: &Path) -> Option<Self> {
+        match code {
+            b'R' => Some(Self::Renamed(path.to_owned())),
+            b'C' => Some(Self::Copied(path.to_owned())),
+            _ => None,
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Renamed(path) | Self::Copied(path) => path,
+        }
+    }
+
+    /// The source a mutation must act on together with the path itself.
+    fn rename_source(&self) -> Option<&Path> {
+        match self {
+            Self::Renamed(path) => Some(path),
+            Self::Copied(_) => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RepositoryFile {
     pub path: PathBuf,
-    pub staged_old_path: Option<PathBuf>,
-    pub unstaged_old_path: Option<PathBuf>,
+    pub staged_old_path: Option<OldPath>,
+    pub unstaged_old_path: Option<OldPath>,
     pub staged: bool,
     pub unstaged: bool,
     pub status: Option<String>,
@@ -92,7 +139,7 @@ impl RepositoryFile {
         }
     }
 
-    /// The rename source the old side of this comparison must read.
+    /// The rename or copy source the old side of this comparison must read.
     ///
     /// `git status` reports a rename source per area, which is where both
     /// working bases get theirs. A committed comparison's rename detection
@@ -100,12 +147,13 @@ impl RepositoryFile {
     /// comes from the working tree, so nothing is invented here.
     fn previous_path(&self, basis: &DiffBasis) -> Option<PathBuf> {
         match basis {
-            DiffBasis::HeadToIndex => self.staged_old_path.clone(),
-            DiffBasis::IndexToWorktree => self.unstaged_old_path.clone(),
+            DiffBasis::HeadToIndex => self.staged_old_path.as_ref(),
+            DiffBasis::IndexToWorktree => self.unstaged_old_path.as_ref(),
             DiffBasis::MergeBaseToHead { .. }
             | DiffBasis::CommitToParent { .. }
             | DiffBasis::PullRequest { .. } => None,
         }
+        .map(|old| old.path().to_owned())
     }
 }
 
@@ -4960,6 +5008,7 @@ impl RepositoryRuntime {
             path: RepoPath::parse(file.path.as_os_str()).ok()?,
             old_path: old_path
                 .as_ref()
+                .and_then(OldPath::rename_source)
                 .map(|path| RepoPath::parse(path.as_os_str()))
                 .transpose()
                 .ok()?,
@@ -9154,15 +9203,18 @@ fn assemble_repository_files(
     for path in parse_paths(untracked, "git ls-files --others")? {
         files.entry(path).or_insert(false);
     }
+    // A rename source no longer exists under that name, so the destination
+    // row stands for it. A copy source is still a file of its own.
     for status in statuses.values() {
-        for old_path in [
+        for source in [
             status.staged_old_path.as_ref(),
             status.unstaged_old_path.as_ref(),
         ]
         .into_iter()
         .flatten()
+        .filter_map(OldPath::rename_source)
         {
-            files.remove(old_path);
+            files.remove(source);
         }
     }
     for path in statuses.keys() {
@@ -9256,8 +9308,8 @@ fn parse_paths(output: &[u8], format: &str) -> Result<Vec<PathBuf>, String> {
 struct ParsedStatus {
     staged: Option<u8>,
     unstaged: Option<u8>,
-    staged_old_path: Option<PathBuf>,
-    unstaged_old_path: Option<PathBuf>,
+    staged_old_path: Option<OldPath>,
+    unstaged_old_path: Option<OldPath>,
 }
 
 impl ParsedStatus {
@@ -9302,8 +9354,8 @@ fn merge_status_fact(
 }
 
 fn merge_status_path(
-    target: &mut Option<PathBuf>,
-    incoming: Option<PathBuf>,
+    target: &mut Option<OldPath>,
+    incoming: Option<OldPath>,
     basis: &str,
 ) -> Result<(), String> {
     if let Some(incoming) = incoming {
@@ -9354,14 +9406,12 @@ fn parse_status_paths(output: &[u8]) -> Result<HashMap<PathBuf, ParsedStatus>, S
             } else {
                 (code[1] != b' ').then_some(code[1])
             },
-            staged_old_path: matches!(code[0], b'R' | b'C')
-                .then(|| old_path.clone())
-                .flatten(),
-            unstaged_old_path: if matches!(code[1], b'R' | b'C') {
-                old_path
-            } else {
-                None
-            },
+            staged_old_path: old_path
+                .as_deref()
+                .and_then(|source| OldPath::from_status_code(code[0], source)),
+            unstaged_old_path: old_path
+                .as_deref()
+                .and_then(|source| OldPath::from_status_code(code[1], source)),
         };
         if let Some(existing) = statuses.get_mut(&path) {
             existing.merge(parsed)?;
@@ -14978,8 +15028,8 @@ mod tests {
         assert_eq!(
             parsed
                 .get(Path::new("renamed.md"))
-                .and_then(|status| status.staged_old_path.as_deref()),
-            Some(Path::new("old.md"))
+                .and_then(|status| status.staged_old_path.as_ref()),
+            Some(&OldPath::Renamed("old.md".into()))
         );
         assert!(!parsed.contains_key(Path::new("old.md")));
     }
@@ -15034,7 +15084,7 @@ mod tests {
             vec![RepositoryFile {
                 path: PathBuf::from("renamed.md"),
                 staged_old_path: None,
-                unstaged_old_path: Some(PathBuf::from("old-name.md")),
+                unstaged_old_path: Some(OldPath::Renamed("old-name.md".into())),
                 staged: false,
                 unstaged: true,
                 status: Some(" R".into()),
@@ -15075,7 +15125,7 @@ mod tests {
                 },
                 RepositoryFile {
                     path: PathBuf::from("renamed.md"),
-                    staged_old_path: Some(PathBuf::from("old-name.md")),
+                    staged_old_path: Some(OldPath::Renamed("old-name.md".into())),
                     unstaged_old_path: None,
                     staged: true,
                     unstaged: false,
@@ -18997,8 +19047,8 @@ mod tests {
             RepositoryFile {
                 path: "CLAUDE.md".into(),
                 unstaged: true,
-                unstaged_old_path: Some("notes.md".into()),
-                status: Some(" M".into()),
+                unstaged_old_path: Some(OldPath::Renamed("notes.md".into())),
+                status: Some(" R".into()),
                 ..RepositoryFile::default()
             },
         ]);
@@ -24034,7 +24084,7 @@ mod tests {
         let file = RepositoryFile {
             path: "new-name.txt".into(),
             staged: true,
-            staged_old_path: Some("old-name.txt".into()),
+            staged_old_path: Some(OldPath::Renamed("old-name.txt".into())),
             ..Default::default()
         };
         drop(runtime.update(RepositoryAction::OpenWorkingDiff {
@@ -24056,6 +24106,65 @@ mod tests {
             runtime.diff_state(&DiffBasis::HeadToIndex),
             Some(DiffState::Loading { .. })
         ));
+    }
+
+    /// A copy reads its source for the diff, but the source is a file of its
+    /// own: unstaging the copy must not also reset the source's index entry,
+    /// which can hold a deliberately staged version nothing else keeps.
+    #[test]
+    fn a_copy_compares_against_its_source_but_mutates_only_itself() {
+        let card = CardId::new();
+        for (old_path, mutated_source) in [
+            (OldPath::Copied("source.txt".into()), None),
+            (
+                OldPath::Renamed("source.txt".into()),
+                Some(Path::new("source.txt")),
+            ),
+        ] {
+            let (mut runtime, _) = working_diff_runtime(card, "old\n", "working\n");
+            drop(runtime.update(RepositoryAction::OpenWorkingDiff {
+                card,
+                file: RepositoryFile {
+                    path: "copy.txt".into(),
+                    staged: true,
+                    staged_old_path: Some(old_path.clone()),
+                    ..Default::default()
+                },
+                basis: DiffBasis::HeadToIndex,
+            }));
+            assert_eq!(
+                runtime.comparison_old_path(),
+                Some(PathBuf::from("source.txt")),
+                "{old_path:?}"
+            );
+            let selection = runtime
+                .selected_staging_selection(false)
+                .expect("the staged path can be unstaged");
+            assert_eq!(selection.path.as_path(), Path::new("copy.txt"));
+            assert_eq!(
+                selection.old_path.as_ref().map(|path| path.as_path()),
+                mutated_source,
+                "{old_path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_copy_source_keeps_its_own_row() {
+        let files =
+            assemble_repository_files(b"source.md\0copy.md\0", b"", b"C  copy.md\0source.md\0")
+                .unwrap();
+        assert_eq!(
+            files
+                .iter()
+                .map(|file| file.path.as_path())
+                .collect::<Vec<_>>(),
+            vec![Path::new("copy.md"), Path::new("source.md")]
+        );
+        assert_eq!(
+            files[0].staged_old_path,
+            Some(OldPath::Copied("source.md".into()))
+        );
     }
 
     #[test]
