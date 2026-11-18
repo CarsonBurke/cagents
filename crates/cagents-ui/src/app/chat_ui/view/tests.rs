@@ -1445,11 +1445,8 @@ fn contentless_thinking_draws_no_row_and_leaves_the_working_indicator_in_place()
             crate::app::chat_ui::Presentations(&runtime.cache),
         );
     };
-    let (mut runtime, _handle) = frame_cost::live_runtime(&[
-        prompt,
-        command("c1", chat::ToolStatus::Succeeded),
-        thought,
-    ]);
+    let (mut runtime, _handle) =
+        frame_cost::live_runtime(&[prompt, command("c1", chat::ToolStatus::Succeeded), thought]);
     Arc::make_mut(&mut runtime.snapshot).busy = true;
     regroup(&mut runtime);
     let placed = |runtime: &Runtime| {
