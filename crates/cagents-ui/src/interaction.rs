@@ -507,6 +507,41 @@ pub(crate) fn fade_below_header(renderer: &mut Renderer, area: Rectangle, color:
     fill_overflow_fade(renderer, area, Edge::Top, color);
 }
 
+/// Fades what reaches the top and the bottom of `area` into `color`: opaque
+/// at each edge and clear `top` and `bottom` inside it. A depth of zero
+/// draws nothing at that edge. Draw it within a layer clipped to `area`.
+pub(crate) fn fade_vertical_edges(
+    renderer: &mut Renderer,
+    area: Rectangle,
+    top: f32,
+    bottom: f32,
+    color: Color,
+) {
+    if top > 0.0 {
+        fill_overflow_fade(
+            renderer,
+            Rectangle {
+                height: top,
+                ..area
+            },
+            Edge::Top,
+            color,
+        );
+    }
+    if bottom > 0.0 {
+        fill_overflow_fade(
+            renderer,
+            Rectangle {
+                y: area.y + area.height - bottom,
+                height: bottom,
+                ..area
+            },
+            Edge::Bottom,
+            color,
+        );
+    }
+}
+
 /// Lets a single line run past its width and fades its trailing edge into
 /// `background`, rather than cutting it off or ending it in an ellipsis.
 ///

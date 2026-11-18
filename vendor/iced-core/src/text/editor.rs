@@ -63,6 +63,18 @@ pub trait Editor: Sized + Default {
         highlighter: &mut H,
         format_highlight: impl Fn(&H::Highlight) -> highlighter::Format<Self::Font>,
     );
+
+    /// cagents: also lays out and draws the text within `above` of the top
+    /// of the [`Editor`]'s bounds and `below` their bottom, so that scrolled
+    /// text can continue into a margin around them, where it can also be
+    /// clicked. Scrolling and the cursor still keep to the bounds.
+    fn set_overscan(&mut self, _above: f32, _below: f32) {}
+
+    /// cagents: how far the drawn text reaches past the top and the bottom
+    /// of the [`Editor`]'s bounds, into the overscan.
+    fn overflow(&self) -> (f32, f32) {
+        (0.0, 0.0)
+    }
 }
 
 /// An interaction with an [`Editor`].

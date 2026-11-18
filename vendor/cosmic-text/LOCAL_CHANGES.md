@@ -134,3 +134,11 @@ once. Lines, endings, attribute splits, the returned cursor and the recorded
 change are the same as upstream's. The application test
 repository_widget::text_editor::tests::native_multiline_insert_and_delete_keep_lines_order_and_history
 checks them, including undoing both changes.
+
+Overscan for edge fades (cagents #2824)
+
+`Buffer::set_overscan(above, below)` adds bands above and below the viewport. The lines in those bands are shaped and laid out, and `Buffer::draw_runs` yields them along with the visible runs, with negative `line_top` above the viewport and values past the height below it. `hit` uses `draw_runs`, so a click in a band lands on the line drawn there. `layout_runs`, scrolling, cursor reveal, PageUp/Down and the measured content height still use only the viewport, so the overscan never changes where the editor scrolls or how large it measures. The default overscan is zero, which keeps upstream behavior.
+
+Why: an editor inside padding cut its text at the padding's inner edge, so a scrolled draft looked sliced in half (#2824). Drawing the neighboring lines into the padding lets the app fade them out instead.
+
+Coverage: `editor_widget::tests::native_overscan_draws_text_past_the_viewport_and_reports_how_far` in cagents-ui. Remove this patch when upstream can draw text past the scroll viewport.

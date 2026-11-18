@@ -64,7 +64,9 @@ or underscores, names the task on HOST: ~/.local/state/cev/NAME there.
                   executables go to HOST; a revision builds on HOST.
                   --integrated builds the UI with the embedded browser, on
                   HOST, as it does for both sides of a pair.
-  shot NAME       Capture on HOST and bring back shots/SIDE-NAME.webp.
+  shot NAME [--lossless]
+                  Capture on HOST and bring back shots/SIDE-NAME.webp;
+                  --lossless keeps every pixel.
   fetch           Bring back every shot and the manifest.
   where           Print the task and checkouts on HOST.
   clean           Remove the task's session, checkouts, refs and directory
@@ -605,8 +607,9 @@ case $command in
     clean) cmd_clean ;;
     build) cmd_build "$@" ;;
     shot)
-        [ "$#" -eq 1 ] || die 'shot needs a name' 2
-        forward shot "$1" >/dev/null
+        [ "$#" -ge 1 ] || die 'shot needs a name' 2
+        # The host's native-evidence checks the name and any options.
+        forward shot "$@" >/dev/null
         fetch_shots
         side=$(forward status | sed -n 's/^session: \(before\|after\),.*/\1/p') || side=
         if [ -n "$side" ]; then
