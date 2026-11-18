@@ -232,7 +232,7 @@ impl Cagents {
         }
         if !first {
             // A second step is someone looking for a workspace, not a tap.
-            self.chrome_ui.workspace_switcher_shown = true;
+            self.mark_workspace_switcher_shown();
             return Task::batch([
                 self.workspace_selection_moved(),
                 self.reveal_workspace_selection(),
@@ -673,12 +673,21 @@ impl Cagents {
     /// The switcher is drawn for the first time. The selection has rested
     /// for as long as the hold took to show it.
     pub(super) fn show_workspace_switcher(&mut self) -> Task<Message> {
-        self.chrome_ui.workspace_switcher_shown = true;
+        self.mark_workspace_switcher_shown();
         if let Some(destination) = self.workspace_switcher_selection() {
             self.chrome_ui.workspace_switcher_panes = self.workspace_panes(destination);
             self.chrome_ui.workspace_switcher_rested = Some(destination);
         }
         self.reveal_workspace_selection()
+    }
+
+    fn mark_workspace_switcher_shown(&mut self) {
+        if !self.chrome_ui.workspace_switcher_shown
+            && let Some(since) = self.chrome_ui.workspace_preview_since
+        {
+            crate::performance::ui_trace::latency_to_next_frame("workspace switcher shown", since);
+        }
+        self.chrome_ui.workspace_switcher_shown = true;
     }
 
     /// The pane `destination` would focus.
@@ -854,6 +863,12 @@ impl Cagents {
                 }
                 _ => {}
             }
+        }
+        if let (Some(_), Some(since)) = (wanted, self.chrome_ui.workspace_preview_since) {
+            crate::performance::ui_trace::latency_to_next_frame(
+                "workspace switcher preview",
+                since,
+            );
         }
         self.chrome_ui.workspace_switcher_preview = wanted;
         self.trim_warm_chats();
