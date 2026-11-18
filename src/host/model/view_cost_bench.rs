@@ -148,7 +148,7 @@ fn view_cost_bench() {
             let first = views::read(&registry.db, scope).unwrap().panes[0].id;
             let mut renamed = pane.clone();
             renamed.user_title = Some(format!("renamed {repetition}"));
-            for index in 0..costs.len() {
+            for (index, (_, durations, sizes)) in costs.iter_mut().enumerate() {
                 let edit = match index {
                     0 => change(
                         &registry,
@@ -183,8 +183,8 @@ fn view_cost_bench() {
                     },
                 };
                 let (duration, bytes) = timed(&mut registry, &path, &edit);
-                costs[index].1.push(duration);
-                costs[index].2.push(bytes);
+                durations.push(duration);
+                sizes.push(bytes);
             }
         }
         for (name, durations, bytes) in costs {

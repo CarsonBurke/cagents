@@ -1455,7 +1455,6 @@ mod startup_retryability_tests {
 /// Persist cleanup authority while the inspected source and captured scope are
 /// still authenticated, before installation or a new attachment can retire the
 /// previous epoch. Pending is never an input or history-resume grant.
-
 fn enroll_pending_for_start(
     host: &SharedHost,
     identity: &chat::runtime::ActorIdentity,

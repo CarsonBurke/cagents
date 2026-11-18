@@ -506,8 +506,10 @@ mod tests {
     fn pane_menu_hints_follow_configured_focused_target_only() {
         use widget::menu::Action as _;
         let id = CardId::new();
-        let mut shortcuts = crate::settings::KeyboardShortcuts::default();
-        shortcuts.close_focused_column = vec!["Ctrl+Alt+F5".into()];
+        let mut shortcuts = crate::settings::KeyboardShortcuts {
+            close_focused_column: vec!["Ctrl+Alt+F5".into()],
+            ..crate::settings::KeyboardShortcuts::default()
+        };
         let bindings = pane_menu_bindings(id, true, &shortcuts);
         let (key, action) = bindings
             .iter()

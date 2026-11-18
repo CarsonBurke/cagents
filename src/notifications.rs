@@ -524,9 +524,11 @@ mod tests {
         let mut unsafe_event = event.clone();
         unsafe_event.directory = Some("/private/message-content".into());
         assert!(unsafe_event.validate().is_err());
-        let mut preferences = Preferences::default();
-        preferences.enabled = true;
-        preferences.waiting = false;
+        let preferences = Preferences {
+            enabled: true,
+            waiting: false,
+            ..Preferences::default()
+        };
         assert!(!preferences.allows(Kind::MessageReceived, false));
     }
 

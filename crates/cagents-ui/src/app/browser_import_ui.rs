@@ -517,7 +517,7 @@ impl Cagents {
                         let mut profiles = 0;
                         let mut skipped = 0;
                         let mut errors = Vec::new();
-                        let now = (unix_millis() / 1000) as i64;
+                        let now = unix_millis() / 1000;
                         for found in selected {
                             if cancel.load(Ordering::Relaxed) {
                                 break;

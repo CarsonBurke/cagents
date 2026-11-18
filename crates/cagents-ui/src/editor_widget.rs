@@ -3687,7 +3687,7 @@ mod tests {
                     };
                     let end = Position {
                         line: last,
-                        column: if last == 400 { 3 } else { 3 },
+                        column: 3,
                     };
                     let cursor = Cursor {
                         position: if reverse { start } else { end },
@@ -4535,11 +4535,9 @@ mod tests {
                 .len(),
             2
         );
+        let pattern = regex::Regex::new("(a)|long").unwrap();
         for text in ["${0}${0}${0}", "λ$0🦀"] {
-            let expected = regex::Regex::new("(a)|long")
-                .unwrap()
-                .replace_all(original, text)
-                .into_owned();
+            let expected = pattern.replace_all(original, text).into_owned();
             assert_eq!(
                 snapshot
                     .replace_matches_bounded(

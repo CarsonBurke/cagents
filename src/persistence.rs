@@ -1775,10 +1775,12 @@ impl StateStore {
         manifest
             .pending_chat_admissions
             .insert(copy.copy.id, copy.source.clone());
-        let mut state = WorkspaceState::default();
-        state.id = copy.workspace;
-        state.channels = manifest.channels;
-        state.card_scopes = manifest.card_scopes;
+        let mut state = WorkspaceState {
+            id: copy.workspace,
+            channels: manifest.channels,
+            card_scopes: manifest.card_scopes,
+            ..WorkspaceState::default()
+        };
         copy.project(&mut state)?;
         for (name, value) in [
             ("chat_drafts", ordered_map_json(&manifest.chat_drafts)?),

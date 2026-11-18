@@ -912,7 +912,7 @@ fn cold_reader_wheel_reports_saved_geometry_and_dispatches_real_history_edges() 
         };
         assert_eq!(scroll.content(), 2_000.0);
         assert_eq!(scroll.window_height(), 400.0);
-        assert_eq!(scroll.from_top(), if bottom { 1_600.0 } else { 0.0 });
+        assert_eq!(scroll.offset_from_top(), if bottom { 1_600.0 } else { 0.0 });
         assert_eq!(observations.borrow()[&None], *scroll);
         drop(pending);
         drop(app.update(reports.into_iter().next().unwrap()));
@@ -1063,7 +1063,8 @@ fn native_paging_shrinks_to_loaded_content_and_wheels_choose_each_edge() {
                     unreachable!()
                 };
                 assert!(
-                    scroll.from_top() > 0.0 && scroll.from_top() < height - viewport.height,
+                    scroll.offset_from_top() > 0.0
+                        && scroll.offset_from_top() < height - viewport.height,
                     "prefetch must start before the physical edge"
                 );
             }
@@ -1538,7 +1539,7 @@ fn actual_native_wheel_survives_tree_drop_before_the_next_layout() {
             &Rectangle::with_size(Size::new(720.0, 400.0)),
         );
     }
-    let expected = observations.borrow()[&None].from_top();
+    let expected = observations.borrow()[&None].offset_from_top();
     assert!(
         expected < 1600.0 && expected > 0.0,
         "the real native wheel must move the reader"

@@ -236,18 +236,14 @@ impl<E: ProcessExecutor> GitHubService<E> {
                 serde_json::from_slice::<serde_json::Value>(graphql_body(&output.stdout)).ok();
             if let Some(limit) = polling::classify(
                 &format!(
-                    "{}\n{}",
-                    format!(
-                        "{}\n{}",
-                        String::from_utf8_lossy(
-                            &output.stdout
-                                [..output.stdout.len() - graphql_body(&output.stdout).len()]
-                        ),
-                        body.as_ref()
-                            .and_then(|body| body.get("errors"))
-                            .map(ToString::to_string)
-                            .unwrap_or_default()
+                    "{}\n{}\n{}",
+                    String::from_utf8_lossy(
+                        &output.stdout[..output.stdout.len() - graphql_body(&output.stdout).len()]
                     ),
+                    body.as_ref()
+                        .and_then(|body| body.get("errors"))
+                        .map(ToString::to_string)
+                        .unwrap_or_default(),
                     String::from_utf8_lossy(&output.stderr)
                 ),
                 polling::now(),

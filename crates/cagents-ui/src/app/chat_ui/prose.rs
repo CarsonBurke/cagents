@@ -175,10 +175,10 @@ impl Highlight {
         let mut run = runs.partition_point(|run| (run.end as usize) <= range.start);
         let mut start = range.start;
         for source in text[range].split_inclusive('\n') {
-            let (line, ending) = if source.ends_with("\r\n") {
-                (&source[..source.len() - 2], "\r\n")
-            } else if source.ends_with('\n') {
-                (&source[..source.len() - 1], "\n")
+            let (line, ending) = if let Some(line) = source.strip_suffix("\r\n") {
+                (line, "\r\n")
+            } else if let Some(line) = source.strip_suffix('\n') {
+                (line, "\n")
             } else {
                 (source, "")
             };
@@ -1189,7 +1189,6 @@ pub(super) fn code_text(
             let revision = revision.finish();
             let text = text.clone();
             let highlight = highlight.clone();
-            let find = find;
             let flow_cache = flow_cache.clone();
             let reader_source = reader_source.clone();
             let descriptor = logical.as_ref().map(|logical| virtualized::LogicalRange {

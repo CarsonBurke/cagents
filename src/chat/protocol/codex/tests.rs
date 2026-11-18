@@ -1614,7 +1614,7 @@ fn align_resume_identity_rewrites_resume_thread() {
     ];
     align_resume_identity(&mut arguments, "new").unwrap();
     assert_eq!(arguments, vec!["app-server", "resume", "new"]);
-    assert!(align_resume_identity(&mut vec!["resume".to_string()], "new").is_err());
+    assert!(align_resume_identity(&mut ["resume".to_string()], "new").is_err());
 }
 
 #[test]

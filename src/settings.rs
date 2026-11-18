@@ -3570,9 +3570,11 @@ mod tests {
 
     #[test]
     fn editor_font_inherits_terminal_until_overridden() {
-        let mut settings = super::AppSettings::default();
-        settings.terminal_font_family = "Test Mono".into();
-        settings.terminal_font_size = 19.0;
+        let mut settings = super::AppSettings {
+            terminal_font_family: "Test Mono".into(),
+            terminal_font_size: 19.0,
+            ..super::AppSettings::default()
+        };
         assert_eq!(settings.editor_font_family(), "Test Mono");
         assert_eq!(settings.editor_font_size(), 19.0);
         settings.editor_font_family = Some("Editor Mono".into());
@@ -3757,8 +3759,10 @@ mod tests {
     fn palette_recents_survive_save_and_old_settings_default_to_empty() {
         let directory = tempfile::tempdir().unwrap();
         let path = path_in(&directory);
-        let mut settings = AppSettings::default();
-        settings.palette_recents = vec!["command:open_settings".into(), "pane:original".into()];
+        let mut settings = AppSettings {
+            palette_recents: vec!["command:open_settings".into(), "pane:original".into()],
+            ..AppSettings::default()
+        };
         save(&path, &settings).unwrap();
         assert_eq!(
             load(&path).unwrap().palette_recents,
@@ -3795,9 +3799,11 @@ mod tests {
                 LinkOpenGesture::ControlClick,
                 LinkOpenGesture::ControlShiftClick,
             ] {
-                let mut settings = AppSettings::default();
-                settings.link_open_destination = destination;
-                settings.link_open_gesture = system_gesture;
+                let settings = AppSettings {
+                    link_open_destination: destination,
+                    link_open_gesture: system_gesture,
+                    ..AppSettings::default()
+                };
                 save(&path, &settings).unwrap();
                 let settings = load(&path).unwrap();
                 assert_eq!(settings.link_destination(None), destination);

@@ -807,7 +807,7 @@ impl Snapshot {
     }
 
     /// Editor-native position to protocol UTF-16 position.
-    fn to_utf16(&self, position: LspPosition) -> Result<lsp_types::Position, LspError> {
+    fn utf16_position(&self, position: LspPosition) -> Result<lsp_types::Position, LspError> {
         let content = self
             .line_content(position.line)
             .ok_or_else(|| self.out_of_range(position.line, position.character))?;
@@ -829,7 +829,7 @@ impl Snapshot {
 
     /// Protocol UTF-16 position to editor-native position. An offset landing
     /// inside a surrogate pair is refused rather than rounded.
-    fn from_utf16(&self, position: lsp_types::Position) -> Result<LspPosition, LspError> {
+    fn native_position(&self, position: lsp_types::Position) -> Result<LspPosition, LspError> {
         if position.line >= self.line_count() {
             return Err(self.out_of_range(position.line, position.character));
         }
@@ -859,19 +859,19 @@ impl Snapshot {
         }
     }
 
-    fn range_to_utf16(&self, range: LspRange) -> Result<lsp_types::Range, LspError> {
+    fn utf16_range(&self, range: LspRange) -> Result<lsp_types::Range, LspError> {
         if range.start > range.end {
             return Err(LspError::InvertedRange);
         }
         Ok(lsp_types::Range::new(
-            self.to_utf16(range.start)?,
-            self.to_utf16(range.end)?,
+            self.utf16_position(range.start)?,
+            self.utf16_position(range.end)?,
         ))
     }
 
-    fn range_from_utf16(&self, range: lsp_types::Range) -> Result<LspRange, LspError> {
-        let start = self.from_utf16(range.start)?;
-        let end = self.from_utf16(range.end)?;
+    fn native_range(&self, range: lsp_types::Range) -> Result<LspRange, LspError> {
+        let start = self.native_position(range.start)?;
+        let end = self.native_position(range.end)?;
         if start > end {
             return Err(LspError::InvertedRange);
         }
@@ -995,7 +995,7 @@ fn native_incremental(
     for edit in edits {
         let snapshot = Snapshot::from_native(base.version, working.clone());
         changes.push(lsp_types::TextDocumentContentChangeEvent {
-            range: Some(snapshot.range_to_utf16(edit.range).ok()?),
+            range: Some(snapshot.utf16_range(edit.range).ok()?),
             range_length: None,
             text: edit.new_text.clone(),
         });
@@ -1026,7 +1026,7 @@ fn measure_edit(
     edit: &LspTextEdit,
     changes: &mut Vec<lsp_types::TextDocumentContentChangeEvent>,
 ) -> Result<(usize, usize), LspError> {
-    let range = working.range_to_utf16(edit.range)?;
+    let range = working.utf16_range(edit.range)?;
     let start = working.byte_offset(edit.range.start)?;
     let end = working.byte_offset(edit.range.end)?;
     changes.push(lsp_types::TextDocumentContentChangeEvent {
@@ -2515,7 +2515,7 @@ fn convert_diagnostic(
     diagnostic: lsp_types::Diagnostic,
 ) -> Option<LspDiagnostic> {
     // One unconvertible range must not discard the whole batch.
-    let range = snapshot.range_from_utf16(diagnostic.range).ok()?;
+    let range = snapshot.native_range(diagnostic.range).ok()?;
     Some(LspDiagnostic {
         range,
         severity: match diagnostic.severity {
@@ -3385,7 +3385,7 @@ fn convert_result(snapshots: &SnapshotStore, request: &PendingRequest, raw: RawR
             range: None,
         },
         RawResult::Hover(Some(hover)) => {
-            let range = match hover.range.map(|range| snapshot.range_from_utf16(range)) {
+            let range = match hover.range.map(|range| snapshot.native_range(range)) {
                 None => None,
                 Some(Ok(range)) => Some(range),
                 Some(Err(error)) => {
@@ -3465,7 +3465,7 @@ fn convert_locations(
             // ranges can be converted to editor coordinates.
             let (range, coordinates) = if location.uri == *request.uri {
                 (
-                    snapshot.range_from_utf16(location.range).ok()?,
+                    snapshot.native_range(location.range).ok()?,
                     LspCoordinates::Scalar,
                 )
             } else {
@@ -3547,19 +3547,19 @@ fn convert_completion(
     // `insertText`, which wins over `label`.
     let edit = match &item.text_edit {
         Some(lsp_types::CompletionTextEdit::Edit(text_edit)) => LspCompletionEdit {
-            range: snapshot.range_from_utf16(text_edit.range)?,
+            range: snapshot.native_range(text_edit.range)?,
             replace_range: None,
             new_text: text_edit.new_text.clone(),
             snippet: None,
         },
         Some(lsp_types::CompletionTextEdit::InsertAndReplace(both)) => LspCompletionEdit {
-            range: snapshot.range_from_utf16(both.insert)?,
-            replace_range: Some(snapshot.range_from_utf16(both.replace)?),
+            range: snapshot.native_range(both.insert)?,
+            replace_range: Some(snapshot.native_range(both.replace)?),
             new_text: both.new_text.clone(),
             snippet: None,
         },
         None => {
-            let position = snapshot.from_utf16(at)?;
+            let position = snapshot.native_position(at)?;
             LspCompletionEdit {
                 range: snapshot.identifier_prefix(position),
                 replace_range: None,
@@ -3574,7 +3574,7 @@ fn convert_completion(
     let mut additional_edits = Vec::new();
     for text_edit in item.additional_text_edits.iter().flatten() {
         additional_edits.push(LspCompletionEdit {
-            range: snapshot.range_from_utf16(text_edit.range)?,
+            range: snapshot.native_range(text_edit.range)?,
             replace_range: None,
             new_text: text_edit.new_text.clone(),
             snippet: None,
@@ -4912,7 +4912,7 @@ impl LspManager {
         if let Some(pending) = self.pending_opens.get(&doc) {
             return pending
                 .text
-                .from_utf16(lsp_types::Position::new(at.line, at.character));
+                .native_position(lsp_types::Position::new(at.line, at.character));
         }
         let reference = self
             .documents
@@ -4922,7 +4922,7 @@ impl LspManager {
             .snapshots
             .latest(&reference.uri)
             .ok_or(LspError::UnknownDocument(doc.0))?;
-        snapshot.from_utf16(lsp_types::Position::new(at.line, at.character))
+        snapshot.native_position(lsp_types::Position::new(at.line, at.character))
     }
 
     /// Replaces the session backing `doc` with a fresh process and re-opens
@@ -5090,7 +5090,7 @@ impl LspManager {
         let Some(snapshot) = self.snapshots.latest(&reference.uri) else {
             return fail(&self.events, LspError::UnknownDocument(doc.0));
         };
-        let position = match snapshot.to_utf16(at) {
+        let position = match snapshot.utf16_position(at) {
             Ok(position) => position,
             Err(error) => return fail(&self.events, error),
         };

@@ -360,8 +360,10 @@ mod tests {
         let (mut app, target, channel, _) = fixture("survives registry replacement");
         retire(&mut app, channel, target.card);
         assert!(runtime(&app, target).closed_elsewhere);
-        let mut replacement = crate::workspace_model::WorkspaceModel::default();
-        replacement.identity = uuid::Uuid::new_v4();
+        let replacement = crate::workspace_model::WorkspaceModel {
+            identity: uuid::Uuid::new_v4(),
+            ..crate::workspace_model::WorkspaceModel::default()
+        };
         drop(app.apply_workspace_model_update(
             crate::app::workspace_model_sync::ModelUpdate::Connected(replacement),
         ));

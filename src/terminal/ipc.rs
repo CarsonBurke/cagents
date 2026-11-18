@@ -2677,7 +2677,7 @@ mod tests {
             }),
             WireTerminalEvent::Error { .. }
         ));
-        assert!(PROTOCOL_VERSION > 105);
+        const { assert!(PROTOCOL_VERSION > 105) };
     }
 
     #[test]
@@ -3121,10 +3121,12 @@ mod tests {
             postcard::from_bytes::<crate::chat::Attachment>(&legacy).is_err(),
             "JSON defaults cannot repair positional postcard layout"
         );
-        assert!(
-            PROTOCOL_VERSION > 104,
-            "image reference fields require matched positional peers"
-        );
+        const {
+            assert!(
+                PROTOCOL_VERSION > 104,
+                "image reference fields require matched positional peers"
+            )
+        };
     }
 
     #[test]

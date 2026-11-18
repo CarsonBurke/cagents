@@ -1499,13 +1499,15 @@ pub(in crate::app) mod tests {
 
     #[test]
     fn rows_sort_by_headroom_reset_or_name_with_unknowns_last() {
-        let mut state = State::default();
-        state.accounts = vec![
-            account_with(Provider::Claude, 0, None),
-            account_with(Provider::Claude, 1, Some((0.9, 500))),
-            account_with(Provider::Claude, 2, Some((0.2, 900))),
-            account_with(Provider::Claude, 3, Some((0.5, 100))),
-        ];
+        let state = State {
+            accounts: vec![
+                account_with(Provider::Claude, 0, None),
+                account_with(Provider::Claude, 1, Some((0.9, 500))),
+                account_with(Provider::Claude, 2, Some((0.2, 900))),
+                account_with(Provider::Claude, 3, Some((0.5, 100))),
+            ],
+            ..State::default()
+        };
         let keys = |sort| {
             rows(&state, Provider::Claude, sort)
                 .iter()

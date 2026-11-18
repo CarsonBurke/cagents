@@ -593,26 +593,27 @@ impl State {
     }
 
     pub(super) fn for_workspace(workspace: &WorkspaceState) -> Self {
-        let mut state = Self::default();
-        state.retained = workspace.local_only_cards.clone();
-        state.attached = workspace
-            .channels
-            .iter()
-            .filter(|scope| scope.shared)
-            .flat_map(|scope| scope.cards.iter().copied())
-            .chain(
-                workspace
-                    .cards
-                    .iter()
-                    .filter(|card| {
-                        workspace.workspace_model_identity.is_some()
-                            && card.existence.is_open()
-                            && matches!(card.kind, CardKind::Terminal(_) | CardKind::Chat(_))
-                    })
-                    .map(|card| card.id),
-            )
-            .collect();
-        state
+        Self {
+            retained: workspace.local_only_cards.clone(),
+            attached: workspace
+                .channels
+                .iter()
+                .filter(|scope| scope.shared)
+                .flat_map(|scope| scope.cards.iter().copied())
+                .chain(
+                    workspace
+                        .cards
+                        .iter()
+                        .filter(|card| {
+                            workspace.workspace_model_identity.is_some()
+                                && card.existence.is_open()
+                                && matches!(card.kind, CardKind::Terminal(_) | CardKind::Chat(_))
+                        })
+                        .map(|card| card.id),
+                )
+                .collect(),
+            ..Self::default()
+        }
     }
 }
 
@@ -4396,14 +4397,12 @@ impl Cagents {
         self.shared_views.default_requests.remove(&id);
         self.shared_chat_detach(id);
         self.retire_lsp_card(id);
-        if let Some(runtime) = self.cards.remove(&id) {
-            #[cfg(feature = "integrated-browser")]
-            if let CardRuntime::Browser(browser) = runtime {
-                self.begin_browser_teardown(browser.handle);
-            }
-            #[cfg(not(feature = "integrated-browser"))]
-            drop(runtime);
+        #[cfg(feature = "integrated-browser")]
+        if let Some(CardRuntime::Browser(browser)) = self.cards.remove(&id) {
+            self.begin_browser_teardown(browser.handle);
         }
+        #[cfg(not(feature = "integrated-browser"))]
+        self.cards.remove(&id);
         self.lifecycle.remove(id);
         if self.workspace.card(id).is_some() && self.workspace.request_close(id).is_ok() {
             let _ = self.workspace.commit_close(id);

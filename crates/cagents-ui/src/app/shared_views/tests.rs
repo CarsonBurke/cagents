@@ -5066,7 +5066,7 @@ fn batched_projection_preserves_large_workspace_history_and_pending_starts() {
     let terminal = fresh_terminal_session(LaunchRecipe::shell(paths[0].clone()).unwrap());
     let durable = Arc::make_mut(&mut app.durable);
     durable.cards.clear();
-    for index in 0..1024 {
+    for (index, path) in paths.iter().enumerate().take(1024) {
         let id = CardId::new();
         let existence = if index < 172 {
             Existence::Open
@@ -5087,14 +5087,14 @@ fn batched_projection_preserves_large_workspace_history_and_pending_starts() {
             existence,
             kind: if index % 3 == 0 {
                 CardKind::Terminal(fresh_terminal_session(
-                    LaunchRecipe::shell(paths[index].join("src")).unwrap(),
+                    LaunchRecipe::shell(path.join("src")).unwrap(),
                 ))
             } else {
                 pane.kind.clone()
             },
         });
         if index % 3 != 0 {
-            durable.card_scopes.insert(id, paths[index].clone());
+            durable.card_scopes.insert(id, path.clone());
         }
         if index % 7 == 0 {
             durable.channels[0].cards.push(id);
@@ -6819,9 +6819,11 @@ fn restored_window_local_terminal_held_for_registry_restores_as_saved_once_it_an
         "a possibly shared terminal waits for the registry"
     );
 
-    let mut model = crate::workspace_model::WorkspaceModel::default();
-    model.identity = identity;
-    model.sequence = 1;
+    let model = crate::workspace_model::WorkspaceModel {
+        identity,
+        sequence: 1,
+        ..crate::workspace_model::WorkspaceModel::default()
+    };
     drop(app.apply_workspace_model_update(
         super::super::workspace_model_sync::ModelUpdate::Connected(model),
     ));
@@ -6888,9 +6890,11 @@ fn restored_terminal_held_for_registry_restores_as_saved_once_it_is_unavailable(
 #[test]
 fn unopened_terminal_no_view_lists_restores_as_saved_once_the_registry_answers() {
     let (mut app, id, identity) = restored_unopened_terminal();
-    let mut model = crate::workspace_model::WorkspaceModel::default();
-    model.identity = identity;
-    model.sequence = 1;
+    let model = crate::workspace_model::WorkspaceModel {
+        identity,
+        sequence: 1,
+        ..crate::workspace_model::WorkspaceModel::default()
+    };
     drop(app.apply_workspace_model_update(
         super::super::workspace_model_sync::ModelUpdate::Connected(model),
     ));
@@ -6988,10 +6992,12 @@ fn saved_terminal_listed_in_a_view_later_hydrates_as_shared() {
     app.lifecycle
         .register(id, Exposure::Visible, Residency::Hibernated, Instant::now());
     drop(app.reconcile_lifecycle(&HashSet::from([id]), &HashSet::new(), &HashSet::new()));
-    let mut model = crate::workspace_model::WorkspaceModel::default();
-    model.identity = identity;
-    model.sequence = 1;
-    model.channels = channels;
+    let model = crate::workspace_model::WorkspaceModel {
+        identity,
+        sequence: 1,
+        channels,
+        ..crate::workspace_model::WorkspaceModel::default()
+    };
     drop(app.apply_workspace_model_update(
         super::super::workspace_model_sync::ModelUpdate::Connected(model),
     ));
@@ -7042,10 +7048,12 @@ fn restored_shared_terminal_held_for_registry_attaches_once_it_answers() {
     let mut view = View::empty(a);
     view.panes
         .push(Pane::from_card(app.card_state(id).unwrap(), None).unwrap());
-    let mut model = crate::workspace_model::WorkspaceModel::default();
-    model.identity = identity;
-    model.sequence = 1;
-    model.views = vec![view];
+    let model = crate::workspace_model::WorkspaceModel {
+        identity,
+        sequence: 1,
+        views: vec![view],
+        ..crate::workspace_model::WorkspaceModel::default()
+    };
     drop(app.apply_workspace_model_update(
         super::super::workspace_model_sync::ModelUpdate::Connected(model),
     ));

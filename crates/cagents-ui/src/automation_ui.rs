@@ -8053,8 +8053,10 @@ mod tests {
     #[test]
     fn exact_no_run_receipt_is_read_only_even_without_a_current_definition_and_at_narrow_width() {
         let id = Uuid::new_v4();
-        let mut state = State::default();
-        state.pending = Some((7, Pending::RefreshList));
+        let mut state = State {
+            pending: Some((7, Pending::RefreshList)),
+            ..State::default()
+        };
         assert!(state.show_lifecycle_receipt(id, 42, Ok(notice_page(id, 42))));
         assert_eq!(
             state

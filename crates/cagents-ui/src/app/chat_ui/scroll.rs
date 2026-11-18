@@ -1315,7 +1315,7 @@ impl Anchor {
                 viewport: Size::new(next.viewport.width, seed.window_height()),
                 content: Size::new(next.content.width, seed.content()),
             });
-            context.top = Some(seed.from_top());
+            context.top = Some(seed.offset_from_top());
             context.follow_end = seed.at_bottom() && follow_end;
         }
         let switched = previous_active != Some(index) || context.geometry.is_none();

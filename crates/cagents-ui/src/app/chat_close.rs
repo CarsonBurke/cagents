@@ -161,7 +161,7 @@ impl Cagents {
         if self.chat_close_confirm.is_none() || self.chat_close_dialog_visible() {
             return None;
         }
-        drop(self.finish_chat_close_question());
+        self.finish_chat_close_question();
         self.dismiss_confirmation(QUESTION);
         Some(self.next_queued_card_close())
     }

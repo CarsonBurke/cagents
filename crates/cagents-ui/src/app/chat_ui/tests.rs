@@ -6644,9 +6644,8 @@ fn native_composer_up_crosses_wrapped_rows_before_history_and_restores_the_draft
                 .composer
                 .perform(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
 
-            let mut moved = 0;
             let mut boundary = None;
-            for _ in 0..256 {
+            for moved in 0..256 {
                 let before = chat_runtime(&app, card).composer.cursor();
                 composer_history_key(&mut app, card, width, Named::ArrowUp, &renderer);
                 let runtime = chat_runtime(&app, card);
@@ -6664,7 +6663,6 @@ fn native_composer_up_crosses_wrapped_rows_before_history_and_restores_the_draft
                     before,
                     "Up must move within the draft"
                 );
-                moved += 1;
             }
             let boundary = boundary.expect("Up eventually reaches native history");
             assert_eq!(

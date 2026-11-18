@@ -1938,8 +1938,10 @@ mod tests {
 
     #[test]
     fn linked_coordinates_preserve_unicode_boundaries_and_clamp_to_the_file() {
-        let mut state = State::default();
-        state.content = text_editor::Content::with_text("first\néx");
+        let mut state = State {
+            content: text_editor::Content::with_text("first\néx"),
+            ..State::default()
+        };
         state.jump_to_fragment("L2:2");
         assert_eq!(
             state.content.cursor().position,

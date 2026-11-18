@@ -1307,8 +1307,10 @@ fn ranked_search_prefers_prefixes_then_substrings_then_abbreviations_and_paths()
         worktree(22, "fix", false),
     ];
     let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
-    let mut state = SidebarState::default();
-    state.query = "fix".into();
+    let state = SidebarState {
+        query: "fix".into(),
+        ..SidebarState::default()
+    };
     let filtered = filtered_projects(&model, &state, false);
     assert_eq!(
         filtered[0]
@@ -1594,8 +1596,10 @@ fn worktree_display_persistence_round_trip_and_legacy_default() {
     let bytes = serde_json::to_vec(&state.saved_view()).unwrap();
     let mut restored = SidebarState::default();
     restored.restore_view(serde_json::from_slice(&bytes).unwrap());
-    let mut settings = crate::settings::AppSettings::default();
-    settings.sidebar_worktree_overrides = state.worktree_display_overrides.clone();
+    let settings = crate::settings::AppSettings {
+        sidebar_worktree_overrides: state.worktree_display_overrides.clone(),
+        ..crate::settings::AppSettings::default()
+    };
     let settings: crate::settings::AppSettings =
         toml::from_str(&toml::to_string(&settings).unwrap()).unwrap();
     restored.set_worktree_overrides(settings.sidebar_worktree_overrides);
@@ -3136,8 +3140,10 @@ fn the_workspace_cycle_follows_the_order_the_sidebar_lists() {
         SidebarChannel::new(second, "Second".into(), false, None, false, 1, true, 2),
     ];
     let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
-    let mut state = SidebarState::default();
-    state.filter = SidebarFilter::Attention;
+    let state = SidebarState {
+        filter: SidebarFilter::Attention,
+        ..SidebarState::default()
+    };
 
     let cycle = workspace_cycle(&model, &state);
     let id = |id| WorktreeId::from_uuid(Uuid::from_u128(id));
@@ -8108,8 +8114,10 @@ fn projects_header_keeps_its_title_and_controls_within_the_minimum_width() {
     let renderer = headless_renderer();
     let model = SidebarModel::ready(SidebarMode::Expanded, vec![project()]);
     let state = SidebarState::default();
-    let mut shortcuts = crate::settings::KeyboardShortcuts::default();
-    shortcuts.toggle_projects = vec!["Alt+B".into()];
+    let shortcuts = crate::settings::KeyboardShortcuts {
+        toggle_projects: vec!["Alt+B".into()],
+        ..crate::settings::KeyboardShortcuts::default()
+    };
     for loading in [false, true] {
         let mut element = header(
             &model,

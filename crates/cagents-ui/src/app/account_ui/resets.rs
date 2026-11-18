@@ -2359,10 +2359,12 @@ pub(in crate::app) mod tests {
             "weekly_scoped:Fable",
             0.0,
         )];
-        let mut state = State::default();
-        state.feedback = Some("Reset used. Usage refreshed.".into());
-        state.feedback_reset = Some(grant.clone());
-        state.feedback_status = Some(ConsumeStatus::Reset);
+        let mut state = State {
+            feedback: Some("Reset used. Usage refreshed.".into()),
+            feedback_reset: Some(grant.clone()),
+            feedback_status: Some(ConsumeStatus::Reset),
+            ..State::default()
+        };
         state.confirmed.insert(
             grant.id.clone(),
             ConfirmedReset {

@@ -42,7 +42,9 @@ fn lifecycle_idle_exit_drains_a_late_original_before_releasing_listener_and_leas
     let Some(root) = private_runtime(NAME) else {
         return;
     };
-    assert!(crate::instance::IS_DEVELOPMENT);
+    if !crate::instance::IS_DEVELOPMENT {
+        panic!("this test needs a development build's instance identity");
+    }
     // SAFETY: this exact self-exec runs one test. Configure its private HOST
     // before starting any HOST/worker thread; inherited authority is untouched.
     unsafe {

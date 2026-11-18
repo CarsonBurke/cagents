@@ -1832,8 +1832,10 @@ mod tests {
             .unwrap();
         store.load_and_sweep(&homes).unwrap();
         assert!(home.is_dir());
-        let mut newer = Registry::default();
-        newer.version = VERSION + 1;
+        let newer = Registry {
+            version: VERSION + 1,
+            ..Registry::default()
+        };
         write(&store.directory, &store.path(), &newer).unwrap();
         store.load_and_sweep(&homes).unwrap();
         assert!(home.is_dir());

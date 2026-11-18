@@ -1459,10 +1459,9 @@ mod tests {
         use std::ffi::OsStr;
         let destination = OsStr::new("/selected-device/home");
         // The defect selected /other/account instead of the chosen device HOME.
-        assert_eq!(
-            Path::new(destination).join("/other/account"),
-            Path::new("/other/account")
-        );
+        #[allow(clippy::join_absolute_paths, reason = "the defect this guards against")]
+        let replaced = Path::new(destination).join("/other/account");
+        assert_eq!(replaced, Path::new("/other/account"));
         for value in [
             "~//other/account",
             "~///other/account",
@@ -2293,11 +2292,12 @@ mod tests {
     }
 }
 
-/// Provider credentials and service endpoints stay inside the explicit
-/// Claude reset transport exception. Ordinary account metadata and all
-/// other provider operations continue to use the provider's own client.
 #[cfg(test)]
 mod credential_guard {
+    //! Provider credentials and service endpoints stay inside the explicit
+    //! Claude reset transport exception. Ordinary account metadata and all
+    //! other provider operations continue to use the provider's own client.
+    //!
     //! A tripwire, not a proof: a determined change can spell a needle so it
     //! does not match. What it does catch is the ordinary way the rule gets
     //! broken - code that names a provider's credential store, token fields,

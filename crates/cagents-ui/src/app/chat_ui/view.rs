@@ -335,11 +335,6 @@ const COMPOSER_MENU_CEILING: f32 = 10.0 * COMPLETION_ROW;
 /// The completion list's scrollable, named so the keyboard can scroll it.
 const COMPLETION_LIST: &str = "chat-completion";
 
-/// How tall the conversation chooser is allowed to grow.
-///
-/// The panel sits over the card, so it is bounded and scrolls: an account with
-/// twenty open conversations must not cover the whole surface.
-
 /// How tall the pending questions are allowed to grow.
 ///
 /// A question blocks the agent, so it is given room to be read and answered
@@ -1084,7 +1079,7 @@ impl Scroll {
     pub(super) fn content(self) -> f32 {
         self.content
     }
-    pub(super) fn from_top(self) -> f32 {
+    pub(super) fn offset_from_top(self) -> f32 {
         self.from_top
     }
     pub(super) fn window_height(self) -> f32 {

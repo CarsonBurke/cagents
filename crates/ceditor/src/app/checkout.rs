@@ -216,8 +216,9 @@ impl Editor {
     }
 
     pub(super) fn invalidate_stale_checkout(&mut self) {
-        if self.checkout_dialog.is_some() && !self.checkout_origin_is_current() {
-            let dialog = self.checkout_dialog.as_mut().unwrap();
+        if !self.checkout_origin_is_current()
+            && let Some(dialog) = self.checkout_dialog.as_mut()
+        {
             if let Some(token) = &dialog.cancellation {
                 token.cancel();
             }

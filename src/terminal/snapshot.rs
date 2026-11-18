@@ -889,7 +889,7 @@ pub(crate) fn capture_viewport(
     };
     let mut snapshot = base.clone();
     snapshot.columns = terminal.cols()?;
-    snapshot.rows = rows.max(1).min(500);
+    snapshot.rows = rows.clamp(1, 500);
     snapshot.scroll.total = terminal.total_rows()? as u64;
     snapshot.scroll.mouse_tracking = terminal.is_mouse_tracking()?;
     snapshot.scroll.bracketed_paste =

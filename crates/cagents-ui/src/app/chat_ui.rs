@@ -1573,7 +1573,7 @@ impl ChangeToken {
 pub(super) fn format_duration(millis: u64) -> String {
     match millis {
         0..1_000 => format!("{millis}ms"),
-        0..60_000 => format!("{:.1}s", millis as f64 / 1_000.0),
+        1_000..60_000 => format!("{:.1}s", millis as f64 / 1_000.0),
         _ => format!("{}m {}s", millis / 60_000, (millis % 60_000) / 1_000),
     }
 }
@@ -5305,7 +5305,6 @@ impl Runtime {
                     if !cache.contains_key(&item.id) {
                         presentation_changed = true;
                     }
-                    let theme = theme;
                     let cached = cache
                         .entry(item.id.clone())
                         .or_insert_with(|| CachedItem::preparing(item, theme));
@@ -14478,23 +14477,21 @@ impl Cagents {
                 };
                 // The body itself lives in the snapshot; only the extracted
                 // code blocks are the cache's own.
-                let text = match part {
-                    part => runtime.active_item(&id).and_then(|item| {
-                        let card = runtime
-                            .presentation_cache()
-                            .get(&item.id)
-                            .and_then(|cached| cached.coordination.as_deref())
-                            .filter(|coordinated| coordinated.is_card());
-                        match card {
-                            // A message read from a file copies as the
-                            // command that sent it.
-                            Some(card) if matches!(part, CopyPart::Text) => {
-                                card.copy_text().or_else(|| copy_text(part, &item.content))
-                            }
-                            _ => copy_text(part, &item.content),
+                let text = runtime.active_item(&id).and_then(|item| {
+                    let card = runtime
+                        .presentation_cache()
+                        .get(&item.id)
+                        .and_then(|cached| cached.coordination.as_deref())
+                        .filter(|coordinated| coordinated.is_card());
+                    match card {
+                        // A message read from a file copies as the
+                        // command that sent it.
+                        Some(card) if matches!(part, CopyPart::Text) => {
+                            card.copy_text().or_else(|| copy_text(part, &item.content))
                         }
-                    }),
-                };
+                        _ => copy_text(part, &item.content),
+                    }
+                });
                 if let Some(text) = text {
                     let at = Instant::now();
                     runtime.copied = Some((id, at));

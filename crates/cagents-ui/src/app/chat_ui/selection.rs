@@ -3269,7 +3269,6 @@ mod tests {
             "Shift-click keeps the original selection anchor"
         );
         assert!(state.end.unwrap().byte > 0 && state.end.unwrap().byte < "one two three".len());
-        drop(send);
         assert!(
             messages.is_empty(),
             "a moved drag returning to the link never activates it"

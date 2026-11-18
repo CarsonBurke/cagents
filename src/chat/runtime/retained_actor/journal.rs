@@ -1022,7 +1022,7 @@ mod tests {
 
     #[test]
     fn checked_retirement_fences_mutation_and_allows_delayed_reader_store_drop() {
-        let store = std::sync::Arc::new(super::super::super::Store::new().unwrap());
+        let store = std::rc::Rc::new(super::super::super::Store::new().unwrap());
         let reader = store.clone();
         let directory = store.directory().to_owned();
         let mut journal = Journal::open(&directory).unwrap();
@@ -1105,7 +1105,7 @@ mod tests {
             let encoded = serde_json::to_vec(&update).unwrap();
             assert!(encoded.len() > MAX_METADATA_ENTRY_BYTES);
             assert!(encoded.len() <= MAX_FINISHED_ENTRY_BYTES);
-            assert!(MAX_FINISHED_ENTRY_BYTES + 4096 < super::super::MAX_FRAME);
+            const { assert!(MAX_FINISHED_ENTRY_BYTES + 4096 < super::super::MAX_FRAME) };
             journal.append(&update, None).unwrap();
             let following = Update::Attention(crate::notifications::Evidence {
                 key: "following-outcome".into(),

@@ -17949,7 +17949,6 @@ impl Application for Cagents {
                         .map(cosmic::Action::App);
                 }
                 let generation = self.pull_request_dialog_generation;
-                
                 cosmic::task::future(async move {
                     let mut dialog = dialog;
                     let result = tokio::task::spawn_blocking(move || {

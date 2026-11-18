@@ -5564,8 +5564,8 @@ fn notification_heads(content: &str) -> Vec<&str> {
                 }
             }
             boundary.or(balanced).or(last)
-        } else if body.starts_with(CLOSE) {
-            Some(&body[CLOSE.len()..])
+        } else if let Some(rest) = body.strip_prefix(CLOSE) {
+            Some(rest)
         } else if body.starts_with("<event>") {
             body.split_once("</event>")
                 .and_then(|(_, tail)| closed(tail).map(|end| &tail[end..]))

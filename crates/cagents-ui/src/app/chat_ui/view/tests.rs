@@ -5483,7 +5483,6 @@ fn rendered_exact_tool_targets_keep_verb_prefixed_names() {
                 if *actual == runtime.target && id == &item.id)
             );
             assert!(dispatch(event(copy.clone(), A11yAction::Focus)).is_empty());
-            drop(dispatch);
             // Keep the actual widget state mounted through diff. AT focus
             // makes the hover control keyboard-visible without a pointer.
             tree.diff(element.as_widget_mut());

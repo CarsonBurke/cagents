@@ -157,7 +157,6 @@ fn current_admission(
 
 /// The successor would select the exact physical account home the old actor
 /// captured, so its provider reads the same on-disk conversation.
-
 fn same_account_home_for_start(
     source: &Session,
     captured: &LaunchAccountScope,
@@ -170,7 +169,6 @@ fn same_account_home_for_start(
 }
 
 /// The physical Claude account home `source`'s launch would select now.
-
 fn selected_account_home_for_start(source: &Session) -> Result<LaunchAccountScope, SetupError> {
     let launch = super::prepare_native_process_launch(
         &source.launch,
@@ -277,7 +275,6 @@ const UNMATCHED: &str = crate::chat::UNPROVEN_OWNER_REFUSAL;
 /// launch under the account home the successor would select. Whatever it had
 /// not acknowledged is lost with it and is never resubmitted; the successor
 /// starts on the saved conversation with no input.
-
 fn abandoned_for_start(
     ownership: &NativeActorOwnership,
     source: &Session,

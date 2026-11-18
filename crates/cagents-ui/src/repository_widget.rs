@@ -1552,7 +1552,7 @@ fn position_for_offset(text: &str, offset: usize) -> LspPosition {
     // drops a `\r` that the editor treats as a terminator of its own and will
     // happily park a caret after. A column that counted such a `\r` would name
     // a character the protocol's line does not have, and
-    // `Snapshot::to_utf16` refuses that outright — silently failing every
+    // `Snapshot::utf16_position` refuses that outright — silently failing every
     // hover, completion and definition made from that caret.
     let span = line_span(text, line).unwrap_or(0..offset);
     let content = &text[span.start..offset.min(span.end)];
@@ -4037,7 +4037,6 @@ impl RepositoryRuntime {
     /// unfocused [`text_editor`] draws no caret at all, so a jump into a
     /// buffer the user has not clicked into lands invisibly. Callers that
     /// move the caret programmatically chain this after it.
-    #[must_use]
     pub fn focus_editor<Message: 'static>(&self, card: CardId) -> Task<Message> {
         self.editor_focus_target(card)
             .map_or_else(Task::none, iced::widget::operation::focus)

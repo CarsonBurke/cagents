@@ -952,8 +952,10 @@ mod tests {
         other.token += 1;
         let mut sources: Vec<_> = cut.iter().map(|_| Some(source(message.len()))).collect();
         *sources.last_mut().unwrap() = Some(other);
-        let mut raw = Snapshot::default();
-        raw.items = cut.clone();
+        let mut raw = Snapshot {
+            items: cut.clone(),
+            ..Snapshot::default()
+        };
         raw.text_copy_sources.conversation = sources;
         let projected = State::default().project(Arc::new(raw));
         assert_eq!(
@@ -974,8 +976,10 @@ mod tests {
     #[test]
     fn joining_without_aligned_sources_leaves_copy_to_what_is_shown() {
         let message = message();
-        let mut raw = Snapshot::default();
-        raw.items = parts("answer", &message, 0..usize::MAX);
+        let mut raw = Snapshot {
+            items: parts("answer", &message, 0..usize::MAX),
+            ..Snapshot::default()
+        };
         raw.text_copy_sources.conversation = vec![Some(source(message.len()))];
         let projected = State::default().project(Arc::new(raw));
         assert_eq!(body(&projected.items[0]), message);

@@ -582,7 +582,6 @@ impl TerminalScrollbar {
                 + (track.height - height)
                     * (scroll.offset.min(max_offset) as f64 / max_offset as f64) as f32,
             height,
-            ..track
         };
         Some(Self {
             track,

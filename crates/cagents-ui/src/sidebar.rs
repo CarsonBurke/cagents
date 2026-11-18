@@ -7081,14 +7081,14 @@ fn compact_operation_rows(
 /// The leading glyph: the worktree icon the row will keep, muted, while the
 /// creation runs; a warning once it has failed. The spinner is the status
 /// slot's in a row, and a corner badge's in the rail.
-fn operation_icon<'a>(phase: WorktreeOperationPhase, size: u16) -> Element<'static, SidebarAction> {
+fn operation_icon(phase: WorktreeOperationPhase, size: u16) -> Element<'static, SidebarAction> {
     match phase {
         WorktreeOperationPhase::Working => worktree_glyph_muted(size).into(),
         WorktreeOperationPhase::Failed => toned_icon_sized(Icon::Warning, BadgeTone::Warning, size),
     }
 }
 
-fn operation_status<'a>(phase: WorktreeOperationPhase) -> Option<Element<'static, SidebarAction>> {
+fn operation_status(phase: WorktreeOperationPhase) -> Option<Element<'static, SidebarAction>> {
     match phase {
         WorktreeOperationPhase::Working => Some(crate::ui_controls::activity_spinner(
             f32::from(ROW_ICON_SIZE),
@@ -8305,7 +8305,7 @@ pub fn attention_indicator<Message: Clone + 'static>(
 
 /// A deletion under way takes the reserved slot: it is the one live thing
 /// about the row, and outranks whatever the row was doing before.
-fn deleting_indicator<'a>() -> Element<'static, SidebarAction> {
+fn deleting_indicator() -> Element<'static, SidebarAction> {
     crate::interaction::tooltip(
         crate::ui_controls::activity_spinner(f32::from(ROW_ICON_SIZE), design::muted_icon_color),
         "Deleting…",
@@ -8353,7 +8353,7 @@ fn deletion_ink(ink: RowInk, deletion: Option<&RowDeletion>) -> RowInk {
 }
 
 /// Mounts a row with the trailing retry a failed deletion offers.
-fn with_deletion_retry<'a>(
+fn with_deletion_retry(
     row: Element<'static, SidebarAction>,
     deletion: Option<&RowDeletion>,
     compact: bool,
@@ -8377,7 +8377,7 @@ fn with_deletion_retry<'a>(
 }
 
 /// A row's accessible name with the deletion it is part of.
-fn with_deletion_name<'a>(
+fn with_deletion_name(
     name: Cow<'static, str>,
     kind: &str,
     label: &str,
@@ -8858,7 +8858,7 @@ fn in_progress_row(
 /// Keep the row's primary button and its destructive quick action separate.
 /// An expanded row reserves the button width so the label continues to
 /// ellipsize correctly; the rail has no room for the action at all.
-fn row_quick_delete<'a>(
+fn row_quick_delete(
     content: Element<'static, SidebarAction>,
     label: &str,
     action: Option<SidebarAction>,
@@ -8893,7 +8893,7 @@ fn row_quick_delete<'a>(
 /// A channel is the only navigation row whose contents exist nowhere else, so
 /// deleting one is destructive and the entry says so with an ellipsis: the
 /// application answers it with a confirmation rather than a removal.
-fn channel_context_controls<'a>(
+fn channel_context_controls(
     content: impl Into<Element<'static, SidebarAction>>,
     channel_id: ChannelId,
     modal_open: bool,
@@ -12356,7 +12356,6 @@ fn history_notice(source: &SourceControlModel) -> Option<&'static str> {
 /// Rows use positional widget state. Their accessible name labels them, and
 /// no command addresses an individual row through a widget [`Id`]. Keeping
 /// these rows nameless also avoids retaining state for every filtered entry.
-
 fn panel_row<'a>(
     name: impl Into<Cow<'a, str>>,
     depth: usize,
