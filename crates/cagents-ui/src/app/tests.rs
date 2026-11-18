@@ -7538,6 +7538,284 @@ mod repository_clone_navigation {
         .expect("actual clone file worker and application callbacks finish");
     }
 
+    /// Binds the sidebar to the fixture worktree, as selecting it does.
+    fn bind_sidebar(app: &mut Cagents, fixture: &Fixture, card: CardId) -> ActiveWorktreeKey {
+        let project = runtime(app, card).descriptor.project;
+        app.sidebar_model = SidebarModel::ready(
+            sidebar::SidebarMode::Expanded,
+            vec![SidebarProject::new(
+                project,
+                RepositoryId::new(),
+                "clone navigation fixture".into(),
+                fixture.root.join(".git"),
+                vec![SidebarWorktree::from_durable(
+                    WorktreeId::new(),
+                    fixture.root.clone(),
+                    None,
+                )],
+                Vec::new(),
+            )],
+        );
+        assert!(app.sidebar_state.sync_active_worktree(
+            &app.sidebar_model,
+            &sidebar::SidebarFocus::Repository {
+                worktree: fixture.root.clone(),
+            },
+        ));
+        app.sidebar_state.active_worktree().unwrap().clone()
+    }
+
+    fn edit(app: &mut Cagents, card: CardId) {
+        drop(app.update(Message::FocusCard(card)));
+        drop(
+            app.update(Message::Repository(RepositoryAction::EditorAction {
+                card,
+                action: repository_widget::EditorAction::Edit(
+                    repository_widget::EditorEdit::Insert('!'),
+                ),
+            })),
+        );
+        assert!(runtime(app, card).blocks_navigation());
+    }
+
+    /// Two browsers on the fixture: the first editing current.txt without
+    /// saving and focused, the second clean. other.txt is modified and
+    /// new.txt untracked on disk, and Source Control shows both.
+    async fn dirty_first_browser(
+        fixture: &Fixture,
+    ) -> (Cagents, CardId, CardId, ActiveWorktreeKey) {
+        let (mut app, first) = fixture.app(true, false).await;
+        let task = app.clone_focused_pane();
+        let second = app.workspace.focused().unwrap();
+        settle(&mut app, task).await;
+        assert_ne!(second, first);
+        edit(&mut app, first);
+        assert_eq!(app.workspace.focused(), Some(first));
+        std::fs::write(fixture.root.join("other.txt"), "changed on disk\n").unwrap();
+        std::fs::write(fixture.root.join("new.txt"), "untracked\n").unwrap();
+        let key = bind_sidebar(&mut app, fixture, first);
+        let snapshot = RepositoryService::system("git")
+            .snapshot_with_options(
+                &fixture.root,
+                crate::repository::SnapshotOptions::default(),
+                &CancellationToken::default(),
+            )
+            .unwrap();
+        app.sidebar_model.source_control = Some(SourceControlModel::ready(key.clone(), &snapshot));
+        (app, first, second, key)
+    }
+
+    fn open_change(
+        app: &mut Cagents,
+        key: &ActiveWorktreeKey,
+        path: &str,
+        area: ChangeArea,
+    ) -> Task<Message> {
+        app.update(Message::Sidebar(SidebarAction::OpenChange {
+            key: key.clone(),
+            path: RepoPath::parse(path).unwrap(),
+            area,
+        }))
+    }
+
+    fn open_file(app: &mut Cagents, key: &ActiveWorktreeKey, path: &str) -> Task<Message> {
+        app.update(Message::Sidebar(SidebarAction::OpenFile {
+            key: key.clone(),
+            path: RepoPath::parse(path).unwrap(),
+        }))
+    }
+
+    async fn edit_in_editor(app: &mut Cagents, card: CardId) {
+        let task = app.update(Message::Repository(RepositoryAction::ApplySourceSurface {
+            card,
+            diff: false,
+        }));
+        settle(app, task).await;
+        edit(app, card);
+    }
+
+    fn assert_shows(app: &Cagents, card: CardId, path: &str, basis: &DiffBasis) {
+        let runtime = runtime(app, card);
+        assert_eq!(runtime.selected_path(), Some(Path::new(path)));
+        assert!(runtime.shows_diff(), "{path} is shown as a diff");
+        assert_eq!(runtime.selected_diff_basis(), basis);
+    }
+
+    /// Source Control rows must reach a browser that can navigate. The first
+    /// browser on the worktree refusing navigation used to take the click,
+    /// focus itself and drop the request.
+    #[tokio::test]
+    async fn source_control_changes_skip_browsers_that_refuse_navigation() {
+        let fixture = Fixture::new().await;
+        let (mut app, first, second, key) = dirty_first_browser(&fixture).await;
+
+        let task = open_change(&mut app, &key, "other.txt", ChangeArea::Unstaged);
+        settle(&mut app, task).await;
+        assert_eq!(app.workspace.focused(), Some(second));
+        assert_shows(&app, second, "other.txt", &DiffBasis::IndexToWorktree);
+        assert_eq!(
+            runtime(&app, first).selected_path(),
+            Some(Path::new("current.txt"))
+        );
+        assert!(runtime(&app, first).is_dirty());
+
+        // A change to the file a browser is editing shows that browser's
+        // live comparison rather than a second, stale copy of the file.
+        edit_in_editor(&mut app, second).await;
+        drop(app.update(Message::FocusCard(first)));
+        let task = open_change(&mut app, &key, "other.txt", ChangeArea::Unstaged);
+        settle(&mut app, task).await;
+        assert_eq!(app.workspace.focused(), Some(second));
+        assert_shows(&app, second, "other.txt", &DiffBasis::IndexToWorktree);
+        assert!(runtime(&app, second).is_dirty());
+        assert_eq!(app.repository_browsers(&fixture.root).count(), 2);
+
+        // With every browser refusing navigation, another change opens in a
+        // new browser rather than nowhere.
+        let task = open_change(&mut app, &key, "new.txt", ChangeArea::Untracked);
+        let third = app.workspace.focused().unwrap();
+        settle(&mut app, task).await;
+        assert_eq!(
+            app.repository_browsers(&fixture.root).collect::<Vec<_>>(),
+            [first, second, third]
+        );
+        assert_shows(&app, third, "new.txt", &DiffBasis::IndexToWorktree);
+        for card in [first, second] {
+            assert!(runtime(&app, card).is_dirty());
+        }
+    }
+
+    /// Files rows take the same route, parked until the chosen browser's
+    /// file list lands.
+    #[tokio::test]
+    async fn files_rows_skip_browsers_that_refuse_navigation() {
+        let fixture = Fixture::new().await;
+        let (mut app, first, second, key) = dirty_first_browser(&fixture).await;
+
+        let task = open_file(&mut app, &key, "other.txt");
+        settle(&mut app, task).await;
+        assert_eq!(app.workspace.focused(), Some(second));
+        assert_eq!(
+            runtime(&app, second).selected_path(),
+            Some(Path::new("other.txt"))
+        );
+        assert!(runtime(&app, first).is_dirty());
+
+        // A row for the file a browser is editing focuses those edits.
+        let task = open_file(&mut app, &key, "current.txt");
+        settle(&mut app, task).await;
+        assert_eq!(app.workspace.focused(), Some(first));
+        assert!(app.pending_panel_open.is_none());
+        assert_eq!(app.repository_browsers(&fixture.root).count(), 2);
+
+        // With every browser refusing navigation, the row opens a new one.
+        edit_in_editor(&mut app, second).await;
+        let task = open_file(&mut app, &key, "new.txt");
+        let third = app.workspace.focused().unwrap();
+        settle(&mut app, task).await;
+        assert_eq!(
+            app.repository_browsers(&fixture.root).collect::<Vec<_>>(),
+            [first, second, third]
+        );
+        assert_eq!(
+            runtime(&app, third).selected_path(),
+            Some(Path::new("new.txt"))
+        );
+        for card in [first, second] {
+            assert!(runtime(&app, card).is_dirty());
+        }
+    }
+
+    /// A pane opened through a path that is not canonical, such as a file
+    /// link through a symlink, still counts as editing the file.
+    #[test]
+    fn same_file_sees_through_a_non_canonical_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("real")).unwrap();
+        std::fs::write(root.join("real/file.txt"), "").unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("alias")).unwrap();
+        assert!(super::super::same_file(
+            &root.join("alias/file.txt"),
+            &root.join("real/file.txt")
+        ));
+        std::fs::write(root.join("real/other.txt"), "").unwrap();
+        assert!(!super::super::same_file(
+            &root.join("alias/other.txt"),
+            &root.join("real/file.txt")
+        ));
+    }
+
+    /// History and branch rows open committed comparisons through the same
+    /// route.
+    #[tokio::test]
+    async fn committed_files_skip_browsers_that_refuse_navigation() {
+        let fixture = Fixture::new().await;
+        let (mut app, first, second, key) = dirty_first_browser(&fixture).await;
+        let head = std::process::Command::new("/usr/bin/git")
+            .current_dir(&fixture.root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let head =
+            crate::repository::Oid::parse_object(String::from_utf8(head.stdout).unwrap().trim())
+                .unwrap();
+        let basis = DiffBasis::CommitToParent {
+            oid: head,
+            parent: None,
+        };
+
+        let task = app.open_committed_file(
+            key.clone(),
+            RepoPath::parse("other.txt").unwrap(),
+            None,
+            basis.clone(),
+        );
+        settle(&mut app, task).await;
+        assert_eq!(app.workspace.focused(), Some(second));
+        assert_shows(&app, second, "other.txt", &basis);
+        assert!(runtime(&app, first).is_dirty());
+
+        // The edited file's own commit shows in its browser, beside the
+        // buffer.
+        drop(app.update(Message::FocusCard(second)));
+        let task = app.open_committed_file(
+            key.clone(),
+            RepoPath::parse("current.txt").unwrap(),
+            None,
+            basis.clone(),
+        );
+        settle(&mut app, task).await;
+        assert_eq!(app.workspace.focused(), Some(first));
+        assert_shows(&app, first, "current.txt", &basis);
+        assert!(runtime(&app, first).is_dirty());
+
+        // A rename cannot be compared beside the buffer. The browser keeps
+        // its edits, and the notice says what to do.
+        let task = app.update(Message::Repository(RepositoryAction::ApplySourceSurface {
+            card: first,
+            diff: false,
+        }));
+        settle(&mut app, task).await;
+        drop(app.update(Message::FocusCard(second)));
+        app.status = None;
+        let task = app.open_committed_file(
+            key.clone(),
+            RepoPath::parse("current.txt").unwrap(),
+            Some(RepoPath::parse("previous.txt").unwrap()),
+            basis,
+        );
+        settle(&mut app, task).await;
+        assert_eq!(app.workspace.focused(), Some(first));
+        assert!(!runtime(&app, first).shows_diff());
+        assert!(runtime(&app, first).is_dirty());
+        assert_eq!(
+            app.status.as_ref().map(|notice| notice.message.as_str()),
+            Some("Save or discard your changes to current.txt to open this comparison")
+        );
+        assert_eq!(app.repository_browsers(&fixture.root).count(), 2);
+    }
+
     #[tokio::test]
     async fn browser_clone_loads_live_file_and_independent_navigation() {
         let fixture = Fixture::new().await;
@@ -7587,30 +7865,9 @@ mod repository_clone_navigation {
         // Drive the sidebar row, not a card-addressed repository action:
         // the sidebar must choose the focused clone rather than the first
         // browser, which is still the source.
+        let key = bind_sidebar(&mut app, &fixture, clone);
         let project = runtime(&app, clone).descriptor.project;
-        app.sidebar_model = SidebarModel::ready(
-            sidebar::SidebarMode::Expanded,
-            vec![SidebarProject::new(
-                project,
-                RepositoryId::new(),
-                "clone navigation fixture".into(),
-                fixture.root.join(".git"),
-                vec![SidebarWorktree::from_durable(
-                    WorktreeId::new(),
-                    fixture.root.clone(),
-                    None,
-                )],
-                Vec::new(),
-            )],
-        );
-        assert!(app.sidebar_state.sync_active_worktree(
-            &app.sidebar_model,
-            &sidebar::SidebarFocus::Repository {
-                worktree: fixture.root.clone(),
-            },
-        ));
-        let key = app.sidebar_state.active_worktree().unwrap().clone();
-        assert_eq!(app.repository_card_for(&fixture.root), Some(source));
+        assert_eq!(app.repository_browsers(&fixture.root).next(), Some(source));
         assert_eq!(app.repository_panel_destination(&fixture.root), Some(clone));
         let task = app.update(Message::Sidebar(SidebarAction::OpenFile {
             key,

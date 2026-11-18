@@ -8001,7 +8001,7 @@ impl Cagents {
         project: ProjectId,
         repository: PathBuf,
         worktree: PathBuf,
-    ) -> Task<Message> {
+    ) -> (CardId, Task<Message>) {
         let card_id = CardId::new();
         let view = RepositoryView {
             selected_file: None,
@@ -8047,7 +8047,8 @@ impl Cagents {
                 ViewportUpdate::unchanged()
             });
         self.persist();
-        Task::batch([self.apply_viewport(update, true, DurableChange::None), load])
+        let task = Task::batch([self.apply_viewport(update, true, DurableChange::None), load]);
+        (card_id, task)
     }
     fn open_link(&mut self, url: Url) -> Task<Message> {
         self.open_link_in(url, self.settings.link_open_destination)
@@ -12829,51 +12830,108 @@ impl Cagents {
         )
     }
 
-    /// The open repository card showing this worktree, if one is open.
-    fn repository_card_for(&self, worktree: &Path) -> Option<CardId> {
-        self.durable
-            .cards
-            .iter()
-            .find(|card| {
-                card.existence.is_open()
-                    && self
-                        .durable
-                        .channels
-                        .iter()
-                        .find(|channel| channel.cards.contains(&card.id))
-                        .map(|channel| channel.id)
-                        == self.durable.active_channel
-                    && matches!(&card.kind, CardKind::Repository(view) if view.selected_file.is_none() && view.worktree == worktree)
+    /// The open repository browsers for this worktree in the active channel,
+    /// in pane order. A browser shows the whole worktree rather than one
+    /// fixed file.
+    fn repository_browsers<'a>(&'a self, worktree: &'a Path) -> impl Iterator<Item = CardId> + 'a {
+        self.active_repository_panes()
+            .filter_map(move |(card, view)| {
+                (view.selected_file.is_none() && view.worktree == worktree).then_some(card)
             })
-            .map(|card| card.id)
     }
 
-    /// Sidebar file navigation follows an eligible focused browser. Other
-    /// callers of `repository_card_for`, including save completion, retain
-    /// their existing first-browser selection.
+    /// The open repository panes of the active channel, in pane order.
+    fn active_repository_panes(&self) -> impl Iterator<Item = (CardId, &RepositoryView)> {
+        let channel = self.durable.active_channel;
+        self.durable.cards.iter().filter_map(move |card| {
+            let CardKind::Repository(view) = &card.kind else {
+                return None;
+            };
+            (card.existence.is_open()
+                && self
+                    .durable
+                    .channels
+                    .iter()
+                    .find(|channel| channel.cards.contains(&card.id))
+                    .map(|channel| channel.id)
+                    == channel)
+                .then_some((card.id, view))
+        })
+    }
+
+    /// The repository browser that sidebar navigation into this worktree
+    /// should drive: the focused browser if it can navigate, otherwise the
+    /// first that can.
+    ///
+    /// A browser holding unsaved edits, a save, editor recovery or a
+    /// durability warning refuses navigation, so routing a click to it would
+    /// only focus it and drop the request. `None` means the caller opens a
+    /// new browser, as a file link does when every file pane is busy.
     fn repository_panel_destination(&self, worktree: &Path) -> Option<CardId> {
+        self.repository_browser_where(worktree, |card| {
+            !matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation())
+        })
+    }
+
+    /// The focused browser for this worktree if it satisfies `accept`,
+    /// otherwise the first that does.
+    fn repository_browser_where(
+        &self,
+        worktree: &Path,
+        accept: impl Fn(CardId) -> bool,
+    ) -> Option<CardId> {
         self.workspace
             .focused()
             .filter(|focused| {
-                self.durable.cards.iter().any(|card| {
-                    card.id == *focused
-                        && card.existence.is_open()
-                        && self
-                            .durable
-                            .channels
-                            .iter()
-                            .find(|channel| channel.cards.contains(&card.id))
-                            .map(|channel| channel.id)
-                            == self.durable.active_channel
-                        && matches!(&card.kind, CardKind::Repository(view) if view.selected_file.is_none() && view.worktree == worktree)
-                })
+                accept(*focused)
+                    && self
+                        .repository_browsers(worktree)
+                        .any(|card| card == *focused)
             })
-            .or_else(|| self.repository_card_for(worktree))
+            .or_else(|| {
+                self.repository_browsers(worktree)
+                    .find(|card| accept(*card))
+            })
+    }
+
+    /// The repository pane whose unsaved work on `worktree`'s `path` keeps
+    /// it from navigating, preferring the focused one. A file pane counts as
+    /// well as a browser: either holds edits a second copy would lack.
+    fn repository_editing(&self, worktree: &Path, path: &Path) -> Option<CardId> {
+        let target = worktree.join(path);
+        let editing = |card: CardId| {
+            matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime))
+            if runtime.blocks_navigation()
+                && runtime
+                    .selected_path()
+                    .is_some_and(|selected| {
+                        same_file(&runtime.descriptor.worktree.join(selected), &target)
+                    }))
+        };
+        let mut panes = self.active_repository_panes().map(|(card, _)| card);
+        self.workspace
+            .focused()
+            .filter(|focused| {
+                editing(*focused)
+                    && self
+                        .active_repository_panes()
+                        .any(|(card, _)| card == *focused)
+            })
+            .or_else(|| panes.find(|card| editing(*card)))
+    }
+
+    fn focus_pane(&mut self, card: CardId) -> Task<Message> {
+        self.workspace
+            .focus(card)
+            .map(|update| self.apply_viewport(update, true, DurableChange::None))
+            .unwrap_or_else(|_| Task::none())
     }
 
     /// Routes one panel row to the worktree's repository card.
     ///
-    /// The card is opened if the worktree has none. Either way the navigation
+    /// A browser already editing that file is focused as it is. Otherwise the
+    /// row goes to [`Self::repository_panel_destination`], and a new browser
+    /// opens if no existing one can navigate. Either way the navigation
     /// is parked in [`Self::pending_panel_open`] and performed when that card's
     /// file list lands, because the card resolves a path against the list it
     /// holds and the sidebar's rows come from a snapshot the list may predate.
@@ -12892,6 +12950,13 @@ impl Cagents {
                     .iter()
                     .any(|row| row.path == *path && row.ignored)
             });
+        // A browser that refuses navigation because of this very file's
+        // unsaved edits already shows what was asked for. Focus it rather than
+        // opening a second copy that would lack those edits.
+        if let Some(card) = self.repository_editing(&key.canonical_path, path.as_path()) {
+            self.pending_panel_open = None;
+            return self.focus_pane(card);
+        }
         let path = path.as_path().to_path_buf();
         match self.repository_panel_destination(&key.canonical_path) {
             Some(card) => {
@@ -12900,11 +12965,7 @@ impl Cagents {
                     path,
                     ignored,
                 });
-                let focus = self
-                    .workspace
-                    .focus(card)
-                    .map(|update| self.apply_viewport(update, true, DurableChange::None))
-                    .unwrap_or_else(|_| Task::none());
+                let focus = self.focus_pane(card);
                 Task::batch([
                     focus,
                     cosmic::task::message(Message::Repository(RepositoryAction::RefreshFiles {
@@ -12916,18 +12977,16 @@ impl Cagents {
                 // `add_repository_card` runs the card's own initial load, so
                 // the parked navigation is answered by that list rather than by
                 // a second one requested here.
-                let task = self.add_repository_card(
+                let (card, task) = self.add_repository_card(
                     key.project_id,
                     key.canonical_path.clone(),
                     key.canonical_path.clone(),
                 );
-                if let Some(card) = self.repository_card_for(&key.canonical_path) {
-                    self.pending_panel_open = Some(PendingPanelOpen {
-                        card,
-                        path,
-                        ignored,
-                    });
-                }
+                self.pending_panel_open = Some(PendingPanelOpen {
+                    card,
+                    path,
+                    ignored,
+                });
                 task
             }
         }
@@ -19806,5 +19865,20 @@ fn unix_millis() -> i64 {
         .try_into()
         .unwrap_or(i64::MAX)
 }
+
+/// Whether two absolute paths name the same file. A repository descriptor
+/// keeps the path its pane was opened with, and a file link's need not be
+/// canonical. Only a candidate already sharing the file name reaches the
+/// filesystem, so routing a click stays cheap.
+fn same_file(candidate: &Path, target: &Path) -> bool {
+    candidate == target
+        || (candidate.file_name() == target.file_name()
+            && candidate
+                .canonicalize()
+                .ok()
+                .zip(target.canonicalize().ok())
+                .is_some_and(|(candidate, target)| candidate == target))
+}
+
 #[cfg(test)]
 mod tests;

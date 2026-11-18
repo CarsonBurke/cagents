@@ -181,6 +181,19 @@ enum BasisChoice {
     Committed(CommittedChoice),
 }
 
+/// Why a pane cannot show a comparison beside its open buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffBasisRefusal {
+    /// A save of the buffer is in flight.
+    Saving,
+    /// The pane shows a folder's files, which have no comparisons.
+    NoComparisons,
+    /// A Git change is being re-read; working comparisons wait for it.
+    Refreshing,
+    /// The pane's file status does not show this comparison yet.
+    NotListed,
+}
+
 /// A comparison the card cannot name without asking Git: a merge base's
 /// default ref comes from the remote's symbolic `HEAD`, and a commit's parent
 /// comes from the commit itself.
@@ -5552,13 +5565,28 @@ impl RepositoryRuntime {
             }
     }
 
+    /// Why the open file cannot switch to `basis` in place, as the toolbar's
+    /// comparison control does without leaving its buffer, or `None` when it
+    /// can.
+    pub fn diff_basis_refusal(&self, basis: &DiffBasis) -> Option<DiffBasisRefusal> {
+        if self.is_saving() {
+            Some(DiffBasisRefusal::Saving)
+        } else if self.directory_only {
+            Some(DiffBasisRefusal::NoComparisons)
+        } else if self.mutation_refresh_pending && !basis.is_immutable() {
+            Some(DiffBasisRefusal::Refreshing)
+        } else if !self
+            .subject_file()
+            .is_some_and(|file| self.file_has_basis(&file, basis))
+        {
+            Some(DiffBasisRefusal::NotListed)
+        } else {
+            None
+        }
+    }
+
     fn can_select_diff_basis(&self, basis: &DiffBasis) -> bool {
-        !self.is_saving()
-            && !self.directory_only
-            && (!self.mutation_refresh_pending || basis.is_immutable())
-            && self
-                .subject_file()
-                .is_some_and(|file| self.file_has_basis(&file, basis))
+        self.diff_basis_refusal(basis).is_none()
     }
 
     fn can_select_committed_basis(&self, choice: CommittedChoice) -> bool {

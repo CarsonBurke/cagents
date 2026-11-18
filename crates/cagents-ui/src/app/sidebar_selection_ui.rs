@@ -456,11 +456,14 @@ pub(in crate::app) mod tests {
         // The selected project has an unsaved editor and sessions in its
         // channel.
         drop(app.add_terminal("/selection-project-wt/wt-3/src".into()));
-        drop(app.add_repository_card(
-            project,
-            "/selection-project".into(),
-            "/selection-project-wt/wt-1".into(),
-        ));
+        drop(
+            app.add_repository_card(
+                project,
+                "/selection-project".into(),
+                "/selection-project-wt/wt-1".into(),
+            )
+            .1,
+        );
         let editor = app.workspace.focused().unwrap();
         app.cards.insert(
             editor,
