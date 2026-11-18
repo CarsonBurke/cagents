@@ -19578,6 +19578,14 @@ pub(in crate::app) mod tests {
             // daemon's own reason is kept under Details.
             assert_eq!(notice.explained, explained, "{recovery:?}");
             assert!(!notice.summary.contains("diverged"));
+            if !explained {
+                // Details carry only what the notice doesn't already say.
+                let key = notice.key.clone();
+                let runtime = app.chat_runtime_mut(target).unwrap();
+                runtime.failure_ui.expanded.insert(key.clone());
+                runtime.cache_failure_preview(&key);
+                assert_eq!(runtime.failure_preview(&key), Some((REASON, false)));
+            }
 
             drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send))));
             assert!(
