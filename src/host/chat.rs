@@ -3467,15 +3467,26 @@ impl Drop for AccountSwitchReservation {
     }
 }
 
-fn recover_account(
+/// The original conversation an automatic account switch may close, held
+/// against every other start of it until its successor starts.
+struct AdmittedSwitch {
+    handle: Handle,
+    reservation: AccountSwitchReservation,
+}
+
+/// Everything [`recover_account`] checks before it changes anything. An
+/// automatic switch is given its original's actor and a reservation of it; an
+/// explicit recovery, whose original is no longer hosted, is given nothing.
+///
+/// Every refusal here leaves the original exactly as it was: the only thing
+/// held is the reservation, which drops with the refusal.
+fn admit_account_recovery(
     host: &SharedHost,
-    client: ClientId,
-    source: Session,
-    replacement: Session,
-    idle_generation: Option<u64>,
-    execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
-) -> Result<ServerResponse, ProtocolError> {
-    if !chat::is_account_recovery(&source, &replacement)
+    source: &Session,
+    replacement: &Session,
+    automatic: bool,
+) -> Result<Option<AdmittedSwitch>, ProtocolError> {
+    if !chat::is_account_recovery(source, replacement)
         || replacement.proof.is_some()
         || replacement.owned_codex_listener.is_some()
     {
@@ -3483,7 +3494,6 @@ fn recover_account(
             "Account recovery must retain the exact provider, conversation and launch options",
         ));
     }
-    let automatic = idle_generation.is_some();
     match check_launch_account(&source.launch) {
         Err(failure) if failure.code == ProtocolErrorCode::AccountRemoved => {}
         Err(failure) => return Err(failure),
@@ -3494,49 +3504,90 @@ fn recover_account(
             ));
         }
     }
-    let mut reservation = None;
-    if let Some(generation) = idle_generation {
-        if source
-            .launch
-            .recipe
-            .environment
-            .get(crate::account::routing::AUTOMATIC_MARKER)
-            .map(String::as_str)
-            != Some("1")
+    if !automatic {
+        return Ok(None);
+    }
+    if source
+        .launch
+        .recipe
+        .environment
+        .get(crate::account::routing::AUTOMATIC_MARKER)
+        .map(String::as_str)
+        != Some("1")
+    {
+        return Err(error("This conversation has an explicitly pinned account"));
+    }
+    let admitted = {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        validate_proof(source.proof.as_ref(), state.proof())?;
+        let record = state.chats.get(&source.id).ok_or_else(|| {
+            error("The original conversation is no longer hosted; reconnect before switching accounts")
+        })?;
+        if record.session.launch.provider != source.launch.provider
+            || record.session.launch.recipe != source.launch.recipe
+            || record.handle.confirmed_session_id() != source.launch.session_id
+            || record.returning_terminal
+            || record.paired_terminal.is_some()
+            || state.chat_handoffs.contains_key(&source.id)
+            || state.chat_spawning.contains_key(&source.id)
         {
-            return Err(error("This conversation has an explicitly pinned account"));
+            return Err(error(
+                "The original conversation changed or has another live owner; account switching was paused",
+            ));
         }
-        let handle = {
-            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-            validate_proof(source.proof.as_ref(), state.proof())?;
-            let record = state.chats.get(&source.id).ok_or_else(|| error("The original conversation is no longer hosted; reconnect before switching accounts"))?;
-            if record.session.launch.provider != source.launch.provider
-                || record.session.launch.recipe != source.launch.recipe
-                || record.handle.confirmed_session_id() != source.launch.session_id
-                || record.returning_terminal
-                || record.paired_terminal.is_some()
-                || state.chat_handoffs.contains_key(&source.id)
-                || state.chat_spawning.contains_key(&source.id)
-            {
-                return Err(error(
-                    "The original conversation changed or has another live owner; account switching was paused",
-                ));
-            }
-            let handle = record.handle.clone();
-            state.chat_spawning.insert(source.id, source.clone());
-            reservation = Some(AccountSwitchReservation {
+        let handle = record.handle.clone();
+        state.chat_spawning.insert(source.id, source.clone());
+        AdmittedSwitch {
+            handle,
+            reservation: AccountSwitchReservation {
                 host: host.clone(),
                 source: source.clone(),
-            });
-            handle
-        };
-        // A refused replacement must leave the original actor and history
-        // intact. The temporary source reservation drops on this error;
-        // actual spawn still reauthorizes the account at its own boundary.
-        check_launch_account(&replacement.launch)?;
+            },
+        }
+    };
+    // A refused replacement must leave the original actor and history
+    // intact. The temporary source reservation drops on this error;
+    // actual spawn still reauthorizes the account at its own boundary.
+    // An account the registry no longer lists is the replacement's, not the
+    // original's, so it is refused as any other replacement would be.
+    check_launch_account(&replacement.launch)?;
+    crate::account::handoff::preflight(source, replacement).map_err(unavailable)?;
+    Ok(Some(admitted))
+}
+
+fn recover_account(
+    host: &SharedHost,
+    client: ClientId,
+    source: Session,
+    replacement: Session,
+    idle_generation: Option<u64>,
+    execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
+) -> Result<ServerResponse, ProtocolError> {
+    let automatic = idle_generation.is_some();
+    // An automatic switch refused here changed nothing, so its client keeps
+    // the conversation on its account. Nothing after the close below is
+    // reported this way, not even the close's own refusal: once the actor has
+    // taken it, the original may already be partly closed.
+    let admitted =
+        admit_account_recovery(host, &source, &replacement, automatic).map_err(|failure| {
+            if automatic {
+                failure.not_admitted()
+            } else {
+                failure
+            }
+        })?;
+    let mut reservation = None;
+    if let (
+        Some(generation),
+        Some(AdmittedSwitch {
+            handle,
+            reservation: held,
+        }),
+    ) = (idle_generation, admitted)
+    {
+        reservation = Some(held);
         // The actor checks this generation after every previously admitted
         // command. A UI snapshot alone cannot prove a timed-out turn is idle.
-        crate::account::handoff::preflight(&source, &replacement).map_err(unavailable)?;
         handle
             .close_if_idle_for_resume(generation)
             .map_err(unavailable)?;
@@ -7853,30 +7904,79 @@ done
             .recipe
             .environment
             .remove(crate::account::routing::AUTOMATIC_MARKER);
-        assert!(
-            recover_account(
-                &host,
-                1,
-                pinned,
-                pinned_replacement,
-                Some(generation),
-                Default::default()
-            )
-            .unwrap_err()
-            .message
-            .contains("pinned")
+        // Refusals before the close changed nothing, and say so, with the
+        // daemon's own sentence.
+        let pinned = recover_account(
+            &host,
+            1,
+            pinned,
+            pinned_replacement,
+            Some(generation),
+            Default::default(),
+        )
+        .unwrap_err();
+        assert_eq!(pinned.code, ProtocolErrorCode::NotAdmitted);
+        assert_eq!(
+            pinned.message,
+            "This conversation has an explicitly pinned account"
         );
+        assert!(!handle.is_completed());
+        assert!(host.lock().unwrap().chat_spawning.is_empty());
+        // Another start of the same conversation is under way.
+        host.lock()
+            .unwrap()
+            .chat_spawning
+            .insert(source.id, source.clone());
+        let owned = recover_account(
+            &host,
+            1,
+            source.clone(),
+            replacement.clone(),
+            Some(generation),
+            Default::default(),
+        )
+        .unwrap_err();
+        assert_eq!(owned.code, ProtocolErrorCode::NotAdmitted);
+        assert!(owned.message.contains("another live owner"), "{owned:?}");
+        assert!(!handle.is_completed());
+        host.lock().unwrap().chat_spawning.remove(&source.id);
+        // The other account already holds a different copy of this
+        // conversation, so its history can't be prepared there.
+        let divergent = alternate_home
+            .join("projects")
+            .join(&project)
+            .join(format!("{conversation}.jsonl"));
+        std::fs::create_dir_all(divergent.parent().unwrap()).unwrap();
+        std::fs::write(&divergent, "{\"other\":true}\n").unwrap();
+        let diverged = recover_account(
+            &host,
+            1,
+            source.clone(),
+            replacement.clone(),
+            Some(generation),
+            Default::default(),
+        )
+        .unwrap_err();
+        assert_eq!(diverged.code, ProtocolErrorCode::NotAdmitted);
         assert!(
-            recover_account(
-                &host,
-                1,
-                source.clone(),
-                replacement.clone(),
-                Some(generation + 1),
-                Default::default()
-            )
-            .is_err()
+            diverged.message.contains("could not be prepared"),
+            "{diverged:?}"
         );
+        assert!(!handle.is_completed());
+        assert!(host.lock().unwrap().chat_spawning.is_empty());
+        std::fs::remove_file(&divergent).unwrap();
+        // The close's own refusal is never reported as refused before any
+        // effect: once the actor has taken it, the original may be closing.
+        let stale = recover_account(
+            &host,
+            1,
+            source.clone(),
+            replacement.clone(),
+            Some(generation + 1),
+            Default::default(),
+        )
+        .unwrap_err();
+        assert_ne!(stale.code, ProtocolErrorCode::NotAdmitted, "{stale:?}");
         assert!(!handle.is_completed());
         assert!(host.lock().unwrap().chat_spawning.is_empty());
         let response = recover_account(
