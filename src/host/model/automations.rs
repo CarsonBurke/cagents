@@ -1105,16 +1105,62 @@ impl Registry {
         before: Option<HistoryCursor>,
         limit: usize,
     ) -> Result<HistoryPage, String> {
+        self.history_page(id, None, before, limit)
+    }
+
+    /// A firing keeps the project of the execution revision it ran under, as
+    /// lifecycle receipts do. After a definition moves between projects, each
+    /// project's hosted conversations read only the firings that ran there.
+    pub(in crate::host) fn project_automation_history(
+        &self,
+        repository: &std::path::Path,
+        id: Uuid,
+        before: Option<HistoryCursor>,
+        limit: usize,
+    ) -> Result<HistoryPage, super::AuthorityError> {
+        let repository = super::repository_key(repository)?;
+        // One snapshot for the scope check and the page it authorizes.
+        let tx = self.db.unchecked_transaction().map_err(|e| e.to_string())?;
+        let allowed: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM automations WHERE id=?1 AND repository=?2)
+             OR EXISTS(SELECT 1 FROM automation_revisions WHERE automation=?1
+                 AND json_extract(definition,'$.agent.target.repository')=?2)",
+                params![id.to_string(), repository],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if !allowed {
+            return Err(super::AuthorityError::Denied(
+                "Hosted conversations can inspect automations only in their own project".into(),
+            ));
+        }
+        let page = self.history_page(Some(id), Some(repository), before, limit)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(page)
+    }
+
+    /// `repository` keeps one automation's firings whose execution revision
+    /// targeted that project, before the page boundary is chosen.
+    fn history_page(
+        &self,
+        id: Option<Uuid>,
+        repository: Option<&str>,
+        before: Option<HistoryCursor>,
+        limit: usize,
+    ) -> Result<HistoryPage, String> {
         let limit = limit.clamp(1, MAX_HISTORY_PAGE);
         let mut query = self
             .db
             .prepare(if id.is_some() {
                 "SELECT f.record,json_extract(r.definition,'$.name') FROM automation_firings f JOIN automation_revisions r ON r.automation=f.automation AND r.revision=f.revision WHERE f.automation=?1
             AND (?2 IS NULL OR f.created_ms < ?2 OR (f.created_ms = ?2 AND f.id < ?3))
+            AND (?5 IS NULL OR json_extract(r.definition,'$.agent.target.repository')=?5)
             ORDER BY f.created_ms DESC,f.id DESC LIMIT ?4"
             } else {
                 "SELECT f.record,json_extract(r.definition,'$.name') FROM automation_firings f JOIN automation_revisions r ON r.automation=f.automation AND r.revision=f.revision WHERE ?1 IS NULL
             AND (?2 IS NULL OR f.created_ms < ?2 OR (f.created_ms = ?2 AND f.id < ?3))
+            AND ?5 IS NULL
             ORDER BY f.created_ms DESC,f.id DESC LIMIT ?4"
             })
             .map_err(|error| error.to_string())?;
@@ -1124,7 +1170,8 @@ impl Registry {
                     id.map(|id| id.to_string()),
                     before.as_ref().map(|cursor| cursor.created_ms),
                     before.map(|cursor| cursor.id.to_string()),
-                    limit + 1
+                    limit + 1,
+                    repository
                 ],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )

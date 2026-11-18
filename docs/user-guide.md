@@ -725,7 +725,9 @@ and cause cannot be recovered from the current enabled state. Prompt bodies,
 launch environment and provider diagnostics are excluded from these receipts.
 Hosted conversations can read only receipts committed in their own project.
 Moving a definition does not move its earlier audit receipts into the new
-project; management inspection retains the complete retained chain.
+project; management inspection retains the complete retained chain. Run history
+follows the same rule: a hosted conversation sees only the runs that ran in its
+project.
 
 Read both revisions from `show`. Reuse the same request UUID when retrying a
 manual request whose response was lost; a new UUID means a new run. History

@@ -327,11 +327,8 @@ fn process_hosted(
             require_scope(&automation.definition.agent.target.repository)?;
             Ok(Response::Automation(automation))
         }
-        Request::History { id: Some(id), before, limit } => {
-            let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-            require_scope(&registry.automation(id)?.definition.agent.target.repository)?;
-            registry.automation_history(Some(id), before, limit).map(Response::History).map_err(Into::into)
-        }
+        Request::History { id: Some(id), before, limit } => registry.lock().unwrap_or_else(|p| p.into_inner())
+            .project_automation_history(&repository, id, before, limit).map(Response::History).map_err(Into::into),
         Request::Audit { id, before, limit } => {
             let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
             registry.project_automation_audit(&repository, id, before, limit).map(Response::Audit).map_err(Into::into)
@@ -776,6 +773,172 @@ mod tests {
             )
             .is_err(),
             "closed session cannot retain project read authority"
+        );
+    }
+
+    /// A firing belongs to the project it ran in. Moving its automation
+    /// carries neither earlier diagnostics into the destination project nor
+    /// later ones back to the source.
+    #[test]
+    fn hosted_run_history_keeps_each_firing_in_the_project_it_ran_in() {
+        use crate::automations::{
+            Precheck, Request, Response, Schedule, SchedulePattern, SessionMode, SkipReason,
+            Trigger,
+        };
+        use crate::host::automations::precheck::Outcome;
+        use std::time::{Duration, Instant};
+        let name = "host::automations::service::tests::hosted_run_history_keeps_each_firing_in_the_project_it_ran_in";
+        if crate::host::agent_execution::tests::isolated(name).is_some() {
+            return;
+        }
+        let (host, request, path) = crate::host::agent_execution::tests::fixture();
+        let accepted = agent_execution::submit(&host, &Authority::default(), request).unwrap();
+        let registry = agent_execution::registry(&host).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let run = registry.lock().unwrap().agent_run(accepted.run.id).unwrap();
+            if run.state.is_terminal() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "fake provider did not settle");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let identity = || DirectoryIdentity {
+            device: 1,
+            inode: 1,
+        };
+        let (authority, arrived, departed, own_firings) = {
+            let mut registry = registry.lock().unwrap();
+            let session = registry.agent(accepted.agent.id).unwrap().session.unwrap();
+            let authority = registry.retained_agent_authority(session.id()).unwrap();
+            let other = path.parent().unwrap().join("other-project");
+            std::fs::create_dir(&other).unwrap();
+            registry
+                .apply(&crate::workspace_model::ModelEdit::OpenProject {
+                    repository: other.clone(),
+                    name: "Other project".into(),
+                    kind: crate::model::ProjectKind::Folder,
+                })
+                .unwrap();
+            let own = Definition {
+                name: "Moved".into(),
+                prompt: "Check".into(),
+                agent: accepted.agent.spec.clone(),
+                schedule: Schedule {
+                    pattern: SchedulePattern::Daily { hour: 0, minute: 0 },
+                    timezone: "UTC".into(),
+                },
+                session_mode: SessionMode::Fresh,
+                precheck: Some(Precheck {
+                    command: "exit 1".into(),
+                    timeout_seconds: 1,
+                }),
+            };
+            let mut elsewhere = own.clone();
+            elsewhere.agent.target.repository = other.clone();
+            elsewhere.agent.target.directory = other;
+            elsewhere.agent.target.placement = None;
+            let mut now = 100;
+            let mut fire = |registry: &mut crate::host::model::Registry,
+                            automation: &crate::automations::Automation,
+                            diagnostic: &str| {
+                now += 100;
+                let claim = registry
+                    .claim_automation(
+                        automation.id,
+                        automation.execution_revision,
+                        None,
+                        Trigger::Manual {
+                            request: uuid::Uuid::new_v4(),
+                        },
+                        None,
+                        true,
+                        now,
+                    )
+                    .unwrap();
+                registry
+                    .finish_automation_precheck(
+                        claim.firing.id,
+                        Outcome::Stopped {
+                            state: crate::automations::FiringState::Skipped,
+                            skip: Some(SkipReason::PrecheckExit),
+                            diagnostic: diagnostic.into(),
+                        },
+                        now + 1,
+                    )
+                    .unwrap();
+                claim.firing.id
+            };
+            // Ran elsewhere, then moved into this conversation's project.
+            let arrived = registry
+                .create_automation(elsewhere.clone(), 100, identity())
+                .unwrap();
+            fire(&mut registry, &arrived, "OTHER_PROJECT_STDERR");
+            let arrived = registry
+                .edit_automation(arrived.id, arrived.revision, own.clone(), 150, identity())
+                .unwrap();
+            let arrived_own = fire(&mut registry, &arrived, "own after arrival");
+            // Ran here, then moved away.
+            let departed = registry.create_automation(own, 100, identity()).unwrap();
+            let departed_own = fire(&mut registry, &departed, "own before departure");
+            let departed = registry
+                .edit_automation(departed.id, departed.revision, elsewhere, 150, identity())
+                .unwrap();
+            fire(&mut registry, &departed, "OTHER_PROJECT_STDERR");
+            assert_eq!(
+                registry
+                    .automation_history(Some(departed.id), None, 100)
+                    .unwrap()
+                    .firings
+                    .len(),
+                2,
+                "management history keeps every firing"
+            );
+            (
+                authority,
+                arrived.id,
+                departed.id,
+                [arrived_own, departed_own],
+            )
+        };
+        for (id, own_firing) in [arrived, departed].into_iter().zip(own_firings) {
+            let Response::History(page) = process_under_control(
+                &host,
+                authority.clone(),
+                Request::History {
+                    id: Some(id),
+                    before: None,
+                    limit: 1,
+                },
+            )
+            .unwrap() else {
+                panic!("expected history");
+            };
+            assert_eq!(
+                page.firings
+                    .iter()
+                    .map(|firing| firing.id)
+                    .collect::<Vec<_>>(),
+                [own_firing]
+            );
+            assert_eq!(page.next, None, "the page boundary ignores other projects");
+            assert!(
+                !serde_json::to_string(&page)
+                    .unwrap()
+                    .contains("OTHER_PROJECT_STDERR")
+            );
+        }
+        assert!(
+            process_under_control(
+                &host,
+                authority,
+                Request::History {
+                    id: Some(uuid::Uuid::new_v4()),
+                    before: None,
+                    limit: 1,
+                },
+            )
+            .is_err_and(|error| matches!(error, Error::PermissionDenied(_)))
         );
     }
 
