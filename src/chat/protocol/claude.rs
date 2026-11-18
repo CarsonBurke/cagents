@@ -2609,12 +2609,13 @@ impl Claude {
         started: bool,
     ) -> Result<Option<String>, ()> {
         if reported.is_some_and(|tool| {
-            self.nested_calls.contains(tool)
-                || (self.nested_agent_tool(tool)
-                    && self.tools.keys().filter(|key| key.id == tool).count() == 1)
+            (self.nested_calls.contains(tool) || self.nested_agent_tool(tool))
+                && !self.tools.contains_key(&ScopedId::new(None, tool))
+                && self.tools.keys().filter(|key| key.id == tool).count() <= 1
         }) {
             // An unscoped lifecycle notice for a helper of a worker cannot
-            // promote that helper into a direct child of the lead.
+            // promote that helper into a direct child of the lead. Keep an
+            // ambiguous raw ID's fallback, even when one scope is nested.
             return Err(());
         }
         let launched = self

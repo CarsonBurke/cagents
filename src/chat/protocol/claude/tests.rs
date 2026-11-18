@@ -13010,7 +13010,7 @@ fn helpers_stay_nested_after_the_tool_cache_turns_over() {
     }
     // A nested task's lifecycle names its call too, before any of its frames.
     lead.receive(
-        json!({"type":"system","subtype":"task_started","uuid":"s","session_id":"s","task_id":"a-late",
+        json!({"type":"system","subtype":"task_started","uuid":"s","session_id":"00000000-0000-4000-8000-000000000001","task_id":"a-late",
         "tool_use_id":"late","task_type":"local_agent","description":"Late","is_backgrounded":true,
         "spawn_depth":2,"parent_task_id":"a-worker"}),
     );
@@ -13025,7 +13025,7 @@ fn helpers_stay_nested_after_the_tool_cache_turns_over() {
 #[test]
 fn work_that_leaves_the_background_level_without_a_notice_stops_running() {
     let mut lead = Lead::default();
-    let level = |tasks: Value| json!({"type":"system","subtype":"background_tasks_changed","uuid":"l","session_id":"s","tasks":tasks});
+    let level = |tasks: Value| json!({"type":"system","subtype":"background_tasks_changed","uuid":"l","session_id":"00000000-0000-4000-8000-000000000001","tasks":tasks});
     lead.receive(
         json!({"type":"assistant","uuid":"a","message":{"id":"m","role":"assistant","content":[
         {"type":"tool_use","id":"cmd","name":"Bash","input":{"command":"sleep 60","description":"Wait","run_in_background":true}},
@@ -13035,7 +13035,7 @@ fn work_that_leaves_the_background_level_without_a_notice_stops_running() {
         json!([{"task_id":"bcmd","task_type":"local_bash","description":"Wait"}]),
     ));
     lead.receive(
-        json!({"type":"system","subtype":"task_started","uuid":"t1","session_id":"s","task_id":"bcmd",
+        json!({"type":"system","subtype":"task_started","uuid":"t1","session_id":"00000000-0000-4000-8000-000000000001","task_id":"bcmd",
         "tool_use_id":"cmd","task_type":"local_bash","description":"Wait","is_backgrounded":true}),
     );
     lead.receive(
@@ -13047,7 +13047,7 @@ fn work_that_leaves_the_background_level_without_a_notice_stops_running() {
         {"task_id":"a-worker","task_type":"local_agent","description":"Worker"}]),
     ));
     lead.receive(
-        json!({"type":"system","subtype":"task_started","uuid":"t2","session_id":"s","task_id":"a-worker",
+        json!({"type":"system","subtype":"task_started","uuid":"t2","session_id":"00000000-0000-4000-8000-000000000001","task_id":"a-worker",
         "tool_use_id":"agent","task_type":"local_agent","description":"Worker","is_backgrounded":true,"spawn_depth":1}),
     );
     lead.receive(
@@ -13075,7 +13075,7 @@ fn work_that_leaves_the_background_level_without_a_notice_stops_running() {
 
     // A notice that arrives late still says how the command went.
     lead.receive(
-        json!({"type":"system","subtype":"task_notification","uuid":"n","session_id":"s","task_id":"bcmd",
+        json!({"type":"system","subtype":"task_notification","uuid":"n","session_id":"00000000-0000-4000-8000-000000000001","task_id":"bcmd",
         "tool_use_id":"cmd","status":"completed","output_file":"/tmp/o",
         "summary":"Background command \"Wait\" completed (exit code 0)"}),
     );
@@ -13090,7 +13090,7 @@ fn the_first_background_level_of_a_process_settles_nothing() {
         {"type":"tool_use","id":"agent","name":"Agent","input":{"description":"Worker","prompt":"Work","run_in_background":true}}]}}),
     );
     lead.receive(
-        json!({"type":"system","subtype":"task_started","uuid":"t","session_id":"s","task_id":"a-worker",
+        json!({"type":"system","subtype":"task_started","uuid":"t","session_id":"00000000-0000-4000-8000-000000000001","task_id":"a-worker",
         "tool_use_id":"agent","task_type":"local_agent","description":"Worker","is_backgrounded":true}),
     );
     lead.receive(
@@ -13101,7 +13101,7 @@ fn the_first_background_level_of_a_process_settles_nothing() {
     // Nothing is emitted at startup, so an empty first level is only the
     // first one seen, not news that the agent ended.
     lead.receive(
-        json!({"type":"system","subtype":"background_tasks_changed","uuid":"l","session_id":"s","tasks":[]}),
+        json!({"type":"system","subtype":"background_tasks_changed","uuid":"l","session_id":"00000000-0000-4000-8000-000000000001","tasks":[]}),
     );
     assert_eq!(agent_counts(&lead.snapshot), (1, 0, 0, 0));
 }
