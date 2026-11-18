@@ -4,9 +4,30 @@
 use super::*;
 
 const IDENTITY: &str = "number title state isDraft headRefName headRefOid headRepository{name} headRepositoryOwner{login} baseRefName updatedAt url";
+/// A check run or status context, in the shape gh's rollup gives it.
+macro_rules! context {
+    () => {
+        "__typename ...on CheckRun{name status conclusion detailsUrl startedAt completedAt checkSuite{workflowRun{workflow{name}}}} ...on StatusContext{context state targetUrl createdAt}"
+    };
+}
 /// Review and check state, which GitHub computes per pull request (a hundred
-/// rollups can time out a query), so it is asked for open ones alone.
-const REVIEW: &str = "reviewDecision additions deletions commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{__typename ...on CheckRun{name status conclusion detailsUrl startedAt completedAt checkSuite{workflowRun{workflow{name}}}} ...on StatusContext{context state targetUrl createdAt}}}}}}}";
+/// rollups can time out a query), so it is asked for open ones alone. A
+/// rollup lists a hundred checks at a time; its own state and count say what
+/// all of them come to.
+const REVIEW: &str = concat!(
+    "reviewDecision additions deletions commits(last:1){nodes{commit{statusCheckRollup{state contexts(first:100){totalCount pageInfo{hasNextPage endCursor} nodes{",
+    context!(),
+    "}}}}}}"
+);
+/// Further pages of one pull request's checks, at the commit they belong to.
+const MORE_CHECKS: &str = concat!(
+    "query CagentsPullRequestChecks($owner:String!,$name:String!,$number:Int!,$cursor:String!){repository(owner:$owner,name:$name){pullRequest(number:$number){commits(last:1){nodes{commit{oid statusCheckRollup{contexts(first:100,after:$cursor){pageInfo{hasNextPage endCursor} nodes{",
+    context!(),
+    "}}}}}}}}}"
+);
+/// Pages of checks read for one pull request, the first included: a
+/// thousand checks. GitHub's state of the rollup covers any beyond.
+const CHECK_PAGES: usize = 10;
 
 /// The user's pull requests in one repository, newest first.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,7 +56,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
             "repo:{}/{} is:pr author:@me sort:updated-desc",
             repository.owner, repository.name
         );
-        let data = self.graphql(
+        let mut data = self.graphql(
             repository,
             &query,
             vec![
@@ -52,11 +73,91 @@ impl<E: ProcessExecutor> GitHubService<E> {
             .filter(|login| !login.is_empty())
             .ok_or_else(|| GitHubError::Inspection("GitHub did not say who is signed in".into()))?
             .to_owned();
+        for node in data
+            .pointer_mut("/open/nodes")
+            .and_then(serde_json::Value::as_array_mut)
+            .into_iter()
+            .flatten()
+        {
+            self.read_more_checks(repository, node, cancellation);
+        }
         Ok(AuthoredPullRequests {
             viewer,
             open: decode_authored(&data, "open", repository)?,
             all: decode_authored(&data, "all", repository)?,
         })
+    }
+}
+
+impl<E: ProcessExecutor> GitHubService<E> {
+    /// Appends the checks past a rollup's first page to `node`, while they
+    /// belong to its head commit. A page that can't be read leaves the rest
+    /// unlisted, which the rollup's own state still accounts for.
+    fn read_more_checks(
+        &self,
+        repository: &GitHubRepoKey,
+        node: &mut serde_json::Value,
+        cancellation: &CancellationToken,
+    ) {
+        const ROLLUP: &str = "/commits/nodes/0/commit/statusCheckRollup/contexts";
+        let (Some(number), Some(head)) = (
+            node.get("number").and_then(serde_json::Value::as_i64),
+            node.get("headRefOid")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+        ) else {
+            return;
+        };
+        let mut page_info = node.pointer(&format!("{ROLLUP}/pageInfo")).cloned();
+        for _ in 1..CHECK_PAGES {
+            if cancellation.is_cancelled() {
+                return;
+            }
+            let Some(cursor) = page_info
+                .as_ref()
+                .filter(|info| info["hasNextPage"] == true)
+                .and_then(|info| info["endCursor"].as_str())
+                .filter(|cursor| !cursor.is_empty())
+                .map(str::to_owned)
+            else {
+                return;
+            };
+            let page = match self.graphql(
+                repository,
+                MORE_CHECKS,
+                vec![
+                    ("owner", repository.owner.as_str().into()),
+                    ("name", repository.name.as_str().into()),
+                    ("number", GraphQlValue::Int(number)),
+                    ("cursor", cursor.into()),
+                ],
+                cancellation,
+            ) {
+                Ok(page) => page,
+                Err(error) => {
+                    tracing::debug!(%error, number, "further checks could not be read");
+                    return;
+                }
+            };
+            let Some(commit) = page.pointer("/repository/pullRequest/commits/nodes/0/commit")
+            else {
+                return;
+            };
+            // A push since the first page: its checks are another commit's.
+            if commit["oid"].as_str() != Some(head.as_str()) {
+                return;
+            }
+            let contexts = &commit["statusCheckRollup"]["contexts"];
+            let (Some(more), Some(listed)) = (
+                contexts["nodes"].as_array(),
+                node.pointer_mut(&format!("{ROLLUP}/nodes"))
+                    .and_then(serde_json::Value::as_array_mut),
+            ) else {
+                return;
+            };
+            listed.extend(more.iter().cloned());
+            page_info = Some(contexts["pageInfo"].clone());
+        }
     }
 }
 
@@ -79,10 +180,23 @@ fn decode_authored(
             if review {
                 // gh's shape: a pull request with no checks has an empty
                 // rollup, which the board reads as known, not unknown.
-                let mut contexts = node
-                    .pointer_mut("/commits/nodes/0/commit/statusCheckRollup/contexts/nodes")
+                let mut rollup = node
+                    .pointer_mut("/commits/nodes/0/commit/statusCheckRollup")
+                    .map(serde_json::Value::take)
+                    .unwrap_or_default();
+                let mut contexts = rollup
+                    .pointer_mut("/contexts/nodes")
                     .map(serde_json::Value::take)
                     .unwrap_or_else(|| serde_json::json!([]));
+                if let Some(state) = rollup.get("state").filter(|state| state.is_string()) {
+                    node["statusCheckState"] = state.clone();
+                }
+                if let Some(count) = rollup
+                    .pointer("/contexts/totalCount")
+                    .filter(|count| count.is_u64())
+                {
+                    node["statusCheckCount"] = count.clone();
+                }
                 // gh's shape names a check run's workflow beside it.
                 for context in contexts.as_array_mut().into_iter().flatten() {
                     let Some(suite) = context
@@ -218,6 +332,170 @@ mod tests {
         );
         assert!(arguments.contains(&"openLimit=50".to_owned()));
         assert!(arguments.contains(&"allLimit=100".to_owned()));
+    }
+
+    /// Answers each request with the next response, recording the requests,
+    /// and cancels the read once the first is answered when
+    /// `cancel_after_first` is set.
+    struct Pages {
+        commands: Mutex<Vec<CommandSpec>>,
+        responses: Mutex<Vec<serde_json::Value>>,
+        cancel_after_first: bool,
+    }
+
+    impl ProcessExecutor for Pages {
+        fn execute(
+            &self,
+            command: &CommandSpec,
+            cancellation: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessFailure> {
+            self.commands.lock().unwrap().push(command.clone());
+            let response = self.responses.lock().unwrap().remove(0);
+            if self.cancel_after_first {
+                cancellation.cancel();
+            }
+            Answer(Mutex::default(), response.to_string()).execute(command, cancellation)
+        }
+    }
+
+    fn checks(conclusion: &str, count: usize) -> Vec<serde_json::Value> {
+        vec![
+            serde_json::json!({"__typename": "CheckRun", "name": "matrix",
+                "status": "COMPLETED", "conclusion": conclusion});
+            count
+        ]
+    }
+
+    fn more_checks(
+        oid: &str,
+        nodes: Vec<serde_json::Value>,
+        next: Option<&str>,
+    ) -> serde_json::Value {
+        serde_json::json!({"data": {"repository": {"pullRequest": {"commits": {"nodes": [{"commit": {
+            "oid": oid,
+            "statusCheckRollup": {"contexts": {
+                "pageInfo": {"hasNextPage": next.is_some(), "endCursor": next},
+                "nodes": nodes,
+            }},
+        }}]}}}}})
+    }
+
+    fn listing_of(total: u64, state: &str) -> serde_json::Value {
+        let mut long = node(5, "OPEN");
+        long["commits"] = serde_json::json!({"nodes": [{"commit": {"statusCheckRollup": {
+            "state": state,
+            "contexts": {
+                "totalCount": total,
+                "pageInfo": {"hasNextPage": true, "endCursor": "page-1"},
+                "nodes": checks("SUCCESS", 100),
+            },
+        }}}]});
+        serde_json::json!({"data": {
+            "viewer": {"login": "me"},
+            "open": {"nodes": [long]},
+            "all": {"nodes": [node(5, "OPEN")]},
+        }})
+    }
+
+    fn read(responses: Vec<serde_json::Value>) -> (AuthoredPullRequests, Vec<CommandSpec>) {
+        read_with(responses, false)
+    }
+
+    fn read_with(
+        responses: Vec<serde_json::Value>,
+        cancel_after_first: bool,
+    ) -> (AuthoredPullRequests, Vec<CommandSpec>) {
+        let executor = Arc::new(Pages {
+            commands: Mutex::default(),
+            responses: Mutex::new(responses),
+            cancel_after_first,
+        });
+        let service = GitHubService::new("gh", executor.clone());
+        let repository = GitHubRepoKey::new("github.com", None, "owner", "repo").unwrap();
+        let listing = service
+            .authored_pull_requests(&repository, 50, 100, &CancellationToken::new())
+            .unwrap();
+        let commands = executor.commands.lock().unwrap().clone();
+        (listing, commands)
+    }
+
+    #[test]
+    fn checks_past_the_first_hundred_are_read_at_the_same_commit() {
+        let head = "a".repeat(40);
+        let mut second = checks("SUCCESS", 99);
+        second.extend(checks("FAILURE", 1));
+        let (listing, commands) = read(vec![
+            listing_of(230, "FAILURE"),
+            more_checks(&head, second, Some("page-2")),
+            more_checks(&head, checks("SUCCESS", 30), None),
+        ]);
+        let open = &listing.open[0];
+        let buckets = open
+            .check_summaries()
+            .into_iter()
+            .map(|check| check.bucket.0)
+            .collect::<Vec<_>>();
+        assert_eq!(buckets.len(), 230);
+        assert_eq!(buckets.iter().filter(|bucket| *bucket == "fail").count(), 1);
+        assert_eq!(open.status_check_count, Some(230));
+        assert_eq!(open.status_check_state, Some(RemoteValue("FAILURE".into())));
+        assert_eq!(listing.all[0].status_check_count, None);
+        let arguments = |command: &CommandSpec| {
+            command
+                .arguments
+                .iter()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert!(arguments(&commands[0]).iter().any(|argument| {
+            argument.contains("statusCheckRollup{state contexts(first:100){totalCount pageInfo{")
+        }));
+        for (command, cursor) in commands[1..].iter().zip(["page-1", "page-2"]) {
+            let arguments = arguments(command);
+            assert!(arguments.contains(&format!("query={MORE_CHECKS}")));
+            assert!(arguments.contains(&format!("cursor={cursor}")));
+            assert!(arguments.contains(&"number=5".to_owned()));
+        }
+    }
+
+    #[test]
+    fn a_push_between_pages_leaves_the_rest_to_githubs_verdict() {
+        let (listing, commands) = read(vec![
+            listing_of(130, "FAILURE"),
+            more_checks(&"b".repeat(40), checks("FAILURE", 30), None),
+        ]);
+        assert_eq!(commands.len(), 2);
+        let open = &listing.open[0];
+        assert_eq!(open.status_check_rollup.as_ref().unwrap().len(), 100);
+        assert_eq!(open.status_check_count, Some(130));
+        assert_eq!(open.status_check_state, Some(RemoteValue("FAILURE".into())));
+    }
+
+    #[test]
+    fn a_read_cancelled_after_the_listing_asks_for_no_further_pages() {
+        let (listing, commands) = read_with(vec![listing_of(230, "FAILURE")], true);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            listing.open[0].status_check_rollup.as_ref().unwrap().len(),
+            100
+        );
+    }
+
+    #[test]
+    fn checks_stop_at_the_page_limit() {
+        let head = "a".repeat(40);
+        let mut responses = vec![listing_of(5_000, "PENDING")];
+        responses.extend(
+            (2..=CHECK_PAGES).map(|page| {
+                more_checks(&head, checks("SUCCESS", 100), Some(&format!("page-{page}")))
+            }),
+        );
+        let (listing, commands) = read(responses);
+        assert_eq!(commands.len(), CHECK_PAGES);
+        assert_eq!(
+            listing.open[0].status_check_rollup.as_ref().unwrap().len(),
+            100 * CHECK_PAGES
+        );
     }
 
     #[test]

@@ -2290,13 +2290,27 @@ impl Cagents {
                 Adoption::Retained => {}
             }
         }
-        for project in &mut self.sidebar_model.projects {
-            project.navigation_order = model
+        // Written only where an order changed, so an unchanged sidebar keeps
+        // its revision and the navigation list its cache.
+        let navigation_order = |project: &SidebarProject| {
+            model
                 .navigation_orders
                 .iter()
                 .find(|order| order.repository == project.repository)
-                .map(|order| order.items.clone())
-                .unwrap_or_default();
+                .map_or(&[][..], |order| order.items.as_slice())
+        };
+        if self
+            .sidebar_model
+            .projects
+            .iter()
+            .any(|project| project.navigation_order != navigation_order(project))
+        {
+            for project in &mut self.sidebar_model.projects {
+                let order = navigation_order(project);
+                if project.navigation_order != order {
+                    project.navigation_order = order.to_vec();
+                }
+            }
         }
         for shared in &model.channels {
             if self.channel_ui.is_deleting(shared.id) || self.channel_ui.was_deleted(shared.id) {

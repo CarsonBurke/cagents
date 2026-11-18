@@ -79,11 +79,10 @@ pub(super) struct Turn {
     /// A failure anywhere in the group, or its last resolved state otherwise.
     /// Collapsing the group must not hide a failed step behind later success.
     pub(super) outcome: Option<ToolStatus>,
-    /// Earliest first observation in the group, when this stretch of work began.
-    started_at: Option<u64>,
-    /// Latest observation in the group. An earlier item can finish after later
+    /// When this stretch of work began, by its earliest first observation,
+    /// and its latest observation. An earlier item can finish after later
     /// items appeared; for a running group this is the last sign of life.
-    ended_at: Option<u64>,
+    span: Span,
     /// The key the reader's disclosure choice is stored under, and the
     /// collapsed strip's own line. Both are formed here, once per snapshot,
     /// because the view draws them on every frame and they change only when
@@ -111,8 +110,7 @@ impl Turn {
             running: false,
             newest_running: false,
             outcome: None,
-            started_at: item.and_then(|item| item.started_at.or(item.at)),
-            ended_at: item.and_then(|item| item.at),
+            span: item.map(Span::of).unwrap_or_default(),
             key: item.map(|item| item.id.clone()).unwrap_or_default(),
             summary: String::new(),
         }
@@ -143,8 +141,8 @@ impl Turn {
     /// frame. `None` where the store has no stamp for either end, which is how
     /// a transcript written before items carried one still renders.
     pub(super) fn working_for(&self, now: u64) -> Option<u64> {
-        let start = self.started_at?;
-        let end = if self.running { now } else { self.ended_at? };
+        let start = self.span.start?;
+        let end = if self.running { now } else { self.span.end? };
         Some(end.saturating_sub(start))
     }
 
@@ -227,15 +225,7 @@ impl Turn {
     /// history reaches the store unstamped, and a group that mixes it with live work should report
     /// the span it can account for rather than nothing at all.
     fn spans(&mut self, item: &Item) {
-        if let Some(start) = item.started_at.or(item.at) {
-            self.started_at = Some(
-                self.started_at
-                    .map_or(start, |previous| previous.min(start)),
-            );
-        }
-        if let Some(end) = item.at {
-            self.ended_at = Some(self.ended_at.map_or(end, |previous| previous.max(end)));
-        }
+        self.span.takes_in(Span::of(item));
     }
 
     fn observe(&mut self, status: Option<ToolStatus>) {
@@ -248,6 +238,30 @@ impl Turn {
             Some(_) => {}
             None => {}
         }
+    }
+}
+
+/// When some work happened: its earliest start and latest observation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Span {
+    start: Option<u64>,
+    end: Option<u64>,
+}
+
+impl Span {
+    fn of(item: &Item) -> Self {
+        Self {
+            start: item.started_at.or(item.at),
+            end: item.at,
+        }
+    }
+
+    fn takes_in(&mut self, other: Span) {
+        self.start = match (self.start, other.start) {
+            (Some(own), Some(other)) => Some(own.min(other)),
+            (own, other) => own.or(other),
+        };
+        self.end = self.end.max(other.end);
     }
 }
 
@@ -336,8 +350,23 @@ pub(super) fn group<'c, T: Borrow<Item>>(
     let mut turns: Vec<Turn> = Vec::new();
     let mut state = Open::Closed;
     let mut newest_running = None;
+    // Reasoning that draws nothing still took time. While a group is taking
+    // work, it counts toward that group; once the agent has handed control
+    // back, by speaking or asking, toward the group the work it led to opens.
+    let mut unplaced: Option<Span> = None;
     for (index, item) in items.iter().map(Borrow::borrow).enumerate() {
         if !renders(&item.content) {
+            if matches!(item.content, ItemContent::Text { thinking: true, .. }) {
+                match turns.last_mut() {
+                    Some(turn) if state == Open::Taking => turn.spans(item),
+                    _ => unplaced.get_or_insert_default().takes_in(Span::of(item)),
+                }
+            }
+            // A question asked after it still ends the group, though the
+            // item draws nothing.
+            if asked_after.contains(item.id.as_str()) {
+                state = Open::Closed;
+            }
             continue;
         }
         let asked = asked_after.contains(item.id.as_str());
@@ -346,6 +375,8 @@ pub(super) fn group<'c, T: Borrow<Item>>(
         // behalf - is a new instruction, so the work that follows it is
         // attributed to it and not to whatever was running when it landed.
         if item.role == Role::User && !item.content.is_step() {
+            // Thinking before the reader's next message was not work on it.
+            unplaced = None;
             match turns.last_mut() {
                 Some(turn)
                     if state == Open::Taking
@@ -401,6 +432,9 @@ pub(super) fn group<'c, T: Borrow<Item>>(
             }
         }
         turn.spans(item);
+        if let Some(thought) = unplaced.take() {
+            turn.span.takes_in(thought);
+        }
         match slot {
             Slot::Step => turn.steps.push(Placed { index, slot }),
             Slot::Thinking | Slot::Commentary | Slot::Prose | Slot::Card => {
@@ -447,10 +481,13 @@ pub(super) fn same_structure(
 /// surface used to draw it as an empty rectangle at the top of every
 /// conversation - two of them, in fact, one captioned and one blank. A text
 /// answer with nothing in it is also the transient state of a message that is
-/// about to stream. Empty reasoning still conveys active work or elapsed time.
+/// about to stream. Reasoning with nothing to read, which is most of what
+/// Claude sends, is working time rather than a row: grouping counts its
+/// time without placing it.
 fn renders(content: &ItemContent) -> bool {
     match content {
-        ItemContent::Text { text, thinking, .. } => *thinking || !text.trim().is_empty(),
+        ItemContent::Text { thinking: true, .. } => !super::reasoning::contentless(content),
+        ItemContent::Text { text, .. } => !text.trim().is_empty(),
         _ => true,
     }
 }
@@ -1426,27 +1463,128 @@ mod tests {
         );
     }
 
+    /// What the Claude adapter makes of a thinking block. Most arrive as
+    /// `{"type":"thinking","thinking":"","signature":"…"}`, and a redacted
+    /// one is given a placeholder; Codex can send an empty summary part.
+    fn thought(id: &str, body: &str, started_at: u64, at: u64) -> Item {
+        Item {
+            id: id.into(),
+            role: Role::Assistant,
+            content: ItemContent::Text {
+                text: body.into(),
+                thinking: true,
+                phase: Phase::Commentary,
+            },
+            started_at: Some(started_at),
+            at: Some(at),
+        }
+    }
+
+    fn timed(mut item: Item, started_at: u64, at: u64) -> Item {
+        item.started_at = Some(started_at);
+        item.at = Some(at);
+        item
+    }
+
     #[test]
-    fn empty_reasoning_keeps_its_place_between_step_groups() {
-        for body in ["", "  \n", "[Redacted thinking]"] {
-            let mut thought = text("thought", Role::Assistant, Phase::Commentary, true);
-            if let ItemContent::Text { text, .. } = &mut thought.content {
-                *text = body.into();
-            }
+    fn reasoning_with_nothing_to_read_neither_draws_nor_splits_its_commands() {
+        for body in ["", "  \n", "[Redacted thinking]", "** **"] {
             let items = vec![
-                command("before", ToolStatus::Succeeded),
-                thought.clone(),
-                command("after", ToolStatus::Running),
+                text("prompt", Role::User, Phase::Final, false),
+                thought("t1", body, 1_000, 2_000),
+                timed(command("c1", ToolStatus::Succeeded), 2_000, 3_000),
+                thought("t2", body, 3_000, 13_000),
+                timed(command("c2", ToolStatus::Succeeded), 13_000, 14_000),
+                thought("t3", body, 14_000, 14_200),
+                timed(command("c3", ToolStatus::Succeeded), 14_200, 15_000),
+                thought("t4", body, 15_000, 23_000),
+                timed(
+                    text("answer", Role::Assistant, Phase::Final, false),
+                    23_000,
+                    24_000,
+                ),
             ];
             let turns = group(&items, &unasked(), plain);
-            assert_eq!(turns.len(), 2);
-            assert_eq!(steps(&turns[0]), [0]);
-            assert_eq!(slots(&turns[0]), [(1, Slot::Thinking)]);
-            assert_eq!(steps(&turns[1]), [2]);
-            assert!(slots(&turns[1]).is_empty());
-            let active = group(&[thought], &unasked(), plain);
-            assert_eq!(slots(&active[0]), [(0, Slot::Thinking)]);
+            assert_eq!(turns.len(), 1, "{body:?}");
+            assert_eq!(steps(&turns[0]), [2, 4, 6], "one group of commands");
+            assert_eq!(slots(&turns[0]), [(8, Slot::Prose)], "no thought rows");
+            assert_eq!(turns[0].summary, "Ran 3 commands");
+            // The first thought began the work and the last one ran until
+            // the answer: both still count.
+            assert_eq!(turns[0].working_for(u64::MAX), Some(23_000));
         }
+    }
+
+    #[test]
+    fn reasoning_with_a_summary_keeps_its_row_among_contentless_thoughts() {
+        let items = vec![
+            text("prompt", Role::User, Phase::Final, false),
+            thought("empty", "", 1_000, 2_000),
+            timed(command("c1", ToolStatus::Succeeded), 2_000, 3_000),
+            thought(
+                "summarized",
+                "**Checking the build**\n\nIt fails.",
+                3_000,
+                5_000,
+            ),
+            timed(command("c2", ToolStatus::Succeeded), 5_000, 6_000),
+        ];
+        let turns = group(&items, &unasked(), plain);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(steps(&turns[0]), [2]);
+        assert_eq!(slots(&turns[0]), [(3, Slot::Thinking)]);
+        assert_eq!(steps(&turns[1]), [4]);
+    }
+
+    #[test]
+    fn a_question_after_contentless_reasoning_still_ends_its_group() {
+        let items = vec![
+            text("prompt", Role::User, Phase::Final, false),
+            timed(command("c1", ToolStatus::Succeeded), 1_000, 2_000),
+            thought("t", "", 2_000, 3_000),
+            timed(command("c2", ToolStatus::Succeeded), 5_000, 6_000),
+        ];
+        let asked = HashSet::from(["t".to_owned()]);
+        let turns = group(&items, &asked, plain);
+        assert_eq!(turns.len(), 2, "the work after the answer is its own group");
+        assert_eq!(steps(&turns[0]), [1]);
+        assert_eq!(steps(&turns[1]), [3]);
+        assert_eq!(turns[0].working_for(u64::MAX), Some(2_000));
+    }
+
+    #[test]
+    fn contentless_reasoning_after_an_answer_counts_toward_the_work_it_led_to() {
+        let items = vec![
+            text("prompt", Role::User, Phase::Final, false),
+            timed(
+                text("said", Role::Assistant, Phase::Final, false),
+                1_000,
+                2_000,
+            ),
+            thought("t", "", 2_000, 9_000),
+            timed(command("c", ToolStatus::Succeeded), 9_000, 10_000),
+        ];
+        let turns = group(&items, &unasked(), plain);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(steps(&turns[1]), [3]);
+        assert!(slots(&turns[1]).is_empty());
+        assert_eq!(turns[1].working_for(u64::MAX), Some(8_000));
+        // While the agent is still thinking, nothing new is drawn: the
+        // working indicator says so.
+        let thinking = group(&items[..3], &unasked(), plain);
+        assert_eq!(thinking.len(), 1);
+        assert_eq!(slots(&thinking[0]), [(1, Slot::Prose)]);
+        assert!(group(&[thought("alone", "", 0, 1)], &unasked(), plain).is_empty());
+    }
+
+    #[test]
+    fn a_thought_gaining_its_first_readable_line_changes_structure() {
+        use std::sync::Arc;
+        let before = vec![Arc::new(thought("t", "", 0, 1))];
+        let after = vec![Arc::new(thought("t", "**Planning**", 0, 1))];
+        assert!(!same_structure(&before, &after));
+        let more = vec![Arc::new(thought("t", "**Planning** the fix", 0, 1))];
+        assert!(same_structure(&after, &more));
     }
 
     /// The view renders prompt, tools, prose for each group. Every streaming

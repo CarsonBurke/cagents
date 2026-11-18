@@ -1,5 +1,8 @@
 //! Single-writer durable attention, independent of workspace/card persistence.
-use std::path::Path;
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 
 use diesel::{connection::SimpleConnection, prelude::*, sqlite::SqliteConnection};
 use uuid::Uuid;
@@ -349,6 +352,70 @@ fn prune_owners(connection: &mut SqliteConnection) -> QueryResult<()> {
     .execute(connection)
     .map(|_| ())
 }
+
+/// The first wait before reopening a journal that failed to open.
+const FIRST_REOPEN: Duration = Duration::from_secs(1);
+/// The longest wait between attempts, so a journal that comes back, such as
+/// a database another daemon held locked through an update, is in use again
+/// within a minute.
+const LAST_REOPEN: Duration = Duration::from_secs(60);
+
+/// The broker's journal, or why it could not be opened and when to try again.
+/// A failure to open is often temporary: a lock still held by the daemon this
+/// one replaced, or a full or briefly unavailable data directory.
+pub(super) struct Reopening {
+    path: Option<PathBuf>,
+    journal: Result<Journal, String>,
+    next_attempt: Instant,
+    delay: Duration,
+}
+
+impl Reopening {
+    /// Opens the journal at `path`, or records why it is unavailable; with no
+    /// path there is nothing to retry.
+    pub(super) fn open(path: Option<PathBuf>, now: Instant) -> Self {
+        let journal = path
+            .as_deref()
+            .ok_or_else(|| "Notification data directory is unavailable".to_owned())
+            .and_then(Journal::open);
+        Self {
+            path,
+            journal,
+            next_attempt: now + FIRST_REOPEN,
+            delay: FIRST_REOPEN,
+        }
+    }
+
+    pub(super) fn journal(&mut self) -> Result<&mut Journal, &String> {
+        self.journal.as_mut().map_err(|error| &*error)
+    }
+
+    /// When a failed journal is next tried, if it can be.
+    pub(super) fn retry_at(&self) -> Option<Instant> {
+        (self.journal.is_err() && self.path.is_some()).then_some(self.next_attempt)
+    }
+
+    /// Tries a failed journal again once its wait has passed, doubling the
+    /// wait after each failure. Returns the error the journal recovered from,
+    /// when this attempt opened it.
+    pub(super) fn reopen_if_due(&mut self, now: Instant) -> Option<String> {
+        let path = self.path.as_deref()?;
+        if self.journal.is_ok() || now < self.next_attempt {
+            return None;
+        }
+        match Journal::open(path) {
+            Ok(journal) => std::mem::replace(&mut self.journal, Ok(journal)).err(),
+            // Keep the first error: it is the one the broker reported.
+            Err(error) => {
+                tracing::debug!(%error, "the notification journal is still unavailable");
+                self.delay = (self.delay * 2).min(LAST_REOPEN);
+                self.next_attempt = now + self.delay;
+                None
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,6 +425,60 @@ mod tests {
         notifications::{Evidence, Kind},
     };
     use rusqlite::Connection;
+
+    #[test]
+    fn a_journal_that_failed_to_open_is_reopened_after_a_bounded_wait() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        // The data directory is not yet usable, as a full disk or a mount that
+        // has not appeared leaves it.
+        std::fs::write(&data, b"").unwrap();
+        let path = data.join("agent-attention.sqlite3");
+        let start = Instant::now();
+        let mut slot = Reopening::open(Some(path.clone()), start);
+        assert!(slot.journal().is_err());
+        assert_eq!(slot.retry_at(), Some(start + FIRST_REOPEN));
+
+        assert_eq!(slot.reopen_if_due(start + FIRST_REOPEN), None);
+        assert!(slot.journal().is_err());
+        let doubled = start + FIRST_REOPEN + FIRST_REOPEN * 2;
+        assert_eq!(slot.retry_at(), Some(doubled));
+
+        std::fs::remove_file(&data).unwrap();
+        std::fs::create_dir(&data).unwrap();
+        assert_eq!(slot.reopen_if_due(doubled - Duration::from_millis(1)), None);
+        assert!(slot.journal().is_err(), "a wait is not cut short");
+        let recovered = slot.reopen_if_due(doubled).expect("the journal reopens");
+        assert!(!recovered.is_empty());
+        assert!(slot.journal().unwrap().list().unwrap().is_empty());
+        assert_eq!(slot.retry_at(), None);
+        assert_eq!(slot.reopen_if_due(doubled + LAST_REOPEN), None);
+
+        let mut waits = Vec::new();
+        let blocked = directory.path().join("blocked");
+        std::fs::write(&blocked, b"").unwrap();
+        let mut never = Reopening::open(Some(blocked.join("journal")), start);
+        let mut now = start;
+        for _ in 0..10 {
+            let next = never.retry_at().unwrap();
+            waits.push(next - now);
+            now = next;
+            never.reopen_if_due(now);
+        }
+        assert_eq!(
+            waits[..3],
+            [FIRST_REOPEN, FIRST_REOPEN * 2, FIRST_REOPEN * 4]
+        );
+        assert_eq!(*waits.last().unwrap(), LAST_REOPEN, "the wait is bounded");
+
+        let mut unplaced = Reopening::open(None, start);
+        assert!(unplaced.journal().is_err());
+        assert_eq!(
+            unplaced.retry_at(),
+            None,
+            "without a path nothing is retried"
+        );
+    }
 
     #[test]
     fn disabling_previews_clears_retained_text_without_changing_acknowledgement() {

@@ -153,19 +153,7 @@ impl Provider {
     /// Recognize only known foreground executable/JavaScript entrypoints.
     /// Options and identity still require recovery's separate exact validation.
     pub fn recognize_launch(launch: &LaunchRecipe) -> Option<Self> {
-        let (provider, arguments) = if Self::is_interpreter(&launch.program) {
-            let script = Path::new(launch.arguments.first()?);
-            let provider = ADAPTERS
-                .iter()
-                .find(|adapter| (adapter.recognizes_script)(script))?
-                .provider;
-            (provider, &launch.arguments[1..])
-        } else {
-            (
-                Self::from_program(&launch.program)?,
-                launch.arguments.as_slice(),
-            )
-        };
+        let (provider, arguments) = Self::launched(launch)?;
         // Shared servers, tool commands and account management do not own the
         // foreground conversation: a terminal signing in is not an agent.
         if arguments.first().is_some_and(|arg| {
@@ -185,6 +173,25 @@ impl Provider {
             return None;
         }
         Some(provider)
+    }
+
+    /// The provider a launch runs, whatever it runs it for, and the arguments
+    /// it passes that provider: a known executable, or an interpreter running
+    /// one of the provider's known entrypoints.
+    pub(crate) fn launched(launch: &LaunchRecipe) -> Option<(Self, &[String])> {
+        if Self::is_interpreter(&launch.program) {
+            let script = Path::new(launch.arguments.first()?);
+            let provider = ADAPTERS
+                .iter()
+                .find(|adapter| (adapter.recognizes_script)(script))?
+                .provider;
+            Some((provider, &launch.arguments[1..]))
+        } else {
+            Some((
+                Self::from_program(&launch.program)?,
+                launch.arguments.as_slice(),
+            ))
+        }
     }
 
     /// Preserve the existing process-recovery normalization without granting an ID.

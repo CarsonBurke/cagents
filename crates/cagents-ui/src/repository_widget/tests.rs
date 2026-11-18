@@ -1637,7 +1637,16 @@ fn diff_actions_share_capabilities_without_blocking_committed_comparisons_or_ret
     file.staged = false;
     file.unstaged = false;
     assert!(!runtime.can_show_diff());
-    assert!(!runtime.can_select_diff_basis(&DiffBasis::HeadToIndex));
+    assert_eq!(
+        runtime.diff_basis_refusal(&DiffBasis::HeadToIndex),
+        Some(DiffBasisRefusal::NotListed)
+    );
+    runtime.mutation_refresh_pending = true;
+    assert_eq!(
+        runtime.diff_basis_refusal(&DiffBasis::HeadToIndex),
+        Some(DiffBasisRefusal::Refreshing)
+    );
+    runtime.mutation_refresh_pending = false;
     drop(runtime.update(RepositoryAction::ApplySourceSurface { card, diff: true }));
     drop(runtime.update(RepositoryAction::ApplyDiffBasis {
         card,

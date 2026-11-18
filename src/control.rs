@@ -3151,6 +3151,30 @@ fn already_stopped() -> CommandOutput {
     }
 }
 
+/// `daemon status` for a selected device whose bridge confirmed that no
+/// daemon is running or holding its inventory lease there.
+fn remote_daemon_stopped() -> CommandOutput {
+    let device = crate::device::selected().map(|device| device.name.as_str());
+    CommandOutput {
+        command: "daemon.status",
+        data: json!({
+            "instance": instance::NAME,
+            "device": device,
+            "running": false,
+            "daemon_present": false,
+            "socket": null,
+            "daemon_version": null,
+            "cli_version": crate::version()
+        }),
+        human: format!(
+            "{} daemon on {} stopped; cli {}",
+            instance::NAME,
+            device.unwrap_or("the selected device"),
+            crate::version()
+        ),
+    }
+}
+
 pub fn run_from<I, T>(arguments: I) -> ExitCode
 where
     I: IntoIterator<Item = T>,
@@ -3361,10 +3385,21 @@ where
             command: DaemonCommand::Stop { .. }
         }
     );
-    let no_start = stopping_daemon
+    // Reading status must observe the daemon, never start it to answer.
+    let reading_daemon_status = matches!(
+        &cli.command,
+        TopCommand::Daemon {
+            command: DaemonCommand::Status
+        }
+    );
+    // The policy a staged owner must inherit. Status is left out: an owner
+    // that predates `--no-start` (v0.1.x) would refuse to parse it, and the
+    // installer reads `--json daemon status` from that owner.
+    let inherited_no_start = stopping_daemon
         || cli.global.no_start
         || std::env::var("CAGENTS_NO_START")
             .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
+    let no_start = inherited_no_start || reading_daemon_status;
     let _start_policy = StartPolicy(NO_START.swap(no_start, std::sync::atomic::Ordering::Relaxed));
     let _output_policy =
         OutputPolicy(JSON_OUTPUT.swap(cli.global.json, std::sync::atomic::Ordering::Relaxed));
@@ -3483,7 +3518,7 @@ where
                 // Carry implicit stop/environment policy into the matched CLI.
                 // An older owner that lacks this flag must refuse parsing
                 // rather than recover/start services before handling the read.
-                if no_start && !cli.global.no_start {
+                if inherited_no_start && !cli.global.no_start {
                     command.arg("--no-start");
                 }
                 command.args(&arguments[1..]);
@@ -3522,6 +3557,10 @@ where
             if crate::device::daemon_absent(&error) {
                 if stopping_daemon {
                     emit_success(cli.global.json, already_stopped());
+                    return ExitCode::SUCCESS;
+                }
+                if reading_daemon_status {
+                    emit_success(cli.global.json, remote_daemon_stopped());
                     return ExitCode::SUCCESS;
                 }
                 emit_error(cli.global.json, &AppError::new("daemon_not_running", error));
@@ -4075,24 +4114,48 @@ fn describe_unattached(
     conversations: &[crate::upgrade::handoff::UnattachedSummary],
     evidence: Option<&Path>,
 ) -> String {
-    let mut text = format!(
-        "{} retained native conversation{} could not be reattached after the daemon update. Nothing was restarted or resent for them and their providers were left as they were; open each in cagents to see why, then recover or close it.",
-        conversations.len(),
-        if conversations.len() == 1 { "" } else { "s" },
-    );
-    for conversation in conversations {
+    use crate::upgrade::handoff::UnattachedDisposition;
+    let plural = |count: usize| if count == 1 { "" } else { "s" };
+    let mut text = String::new();
+    for (disposition, headline) in [
+        (
+            UnattachedDisposition::Retained,
+            "retained native conversation{s} could not be reattached after the daemon update. Nothing was restarted or resent for them and their providers were left as they were; open each in cagents to see why, then recover or close it.",
+        ),
+        (
+            UnattachedDisposition::Stopped,
+            "native conversation{s} could not be restarted after the daemon update. Each restart was stopped and nothing was resent; open each in cagents to reopen it.",
+        ),
+    ] {
+        let group = conversations
+            .iter()
+            .filter(|conversation| conversation.disposition == disposition)
+            .collect::<Vec<_>>();
+        if group.is_empty() {
+            continue;
+        }
+        if !text.is_empty() {
+            text.push('\n');
+        }
         text.push_str(&format!(
-            "\n  {} {} in {}: {}",
-            conversation.provider.label(),
-            printable(
-                conversation
-                    .conversation
-                    .as_deref()
-                    .unwrap_or("(unconfirmed conversation)")
-            ),
-            printable(&conversation.working_directory.to_string_lossy()),
-            printable(&conversation.reason),
+            "{} {}",
+            group.len(),
+            headline.replace("{s}", plural(group.len()))
         ));
+        for conversation in group {
+            text.push_str(&format!(
+                "\n  {} {} in {}: {}",
+                conversation.provider.label(),
+                printable(
+                    conversation
+                        .conversation
+                        .as_deref()
+                        .unwrap_or("(unconfirmed conversation)")
+                ),
+                printable(&conversation.working_directory.to_string_lossy()),
+                printable(&conversation.reason),
+            ));
+        }
     }
     if let Some(evidence) = evidence {
         text.push_str(&format!(
@@ -4311,9 +4374,11 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                 daemon_socket_path().map_err(|error| AppError::new("socket_path", error))?;
             let socket = &selected_socket;
             let mut daemon_version = None;
+            let mut startup = None;
             let running = match ControlClient::connect(socket) {
                 Ok(mut client) => {
                     daemon_version = Some(client.daemon_version().map_err(protocol_error)?);
+                    startup = Some(client.startup_state().map_err(protocol_error)?);
                     true
                 }
                 Err(ControlError::Connect(error))
@@ -4337,10 +4402,12 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                 .map_err(|error| AppError::new("daemon_status", error))?;
             let mut data = json!({
                 "instance": instance::NAME,
+                "device": crate::device::selected().map(|device| device.name.as_str()),
                 "running": running,
                 "daemon_present": daemon_present,
                 "socket": socket,
                 "daemon_version": daemon_version,
+                "startup": startup,
                 "inherited_lease": crate::daemon::lease_handoff::has_inherited_lease()
                     .map_err(|error| AppError::new("daemon_status", error))?,
                 "cli_version": crate::version()
@@ -4367,6 +4434,18 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                     crate::version()
                 )
             };
+            match &startup {
+                Some(terminal::ipc::StartupState::Restoring { awaiting }) => {
+                    human.push_str(&format!(
+                        "\nstartup: restoring; {awaiting} original owners await their outcome"
+                    ))
+                }
+                Some(terminal::ipc::StartupState::Retained { detail }) => {
+                    human.push_str("\nstartup: recovery holds original ownership: ");
+                    human.push_str(detail);
+                }
+                Some(terminal::ipc::StartupState::Ready) | None => {}
+            }
             if let Some((attention, warning)) = upgrade_attention() {
                 data["upgrade_attention"] = attention;
                 human.push_str("\nwarning: ");
@@ -4488,15 +4567,41 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                     "pass --yes to archive the interrupted checkpoint; its conversations will require explicit manual recovery",
                 ));
             }
-            let archive = crate::upgrade::abandon()
+            let abandoned = crate::upgrade::abandon()
                 .map_err(|error| AppError::new("upgrade_recovery", error))?;
+            let mut human = format!(
+                "Archived checkpoint at {}; no processes resumed. Recover exact conversations manually after checking their existing writers",
+                abandoned.archive.display()
+            );
+            match &abandoned.checkpoint_only {
+                Some(identities) if identities.is_empty() => {}
+                Some(identities) => {
+                    human.push_str(&format!(
+                        ".\nOnly the checkpoint records the provider conversation of {} chat(s). The next daemon start saves each to the agent and pane still showing it, and logs any it cannot:",
+                        identities.len()
+                    ));
+                    for identity in identities {
+                        human.push_str(&format!(
+                            "\n  {} {} {} in {}",
+                            identity.id,
+                            identity.provider.label(),
+                            identity.conversation,
+                            identity.working_directory.display()
+                        ));
+                    }
+                }
+                None => human.push_str(
+                    ".\nThe checkpoint could not be read, so conversations only it identified may not reconnect",
+                ),
+            }
             Ok(CommandOutput {
                 command: "daemon.abandon_upgrade",
-                data: json!({ "archive": archive, "resumed": false }),
-                human: format!(
-                    "Archived checkpoint at {}; no processes resumed. Recover exact conversations manually after checking their existing writers",
-                    archive.display()
-                ),
+                data: json!({
+                    "archive": abandoned.archive,
+                    "resumed": false,
+                    "checkpoint_only_identities": abandoned.checkpoint_only,
+                }),
+                human,
             })
         }
         DaemonCommand::StopForRebuild {
@@ -6709,6 +6814,15 @@ mod tests {
                         version: "fixture".into(),
                     },
                 );
+                // Status also reports whether startup recovery holds owners.
+                let request: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+                assert!(matches!(request.request, ClientRequest::StartupState));
+                response(
+                    &mut stream,
+                    &pinned,
+                    request.request_id,
+                    ServerResponse::StartupState(terminal::ipc::StartupState::Ready),
+                );
                 assert!(read_frame::<ClientEnvelope>(&mut stream).unwrap().is_none());
             });
             assert_eq!(
@@ -6964,6 +7078,7 @@ mod tests {
             conversation: Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into()),
             working_directory: "/work/project".into(),
             reason: reason.into(),
+            disposition: crate::upgrade::handoff::UnattachedDisposition::Retained,
         };
         let one = describe_unattached(
             &[conversation("no rollout found for thread id")],
@@ -7001,6 +7116,25 @@ mod tests {
             "{hostile}"
         );
         assert_eq!(hostile.lines().count(), 2, "{hostile}");
+
+        // A restart the update stopped is described as stopped, never as a
+        // provider that was left running, and is grouped apart from those.
+        let mut stopped =
+            conversation("Codex server did not open its local socket within 15 seconds");
+        stopped.disposition = crate::upgrade::handoff::UnattachedDisposition::Stopped;
+        let mixed = describe_unattached(&[conversation("unavailable"), stopped], None);
+        let lines = mixed.lines().collect::<Vec<_>>();
+        assert!(
+            lines[0].starts_with("1 retained native conversation could not be reattached"),
+            "{mixed}"
+        );
+        assert!(lines[1].ends_with(": unavailable"), "{mixed}");
+        assert!(
+            lines[2].starts_with("1 native conversation could not be restarted"),
+            "{mixed}"
+        );
+        assert!(lines[2].contains("Each restart was stopped"), "{mixed}");
+        assert!(lines[3].ends_with("within 15 seconds"), "{mixed}");
     }
 
     #[test]

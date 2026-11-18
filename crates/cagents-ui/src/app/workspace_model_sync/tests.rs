@@ -6789,3 +6789,48 @@ fn a_window_that_has_reached_no_registry_yet_neither_retires_nor_publishes() {
     );
     assert!(drain(&published).is_empty());
 }
+
+/// Reconciling against a model whose navigation orders the sidebar already
+/// shows leaves the sidebar's revision alone, so the navigation list keeps
+/// its cache; a changed order still reaches the sidebar.
+#[test]
+fn reconciling_unchanged_navigation_orders_keeps_the_sidebar_revision() {
+    use crate::sidebar::Revisioned;
+    use crate::workspace_model::{NavigationItem, NavigationOrder};
+
+    let (mut app, _, repository) = app_with_project();
+    let mut model = registry(Vec::new());
+    model.projects.push(ModelProject {
+        repository: repository.clone(),
+        name: "repo".into(),
+        kind: ProjectKind::Git,
+        ordinal: 0,
+    });
+    model.navigation_orders.push(NavigationOrder {
+        repository: repository.clone(),
+        items: vec![NavigationItem::Worktree("/repo/worktree".into())],
+    });
+    app.workspace_model = model;
+    drop(app.reconcile_workspace_model());
+    assert_eq!(
+        app.sidebar_model.projects[0].navigation_order,
+        vec![NavigationItem::Worktree("/repo/worktree".into())]
+    );
+    let settled = Revisioned::revision(&app.sidebar_model.projects);
+
+    drop(app.reconcile_workspace_model());
+    assert_eq!(
+        Revisioned::revision(&app.sidebar_model.projects),
+        settled,
+        "an order the sidebar already shows takes no new revision"
+    );
+
+    app.workspace_model.navigation_orders[0].items =
+        vec![NavigationItem::Worktree("/repo/other".into())];
+    drop(app.reconcile_workspace_model());
+    assert_ne!(Revisioned::revision(&app.sidebar_model.projects), settled);
+    assert_eq!(
+        app.sidebar_model.projects[0].navigation_order,
+        vec![NavigationItem::Worktree("/repo/other".into())]
+    );
+}

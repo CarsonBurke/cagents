@@ -3787,6 +3787,10 @@ fn presentation_scoped_chrome_includes_retained_utility_and_keeps_focus() {
     drop(app.update(Message::Sidebar(SidebarAction::OpenSettings)));
     let utility = app.workspace.focused().unwrap();
     assert_eq!(app.card_state(utility).unwrap().kind, CardKind::Settings);
+    // Opening Settings is saved with the navigation burst, and the scoped
+    // projection waits for that save.
+    drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
+    assert!(app.navigation_save.is_none());
     let utility_state = app.card_state(utility).unwrap().clone();
     assert!(
         app.presentation_chrome_cards(&Scope::Channel(source))

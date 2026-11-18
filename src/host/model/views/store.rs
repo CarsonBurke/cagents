@@ -556,6 +556,25 @@ pub(in crate::host::model) fn resource_holder(
         .transpose()
 }
 
+/// The pane presenting chat `id`, in any view.
+pub(in crate::host::model) fn chat_pane(
+    db: &Connection,
+    id: crate::model::TerminalId,
+) -> Result<Option<CardId>, String> {
+    db.prepare_cached("SELECT id FROM panes WHERE kind = 'chat' AND resource = ?1")
+        .and_then(|mut statement| {
+            statement
+                .query_row([id.to_string()], |row| row.get::<_, String>(0))
+                .optional()
+        })
+        .map_err(sql)?
+        .map(|id| {
+            id.parse()
+                .map_err(|error| format!("saved pane id `{id}` is unreadable: {error}"))
+        })
+        .transpose()
+}
+
 /// Every scope of `repository`: its worktrees and its channels.
 pub(in crate::host::model) fn project_scopes(
     db: &Connection,
