@@ -2311,7 +2311,7 @@ mod tests {
     fn reopening_a_closed_chat_puts_its_pane_back_before_any_answer() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = crate::app::tests::context_inspector_test_app(false);
-        app.select_worktree(directory.path().to_path_buf(), false);
+        drop(app.select_worktree(directory.path().to_path_buf(), false));
         let entry = retained(directory.path());
         let closed = CardState {
             id: entry.card,
