@@ -35,7 +35,7 @@ const RAIL_INSET: f32 = space::M;
 
 /// Where a group's thread line hangs: under the centre of its kind icon.
 const THREAD_RAIL_OFFSET: f32 =
-    GAP_S + design::COMPACT_ICON_SIZE as f32 / 2.0 - design::BORDER_WIDTH / 2.0;
+    GAP_S + design::LEADING_ICON_SIZE as f32 / 2.0 - design::BORDER_WIDTH / 2.0;
 
 /// The glyph that stands for what a step was doing, so a reader scanning the
 /// left edge of a strip can tell reading from running from editing without

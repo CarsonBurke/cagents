@@ -143,11 +143,11 @@ pub(super) fn row_named(
     let text = label.into().view();
     let indicator = match status {
         Some(chat::ToolStatus::Running) => crate::ui_controls::activity_spinner(
-            f32::from(design::COMPACT_ICON_SIZE),
+            f32::from(design::LEADING_ICON_SIZE),
             design::muted_color,
         ),
         Some(chat::ToolStatus::Failed) => widget::icon(Icon::Error.handle())
-            .size(design::COMPACT_ICON_SIZE)
+            .size(design::LEADING_ICON_SIZE)
             .class(cosmic::theme::Svg::Custom(Rc::new(|theme| {
                 iced::widget::svg::Style {
                     color: Some(design::destructive_color(theme)),
@@ -155,7 +155,7 @@ pub(super) fn row_named(
             })))
             .into(),
         _ => {
-            crate::ui_controls::passive_icon(status_glyph(icon, status), design::COMPACT_ICON_SIZE)
+            crate::ui_controls::passive_icon(status_glyph(icon, status), design::LEADING_ICON_SIZE)
         }
     };
     let mut cells = vec![indicator, text];
@@ -278,5 +278,44 @@ mod tests {
         }
         assert_eq!(times[0], times[1]);
         assert_eq!(times[1], times[2]);
+    }
+
+    /// The glyph leads a line of body text, so it is drawn at the leading
+    /// size in every state, and the words start in the same place whether
+    /// the step is running, failed or done.
+    #[test]
+    fn the_leading_glyph_is_sized_to_the_line_in_every_state() {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        let renderer = crate::app::tests::headless_renderer();
+        let mut words = Vec::new();
+        for status in [
+            None,
+            Some(chat::ToolStatus::Running),
+            Some(chat::ToolStatus::Failed),
+            Some(chat::ToolStatus::Succeeded),
+            Some(chat::ToolStatus::Stopped),
+        ] {
+            let mut element = row(
+                "Ran 2 commands".to_owned(),
+                "Ran 2 commands".into(),
+                Icon::Terminal,
+                status,
+                None,
+                Some(false),
+                None,
+            );
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(300.0, 80.0)),
+            );
+            let line = Layout::new(&node).children().next().unwrap();
+            let glyph = line.children().next().unwrap().bounds();
+            let size = f32::from(design::LEADING_ICON_SIZE);
+            assert_eq!((glyph.width, glyph.height), (size, size), "{status:?}");
+            words.push(line.children().nth(1).unwrap().bounds().x);
+        }
+        assert!(words.windows(2).all(|pair| pair[0] == pair[1]), "{words:?}");
     }
 }
