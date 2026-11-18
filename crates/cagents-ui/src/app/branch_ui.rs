@@ -1,6 +1,7 @@
 use super::*;
 use crate::{
     repository::{BranchComparison, HeadState, Oid, ValidatedRefName},
+    repository_widget::DiffBasisRefusal,
     sidebar::{BranchChanges, BranchChangesModel},
 };
 use std::sync::Arc;
@@ -372,20 +373,36 @@ impl Cagents {
         self.pending_panel_open = None;
         if let Some(card) = self.repository_editing(&key.canonical_path, path.as_path()) {
             let focus = self.focus_pane(card);
-            if in_place
-                && matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime))
-                    if runtime.can_show_diff_basis(&basis))
-            {
+            let refusal = match self.cards.get(&card) {
+                Some(CardRuntime::Repository(runtime)) if in_place => {
+                    runtime.diff_basis_refusal(&basis)
+                }
+                _ => Some(DiffBasisRefusal::NoComparisons),
+            };
+            let Some(refusal) = refusal else {
                 let show = Message::Repository(RepositoryAction::ApplyDiffBasis { card, basis });
                 return Task::batch([focus, cosmic::task::message(show)]);
-            }
+            };
             let name = path.as_path().file_name().map_or_else(
                 || path.to_string(),
                 |name| name.to_string_lossy().into_owned(),
             );
-            self.status = Some(TransientNotice::warning(format!(
-                "Save or discard your changes to {name} to open this comparison"
-            )));
+            self.status = Some(TransientNotice::warning(match refusal {
+                DiffBasisRefusal::Saving => {
+                    format!("{name} is saving. Open this comparison again when the save finishes")
+                }
+                DiffBasisRefusal::Refreshing => format!(
+                    "The Git status of {name} is refreshing. Open this comparison again in a moment"
+                ),
+                DiffBasisRefusal::NotListed => format!(
+                    "The pane editing {name} hasn't picked up that change yet. Open this comparison again once it does"
+                ),
+                // A rename source, or a pane without comparisons, cannot sit
+                // beside the buffer; a clean pane is routed normally.
+                DiffBasisRefusal::NoComparisons => {
+                    format!("Save or discard your changes to {name} to open this comparison")
+                }
+            }));
             return focus;
         }
         let (card, prepare) = match self.repository_panel_destination(&key.canonical_path) {

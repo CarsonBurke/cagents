@@ -7725,6 +7725,26 @@ mod repository_clone_navigation {
         }
     }
 
+    /// A pane opened through a path that is not canonical, such as a file
+    /// link through a symlink, still counts as editing the file.
+    #[test]
+    fn same_file_sees_through_a_non_canonical_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("real")).unwrap();
+        std::fs::write(root.join("real/file.txt"), "").unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("alias")).unwrap();
+        assert!(super::super::same_file(
+            &root.join("alias/file.txt"),
+            &root.join("real/file.txt")
+        ));
+        std::fs::write(root.join("real/other.txt"), "").unwrap();
+        assert!(!super::super::same_file(
+            &root.join("alias/other.txt"),
+            &root.join("real/file.txt")
+        ));
+    }
+
     /// History and branch rows open committed comparisons through the same
     /// route.
     #[tokio::test]
@@ -7788,7 +7808,10 @@ mod repository_clone_navigation {
         assert_eq!(app.workspace.focused(), Some(first));
         assert!(!runtime(&app, first).shows_diff());
         assert!(runtime(&app, first).is_dirty());
-        assert!(app.status.is_some());
+        assert_eq!(
+            app.status.as_ref().map(|notice| notice.message.as_str()),
+            Some("Save or discard your changes to current.txt to open this comparison")
+        );
         assert_eq!(app.repository_browsers(&fixture.root).count(), 2);
     }
 

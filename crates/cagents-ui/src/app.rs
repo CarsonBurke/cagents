@@ -12899,10 +12899,12 @@ impl Cagents {
         let target = worktree.join(path);
         let editing = |card: CardId| {
             matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime))
-                if runtime.blocks_navigation()
-                    && runtime
-                        .selected_path()
-                        .is_some_and(|selected| runtime.descriptor.worktree.join(selected) == target))
+            if runtime.blocks_navigation()
+                && runtime
+                    .selected_path()
+                    .is_some_and(|selected| {
+                        same_file(&runtime.descriptor.worktree.join(selected), &target)
+                    }))
         };
         let mut panes = self.active_repository_panes().map(|(card, _)| card);
         self.workspace
@@ -19867,5 +19869,20 @@ fn unix_millis() -> i64 {
         .try_into()
         .unwrap_or(i64::MAX)
 }
+
+/// Whether two absolute paths name the same file. A repository descriptor
+/// keeps the path its pane was opened with, and a file link's need not be
+/// canonical. Only a candidate already sharing the file name reaches the
+/// filesystem, so routing a click stays cheap.
+fn same_file(candidate: &Path, target: &Path) -> bool {
+    candidate == target
+        || (candidate.file_name() == target.file_name()
+            && candidate
+                .canonicalize()
+                .ok()
+                .zip(target.canonicalize().ok())
+                .is_some_and(|(candidate, target)| candidate == target))
+}
+
 #[cfg(test)]
 mod tests;
