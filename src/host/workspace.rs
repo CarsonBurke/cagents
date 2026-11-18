@@ -266,7 +266,12 @@ fn apply_delta_guarded<G>(
         if error == Registry::VIEW_REMOVAL_CONFLICT {
             return ProtocolError::new(ProtocolErrorCode::InvalidRequest, error, false);
         }
-        if error == Registry::VIEW_SOURCE_CONFLICT || error == Registry::VIEW_REVISION_CONFLICT {
+        // Stale-precondition refusals the client resolves by reading again,
+        // the confirmed project close's channel set among them.
+        if error == Registry::VIEW_SOURCE_CONFLICT
+            || error == Registry::VIEW_REVISION_CONFLICT
+            || error == Registry::PROJECT_CHANNELS_CONFLICT
+        {
             return ProtocolError::new(ProtocolErrorCode::ViewConflict, error, true);
         }
         // Execution retirement may close the scope after the preflight read.

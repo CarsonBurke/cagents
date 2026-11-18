@@ -3021,7 +3021,9 @@ const CAPACITY_GUIDANCE: &str = "Inspect usage with cagents chat capacity. Check
 pub(super) struct Runtime {
     preparation: preparation::State,
     find: Option<String>,
-    find_matches: Vec<String>,
+    /// The groups Find matched, in transcript order. Every turn asks whether
+    /// it is among them on every frame, so membership is a lookup.
+    find_matches: indexmap::IndexSet<String>,
     find_disclosure: find::Disclosure,
     child_find_disclosure: HashMap<String, find::Disclosure>,
     find_index: usize,
@@ -4240,7 +4242,7 @@ impl Runtime {
             fork_seen: None,
             files: None,
             find: None,
-            find_matches: Vec::new(),
+            find_matches: indexmap::IndexSet::new(),
             find_disclosure: find::Disclosure::default(),
             child_find_disclosure: HashMap::new(),
             find_index: 0,
@@ -11965,7 +11967,7 @@ impl Cagents {
                         )));
                     }
                 }
-                return self.update(Message::ChatUi(Action::Ready(target, ready)));
+                return self.dispatch(Message::ChatUi(Action::Ready(target, ready)));
             }
             Action::ResumeCommitted(target, ready, result) => {
                 match result {
@@ -11992,11 +11994,11 @@ impl Cagents {
                         });
                         return Task::batch([
                             retire,
-                            self.update(Message::ChatUi(Action::Ready(target, ready))),
+                            self.dispatch(Message::ChatUi(Action::Ready(target, ready))),
                         ]);
                     }
                 }
-                return self.update(Message::ChatUi(Action::Ready(target, ready)));
+                return self.dispatch(Message::ChatUi(Action::Ready(target, ready)));
             }
             Action::AccountCommitted(target, ready, result) => {
                 match result {
@@ -12017,7 +12019,7 @@ impl Cagents {
                         )));
                     }
                 }
-                return self.update(Message::ChatUi(Action::Ready(target, ready)));
+                return self.dispatch(Message::ChatUi(Action::Ready(target, ready)));
             }
             Action::DraftStartCheckpointed(target, attempt, result) => {
                 return self.draft_start_checkpointed(target, attempt, result);
@@ -14056,7 +14058,7 @@ impl Cagents {
                 // Through the app's own dispatch, so every guard a pressed row
                 // passes, such as a remote device refusing local files, holds
                 // for Enter too.
-                let task = self.update(Message::ChatUi(chosen));
+                let task = self.dispatch(Message::ChatUi(chosen));
                 if !refocus {
                     return task;
                 }

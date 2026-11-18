@@ -2904,6 +2904,146 @@ fn a_request_that_panics_is_answered_and_the_connection_keeps_serving() {
     assert!(host.lock().unwrap().clients.is_empty());
 }
 
+/// A terminal's worker can publish an event after a client attaches but
+/// before its reply and replay are queued. That event must still reach the
+/// client after them: ahead of the reply it would make the client retry, and
+/// ahead of the replay it would advance the client's cursor past older events.
+#[test]
+fn a_live_event_follows_the_attach_reply_and_its_replay() {
+    use crate::terminal::{TerminalConfig, TerminalEvent, TerminalHandle};
+
+    fn attach_then_publish(
+        host: &SharedHost,
+        client_id: ClientId,
+        request: ClientRequest,
+    ) -> Result<RequestOutcome, ProtocolError> {
+        let attached = match &request {
+            ClientRequest::Attach { terminal_id, .. } => Some(*terminal_id),
+            _ => None,
+        };
+        let outcome = process_request(host, client_id, request);
+        if let Some(terminal_id) = attached {
+            crate::host::state::record_event(
+                &Arc::downgrade(host),
+                terminal_id,
+                TerminalEvent::ConversationTitleChanged("Live".into()),
+            );
+        }
+        outcome
+    }
+
+    let (proof, host) = panic_test_host("attach-replay-order");
+    let recipe = crate::model::LaunchRecipe {
+        unset_environment: Default::default(),
+        program: "/bin/cat".into(),
+        arguments: Vec::new(),
+        working_directory: "/".into(),
+        environment: Default::default(),
+    };
+    let session = crate::model::TerminalSession {
+        recovery_origin: None,
+        predecessor: None,
+        owned_codex_listener: None,
+        id: TerminalId::new(),
+        launch: recipe.clone(),
+        transcript_path: None,
+        resume_hint: None,
+        continuity: crate::model::TerminalContinuity::RelaunchAvailable {
+            recipe,
+            last_exit: None,
+        },
+    };
+    let terminal_id = session.id;
+    let handle = TerminalHandle::spawn(session.clone(), TerminalConfig::default(), |_| {}).unwrap();
+    host.lock()
+        .unwrap()
+        .finish_spawn(2, session, handle.clone(), false)
+        .unwrap();
+    crate::host::state::record_event(
+        &Arc::downgrade(&host),
+        terminal_id,
+        TerminalEvent::ConversationTitleChanged("Replayed".into()),
+    );
+
+    let (mut stream, server_stream) = UnixStream::pair().unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let server_host = Arc::clone(&host);
+    let server =
+        thread::spawn(move || serve_with(server_stream, 1, server_host, attach_then_publish));
+    let mut writer = FrameCodec::new(MAX_CLIENT_FRAME_BYTES);
+    let mut reader = FrameCodec::new(MAX_FRAME_BYTES);
+    let mut send = |request_id, request| {
+        writer
+            .write(
+                &mut stream,
+                &ClientEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id,
+                    proof: Some(proof.clone()),
+                    request,
+                },
+            )
+            .unwrap();
+    };
+    send(
+        1,
+        ClientRequest::Connect {
+            expected_host: Some(proof.clone()),
+            resume: Vec::new(),
+        },
+    );
+    send(
+        2,
+        ClientRequest::Attach {
+            terminal_id,
+            after_generation: 0,
+            after_event_sequence: 0,
+        },
+    );
+    let mut order = Vec::new();
+    while !order.iter().any(|step: &String| step == "event 2") {
+        let envelope = reader
+            .read::<ServerEnvelope>(&mut stream)
+            .unwrap()
+            .expect("the connection stays open");
+        order.push(match envelope.message {
+            ServerMessage::Response {
+                response: ServerResponse::Connected { .. },
+            } => "connected".into(),
+            ServerMessage::Response {
+                response: ServerResponse::Attached { .. },
+            } => "attached".into(),
+            ServerMessage::Event {
+                terminal_id: id,
+                sequence,
+                ..
+            } if id == terminal_id => format!("event {sequence}"),
+            ServerMessage::Synchronized {
+                terminal_id: id,
+                event_sequence,
+                ..
+            } if id == terminal_id => format!("synchronized {event_sequence}"),
+            _ => continue,
+        });
+    }
+    assert_eq!(
+        order,
+        [
+            "connected",
+            "attached",
+            "event 1",
+            "synchronized 1",
+            "event 2"
+        ]
+    );
+
+    drop(stream);
+    server.join().unwrap();
+    handle.shutdown().unwrap();
+}
+
 #[test]
 fn a_client_thread_that_unwinds_unregisters_its_client_and_releases_its_writer() {
     let (_, host) = panic_test_host("unwinding-client");

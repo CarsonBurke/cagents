@@ -1278,6 +1278,7 @@ dependencies = [
  "iced_accessibility",
  "image",
  "imara-diff",
+ "indexmap",
  "jiff",
  "keyboard-types",
  "libc",

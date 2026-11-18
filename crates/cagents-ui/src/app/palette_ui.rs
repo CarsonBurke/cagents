@@ -443,7 +443,7 @@ impl Cagents {
                 } else {
                     Task::none()
                 };
-                navigation.chain(self.update(Message::FocusCard(id)))
+                navigation.chain(self.dispatch(Message::FocusCard(id)))
             }
             Action::Submit => {
                 let Some(selected) = self.palette.selected.as_ref() else {
@@ -477,7 +477,7 @@ impl Cagents {
         self.palette.query = None;
         self.palette.move_pane = None;
         self.palette.selected = None;
-        let command = self.update(message);
+        let command = self.dispatch(message);
         let save = if self.settings_path.is_some() {
             self.save_settings_task(false)
         } else {
@@ -593,7 +593,7 @@ impl Cagents {
                     });
                     if self.palette.filtering_key {
                         self.palette.filtering_key = false;
-                        let task = self.update(Message::SettingsSearchChanged(chord));
+                        let task = self.dispatch(Message::SettingsSearchChanged(chord));
                         // Match the event, rather than one spelling: a shifted
                         // number key can trigger both digit and symbol chords.
                         self.palette.pressed_key_filter = Some(event.clone());
@@ -1232,14 +1232,14 @@ impl Cagents {
             Command::NewThread => {
                 self.update_chrome(chrome_ui::Action::Launch(chrome_ui::NewTab::Thread))
             }
-            Command::ToggleInspector => self.update(Message::ToggleContextInspector),
-            Command::OpenSettings => self.update(Message::Sidebar(SidebarAction::OpenSettings)),
-            Command::NewTerminal => self.update(Message::NewTerminal),
+            Command::ToggleInspector => self.dispatch(Message::ToggleContextInspector),
+            Command::OpenSettings => self.dispatch(Message::Sidebar(SidebarAction::OpenSettings)),
+            Command::NewTerminal => self.dispatch(Message::NewTerminal),
             Command::NewChannel => self.new_project_channel(),
             Command::ClonePane => self.clone_focused_pane(),
             Command::CloseFocusedCard => close_focused_message(&self.workspace)
-                .map_or_else(Task::none, |message| self.update(message)),
-            Command::FocusProjectSearch => self.update(Message::FocusProjectSearch),
+                .map_or_else(Task::none, |message| self.dispatch(message)),
+            Command::FocusProjectSearch => self.dispatch(Message::FocusProjectSearch),
             Command::FindInPane => {
                 if self.settings_card_focused() {
                     return iced::widget::operation::focus(crate::settings_widgets::search_id())
@@ -1247,7 +1247,7 @@ impl Cagents {
                 }
                 match self.focused_editable_repository_card() {
                     Some(card) => {
-                        self.update(Message::Repository(RepositoryAction::OpenFind { card }))
+                        self.dispatch(Message::Repository(RepositoryAction::OpenFind { card }))
                     }
                     None => {
                         if let Some(task) = self.open_chat_find() {
@@ -1262,8 +1262,8 @@ impl Cagents {
                     }
                 }
             }
-            Command::FocusAdjacent(direction) => self.update(Message::FocusAdjacent(direction)),
-            Command::CyclePaneWidth => self.update(Message::CyclePaneWidth),
+            Command::FocusAdjacent(direction) => self.dispatch(Message::FocusAdjacent(direction)),
+            Command::CyclePaneWidth => self.dispatch(Message::CyclePaneWidth),
             Command::CycleWorkspace(direction) => self.cycle_workspace(direction, modifiers),
             Command::MovePaneLeft | Command::MovePaneRight => {
                 let Some(id) = self.workspace.focused() else {
@@ -1322,7 +1322,7 @@ impl Cagents {
                     _ => 8,
                 };
                 let card = self.workspace.order().nth(index);
-                card.map_or_else(Task::none, |id| self.update(Message::FocusCard(id)))
+                card.map_or_else(Task::none, |id| self.dispatch(Message::FocusCard(id)))
             }
             Command::ReviewToggleViewed
             | Command::ReviewNextFile

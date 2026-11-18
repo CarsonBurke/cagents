@@ -135,7 +135,7 @@ impl Cagents {
                     if let sidebar::SelectionRow::Project(project) = row {
                         let expanded = self.sidebar_state.project_expanded(project);
                         if expanded == (key == Named::ArrowLeft) {
-                            return ControlFlow::Break(self.update(Message::Sidebar(SidebarAction::ToggleProject(project))));
+                            return ControlFlow::Break(self.dispatch(Message::Sidebar(SidebarAction::ToggleProject(project))));
                         }
                     }
                     return ControlFlow::Break(Task::none());
