@@ -16209,9 +16209,8 @@ fn an_agents_never_named_conversation_stays_its_card_when_its_daemon_is_gone() {
         CardKind::Chat(session.clone()),
         "the card still names the conversation the agent ran"
     );
-    let runtime = chat_runtime(&app, card);
-    assert!(!runtime.is_draft());
-    assert!(!runtime.session.is_unstarted());
+    // It reports why it can't reopen instead of opening as a draft.
+    assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));
     assert_eq!(
         attach_failure_details(&app, card),
         Some(super::unnamed_agent_conversation(&session))

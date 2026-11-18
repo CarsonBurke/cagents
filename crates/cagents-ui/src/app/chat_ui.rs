@@ -1122,8 +1122,6 @@ fn draft_start_backend() -> Option<(String, String, String)> {
     })
 }
 
-/// Why sending cannot move a conversation to another account yet: a
-/// background subagent holds it, which the daemon would refuse to close.
 /// Why an agent's card that never saved its provider's conversation ID can't
 /// reopen it. The agent stays open, so Close is how the reader ends it.
 fn unnamed_agent_conversation(session: &chat::Session) -> String {
@@ -1133,6 +1131,8 @@ fn unnamed_agent_conversation(session: &chat::Session) -> String {
     )
 }
 
+/// Why sending cannot move a conversation to another account yet: a
+/// background subagent holds it, which the daemon would refuse to close.
 fn account_switch_hold(snapshot: &chat::Snapshot) -> Option<String> {
     let hold = snapshot.work_hold();
     let held = hold.subagents();
