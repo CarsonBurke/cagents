@@ -2363,6 +2363,101 @@ fn a_non_fast_forward_push_is_reported_as_not_pushed() {
     );
 }
 
+/// Git pushes to every push URL a remote configures, and each reports on its
+/// own. One refusing the branch while another accepts it is not a push that
+/// definitively did not happen: claiming so would hide that the branch is now
+/// published somewhere.
+#[test]
+fn a_push_refused_by_only_some_destinations_is_not_reported_as_not_pushed() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let published = publish_main(&fixture);
+    let destinations = ["first-push.git", "second-push.git"].map(|name| {
+        let destination = fixture.root.path().join(name);
+        fixture.run(
+            fixture.root.path(),
+            &[
+                "clone",
+                "--quiet",
+                "--bare",
+                fixture.origin().to_str().unwrap(),
+                destination.to_str().unwrap(),
+            ],
+        );
+        fixture.git_in_work(&[
+            "config",
+            "--add",
+            "remote.origin.pushurl",
+            destination.to_str().unwrap(),
+        ]);
+        destination
+    });
+    // Another clone has moved a destination's branch on, so a fast-forward
+    // from this worktree is refused there.
+    let diverge = |destination: &Path| {
+        let tree = fixture.text(&["rev-parse", "HEAD^{tree}"]);
+        let commit = String::from_utf8(fixture.run(
+            destination,
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                published.as_str(),
+                "-m",
+                "elsewhere",
+            ],
+        ))
+        .unwrap();
+        fixture.run(
+            destination,
+            &["update-ref", "refs/heads/main", commit.trim()],
+        );
+        commit.trim().to_owned()
+    };
+    let main_at = |destination: &Path| {
+        String::from_utf8(fixture.run(destination, &["rev-parse", "refs/heads/main"]))
+            .unwrap()
+            .trim()
+            .to_owned()
+    };
+    let request = PushRequest {
+        worktree: fixture.work(),
+        branch: ValidatedBranchName::parse("main").unwrap(),
+        target: PushTarget::Upstream {
+            remote: "origin".into(),
+            remote_ref: ValidatedRefName::parse("refs/heads/main").unwrap(),
+        },
+    };
+
+    let first_tip = diverge(&destinations[0]);
+    fixture.write("a.txt", b"local\n");
+    let local = fixture.commit_all("local");
+    let outcome = fixture
+        .service()
+        .push(&request, &CancellationToken::new())
+        .expect("push");
+    assert_eq!(main_at(&destinations[0]), first_tip);
+    assert_eq!(main_at(&destinations[1]), local.as_str());
+    assert!(
+        matches!(outcome, PushOutcome::OutcomeUnknown { .. }),
+        "the second destination took the branch: {outcome:?}"
+    );
+
+    // Refused by every destination, it is definitively not pushed.
+    let second_tip = diverge(&destinations[1]);
+    let outcome = fixture
+        .service()
+        .push(&request, &CancellationToken::new())
+        .expect("push");
+    assert!(
+        matches!(outcome, PushOutcome::NotPushed { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(main_at(&destinations[0]), first_tip);
+    assert_eq!(main_at(&destinations[1]), second_tip);
+}
+
 #[test]
 fn an_ambiguous_push_is_reconciled_against_the_remote() {
     let Some(fixture) = Fixture::new() else {

@@ -2766,24 +2766,34 @@ fn parse_batch_blobs(
     Ok(objects)
 }
 
-/// The push status flag Git printed for one refspec, or `None` when the
-/// refspec is absent from the output.
+/// Whether Git's porcelain output proves that no destination took the update.
 ///
 /// `--porcelain` lines are `<flag> TAB <from>:<to> TAB <summary>`, and `!`
-/// means the remote refused the update, which is definitive evidence that the
-/// remote ref did not move.
-fn push_ref_flag(output: &[u8], refspec: &str) -> Option<u8> {
-    for line in output.split(|byte| *byte == b'\n') {
-        let mut columns = line.split(|byte| *byte == b'\t');
-        let flag = columns.next()?;
-        let Some(pair) = columns.next() else {
-            continue;
-        };
-        if pair == refspec.as_bytes() {
-            return Some(flag.first().copied().unwrap_or(b' '));
-        }
-    }
-    None
+/// means a remote refused the update, which is definitive evidence that its
+/// ref did not move. A remote with several push URLs is pushed to each in
+/// turn, each reporting under its own `To` header, and one can refuse what
+/// another accepted. So the push was refused only when every destination it
+/// was sent to reported `!`; a destination that reported nothing, perhaps
+/// because it could not be reached, proves nothing either way. Without the
+/// captured destination list there is no count to hold the report to.
+fn push_refused_everywhere(
+    output: &[u8],
+    refspec: &str,
+    destinations: Option<&[OsString]>,
+) -> bool {
+    let flags: Vec<u8> = output
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| {
+            let mut columns = line.split(|byte| *byte == b'\t');
+            let flag = columns.next()?;
+            (columns.next()? == refspec.as_bytes()).then(|| flag.first().copied().unwrap_or(b' '))
+        })
+        .collect();
+    destinations.is_some_and(|destinations| {
+        !destinations.is_empty()
+            && flags.len() == destinations.len()
+            && flags.iter().all(|flag| *flag == b'!')
+    })
 }
 
 /// Classifies raw bytes without ever decoding them lossily.
@@ -5804,12 +5814,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 });
             }
             Ok(output) => {
-                let rejected = push_ref_flag(&output.stdout, &refspec) == Some(b'!');
+                let rejected =
+                    push_refused_everywhere(&output.stdout, &refspec, destinations.as_deref());
                 let failure = git_failure(&command, output);
                 if rejected {
-                    // `!` is Git reporting that the remote refused this exact
-                    // update, so the remote ref definitively did not move and
-                    // there is nothing ambiguous to reconcile.
+                    // Every destination refused this exact update, so no
+                    // remote ref moved and there is nothing to reconcile.
                     return Ok(PushOutcome::NotPushed {
                         failure: failure.into(),
                     });
@@ -5822,7 +5832,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 });
             }
             Err(failure) => {
-                if push_ref_flag(&failure.stdout, &refspec) == Some(b'!') {
+                if push_refused_everywhere(&failure.stdout, &refspec, destinations.as_deref()) {
                     return Ok(PushOutcome::NotPushed {
                         failure: failure.into(),
                     });
@@ -10820,6 +10830,45 @@ mod tests {
         assert!(matches!(outcome, PushOutcome::NotPushed { .. }));
         // No endpoint lookup follows rejection; only private preflight configuration reads run.
         assert_eq!(service.executor.commands.lock().unwrap().len(), 8);
+    }
+
+    #[test]
+    fn a_push_is_refused_only_when_every_destination_refused_it() {
+        let refspec = "refs/heads/main:refs/heads/main";
+        let refused = |url: &str| {
+            format!("To {url}\n!\t{refspec}\t[rejected] (fetch first)\nDone\n").into_bytes()
+        };
+        let accepted =
+            |url: &str| format!("To {url}\n \t{refspec}\taaaa..bbbb\nDone\n").into_bytes();
+        let one = [OsString::from("/a")];
+        let two = [OsString::from("/a"), OsString::from("/b")];
+
+        assert!(push_refused_everywhere(&refused("/a"), refspec, Some(&one)));
+        assert!(push_refused_everywhere(
+            &[refused("/a"), refused("/b")].concat(),
+            refspec,
+            Some(&two)
+        ));
+        // The second destination took the branch.
+        assert!(!push_refused_everywhere(
+            &[refused("/a"), accepted("/b")].concat(),
+            refspec,
+            Some(&two)
+        ));
+        // The second destination reported nothing, so it may or may not have.
+        assert!(!push_refused_everywhere(
+            &refused("/a"),
+            refspec,
+            Some(&two)
+        ));
+        // A refusal of some other ref says nothing about this one.
+        assert!(!push_refused_everywhere(
+            b"To /a\n!\trefs/heads/x:refs/heads/x\t[rejected]\nDone\n",
+            refspec,
+            Some(&one)
+        ));
+        // Without the destinations Git pushed to, nothing can be counted.
+        assert!(!push_refused_everywhere(&refused("/a"), refspec, None));
     }
 
     #[test]
