@@ -408,6 +408,31 @@ class CodexToolRowsFixture(unittest.TestCase):
                     scenario.request({"id": 1, "method": "turn/start", "params": {
                         "threadId": scenario.thread}}, home)
 
+    def test_a_held_turn_start_answers_after_its_delay_and_accepts_a_steer_once_known(self):
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as home:
+            Path(home, "fixture-turn-start-delay").write_text("5\n")
+            scenario = PEER["Scenario"]()
+            replies = scenario.request({"id": 1, "method": "turn/start", "params": {
+                "threadId": scenario.thread}}, home)
+            self.assertEqual(replies[0], {"_sleep": 5})
+            self.assertEqual(replies[1]["id"], 1)
+            turn = replies[1]["result"]["turn"]["id"]
+            self.assertEqual(replies[2]["method"], "turn/started")
+            steer = scenario.request({"id": 2, "method": "turn/steer", "params": {
+                "threadId": scenario.thread, "expectedTurnId": turn,
+                "input": [{"type": "text", "text": "and then"}]}}, home)
+            self.assertEqual(steer, [{"id": 2, "result": {"turnId": turn}}])
+            stale = scenario.request({"id": 3, "method": "turn/steer", "params": {
+                "threadId": scenario.thread, "expectedTurnId": "earlier",
+                "input": [{"type": "text", "text": "and then"}]}}, home)
+            self.assertIn("error", stale[0])
+            for invalid in ("NaN", "-1", "31"):
+                Path(home, "fixture-turn-start-delay").write_text(invalid)
+                scenario = PEER["Scenario"]()
+                with self.assertRaisesRegex(ValueError, "seconds between 0 and 30"):
+                    scenario.request({"id": 1, "method": "turn/start", "params": {
+                        "threadId": scenario.thread}}, home)
+
     def test_parent_and_child_complete_after_the_pause_without_phantom_work(self):
         scenario = PEER["Scenario"]()
         replies = scenario.request({"id": 1, "method": "turn/start", "params": {

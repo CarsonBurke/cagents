@@ -36,6 +36,9 @@ With CODEX_HOME/fixture-plan present, the ordinary turn also publishes a plan
 with one step done, one in progress and one pending, and finishes it before
 completing. The file may hold whole seconds for the turn to stay working,
 instead of the usual pause, so a slow capture still finds it running.
+CODEX_HOME/fixture-turn-start-delay may hold seconds, up to 30, to hold each
+turn/start response and the turn's notifications, so a prompt can be seen
+accepted before its turn has begun. A steer of the active turn is accepted.
 With CODEX_HOME/fixture-unnamed-child present, the collaboration calls and the
 thread listing report the child without a nickname, as Codex can before it has
 named one; only the child's own thread read reports it as Quinn.
@@ -534,6 +537,24 @@ class Scenario:
             after = self.notifications(turn, starts_child, pause=pause, web_rows=web_rows,
                                        diagnostics=diagnostics, plan=plan,
                                        unnamed_child=(Path(codex_home) / "fixture-unnamed-child").is_file())
+            held = Path(codex_home) / "fixture-turn-start-delay"
+            if held.is_file():
+                # Codex learns a turn's id only from this response or its
+                # turn/started notification; holding both shows the moment
+                # between a prompt's acceptance and its turn.
+                try:
+                    delay = float(held.read_text())
+                    if not 0 <= delay <= 30:
+                        raise ValueError()
+                except ValueError:
+                    raise ValueError("fixture-turn-start-delay must hold seconds between 0 and 30") from None
+                return [{"_sleep": delay}, {"id": identifier, "result": result}, *after]
+        elif method == "turn/steer":
+            latest = self.latest if params.get("threadId") == self.thread else None
+            if (latest is None or latest["status"] != "inProgress"
+                    or params.get("expectedTurnId") != latest["id"]):
+                return [{"id": identifier, "error": {"code": -32602, "message": "No matching active fixture turn"}}]
+            result = {"turnId": latest["id"]}
         elif method == "turn/interrupt":
             thread = params.get("threadId")
             if thread not in (self.thread, self.child):
