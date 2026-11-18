@@ -2376,7 +2376,8 @@ fn settings_lock(path: &Path) -> Result<crate::instance::OwnedLock, SettingsErro
 }
 
 /// Applies only fields this window changed since its last successful save.
-/// Nested shortcut tables merge by action; list-valued preferences are atomic.
+/// Nested shortcut tables merge by action; list-valued preferences and
+/// [`ATOMIC_SETTINGS`] are replaced whole.
 pub fn save_merged(
     path: impl AsRef<Path>,
     base: &AppSettings,
@@ -2390,11 +2391,25 @@ pub fn save_merged(
         &toml::Value::try_from(base)?,
         &toml::Value::try_from(desired)?,
         &mut current,
+        &ATOMIC_SETTINGS,
     );
     save_unlocked(path, &current.try_into::<AppSettings>()?.validate()?)
 }
 
-fn merge_changed_fields(base: &toml::Value, desired: &toml::Value, current: &mut toml::Value) {
+/// Settings chosen as a whole. Merging a palette color by color could save
+/// one that neither window chose.
+const ATOMIC_SETTINGS: [&str; 2] = ["terminal_theme", "custom_terminal_theme"];
+
+/// Writes into `current` what changed from `base` to `desired`. Keys named in
+/// `atomic` apply at this level only. A changed entry that `current` lacks is
+/// written whole, even when it is a table the window edited one field of:
+/// its other fields may be required, so a partial table could not load.
+fn merge_changed_fields(
+    base: &toml::Value,
+    desired: &toml::Value,
+    current: &mut toml::Value,
+    atomic: &[&str],
+) {
     if base == desired {
         return;
     }
@@ -2409,7 +2424,9 @@ fn merge_changed_fields(base: &toml::Value, desired: &toml::Value, current: &mut
                 continue;
             }
             match (previous, current.get_mut(key)) {
-                (Some(previous), Some(current)) => merge_changed_fields(previous, value, current),
+                (Some(previous), Some(current)) if !atomic.contains(&key.as_str()) => {
+                    merge_changed_fields(previous, value, current, &[]);
+                }
                 _ => {
                     current.insert(key.clone(), value.clone());
                 }
@@ -3919,6 +3936,57 @@ mod tests {
         };
         save_merged(&path, &base, &resized).unwrap();
         assert_eq!(load(&path).unwrap().editor_font_size, Some(14.0));
+    }
+
+    #[test]
+    fn a_palette_is_saved_whole_rather_than_merged_color_by_color() {
+        use crate::terminal::{TerminalTheme, ThemeColor};
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let palette = TerminalTheme::Dracula.palette();
+        let base = AppSettings {
+            terminal_theme: TerminalTheme::Custom(palette),
+            ..AppSettings::default()
+        }
+        .validate()
+        .unwrap();
+        save(&path, &base).unwrap();
+
+        let mut first = palette;
+        first.background = ThemeColor(0x112233);
+        let first = AppSettings {
+            terminal_theme: TerminalTheme::Custom(first),
+            custom_terminal_theme: Some(first),
+            ..base.clone()
+        };
+        save_merged(&path, &base, &first).unwrap();
+        let mut second = palette;
+        second.foreground = ThemeColor(0x445566);
+        let second = AppSettings {
+            terminal_theme: TerminalTheme::Custom(second),
+            custom_terminal_theme: Some(second),
+            ..base.clone()
+        };
+        save_merged(&path, &base, &second).unwrap();
+
+        let restored = load(&path).unwrap();
+        assert_eq!(restored.terminal_theme, second.terminal_theme);
+        assert_eq!(restored.custom_terminal_theme, second.custom_terminal_theme);
+    }
+
+    #[test]
+    fn a_changed_entry_another_window_removed_is_written_whole() {
+        let base: toml::Value = toml::toml! {
+            [entries.kept]
+            size = 1
+            shape = "round"
+        }
+        .into();
+        let mut desired = base.clone();
+        desired["entries"]["kept"]["size"] = 2.into();
+        let mut current: toml::Value = toml::toml! { [entries] }.into();
+        merge_changed_fields(&base, &desired, &mut current, &[]);
+        assert_eq!(current, desired);
     }
 
     #[test]
