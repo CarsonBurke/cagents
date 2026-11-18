@@ -2582,8 +2582,6 @@ impl Claude {
         }
     }
 
-    /// Whether a call started a conversation inside one of this
-    /// conversation's agents, rather than one of its own.
     /// Remember what a frame from inside an agent, or a task's lifecycle,
     /// says runs nested, whatever depth that agent is at.
     fn observe_nested(&mut self, frame: &Value) {
@@ -2603,6 +2601,8 @@ impl Claude {
         }
     }
 
+    /// Whether a call started a conversation inside one of this
+    /// conversation's agents, rather than one of its own.
     fn nested_call(&self, tool: &str) -> bool {
         !self.tools.contains_key(&ScopedId::new(None, tool))
             && (self.nested_calls.contains(tool) || self.nested_agent_tool(tool))
