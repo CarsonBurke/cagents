@@ -152,6 +152,7 @@ STUBS = {
     "magick": """
         #!/bin/bash
         if [ "$1" = identify ]; then printf '1500x900'; exit 0; fi
+        printf '%s\\n' "$*" >> "$STUB_LOG/magick"
         cp "$1" "${@: -1}"
     """,
     "rustup": """
@@ -1615,6 +1616,14 @@ class Evidence(unittest.TestCase):
         self.assertEqual(self.run_tool("shot", "bad/name", check=False).returncode, 2)
         self.run_tool("shot", "empty-state")
         self.assertEqual(len((self.task / "shots" / "manifest.tsv").read_text().splitlines()), 1)
+        self.assertIn("-quality 92", (self.logs / "magick").read_text().splitlines()[-1])
+        self.run_tool("shot", "edges", "--lossless")
+        self.assertIn("-define webp:lossless=true",
+                      (self.logs / "magick").read_text().splitlines()[-1])
+        self.assertIn("after-edges.webp", (self.task / "shots" / "manifest.tsv").read_text())
+        self.assertEqual(self.run_tool("shot", "edges", "--lossy", check=False).returncode, 2)
+        self.assertEqual(
+            self.run_tool("shot", "edges", "--lossless", "extra", check=False).returncode, 2)
 
         second = self.run_tool("start", "after", check=False)
         self.assertEqual(second.returncode, 1)
@@ -2423,7 +2432,8 @@ REMOTE_TOOL = """
         status) [ ! -e "$STUB_LOG/status-holds" ] || exec /usr/bin/python3 "$STUB_LOG/hold.py"
                 [ -e "$task/side" ] && echo "session: $(cat "$task/side"), pid 1, ready" || echo 'session: none'
                 sleep 0.2; echo "native slots: 3 free of 3" ;;
-        shot) printf 'webp' > "$task/shots/$(cat "$task/side")-$2.webp"
+        shot) printf '%s\\n' "$*" > "$task/shot-arguments"
+              printf 'webp' > "$task/shots/$(cat "$task/side")-$2.webp"
               printf '%s\\tREV\\n' "$(cat "$task/side")-$2.webp" >> "$task/shots/manifest.tsv" ;;
         build) [ ! -e "$task/build-fails" ] || exit 1
                printf '%s\\n' "$3" > "$task/built-$2"; ls "$3" > "$task/files-$2"
@@ -2925,6 +2935,11 @@ class RemoteEvidence(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), str(self.task / "shots" / "after-home.webp"))
         self.assertEqual((self.task / "shots" / "after-home.webp").read_text(), "webp")
         self.assertIn("after-home.webp", (self.task / "shots" / "manifest.tsv").read_text())
+        # Options reach the host's native-evidence, which checks them.
+        result = self.run_tool("shot", "edges", "--lossless")
+        self.assertEqual(result.stdout.strip(), str(self.task / "shots" / "after-edges.webp"))
+        self.assertEqual((self.remote_task / "shot-arguments").read_text().strip(),
+                         "shot edges --lossless")
 
     def test_cli_arguments_name_the_fixture_on_the_host(self) -> None:
         checkout = self.checkout("after", {"src.rs": "\n"})

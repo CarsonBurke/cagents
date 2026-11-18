@@ -93,3 +93,7 @@ punctuation beside it. It maps to cosmic-text's `Attrs::inline_padding`
 ```sh
 cargo test --manifest-path vendor/iced-core/Cargo.toml text::span_metrics_tests
 ```
+
+# Editor overscan (#2824)
+
+`text::Editor` has two default methods, `set_overscan` and `overflow`. They let the widget ask the renderer to lay out and draw lines into its padding, and report how far drawn text currently reaches past the text area. The defaults do nothing and report zero, so editors without overscan behave as upstream. See vendor/cosmic-text/LOCAL_CHANGES.md.

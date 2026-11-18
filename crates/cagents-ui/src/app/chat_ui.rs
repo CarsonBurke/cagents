@@ -10366,6 +10366,35 @@ impl Cagents {
         }
     }
 
+    /// Names an unnamed channel from the first prompt its primary chat
+    /// delivered, and keeps that name as the chat's observation. The
+    /// suggestion can be refused, as when the pane has not yet recorded its
+    /// conversation; a chat on no screen reads no snapshot, so only the kept
+    /// observation offers the name again at the channel's next view.
+    pub(super) fn name_channel_from_prompt(&mut self, target: Target, prompt: &str) {
+        if !self.channel_lacks_name(target.card) {
+            return;
+        }
+        let Some(title) = crate::workspace_model::channel_title_from_prompt(prompt) else {
+            return;
+        };
+        if !self.chat_ui.channel_names.contains_key(&target) {
+            self.chat_ui
+                .channel_names
+                .retain(|previous, _| previous.card != target.card);
+        }
+        let observation = self.chat_ui.channel_names.entry(target).or_default();
+        // A name the conversation already reported is published by its own
+        // observation.
+        if observation.title.is_some() {
+            return;
+        }
+        let source = crate::model::ChannelTitleSource::Prompt;
+        observation.title = Some((title.clone(), source));
+        observation.pending = true;
+        self.publish_observed_channel_name(target, title, source);
+    }
+
     pub(super) fn defer_channel_title_suggestion(
         &mut self,
         edit: &crate::workspace_model::ModelEdit,
@@ -11004,7 +11033,7 @@ impl Cagents {
         }
         runtime.refresh();
         if let Some(prompt) = first_prompt {
-            self.name_channel_from_prompt(target.card, &prompt);
+            self.name_channel_from_prompt(target, &prompt);
         }
         Task::none()
     }
@@ -14077,7 +14106,7 @@ impl Cagents {
                     self.persist();
                 }
                 if let Some(prompt) = first_prompt {
-                    self.name_channel_from_prompt(target.card, &prompt);
+                    self.name_channel_from_prompt(target, &prompt);
                 }
                 // Idle may have arrived while this command was awaiting its
                 // acknowledgement. No later provider event is guaranteed to
@@ -24040,6 +24069,93 @@ pub(in crate::app) mod tests {
         );
         assert!(cosmic::iced::runtime::task::into_stream(task).is_none());
         assert!(app.chat_ui.channel_names[&target].pending);
+    }
+
+    #[test]
+    fn a_refused_first_prompt_name_is_offered_again_from_a_chat_on_no_screen() {
+        use crate::model::{ChannelId, ChannelTitleSource, ProjectChannel, ProjectId};
+        use crate::workspace_model::{
+            ModelEdit,
+            views::{Pane, Scope, View},
+        };
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        // A chat whose provider has not reported its conversation, and whose
+        // window has moved on: it reads no snapshot, so nothing it shows
+        // can name the channel.
+        let card = live_chat_for_provider(&mut app, Provider::Claude, None);
+        let target = chat_runtime(&app, card).target;
+        let id = ChannelId::new();
+        Arc::make_mut(&mut app.durable).channels = vec![ProjectChannel {
+            id,
+            project_id: ProjectId::new(),
+            title: String::new(),
+            title_source: ChannelTitleSource::Manual,
+            ordinal: 0,
+            shared: true,
+            cards: vec![card],
+            focused: Some(card),
+        }];
+        let pane = Pane::from_card(
+            app.card_state(card).unwrap(),
+            app.durable.card_scopes.get(&card).cloned(),
+        )
+        .unwrap();
+        let view = move |revision| View {
+            scope: Scope::Channel(id),
+            revision,
+            retired: Vec::new(),
+            panes: vec![pane.clone()],
+        };
+        app.workspace_model.views = vec![view(5)];
+        let (tx, requests) = super::super::workspace_model_sync::test_model_channel();
+        app.workspace_model_tx = tx;
+        let suggested = |revision| {
+            std::iter::from_fn(|| requests.try_recv().ok()).any(|edit| {
+                matches!(
+                    edit,
+                    ModelEdit::SuggestConversationTitle {
+                        id: channel,
+                        card: pane,
+                        expected_revision,
+                        title,
+                        source: ChannelTitleSource::Prompt,
+                    } if channel == id
+                        && pane == card
+                        && expected_revision == revision
+                        && title == "Plan the quarterly roadmap review"
+                )
+            })
+        };
+
+        app.name_channel_from_prompt(target, "Plan the quarterly roadmap review");
+        assert!(suggested(5));
+        assert_eq!(
+            app.durable.channels[0].title,
+            "Plan the quarterly roadmap review"
+        );
+        // The registry refuses it and the window restores the stored name.
+        Arc::make_mut(&mut app.durable).channels[0].title = String::new();
+
+        // The same view proof does not retry.
+        drop(app.refresh_channel_title_suggestions());
+        assert!(!suggested(5));
+        // The channel's next view offers the name again.
+        app.workspace_model.views = vec![view(6)];
+        drop(app.refresh_channel_title_suggestions());
+        assert!(suggested(6));
+        assert_eq!(
+            app.durable.channels[0].title,
+            "Plan the quarterly roadmap review"
+        );
+
+        // A later prompt never renames a named channel.
+        app.chat_ui.channel_names.clear();
+        app.name_channel_from_prompt(target, "A later prompt must not replace it");
+        assert!(app.chat_ui.channel_names.is_empty());
+        assert_eq!(
+            app.durable.channels[0].title,
+            "Plan the quarterly roadmap review"
+        );
     }
 
     #[test]

@@ -158,8 +158,10 @@ impl editor::Editor for Editor {
             Some((start, end)) => {
                 let line_height = buffer.metrics().line_height;
 
+                // cagents: include the overscan, so a selection carries on
+                // into the text drawn there.
                 let regions = buffer
-                    .layout_runs()
+                    .draw_runs()
                     .filter(|run| {
                         run.line_i >= start.line && run.line_i <= end.line
                     })
@@ -181,7 +183,7 @@ impl editor::Editor for Editor {
             }
             _ => {
                 let point = buffer
-                    .layout_runs()
+                    .draw_runs()
                     .filter(|run| run.line_i == cursor.line)
                     .find_map(|run| {
                         run.cursor_position(&cursor).map(|x| {
@@ -476,6 +478,39 @@ impl editor::Editor for Editor {
         self.internal().bounds
     }
 
+    fn set_overscan(&mut self, above: f32, below: f32) {
+        if self.buffer().overscan() == (above.max(0.0), below.max(0.0)) {
+            return;
+        }
+
+        self.with_internal_mut(|internal| {
+            buffer_mut_from_editor(&mut internal.editor)
+                .set_overscan(above, below);
+        });
+    }
+
+    fn overflow(&self) -> (f32, f32) {
+        let buffer = self.buffer();
+        let (above, below) = buffer.overscan();
+
+        if above == 0.0 && below == 0.0 {
+            return (0.0, 0.0);
+        }
+
+        let height = buffer.size().1.unwrap_or(f32::INFINITY);
+        let (top, bottom) = buffer.draw_runs().fold(
+            (0.0_f32, 0.0_f32),
+            |(top, bottom), run| {
+                (
+                    top.max(-run.line_top),
+                    bottom.max(run.line_top + run.line_height - height),
+                )
+            },
+        );
+
+        (top.min(above), bottom.min(below))
+    }
+
     fn min_bounds(&self) -> Size {
         let internal = self.internal();
 
@@ -580,7 +615,10 @@ impl editor::Editor for Editor {
         let buffer = buffer_from_editor(&internal.editor);
 
         let scroll = buffer.scroll();
-        let mut window = (internal.bounds.height / buffer.metrics().line_height)
+        // cagents: the lines drawn in the overscan below are highlighted
+        // too, so they are drawn in their final font and colors.
+        let mut window = ((internal.bounds.height + buffer.overscan().1)
+            / buffer.metrics().line_height)
             .ceil() as i32;
 
         let last_visible_line = buffer.lines[scroll.line..]

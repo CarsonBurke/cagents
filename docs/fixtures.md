@@ -296,6 +296,11 @@ The `usage-resets` peer also exercises account usage and explicit reset
 consumption with invented credits. The other peers leave the app's account and
 usage-limit handling unexercised, and no peer verifies live account credentials.
 
+With `home/.codex/fixture-unnamed-child` present, the `tool-rows` peer's
+collaboration calls and thread listing report its child without a nickname,
+and only the child's own thread read names it Quinn: a child discovered before
+Codex named it.
+
 The `tool-rows` peer also reads an optional `model/list` result from
 `home/.codex/fixture-models.json`. Its nonempty `data` array needs a `model`
 ID on each entry; `displayName`, `supportedReasoningEfforts`,

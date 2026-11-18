@@ -36,6 +36,9 @@ With CODEX_HOME/fixture-plan present, the ordinary turn also publishes a plan
 with one step done, one in progress and one pending, and finishes it before
 completing. The file may hold whole seconds for the turn to stay working,
 instead of the usual pause, so a slow capture still finds it running.
+With CODEX_HOME/fixture-unnamed-child present, the collaboration calls and the
+thread listing report the child without a nickname, as Codex can before it has
+named one; only the child's own thread read reports it as Quinn.
 """
 import copy
 import fcntl
@@ -69,6 +72,14 @@ def long_history():
     text = (phrase * (size // len(phrase) + 1))[:size]
     return [{"id": f"history-{at}", "type": "agentMessage", "text": f"Step {at}: {text}", "phase": None}
             for at in range(count)]
+
+
+def unnamed(item):
+    """A collaboration call that reports its children without a nickname."""
+    if item is None or "agentsStates" not in item:
+        return item
+    return {**item, "agentsStates": {child: {**state, "agentNickname": None}
+                                     for child, state in item["agentsStates"].items()}}
 
 
 def items(child):
@@ -338,7 +349,8 @@ class Scenario:
                     if self.observe(response, generations):
                         publish(response)
 
-    def notifications(self, turn, starts_child=True, *, pause=PAUSE, web_rows=False, diagnostics=False, plan=None):
+    def notifications(self, turn, starts_child=True, *, pause=PAUSE, web_rows=False, diagnostics=False, plan=None,
+                      unnamed_child=False):
         starts_child = starts_child and not (web_rows or diagnostics)
         def notify(method, **params):
             return {"method": method, "params": {"threadId": self.thread, **params}}
@@ -354,6 +366,8 @@ class Scenario:
                                                    "error": {"message": raw}})]
         started, completed = [], []
         pairs = web_items() if web_rows else items(self.child)
+        if unnamed_child:
+            pairs = [tuple(unnamed(item) for item in pair) for pair in pairs]
         for begin, end in pairs:
             if begin is not None:
                 started.append(notify("item/started", turnId=turn, item=begin))
@@ -434,6 +448,9 @@ class Scenario:
             result = {"data": [] if any((Path(codex_home) / marker).is_file()
                                        for marker in ("fixture-web-rows", "fixture-row-diagnostics"))
                       else [self.metadata(self.child)], "nextCursor": None}
+            if (Path(codex_home) / "fixture-unnamed-child").is_file():
+                for thread in result["data"]:
+                    thread["agentNickname"] = None
         elif method == "thread/turns/list":
             latest = self.latest if params.get("threadId") == self.thread else self.child_latest
             result = {"data": [latest] if latest else [], "nextCursor": None}
@@ -515,7 +532,8 @@ class Scenario:
                 held = marker.read_text().strip()
                 plan = float(held) if held.isdigit() else PAUSE
             after = self.notifications(turn, starts_child, pause=pause, web_rows=web_rows,
-                                       diagnostics=diagnostics, plan=plan)
+                                       diagnostics=diagnostics, plan=plan,
+                                       unnamed_child=(Path(codex_home) / "fixture-unnamed-child").is_file())
         elif method == "turn/interrupt":
             thread = params.get("threadId")
             if thread not in (self.thread, self.child):

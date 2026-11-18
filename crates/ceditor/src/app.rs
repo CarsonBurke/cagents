@@ -36,7 +36,7 @@ use cosmic::{
     widget,
 };
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -61,6 +61,17 @@ pub struct Opened {
     root: PathBuf,
     file: Option<PathBuf>,
     snapshot: Option<RepositorySnapshot>,
+}
+
+/// An untitled note whose Save As chooser is open.
+struct PendingSaveAs {
+    /// The note's scratch file, which identifies it: its tab can move on to
+    /// another note while the chooser is up.
+    scratch: Option<PathBuf>,
+    /// The note's text when the chooser opened. The chooser does not block
+    /// editing, so a note still open in its tab is saved from the live buffer;
+    /// this stands in only once the tab has closed it.
+    text: String,
 }
 
 struct PendingFile {
@@ -540,7 +551,7 @@ pub struct Editor {
     restoring_session: bool,
     saved_session: crate::preferences::Session,
     sidebar_open: bool,
-    pending_save_as: Option<(CardId, String)>,
+    pending_save_as: HashMap<CardId, PendingSaveAs>,
     sidebar_transition: Option<SidebarTransition>,
     /// A shell theme change has landed that the open document pages were not
     /// rendered for. It is recorded rather than acted on, because the notice
@@ -1681,7 +1692,14 @@ impl Editor {
             .and_then(|path| path.file_name())
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| "Untitled".into());
-        self.pending_save_as = Some((id, self.untitled_text(id)));
+        if self.pending_save_as.contains_key(&id) {
+            return Task::none();
+        }
+        let pending = PendingSaveAs {
+            scratch: self.untitled_scratch_path(id),
+            text: self.untitled_text(id),
+        };
+        self.pending_save_as.insert(id, pending);
         cosmic::task::future(async move {
             let dialog = cosmic::dialog::file_chooser::save::Dialog::new()
                 .title("Save note".to_owned())
@@ -1695,12 +1713,9 @@ impl Editor {
         id: CardId,
         result: Result<Option<PathBuf>, String>,
     ) -> Task<Message> {
-        let Some((pending_id, text)) = self.pending_save_as.take() else {
+        let Some(pending) = self.pending_save_as.remove(&id) else {
             return Task::none();
         };
-        if pending_id != id {
-            return Task::none();
-        }
         let path = match result {
             Ok(Some(path)) => path,
             Ok(None) => return Task::none(),
@@ -1716,11 +1731,23 @@ impl Editor {
             self.notice = Some("Choose a location outside Untitled notes.".into());
             return Task::none();
         }
+        // Edits made while the chooser was open belong to the saved note: its
+        // tab is about to close, so anything left out of the file would be lost.
+        let open = self.tab(id).is_some_and(|tab| self.tab_is_untitled(tab))
+            && match (self.untitled_scratch_path(id), &pending.scratch) {
+                (Some(current), Some(chosen)) => paths_equal(&current, chosen),
+                (current, chosen) => current == *chosen,
+            };
+        let text = if open {
+            self.untitled_text(id)
+        } else {
+            pending.text
+        };
         if let Err(error) = create_new_file(&path, &text) {
             self.notice = Some(error);
             return Task::none();
         }
-        if self.tab(id).is_some_and(|tab| self.tab_is_untitled(tab)) {
+        if open {
             self.remove_tab(id);
         }
         if self.exiting {
@@ -2091,34 +2118,44 @@ impl Editor {
         }
     }
 
+    /// The control a close prompt for `id` focuses, or nothing when the tab
+    /// can close without asking the user to save, discard, or wait for a
+    /// background operation.
+    fn close_prompt_focus(&self, id: CardId) -> Option<&'static str> {
+        let tab = self.tab(id)?;
+        // Window shutdown keeps untitled notes on disk for the next session,
+        // so only closing one on its own asks what to do with its text.
+        let untitled_note =
+            !self.exiting && self.tab_is_untitled(tab) && self.untitled_has_content(id);
+        let blocked = tab.runtime.blocks_navigation() || tab.mutation.is_some();
+        if !blocked && !(untitled_note && !self.close_confirmed) {
+            return None;
+        }
+        Some(if untitled_note || tab.runtime.can_save() {
+            "ceditor.close.save"
+        } else if tab.runtime.can_abandon_unsaved_changes() && tab.mutation.is_none() {
+            "ceditor.close.discard"
+        } else {
+            "ceditor.close.cancel"
+        })
+    }
+
     fn request_close(&mut self, id: CardId) -> Task<Message> {
-        let untitled_note = self.tab(id).is_some_and(|tab| self.tab_is_untitled(tab))
-            && self.untitled_has_content(id)
-            && !self.exiting;
-        if self
-            .tab(id)
-            .is_some_and(|tab| tab.runtime.blocks_navigation() || tab.mutation.is_some())
-            || (untitled_note && !self.close_confirmed)
-        {
+        if let Some(focus) = self.close_prompt_focus(id) {
             self.active = Some(id);
             self.closing = Some(id);
             self.close_confirmed = false;
-            let tab = self.tab(id).unwrap();
-            let focus = if untitled_note || tab.runtime.can_save() {
-                "ceditor.close.save"
-            } else if tab.runtime.can_abandon_unsaved_changes() && tab.mutation.is_none() {
-                "ceditor.close.discard"
-            } else {
-                "ceditor.close.cancel"
-            };
             return iced::widget::operation::focus(widget::Id::new(focus)).map(cosmic::Action::App);
         }
-        self.remove_tab(id);
         if self.exiting {
-            self.continue_exit()
-        } else {
-            self.resume_pending_files()
+            // This tab is settled; shutdown closes it with the others once
+            // every tab is, so cancelling a later prompt keeps it open.
+            self.closing = None;
+            self.close_confirmed = false;
+            return self.continue_exit();
         }
+        self.remove_tab(id);
+        self.resume_pending_files()
     }
 
     fn continue_exit(&mut self) -> Task<Message> {
@@ -2130,8 +2167,18 @@ impl Editor {
             return Task::none();
         }
 
-        if let Some(tab) = self.tabs.first() {
-            return self.request_close(tab.id);
+        // Settle every tab before closing any: a cancelled prompt must leave
+        // the window exactly as it was.
+        if let Some(id) = self
+            .tabs
+            .iter()
+            .map(|tab| tab.id)
+            .find(|id| self.close_prompt_focus(*id).is_some())
+        {
+            return self.request_close(id);
+        }
+        for id in self.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>() {
+            self.remove_tab(id);
         }
         let reaped = self.lsp.begin_shutdown();
         cosmic::task::future(async move {
@@ -3059,7 +3106,7 @@ impl Application for Editor {
             restoring_session: !startup_paths.is_empty(),
             saved_session,
             sidebar_open,
-            pending_save_as: None,
+            pending_save_as: HashMap::new(),
             sidebar_transition: None,
             document_tone_stale: false,
             sidebar_panel: WorktreePanel::Files,
@@ -6729,7 +6776,7 @@ mod tests {
             restoring_session: false,
             saved_session: crate::preferences::Session::default(),
             sidebar_open: true,
-            pending_save_as: None,
+            pending_save_as: HashMap::new(),
             sidebar_transition: None,
             document_tone_stale: false,
             sidebar_panel: WorktreePanel::Files,
@@ -9300,7 +9347,7 @@ mod tests {
         );
         let destination = directory.path().join("kept.md");
         let scratch = app.untitled_scratch_path(id).unwrap();
-        app.pending_save_as = Some((id, app.untitled_text(id)));
+        drop(app.save_as(id));
         drop(app.finish_save_as(id, Ok(Some(destination.clone()))));
         assert!(!scratch.exists());
         assert_eq!(
@@ -9317,6 +9364,150 @@ mod tests {
         assert_eq!(app.tab(opened).unwrap().title, "kept.md");
     }
 
+    fn paste(app: &mut Editor, id: CardId, text: &str) {
+        drop(
+            app.update(Message::Repository(RepositoryAction::EditorAction {
+                card: id,
+                action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Paste(
+                    Arc::new(text.into()),
+                )),
+            })),
+        );
+    }
+
+    #[test]
+    fn save_as_keeps_edits_made_while_the_chooser_is_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = configured(&directory);
+        drop(app.update(Message::NewTab));
+        let id = app.active.unwrap();
+        load_selected(&mut app, id);
+        paste(&mut app, id, "before the chooser\n");
+        let scratch = app.untitled_scratch_path(id).unwrap();
+        drop(app.save_as(id));
+        // The system chooser leaves the editor usable, and a paste requested
+        // before it opened can land while it is up.
+        paste(&mut app, id, "while choosing\n");
+
+        let destination = directory.path().join("note.md");
+        drop(app.finish_save_as(id, Ok(Some(destination.clone()))));
+
+        assert_eq!(
+            std::fs::read_to_string(&destination).unwrap(),
+            "before the chooser\nwhile choosing\n"
+        );
+        assert!(app.tab(id).is_none());
+        assert!(!scratch.exists());
+        assert!(app.pending_save_as.is_empty());
+    }
+
+    #[test]
+    fn save_as_saves_the_chosen_note_after_its_tab_opens_another() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = configured(&directory);
+        drop(app.update(Message::NewTab));
+        let id = app.active.unwrap();
+        let first = app.untitled_scratch_path(id).unwrap();
+        std::fs::write(&first, "first note\n").unwrap();
+        load_selected(&mut app, id);
+        drop(app.save_as(id));
+
+        let second = first.with_file_name("Untitled-2");
+        std::fs::write(&second, "second note\n").unwrap();
+        let request = app.tab(id).unwrap().next_open;
+        drop(app.request_file(id, "Untitled-2".into()));
+        drop(app.update(Message::FileResolved(id, request, Ok(second.clone()))));
+        load_selected(&mut app, id);
+        assert_eq!(app.untitled_text(id), "second note\n");
+
+        let destination = directory.path().join("first.md");
+        drop(app.finish_save_as(id, Ok(Some(destination.clone()))));
+
+        assert_eq!(
+            std::fs::read_to_string(&destination).unwrap(),
+            "first note\n"
+        );
+        assert!(app.tab(id).is_some(), "the tab now shows a different note");
+        assert_eq!(
+            std::fs::read_to_string(&second).unwrap(),
+            "second note\n"
+        );
+    }
+
+    #[test]
+    fn concurrent_save_as_choosers_each_save_their_own_note() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = configured(&directory);
+        let mut notes = Vec::new();
+        for text in ["first\n", "second\n"] {
+            drop(app.update(Message::NewTab));
+            let id = app.active.unwrap();
+            load_selected(&mut app, id);
+            paste(&mut app, id, text);
+            drop(app.save_as(id));
+            notes.push(id);
+        }
+        // A second chooser for a note that already has one is not opened.
+        drop(app.save_as(notes[0]));
+        assert_eq!(app.pending_save_as.len(), 2);
+
+        for (index, id) in notes.iter().enumerate() {
+            let destination = directory.path().join(format!("{index}.md"));
+            drop(app.finish_save_as(*id, Ok(Some(destination))));
+        }
+
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("0.md")).unwrap(),
+            "first\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("1.md")).unwrap(),
+            "second\n"
+        );
+        assert!(app.tabs.is_empty());
+    }
+
+    #[test]
+    fn cancelling_window_close_keeps_tabs_settled_before_the_prompt() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("clean.txt"), "clean\n").unwrap();
+        std::fs::write(directory.path().join("dirty.txt"), "saved\n").unwrap();
+        let mut app = configured(&directory);
+        app.settings_writable = true;
+        let root = directory.path().to_str().unwrap();
+        let clean = add(&mut app, root, Some("clean.txt"));
+        load_selected(&mut app, clean);
+        let dirty = add(&mut app, root, Some("dirty.txt"));
+        load_selected(&mut app, dirty);
+        paste(&mut app, dirty, "unsaved ");
+        assert!(app.tab(dirty).unwrap().runtime.is_dirty());
+        flush_session(&mut app);
+        let session = app.session();
+
+        drop(app.update(Message::CloseWindow));
+        assert_eq!(app.closing, Some(dirty));
+        assert_eq!(app.tabs.len(), 2, "no tab closes before every tab is settled");
+
+        drop(app.update(Message::CancelClose));
+        assert!(!app.exiting);
+        assert_eq!(
+            app.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>(),
+            vec![clean, dirty]
+        );
+        assert!(app.tab(dirty).unwrap().runtime.is_dirty());
+        assert_eq!(app.session(), session);
+
+        // Settling the remaining tab finishes the shutdown.
+        drop(app.update(Message::CloseWindow));
+        assert_eq!(app.closing, Some(dirty));
+        drop(app.update(Message::DiscardClose));
+        assert!(app.tabs.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("dirty.txt")).unwrap(),
+            "saved\n"
+        );
+    }
+
     #[test]
     fn save_as_does_not_replace_an_existing_file() {
         let directory = tempfile::tempdir().unwrap();
@@ -9325,7 +9516,7 @@ mod tests {
         let id = app.active.unwrap();
         let destination = directory.path().join("existing.md");
         std::fs::write(&destination, "original\n").unwrap();
-        app.pending_save_as = Some((id, app.untitled_text(id)));
+        drop(app.save_as(id));
         drop(app.finish_save_as(id, Ok(Some(destination.clone()))));
         assert_eq!(std::fs::read_to_string(&destination).unwrap(), "original\n");
         assert!(app.tab(id).is_some());
@@ -9348,7 +9539,7 @@ mod tests {
         drop(task);
         assert!(app.tab(id).is_some());
         assert!(app.tab_is_untitled(app.tab(id).unwrap()));
-        assert!(app.pending_save_as.is_some());
+        assert!(app.pending_save_as.contains_key(&id));
     }
 
     #[test]
@@ -9388,7 +9579,7 @@ mod tests {
                 )),
             })),
         );
-        app.pending_save_as = Some((id, app.untitled_text(id)));
+        drop(app.save_as(id));
         drop(app.update(Message::CloseTab(id)));
         drop(app.update(Message::DiscardClose));
         assert!(app.tabs.is_empty());
@@ -9418,7 +9609,7 @@ mod tests {
         );
         drop(app.update(Message::CloseWindow));
         assert_eq!(app.closing, Some(id));
-        app.pending_save_as = Some((id, app.untitled_text(id)));
+        drop(app.save_as(id));
         let destination = directory.path().join("exited.txt");
         drop(app.finish_save_as(id, Ok(Some(destination.clone()))));
         assert_eq!(std::fs::read_to_string(&destination).unwrap(), "exiting\n");
