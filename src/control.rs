@@ -3151,6 +3151,30 @@ fn already_stopped() -> CommandOutput {
     }
 }
 
+/// `daemon status` for a selected device whose bridge confirmed that no
+/// daemon is running or holding its inventory lease there.
+fn remote_daemon_stopped() -> CommandOutput {
+    let device = crate::device::selected().map(|device| device.name.as_str());
+    CommandOutput {
+        command: "daemon.status",
+        data: json!({
+            "instance": instance::NAME,
+            "device": device,
+            "running": false,
+            "daemon_present": false,
+            "socket": null,
+            "daemon_version": null,
+            "cli_version": crate::version()
+        }),
+        human: format!(
+            "{} daemon on {} stopped; cli {}",
+            instance::NAME,
+            device.unwrap_or("the selected device"),
+            crate::version()
+        ),
+    }
+}
+
 pub fn run_from<I, T>(arguments: I) -> ExitCode
 where
     I: IntoIterator<Item = T>,
@@ -3361,10 +3385,21 @@ where
             command: DaemonCommand::Stop { .. }
         }
     );
-    let no_start = stopping_daemon
+    // Reading status must observe the daemon, never start it to answer.
+    let reading_daemon_status = matches!(
+        &cli.command,
+        TopCommand::Daemon {
+            command: DaemonCommand::Status
+        }
+    );
+    // The policy a staged owner must inherit. Status is left out: an owner
+    // that predates `--no-start` (v0.1.x) would refuse to parse it, and the
+    // installer reads `--json daemon status` from that owner.
+    let inherited_no_start = stopping_daemon
         || cli.global.no_start
         || std::env::var("CAGENTS_NO_START")
             .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
+    let no_start = inherited_no_start || reading_daemon_status;
     let _start_policy = StartPolicy(NO_START.swap(no_start, std::sync::atomic::Ordering::Relaxed));
     let _output_policy =
         OutputPolicy(JSON_OUTPUT.swap(cli.global.json, std::sync::atomic::Ordering::Relaxed));
@@ -3483,7 +3518,7 @@ where
                 // Carry implicit stop/environment policy into the matched CLI.
                 // An older owner that lacks this flag must refuse parsing
                 // rather than recover/start services before handling the read.
-                if no_start && !cli.global.no_start {
+                if inherited_no_start && !cli.global.no_start {
                     command.arg("--no-start");
                 }
                 command.args(&arguments[1..]);
@@ -3522,6 +3557,10 @@ where
             if crate::device::daemon_absent(&error) {
                 if stopping_daemon {
                     emit_success(cli.global.json, already_stopped());
+                    return ExitCode::SUCCESS;
+                }
+                if reading_daemon_status {
+                    emit_success(cli.global.json, remote_daemon_stopped());
                     return ExitCode::SUCCESS;
                 }
                 emit_error(cli.global.json, &AppError::new("daemon_not_running", error));
@@ -4339,6 +4378,7 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                 .map_err(|error| AppError::new("daemon_status", error))?;
             let mut data = json!({
                 "instance": instance::NAME,
+                "device": crate::device::selected().map(|device| device.name.as_str()),
                 "running": running,
                 "daemon_present": daemon_present,
                 "socket": socket,

@@ -39,15 +39,23 @@ its own configuration directory):
 
 `executable` defaults to `cagents` and names the remote CLI, not a shell script
 body. It is quoted as one executable name. Device names contain 1–16 letters,
-digits, hyphens, or underscores. `local` is reserved for this computer.
+digits, hyphens, or underscores. `local` is reserved for this computer. A saved
+name keeps its connection: saving the same name with another host or executable
+is refused. The file holds at most 64 devices and 64 KiB, and a save that would
+exceed either is refused. Windows saving at the same time each keep their device.
 
 ```console
 cagents ui
 cagents --device build-host ui
 cagents --device build-host ui --window work
+cagents --device build-host daemon status
 cagents --device build-host terminal list
 cagents --device build-host terminal spawn --cwd /home/user/projects/example
 ```
+
+`daemon status` and `daemon stop` never start the device's daemon; status
+reports a stopped one as stopped. Other commands start it unless you pass
+`--no-start`.
 
 Choosing a device from the status-bar menu switches the current client after the
 new connection is ready. Its hosted jobs continue. Each device row also offers
