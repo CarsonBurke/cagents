@@ -22,6 +22,146 @@ const SELECTOR: &str = "CAGENTS_PAIRED_PROJECTION_SELECTOR";
 const CLIENT: u64 = 7;
 const THREAD: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
+#[test]
+fn saved_codex_identity_retains_the_native_holder_recovery_capability() {
+    if isolated("saved_codex_identity_retains_the_native_holder_recovery_capability") {
+        return;
+    }
+    use crate::{
+        agent_execution::{Destination, HostedSession, Origin, Spec, Submit, Surface, Target},
+        workspace_model::ModelEdit,
+    };
+    let mut saved_identity = None;
+    let fixture = Fixture::with_initial_observer(false, |host, initial, root| {
+        assert!(initial.launch.session_id.is_none());
+        assert_eq!(initial.native_continuity, NativeContinuity::ReconnectOnly);
+        let store = crate::host::agent_execution::registry(host).unwrap();
+        let accepted = {
+            let mut store = store.lock().unwrap();
+            store
+                .apply(&ModelEdit::OpenProject {
+                    repository: root.join("project"),
+                    name: "Saved identity fixture".into(),
+                    kind: crate::model::ProjectKind::Folder,
+                })
+                .unwrap();
+            let accepted = store
+                .submit_agent(
+                    &Origin::User,
+                    &Submit {
+                        name: None,
+                        destination: Destination::New(Spec {
+                            provider: Provider::Codex,
+                            account: None,
+                            target: Target {
+                                repository: root.join("project"),
+                                directory: root.join("project"),
+                                placement: None,
+                            },
+                            surface: Surface::Chat,
+                            model: None,
+                            permission_mode: None,
+                            reasoning_effort: None,
+                        }),
+                        prompt: "Save the confirmed identity".into(),
+                        idempotency_key: "saved-identity".into(),
+                    },
+                    1,
+                )
+                .unwrap();
+            store
+                .bind_agent(
+                    accepted.agent.id,
+                    None,
+                    HostedSession::Chat(initial.clone()),
+                )
+                .unwrap();
+            store
+                .pin_agent_directory(
+                    accepted.agent.id,
+                    crate::agent_execution::DirectoryIdentity::from_metadata(
+                        &fs::metadata(root.join("project")).unwrap(),
+                    ),
+                )
+                .unwrap();
+            store
+                .apply(&ModelEdit::SeedView {
+                    scope: accepted.agent.placement.clone(),
+                    closed: vec![],
+                    panes: vec![crate::workspace_model::views::Pane {
+                        id: crate::model::CardId::from_uuid(accepted.agent.id.as_uuid()),
+                        title: "Unshown Codex agent".into(),
+                        user_title: None,
+                        pending_terminal_start: false,
+                        width_fraction: 1.0,
+                        kind: crate::model::CardKind::Chat(initial.clone()),
+                        scope: None,
+                    }],
+                })
+                .unwrap();
+            accepted
+        };
+        let instance = host.lock().unwrap().chats[&initial.id].execution_instance;
+        crate::host::agent_execution::observed(
+            host,
+            initial.id,
+            instance,
+            accepted.run.id,
+            crate::agent_execution::Update::Finished {
+                state: crate::agent_execution::State::Cancelled,
+                result: Default::default(),
+            },
+        );
+        let Some(HostedSession::Chat(saved)) = store
+            .lock()
+            .unwrap()
+            .agent(accepted.agent.id)
+            .unwrap()
+            .session
+        else {
+            panic!("saved agent conversation required");
+        };
+        assert_eq!(saved.launch.session_id.as_deref(), Some(THREAD));
+        assert!(matches!(
+            saved.native_continuity,
+            NativeContinuity::Durable { .. }
+        ));
+        let database = rusqlite::Connection::open(root.join("registry.sqlite3")).unwrap();
+        let (descriptor, provider_session): (String, Option<String>) = database
+            .query_row(
+                "SELECT descriptor, provider_session FROM panes WHERE id=?1",
+                [crate::model::CardId::from_uuid(accepted.agent.id.as_uuid()).to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<crate::model::CardKind>(&descriptor).unwrap(),
+            crate::model::CardKind::Chat(saved.clone())
+        );
+        assert_eq!(provider_session.as_deref(), Some(THREAD));
+        saved_identity = Some((accepted.agent.id, saved));
+    });
+    let (agent_id, saved) = saved_identity.unwrap();
+    assert!(fixture.original.previous_sources.contains(&saved));
+    let store = crate::host::agent_execution::registry(&fixture.host).unwrap();
+    assert_eq!(
+        store.lock().unwrap().agent(agent_id).unwrap().session,
+        Some(HostedSession::Chat(saved.clone()))
+    );
+    restore(&fixture.host, CLIENT, &saved).unwrap();
+    let Some(HostedSession::Chat(recovered)) =
+        store.lock().unwrap().agent(agent_id).unwrap().session
+    else {
+        panic!("recovered agent conversation required");
+    };
+    assert_eq!(recovered.launch.session_id.as_deref(), Some(THREAD));
+    assert!(matches!(
+        recovered.native_continuity,
+        NativeContinuity::Durable { .. }
+    ));
+    fixture.assert_one_provider();
+}
+
 /// A saved descriptor may predate the provider's durable confirmation. Its
 /// live holder must take ChatStart through adoption before any restart proof.
 #[test]
@@ -1334,6 +1474,13 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_initial_observer(true, |_, _, _| {})
+    }
+
+    fn with_initial_observer(
+        adopt_paired_identity: bool,
+        observe: impl FnOnce(&SharedHost, &Session, &Path),
+    ) -> Self {
         let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
         let old_proof = HostSessionProof {
             host_session_id: HostSessionId::new("paired-projection-fixture"),
@@ -1419,6 +1566,7 @@ impl Fixture {
             .unwrap()
             .install_model(crate::host::model::Registry::at(&ownership).unwrap());
         let initial = original.lock().unwrap().chats[&id].session.clone();
+        observe(&original, &initial, &root);
         let ServerResponse::ChatAttached {
             session: source, ..
         } = session_snapshot(&initial, &actor).unwrap()
@@ -1496,15 +1644,17 @@ impl Fixture {
             .cloned()
             .map(crate::agent_execution::HostedSession::Chat)
             .collect::<Vec<_>>();
-        crate::host::agent_execution::registry(&original)
-            .unwrap()
-            .lock()
-            .unwrap()
-            .adopt_authenticated_agent_session(
-                &retained,
-                &crate::agent_execution::HostedSession::Chat(source.clone()),
-            )
-            .unwrap();
+        if adopt_paired_identity {
+            crate::host::agent_execution::registry(&original)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .adopt_authenticated_agent_session(
+                    &retained,
+                    &crate::agent_execution::HostedSession::Chat(source.clone()),
+                )
+                .unwrap();
+        }
         worker.preserve_for_restart().unwrap();
         drop(actor);
         drop(original);
