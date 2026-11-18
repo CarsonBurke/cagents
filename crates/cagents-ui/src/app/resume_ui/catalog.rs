@@ -77,8 +77,10 @@ struct FileVersion {
     changed: (i64, i64),
 }
 impl FileVersion {
-    /// Whether both versions are of the same file, however it changed. A
-    /// transcript replaced at its path is read from its start.
+    /// Whether both versions are of the same file, however it changed, so a
+    /// transcript replaced at its path is read from its start. Only a
+    /// heuristic: a file deleted and created again can reuse the inode, so a
+    /// scan also confirms the bytes it read before it is reused.
     fn same_file(&self, other: &Self) -> bool {
         (self.device, self.inode) == (other.device, other.inode)
     }
@@ -681,6 +683,15 @@ mod tests {
         std::fs::rename(&replacement, &path).unwrap();
         assert_ne!(inode(&path), replaced);
         assert_eq!(find(&path).unwrap().id(), id);
+
+        // Rewritten in place, the same file differs only before the bytes
+        // that end its first record.
+        std::fs::write(&path, format!("{subagent}\n")).unwrap();
+        assert!(find(&path).is_none());
+        let rewritten = inode(&path);
+        std::fs::write(&path, format!("{main}\n{asked}\n")).unwrap();
+        assert_eq!(inode(&path), rewritten);
+        assert_eq!(find(&path).unwrap().id(), id);
     }
 
     /// A transcript with nothing in it has nothing to return to.
@@ -1014,6 +1025,37 @@ mod tests {
                 .unwrap()
                 .title,
             "Original fallback"
+        );
+    }
+
+    /// A conversation renamed over another is read from its start, even
+    /// where the bytes the earlier scan stopped after are the same.
+    #[test]
+    fn a_conversation_replaced_by_rename_is_read_afresh() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let id = "00000000-0000-4000-8000-000000000001";
+        let reply = json!({"type":"assistant","sessionId":id,"message":{"role":"assistant","content":[{"type":"text","text":"r".repeat(400)}]}});
+        let write = |path: &Path, prompt: &str| {
+            let user = json!({"type":"user","sessionId":id,"cwd":directory.path(),"message":{"content":prompt}});
+            std::fs::write(path, format!("{user}\n{reply}\n")).unwrap();
+        };
+        write(&path, "Profile the importer");
+        let cache = Cache::default();
+        let before = candidate(0, &path);
+        assert_eq!(
+            cache.find(Provider::Claude, &before).unwrap().title,
+            "Profile the importer"
+        );
+        let replacement = path.with_extension("replacement");
+        write(&replacement, "Profile the exporter");
+        std::fs::rename(&replacement, &path).unwrap();
+        let after = candidate(0, &path);
+        assert_eq!(before.version.len, after.version.len);
+        assert_ne!(before.version.inode, after.version.inode);
+        assert_eq!(
+            cache.find(Provider::Claude, &after).unwrap().title,
+            "Profile the exporter"
         );
     }
 

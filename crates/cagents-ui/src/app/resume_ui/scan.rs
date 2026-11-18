@@ -74,7 +74,8 @@ impl Summary {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Scan {
     offset: u64,
-    /// A hash of the bytes just before `offset`.
+    /// A hash of the bytes just before `offset`, or of all of them once the
+    /// scan is a settled negative.
     boundary: u64,
     /// `None` until a record declares the conversation, then whether it is
     /// one that can be resumed on its own.
@@ -139,7 +140,7 @@ pub fn scan(
     }
     // An unfinished last record is read again, whole, next time; a settled
     // negative keeps where it was decided, so a later read can confirm it.
-    scan.boundary = boundary(&mut file, scan.offset).unwrap_or(0);
+    scan.boundary = boundary(&mut file, &scan).unwrap_or(0);
     if !settled && len >= UNCACHE_BYTES {
         uncache(&file);
     }
@@ -262,19 +263,37 @@ pub fn first_prompt<T>(
 
 /// Whether `file` still holds what `previous` read, and possibly more.
 fn continues(file: &mut std::fs::File, len: u64, previous: &Scan) -> bool {
-    previous.offset <= len
-        && boundary(file, previous.offset).is_some_and(|hash| hash == previous.boundary)
+    previous.offset <= len && boundary(file, previous).is_some_and(|hash| hash == previous.boundary)
 }
 
-fn boundary(file: &mut std::fs::File, offset: u64) -> Option<u64> {
-    let start = offset.saturating_sub(BOUNDARY_BYTES);
+/// A hash of the bytes of `file` that `scan` depends on. A growing
+/// conversation is checked at its tail, which is cheap however long it gets;
+/// a settled negative, decided by its first records and never read past them,
+/// is checked whole, so a rewrite anywhere in them is read again.
+fn boundary(file: &mut std::fs::File, scan: &Scan) -> Option<u64> {
+    let start = if scan.settled_negative() {
+        0
+    } else {
+        scan.offset.saturating_sub(BOUNDARY_BYTES)
+    };
     file.seek(SeekFrom::Start(start)).ok()?;
-    let mut bytes = vec![0; (offset - start) as usize];
-    file.read_exact(&mut bytes).ok()?;
+    let length = scan.offset - start;
+    let mut bytes = file.by_ref().take(length);
+    let mut buffer = [0; 8192];
     // FNV-1a: stable across builds, unlike the standard library's hasher.
-    Some(bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
-    }))
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut read = 0;
+    loop {
+        let count = bytes.read(&mut buffer).ok()?;
+        if count == 0 {
+            break;
+        }
+        read += count as u64;
+        for &byte in &buffer[..count] {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    (read == length).then_some(hash)
 }
 
 fn uncache(file: &std::fs::File) {
