@@ -5151,13 +5151,7 @@ impl Runtime {
             TurnPart::Card(prose) | TurnPart::Prose(prose) => {
                 2u8.hash(&mut hasher);
                 let placed = &turn.prose[prose];
-                self.hash_turn_item(
-                    placed.index,
-                    cached,
-                    Some(placed.slot),
-                    now,
-                    &mut hasher,
-                )
+                self.hash_turn_item(placed.index, cached, Some(placed.slot), now, &mut hasher)
             }
         };
         if coordinating {
