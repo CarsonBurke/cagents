@@ -3170,7 +3170,7 @@ mod tests {
             matches!(table.codex_execution(&stale), CodexExecution::Unproved { reason } if reason == CODEX_PROCESS_STARTING)
         );
         // Permission-denied process entries must not poison the entire census.
-        std::fs::set_permissions(&process, std::os::unix::fs::PermissionsExt::from_mode(0))
+        std::fs::set_permissions(&process, std::os::unix::fs::PermissionsExt::from_mode(0o000))
             .unwrap();
         if crate::daemon::current_uid() != 0 {
             assert_eq!(table.codex_execution(&card), CodexExecution::Ended);

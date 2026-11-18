@@ -7766,7 +7766,7 @@ fn real_notice_orders_show_the_latest_state_at_every_step() {
     for order in ["fiiiiif", "iiic", "fiiif", "iifiic", "i", "if"] {
         let mut adapter = Claude::default();
         notification_agent(&mut adapter, "tool-one", "task-one", true);
-        for (index, kind) in order.chars().enumerate() {
+        for (index, kind) in order.char_indices() {
             let (status, summary, note, expected) = match kind {
                 'i' => (
                     "completed",

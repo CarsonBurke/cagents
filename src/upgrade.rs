@@ -3371,7 +3371,7 @@ mod tests {
         fs::write(process.join("comm"), format!("{name}\n")).unwrap();
         fs::write(process.join("cmdline"), format!("{name}\0")).unwrap();
         fs::write(process.join("environ"), b"PATH=/bin\0").unwrap();
-        fs::set_permissions(process.join("environ"), fs::Permissions::from_mode(0)).unwrap();
+        fs::set_permissions(process.join("environ"), fs::Permissions::from_mode(0o000)).unwrap();
         assert_eq!(
             fs::read(process.join("environ")).unwrap_err().kind(),
             io::ErrorKind::PermissionDenied,

@@ -1260,7 +1260,7 @@ mod tests {
         // bypasses ordinary file permissions, so this assertion is non-root.
         if unsafe { libc::geteuid() } != 0 {
             std::fs::write(&reference, valid_commit).unwrap();
-            std::fs::set_permissions(&reference, std::fs::Permissions::from_mode(0)).unwrap();
+            std::fs::set_permissions(&reference, std::fs::Permissions::from_mode(0o000)).unwrap();
             let outcome = invoke();
             std::fs::set_permissions(&reference, std::fs::Permissions::from_mode(0o600)).unwrap();
             assert!(outcome.is_err());

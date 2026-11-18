@@ -1977,7 +1977,7 @@ mod tests {
         fs::write(process.join("comm"), b"ssh-agent\n").unwrap();
         fs::write(process.join("cmdline"), b"ssh-agent\0").unwrap();
         fs::write(process.join("environ"), b"PATH=/bin\0").unwrap();
-        fs::set_permissions(process.join("environ"), fs::Permissions::from_mode(0)).unwrap();
+        fs::set_permissions(process.join("environ"), fs::Permissions::from_mode(0o000)).unwrap();
         assert!(fs::read(process.join("environ")).is_err());
         pid
     }
