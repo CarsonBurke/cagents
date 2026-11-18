@@ -30,7 +30,9 @@ pub(crate) fn set_default(
     expected_revision: u64,
     provider: crate::agent::Provider,
     selection: &DefaultSelection,
-) -> Result<super::registry::Registry, String> {
+) -> Result<super::registry::Registry, super::remote::LifecycleError> {
+    // Runs under shared control admission, so a held account list refuses at
+    // once rather than wait; the refusal is retryable.
     let (registry, result) = store.try_update(|registry| {
         if registry.revision() != expected_revision {
             return Err("accounts changed on the device; reload before saving".to_owned());
@@ -68,8 +70,8 @@ pub(crate) fn set_default(
         // Every fallible selection/conflict check precedes mutation.
         registry.set_default(account);
         Ok(())
-    }).map_err(|error| error.to_string())?;
-    result?;
+    })?;
+    result.map_err(super::remote::LifecycleError::Failed)?;
     Ok(registry)
 }
 
@@ -155,6 +157,52 @@ mod tests {
         assert_eq!(store.load().unwrap(), automatic);
     }
 
+    /// Another window saving the account list refuses a default at once, in
+    /// its own words and retryably, and the same choice succeeds once the
+    /// list is free.
+    #[test]
+    fn a_held_account_list_refuses_a_default_retryably_and_changes_nothing() {
+        use crate::account::remote::{LifecycleError, ListHeld};
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path());
+        let homes = Homes::at(directory.path().join("homes"));
+        let key = Uuid::new_v4();
+        let (original, ()) = store
+            .update(|registry| {
+                registry
+                    .register(registered(key, "one@example.com"), &[])
+                    .unwrap();
+            })
+            .unwrap();
+        let before = fs::read(directory.path().join("accounts.toml")).unwrap();
+        let account = Account::managed(Provider::Claude, key, homes.path(Provider::Claude, key));
+        let choose = || {
+            set_default(
+                &store,
+                Some(&homes),
+                &BTreeMap::new(),
+                original.revision(),
+                Provider::Claude,
+                &DefaultSelection::Account(account.id()),
+            )
+        };
+        let held = store.lock().unwrap();
+        assert_eq!(
+            choose().unwrap_err(),
+            LifecycleError::ListHeld(ListHeld::Registry)
+        );
+        assert_eq!(
+            fs::read(directory.path().join("accounts.toml")).unwrap(),
+            before
+        );
+        drop(held);
+        let saved = choose().unwrap();
+        assert_eq!(
+            saved.default_account(Provider::Claude, Some(&homes)).id(),
+            account.id()
+        );
+    }
+
     #[test]
     fn rejected_default_intents_leave_the_original_registry_bytes_unchanged() {
         let directory = tempfile::tempdir().unwrap();
@@ -205,7 +253,8 @@ mod tests {
                 provider,
                 &selection,
             )
-            .unwrap_err();
+            .unwrap_err()
+            .to_string();
             assert!(error.contains(reason), "{error}");
             assert_eq!(
                 fs::read(directory.path().join("accounts.toml")).unwrap(),
@@ -229,6 +278,7 @@ mod tests {
                 &DefaultSelection::Account(hidden.id())
             )
             .unwrap_err()
+            .to_string()
             .contains("No active")
         );
         assert_eq!(
@@ -275,6 +325,7 @@ mod tests {
                 &choose
             )
             .unwrap_err()
+            .to_string()
             .contains("different login")
         );
         cache.insert(accounts[0].cache_key().unwrap(), entry("one@example.com"));
@@ -289,6 +340,7 @@ mod tests {
                 &choose
             )
             .unwrap_err()
+            .to_string()
             .contains("same login")
         );
         assert_eq!(
@@ -325,6 +377,7 @@ mod tests {
                 &DefaultSelection::Account(account.id())
             )
             .unwrap_err()
+            .to_string()
             .contains("same home")
         );
         assert_eq!(

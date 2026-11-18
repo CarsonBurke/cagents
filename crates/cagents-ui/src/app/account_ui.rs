@@ -1339,7 +1339,7 @@ pub enum Action {
     /// The registry was read again, as another window may have changed it.
     RegistryLoaded(Result<Registry, String>),
     /// A change this window made to the registry was written, or was not.
-    Saved(Result<Registry, String>),
+    Saved(Result<Registry, RequestError>),
     /// Starts adding an account; `device` asks Codex for a device code
     /// rather than a browser hand-off.
     Add {
@@ -2454,22 +2454,25 @@ impl Cagents {
             change(&mut registry);
             return cosmic::task::future(async move {
                 let result = tokio::task::spawn_blocking(move || {
-                    let registry =
-                        serde_json::to_value(registry).map_err(|error| error.to_string())?;
-                    match crate::device_service::request(
+                    let registry = serde_json::to_value(registry)
+                        .map_err(|error| RequestError::Failed(error.to_string()))?;
+                    match crate::device_service::request_unless_busy(
                         crate::device_service::Operation::AccountsUpdate {
                             expected_revision,
                             registry,
                         },
                     )? {
                         crate::device_service::Reply::AccountRegistry(value) => {
-                            serde_json::from_value(value).map_err(|error| error.to_string())
+                            serde_json::from_value(value)
+                                .map_err(|error| RequestError::Failed(error.to_string()))
                         }
-                        _ => Err("The device did not save account preferences".into()),
+                        _ => Err(RequestError::Failed(
+                            "The device did not save account preferences".into(),
+                        )),
                     }
                 })
                 .await
-                .map_err(|error| error.to_string())
+                .map_err(|error| RequestError::Failed(error.to_string()))
                 .and_then(|result| result);
                 Message::AccountUi(Action::Saved(result))
             });
@@ -2490,7 +2493,8 @@ impl Cagents {
                     result
                         .map(|(registry, ())| registry)
                         .map_err(|error| error.to_string())
-                });
+                })
+                .map_err(RequestError::Failed);
             Message::AccountUi(Action::Saved(result))
         })
     }
@@ -3681,7 +3685,16 @@ impl Cagents {
             Action::Saved(result) => {
                 match result {
                     Ok(registry) => self.account_ui.set_registry(registry),
-                    Err(error) => {
+                    // Refused before anything was saved: the accounts still
+                    // show what the device has, and the same change can be
+                    // made again.
+                    Err(RequestError::Refused(refusal)) => {
+                        self.status = Some(TransientNotice::warning(format!(
+                            "{}, so the change to your accounts was not saved. Try again in a moment.",
+                            refusal.cause()
+                        )));
+                    }
+                    Err(RequestError::Failed(error)) => {
                         self.status = Some(TransientNotice::error(format!(
                             "The change to your accounts could not be saved: {error}"
                         )));
@@ -12599,6 +12612,22 @@ mod app_tests {
             [
                 "Another window was saving the account list, so the new Claude Code account was not saved yet. cagents will try again."
             ]
+        );
+
+        // A preference change, such as a default or a rename, keeps the
+        // accounts as the device has them.
+        let mut app = context_inspector_test_app(false);
+        let registry = app.account_ui.registry.clone();
+        let _ = app.update(Message::AccountUi(Action::Saved(refused(
+            ListHeld::Registry,
+        ))));
+        assert_eq!(app.account_ui.registry, registry);
+        let entries = app.notices.recent().collect::<Vec<_>>();
+        assert!(
+            matches!(entries.as_slice(), [entry] if entry.notice.severity == NoticeSeverity::Warning
+                && entry.notice.message == "Another window was saving the account list, so the change to your accounts was not saved. Try again in a moment."),
+            "{:?}",
+            notice_messages(&app)
         );
     }
 

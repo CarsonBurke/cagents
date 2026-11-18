@@ -208,29 +208,11 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
             navigation(repository, kind).map(Reply::ProjectNavigation)
         }
         Operation::AccountsRead => accounts(),
-        Operation::AccountDefault {
-            expected_revision,
-            provider,
-            selection,
-        } => {
-            let store = crate::account::registry::Store::installation()
-                .ok_or("remote account registry is unavailable")?;
-            let homes = crate::account::home::Homes::installation();
-            let now = crate::chat::now_ms().unwrap_or_default();
-            let cached = crate::account::cache::Cache::installation()
-                .map(|cache| cache.load(now))
-                .unwrap_or_default();
-            let registry = crate::account::preferences::set_default(
-                &store,
-                homes.as_ref(),
-                &cached,
-                expected_revision,
-                provider,
-                &selection,
-            )?;
-            serde_json::to_value(registry)
-                .map(Reply::AccountRegistry)
-                .map_err(|error| error.to_string())
+        // Under the daemon, account preference changes run typed, through
+        // [`account_default`] and [`update_accounts`], so a held account list
+        // reaches the window as a retryable refusal.
+        Operation::AccountDefault { .. } | Operation::AccountsUpdate { .. } => {
+            Err("Account preference changes require daemon admission".into())
         }
         Operation::AccountLifecycle { operation } => {
             crate::account::remote::execute(operation).map(Reply::AccountLifecycle)
@@ -260,10 +242,6 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
             Ok(Reply::Saved)
         }
         Operation::Skills { launch } => Ok(Reply::Skills(crate::chat::skills::discover(&launch))),
-        Operation::AccountsUpdate {
-            expected_revision,
-            registry,
-        } => update_accounts(expected_revision, registry),
         Operation::AccountLogin { account } => account_login(account),
         Operation::AccountProbe { account, force } => probe_account(account, force, false),
         Operation::AccountProbeAfterLogin { account } => probe_account(account, true, true),
@@ -763,6 +741,39 @@ fn unstage_command(
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// Another window saving the account list refuses a preference change,
+    /// such as a rename, at once, in its own words and
+    /// retryably; the same change is saved once the list is free.
+    #[test]
+    fn a_held_account_list_refuses_a_preference_change_retryably_and_changes_nothing() {
+        use crate::account::{
+            Account,
+            registry::Store,
+            remote::{LifecycleError, ListHeld},
+        };
+        let system = Account::system(crate::agent::Provider::Claude);
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path());
+        let (current, ()) = store.update(|_| ()).unwrap();
+        let before = store.load().unwrap();
+        let mut proposed = current.clone();
+        proposed.set_label(&system, Some("Work".into()));
+        let held = store.lock().unwrap();
+        assert_eq!(
+            update_accounts_in(&store, current.revision(), proposed.clone()).unwrap_err(),
+            LifecycleError::ListHeld(ListHeld::Registry)
+        );
+        assert_eq!(store.load().unwrap(), before);
+        drop(held);
+        let Reply::AccountRegistry(saved) =
+            update_accounts_in(&store, current.revision(), proposed).unwrap()
+        else {
+            panic!("a preference change replies with the registry");
+        };
+        let saved: crate::account::registry::Registry = serde_json::from_value(saved).unwrap();
+        assert_eq!(saved.label(&system), Some("Work"));
+    }
     #[test]
     fn image_asset_operation_reads_backend_receipts_and_refuses_foreign_or_missing_identity() {
         crate::chat::attachment_assets::with_test_image(|backend| {
@@ -1825,49 +1836,93 @@ fn accounts() -> Result<Reply, String> {
         .map_err(|error| error.to_string())
 }
 
+/// Chooses the default account for `provider`, as
+/// [`Operation::AccountDefault`] asks, under the daemon's shared admission.
 #[cfg(feature = "host")]
-fn update_accounts(expected_revision: u64, proposal: serde_json::Value) -> Result<Reply, String> {
+pub(crate) fn account_default(
+    expected_revision: u64,
+    provider: crate::agent::Provider,
+    selection: &crate::account::preferences::DefaultSelection,
+) -> Result<Reply, crate::account::remote::LifecycleError> {
+    let store = crate::account::registry::Store::installation()
+        .ok_or("remote account registry is unavailable")?;
+    let homes = crate::account::home::Homes::installation();
+    let now = crate::chat::now_ms().unwrap_or_default();
+    let cached = crate::account::cache::Cache::installation()
+        .map(|cache| cache.load(now))
+        .unwrap_or_default();
+    let registry = crate::account::preferences::set_default(
+        &store,
+        homes.as_ref(),
+        &cached,
+        expected_revision,
+        provider,
+        selection,
+    )?;
+    Ok(registry_reply(registry)?)
+}
+
+/// Saves the account preferences `proposal` changes, as
+/// [`Operation::AccountsUpdate`] asks, under the daemon's shared admission:
+/// a held account list refuses at once rather than wait, retryably.
+#[cfg(feature = "host")]
+pub(crate) fn update_accounts(
+    expected_revision: u64,
+    proposal: serde_json::Value,
+) -> Result<Reply, crate::account::remote::LifecycleError> {
     use crate::account::registry::{Registry, Store};
     let proposed: Registry = serde_json::from_value(proposal).map_err(|error| error.to_string())?;
     let store = Store::installation().ok_or("remote account registry is unavailable")?;
-    let (registry, result) = store
-        .update(|current| {
-            if current.revision() != expected_revision {
-                return Err("accounts changed on the device; reload before saving".to_owned());
+    update_accounts_in(&store, expected_revision, proposed)
+}
+
+#[cfg(feature = "host")]
+fn update_accounts_in(
+    store: &crate::account::registry::Store,
+    expected_revision: u64,
+    proposed: crate::account::registry::Registry,
+) -> Result<Reply, crate::account::remote::LifecycleError> {
+    use crate::account::registry::Registry;
+    let (registry, result) = store.try_update(|current| {
+        if current.revision() != expected_revision {
+            return Err("accounts changed on the device; reload before saving".to_owned());
+        }
+        // This endpoint edits preferences. Credential-home ownership and
+        // pending create/remove transactions cannot be replaced by a client.
+        let strip_preferences = |registry: &Registry| -> Result<serde_json::Value, String> {
+            let mut value = serde_json::to_value(registry).map_err(|error| error.to_string())?;
+            let document = value.as_object_mut().ok_or("invalid account registry")?;
+            for key in ["defaults", "project_defaults", "system_labels", "archived"] {
+                document.remove(key);
             }
-            // This endpoint edits preferences. Credential-home ownership and
-            // pending create/remove transactions cannot be replaced by a client.
-            let strip_preferences = |registry: &Registry| -> Result<serde_json::Value, String> {
-                let mut value =
-                    serde_json::to_value(registry).map_err(|error| error.to_string())?;
-                let document = value.as_object_mut().ok_or("invalid account registry")?;
-                for key in ["defaults", "project_defaults", "system_labels", "archived"] {
-                    document.remove(key);
-                }
-                if let Some(accounts) = document
-                    .get_mut("account")
-                    .and_then(|accounts| accounts.as_array_mut())
-                {
-                    for account in accounts {
-                        if let Some(account) = account.as_object_mut() {
-                            for key in ["label", "email", "organization"] {
-                                account.remove(key);
-                            }
+            if let Some(accounts) = document
+                .get_mut("account")
+                .and_then(|accounts| accounts.as_array_mut())
+            {
+                for account in accounts {
+                    if let Some(account) = account.as_object_mut() {
+                        for key in ["label", "email", "organization"] {
+                            account.remove(key);
                         }
                     }
                 }
-                Ok(value)
-            };
-            if strip_preferences(current)? != strip_preferences(&proposed)? {
-                return Err(
-                    "remote preference update cannot add, remove or redirect account homes".into(),
-                );
             }
-            *current = proposed;
-            Ok(())
-        })
-        .map_err(|error| error.to_string())?;
-    result?;
+            Ok(value)
+        };
+        if strip_preferences(current)? != strip_preferences(&proposed)? {
+            return Err(
+                "remote preference update cannot add, remove or redirect account homes".into(),
+            );
+        }
+        *current = proposed;
+        Ok(())
+    })?;
+    result.map_err(crate::account::remote::LifecycleError::Failed)?;
+    Ok(registry_reply(registry)?)
+}
+
+#[cfg(feature = "host")]
+fn registry_reply(registry: crate::account::registry::Registry) -> Result<Reply, String> {
     serde_json::to_value(registry)
         .map(Reply::AccountRegistry)
         .map_err(|error| error.to_string())

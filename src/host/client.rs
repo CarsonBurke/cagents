@@ -1478,9 +1478,24 @@ fn process_admitted_request(
                 }
                 _ => {}
             }
-            let reply = crate::device_service::execute(operation).map_err(|message| {
-                ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
-            })?;
+            let reply = match operation {
+                crate::device_service::Operation::AccountDefault {
+                    expected_revision,
+                    provider,
+                    selection,
+                } => {
+                    crate::device_service::account_default(expected_revision, provider, &selection)
+                        .map_err(lifecycle_refusal)?
+                }
+                crate::device_service::Operation::AccountsUpdate {
+                    expected_revision,
+                    registry,
+                } => crate::device_service::update_accounts(expected_revision, registry)
+                    .map_err(lifecycle_refusal)?,
+                operation => crate::device_service::execute(operation).map_err(|message| {
+                    ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
+                })?,
+            };
             Ok((ServerResponse::DeviceOperation { reply }, Vec::new(), false))
         }
         ClientRequest::Authenticate { authority } => {
