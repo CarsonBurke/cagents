@@ -325,6 +325,8 @@ fn serve_with<R: Into<crate::terminal_ipc::PreparedResponse>>(
                 break;
             }
             connected = true;
+            // A resumed terminal's live events follow its handshake and replay.
+            let hold = delivery.hold_broadcasts();
             let (resumed, replay) = match prepare_resume(&host, client_id, resume) {
                 Ok(prepared) => prepared,
                 Err(error) => {
@@ -346,7 +348,7 @@ fn serve_with<R: Into<crate::terminal_ipc::PreparedResponse>>(
                 break;
             }
             for message in replay {
-                if delivery
+                if hold
                     .push(ServerEnvelope {
                         version: PROTOCOL_VERSION,
                         request_id: None,
@@ -372,6 +374,9 @@ fn serve_with<R: Into<crate::terminal_ipc::PreparedResponse>>(
         // than the connection. The panic hook has already recorded it.
         let request = envelope.request;
         let releases_retention = may_release_retention(&request);
+        // An attached terminal's live events follow its reply and replay.
+        let hold =
+            matches!(request, ClientRequest::Attach { .. }).then(|| delivery.hold_broadcasts());
         // Register even before ordinary exit starts: its writer can enter
         // after process_request releases control, before this reply is queued.
         // The final HostMutex seal closes acquisition before any handler effect.
@@ -429,15 +434,17 @@ fn serve_with<R: Into<crate::terminal_ipc::PreparedResponse>>(
                     break;
                 }
                 for message in extras {
-                    if delivery
-                        .push(ServerEnvelope {
-                            version: PROTOCOL_VERSION,
-                            request_id: None,
-                            proof: proof.clone(),
-                            message,
-                        })
-                        .is_err()
-                    {
+                    let message = ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: None,
+                        proof: proof.clone(),
+                        message,
+                    };
+                    let queued = match &hold {
+                        Some(hold) => hold.push(message),
+                        None => delivery.push(message),
+                    };
+                    if queued.is_err() {
                         break;
                     }
                 }
