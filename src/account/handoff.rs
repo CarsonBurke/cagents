@@ -8,6 +8,10 @@ use std::{
 };
 
 const MAX_TRANSCRIPT: u64 = 256 * 1024 * 1024;
+/// Names a staged copy beside its destination, which no provider reads.
+const STAGED_PREFIX: &str = ".cagents-handoff-";
+/// How old a staged copy is before it counts as abandoned.
+const ABANDONED: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 /// A conversation's history copied beside its place on the alternate account
 /// while the original conversation still runs. Staging is what can fail for
@@ -174,7 +178,8 @@ fn stage_transcript(source: PathBuf, destination: PathBuf) -> io::Result<Staged>
     }
     let parent = transcript_directory(&staged.destination)?;
     crate::secure_file::prepare_private_directory(parent)?;
-    let temporary = parent.join(format!(".cagents-handoff-{}", uuid::Uuid::new_v4()));
+    remove_abandoned_copies(parent);
+    let temporary = parent.join(format!("{STAGED_PREFIX}{}", uuid::Uuid::new_v4()));
     use std::os::unix::fs::OpenOptionsExt;
     let mut file = fs::OpenOptions::new()
         .write(true)
@@ -186,6 +191,31 @@ fn stage_transcript(source: PathBuf, destination: PathBuf) -> io::Result<Staged>
     file.write_all(&bytes)?;
     file.sync_all()?;
     Ok(staged)
+}
+
+/// Removes staged copies a daemon left when it stopped between staging and
+/// commit. A copy younger than [`ABANDONED`] may belong to a switch still in
+/// progress, so it stays.
+fn remove_abandoned_copies(directory: &Path) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let abandoned = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(STAGED_PREFIX))
+            && entry.file_type().is_ok_and(|kind| kind.is_file())
+            && entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age >= ABANDONED);
+        if abandoned {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 fn commit_transcript(staged: &mut Staged) -> io::Result<()> {
@@ -210,12 +240,14 @@ fn commit_transcript(staged: &mut Staged) -> io::Result<()> {
                 (temporary, file, 0)
             }
         },
+        // The destination already held this history when it was staged. Add
+        // what the conversation wrote since in place: an interrupted append
+        // still leaves a prefix of the history, which a retry extends.
         None => {
-            crate::secure_file::prepare_private_directory(&parent)?;
-            let temporary = parent.join(format!(".cagents-handoff-{}", uuid::Uuid::new_v4()));
-            let file = options.write(true).create_new(true).open(&temporary)?;
-            staged.temporary = Some(temporary.clone());
-            (temporary, file, 0)
+            let published = existing_prefix(&staged.destination, &bytes)?;
+            let mut file = options.append(true).open(&staged.destination)?;
+            file.write_all(&bytes[published..])?;
+            return file.sync_all();
         }
     };
     file.write_all(&bytes[written..])?;
@@ -374,6 +406,8 @@ mod tests {
 
     #[test]
     fn commit_publishes_what_the_conversation_wrote_after_staging() {
+        use std::os::unix::fs::MetadataExt;
+
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("source.jsonl");
         let target = directory.path().join("account/sessions/target.jsonl");
@@ -392,6 +426,36 @@ mod tests {
         fs::write(&source, b"other\n").unwrap();
         commit_transcript(&mut staged).unwrap();
         assert_eq!(fs::read(&rewritten).unwrap(), b"other\n");
+
+        // A destination that already held the history when staged is
+        // extended in place with what was written since.
+        let mut staged = stage_at(&source, &rewritten).unwrap();
+        assert!(staged.temporary.is_none());
+        fs::write(&source, b"other\nmore\n").unwrap();
+        let before = fs::metadata(&rewritten).unwrap().ino();
+        commit_transcript(&mut staged).unwrap();
+        assert_eq!(fs::read(&rewritten).unwrap(), b"other\nmore\n");
+        assert_eq!(fs::metadata(&rewritten).unwrap().ino(), before);
+
+        // A copy a stopped daemon abandoned is swept by the next stage; a
+        // recent one may belong to a switch in progress.
+        let sessions = target.parent().unwrap();
+        let abandoned = sessions.join(format!("{STAGED_PREFIX}abandoned"));
+        let recent = sessions.join(format!("{STAGED_PREFIX}recent"));
+        fs::write(&abandoned, b"old").unwrap();
+        fs::write(&recent, b"new").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&abandoned)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - ABANDONED)
+            .unwrap();
+        fs::write(&source, b"fresh\n").unwrap();
+        drop(stage_at(&source, &sessions.join("fresh.jsonl")).unwrap());
+        assert!(!abandoned.exists());
+        assert!(recent.exists());
+        fs::remove_file(&recent).unwrap();
+        fs::write(&source, b"one\ntwo\n").unwrap();
 
         // History that diverged on the alternate account since staging stays.
         fs::write(&source, b"one\ntwo\nthree\n").unwrap();
