@@ -527,6 +527,16 @@ impl editor::Editor for Editor {
         (above.min(limit), (bottom - height).clamp(0.0, limit))
     }
 
+    fn caret(&self) -> Option<Rectangle> {
+        match self.selection() {
+            editor::Selection::Caret(position) => Some(Rectangle::new(
+                position,
+                Size::new(1.0, self.buffer().metrics().line_height),
+            )),
+            editor::Selection::Range(_) => None,
+        }
+    }
+
     fn min_bounds(&self) -> Size {
         let internal = self.internal();
 

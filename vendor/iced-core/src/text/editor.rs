@@ -77,6 +77,12 @@ pub trait Editor: Sized + Default {
     fn overflow(&self) -> (f32, f32) {
         (0.0, 0.0)
     }
+
+    /// cagents: the line the caret is on, relative to the [`Editor`]'s
+    /// bounds, while nothing is selected.
+    fn caret(&self) -> Option<Rectangle> {
+        None
+    }
 }
 
 /// An interaction with an [`Editor`].
