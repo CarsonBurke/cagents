@@ -32,18 +32,32 @@ impl From<&str> for AuthorityError {
     }
 }
 
-/// An identity-only projection issued by an authenticated retained Claude
-/// helper. This shape grants no authority: callers must authenticate its exact
-/// source lineage before updating a saved agent or pane.
-pub(super) fn retained_identity_update(
+/// An identity-only projection: `replacement` is `source` with nothing changed
+/// but the conversation ID its provider confirmed. It covers retained Claude
+/// helpers and daemon-hosted Codex threads on their own listener, the two
+/// actors whose first identity arrives after the descriptor was saved. This
+/// shape grants no authority: callers must authenticate the exact source
+/// lineage (the hosted actor, or the helper's census) before updating a saved
+/// agent or pane.
+pub(in crate::host) fn confirmed_identity_update(
     source: &crate::chat::Session,
     replacement: &crate::chat::Session,
 ) -> bool {
-    if source.launch.provider != crate::agent::Provider::Claude
-        || !matches!(
+    let learns = match source.launch.provider {
+        crate::agent::Provider::Claude => matches!(
             source.native_continuity,
             crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 }
-        )
+        ),
+        // A begun Codex thread never changes identity, and only a thread on
+        // its own listener belongs to this one hosted conversation.
+        crate::agent::Provider::Codex => {
+            source.launch.session_id.is_none()
+                && source.owns_codex_listener()
+                && source.native_continuity == crate::chat::NativeContinuity::ReconnectOnly
+        }
+        _ => false,
+    };
+    if !learns
         || !source.has_valid_native_continuity()
         || !source
             .proof
@@ -1654,7 +1668,7 @@ impl Registry {
             if let (HostedSession::Chat(current), HostedSession::Chat(learned)) =
                 (&mut session, &pending)
                 && current.launch.session_id.is_none()
-                && retained_identity_update(current, learned)
+                && confirmed_identity_update(current, learned)
             {
                 current.launch.session_id = learned.launch.session_id.clone();
             }
@@ -5643,6 +5657,53 @@ mod tests {
             accepted.run,
             "adoption never resends or settles the accepted prompt"
         );
+    }
+
+    #[test]
+    fn confirmed_identity_update_learns_only_an_owned_codex_threads_first_id() {
+        let HostedSession::Chat(mut codex) = source() else {
+            unreachable!()
+        };
+        codex.launch.provider = Provider::Codex;
+        codex.launch.recipe.program = "codex".into();
+        codex.launch.recipe.arguments = vec!["--remote".into(), "unix://".into()];
+        codex.launch.session_id = None;
+        let proof = codex.proof.clone().unwrap();
+        assert!(codex.claim_owned_codex_listener(std::path::Path::new("/run/fixture"), &proof));
+        let thread = uuid::Uuid::new_v4().to_string();
+        let learned = |source: &crate::chat::Session| {
+            let mut next = source.clone();
+            next.launch.session_id = Some(thread.clone());
+            next
+        };
+        assert!(confirmed_identity_update(&codex, &learned(&codex)));
+        // A begun thread never changes its ID.
+        let mut begun = codex.clone();
+        begun.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        assert!(!confirmed_identity_update(&begun, &learned(&begun)));
+        // Anything else changing is not identity learning.
+        let mut changed = learned(&codex);
+        changed.launch.recipe.arguments.push("--model".into());
+        assert!(!confirmed_identity_update(&codex, &changed));
+        let mut reproved = learned(&codex);
+        reproved.proof = None;
+        assert!(!confirmed_identity_update(&codex, &reproved));
+        // A shared or external server's thread is not this conversation's.
+        let mut shared = codex.clone();
+        shared.owned_codex_listener = None;
+        assert!(!confirmed_identity_update(&shared, &learned(&shared)));
+        let mut unproved = codex.clone();
+        unproved.proof = None;
+        assert!(!confirmed_identity_update(&unproved, &learned(&unproved)));
+        let mut invalid = codex.clone();
+        invalid.launch.session_id = Some("not-a-thread".into());
+        assert!(!confirmed_identity_update(&codex, &invalid));
+        // Other providers and plain Claude sessions do not learn this way.
+        let HostedSession::Chat(mut claude) = source() else {
+            unreachable!()
+        };
+        claude.launch.session_id = None;
+        assert!(!confirmed_identity_update(&claude, &learned(&claude)));
     }
 
     #[test]

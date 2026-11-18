@@ -1117,6 +1117,9 @@ fn dispatch(
         return Ok(());
     }
     ready?;
+    // A new thread is named before it reports ready. Save that now, so an
+    // agent no run update reaches again still keeps its conversation.
+    save_confirmed_identity(host, &registry, &session, handle.confirmed_session_id());
     if claim.is_none_or(|claim| claim.withdrawn) {
         return Err((State::Cancelled, UNDELIVERED_CANCELLATION.into()));
     }
@@ -1181,7 +1184,7 @@ pub(super) fn observed(
     run: RunId,
     update: Update,
 ) {
-    let source = {
+    let (source, confirmed) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let Some(record) = state
             .chats
@@ -1190,9 +1193,10 @@ pub(super) fn observed(
         else {
             return;
         };
-        record.session.clone()
+        (record.session.clone(), record.handle.confirmed_session_id())
     };
     let Ok(registry) = registry(host) else { return };
+    save_confirmed_identity(host, &registry, &source, confirmed);
     // The store guard ends with this block: `announce` takes the registry lock
     // and then the host lock, so it must never run while either is held.
     let recorded = {
@@ -1220,6 +1224,73 @@ pub(super) fn observed(
             super::automations::wake(host);
         }
     }
+}
+
+/// Saves the conversation ID a daemon-hosted Codex thread's provider
+/// confirmed to its agent and pane, whether or not any window shows it.
+///
+/// The thread is named only after its descriptor was bound, and without the
+/// saved ID nothing can resume it once this actor is gone: a restart that does
+/// not keep the provider, or an abandoned update, would otherwise leave the
+/// agent and its pane pointing at no conversation. `hosted` is the actor this
+/// daemon is running, so the bound descriptor is authenticated by being the
+/// same process; only the ID changes. Retained Claude helpers save theirs
+/// through the outcome broker under their census instead.
+fn save_confirmed_identity(
+    host: &SharedHost,
+    registry: &SharedRegistry,
+    hosted: &chat::Session,
+    confirmed: Option<String>,
+) {
+    // The store guard ends with this statement: `announce` takes the registry
+    // lock and then the host lock.
+    let learned = persist_confirmed_identity(
+        &mut registry.lock().unwrap_or_else(|p| p.into_inner()),
+        hosted,
+        confirmed,
+    );
+    match learned {
+        Ok(true) => announce(host, registry),
+        Ok(false) => {}
+        Err(error) => tracing::warn!(
+            %error,
+            chat = %hosted.id,
+            "cannot save the provider's confirmed conversation ID"
+        ),
+    }
+}
+
+fn persist_confirmed_identity(
+    store: &mut Registry,
+    hosted: &chat::Session,
+    confirmed: Option<String>,
+) -> Result<bool, String> {
+    let Some(confirmed) = confirmed else {
+        return Ok(false);
+    };
+    if hosted.launch.provider != crate::agent::Provider::Codex {
+        return Ok(false);
+    }
+    let Some(agent) = store.agent_for_session(hosted.id)? else {
+        return Ok(false);
+    };
+    let Some(HostedSession::Chat(bound)) = agent.session.filter(|_| !agent.closed) else {
+        return Ok(false);
+    };
+    if bound.launch.session_id.is_some()
+        || !crate::agent_execution::same_chat_process(&bound, hosted)
+    {
+        return Ok(false);
+    }
+    let mut learned = bound.clone();
+    learned.launch.session_id = Some(confirmed);
+    if !super::model::confirmed_identity_update(&bound, &learned) {
+        return Ok(false);
+    }
+    store.adopt_authenticated_agent_session(
+        &[HostedSession::Chat(bound)],
+        &HostedSession::Chat(learned),
+    )
 }
 
 fn finish_failure(host: &SharedHost, run: RunId, state: State, diagnostic: String) {

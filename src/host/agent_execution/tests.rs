@@ -2763,6 +2763,159 @@ fn fresh_codex_execution_uses_owned_listener_and_correlated_provider_result() {
     assert_eq!(server.join().unwrap(), 1);
 }
 
+/// A managed Codex agent no window shows keeps its thread: the daemon saves
+/// the ID the provider confirmed to the agent and its pane, so a restart that
+/// does not keep the provider can still resume it (#3095).
+#[test]
+fn undisplayed_codex_agent_saves_confirmed_thread_before_restart() {
+    if isolated("undisplayed_codex_agent_saves_confirmed_thread_before_restart").is_some() {
+        return;
+    }
+    use serde_json::{Value, json};
+    const THREAD: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    let (host, mut request, path) = fixture();
+    let root = path.parent().unwrap().to_owned();
+    let program = root.join("bin/codex");
+    std::fs::write(&program, "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > \"$HOME/../codex-arguments.partial\"\nmv \"$HOME/../codex-arguments.partial\" \"$HOME/../codex-arguments\"\nexec /bin/sleep 60\n").unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let Destination::New(spec) = &mut request.destination else {
+        unreachable!()
+    };
+    spec.provider = Provider::Codex;
+    let server_root = root.clone();
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let socket = loop {
+            if let Ok(arguments) = std::fs::read_to_string(server_root.join("codex-arguments"))
+                && let Some(socket) = arguments
+                    .lines()
+                    .find_map(|arg| arg.strip_prefix("unix://"))
+            {
+                break std::path::PathBuf::from(socket);
+            }
+            assert!(Instant::now() < deadline, "Codex server was not launched");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        let mut websocket = tungstenite::accept(stream).unwrap();
+        loop {
+            let Ok(message) = websocket.read() else { break };
+            if message.is_close() {
+                break;
+            }
+            let frame: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+            let Some(id) = frame.get("id") else { continue };
+            let method = frame["method"].as_str().unwrap();
+            let result = match method {
+                "initialize" => {
+                    json!({"userAgent":"codex/0.157.1", "codexHome":server_root.join("home/.codex")})
+                }
+                "thread/start" => {
+                    json!({"thread":{"id":THREAD,"canAcceptDirectInput":true,"status":{"type":"idle"}}})
+                }
+                "model/list" | "skills/list" => json!({"data":[]}),
+                "thread/queue/list" | "thread/list" => json!({"data":[],"nextCursor":null}),
+                "turn/start" => {
+                    // Hold the turn until the test has saved the pane, so the
+                    // run's outcome is what reports the confirmed thread.
+                    while !server_root.join("release-turn").exists() {
+                        assert!(Instant::now() < deadline, "turn was never released");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    json!({"turn":{"id":"owned-turn"}})
+                }
+                "thread/read" => json!({"thread":{"id":THREAD,"turns":[]}}),
+                method => panic!("unexpected Codex request {method}"),
+            };
+            websocket
+                .send(tungstenite::Message::Text(
+                    json!({"id":id,"result":result}).to_string().into(),
+                ))
+                .unwrap();
+            if method == "turn/start" {
+                websocket.send(tungstenite::Message::Text(json!({"method":"turn/completed","params":{"threadId":THREAD,"turn":{"id":"owned-turn","status":"completed","items":[{"id":"answer","type":"agentMessage","text":"SAVED_THREAD"}]}}}).to_string().into())).unwrap();
+            }
+        }
+    });
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    let store = registry(&host).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let bound = loop {
+        if let Some(HostedSession::Chat(bound)) = store
+            .lock()
+            .unwrap()
+            .agent(accepted.agent.id)
+            .unwrap()
+            .session
+        {
+            break bound;
+        }
+        assert!(Instant::now() < deadline, "agent never bound its provider");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(bound.owns_codex_listener());
+    assert!(bound.launch.session_id.is_none());
+    let id = bound.id;
+    assert!(
+        host.lock().unwrap().chats[&id]
+            .subscribers
+            .iter()
+            .all(|(client, visible)| *client == EXECUTION_CLIENT && !visible),
+        "no window displayed this chat"
+    );
+    // The agent's saved pane, as the daemon places it, never shown.
+    let pane_id = crate::model::CardId::from_uuid(accepted.agent.id.as_uuid());
+    store
+        .lock()
+        .unwrap()
+        .apply(&ModelEdit::SeedView {
+            scope: accepted.agent.placement.clone(),
+            closed: vec![],
+            panes: vec![crate::workspace_model::views::Pane {
+                id: pane_id,
+                title: "Unshown Codex agent".into(),
+                user_title: None,
+                pending_terminal_start: false,
+                width_fraction: 1.0,
+                kind: crate::model::CardKind::Chat(bound.clone()),
+                scope: None,
+            }],
+        })
+        .unwrap();
+    std::fs::write(root.join("release-turn"), "").unwrap();
+    let run = settled(&host, accepted.run.id);
+    assert_eq!(run.state, State::Succeeded, "{run:?}");
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let saved_pane = || {
+        let (descriptor, provider_session): (String, Option<String>) = db
+            .query_row(
+                "SELECT descriptor, provider_session FROM panes WHERE id=?1",
+                [pane_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let crate::model::CardKind::Chat(pane) = serde_json::from_str(&descriptor).unwrap() else {
+            panic!("saved chat pane");
+        };
+        (pane, provider_session)
+    };
+    let mut expected = bound.clone();
+    expected.launch.session_id = Some(THREAD.into());
+    // Daemon stop, then only the durable model remains.
+    super::super::finish_chat_shutdown(&host).unwrap();
+    let agent = store.lock().unwrap().agent(accepted.agent.id).unwrap();
+    assert!(!agent.closed);
+    assert_eq!(agent.session, Some(HostedSession::Chat(expected.clone())));
+    let (pane, provider_session) = saved_pane();
+    assert_eq!(pane, expected, "only the thread ID changed");
+    assert_eq!(provider_session.as_deref(), Some(THREAD));
+    server.join().unwrap();
+}
+
 /// An unverified Codex (ReconnectOnly) agent is not carried through an update:
 /// the successor daemon relaunches its server and resumes the saved thread.
 /// The agent must then follow its relaunched conversation instead of refusing

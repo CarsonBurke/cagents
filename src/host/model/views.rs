@@ -976,7 +976,7 @@ pub(super) fn adopt_authenticated_agent_pane_with_console(
             if retained.contains(&HostedSession::Chat(current.clone()))
                 && (crate::chat::is_upgrade_recovery(current, next)
                     || crate::chat::is_upgrade_identity_learning(current, next)
-                    || super::execution::retained_identity_update(current, next)) =>
+                    || super::execution::confirmed_identity_update(current, next)) =>
         {
             CardKind::Chat(next.clone())
         }
