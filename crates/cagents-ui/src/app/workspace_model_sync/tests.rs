@@ -1985,7 +1985,9 @@ fn first_model_read_uses_moved_native_pane_instead_of_stale_managed_placement() 
     };
     app.automation_ui.update(Action::Received {
         sequence,
-        result: Arc::new(Ok(crate::automations::Response::Detail(detail.clone()))),
+        result: Arc::new(Ok(crate::automations::Response::Detail(Box::new(
+            detail.clone(),
+        )))),
     });
     let Some(Effect::Request { sequence, .. }) = app.automation_ui.update(Action::OpenSession)
     else {
@@ -1994,7 +1996,7 @@ fn first_model_read_uses_moved_native_pane_instead_of_stale_managed_placement() 
     Arc::make_mut(&mut app.durable).active_channel = Some(target);
     drop(app.update_automation_ui(Action::Received {
         sequence,
-        result: Arc::new(Ok(crate::automations::Response::Detail(detail))),
+        result: Arc::new(Ok(crate::automations::Response::Detail(Box::new(detail)))),
     }));
     assert_eq!(
         app.durable.active_channel,

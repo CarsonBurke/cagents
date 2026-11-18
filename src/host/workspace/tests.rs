@@ -153,7 +153,7 @@ fn assert_sqlite_progress(removing: bool) {
                     scope,
                     view_revision: model.views[0].revision,
                     model_sequence: model.sequence,
-                    before: pane,
+                    before: Box::new(pane),
                 }),
             },
         }

@@ -125,7 +125,7 @@ pub enum Outcome {
     /// The account's state, which may be "signed out" or "not installed".
     Answered {
         identity: Option<Identity>,
-        snapshot: UsageSnapshot,
+        snapshot: Box<UsageSnapshot>,
         /// The models the CLI listed while it was asked, which a cached
         /// answer does not repeat: the cache holds its own list.
         catalog: Option<Catalog>,
@@ -266,7 +266,7 @@ async fn run_reading(
     {
         let entry = Entry {
             identity: identity.clone(),
-            snapshot: snapshot.clone(),
+            snapshot: UsageSnapshot::clone(snapshot),
         };
         let catalog = catalog.clone();
         let provider = account.provider;
@@ -349,7 +349,7 @@ fn prepare(
 fn answered(identity: Option<Identity>, snapshot: UsageSnapshot) -> Outcome {
     Outcome::Answered {
         identity,
-        snapshot,
+        snapshot: Box::new(snapshot),
         catalog: None,
     }
 }
@@ -382,7 +382,7 @@ impl Probed {
     fn into_outcome(self) -> Outcome {
         Outcome::Answered {
             identity: self.identity,
-            snapshot: self.snapshot,
+            snapshot: Box::new(self.snapshot),
             catalog: self.catalog,
         }
     }

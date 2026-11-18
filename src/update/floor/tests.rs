@@ -1386,7 +1386,7 @@ fn paired_chat_and_console_are_listed_as_one_pane() {
             .daemon
             .as_ref()
             .map(|daemon| daemon.capability.proof.clone()),
-        terminal: Some(terminal.clone()),
+        terminal: Some(Box::new(terminal.clone())),
         owned_codex_listener: None,
         native_continuity: Default::default(),
     };

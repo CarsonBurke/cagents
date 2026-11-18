@@ -56,12 +56,12 @@ fn complete(
 ) -> Action {
     Action::Inspected {
         card,
-        source,
+        source: Box::new(source),
         request,
         socket: Some(crate::terminal::ipc::daemon_socket_path().expect("fixture socket address")),
         relaunch: false,
         directory: Directory::Available,
-        result,
+        result: result.map(|started| started.map(Box::new)),
     }
 }
 
@@ -444,7 +444,7 @@ fn directory_evidence_is_presentation_and_does_not_change_the_saved_recipe() {
     // Submit the actual same owned completion with explicit missing-folder data.
     let action = Action::Inspected {
         card,
-        source: source.clone(),
+        source: Box::new(source.clone()),
         request,
         socket: Some(crate::terminal::ipc::daemon_socket_path().expect("fixture socket address")),
         relaunch: false,

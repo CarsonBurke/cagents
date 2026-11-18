@@ -426,7 +426,7 @@ mod tests {
                         session_id: None,
                     },
                     proof: terminal.continuity.live_proof(),
-                    terminal: Some(terminal),
+                    terminal: Some(Box::new(terminal)),
                     owned_codex_listener: None,
                     native_continuity: Default::default(),
                 });

@@ -310,7 +310,7 @@ mod tests {
                 host_incarnation: proof.host_incarnation.clone(),
             };
             let issued = source.clone();
-            source.terminal = Some(terminal.clone());
+            source.terminal = Some(Box::new(terminal.clone()));
             let agent = Agent {
                 id,
                 name: Some("fixture-console".into()),

@@ -238,7 +238,7 @@ struct ClosePublication {
 #[derive(Serialize, Deserialize)]
 enum ConditionalClosePublication {
     Changed,
-    Closed(ClosePublication),
+    Closed(Box<ClosePublication>),
 }
 #[derive(Serialize, Deserialize)]
 struct Startup {
@@ -2269,7 +2269,7 @@ impl RemoteActor {
     pub fn try_close_if_idle(&self, generation: u64) -> Result<bool, String> {
         let publication = match self.call("try_close_if_idle", json!([generation])) {
             Ok(ConditionalClosePublication::Changed) => return Ok(false),
-            Ok(ConditionalClosePublication::Closed(publication)) => Ok(publication),
+            Ok(ConditionalClosePublication::Closed(publication)) => Ok(*publication),
             Err(error) => Err(error),
         };
         // A lost reply remains uncertain unless the existing exact durable
@@ -3655,7 +3655,7 @@ impl Server {
             self.finish_inputs();
         }
         self.publish_close()
-            .map(ConditionalClosePublication::Closed)
+            .map(|publication| ConditionalClosePublication::Closed(Box::new(publication)))
     }
     fn publish_close(&mut self) -> Result<ClosePublication, String> {
         let snapshot = if let Some(snapshot) = &self.closed_snapshot {
@@ -3794,7 +3794,7 @@ impl Server {
                 let (request, reply) = call.into_parts();
                 let close = request.method == "retire";
                 if request.method == "presentation_binary" {
-                    let response = self.binary_presentation(request);
+                    let response = self.binary_presentation(request).map(Box::new);
                     reply.send(connections::Answer::Binary(response));
                     orphans.run();
                     continue;

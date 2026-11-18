@@ -269,7 +269,7 @@ while True:
     let mut paired = Handle::inspect_remote(&identity.record, first.clone())
         .unwrap()
         .source;
-    paired.terminal = Some(descriptor.session.clone());
+    paired.terminal = Some(Box::new(descriptor.session.clone()));
     actor
         .update_native_source(paired.clone(), Some(recipe), Some(pair.clone()))
         .unwrap();

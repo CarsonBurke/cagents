@@ -137,7 +137,7 @@ for line in sys.stdin:
         .load(now_ms())
         .remove(&claude.cache_key().unwrap())
         .unwrap();
-    assert_eq!(published.snapshot, snapshot);
+    assert_eq!(published.snapshot, *snapshot);
     assert!(
         cache
             .as_ref()

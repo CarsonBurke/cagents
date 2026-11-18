@@ -12,6 +12,8 @@ use crate::{
 };
 use imara_diff::{Algorithm, Diff, InternedInput};
 
+// Parsed once per CLI invocation and dispatched at once, so boxing `Spawn` would only add indirection.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 pub enum AgentCommand {
     /// The terminal presentation of an already hosted execution agent.

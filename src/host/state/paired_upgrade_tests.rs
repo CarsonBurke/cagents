@@ -386,7 +386,7 @@ fn run_pair(mode: &str) {
     assert_eq!(prepared.chats[0].source, saved);
     let mut checkpoint_source = prepared.terminals[0].source.clone();
     checkpoint_source.continuity = saved.terminal.as_ref().unwrap().continuity.clone();
-    assert_eq!(checkpoint_source, *saved.terminal.as_ref().unwrap());
+    assert_eq!(checkpoint_source, **saved.terminal.as_ref().unwrap());
     let expected_execution = saved.launch.terminal_recipe().unwrap();
     assert_eq!(prepared.terminals[0].recipe, expected_execution);
     if mode != "exact" {

@@ -237,7 +237,7 @@ pub(super) fn to_agent(
             super::now(),
         );
     let accepted = match handoff {
-        Ok(MessageHandoff::Accepted(accepted)) => accepted,
+        Ok(MessageHandoff::Accepted(accepted)) => *accepted,
         Ok(MessageHandoff::Settled) => return Ok(None),
         Ok(MessageHandoff::Behind) => return Ok(Some(Handoff::Behind { agent: agent.id })),
         Ok(MessageHandoff::NoSlot) => return Ok(Some(Handoff::NoSlot { agent: agent.id })),

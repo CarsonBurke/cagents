@@ -785,7 +785,7 @@ pub(super) fn apply_recorded(
                         return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
                     }
                     if let Some(capture) = capture {
-                        if capture.scope != *scope || capture.before != *before {
+                        if capture.scope != *scope || *capture.before != *before {
                             return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
                         }
                         bindings::captured(transaction, capture, None)?;
@@ -983,7 +983,7 @@ pub(super) fn adopt_authenticated_agent_pane_with_console(
         (CardKind::Terminal(current), _) => {
             let terminal = |source: &HostedSession| match source {
                 HostedSession::Terminal(session) => Some(session.clone()),
-                HostedSession::Chat(session) => session.terminal.clone(),
+                HostedSession::Chat(session) => session.terminal.as_deref().cloned(),
             };
             let Some(next) = terminal(successor) else {
                 return Ok(false);
@@ -2258,7 +2258,7 @@ mod tests {
         seed(&mut registry, channel, vec![original.clone()]);
         let mut delayed = original.clone();
         if let CardKind::Chat(chat) = &mut delayed.kind {
-            chat.terminal = Some(terminal);
+            chat.terminal = Some(Box::new(terminal));
         }
         let mut current = original.clone();
         if let CardKind::Chat(chat) = &mut current.kind {
@@ -2911,7 +2911,7 @@ mod tests {
                         session_id: Some(uuid::Uuid::new_v4().to_string()),
                     },
                     proof: terminal.continuity.live_proof(),
-                    terminal: Some(terminal.clone()),
+                    terminal: Some(Box::new(terminal.clone())),
                     owned_codex_listener: None,
                     native_continuity: Default::default(),
                 })
@@ -2933,7 +2933,7 @@ mod tests {
             let presentation = |session: &HostedSession| match session {
                 HostedSession::Chat(session) if !console => CardKind::Chat(session.clone()),
                 HostedSession::Chat(session) => {
-                    CardKind::Terminal(session.terminal.clone().unwrap())
+                    CardKind::Terminal(session.terminal.as_deref().cloned().unwrap())
                 }
                 HostedSession::Terminal(session) => CardKind::Terminal(session.clone()),
             };
@@ -3193,7 +3193,7 @@ mod tests {
                         session_id: Some(uuid::Uuid::new_v4().to_string()),
                     },
                     proof: terminal.continuity.live_proof(),
-                    terminal: Some(terminal),
+                    terminal: Some(Box::new(terminal)),
                     owned_codex_listener: None,
                     native_continuity: Default::default(),
                 })
@@ -3202,7 +3202,7 @@ mod tests {
             };
             let original = r.bind_agent(accepted.agent.id, None, live.clone()).unwrap();
             let console = if let HostedSession::Chat(session) = &live {
-                let terminal = session.terminal.clone().unwrap();
+                let terminal = session.terminal.as_deref().cloned().unwrap();
                 r.bind_agent_console(original.id, &live, terminal.clone())
                     .unwrap();
                 Some(Pane {
@@ -3764,7 +3764,7 @@ mod tests {
                 session_id: None,
             },
             proof: terminal.continuity.live_proof(),
-            terminal: Some(terminal),
+            terminal: Some(Box::new(terminal)),
             owned_codex_listener: None,
             native_continuity: Default::default(),
         });

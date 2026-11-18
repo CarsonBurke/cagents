@@ -4236,7 +4236,7 @@ impl Cagents {
                 {
                     learned = Some((key, identity.clone()));
                 }
-                state.snapshot = Some(snapshot);
+                state.snapshot = Some(*snapshot);
                 state.failure = None;
             }
             Outcome::Failed(message) => {
@@ -5405,7 +5405,7 @@ impl Cagents {
                     if let Some(snapshot) = snapshot {
                         state.schedule.start(Trigger::Manual, now);
                         state.schedule.succeed(snapshot.observed_at);
-                        state.snapshot = Some(snapshot);
+                        state.snapshot = Some(*snapshot);
                     }
                     state.identity = identity;
                 }
@@ -7052,7 +7052,7 @@ mod tests {
                     email: Some("signed-in@example.com".into()),
                     ..Identity::default()
                 }),
-                snapshot: UsageSnapshot::state(UsageStatus::Ok, "signed in", now_ms()),
+                snapshot: Box::new(UsageSnapshot::state(UsageStatus::Ok, "signed in", now_ms())),
             },
         })));
         let state = app.account_ui.account(&id).unwrap();
@@ -8881,7 +8881,7 @@ mod app_tests {
                     email: Some(email.into()),
                     ..Identity::default()
                 }),
-                snapshot: UsageSnapshot::state(UsageStatus::Ok, "", NOW),
+                snapshot: Box::new(UsageSnapshot::state(UsageStatus::Ok, "", NOW)),
             },
         })
     }
@@ -9235,7 +9235,7 @@ mod app_tests {
             outcome: Outcome::Answered {
                 catalog: None,
                 identity: None,
-                snapshot: UsageSnapshot::state(UsageStatus::NeedsLogin, "", NOW),
+                snapshot: Box::new(UsageSnapshot::state(UsageStatus::NeedsLogin, "", NOW)),
             },
         }));
         let state = app.account_ui.account_mut(&id).unwrap();
@@ -9416,7 +9416,7 @@ mod app_tests {
             outcome: Outcome::Answered {
                 catalog: None,
                 identity: Some(identity),
-                snapshot,
+                snapshot: Box::new(snapshot),
             },
         })
     }
@@ -9665,7 +9665,7 @@ mod app_tests {
             outcome: Outcome::Answered {
                 catalog: None,
                 identity: None,
-                snapshot: snapshot.clone(),
+                snapshot: Box::new(snapshot.clone()),
             },
         }));
         let state = app.account_ui.account(&id).unwrap();
@@ -9703,7 +9703,7 @@ mod app_tests {
                     plan: None,
                     disputed_by: None,
                 }),
-                snapshot: older,
+                snapshot: Box::new(older),
             },
         }));
         let state = app.account_ui.account(&id).unwrap();
@@ -9766,7 +9766,7 @@ mod app_tests {
                 outcome: Outcome::Answered {
                     catalog: None,
                     identity: Some(old_identity),
-                    snapshot: delayed,
+                    snapshot: Box::new(delayed),
                 },
             });
             let rejection = LiveReport::Claude(
@@ -9859,7 +9859,7 @@ mod app_tests {
                 outcome: Outcome::Answered {
                     catalog: None,
                     identity: Some(identity.clone()),
-                    snapshot: fresh.clone(),
+                    snapshot: Box::new(fresh.clone()),
                 },
             })));
 
@@ -10115,7 +10115,11 @@ mod app_tests {
                 identity,
                 snapshot,
                 catalog,
-            } => (identity.clone(), snapshot.clone(), catalog.clone()),
+            } => (
+                identity.clone(),
+                UsageSnapshot::clone(snapshot),
+                catalog.clone(),
+            ),
             _ => panic!("actual collector/finisher must build the answer"),
         };
         assert_eq!(produced_snapshot.source, UsageSource::Probe);
@@ -10354,7 +10358,7 @@ mod app_tests {
         state.present = true;
         state.identity = identity;
         state.schedule.succeed(snapshot.observed_at);
-        state.snapshot = Some(snapshot);
+        state.snapshot = Some(*snapshot);
         let provider = state.account.provider;
         app.account_ui.take_catalog(provider, catalog.unwrap(), now);
     }
@@ -10528,7 +10532,7 @@ mod app_tests {
                     unreachable!()
                 };
                 let state = app.account_ui.account(&id).unwrap();
-                assert_eq!(state.snapshot.as_ref(), Some(&snapshot));
+                assert_eq!(state.snapshot.as_ref(), Some(&*snapshot));
                 assert_eq!(state.identity, identity);
                 assert!(state.failure.is_none());
                 assert!(!state.schedule.in_flight(now));
@@ -10929,7 +10933,7 @@ mod app_tests {
                         assert_eq!(snapshot.observed_at, observed_at);
                         assert!(!snapshot.windows.is_empty());
                         assert!(snapshot.plan.is_some() && snapshot.credits.is_some());
-                        assert_eq!(state.snapshot.as_ref(), Some(&snapshot));
+                        assert_eq!(state.snapshot.as_ref(), Some(&*snapshot));
                         assert_eq!(state.identity, identity);
                         assert!(state.present && state.failure.is_none());
                         assert_eq!(state.schedule.failures(), 0);
@@ -11064,11 +11068,11 @@ mod app_tests {
                             id,
                             outcome: Outcome::Answered {
                                 identity: None,
-                                snapshot: UsageSnapshot::state(
+                                snapshot: Box::new(UsageSnapshot::state(
                                     UsageStatus::Ok,
                                     "probe after clock rollback",
                                     now,
-                                ),
+                                )),
                                 catalog: Some(catalog(now, "current")),
                             },
                         }))
@@ -11138,7 +11142,7 @@ mod app_tests {
             id: managed.clone(),
             outcome: Outcome::Answered {
                 identity: None,
-                snapshot: snapshot.clone(),
+                snapshot: Box::new(snapshot.clone()),
                 catalog: Some(catalog(now - 5_000, "probed")),
             },
         }));
@@ -11239,7 +11243,7 @@ mod app_tests {
             outcome: Outcome::Answered {
                 catalog: None,
                 identity: None,
-                snapshot: probed,
+                snapshot: Box::new(probed),
             },
         }));
         let _ = app.account_reported(Provider::Claude, &recipe, vec![(claude_report(0.43), now)]);
@@ -11370,7 +11374,7 @@ mod app_tests {
             outcome: Outcome::Answered {
                 catalog: None,
                 identity: None,
-                snapshot: probed.clone(),
+                snapshot: Box::new(probed.clone()),
             },
         }));
         let _ = app.update(Message::AccountUi(Action::Located {
@@ -11449,7 +11453,11 @@ mod app_tests {
             outcome: Outcome::Answered {
                 catalog: None,
                 identity: None,
-                snapshot: UsageSnapshot::state(UsageStatus::NeedsLogin, "signed out", now),
+                snapshot: Box::new(UsageSnapshot::state(
+                    UsageStatus::NeedsLogin,
+                    "signed out",
+                    now,
+                )),
             },
         }));
         let recipe = recipe_on(&app, &id);
@@ -12197,11 +12205,11 @@ mod app_tests {
                         email: Some("cached@example.com".into()),
                         ..Identity::default()
                     }),
-                    snapshot: UsageSnapshot::state(
+                    snapshot: Box::new(UsageSnapshot::state(
                         UsageStatus::NeedsLogin,
                         "expired credentials",
                         NOW,
-                    ),
+                    )),
                 },
             );
             assert!(app.account_ui.registry.find(key).is_none());
@@ -12229,7 +12237,7 @@ mod app_tests {
                 email: Some(email.into()),
                 ..Identity::default()
             }),
-            snapshot: UsageSnapshot::state(status, "fixture", NOW),
+            snapshot: Box::new(UsageSnapshot::state(status, "fixture", NOW)),
         }
     }
 
@@ -12319,7 +12327,11 @@ mod app_tests {
             outcome: Outcome::Answered {
                 catalog: None,
                 identity: None,
-                snapshot: UsageSnapshot::state(UsageStatus::NeedsLogin, "signed out", now),
+                snapshot: Box::new(UsageSnapshot::state(
+                    UsageStatus::NeedsLogin,
+                    "signed out",
+                    now,
+                )),
             },
         }));
         assert!(app.account_ui.logins.is_empty());
@@ -12338,7 +12350,11 @@ mod app_tests {
             outcome: Outcome::Answered {
                 catalog: None,
                 identity: None,
-                snapshot: UsageSnapshot::state(UsageStatus::NeedsLogin, "signed out", NOW),
+                snapshot: Box::new(UsageSnapshot::state(
+                    UsageStatus::NeedsLogin,
+                    "signed out",
+                    NOW,
+                )),
             },
         }));
         assert_eq!(app.account_ui.logins[0].phase, LoginPhase::Discarding);
@@ -12382,7 +12398,7 @@ mod app_tests {
             result: Ok(Settled::Registered {
                 registry,
                 identity: Some(identity.clone()),
-                snapshot: Some(UsageSnapshot::state(UsageStatus::Ok, "", NOW)),
+                snapshot: Some(Box::new(UsageSnapshot::state(UsageStatus::Ok, "", NOW))),
             }),
         }));
         assert!(app.account_ui.logins.is_empty());
@@ -13247,7 +13263,11 @@ mod app_tests {
             outcome: Outcome::Answered {
                 identity: Some(Identity::default()),
                 catalog: None,
-                snapshot: UsageSnapshot::state(UsageStatus::Ok, "late old executable", now_ms()),
+                snapshot: Box::new(UsageSnapshot::state(
+                    UsageStatus::Ok,
+                    "late old executable",
+                    now_ms(),
+                )),
             },
         }));
         let state = app.account_ui.account(&id).unwrap();
@@ -13365,7 +13385,11 @@ mod app_tests {
             outcome: Outcome::Answered {
                 identity: Some(Identity::default()),
                 catalog: None,
-                snapshot: UsageSnapshot::state(UsageStatus::Ok, "late old executable", now + 1),
+                snapshot: Box::new(UsageSnapshot::state(
+                    UsageStatus::Ok,
+                    "late old executable",
+                    now + 1,
+                )),
             },
         }));
         let state = app.account_ui.account(&id).unwrap();
@@ -13393,7 +13417,7 @@ mod app_tests {
                 outcome: Outcome::Answered {
                     identity: None,
                     catalog: None,
-                    snapshot: fresh.clone(),
+                    snapshot: Box::new(fresh.clone()),
                 },
             })
         };
@@ -13496,7 +13520,7 @@ mod app_tests {
                 outcome: Outcome::Answered {
                     catalog: None,
                     identity: None,
-                    snapshot: UsageSnapshot::state(status, "", now_ms()),
+                    snapshot: Box::new(UsageSnapshot::state(status, "", now_ms())),
                 },
             })
         };
@@ -14033,7 +14057,11 @@ mod app_tests {
             Outcome::Answered {
                 identity: Some(known_login.clone()),
                 catalog: None,
-                snapshot: UsageSnapshot::state(UsageStatus::Ok, "old cached answer", now),
+                snapshot: Box::new(UsageSnapshot::state(
+                    UsageStatus::Ok,
+                    "old cached answer",
+                    now,
+                )),
             },
         ));
         let fresh = app.account_ui.pending_probe_for_test(&id).unwrap();
@@ -14052,7 +14080,11 @@ mod app_tests {
             Outcome::Answered {
                 identity: None,
                 catalog: None,
-                snapshot: UsageSnapshot::state(UsageStatus::Limited, "old owner", now + 1),
+                snapshot: Box::new(UsageSnapshot::state(
+                    UsageStatus::Limited,
+                    "old owner",
+                    now + 1,
+                )),
             },
         ));
         assert!(
@@ -14075,11 +14107,11 @@ mod app_tests {
             Outcome::Answered {
                 identity: None,
                 catalog: None,
-                snapshot: UsageSnapshot::state(
+                snapshot: Box::new(UsageSnapshot::state(
                     UsageStatus::Limited,
                     "changed login result",
                     now + 1,
-                ),
+                )),
             },
         ));
         assert!(app.account_ui.pending_probe_for_test(&id).is_none());
@@ -14212,7 +14244,7 @@ mod app_tests {
             Outcome::Answered {
                 identity: None,
                 catalog: None,
-                snapshot: UsageSnapshot::state(UsageStatus::Ok, "finished", now),
+                snapshot: Box::new(UsageSnapshot::state(UsageStatus::Ok, "finished", now)),
             },
         ));
         assert!(
@@ -14364,7 +14396,7 @@ mod app_tests {
                 Outcome::Answered {
                     identity: None,
                     catalog: None,
-                    snapshot: old,
+                    snapshot: Box::new(old),
                 },
             ));
             let state = app.account_ui.account_mut(&id).unwrap();
@@ -14409,7 +14441,7 @@ mod app_tests {
                 Outcome::Answered {
                     identity: None,
                     catalog: None,
-                    snapshot: fresh,
+                    snapshot: Box::new(fresh),
                 },
             ));
             let state = app.account_ui.account(&id).unwrap();
@@ -14458,7 +14490,7 @@ mod app_tests {
             Outcome::Answered {
                 identity: None,
                 catalog: None,
-                snapshot: UsageSnapshot::state(UsageStatus::Ok, "finished", now),
+                snapshot: Box::new(UsageSnapshot::state(UsageStatus::Ok, "finished", now)),
             },
         ));
         assert!(app.account_ui.pending_probe_for_test(&id).unwrap().force);
@@ -14490,7 +14522,11 @@ mod app_tests {
             Outcome::Answered {
                 identity: None,
                 catalog: None,
-                snapshot: UsageSnapshot::state(UsageStatus::Ok, "older admitted read", now + 1),
+                snapshot: Box::new(UsageSnapshot::state(
+                    UsageStatus::Ok,
+                    "older admitted read",
+                    now + 1,
+                )),
             },
         ));
         let state = app.account_ui.account(&id).unwrap();
@@ -14510,7 +14546,11 @@ mod app_tests {
             Outcome::Answered {
                 identity: None,
                 catalog: None,
-                snapshot: UsageSnapshot::state(UsageStatus::Ok, "fresh current read", now + 2),
+                snapshot: Box::new(UsageSnapshot::state(
+                    UsageStatus::Ok,
+                    "fresh current read",
+                    now + 2,
+                )),
             },
         ));
         let state = app.account_ui.account(&id).unwrap();

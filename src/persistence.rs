@@ -8295,7 +8295,7 @@ mod tests {
                 session_id: Some(id.into()),
             },
             proof: None,
-            terminal: Some(source.clone()),
+            terminal: Some(Box::new(source.clone())),
         };
         (workspace, chat)
     }
@@ -9662,7 +9662,7 @@ mod tests {
         lane.save(&store, &workspace).unwrap();
         let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
         assert_eq!(restored.cards[0].kind, CardKind::Chat(chat.clone()));
-        let mut terminal = chat.terminal.clone().unwrap();
+        let mut terminal = chat.terminal.as_deref().cloned().unwrap();
         terminal.id = TerminalId::new();
         terminal.continuity = TerminalContinuity::RelaunchAvailable {
             recipe: terminal.launch.clone(),
@@ -10841,7 +10841,7 @@ mod tests {
         };
         fresh.kind = CardKind::Chat(crate::chat::Session {
             id: TerminalId::new(),
-            terminal: Some(source.clone()),
+            terminal: Some(Box::new(source.clone())),
             ..draft.clone()
         });
         let fresh_id = fresh.id;
@@ -11129,7 +11129,7 @@ mod tests {
             card_refusal(lane.save(&store, &workspace), workspace.cards[0].id),
             StoreError::InvalidState(_)
         ));
-        let terminal = chat.terminal.unwrap();
+        let terminal = *chat.terminal.unwrap();
         workspace.cards[0].kind = CardKind::Terminal(terminal.clone());
         lane.save(&store, &workspace).unwrap();
         let proof = terminal.continuity.live_proof().unwrap();
@@ -11216,7 +11216,7 @@ mod tests {
                     session_id: chat.launch.session_id.clone(),
                 },
                 proof: None,
-                terminal: Some(terminal.clone()),
+                terminal: Some(Box::new(terminal.clone())),
             };
             workspace.cards[0].kind = CardKind::Chat(again.clone());
             lane.save(&store, &workspace).unwrap();
@@ -11347,7 +11347,7 @@ mod tests {
                     StoreError::InvalidState(_)
                 ));
                 let mut paired = native.clone();
-                paired.terminal = Some(wrong);
+                paired.terminal = Some(Box::new(wrong));
                 workspace.cards[0].kind = CardKind::Chat(paired);
                 assert!(matches!(
                     card_refusal(lane.save(&store, &workspace), workspace.cards[0].id),
@@ -11356,7 +11356,7 @@ mod tests {
             }
             if paired_first {
                 let mut paired = native.clone();
-                paired.terminal = Some(view.clone());
+                paired.terminal = Some(Box::new(view.clone()));
                 workspace.cards[0].kind = CardKind::Chat(paired);
                 lane.save(&store, &workspace).unwrap();
             }
@@ -11372,7 +11372,7 @@ mod tests {
             );
             // And the CLI switches back to the chat it came from.
             let mut paired = native.clone();
-            paired.terminal = Some(view);
+            paired.terminal = Some(Box::new(view));
             workspace.cards[0].kind = CardKind::Chat(paired.clone());
             lane.save(&store, &workspace).unwrap();
             let restored = store

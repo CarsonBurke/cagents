@@ -974,7 +974,7 @@ fn blocked_fresh_abandoned_cleanup_keeps_captured_pair_receipt_required() {
     source.native_continuity = chat::NativeContinuity::ReconnectOnly;
     source.owned_codex_listener = None;
     let proof = source.proof.clone().unwrap();
-    source.terminal = Some(crate::model::TerminalSession {
+    source.terminal = Some(Box::new(crate::model::TerminalSession {
         id: source.id,
         launch: source.launch.recipe.clone(),
         owned_codex_listener: None,
@@ -987,7 +987,7 @@ fn blocked_fresh_abandoned_cleanup_keeps_captured_pair_receipt_required() {
             boot_id: proof.boot_id,
             host_incarnation: proof.host_incarnation,
         },
-    });
+    }));
     app.card_state_mut(card).unwrap().kind = CardKind::Chat(source.clone());
     let runtime = app.chat_runtime_mut(target).unwrap();
     runtime.session = source.clone();

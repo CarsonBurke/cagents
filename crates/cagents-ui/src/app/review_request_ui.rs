@@ -164,12 +164,13 @@ impl Cagents {
         drop(self.update_review_requests(Action::SharedLoaded {
             repository,
             generation,
-            result: Ok(crate::github::review_requests::shared::PollResult {
-                scan,
-                error: None,
-                due: crate::github::polling::now() + 60,
-                observation: (uuid::Uuid::new_v4().to_string(), 1),
-                observed: vec![crate::github::review_requests::shared::Observation {
+            result: Ok(Box::new(
+                crate::github::review_requests::shared::PollResult {
+                    scan,
+                    error: None,
+                    due: crate::github::polling::now() + 60,
+                    observation: (uuid::Uuid::new_v4().to_string(), 1),
+                    observed: vec![crate::github::review_requests::shared::Observation {
                         revision: 1,
                         at: crate::github::polling::now(),
                         viewer: "viewer".into(),
@@ -178,7 +179,8 @@ impl Cagents {
                             .map(|&number| (number, format!("request-{number}")))
                             .collect(),
                     }],
-            }),
+                },
+            )),
         }));
     }
 }

@@ -123,7 +123,7 @@ fn earlier_message_waits(db: &Connection, id: MessageId, now: u64) -> Result<boo
 #[derive(Debug)]
 pub(crate) enum MessageHandoff {
     /// The message is settled and `Accepted` is the run it became.
-    Accepted(crate::agent_execution::Accepted),
+    Accepted(Box<crate::agent_execution::Accepted>),
     /// It was already settled, by another delivery or its recipient.
     Settled,
     /// An earlier message to the same recipient has not reached it yet.
@@ -624,7 +624,7 @@ impl Registry {
             Err(error) => return Err(error),
         };
         tx.commit().map_err(|error| error.to_string())?;
-        Ok(MessageHandoff::Accepted(accepted))
+        Ok(MessageHandoff::Accepted(Box::new(accepted)))
     }
 
     /// Returns a message `session` refused to the queue it was claimed from.

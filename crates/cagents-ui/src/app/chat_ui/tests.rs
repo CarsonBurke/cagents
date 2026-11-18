@@ -3766,10 +3766,10 @@ fn automatic_draft_routing_waits_for_untouched_send_and_same_account_choice_pins
             outcome: account::probe::Outcome::Answered {
                 identity: None,
                 catalog: None,
-                snapshot: account::codex::parse_rate_limits(
+                snapshot: Box::new(account::codex::parse_rate_limits(
                     &serde_json::json!({"ordinaryUsageAllowed": status == account::UsageStatus::Ok}),
                     now,
-                ),
+                )),
             },
         }));
     }
@@ -3838,10 +3838,10 @@ fn limited_automatic_chat(app: &mut Cagents, draft: &str) -> (CardId, Target) {
             outcome: account::probe::Outcome::Answered {
                 identity: None,
                 catalog: None,
-                snapshot: account::codex::parse_rate_limits(
+                snapshot: Box::new(account::codex::parse_rate_limits(
                     &serde_json::json!({"ordinaryUsageAllowed": allowed}),
                     now,
-                ),
+                )),
             },
         }));
     }
@@ -11794,11 +11794,11 @@ fn a_conversations_account_report_reaches_its_account() {
         outcome: crate::account::probe::Outcome::Answered {
             catalog: None,
             identity: None,
-            snapshot: crate::account::UsageSnapshot::state(
+            snapshot: Box::new(crate::account::UsageSnapshot::state(
                 crate::account::UsageStatus::Ok,
                 "",
                 now - 1,
-            ),
+            )),
         },
     }));
     assert!(handle.push_account_usage_for_test(report(20), now));
@@ -11876,11 +11876,11 @@ fn a_new_chat_limit_without_usage_frames_forces_one_read_with_usage_views_closed
             outcome: crate::account::probe::Outcome::Answered {
                 identity: None,
                 catalog: None,
-                snapshot: crate::account::UsageSnapshot::state(
+                snapshot: Box::new(crate::account::UsageSnapshot::state(
                     crate::account::UsageStatus::Ok,
                     "cached",
                     now,
-                ),
+                )),
             },
         })),
     );
@@ -11923,11 +11923,11 @@ fn a_new_chat_limit_without_usage_frames_forces_one_read_with_usage_views_closed
             outcome: crate::account::probe::Outcome::Answered {
                 identity: None,
                 catalog: None,
-                snapshot: crate::account::UsageSnapshot::state(
+                snapshot: Box::new(crate::account::UsageSnapshot::state(
                     crate::account::UsageStatus::Limited,
                     "fresh",
                     now + 1,
-                ),
+                )),
             },
         })),
     );
@@ -12109,11 +12109,11 @@ fn revealing_a_cold_disconnected_current_limit_refreshes_once_without_another_cl
                     outcome: crate::account::probe::Outcome::Answered {
                         identity: None,
                         catalog: None,
-                        snapshot: crate::account::UsageSnapshot::state(
+                        snapshot: Box::new(crate::account::UsageSnapshot::state(
                             crate::account::UsageStatus::Limited,
                             "fresh",
                             crate::chat::now_ms().unwrap(),
-                        ),
+                        )),
                     },
                 })),
             );
@@ -13025,7 +13025,7 @@ pub(super) fn fresh_close_answer(
     (target, source, requested): (Target, chat::Session, chat::Session),
     result: Result<(), String>,
 ) -> Action {
-    Action::FreshCloseFinished(target, source, requested, result)
+    Action::FreshCloseFinished(target, Box::new(source), Box::new(requested), result)
 }
 
 /// A fresh start gives up the previous conversation before it starts the
@@ -15515,7 +15515,7 @@ fn upgraded_identity_is_installed_only_after_its_exact_durable_receipt() {
                 };
             } else {
                 let proof = source.proof.clone().unwrap();
-                source.terminal = Some(TerminalSession {
+                source.terminal = Some(Box::new(TerminalSession {
                     id: source.id,
                     launch: source.launch.terminal_recipe().unwrap(),
                     continuity: TerminalContinuity::Live {
@@ -15528,7 +15528,7 @@ fn upgraded_identity_is_installed_only_after_its_exact_durable_receipt() {
                     owned_codex_listener: None,
                     recovery_origin: None,
                     predecessor: None,
-                });
+                }));
             }
             if learns_identity {
                 source.launch.session_id = None;
@@ -15621,7 +15621,7 @@ fn upgraded_identity_is_installed_only_after_its_exact_durable_receipt() {
         let target = app.chat_ui.next_target(card);
         app.chat_ui.phases.insert(
             card,
-            Phase::Starting(Attempt {
+            Phase::Starting(Box::new(Attempt {
                 target,
                 intent: chat::Intent::Restore,
                 session: source.clone(),
@@ -15629,7 +15629,7 @@ fn upgraded_identity_is_installed_only_after_its_exact_durable_receipt() {
                 upgrade_committed: false,
                 resume_committed: false,
                 upgrade_admission: None,
-            }),
+            })),
         );
         app.cards.remove(&card);
         let task = app.update(Message::ChatUi(Action::Ready(
@@ -15680,7 +15680,7 @@ fn upgraded_identity_is_installed_only_after_its_exact_durable_receipt() {
             let next = app.chat_ui.next_target(card);
             app.chat_ui.phases.insert(
                 card,
-                Phase::Starting(Attempt {
+                Phase::Starting(Box::new(Attempt {
                     target: next,
                     intent: chat::Intent::Restore,
                     session: source.clone(),
@@ -15688,7 +15688,7 @@ fn upgraded_identity_is_installed_only_after_its_exact_durable_receipt() {
                     upgrade_committed: false,
                     resume_committed: false,
                     upgrade_admission: None,
-                }),
+                })),
             );
             let _ = app.update(receipt);
             assert_eq!(app.chat_ui.attempt(card).unwrap().target, next);
@@ -16157,13 +16157,13 @@ fn a_never_named_conversation_whose_daemon_is_gone_reopens_as_a_draft() {
     // so it asks, as before.
     let card = live_chat(&mut app, None);
     let mut session = chat_runtime(&app, card).session.clone();
-    session.terminal = Some(crate::app::fresh_terminal_session(LaunchRecipe {
+    session.terminal = Some(Box::new(crate::app::fresh_terminal_session(LaunchRecipe {
         unset_environment: Default::default(),
         program: "codex".into(),
         arguments: Vec::new(),
         working_directory: session.launch.recipe.working_directory.clone(),
         environment: Default::default(),
-    }));
+    })));
     app.chat_forget(card);
     app.cards.insert(card, CardRuntime::Loading);
     let _ = app.open_chat(card, session, chat::Intent::Restore);
@@ -16646,7 +16646,7 @@ fn an_explicit_fresh_start_drops_retained_actor_and_pair_authority() {
         };
         if paired {
             let proof = source.proof.clone().unwrap();
-            source.terminal = Some(TerminalSession {
+            source.terminal = Some(Box::new(TerminalSession {
                 id: source.id,
                 launch: source.launch.recipe.clone(),
                 continuity: TerminalContinuity::Live {
@@ -16659,7 +16659,7 @@ fn an_explicit_fresh_start_drops_retained_actor_and_pair_authority() {
                 owned_codex_listener: source.owned_codex_listener.clone(),
                 recovery_origin: None,
                 predecessor: None,
-            });
+            }));
         }
         assert!(source.has_valid_native_continuity());
         assert_eq!(source.owns_codex_listener(), provider == Provider::Codex);
@@ -18841,7 +18841,11 @@ fn auth_recovery_changed_identity_keeps_sign_in_but_fences_resume() {
                     disputed_by: None,
                 }),
                 catalog: None,
-                snapshot: account::UsageSnapshot::state(account::UsageStatus::Ok, "", now),
+                snapshot: Box::new(account::UsageSnapshot::state(
+                    account::UsageStatus::Ok,
+                    "",
+                    now,
+                )),
             },
         })));
         assert!(
@@ -20667,7 +20671,7 @@ fn retained_live_model_upgrade_does_not_supersede_account_return_or_close_owners
         let mut f = live_shared_recovery_fixture();
         let target = f.app.chat_ui.next_target(f.card);
         let phase = match owner {
-            "account" => Phase::Starting(Attempt {
+            "account" => Phase::Starting(Box::new(Attempt {
                 target,
                 intent: chat::Intent::Restore,
                 session: f.source.clone(),
@@ -20679,7 +20683,7 @@ fn retained_live_model_upgrade_does_not_supersede_account_return_or_close_owners
                 upgrade_committed: false,
                 resume_committed: false,
                 upgrade_admission: None,
-            }),
+            })),
             "return" => Phase::Returning {
                 target,
                 local: None,
@@ -20689,7 +20693,7 @@ fn retained_live_model_upgrade_does_not_supersede_account_return_or_close_owners
                 let mut other = f.source.clone();
                 other.id = TerminalId::new();
                 other.launch.recipe.arguments.push("--other-start".into());
-                Phase::Starting(Attempt {
+                Phase::Starting(Box::new(Attempt {
                     target,
                     intent: chat::Intent::Restore,
                     session: other,
@@ -20697,7 +20701,7 @@ fn retained_live_model_upgrade_does_not_supersede_account_return_or_close_owners
                     upgrade_committed: false,
                     resume_committed: false,
                     upgrade_admission: None,
-                })
+                }))
             }
             _ => Phase::Closing {
                 target,
@@ -20996,7 +21000,7 @@ fn retained_claude_identity_is_installed_only_after_its_exact_durable_receipt() 
         let target = app.chat_ui.next_target(card);
         app.chat_ui.phases.insert(
             card,
-            Phase::Starting(Attempt {
+            Phase::Starting(Box::new(Attempt {
                 target,
                 intent: chat::Intent::Restore,
                 session: source.clone(),
@@ -21004,7 +21008,7 @@ fn retained_claude_identity_is_installed_only_after_its_exact_durable_receipt() 
                 upgrade_committed: false,
                 resume_committed: false,
                 upgrade_admission: None,
-            }),
+            })),
         );
         app.cards.remove(&card);
         let task = app.update(Message::ChatUi(Action::Ready(
@@ -21075,7 +21079,7 @@ fn retained_claude_identity_is_installed_only_after_its_exact_durable_receipt() 
             let next = app.chat_ui.next_target(card);
             app.chat_ui.phases.insert(
                 card,
-                Phase::Starting(Attempt {
+                Phase::Starting(Box::new(Attempt {
                     target: next,
                     intent: chat::Intent::Restore,
                     session: source.clone(),
@@ -21083,7 +21087,7 @@ fn retained_claude_identity_is_installed_only_after_its_exact_durable_receipt() 
                     upgrade_committed: false,
                     resume_committed: false,
                     upgrade_admission: None,
-                }),
+                })),
             );
             let _ = app.update(receipt);
             assert_eq!(app.chat_ui.attempt(card).unwrap().target, next);

@@ -2136,7 +2136,7 @@ mod tests {
                 session_id: None,
             },
             proof: None,
-            terminal: Some(source),
+            terminal: Some(Box::new(source)),
         });
         app.durable = Arc::new(WorkspaceState {
             cards: vec![card.clone()].into(),

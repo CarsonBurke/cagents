@@ -839,6 +839,8 @@ pub struct ServerEnvelope {
 
 /// A host reply whose transcript may already be encoded by a retained helper.
 #[cfg(feature = "host")]
+// Never stored: delivery unpacks each reply at once, so boxing would only add an allocation.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub(crate) enum PreparedResponse {
     Decoded(ServerResponse),

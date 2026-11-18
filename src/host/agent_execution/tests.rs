@@ -1852,7 +1852,7 @@ fn legacy_open_console_preflight_refuses_before_provider_stop_and_keeps_followup
     {
         let mut state = host.lock().unwrap();
         let record = state.chats.get_mut(&source).unwrap();
-        record.session.terminal = Some(descriptor.session);
+        record.session.terminal = Some(Box::new(descriptor.session));
         record.paired_terminal = Some(terminal.clone());
     }
     // Seed the old store's projection only now. A current spawn publishes its

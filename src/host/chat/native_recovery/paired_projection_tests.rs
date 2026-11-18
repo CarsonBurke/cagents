@@ -166,7 +166,7 @@ fn current_projection_rebinds_real_paired_native_owner_without_relaunch() {
             TerminalContinuity::DetachedSameBoot { .. }
         ));
         let projected = state.native_terminal_projection(issued.id).unwrap();
-        assert_eq!(published.terminal.as_ref(), Some(&projected));
+        assert_eq!(published.terminal.as_deref(), Some(&projected));
         assert_ne!(observer.session, projected);
         assert!(!observer.upgrade_sources.contains(&projected));
         assert_eq!(state.terminals[&issued.id].session, raw);
@@ -723,7 +723,7 @@ fn retained_close_uses_exact_completed_receipt_for_an_issued_alias() {
     }
     let fixture = Fixture::new();
     let acknowledged = fixture.acknowledged_for_retained_close();
-    let terminal = acknowledged.terminal.as_ref().unwrap();
+    let terminal = acknowledged.terminal.as_deref().unwrap();
     let holder = fixture.worker.holder_identity().unwrap().clone();
     fixture
         .worker
@@ -906,14 +906,14 @@ fn refused_source_update_ack_preserves_exact_holder_thread_and_provider() {
         crate::chat::native_holder::adopt(&fixture.native, &fixture.source, &fixture.proof)
             .unwrap();
     let mut attempted = recovered.source.clone();
-    attempted.terminal = Some(
+    attempted.terminal = Some(Box::new(
         fixture
             .host
             .lock()
             .unwrap()
             .native_terminal_projection(attempted.id)
             .unwrap(),
-    );
+    ));
     attempted.launch.session_id = Some("different-thread".into());
     let refusal = holder
         .update_source(
@@ -1003,7 +1003,7 @@ fn final_retirement_reservation_defers_adoption_without_releasing_original_provi
     assert!(!exited);
     assert_eq!(acknowledged.source.proof.as_ref(), Some(&fixture.proof));
     assert_eq!(
-        acknowledged.source.terminal.as_ref(),
+        acknowledged.source.terminal.as_deref(),
         Some(
             &fixture
                 .host
@@ -1468,7 +1468,7 @@ impl Fixture {
             .push((descriptor.session.clone(), worker.clone()));
         let original_pair = worker.holder_identity().unwrap().clone();
         let mut source = source;
-        source.terminal = Some(descriptor.session.clone());
+        source.terminal = Some(Box::new(descriptor.session.clone()));
         actor
             .update_native_source(
                 source.clone(),

@@ -259,7 +259,7 @@ impl Fixture {
 
     fn show(&mut self, id: Uuid) -> Result<Automation, String> {
         match self.user.automation(Request::Show { id })? {
-            Response::Automation(value) => Ok(value),
+            Response::Automation(value) => Ok(*value),
             _ => Err("unexpected automation response".into()),
         }
     }
@@ -276,7 +276,7 @@ impl Fixture {
         {
             self.sources.push(source.clone());
         }
-        Ok(detail)
+        Ok(*detail)
     }
 
     fn run_now(&mut self, automation: &Automation, request: Uuid) -> Result<Firing, String> {

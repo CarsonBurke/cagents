@@ -64,12 +64,12 @@ pub enum Action {
     },
     Inspected {
         card: CardId,
-        source: TerminalSession,
+        source: Box<TerminalSession>,
         request: uuid::Uuid,
         socket: Option<PathBuf>,
         relaunch: bool,
         directory: Directory,
-        result: Result<Option<StartedTerminal>, String>,
+        result: Result<Option<Box<StartedTerminal>>, String>,
     },
 }
 impl Action {
@@ -587,12 +587,12 @@ impl Cagents {
             };
             Message::SavedTerminal(Action::Inspected {
                 card,
-                source: original,
+                source: Box::new(original),
                 request,
                 socket: endpoint,
                 relaunch,
                 directory,
-                result,
+                result: result.map(|started| started.map(Box::new)),
             })
         })
     }
@@ -671,7 +671,7 @@ impl Cagents {
             self.saved_terminals.active = None;
         }
         let current = self.saved_terminal_current(card).is_some_and(|entry| {
-            entry.source == source
+            entry.source == *source
                 && entry.request == request
                 && entry.socket.as_ref().ok().cloned().flatten() == socket
         }) && !self.pane_close_owned(card)
@@ -711,7 +711,7 @@ impl Cagents {
                     }
                 };
                 self.register_presence(card, exposure, residency);
-                self.terminal_started(card, source.id, Ok(started))
+                self.terminal_started(card, source.id, Ok(*started))
             }
             result => {
                 let entry = self.saved_terminals.entries.get_mut(&card).unwrap();

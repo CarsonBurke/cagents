@@ -1412,7 +1412,7 @@ pub(crate) mod handoff {
         let issued = chat
             .source
             .terminal
-            .as_ref()
+            .as_deref()
             .ok_or("Carried native console has no issued pair")?;
         if !chat.source.native_continuity.retains_provider()
             || issued.id != chat.source.id
@@ -1441,7 +1441,7 @@ pub(crate) mod handoff {
         let original = chat
             .source
             .terminal
-            .as_ref()
+            .as_deref()
             .ok_or("Upgrade pair is missing")?;
         if chat.launch.provider != crate::agent::Provider::Codex
             || chat.launch.terminal_recipe().as_ref() != Some(&terminal.recipe)
@@ -4152,7 +4152,7 @@ mod tests {
             boot_id: saved.proof.boot_id.clone(),
             host_incarnation: saved.proof.host_incarnation.clone(),
         };
-        saved.chats[0].source.terminal = Some(issued);
+        saved.chats[0].source.terminal = Some(Box::new(issued));
         saved.carried.push(console);
         saved
             .validate()

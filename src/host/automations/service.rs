@@ -159,6 +159,7 @@ fn process_user(
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .automation(id)
+                .map(Box::new)
                 .map(Response::Automation);
         }
         Request::History { id, before, limit } => {
@@ -180,21 +181,21 @@ fn process_user(
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .automation_run_detail(id)
-                .map(Response::Detail);
+                .map(|detail| Response::Detail(Box::new(detail)));
         }
         Request::ShowRun { run } => {
             return registry
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .automation_detail_for_run(run)
-                .map(Response::Detail);
+                .map(|detail| Response::Detail(Box::new(detail)));
         }
-        Request::Create { definition } => Response::Automation(create(host, definition)?),
+        Request::Create { definition } => Response::Automation(Box::new(create(host, definition)?)),
         Request::Edit {
             id,
             revision,
             definition,
-        } => Response::Automation(edit(host, id, revision, definition)?),
+        } => Response::Automation(Box::new(edit(host, id, revision, definition)?)),
         Request::SetEnabled {
             id,
             revision,
@@ -204,7 +205,7 @@ fn process_user(
             if value {
                 handle()?;
             }
-            Response::Automation(enabled(host, id, revision, value, confirmed)?)
+            Response::Automation(Box::new(enabled(host, id, revision, value, confirmed)?))
         }
         Request::Remove { id, revision } => {
             remove(host, id, revision)?;
@@ -325,7 +326,7 @@ fn process_hosted(
         Request::Show { id } => {
             let automation = registry.lock().unwrap_or_else(|p| p.into_inner()).automation(id)?;
             require_scope(&automation.definition.agent.target.repository)?;
-            Ok(Response::Automation(automation))
+            Ok(Response::Automation(Box::new(automation)))
         }
         Request::History { id: Some(id), before, limit } => registry.lock().unwrap_or_else(|p| p.into_inner())
             .project_automation_history(&repository, id, before, limit).map(Response::History).map_err(Into::into),
@@ -336,12 +337,12 @@ fn process_hosted(
         Request::ShowFiring { id } => {
             let detail = registry.lock().unwrap_or_else(|p| p.into_inner()).automation_run_detail(id)?;
             require_scope(&detail.definition.agent.target.repository)?;
-            Ok(Response::Detail(detail))
+            Ok(Response::Detail(Box::new(detail)))
         }
         Request::ShowRun { run } => {
             let detail = registry.lock().unwrap_or_else(|p| p.into_inner()).automation_detail_for_run(run)?;
             require_scope(&detail.definition.agent.target.repository)?;
-            Ok(Response::Detail(detail))
+            Ok(Response::Detail(Box::new(detail)))
         }
         Request::History { id: None, .. } => Err("Choose an automation ID for scoped run history".into()),
         _ => Err(Error::PermissionDenied("An agent's child-execution capability does not grant automation management. Prepare a proposal for explicit user approval.".into())),
