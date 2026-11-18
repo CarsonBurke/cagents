@@ -19166,6 +19166,81 @@ fn logical_message_copy_uses_aligned_scope_and_never_loaded_fragment_fallback() 
     assert!(chat_runtime(&app, card).copied.is_none());
 }
 
+/// A long output's row shows only its start and end. Its Copy reads the
+/// whole output from its source, and the step's copy puts the command ahead
+/// of it, while a row showing all of its output copies what it shows.
+#[test]
+fn an_excerpted_output_copies_whole_from_its_source() {
+    let _context = text_copy::isolated_context();
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let (card, target, handle) = history_fixture(&mut app);
+    app.workspace.focus(card).unwrap();
+    let whole = "line\n".repeat(200_000);
+    let step = |id: &str, output: &str| {
+        Arc::new(chat::Item {
+            id: id.into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Command {
+                label: String::new(),
+                command: "cargo build".into(),
+                working_directory: String::new(),
+                action: chat::CommandAction::Run,
+                status: chat::ToolStatus::Succeeded,
+                exit_code: Some(0),
+                duration_ms: None,
+                output: output.into(),
+            },
+            at: None,
+            started_at: None,
+        })
+    };
+    let source = |token, bytes: usize| chat::TextCopySource {
+        cache: uuid::Uuid::new_v4(),
+        scope: chat::TextCopyScope::Conversation,
+        token,
+        revision: 1,
+        bytes: bytes as u64,
+    };
+    let excerpt = "line\n\u{22ef} 1.0 MB not shown \u{22ef}\nline\n";
+    let excerpted = source(1, whole.len());
+    let mut snapshot = (*handle.snapshot()).clone();
+    snapshot.items = vec![step("long", excerpt), step("short", "done\n")];
+    snapshot.text_copy_sources.conversation = vec![Some(excerpted.clone()), Some(source(2, 5))];
+    snapshot.generation += 1;
+    handle.publish_snapshot_for_test(snapshot);
+    app.chat_runtime_mut(target).unwrap().refresh();
+    let runtime = chat_runtime(&app, card);
+    assert_eq!(
+        runtime.excerpted_output_source(runtime.active_item("long").unwrap()),
+        Some(excerpted.clone())
+    );
+    assert_eq!(
+        runtime.excerpted_output_source(runtime.active_item("short").unwrap()),
+        None,
+        "a row showing all of its output copies what it shows"
+    );
+    assert_eq!(
+        step::excerpt_note(whole.len() as u64),
+        "Only the start and end of this 1.0 MB output are shown. Copy includes all of it."
+    );
+    let request = text_copy::Request::for_test(handle.clone(), excerpted.clone());
+    let task = app.handle_chat_ui(Action::MessageCopied(
+        target,
+        "long".into(),
+        request,
+        Ok(whole.clone()),
+    ));
+    assert_chat_copy_task_writes(task, &whole);
+    let request = text_copy::Request::for_test(handle, excerpted).with_prefix("cargo build");
+    let task = app.handle_chat_ui(Action::MessageCopied(
+        target,
+        "long".into(),
+        request,
+        Ok(whole.clone()),
+    ));
+    assert_chat_copy_task_writes(task, &format!("cargo build\n\n{whole}"));
+}
+
 /// Establish every completion guard, and prove this exact authority can
 /// emit a clipboard effect before a later copy supersedes its intent.
 fn valid_message_copy_completion(

@@ -403,6 +403,9 @@ pub enum Action {
     SessionLinkToken(String, TerminalId, Option<String>),
     Copy(Target, String, CopyPart),
     CopyMessage(Target, String, Option<chat::TextCopySource>),
+    /// Copies a step whose row shows only an excerpt of its output, reading
+    /// the whole output from its source.
+    CopyStep(Target, String, CopyPart, chat::TextCopySource),
     MessageCopied(Target, String, text_copy::Request, Result<String, String>),
     /// A complete message read for a window that shows only part of it.
     LogicalProseRead(Target, chat::TextCopySource, Result<String, String>),
@@ -812,6 +815,7 @@ impl Action {
             Self::SessionLinkToken(..) => "SessionLinkToken",
             Self::Copy(..) => "Copy",
             Self::CopyMessage(..) => "CopyMessage",
+            Self::CopyStep(..) => "CopyStep",
             Self::MessageCopied(..) => "MessageCopied",
             Self::LogicalProseRead(..) => "LogicalProseRead",
             Self::MarkdownPrepared(..) => "MarkdownPrepared",
@@ -14397,7 +14401,25 @@ impl Cagents {
                 }
             }
             Action::CopyMessage(target, id, source) => {
-                return self.start_message_copy(target, id, source);
+                return self.start_message_copy(target, id, source, String::new());
+            }
+            Action::CopyStep(target, id, part, source) => {
+                // What the step's copy adds ahead of its output, as
+                // `copy_text` would join it.
+                let prefix = self
+                    .chat_runtime_mut(target)
+                    .and_then(|runtime| runtime.active_item(&id))
+                    .and_then(|item| match (&part, &item.content) {
+                        (CopyPart::Text, ItemContent::Command { command, .. }) => {
+                            Some(command.clone())
+                        }
+                        (CopyPart::Text, ItemContent::Tool { input, .. }) => Some(input.clone()),
+                        (CopyPart::Output, _) => Some(String::new()),
+                        _ => None,
+                    });
+                if let Some(prefix) = prefix {
+                    return self.start_message_copy(target, id, Some(source), prefix);
+                }
             }
             Action::MessageCopied(target, id, request, result) => {
                 return self.finish_message_copy(target, id, request, result);

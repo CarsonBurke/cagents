@@ -73,11 +73,12 @@ scripts/native-evidence cli project open "$CAGENTS_EVIDENCE_TASK/fixture/project
 
 Choose **Resume conversation** from the new-tab menu and open **History paging
 checkpoints**. Its 260 numbered exchanges include a 4 MiB Bash result every 32
-turns. These results consume the transcript's byte budget while their collapsed
-command groups can fit inside the viewport. Page backward into one of these
-short rendered windows, then wheel downward to check that newer history loads
-without clicking its fallback button. Check that the visible checkpoint stays
-anchored when the next page arrives. No provider command is executed.
+turns, numbered line by line. Each is one command row whose expanded output
+shows its first and last lines, with a line between them saying how much is
+left out, and whose Copy takes the whole result. Page backward past several of
+them, then wheel downward to check that newer history loads without clicking
+its fallback button. Check that the visible checkpoint stays anchored when the
+next page arrives. No provider command is executed.
 
 Omit `--tool-bytes` for ordinary completed prose. `--scale 64` increases the
 paragraph count enough to exercise provider history paging with prose alone.

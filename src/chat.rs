@@ -1710,13 +1710,30 @@ pub struct TextCopySource {
     pub bytes: u64,
 }
 
-/// A transcript item's body is presented in parts of at most this many bytes,
-/// so one enormous message or tool output stays pageable.
+/// A message's body is presented in parts of at most this many bytes, so one
+/// enormous message stays pageable. A step's input and output are never cut
+/// into parts: a long one is presented as an excerpt of its start and end.
 pub const TRANSCRIPT_PART_BYTES: usize = 128 * 1024;
 
 /// A transcript window presents items of at most this many bytes in all; the
 /// reader pages to see more.
 pub const TRANSCRIPT_WINDOW_BYTES: usize = 3 * 1024 * 1024;
+
+/// A size in bytes, rounded for reading at a glance: `4.2 MB`, `850 KB`.
+pub fn approximate_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1000.0 && unit + 1 < UNITS.len() {
+        value /= 1000.0;
+        unit += 1;
+    }
+    if unit == 0 || value >= 100.0 {
+        format!("{value:.0} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
 
 /// Where a presented part after the first sits in its transcript item. The
 /// first part keeps the item's own ID; each later part's ID names the item,
@@ -2429,21 +2446,6 @@ pub struct Item {
     /// when it finished for an item that is no longer being written to.
     #[serde(default)]
     pub at: Option<u64>,
-}
-
-/// A paged command's label or tool's name as the provider gave it.
-#[cfg(feature = "host")]
-pub(crate) fn without_page_mark(label: &str) -> &str {
-    label
-        .rsplit_once(" (part ")
-        .filter(|(_, mark)| {
-            mark.strip_suffix(')')
-                .and_then(|mark| mark.split_once('/'))
-                .is_some_and(|(part, parts)| {
-                    part.parse::<usize>().is_ok() && parts.parse::<usize>().is_ok()
-                })
-        })
-        .map_or(label, |(label, _)| label)
 }
 
 impl Item {

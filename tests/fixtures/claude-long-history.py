@@ -58,8 +58,9 @@ with (directory / f"{session}.jsonl").open("w") as transcript:
                                 "input": {"command": "cat checkpoint.log",
                                           "description": f"Verify checkpoint {turn:03d}"}}]),
                 ("user", [{"type": "tool_result", "tool_use_id": call,
-                           "content": ("Checkpoint verification passed.\n" *
-                                       (args.tool_bytes // 32 + 1))[:args.tool_bytes]}]),
+                           "content": "".join(
+                               f"checkpoint {turn:03d} log line {line:06d}: verification passed\n"
+                               for line in range(args.tool_bytes // 52 + 1))[:args.tool_bytes]}]),
             ])
         messages.append(("assistant", [{"type": "text", "text":
                          f"Checkpoint {turn:03d} is complete.\n\n{details}\n\n"

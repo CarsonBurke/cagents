@@ -158,6 +158,14 @@ fn change_verb(kind: &ChangeKind) -> &'static str {
     }
 }
 
+/// What an excerpted output's note says, for an output of `bytes`.
+pub(super) fn excerpt_note(bytes: u64) -> String {
+    format!(
+        "Only the start and end of this {} output are shown. Copy includes all of it.",
+        chat::approximate_size(bytes)
+    )
+}
+
 fn change_view(change: &FileChange) -> Element<'static, Message> {
     let mut rows: Vec<Element<'_, Message>> = vec![
         widget::row::with_children(vec![
@@ -209,7 +217,14 @@ impl Runtime {
         };
         let target = self.target;
         let id = item.id.clone();
-        let copy = Action::Copy(target, id.clone(), part.clone());
+        // A long output's row holds only its start and end; Copy reads the
+        // whole of it.
+        let copy = match (&part, self.excerpted_output_source(item)) {
+            (CopyPart::Output, Some(source)) => {
+                Action::CopyStep(target, id.clone(), CopyPart::Output, source)
+            }
+            _ => Action::Copy(target, id.clone(), part.clone()),
+        };
         // What a command or a tool printed is followed from its end. A patch,
         // an input, and what a read or a search returned are read from the
         // top, whether or not the step is still running.
@@ -527,6 +542,18 @@ impl Runtime {
             .filter(|status| *status != ToolStatus::Running || newest)
     }
 
+    /// Says, beneath an output shown as an excerpt, how much of it there is
+    /// and that Copy takes all of it, so the line marking the gap is not
+    /// mistaken for something the command printed.
+    fn excerpt_note(&self, item: &chat::Item) -> Option<Element<'static, Message>> {
+        let source = self.excerpted_output_source(item)?;
+        Some(
+            design::caption(excerpt_note(source.bytes))
+                .class(cosmic::theme::Text::Custom(design::muted_text))
+                .into(),
+        )
+    }
+
     /// The bounded height a step's raw output is allowed to occupy before it
     /// scrolls inside its own surface, so one long build log cannot bury the
     /// steps that follow it.
@@ -599,6 +626,7 @@ impl Runtime {
                         "Output",
                         Some(Self::OUTPUT_HEIGHT),
                     ));
+                    rows.extend(self.excerpt_note(item));
                 }
             }
             ItemContent::Changes { changes, status } => {
@@ -648,6 +676,7 @@ impl Runtime {
                         "Output",
                         Some(Self::OUTPUT_HEIGHT),
                     ));
+                    rows.extend(self.excerpt_note(item));
                 }
             }
             ItemContent::Image { path, .. } => {
