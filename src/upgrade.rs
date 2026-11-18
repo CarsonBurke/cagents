@@ -1642,6 +1642,7 @@ pub(crate) mod handoff {
         }
 
         /// A conversation whose restart this restore started, then stopped.
+        #[cfg(feature = "host")]
         pub fn stopped(evidence: Chat, reason: String) -> Self {
             let mut chat = Self::new(evidence, reason);
             chat.summary.disposition = UnattachedDisposition::Stopped;
@@ -2240,7 +2241,7 @@ pub(crate) mod handoff {
         /// Why this restore stopped the conversation an exact descriptor it
         /// issued names, if it did. Only a complete issued source retrieves
         /// the reason, as with a retained conversation's refusal.
-        #[cfg(any(feature = "host", test))]
+        #[cfg(feature = "host")]
         pub fn stopped_reason(&self, source: &crate::chat::Session) -> Option<String> {
             let _update = self.unattached.lock().unwrap_or_else(|p| p.into_inner());
             self.read_unattached::<UnattachedChat>()
@@ -2262,7 +2263,7 @@ pub(crate) mod handoff {
 
         /// Forgets a stopped conversation once it has been started again. A
         /// retained entry for the same id still names a provider of its own.
-        #[cfg(any(feature = "host", test))]
+        #[cfg(feature = "host")]
         pub fn retire_stopped_unattached(
             &self,
             id: crate::model::TerminalId,
