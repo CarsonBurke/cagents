@@ -22,7 +22,7 @@ const ABANDONED: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 
 pub struct Staged {
     source: PathBuf,
     destination: PathBuf,
-    /// The copy, absent when the destination already held this history.
+    /// The copy, until it is renamed into place or removed.
     temporary: Option<PathBuf>,
 }
 
@@ -166,6 +166,9 @@ fn destination_current(destination: &Path, bytes: &[u8]) -> io::Result<bool> {
     Ok(destination.exists() && matches_existing_transcript(destination, bytes)?)
 }
 
+/// Stages a copy even when the destination already holds the history, so the
+/// commit after the original closes only renames into a directory this
+/// account has already written.
 fn stage_transcript(source: PathBuf, destination: PathBuf) -> io::Result<Staged> {
     let bytes = read_transcript(&source)?;
     let mut staged = Staged {
@@ -173,9 +176,7 @@ fn stage_transcript(source: PathBuf, destination: PathBuf) -> io::Result<Staged>
         destination,
         temporary: None,
     };
-    if destination_current(&staged.destination, &bytes)? {
-        return Ok(staged);
-    }
+    destination_current(&staged.destination, &bytes)?;
     let parent = transcript_directory(&staged.destination)?;
     crate::secure_file::prepare_private_directory(parent)?;
     remove_abandoned_copies(parent);
@@ -224,31 +225,21 @@ fn commit_transcript(staged: &mut Staged) -> io::Result<()> {
         return Ok(());
     }
     let parent = transcript_directory(&staged.destination)?.to_owned();
+    let temporary = staged
+        .temporary
+        .clone()
+        .ok_or_else(|| io::Error::other("The staged history was already committed"))?;
     use std::os::unix::fs::OpenOptionsExt;
     let mut options = fs::OpenOptions::new();
     options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     // The staged copy is normally all or nearly all of the history. Only a
     // source that changed what it had already written is copied again.
-    let (temporary, mut file, written) = match staged.temporary.clone() {
-        Some(temporary) => match existing_prefix(&temporary, &bytes) {
-            Ok(written) => {
-                let file = options.append(true).open(&temporary)?;
-                (temporary, file, written)
-            }
-            Err(_) => {
-                let file = options.write(true).truncate(true).open(&temporary)?;
-                (temporary, file, 0)
-            }
-        },
-        // The destination already held this history when it was staged. Add
-        // what the conversation wrote since in place: an interrupted append
-        // still leaves a prefix of the history, which a retry extends.
-        None => {
-            let published = existing_prefix(&staged.destination, &bytes)?;
-            let mut file = options.append(true).open(&staged.destination)?;
-            file.write_all(&bytes[published..])?;
-            return file.sync_all();
+    let (mut file, written) = match existing_prefix(&temporary, &bytes) {
+        Ok(written) => (options.append(true).open(&temporary)?, written),
+        Err(error) if error.kind() == io::ErrorKind::Other => {
+            (options.write(true).truncate(true).open(&temporary)?, 0)
         }
+        Err(error) => return Err(error),
     };
     file.write_all(&bytes[written..])?;
     file.sync_all()?;
@@ -406,8 +397,6 @@ mod tests {
 
     #[test]
     fn commit_publishes_what_the_conversation_wrote_after_staging() {
-        use std::os::unix::fs::MetadataExt;
-
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("source.jsonl");
         let target = directory.path().join("account/sessions/target.jsonl");
@@ -427,15 +416,15 @@ mod tests {
         commit_transcript(&mut staged).unwrap();
         assert_eq!(fs::read(&rewritten).unwrap(), b"other\n");
 
-        // A destination that already held the history when staged is
-        // extended in place with what was written since.
+        // A destination that already held the history when staged still
+        // gets a staged copy, which takes what was written since.
         let mut staged = stage_at(&source, &rewritten).unwrap();
-        assert!(staged.temporary.is_none());
+        assert!(staged.temporary.as_ref().is_some_and(|copy| copy.exists()));
         fs::write(&source, b"other\nmore\n").unwrap();
-        let before = fs::metadata(&rewritten).unwrap().ino();
         commit_transcript(&mut staged).unwrap();
+        drop(staged);
         assert_eq!(fs::read(&rewritten).unwrap(), b"other\nmore\n");
-        assert_eq!(fs::metadata(&rewritten).unwrap().ino(), before);
+        assert_eq!(fs::read_dir(target.parent().unwrap()).unwrap().count(), 2);
 
         // A copy a stopped daemon abandoned is swept by the next stage; a
         // recent one may belong to a switch in progress.

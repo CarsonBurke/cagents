@@ -3484,7 +3484,8 @@ struct AdmittedSwitch {
 ///
 /// Every refusal here leaves the original exactly as it was: what is held is
 /// the reservation and the staged copy of its history, which both drop with
-/// the refusal.
+/// the refusal. Staging may leave the alternate account's empty, private
+/// project directory, which no conversation reads.
 fn admit_account_recovery(
     host: &SharedHost,
     source: &Session,
