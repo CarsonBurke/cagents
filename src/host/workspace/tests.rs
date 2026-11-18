@@ -323,3 +323,74 @@ fn shared_view_publication_preserves_the_exact_worker_retirement_fence() {
     process_request(&host, 1, ClientRequest::EditWorkspaceModel { edit }).unwrap();
     assert_eq!(snapshot(&host, None).unwrap().views.len(), 1);
 }
+
+/// `project close` sends the channels it showed the user. A window that
+/// creates a channel after that read, before the close commits, must keep it:
+/// the cascade may only take what was confirmed. Once the confirmed set
+/// matches, watchers are told of the close as the plain close they fold.
+#[test]
+fn a_confirmed_project_close_cannot_take_a_channel_created_after_confirmation() {
+    let (_directory, host, delivery) = fixture();
+    // A removed checkout: the key alone must be enough to close it.
+    let repository = std::path::PathBuf::from("/cagents-removed-checkout/.git");
+    process_request(&host, 2, ClientRequest::WatchWorkspaceModel).unwrap();
+    process_request(
+        &host,
+        1,
+        ClientRequest::EditWorkspaceModel {
+            edit: open_project(&repository),
+        },
+    )
+    .unwrap();
+    let confirmed = snapshot(&host, None).unwrap();
+    assert!(
+        confirmed.channels.is_empty(),
+        "the CLI read an empty project"
+    );
+    let late = crate::model::ChannelId::new();
+    process_request(
+        &host,
+        2,
+        ClientRequest::EditWorkspaceModel {
+            edit: ModelEdit::CreateChannel {
+                id: late,
+                repository: repository.clone(),
+                title: "created by another window".into(),
+                title_source: Default::default(),
+            },
+        },
+    )
+    .unwrap();
+    let before = snapshot(&host, None).unwrap();
+    let close = |channels: &[crate::model::ChannelId]| ClientRequest::EditWorkspaceModel {
+        edit: ModelEdit::CloseConfirmedProject {
+            repository: repository.clone(),
+            channels: channels.iter().copied().collect(),
+        },
+    };
+    let error = process_request(&host, 1, close(&[])).unwrap_err();
+    assert_eq!(error.code, ProtocolErrorCode::ViewConflict);
+    assert!(error.retryable, "the CLI reads the project again");
+    assert_eq!(
+        snapshot(&host, None).unwrap(),
+        before,
+        "a refused close removes nothing"
+    );
+    process_request(&host, 1, close(&[late, crate::model::ChannelId::new()])).unwrap_err();
+    assert_eq!(snapshot(&host, None).unwrap(), before);
+
+    process_request(&host, 1, close(&[late])).unwrap();
+    let after = snapshot(&host, None).unwrap();
+    assert!(after.project(&repository).is_none());
+    assert!(after.channel(late).is_none());
+    delivery.close_after_drain();
+    let last = std::iter::from_fn(|| delivery.pop())
+        .filter_map(|envelope| match envelope.message {
+            ServerMessage::WorkspaceModelEdited { edit, effects, .. } => Some((edit, effects)),
+            _ => None,
+        })
+        .last()
+        .expect("the watching window is told of the close");
+    assert_eq!(last.0, ModelEdit::CloseProject { repository });
+    assert_eq!(last.1.removed_channels, [late]);
+}
