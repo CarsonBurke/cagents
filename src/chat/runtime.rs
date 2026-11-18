@@ -16,7 +16,7 @@ use std::{
     process::{Child, Command as Process, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -320,6 +320,9 @@ struct Inner {
     native_installed: Arc<AtomicBool>,
     history_only: bool,
     provider_process: Arc<Mutex<Option<crate::daemon::holder_registry::Process>>>,
+    /// Milliseconds a launched server spent blocked behind another process's
+    /// file lock before accepting. See [`Handle::startup_lock_wait`].
+    startup_lock_wait: Arc<AtomicU64>,
     launch_account_scope: Result<crate::account::scope::LaunchAccountScope, String>,
 }
 
@@ -559,6 +562,7 @@ impl LocalHandle {
         let adopted_native = expected_native_peer.is_some();
         let native_installed = Arc::new(AtomicBool::new(false));
         let provider_process = Arc::new(Mutex::new(None));
+        let startup_lock_wait = Arc::new(AtomicU64::new(0));
         let native_holder = match ownership {
             Some(NativeOwnership::New(source, _))
                 if matches!(spec.transport, TransportSpec::OwnedUnixWebSocket { .. }) =>
@@ -621,6 +625,7 @@ impl LocalHandle {
             native_installed: native_installed.clone(),
             history_only: matches!(spec.transport, TransportSpec::History),
             provider_process: provider_process.clone(),
+            startup_lock_wait: startup_lock_wait.clone(),
             launch_account_scope: launch_account_scope
                 .clone()
                 .ok_or_else(|| "This local actor has no retained account scope".to_owned()),
@@ -638,6 +643,7 @@ impl LocalHandle {
                     working_directory: spec.working_directory.clone(),
                     child: None,
                     native_holder,
+                    startup_lock_wait,
                     reconnect_only_reported: false,
                     command_stops: 0,
                     expected_native_peer,
@@ -1421,6 +1427,14 @@ impl LocalHandle {
     pub(crate) fn is_ready(&self) -> bool {
         self.0.state.lock().unwrap_or_else(|p| p.into_inner()).ready
     }
+    /// How long the server this conversation launched has so far waited
+    /// behind another process's file lock instead of starting, such as Codex
+    /// queueing app-server startups that share one `CODEX_HOME`. Callers that
+    /// bound the whole startup extend their deadline by it.
+    pub(crate) fn startup_lock_wait(&self) -> Duration {
+        Duration::from_millis(self.0.startup_lock_wait.load(Ordering::Acquire))
+    }
+
     /// Identity received from the provider, not the speculative launch selector.
     pub(crate) fn confirmed_session_id(&self) -> Option<String> {
         self.0
@@ -2266,6 +2280,7 @@ struct Actor {
     working_directory: std::path::PathBuf,
     child: Option<ChildGuard>,
     native_holder: Option<super::native_holder::Holder>,
+    startup_lock_wait: Arc<AtomicU64>,
     /// Whether this conversation's lack of durable continuity was logged.
     reconnect_only_reported: bool,
     /// Commands memory exhaustion stopped while this actor ran.

@@ -10,6 +10,7 @@
 //! the runtime directory is deliberately swept when the session ends.
 
 use std::{
+    collections::BTreeSet,
     fs, io,
     os::unix::fs::DirBuilderExt,
     path::{Path, PathBuf},
@@ -138,6 +139,11 @@ pub(crate) struct Registry {
 }
 
 impl Registry {
+    /// A confirmed close refused because the project's channels are no longer
+    /// the ones the user confirmed.
+    pub(crate) const PROJECT_CHANNELS_CONFLICT: &'static str =
+        "The project's channels changed since they were confirmed; nothing was closed";
+
     /// Opens the registry in this installation's data directory.
     pub(crate) fn open() -> Result<Self, String> {
         let dirs = crate::instance::project_dirs()
@@ -505,34 +511,18 @@ impl Registry {
             // `foreign_keys = ON` is verified to enforce: a channel in a project
             // nobody has open is reachable from no window's sidebar.
             ModelEdit::CloseProject { repository } => {
-                let key = repository_key(repository)?;
-                let channels = {
-                    let mut statement = transaction.prepare("SELECT id FROM channels WHERE repository=?1").map_err(|e| e.to_string())?;
-                    statement.query_map(params![key], |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?
-                        .collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?
-                };
-                views::record_project_removal(&transaction, repository, &mut recorder)?;
-                removed_channels.extend(channels.iter().map(|id| parse_channel_id(id)).collect::<Result<Vec<_>, _>>()?);
-                let removed = transaction
-                    .execute("DELETE FROM projects WHERE repository = ?1", params![key])
-                    .map_err(|error| error.to_string())?
-                    > 0;
-                let recorded = transaction
-                    .execute(
-                        "INSERT OR IGNORE INTO closed_projects(repository) VALUES (?1)",
-                        params![key],
-                    )
-                    .map_err(|error| error.to_string())?
-                    > 0;
-                if removed || recorded {
-                    automations::close_project(
-                        &transaction,
-                        key,
-                        crate::chat::now_ms().unwrap_or(0),
-                    )?;
-                }
-                removed || recorded
+                close_project(&transaction, repository, None, &mut recorder, &mut removed_channels)?
             }
+            ModelEdit::CloseConfirmedProject {
+                repository,
+                channels,
+            } => close_project(
+                &transaction,
+                repository,
+                Some(channels),
+                &mut recorder,
+                &mut removed_channels,
+            )?,
             ModelEdit::CreateChannel {
                 id,
                 repository,
@@ -674,6 +664,53 @@ impl Registry {
     }
 }
 
+/// Removes a project, and every channel inside it through the foreign key's
+/// cascade, which `foreign_keys = ON` is verified to enforce: a channel in a
+/// project nobody has open is reachable from no window's sidebar.
+///
+/// With `confirmed`, the channels the store holds for the project must be
+/// exactly those, read in this same transaction, or nothing is removed.
+fn close_project(
+    transaction: &rusqlite::Transaction<'_>,
+    repository: &Path,
+    confirmed: Option<&BTreeSet<ChannelId>>,
+    recorder: &mut views::Recorder,
+    removed_channels: &mut Vec<ChannelId>,
+) -> Result<bool, String> {
+    let key = repository_key(repository)?;
+    let channels = transaction
+        .prepare("SELECT id FROM channels WHERE repository = ?1")
+        .and_then(|mut statement| {
+            statement
+                .query_map(params![key], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .map_err(|error| error.to_string())?
+        .iter()
+        .map(|id| parse_channel_id(id))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if confirmed.is_some_and(|confirmed| *confirmed != channels) {
+        return Err(Registry::PROJECT_CHANNELS_CONFLICT.into());
+    }
+    views::record_project_removal(transaction, repository, recorder)?;
+    removed_channels.extend(channels);
+    let removed = transaction
+        .execute("DELETE FROM projects WHERE repository = ?1", params![key])
+        .map_err(|error| error.to_string())?
+        > 0;
+    let recorded = transaction
+        .execute(
+            "INSERT OR IGNORE INTO closed_projects(repository) VALUES (?1)",
+            params![key],
+        )
+        .map_err(|error| error.to_string())?
+        > 0;
+    if removed || recorded {
+        automations::close_project(transaction, &key, crate::chat::now_ms().unwrap_or(0))?;
+    }
+    Ok(removed || recorded)
+}
+
 fn project_rows(db: &Connection) -> Result<Vec<ModelProject>, String> {
     db.prepare("SELECT repository, name, ordinal, kind FROM projects ORDER BY ordinal")
         .map_err(|error| error.to_string())?
@@ -737,7 +774,10 @@ fn public_effects(
                 None => effects.removed_projects.push(repository.clone()),
             }
         }
-        ModelEdit::CloseProject { repository } => effects.removed_projects.push(repository.clone()),
+        ModelEdit::CloseProject { repository }
+        | ModelEdit::CloseConfirmedProject { repository, .. } => {
+            effects.removed_projects.push(repository.clone())
+        }
         ModelEdit::CreateChannel { id, .. }
         | ModelEdit::RetitleChannel { id, .. }
         | ModelEdit::SuggestChannelTitle { id, .. }

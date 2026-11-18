@@ -150,7 +150,14 @@ cagents daemon stop --confirm
   terminals that session controls; see
   [Hosted agent execution](agent-execution.md#finding-other-sessions).
 - `project close` asks for `--yes` before deleting the channels a project
-  still holds, since closing a project removes them in every window.
+  still holds, since closing a project removes them in every window. If
+  another window creates a channel while the command runs, the project is not
+  closed without `--yes`, and the refusal names the new channel. With `--yes`,
+  the output lists every channel that was deleted.
+- `project close` and `channel list --repository` accept the key `project
+  list` prints after the project's checkout was deleted from disk. On this
+  computer, the directory of a deleted checkout that held the project's `.git`
+  works too, even through `..`.
 
 ## Compatible upgrades
 

@@ -84,6 +84,7 @@ keyboard-types = { version = "=0.8.3", features = ["serde"], optional = true }
 # default set and the editor is the only consumer.
 libcosmic = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", default-features = false, features = ["a11y", "highlighter", "markdown", "multi-window", "surface-message", "tokio", "wgpu", "winit", "xdg-portal"] }
 imara-diff = "0.2.0"
+indexmap = "2.14"
 libc = "0.2.189"
 # Finds records worth parsing in large provider transcripts for the resume
 # picker; already in the resolved graph through regex.

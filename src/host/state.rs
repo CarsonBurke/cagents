@@ -978,6 +978,7 @@ impl HostState {
         edit: &ModelEdit,
         effects: &crate::workspace_model::delta::EditEffects,
     ) {
+        let edit = edit.committed();
         for client_id in &self.model_watchers {
             if *client_id == origin {
                 continue;
@@ -987,7 +988,7 @@ impl HostState {
                     &self.proof,
                     ServerMessage::WorkspaceModelEdited {
                         sequence,
-                        edit: edit.clone(),
+                        edit: edit.as_ref().clone(),
                         effects: effects.clone(),
                     },
                 ));
@@ -3153,8 +3154,9 @@ fn apply_size(
 }
 
 /// Runs while HostLease is held, before accepting clients on the public listener.
-/// Returns the retained native conversations this restore left unattached:
-/// their reattachment was just refused, so startup must not retry it at once.
+/// Returns the native conversations this restore left unattached: a retained
+/// one's reattachment was just refused, so startup must not retry it at once,
+/// and a relaunched one's failed restart was stopped for its pane to reopen.
 pub(super) fn restore_upgrade(host: &SharedHost) -> Result<Vec<TerminalId>, String> {
     restore_upgrade_from(
         host,
@@ -3473,6 +3475,39 @@ impl ChatRestore {
     }
 }
 
+/// Restarts one conversation the previous daemon stopped for the update.
+///
+/// Its provider was stopped before the checkpoint became Ready, so a restart
+/// that fails is that conversation's problem alone, as a refused reattachment
+/// is for a retained one: what this restart started is positively stopped, the
+/// conversation is recorded for its pane to reopen, and the rest of the update
+/// is restored. Only a stop that cannot be proved, or a daemon asked to stop,
+/// fails the whole restore, since then something of it may still run.
+fn restart_or_stop(
+    host: &SharedHost,
+    chat: &crate::upgrade::handoff::Chat,
+    unattached: &mut Vec<crate::upgrade::handoff::UnattachedChat>,
+    queue_budget: &mut super::chat::UpgradeRestoreQueueBudget,
+) -> Result<(), String> {
+    let Err(reason) = super::chat::restore_upgrade_with_queue_budget(host, chat, queue_budget)
+    else {
+        return Ok(());
+    };
+    if crate::daemon::termination_requested() {
+        return Err(RESTORE_TERMINATED.to_owned());
+    }
+    super::chat::stop_failed_upgrade_restore(host, chat).map_err(|stop| {
+        format!("{reason}; stopping that restart could not be confirmed: {stop}")
+    })?;
+    tracing::warn!(session = %chat.source.id, %reason,
+        "a conversation the update stopped could not be restarted; its restart was stopped, nothing was resent, and the rest of the update was restored");
+    unattached.push(crate::upgrade::handoff::UnattachedChat::stopped(
+        chat.clone(),
+        reason,
+    ));
+    Ok(())
+}
+
 /// Replays a checkpoint, abandoning the replay as soon as termination is
 /// requested.
 ///
@@ -3569,12 +3604,17 @@ fn restore_upgrade_from(
     let mut unattached = Vec::new();
     let mut reattached = Vec::new();
     let mut interrupted_setups = false;
+    // Restarts stay serial: a Codex TUI needs its exact listener first, and a
+    // failed restart must be positively stopped before restore proceeds. Share
+    // lock queue time so one external lock holder cannot delay every restart
+    // by another minute while this daemon cannot yet accept clients.
+    let mut queue_budget = super::chat::UpgradeRestoreQueueBudget::default();
     let restored = (|| {
         // A managed CLI connects to its thread's server. Recreate that exact
         // actor first; starting the TUI first races a socket that does not exist.
         for chat in &checkpoint.chats {
             if ChatRestore::of(chat) == ChatRestore::CodexListener {
-                super::chat::restore_upgrade(host, chat)?;
+                restart_or_stop(host, chat, &mut unattached, &mut queue_budget)?;
             }
         }
         // Carried terminals are adopted before anything is relaunched: their
@@ -3739,7 +3779,7 @@ fn restore_upgrade_from(
             if crate::daemon::termination_requested() {
                 return Err(RESTORE_TERMINATED.to_owned());
             }
-            super::chat::restore_upgrade(host, chat)?;
+            restart_or_stop(host, chat, &mut unattached, &mut queue_budget)?;
         }
         let recovered = {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -3845,7 +3885,7 @@ fn restore_upgrade_from(
         tracing::warn!(
             conversations = unattached.len(),
             evidence = %store.unattached_path().display(),
-            "the daemon upgrade finished, but retained native conversations need attention"
+            "the daemon upgrade finished, but native conversations it could not restore need attention"
         );
     }
     Ok(unattached.iter().map(|chat| chat.summary.id).collect())
@@ -3855,6 +3895,8 @@ fn restore_upgrade_from(
 /// as after a reboot or once the holder itself exited: nothing in cagents can
 /// reattach or close them any more, so they would otherwise warn forever.
 /// Their identity stays in the log for manual recovery from provider storage.
+/// A conversation whose restart was stopped never has a holder, so its notice
+/// lasts until the next daemon start; its pane can reopen it at any time.
 fn forget_departed_unattached(store: &crate::upgrade::handoff::Store) {
     use crate::daemon::holder_registry::{self as registry, Kind};
     let conversations = match store.unattached() {
@@ -3916,6 +3958,34 @@ pub(super) fn retire_recovered_upgrade_chat(host: &SharedHost, id: TerminalId) {
     {
         tracing::warn!(session = %id, %error, "could not retire closed conversation recovery evidence");
     }
+}
+
+/// Retires the stopped-restart evidence of a conversation started again.
+pub(super) fn retire_stopped_upgrade_chat(host: &SharedHost, id: TerminalId) {
+    let Some(store) = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .upgrade_evidence
+        .clone()
+    else {
+        return;
+    };
+    if let Err(error) = store.retire_stopped_unattached(id) {
+        tracing::warn!(session = %id, %error,
+            "could not retire the evidence of a reopened conversation");
+    }
+}
+
+/// Why the last update's restore stopped the conversation `source` names.
+pub(super) fn stopped_upgrade_reason(
+    host: &SharedHost,
+    source: &crate::chat::Session,
+) -> Option<String> {
+    host.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .upgrade_evidence
+        .clone()?
+        .stopped_reason(source)
 }
 
 /// Forgets that a retained native conversation was left unattached by an
@@ -5663,7 +5733,11 @@ fn commit_redraw(
 }
 
 #[cfg(test)]
-fn record_event(host: &Weak<HostLock>, terminal_id: TerminalId, event: TerminalEvent) {
+pub(in crate::host) fn record_event(
+    host: &Weak<HostLock>,
+    terminal_id: TerminalId,
+    event: TerminalEvent,
+) {
     record_event_from(host, terminal_id, event, None);
 }
 fn record_event_from(

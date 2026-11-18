@@ -3020,7 +3020,9 @@ const CAPACITY_GUIDANCE: &str = "Inspect usage with cagents chat capacity. Check
 pub(super) struct Runtime {
     preparation: preparation::State,
     find: Option<String>,
-    find_matches: Vec<String>,
+    /// The groups Find matched, in transcript order. Every turn asks whether
+    /// it is among them on every frame, so membership is a lookup.
+    find_matches: indexmap::IndexSet<String>,
     find_disclosure: find::Disclosure,
     child_find_disclosure: HashMap<String, find::Disclosure>,
     find_index: usize,
@@ -4239,7 +4241,7 @@ impl Runtime {
             fork_seen: None,
             files: None,
             find: None,
-            find_matches: Vec::new(),
+            find_matches: indexmap::IndexSet::new(),
             find_disclosure: find::Disclosure::default(),
             child_find_disclosure: HashMap::new(),
             find_index: 0,

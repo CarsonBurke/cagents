@@ -836,6 +836,37 @@ impl Workspace {
         })
     }
 
+    /// A strip holding `cards` in order, focused on the first, as adding them
+    /// one at a time unfocused would leave it. The indices, geometry and
+    /// visibility are built once for the whole strip rather than once per
+    /// card, so restoring a scope costs time in proportion to its panes.
+    pub fn with_cards(
+        config: WorkspaceConfig,
+        cards: impl IntoIterator<Item = WorkspaceCard>,
+    ) -> Result<Self, WorkspaceError> {
+        let mut workspace = Self::new(config)?;
+        workspace.cards = cards
+            .into_iter()
+            .map(|card| WorkspaceCard::new(card.id, card.accessible_name, card.width))
+            .collect::<Result<_, _>>()?;
+        workspace.rebuild_card_indices();
+        if workspace.card_indices.len() != workspace.cards.len() {
+            let duplicate = workspace
+                .cards
+                .iter()
+                .enumerate()
+                .find(|(index, card)| workspace.card_indices[&card.id] != *index)
+                .map(|(_, card)| card.id)
+                .expect("a lost index belongs to a repeated card");
+            return Err(WorkspaceError::DuplicateCard(duplicate));
+        }
+        workspace.focused = workspace.cards.first().map(|card| card.id);
+        workspace.pending_widget_focus = workspace.focused;
+        workspace.rebuild_geometry();
+        workspace.refresh_visibility(false);
+        Ok(workspace)
+    }
+
     pub fn cards(&self) -> &[WorkspaceCard] {
         &self.cards
     }
@@ -1770,6 +1801,8 @@ impl Workspace {
     }
 
     fn rebuild_card_indices(&mut self) {
+        #[cfg(test)]
+        tests::CARD_INDEX_BUILDS.set(tests::CARD_INDEX_BUILDS.get() + 1);
         self.card_indices = Arc::new(
             self.cards
                 .iter()
@@ -1798,6 +1831,8 @@ impl Workspace {
     }
 
     fn rebuild_geometry(&mut self) {
+        #[cfg(test)]
+        tests::GEOMETRY_BUILDS.set(tests::GEOMETRY_BUILDS.get() + 1);
         let geometry = self.build_geometry(self.viewport_width);
         if geometry == self.geometry {
             return;
@@ -2136,8 +2171,58 @@ fn validate_nonnegative_finite(value: f32, field: &'static str) -> Result<(), Wo
 mod tests {
     use super::*;
 
+    thread_local! {
+        /// How many times this thread has indexed a strip's cards.
+        pub(super) static CARD_INDEX_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// How many times this thread has laid out a strip.
+        pub(super) static GEOMETRY_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
     fn card(width: CardWidth) -> WorkspaceCard {
         WorkspaceCard::new(CardId::new(), "Test card", width).unwrap()
+    }
+
+    #[test]
+    fn a_strip_built_whole_matches_one_built_card_by_card_and_lays_out_once() {
+        let cards = (0..64)
+            .map(|index| card(CardWidth::Fraction(0.25 + (index % 3) as f32 * 0.25)))
+            .collect::<Vec<_>>();
+        let mut added = Workspace::default();
+        for (index, card) in cards.iter().cloned().enumerate() {
+            added.add_card(card, index, false).unwrap();
+        }
+
+        let (indexed, laid_out) = (CARD_INDEX_BUILDS.get(), GEOMETRY_BUILDS.get());
+        let whole = Workspace::with_cards(WorkspaceConfig::default(), cards.clone()).unwrap();
+        assert_eq!(CARD_INDEX_BUILDS.get() - indexed, 1, "indexed once");
+        assert_eq!(GEOMETRY_BUILDS.get() - laid_out, 1, "laid out once");
+
+        assert_eq!(whole.cards(), added.cards());
+        assert_eq!(whole.card_indices(), added.card_indices());
+        assert_eq!(whole.focused(), Some(cards[0].id));
+        assert_eq!(whole.focused(), added.focused());
+        assert_eq!(whole.pending_widget_focus, added.pending_widget_focus);
+        assert_eq!(whole.geometry(), added.geometry());
+        for card in &cards {
+            assert_eq!(whole.visibility(card.id), added.visibility(card.id));
+        }
+    }
+
+    #[test]
+    fn a_strip_built_whole_refuses_a_repeated_card() {
+        let repeated = card(CardWidth::Fraction(0.5));
+        let error = Workspace::with_cards(
+            WorkspaceConfig::default(),
+            [
+                repeated.clone(),
+                card(CardWidth::Fraction(0.5)),
+                repeated.clone(),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(error, WorkspaceError::DuplicateCard(repeated.id));
+        let empty = Workspace::with_cards(WorkspaceConfig::default(), []).unwrap();
+        assert!(empty.cards().is_empty() && empty.focused().is_none());
     }
 
     fn workspace_with_widths(widths: &[CardWidth], viewport: f32) -> Workspace {

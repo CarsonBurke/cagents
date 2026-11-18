@@ -6097,15 +6097,19 @@ impl Cagents {
     }
 
     fn rebuild_workspace(state: &WorkspaceState) -> Workspace {
-        let mut workspace = Workspace::new(WorkspaceConfig::default()).unwrap_or_default();
-        for card in state.cards.iter().filter(|card| card.existence.is_open()) {
-            let width = if card.width_fraction.is_finite() && card.width_fraction > 0.0 {
-                CardWidth::Fraction(card.width_fraction.min(1.0))
-            } else {
-                CardWidth::Fraction(0.5)
-            };
-            let index = workspace.cards().len();
-            let _ = workspace.add_card(
+        // Durable state names each card once; a repeat keeps its first place,
+        // as the strip always has.
+        let mut seen = HashSet::new();
+        let cards = state
+            .cards
+            .iter()
+            .filter(|card| card.existence.is_open() && seen.insert(card.id))
+            .map(|card| {
+                let width = if card.width_fraction.is_finite() && card.width_fraction > 0.0 {
+                    CardWidth::Fraction(card.width_fraction.min(1.0))
+                } else {
+                    CardWidth::Fraction(0.5)
+                };
                 WorkspaceCard::new(
                     card.id,
                     if matches!(card.kind, CardKind::Browser(_)) {
@@ -6119,11 +6123,10 @@ impl Cagents {
                     id: card.id,
                     accessible_name: "Workspace card".into(),
                     width: CardWidth::Fraction(0.5),
-                }),
-                index,
-                false,
-            );
-        }
+                })
+            });
+        let mut workspace =
+            Workspace::with_cards(WorkspaceConfig::default(), cards).unwrap_or_default();
         if let Some(focused) = state.focused {
             let _ = workspace.focus(focused);
         }

@@ -8,6 +8,26 @@ use crate::{
 };
 use serde_json::{Value, json};
 
+#[test]
+fn upgrade_restore_queue_budget_is_shared_across_conversations() {
+    let mut budget = UpgradeRestoreQueueBudget::default();
+    budget.charge(Duration::from_secs(40));
+    assert!(budget.permits(Duration::from_secs(19)));
+    assert!(!budget.permits(Duration::from_secs(20)));
+    budget.charge(Duration::from_secs(15));
+    assert!(budget.permits(Duration::from_secs(4)));
+    assert!(!budget.permits(Duration::from_secs(5)));
+}
+
+#[test]
+fn upgrade_restore_queue_budget_exhaustion_still_permits_unqueued_startup() {
+    let mut budget = UpgradeRestoreQueueBudget::default();
+    // A sample can cross the remaining budget; charging it must saturate.
+    budget.charge(Duration::from_secs(61));
+    assert!(budget.permits(Duration::ZERO));
+    assert!(!budget.permits(Duration::from_millis(1)));
+}
+
 // Each case owns the process-global daemon wake pipe in an exact child;
 // unrelated tests cannot supply the wake this regression is waiting for.
 fn isolated_completion_wake_case(marker: &str) -> bool {
@@ -1466,7 +1486,7 @@ fn missing_claude_directory_restores_a_hosted_history_reader_without_authority()
     );
     handle.command(chat::Command::Refresh).unwrap();
     let failure = restore_upgrade(&host, &saved).unwrap_err();
-    assert!(failure.contains("No provider was restarted"));
+    assert!(failure.contains("only its conversation history can be opened"));
     assert!(
         host.lock()
             .unwrap_or_else(|p| p.into_inner())

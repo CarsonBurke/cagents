@@ -3469,7 +3469,10 @@ fn find_actions_restore_automatic_disclosures_and_keep_explicit_choices() {
         "STRASSE".into(),
     ));
     let runtime = chat_runtime(&app, card);
-    assert_eq!(runtime.find_matches, vec!["prompt"]);
+    assert_eq!(
+        runtime.find_matches.iter().collect::<Vec<_>>(),
+        vec!["prompt"]
+    );
     assert!(
         ["automatic", "manual", "changed"]
             .iter()
@@ -4805,7 +4808,7 @@ fn selected_child_find_searches_visible_scope_and_preserves_explicit_disclosures
     ));
     let runtime = chat_runtime(&app, card);
     assert_eq!(
-        runtime.find_matches,
+        runtime.find_matches.iter().collect::<Vec<_>>(),
         vec!["same#opaque-id"],
         "Find must search the visible child, not the parent"
     );
@@ -4829,7 +4832,10 @@ fn selected_child_find_searches_visible_scope_and_preserves_explicit_disclosures
     drop(app.handle_chat_ui(Action::Toggle(target, "same#opaque-id".into())));
     drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("two".into()))));
     assert_eq!(
-        chat_runtime(&app, card).find_matches,
+        chat_runtime(&app, card)
+            .find_matches
+            .iter()
+            .collect::<Vec<_>>(),
         vec!["same#opaque-id"]
     );
     drop(app.handle_chat_ui(Action::FindNext(target, true)));
@@ -4940,7 +4946,10 @@ fn selected_child_find_refreshes_on_live_changes_and_child_retirement() {
         &mut app, target,
     ));
     assert_eq!(
-        chat_runtime(&app, card).find_matches,
+        chat_runtime(&app, card)
+            .find_matches
+            .iter()
+            .collect::<Vec<_>>(),
         vec!["same#opaque-id"]
     );
     drop(app.handle_chat_ui(Action::FindNext(target, true)));

@@ -251,7 +251,8 @@ impl WorkspaceModel {
                     }),
                 }
             }
-            ModelEdit::CloseProject { repository } => {
+            ModelEdit::CloseProject { repository }
+            | ModelEdit::CloseConfirmedProject { repository, .. } => {
                 self.navigation_orders
                     .retain(|order| order.repository != *repository);
                 if !self.closed_projects.contains(repository) {
@@ -442,6 +443,16 @@ pub enum ModelEdit {
         home: ChannelIncarnation,
         expected_view_revision: u64,
     },
+    /// [`ModelEdit::CloseProject`], applied only while the project's channels
+    /// are exactly `channels`: the ones the caller showed the user and had
+    /// confirmed. A channel created in, moved into or removed from the project
+    /// since then refuses the whole close, so nothing is deleted that the user
+    /// was not told about. Once it commits it is that close, and every other
+    /// client is sent it as one.
+    CloseConfirmedProject {
+        repository: PathBuf,
+        channels: std::collections::BTreeSet<ChannelId>,
+    },
 }
 
 impl ModelEdit {
@@ -487,6 +498,13 @@ impl ModelEdit {
             Self::CloseProject { repository } => Self::CloseProject {
                 repository: canonical_repository(&repository)?,
             },
+            Self::CloseConfirmedProject {
+                repository,
+                channels,
+            } => Self::CloseConfirmedProject {
+                repository: canonical_repository(&repository)?,
+                channels,
+            },
             Self::CreateChannel {
                 id,
                 repository,
@@ -531,6 +549,21 @@ impl ModelEdit {
             | Self::RetiredChannelWorkChanged
             | Self::RetireEmptyChannel { .. }) => edit,
         })
+    }
+
+    /// This edit as other clients are told about it once it has committed.
+    ///
+    /// A confirmed close's precondition belongs to the client that asked; the
+    /// close that held is the one every window already knows how to fold.
+    pub fn committed(&self) -> std::borrow::Cow<'_, Self> {
+        match self {
+            Self::CloseConfirmedProject { repository, .. } => {
+                std::borrow::Cow::Owned(Self::CloseProject {
+                    repository: repository.clone(),
+                })
+            }
+            edit => std::borrow::Cow::Borrowed(edit),
+        }
     }
 }
 
