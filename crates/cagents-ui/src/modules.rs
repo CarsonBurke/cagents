@@ -39,6 +39,7 @@ pub mod startup_window;
 mod sticky_tree;
 pub mod tab_history;
 pub mod tab_strip;
+pub mod termination;
 pub mod ui_controls;
 pub mod ui_memory;
 pub mod work_ui;

@@ -4669,6 +4669,8 @@ pub enum Message {
     CloseCard(CardId),
     CloseCardUnasked(CardId),
     WindowCloseRequested(window::Id),
+    /// A signal asked the application to end, as at logout.
+    TerminationRequested(crate::termination::Request),
     CancelTransientWorkClose,
     ReturnToDeviceBeforeClose,
     ReturnToAutomationBeforeClose,
@@ -14284,7 +14286,30 @@ impl Cagents {
             ));
             return Task::none();
         }
+        self.commit_exit()
+    }
 
+    /// Leaves the application because a signal asked it to, as a session
+    /// manager does at logout.
+    ///
+    /// This is the close button's exit without its questions. Nobody is
+    /// there to answer them, and whoever sent the signal ends the process
+    /// soon regardless, so asking would only lose what the exit saves. That
+    /// includes the window settings and session state written in `Drop`.
+    /// Unsaved editor buffers and retained file operations are left exactly
+    /// as the signal's default action would have left them.
+    fn exit_on_request(&mut self, request: crate::termination::Request) -> Task<Message> {
+        if self.exit.is_some() {
+            return Task::none();
+        }
+        tracing::info!(?request, "closing the window on request");
+        self.transient_work_close = None;
+        self.commit_exit()
+    }
+
+    /// Commits to the exit described on [`Self::exit_after_language_servers`]
+    /// once nothing stands in its way.
+    fn commit_exit(&mut self) -> Task<Message> {
         if self.exit.is_some() {
             return Task::none();
         }
@@ -18101,6 +18126,7 @@ impl Application for Cagents {
                     .collect::<VecDeque<_>>();
                 self.begin_dirty_close(DirtyCloseIntent::Application(window), dirty)
             }
+            Message::TerminationRequested(request) => self.exit_on_request(request),
             Message::CancelTransientWorkClose => {
                 self.transient_work_close = None;
                 let target = if self.automation_ui.draft_dialog_open() {
@@ -19564,6 +19590,7 @@ impl Application for Cagents {
             self.notice_expiry_subscription(),
             Subscription::run(crate::daemon_health::stream).map(Message::DaemonHealth),
             Subscription::run(crate::desktop_cursor_blink::stream).map(Message::CursorBlink),
+            Subscription::run(crate::termination::stream).map(Message::TerminationRequested),
             self.refresh_subscription(),
             self.review_request_subscription(),
             self.git_subscription(),
@@ -22133,6 +22160,71 @@ mod tests {
         let _ = app.update(Message::WindowCloseRequested(window));
         assert!(app.dirty_repository_close.is_none());
         assert_eq!(app.exit, closing);
+    }
+
+    /// A signal at logout gets the close button's exit without its
+    /// questions: nobody can answer them, and the process ends soon
+    /// regardless, so asking would lose the window settings and session state
+    /// the exit saves.
+    #[test]
+    fn a_termination_request_exits_without_asking_about_unsaved_work() {
+        let mut app = context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let window = window::Id::unique();
+        app.core.set_main_window_id(Some(window));
+        app.cards.insert(
+            card,
+            CardRuntime::Repository(Box::new(RepositoryRuntime::dirty_fixture(card))),
+        );
+
+        // The same state stops the close button to ask.
+        let _ = app.update(Message::WindowCloseRequested(window));
+        assert!(app.dirty_repository_close.is_some());
+        assert_eq!(app.exit, None);
+        assert_eq!(app.core.main_window_id(), Some(window));
+
+        let _ = app.update(Message::TerminationRequested(
+            crate::termination::Request::Terminate,
+        ));
+        let closing = Some(ApplicationExit {
+            closing: Some(window),
+            servers_reaped: false,
+        });
+        assert_eq!(app.exit, closing);
+        assert_eq!(app.core.main_window_id(), None);
+
+        // A second signal is the subscription's to act on; it must not
+        // restart the exit the first one committed.
+        let _ = app.update(Message::TerminationRequested(
+            crate::termination::Request::Hangup,
+        ));
+        assert_eq!(app.exit, closing);
+    }
+
+    /// File operations still in flight hold the close button, but not a
+    /// signal: the process ends soon whether or not the exit waits.
+    #[test]
+    fn a_termination_request_exits_while_file_operations_are_retained() {
+        let mut app = context_inspector_test_app(true);
+        let window = window::Id::unique();
+        app.core.set_main_window_id(Some(window));
+        let root = Arc::new(crate::fs_safety::Root::open(&std::env::temp_dir()).unwrap());
+        let _ticket = crate::operation_recovery::begin_operation(
+            &app.operation_recovery,
+            std::env::temp_dir(),
+            root,
+        )
+        .unwrap();
+        assert!(app.operation_recovery_pending());
+
+        let _ = app.update(Message::WindowCloseRequested(window));
+        assert_eq!(app.exit, None);
+
+        let _ = app.update(Message::TerminationRequested(
+            crate::termination::Request::Terminate,
+        ));
+        assert!(app.exit.is_some());
+        assert_eq!(app.core.main_window_id(), None);
     }
 
     #[test]
