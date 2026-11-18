@@ -635,6 +635,14 @@ impl Independence {
         self.allocations.insert(id);
     }
 
+    /// A replacement that takes over an independent conversation, such as the
+    /// terminal it returns to, is as independent of recovery as it was.
+    pub(in crate::host) fn extend(&mut self, source: TerminalId, replacement: TerminalId) {
+        if self.contains(source) {
+            self.insert(replacement);
+        }
+    }
+
     fn contains_conversation(&self, provider: Provider, id: &str) -> bool {
         self.conversations.contains(&(provider, id.to_owned()))
     }

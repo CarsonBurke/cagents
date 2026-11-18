@@ -95,6 +95,26 @@ fn prompt(text: &str) -> Command {
     }
 }
 
+/// Sends once the provider has finished initializing, as a window's
+/// composer waits to.
+fn send(host: &SharedHost, client: crate::host::state::ClientId, chat_id: TerminalId, text: &str) {
+    wait_for(
+        "the conversation never accepted its prompt",
+        || match process_request(
+            host,
+            client,
+            ClientRequest::ChatCommand {
+                chat_id,
+                command: prompt(text),
+            },
+        ) {
+            Ok((ServerResponse::Accepted, ..)) => true,
+            Err(error) if error.message == "Claude is still initializing" => false,
+            other => panic!("the prompt was not accepted: {other:?}"),
+        },
+    );
+}
+
 fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(20);
     while !ready() {
@@ -271,15 +291,6 @@ fn a_fresh_conversation_sends_and_reopens_while_recovery_holds_retained_owners()
         .0,
         ServerResponse::Spawned { .. }
     ));
-    process_request(
-        &host,
-        user,
-        ClientRequest::CloseTerminalChecked {
-            terminal_id: shell.id,
-            allow_active: true,
-        },
-    )
-    .unwrap();
     // An unstarted draft reusing the checkpointed allocation is no fresh start.
     let mut reused = claude(&root, None);
     reused.id = codex.source.id;
@@ -324,19 +335,7 @@ fn a_fresh_conversation_sends_and_reopens_while_recovery_holds_retained_owners()
         matches!(&started, ServerResponse::ChatAttached { session, .. } if session.id == fresh.id),
         "{started:?}"
     );
-    assert!(matches!(
-        process_request(
-            &host,
-            user,
-            ClientRequest::ChatCommand {
-                chat_id: fresh.id,
-                command: prompt("first"),
-            },
-        )
-        .unwrap()
-        .0,
-        ServerResponse::Accepted
-    ));
+    send(&host, user, fresh.id, "first");
     let prompts = || std::fs::read_to_string(root.join("prompts")).unwrap_or_default();
     wait_for("the fresh conversation's prompt never arrived", || {
         prompts() == "prompt\n"
@@ -422,15 +421,7 @@ fn a_fresh_conversation_sends_and_reopens_while_recovery_holds_retained_owners()
             })
         },
     );
-    process_request(
-        &host,
-        user,
-        ClientRequest::ChatCommand {
-            chat_id: reopened.id,
-            command: prompt("second"),
-        },
-    )
-    .unwrap();
+    send(&host, user, reopened.id, "second");
     wait_for("the reopened conversation's prompt never arrived", || {
         prompts() == "prompt\nprompt\n"
     });
@@ -457,9 +448,57 @@ fn a_fresh_conversation_sends_and_reopens_while_recovery_holds_retained_owners()
     wait_for("Close did not end the retained original", || {
         original_handle.is_completed()
     });
-    let state = host.lock().unwrap();
-    assert!(state.chats[&reopened.id].handle.owns_work());
-    assert!(!state.recovery_owns_work());
+    let shell_handle = {
+        let state = host.lock().unwrap();
+        assert!(state.chats[&reopened.id].handle.owns_work());
+        let shell = state.terminals[&shell.id].handle.clone();
+        assert!(!shell.is_completed());
+        // Neither does the terminal started beside it.
+        assert!(!state.recovery_owns_work());
+        shell
+    };
+    assert!(matches!(
+        process_request(
+            &host,
+            user,
+            ClientRequest::CloseTerminalChecked {
+                terminal_id: shell.id,
+                allow_active: true,
+            },
+        )
+        .unwrap()
+        .0,
+        ServerResponse::TerminalCloseChecked {
+            outcome: crate::terminal_ipc::TerminalCloseResult::Closed,
+            ..
+        }
+    ));
+    wait_for("Close did not end the independent terminal", || {
+        shell_handle.is_completed()
+    });
+    // Its conversation returns to a terminal beside the hold as well.
+    let ServerResponse::ChatTerminal {
+        session: terminal, ..
+    } = process_request(
+        &host,
+        user,
+        ClientRequest::ChatReturnTerminal {
+            chat_id: reopened.id,
+        },
+    )
+    .unwrap()
+    .0
+    else {
+        panic!("the independent conversation did not return to its terminal");
+    };
+    let terminal_handle = host.lock().unwrap().terminals[&terminal.id].handle.clone();
+    assert_eq!(
+        terminal_handle.close_checked(true),
+        crate::terminal_ipc::TerminalCloseResult::Closed
+    );
+    wait_for("Close did not end the returned terminal", || {
+        terminal_handle.is_completed()
+    });
 }
 
 /// A terminal names the conversation it opens only through its provider's
