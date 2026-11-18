@@ -3493,57 +3493,130 @@ fn wheel_navigation_respects_direction_and_nested_capture() {
     assert!(navigation_input(Some(10.0), 10.0, top, Some(0.0), false, BOTH).is_none());
 }
 
-/// The kept half of a slide is where its middle item is drawn, not half
-/// the height: a reader whose viewport reaches past that item would lose
-/// rows they see, so the page waits (#3102).
+fn kept(older_end: f32, newer_start: f32) -> Option<view::Kept> {
+    Some(view::Kept {
+        older_end,
+        newer_start,
+    })
+}
+
+/// The half a slide keeps is where its rows were drawn, not half the
+/// height: a reader whose viewport reaches past it would lose rows they
+/// see, so the page waits. Before the rows are drawn, only the edge asks
+/// (#3102).
 #[test]
 fn prefetch_waits_until_the_viewport_is_inside_the_half_a_slide_keeps() {
-    // A short older half: the middle item ends 900 px down a 10000 px window.
-    let short_half = |top: f32| Scroll::new(top, 10_000.0, 800.0).with_pivot(Some((850.0, 900.0)));
+    // A short older half: it ends 900 px down a 10000 px window.
+    let short_half = |top: f32| Scroll::new(top, 10_000.0, 800.0).with_kept(kept(900.0, 850.0));
     assert!(short_half(50.0).prefetch_earlier());
     assert!(!short_half(600.0).prefetch_earlier());
     // A tall older half keeps more of the window, so the page goes sooner.
-    let tall_half =
-        |top: f32| Scroll::new(top, 10_000.0, 800.0).with_pivot(Some((8_000.0, 8_400.0)));
+    let tall_half = |top: f32| Scroll::new(top, 10_000.0, 800.0).with_kept(kept(8_400.0, 8_000.0));
     assert!(tall_half(1_500.0).prefetch_earlier());
     assert!(!tall_half(7_700.0).prefetch_later());
     assert!(tall_half(8_000.0).prefetch_later());
+    let unmeasured = Scroll::new(1_500.0, 10_000.0, 800.0);
+    assert!(!unmeasured.prefetch_earlier());
+    assert!(Scroll::new(0.0, 10_000.0, 800.0).prefetch_earlier());
+}
+
+/// An exchange draws its steps on one strip above its prose, whatever
+/// their order, and a row holds every item it aliases. The kept halves end
+/// at the nearest row holding an item of the other half, not at the middle
+/// item's own row (#3102).
+#[test]
+fn the_kept_halves_end_at_the_rows_of_the_items_a_slide_drops() {
+    let ids = ["prompt", "step-1", "prose", "step-2", "next-prompt"];
+    let items: Vec<_> = ids
+        .iter()
+        .map(|id| (item_id(id), *id))
+        .chain([(item_id("turn"), "turn")])
+        .collect();
+    let row = |id: &str, y: f32, height: f32| Row {
+        id: id.to_owned(),
+        bounds: Rectangle::new(iced::Point::new(0.0, y), Size::new(800.0, height)),
+        placeholder: false,
+    };
+    let mut anchor = Anchor::default();
+    anchor.contexts.push(Context {
+        rows: vec![
+            row("prompt", 0.0, 100.0),
+            // Both steps share the strip, which is drawn above the prose.
+            row("step-1", 100.0, 300.0),
+            row("step-2", 100.0, 300.0),
+            row("prose", 400.0, 500.0),
+            row("next-prompt", 900.0, 100.0),
+            // A turn's own row spans every item, and is not one of them.
+            row("turn", 0.0, 900.0),
+        ],
+        ..Context::default()
+    });
+    // The middle item is the prose: an earlier page drops step-2, drawn
+    // above it, and a later page drops step-1, drawn on the same strip.
+    let kept = anchor
+        .kept(None, &items, Pivot { index: 2, items: 5 })
+        .expect("rows on both sides of the middle item");
+    assert_eq!(kept.older_end, 100.0);
+    assert_eq!(kept.newer_start, 400.0);
+    // Nothing is drawn yet for another transcript.
+    assert!(
+        anchor
+            .kept(Some("child"), &items, Pivot { index: 2, items: 5 })
+            .is_none()
+    );
 }
 
 /// A wheel near a loaded edge asks once for the page there, and only when
 /// there is one: reading the newest messages of a live conversation sends
-/// nothing to the model (#3102).
+/// nothing to the model. Turning back, or a window that moved, asks again
+/// (#3102).
 #[test]
 fn wheel_prefetch_asks_once_and_only_for_a_page_that_exists() {
-    let near_bottom = Scroll::new(8_600.0, 10_000.0, 800.0);
+    let at = |top: f32| Scroll::new(top, 10_000.0, 800.0).with_kept(kept(5_000.0, 5_000.0));
     let live = Pages {
         earlier: true,
         later: false,
     };
     assert_eq!(
-        navigation_input(Some(8_540.0), 8_600.0, near_bottom, Some(-1.0), false, live),
+        navigation_input(Some(8_540.0), 8_600.0, at(8_600.0), Some(-1.0), false, live),
         None
     );
     let mut anchor = Anchor::default();
-    let near_top = Scroll::new(600.0, 10_000.0, 800.0);
-    let ask = |anchor: &mut Anchor, scroll: Scroll| {
+    let ask = |anchor: &mut Anchor, from: f32, to: f32, pivot: &str| {
         let direction = navigation_input(
-            Some(scroll.from_top() + 60.0),
-            scroll.from_top(),
-            scroll,
-            Some(1.0),
+            Some(from),
+            to,
+            at(to),
+            Some(if to < from { 1.0 } else { -1.0 }),
             false,
             live,
         );
-        anchor.ahead_once(direction, true, scroll)
+        anchor.ahead_once(direction, true, at(to), Some(pivot))
     };
-    assert_eq!(ask(&mut anchor, near_top), Some(view::Page::Earlier));
-    assert_eq!(ask(&mut anchor, Scroll::new(540.0, 10_000.0, 800.0)), None);
-    // A page arrived: the content is taller, and the next edge is asked for.
     assert_eq!(
-        ask(&mut anchor, Scroll::new(600.0, 14_000.0, 800.0)),
+        ask(&mut anchor, 660.0, 600.0, "a"),
         Some(view::Page::Earlier)
     );
+    assert_eq!(ask(&mut anchor, 600.0, 540.0, "a"), None);
+    // The reader turns back, then heads for the edge again.
+    assert_eq!(ask(&mut anchor, 540.0, 600.0, "a"), None);
+    assert_eq!(
+        ask(&mut anchor, 600.0, 540.0, "a"),
+        Some(view::Page::Earlier)
+    );
+    // A page arrived: the window slides around another item.
+    assert_eq!(
+        ask(&mut anchor, 600.0, 540.0, "b"),
+        Some(view::Page::Earlier)
+    );
+    // At the edge itself every notch is passed on, as before.
+    let edge = Scroll::new(0.0, 10_000.0, 800.0);
+    for _ in 0..2 {
+        assert_eq!(
+            anchor.ahead_once(Some(view::Page::Earlier), true, edge, Some("b")),
+            Some(view::Page::Earlier)
+        );
+    }
 }
 
 /// A wheel heading for a loaded edge asks for its page a couple of screens
@@ -3551,7 +3624,8 @@ fn wheel_prefetch_asks_once_and_only_for_a_page_that_exists() {
 /// asks for nothing (#3102).
 #[test]
 fn wheel_toward_a_loaded_edge_fetches_ahead_of_the_reader() {
-    let near_top = Scroll::new(600.0, 10_000.0, 800.0);
+    let at = |top: f32| Scroll::new(top, 10_000.0, 800.0).with_kept(kept(5_000.0, 5_000.0));
+    let near_top = at(600.0);
     assert!(!near_top.at_top() && near_top.prefetch_earlier());
     assert_eq!(
         navigation_input(Some(660.0), 600.0, near_top, Some(1.0), false, BOTH),
@@ -3562,14 +3636,12 @@ fn wheel_toward_a_loaded_edge_fetches_ahead_of_the_reader() {
         navigation_input(Some(540.0), 600.0, near_top, Some(-1.0), false, BOTH),
         None
     );
-    let middle = Scroll::new(4_600.0, 10_000.0, 800.0);
     assert_eq!(
-        navigation_input(Some(4_660.0), 4_600.0, middle, Some(1.0), false, BOTH),
+        navigation_input(Some(4_660.0), 4_600.0, at(4_600.0), Some(1.0), false, BOTH),
         None
     );
-    let near_bottom = Scroll::new(8_600.0, 10_000.0, 800.0);
     assert_eq!(
-        navigation_input(Some(8_540.0), 8_600.0, near_bottom, Some(-1.0), false, BOTH),
+        navigation_input(Some(8_540.0), 8_600.0, at(8_600.0), Some(-1.0), false, BOTH),
         Some(view::Page::Newer)
     );
 }
