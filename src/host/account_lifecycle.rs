@@ -301,6 +301,9 @@ pub(crate) struct Reservation {
     accounts: Vec<Account>,
     create: Option<(crate::agent::Provider, uuid::Uuid)>,
     store: Store,
+    /// How long each step asks again for an account-list lock another
+    /// process holds. See [`crate::account::registry::patiently`].
+    patience: std::time::Duration,
     /// Only relevant registrations, not the global revision: unrelated edits
     /// must be preserved while a provider is taking time to sign out.
     registered: Vec<(
@@ -335,6 +338,7 @@ impl Reservation {
             store,
             crate::account::home::Homes::installation().as_ref(),
             restores,
+            crate::account::registry::LIST_PATIENCE,
         )
     }
 
@@ -344,6 +348,7 @@ impl Reservation {
         store: Store,
         installed_homes: Option<&crate::account::home::Homes>,
         restores: Option<(crate::agent::Provider, uuid::Uuid)>,
+        patience: std::time::Duration,
     ) -> Result<Self, ProtocolError> {
         let gate = host
             .lock()
@@ -366,17 +371,9 @@ impl Reservation {
             })
             .collect::<Result<Vec<_>, _>>()
             .map_err(refusal)?;
-        let registry = store.try_load().map_err(|error| {
-            if error.kind() == std::io::ErrorKind::WouldBlock {
-                ProtocolError::new(
-                    ProtocolErrorCode::InvalidRequest,
-                    "Another window is saving the account list. Try again in a moment.",
-                    true,
-                )
-            } else {
-                refusal(error.to_string())
-            }
-        })?;
+        // Nothing is held yet: no lease, no control admission.
+        let registry = crate::account::registry::patiently(patience, || store.try_load())
+            .map_err(|error| super::client::lifecycle_refusal(error.into()))?;
         // The request's account lookup happened before this snapshot. Never
         // pair an old linked path with a newer registration under the same ID.
         let current_accounts = registry.all_accounts(installed_homes);
@@ -462,11 +459,14 @@ impl Reservation {
             create: None,
             registered,
             store,
+            patience,
         };
         // No effects have happened. Refuse any filesystem/registration change
         // across observation and installation while the installed token fences
         // subsequent related ingress.
-        reservation.verify().map_err(refusal)?;
+        reservation
+            .verify()
+            .map_err(|error| super::client::lifecycle_refusal(error.into()))?;
         reservation.ensure_no_active_owners(host)?;
         Ok(reservation)
     }
@@ -483,7 +483,21 @@ impl Reservation {
         store: Store,
         homes: &crate::account::home::Homes,
     ) -> Result<Self, ProtocolError> {
-        Self::install_with_store(host, accounts, store, Some(homes), None)
+        Self::install_with_store(
+            host,
+            accounts,
+            store,
+            Some(homes),
+            None,
+            crate::account::registry::LIST_PATIENCE,
+        )
+    }
+
+    /// Asks again for a held account-list lock for only `patience`.
+    #[cfg(test)]
+    pub(crate) fn with_patience(mut self, patience: std::time::Duration) -> Self {
+        self.patience = patience;
+        self
     }
 
     fn ensure_no_active_owners(&self, host: &SharedHost) -> Result<(), ProtocolError> {
@@ -567,7 +581,8 @@ impl Reservation {
         host: &SharedHost,
         operation: &crate::account::remote::Operation,
     ) -> Result<Self, ProtocolError> {
-        let mut accounts = crate::account::remote::affected_accounts(operation).map_err(refusal)?;
+        let mut accounts = crate::account::remote::affected_accounts(operation)
+            .map_err(super::client::lifecycle_refusal)?;
         let create = if let crate::account::remote::Operation::Create { provider, .. } = operation {
             let homes = crate::account::home::Homes::installation()
                 .ok_or_else(|| refusal("Account homes unavailable"))?;
@@ -654,9 +669,13 @@ impl Reservation {
         patience: std::time::Duration,
     ) -> std::io::Result<(uuid::Uuid, PathBuf)> {
         self.retry_busy_enrollment(std::time::Instant::now() + patience, || {
-            self.verify().map_err(std::io::Error::other)?;
-            store.try_create_pending_reserved(self, homes, provider, started_at, || {
-                self.create_home_initialized(homes, provider, system, config, |_| Ok(()))
+            // A held lock refuses before the home is made, so asking again
+            // for it leaves nothing behind.
+            self.patiently(|| {
+                self.verify_once()?;
+                store.try_create_pending_reserved(self, homes, provider, started_at, || {
+                    self.create_home_initialized(homes, provider, system, config, |_| Ok(()))
+                })
             })
         })
     }
@@ -876,28 +895,51 @@ impl Reservation {
     /// global reader/writer spans slow storage, so unrelated Input remains
     /// independent even when another scoped writer is awaiting admission.
     /// Store revalidates relevant metadata under its actual mutation lease.
+    ///
+    /// `effect` takes its locks without waiting. While another process holds
+    /// one, verification and `effect` are made again for a moment, holding
+    /// nothing in between; past that the refusal is
+    /// [`LifecycleError::ListHeld`](crate::account::remote::LifecycleError).
     pub(crate) fn commit<T>(
         &self,
-        effect: impl FnOnce() -> std::io::Result<T>,
-    ) -> Result<T, String> {
-        self.verify()?;
-        effect().map_err(|error| error.to_string())
+        mut effect: impl FnMut() -> std::io::Result<T>,
+    ) -> Result<T, crate::account::remote::LifecycleError> {
+        self.patiently(|| {
+            self.verify_once()?;
+            effect()
+        })
+        .map_err(Into::into)
+    }
+
+    /// Makes `attempt` again while another process holds an account-list
+    /// lock it asked for, for as long as this reservation's patience.
+    pub(crate) fn patiently<T>(
+        &self,
+        attempt: impl FnMut() -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
+        crate::account::registry::patiently(self.patience, attempt)
     }
 
     /// Call outside HostState and before each destructive stage/final commit.
-    pub(crate) fn verify(&self) -> Result<(), String> {
+    pub(crate) fn verify(&self) -> std::io::Result<()> {
+        self.patiently(|| self.verify_once())
+    }
+
+    /// [`Self::verify`], refusing at once if the registry lock is held.
+    fn verify_once(&self) -> std::io::Result<()> {
         if !self
             .map
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .contains_key(&self.token)
         {
-            return Err(
-                "The account mutation reservation was released; reload accounts and retry".into(),
-            );
+            return Err(std::io::Error::other(
+                "The account mutation reservation was released; reload accounts and retry",
+            ));
         }
-        let registry = self.store.try_load().map_err(|error| error.to_string())?;
+        let registry = self.store.try_load()?;
         self.verify_registry(&registry)
+            .map_err(std::io::Error::other)
     }
 
     /// Invoked by Store under the SAME registry lease as its mutation; never
@@ -1139,7 +1181,7 @@ pub(super) fn restore_pass(
                     tracing::info!(
                         provider = provider.executable(),
                         %key,
-                        reason = %failure.message,
+                        reason = %failure.error,
                         "an unlisted account home was left unchanged"
                     );
                     break;
@@ -1149,7 +1191,7 @@ pub(super) fn restore_pass(
                     tracing::debug!(
                         provider = provider.executable(),
                         %key,
-                        reason = %failure.message,
+                        reason = %failure.error,
                         "an unlisted account home could not be checked yet"
                     );
                     break;
@@ -1360,7 +1402,8 @@ pub(super) fn ensure_update(host: &SharedHost, proposed: &Registry) -> Result<()
     let current = Store::installation()
         .ok_or_else(|| refusal("Account registry unavailable"))?
         .try_load()
-        .map_err(|error| refusal(error.to_string()))?;
+        // Under shared control admission: refuse at once rather than wait.
+        .map_err(|error| super::client::lifecycle_refusal(error.into()))?;
     let homes = crate::account::home::Homes::installation();
     let changed = current.changed_account_homes(proposed, homes.as_ref());
     ensure_paths(host, changed)
@@ -1923,6 +1966,113 @@ pub(crate) mod tests {
                 .iter()
                 .any(|pending| pending.key == key)
         );
+    }
+    #[test]
+    fn a_creation_refused_by_a_held_account_list_leaves_nothing_behind() {
+        use crate::account::remote::ListHeld;
+        let (_root, homes, store, _host, reservation) = creating(Provider::Codex);
+        let reservation = reservation.with_patience(std::time::Duration::from_millis(30));
+        let (_, key) = reservation.create.unwrap();
+        let target = homes.path(Provider::Codex, key);
+        let create = || {
+            reservation.create_pending_home(
+                &store,
+                &homes,
+                Provider::Codex,
+                1,
+                None,
+                CodexConfig::Shared,
+            )
+        };
+        for refusal in [ListHeld::Registry, ListHeld::Lifecycle] {
+            let held = match refusal {
+                ListHeld::Registry => store.lock().unwrap(),
+                ListHeld::Lifecycle => homes.lifecycle_lock().unwrap(),
+            };
+            let error = create().unwrap_err();
+            assert_eq!(ListHeld::of(&error), Some(refusal), "{error}");
+            assert_eq!(error.to_string(), refusal.to_string());
+            drop(held);
+            assert!(
+                !target.exists(),
+                "nothing was made while {refusal:?} was held"
+            );
+            assert!(store.load().unwrap().pending().is_empty());
+            assert!(reservation.current().unwrap().homes[0].pin.is_none());
+        }
+        assert_eq!(create().unwrap(), (key, target));
+    }
+    #[test]
+    fn a_creation_waits_out_an_account_list_held_for_a_moment() {
+        let (_root, homes, store, _host, reservation) = creating(Provider::Codex);
+        // Long enough that a slow scheduler cannot outlast it before the
+        // lock is released; only waiting, not its bound, is under test.
+        let reservation = reservation.with_patience(std::time::Duration::from_secs(30));
+        let (_, key) = reservation.create.unwrap();
+        let target = homes.path(Provider::Codex, key);
+        let held = homes.lifecycle_lock().unwrap();
+        std::thread::scope(|scope| {
+            let creation = scope.spawn(|| {
+                reservation.create_pending_home(
+                    &store,
+                    &homes,
+                    Provider::Codex,
+                    1,
+                    None,
+                    CodexConfig::Shared,
+                )
+            });
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(!creation.is_finished(), "creation did not wait");
+            assert!(!target.exists());
+            drop(held);
+            assert_eq!(creation.join().unwrap().unwrap(), (key, target.clone()));
+        });
+        assert!(target.is_dir());
+    }
+    #[test]
+    fn a_reservation_waits_out_and_then_refuses_a_held_account_list_retryably() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::at(root.path().join("registry"));
+        let home = root.path().join("linked");
+        std::fs::create_dir(&home).unwrap();
+        let accounts = [Account::linked(Provider::Codex, uuid::Uuid::new_v4(), home)];
+        let host = host();
+        let held = store.lock().unwrap();
+        let refusal = match Reservation::install_with_store(
+            &host,
+            &accounts,
+            store.clone(),
+            None,
+            None,
+            std::time::Duration::from_millis(30),
+        ) {
+            Err(refusal) => refusal,
+            Ok(_) => panic!("installed while the account list was held"),
+        };
+        assert!(refusal.retryable);
+        assert_eq!(
+            refusal.message,
+            crate::account::remote::ListHeld::Registry.to_string()
+        );
+        assert!(!reservations_active(&host));
+        std::thread::scope(|scope| {
+            let installing = scope.spawn(|| {
+                Reservation::install_with_store(
+                    &host,
+                    &accounts,
+                    store.clone(),
+                    None,
+                    None,
+                    std::time::Duration::from_secs(30),
+                )
+                .map(drop)
+            });
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(!installing.is_finished(), "installation did not wait");
+            drop(held);
+            installing.join().unwrap().unwrap();
+        });
     }
     #[test]
     fn scoped_registry_mutation_refuses_changed_relevant_metadata() {

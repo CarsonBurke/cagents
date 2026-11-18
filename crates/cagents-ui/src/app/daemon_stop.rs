@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    control::{ControlClient, RequestError, StopReport, shutdown_outcome_summary},
+    control::{ControlClient, Refusal, RequestError, StopReport, shutdown_outcome_summary},
     terminal::ipc::{ShutdownCapability, ShutdownOutcome},
 };
 use std::io::Write;
@@ -20,14 +20,22 @@ pub enum StopMessage {
 /// Confirm is offered.
 const CONSEQUENCE: &str = "Confirming stops these hosted terminal/chat sessions and all their background subagents. Background work will not resume automatically. Cancel makes no shutdown request.";
 
-/// What the dialog says when a busy daemon refused to count again; the
-/// earlier result and its Refresh stay as they were.
-const REFRESH_REFUSED_BUSY: &str = "The cagents daemon was busy finishing another operation, so the count was not refreshed. Try again in a moment.";
+/// What the dialog says when the daemon refused to count again; the earlier
+/// result and its Refresh stay as they were.
+fn refresh_refused(refusal: Refusal) -> String {
+    format!(
+        "{}, so the count was not refreshed. Try again in a moment.",
+        refusal.cause()
+    )
+}
 
-/// What the dialog says after a busy refusal: nothing was stopped, the count
+/// What the dialog says after a refused stop: nothing was stopped, the count
 /// and its capability still stand, and Confirm still does what it did.
-fn busy_detail() -> String {
-    format!("{}\n\n{CONSEQUENCE}", crate::control::STOP_REFUSED_BUSY)
+fn refused_detail(refusal: Refusal) -> String {
+    format!(
+        "{}, so nothing was stopped. Try again in a moment.\n\n{CONSEQUENCE}",
+        refusal.cause()
+    )
 }
 
 pub struct DaemonStop {
@@ -119,14 +127,14 @@ impl Application for DaemonStop {
             StopMessage::Finished(result) if self.pending => {
                 self.pending = false;
                 let report = match result {
-                    Err(RequestError::Busy) => {
+                    Err(RequestError::Refused(refusal)) => {
                         // Refused before anything was stopped: the reviewed
                         // count and its capability still stand, so Confirm
                         // stays available. A capability that expires
                         // meanwhile is answered as Expired.
                         // Focus stays on the safe choice, as when the
                         // dialog opened; Confirm is one press away.
-                        self.detail = busy_detail();
+                        self.detail = refused_detail(refusal);
                         return iced::widget::operation::focus(widget::Id::new(
                             "daemon-stop.cancel",
                         ))
@@ -163,11 +171,11 @@ impl Application for DaemonStop {
                     }
                     // The refresh issued nothing, so the dialog stays as it
                     // was, Refresh and the earlier result's text included;
-                    // the busy sentence follows that text once.
-                    Err(RequestError::Busy) => {
-                        let busy = format!("\n\n{REFRESH_REFUSED_BUSY}");
-                        let earlier = before.strip_suffix(&busy).unwrap_or(&before);
-                        self.detail = format!("{earlier}{busy}");
+                    // the refusal follows that text once.
+                    Err(RequestError::Refused(refusal)) => {
+                        let refused = format!("\n\n{}", refresh_refused(refusal));
+                        let earlier = before.strip_suffix(&refused).unwrap_or(&before);
+                        self.detail = format!("{earlier}{refused}");
                     }
                     Err(RequestError::Failed(error)) => {
                         self.settled = true;
@@ -389,13 +397,17 @@ mod tests {
         let mut app = confirmation(3);
         let capability = app.capability.clone();
         let _unpolled = app.update(StopMessage::Confirm);
-        let _ = app.update(StopMessage::Finished(Err(RequestError::Busy)));
+        let _ = app.update(StopMessage::Finished(Err(RequestError::Refused(
+            Refusal::Busy,
+        ))));
         assert!(!app.pending);
         assert!(!app.settled, "Confirm is still available");
         assert!(!app.failed.load(Ordering::Acquire));
         assert_eq!(app.report, None, "closing now reports a cancellation");
         assert_eq!(app.capability, capability);
-        assert_eq!(app.detail, busy_detail());
+        assert_eq!(app.detail, refused_detail(Refusal::Busy));
+        // The tray says the same of the same refusal.
+        assert!(app.detail.starts_with(crate::control::STOP_REFUSED_BUSY));
         let _unpolled = app.update(StopMessage::Confirm);
         assert!(app.pending, "the same stop is asked again");
 
@@ -406,10 +418,14 @@ mod tests {
         let _ = app.update(StopMessage::Finished(Ok(ShutdownOutcome::Expired)));
         let report = app.report.clone();
         let failure = app.detail.clone();
-        let refused = format!("{failure}\n\n{REFRESH_REFUSED_BUSY}");
+        let refused = format!(
+            "{failure}\n\nThe cagents daemon was busy finishing another operation, so the count was not refreshed. Try again in a moment."
+        );
         for _ in 0..2 {
             let _unpolled = app.update(StopMessage::Refresh);
-            let _ = app.update(StopMessage::Refreshed(Err(RequestError::Busy)));
+            let _ = app.update(StopMessage::Refreshed(Err(RequestError::Refused(
+                Refusal::Busy,
+            ))));
             assert!(!app.pending && app.settled);
             assert_eq!(app.report, report);
             assert_eq!(app.capability, capability);

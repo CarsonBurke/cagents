@@ -1156,11 +1156,16 @@ fn terminal_io_request(request: &ClientRequest) -> bool {
     )
 }
 
-/// A busy refusal stays the gate's own retryable one, so a client tells the
-/// person to wait and retry rather than reporting a failed operation.
-fn lifecycle_refusal(error: crate::account::remote::LifecycleError) -> ProtocolError {
+/// An account operation's failure as the daemon's reply. Both refusals left
+/// everything as it was and say so with `retryable`, so a client tells the
+/// person to wait and retry rather than reporting a failed operation. Only a
+/// busy control gate is the daemon's own busy sentence.
+pub(super) fn lifecycle_refusal(error: crate::account::remote::LifecycleError) -> ProtocolError {
     match error {
         crate::account::remote::LifecycleError::Busy => control_gate::busy(),
+        crate::account::remote::LifecycleError::ListHeld(held) => {
+            ProtocolError::new(ProtocolErrorCode::InvalidRequest, held.to_string(), true)
+        }
         crate::account::remote::LifecycleError::Failed(message) => {
             ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
         }
@@ -1500,9 +1505,24 @@ fn process_admitted_request(
                 }
                 _ => {}
             }
-            let reply = crate::device_service::execute(operation).map_err(|message| {
-                ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
-            })?;
+            let reply = match operation {
+                crate::device_service::Operation::AccountDefault {
+                    expected_revision,
+                    provider,
+                    selection,
+                } => {
+                    crate::device_service::account_default(expected_revision, provider, &selection)
+                        .map_err(lifecycle_refusal)?
+                }
+                crate::device_service::Operation::AccountsUpdate {
+                    expected_revision,
+                    registry,
+                } => crate::device_service::update_accounts(expected_revision, registry)
+                    .map_err(lifecycle_refusal)?,
+                operation => crate::device_service::execute(operation).map_err(|message| {
+                    ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
+                })?,
+            };
             Ok((ServerResponse::DeviceOperation { reply }, Vec::new(), false))
         }
         ClientRequest::Authenticate { authority } => {
