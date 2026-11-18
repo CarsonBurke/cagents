@@ -14298,13 +14298,25 @@ impl Cagents {
     /// includes the window settings and session state written in `Drop`.
     /// Unsaved editor buffers and retained file operations are left exactly
     /// as the signal's default action would have left them.
+    ///
+    /// The window settings are saved here as well as in `Drop`: the sender
+    /// may end the process before the exit reaches `Drop`, which waits for
+    /// the window's close report and the language-server reap.
     fn exit_on_request(&mut self, request: crate::termination::Request) -> Task<Message> {
         if self.exit.is_some() {
             return Task::none();
         }
         tracing::info!(?request, "closing the window on request");
         self.transient_work_close = None;
-        self.commit_exit()
+        let exit = self.commit_exit();
+        self.fold_settings_drafts();
+        if let Err(error) = self.save_settings_now() {
+            crate::diagnostics::record(crate::diagnostics::Event::SettingsFailed {
+                category: crate::diagnostics::Failure::Unknown,
+            });
+            tracing::error!(%error, "failed to persist settings before closing on request");
+        }
+        exit
     }
 
     /// Commits to the exit described on [`Self::exit_after_language_servers`]
@@ -22199,6 +22211,35 @@ mod tests {
             crate::termination::Request::Hangup,
         ));
         assert_eq!(app.exit, closing);
+    }
+
+    /// The sender may end the process before the exit reaches `Drop`, so the
+    /// window's settings are already saved when the request is handled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_termination_request_saves_the_window_settings_at_once() {
+        let mut app = context_inspector_test_app(true);
+        let window = window::Id::unique();
+        app.core.set_main_window_id(Some(window));
+        let directory = tempfile::tempdir().unwrap();
+        let (session, _) = crate::session::SessionRuntime::open(
+            &directory.path().join("window.sqlite3"),
+            crate::model::BootId::new("termination-test"),
+        )
+        .unwrap();
+        let store = session.operation_store();
+        app.session = Some(session);
+        app.settings_path = Some(directory.path().join("settings.toml"));
+        app.settings_write_blocked = false;
+        app.chrome_ui.projects_collapsed = true;
+
+        let _ = app.update(Message::TerminationRequested(
+            crate::termination::Request::Terminate,
+        ));
+
+        let view: WindowView =
+            serde_json::from_str(&store.load_window_view().unwrap().unwrap()).unwrap();
+        assert!(view.projects_sidebar_collapsed);
+        assert!(app.exit.is_some());
     }
 
     /// File operations still in flight hold the close button, but not a
