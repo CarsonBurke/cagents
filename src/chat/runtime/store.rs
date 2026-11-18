@@ -2666,10 +2666,12 @@ mod tests {
             if !page.has_later {
                 break;
             }
+            let kept = page.items[page.items.len() / 2..].to_vec();
             let boundary = page.items.last().unwrap().id.clone();
             store.later().unwrap();
             page = store.window().unwrap();
-            assert_eq!(page.items.first().unwrap().id, boundary);
+            assert!(page.items.starts_with(&kept));
+            assert_ne!(page.items.last().unwrap().id, boundary);
         }
         assert_eq!(bytes, text.len());
     }
