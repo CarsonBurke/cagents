@@ -293,11 +293,17 @@ impl Cagents {
         old_path: Option<RepoPath>,
         basis: DiffBasis,
     ) -> Task<Message> {
-        self.open_diff_card(key, move |card| RepositoryAction::OpenCommittedFile {
-            card,
-            path,
-            old_path,
-            basis,
+        // A pane derives a committed comparison's rename source only from a
+        // committed selection, so a rename cannot be shown beside an open
+        // buffer.
+        let in_place = old_path.is_none();
+        self.open_diff_card(key, path.clone(), basis.clone(), in_place, move |card| {
+            RepositoryAction::OpenCommittedFile {
+                card,
+                path,
+                old_path,
+                basis,
+            }
         })
     }
 
@@ -341,29 +347,49 @@ impl Cagents {
         } else {
             DiffBasis::IndexToWorktree
         };
-        self.open_diff_card(key, move |card| RepositoryAction::OpenWorkingDiff {
-            card,
-            file,
-            basis,
+        self.open_diff_card(key, path, basis.clone(), true, move |card| {
+            RepositoryAction::OpenWorkingDiff { card, file, basis }
         })
     }
 
+    /// Opens a comparison of `path` in a repository browser that can take it.
+    ///
+    /// A browser holding unsaved work on `path` itself is focused instead of
+    /// opening a second, stale copy of that file. It switches to `basis` in
+    /// place when it can (`in_place` says whether its own comparison would be
+    /// faithful), as its toolbar would, comparing the live buffer. Otherwise
+    /// the notice says why the comparison did not open.
     fn open_diff_card(
         &mut self,
         key: ActiveWorktreeKey,
+        path: RepoPath,
+        basis: DiffBasis,
+        in_place: bool,
         open: impl FnOnce(CardId) -> RepositoryAction,
     ) -> Task<Message> {
         // A historical path may be deleted, renamed, or never exist in the
         // working file list. Do not park behind or emit OpenFile/RefreshFiles.
         self.pending_panel_open = None;
+        if let Some(card) = self.repository_editing(&key.canonical_path, path.as_path()) {
+            let focus = self.focus_pane(card);
+            if in_place
+                && matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime))
+                    if runtime.can_show_diff_basis(&basis))
+            {
+                let show = Message::Repository(RepositoryAction::ApplyDiffBasis { card, basis });
+                return Task::batch([focus, cosmic::task::message(show)]);
+            }
+            let name = path.as_path().file_name().map_or_else(
+                || path.to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            );
+            self.status = Some(TransientNotice::warning(format!(
+                "Save or discard your changes to {name} to open this comparison"
+            )));
+            return focus;
+        }
         let (card, prepare) = match self.repository_panel_destination(&key.canonical_path) {
-            Some(card) => (
-                card,
-                self.workspace
-                    .focus(card)
-                    .map(|update| self.apply_viewport(update, true, DurableChange::None))
-                    .unwrap_or_else(|_| Task::none()),
-            ),
+            Some(card) => (card, self.focus_pane(card)),
             None => self.add_repository_card(
                 key.project_id,
                 key.canonical_path.clone(),

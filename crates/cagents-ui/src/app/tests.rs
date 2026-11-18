@@ -7577,23 +7577,22 @@ mod repository_clone_navigation {
         assert!(runtime(app, card).blocks_navigation());
     }
 
-    /// Source Control and Files rows must reach a browser that can navigate.
-    /// The first browser on the worktree refusing navigation used to take
-    /// the click, focus itself and drop the request.
-    #[tokio::test]
-    async fn sidebar_rows_skip_browsers_that_refuse_navigation() {
-        let fixture = Fixture::new().await;
+    /// Two browsers on the fixture: the first editing current.txt without
+    /// saving and focused, the second clean. other.txt is modified and
+    /// new.txt untracked on disk, and Source Control shows both.
+    async fn dirty_first_browser(
+        fixture: &Fixture,
+    ) -> (Cagents, CardId, CardId, ActiveWorktreeKey) {
         let (mut app, first) = fixture.app(true, false).await;
         let task = app.clone_focused_pane();
         let second = app.workspace.focused().unwrap();
         settle(&mut app, task).await;
         assert_ne!(second, first);
-        // The user is editing current.txt in the first browser, which stays
-        // focused, and other.txt has changed on disk.
         edit(&mut app, first);
         assert_eq!(app.workspace.focused(), Some(first));
         std::fs::write(fixture.root.join("other.txt"), "changed on disk\n").unwrap();
-        let key = bind_sidebar(&mut app, &fixture, first);
+        std::fs::write(fixture.root.join("new.txt"), "untracked\n").unwrap();
+        let key = bind_sidebar(&mut app, fixture, first);
         let snapshot = RepositoryService::system("git")
             .snapshot_with_options(
                 &fixture.root,
@@ -7602,64 +7601,195 @@ mod repository_clone_navigation {
             )
             .unwrap();
         app.sidebar_model.source_control = Some(SourceControlModel::ready(key.clone(), &snapshot));
-        let other = RepoPath::parse("other.txt").unwrap();
-        let open_change = |app: &mut Cagents| {
-            app.update(Message::Sidebar(SidebarAction::OpenChange {
-                key: key.clone(),
-                path: other.clone(),
-                area: ChangeArea::Unstaged,
-            }))
-        };
+        (app, first, second, key)
+    }
 
-        let task = open_change(&mut app);
+    fn open_change(
+        app: &mut Cagents,
+        key: &ActiveWorktreeKey,
+        path: &str,
+        area: ChangeArea,
+    ) -> Task<Message> {
+        app.update(Message::Sidebar(SidebarAction::OpenChange {
+            key: key.clone(),
+            path: RepoPath::parse(path).unwrap(),
+            area,
+        }))
+    }
+
+    fn open_file(app: &mut Cagents, key: &ActiveWorktreeKey, path: &str) -> Task<Message> {
+        app.update(Message::Sidebar(SidebarAction::OpenFile {
+            key: key.clone(),
+            path: RepoPath::parse(path).unwrap(),
+        }))
+    }
+
+    async fn edit_in_editor(app: &mut Cagents, card: CardId) {
+        let task = app.update(Message::Repository(RepositoryAction::ApplySourceSurface {
+            card,
+            diff: false,
+        }));
+        settle(app, task).await;
+        edit(app, card);
+    }
+
+    fn assert_shows(app: &Cagents, card: CardId, path: &str, basis: &DiffBasis) {
+        let runtime = runtime(app, card);
+        assert_eq!(runtime.selected_path(), Some(Path::new(path)));
+        assert!(runtime.shows_diff(), "{path} is shown as a diff");
+        assert_eq!(runtime.selected_diff_basis(), basis);
+    }
+
+    /// Source Control rows must reach a browser that can navigate. The first
+    /// browser on the worktree refusing navigation used to take the click,
+    /// focus itself and drop the request.
+    #[tokio::test]
+    async fn source_control_changes_skip_browsers_that_refuse_navigation() {
+        let fixture = Fixture::new().await;
+        let (mut app, first, second, key) = dirty_first_browser(&fixture).await;
+
+        let task = open_change(&mut app, &key, "other.txt", ChangeArea::Unstaged);
         settle(&mut app, task).await;
         assert_eq!(app.workspace.focused(), Some(second));
-        assert_eq!(
-            runtime(&app, second).selected_path(),
-            Some(Path::new("other.txt"))
-        );
+        assert_shows(&app, second, "other.txt", &DiffBasis::IndexToWorktree);
         assert_eq!(
             runtime(&app, first).selected_path(),
             Some(Path::new("current.txt"))
         );
         assert!(runtime(&app, first).is_dirty());
 
-        // With every browser refusing navigation, the change opens in a new
-        // browser rather than nowhere.
-        let task = app.update(Message::Repository(RepositoryAction::ApplySourceSurface {
-            card: second,
-            diff: false,
-        }));
-        settle(&mut app, task).await;
-        edit(&mut app, second);
+        // A change to the file a browser is editing shows that browser's
+        // live comparison rather than a second, stale copy of the file.
+        edit_in_editor(&mut app, second).await;
         drop(app.update(Message::FocusCard(first)));
-        let task = open_change(&mut app);
+        let task = open_change(&mut app, &key, "other.txt", ChangeArea::Unstaged);
+        settle(&mut app, task).await;
+        assert_eq!(app.workspace.focused(), Some(second));
+        assert_shows(&app, second, "other.txt", &DiffBasis::IndexToWorktree);
+        assert!(runtime(&app, second).is_dirty());
+        assert_eq!(app.repository_browsers(&fixture.root).count(), 2);
+
+        // With every browser refusing navigation, another change opens in a
+        // new browser rather than nowhere.
+        let task = open_change(&mut app, &key, "new.txt", ChangeArea::Untracked);
         let third = app.workspace.focused().unwrap();
         settle(&mut app, task).await;
-        assert!(![first, second].contains(&third));
+        assert_eq!(
+            app.repository_browsers(&fixture.root).collect::<Vec<_>>(),
+            [first, second, third]
+        );
+        assert_shows(&app, third, "new.txt", &DiffBasis::IndexToWorktree);
+        for card in [first, second] {
+            assert!(runtime(&app, card).is_dirty());
+        }
+    }
+
+    /// Files rows take the same route, parked until the chosen browser's
+    /// file list lands.
+    #[tokio::test]
+    async fn files_rows_skip_browsers_that_refuse_navigation() {
+        let fixture = Fixture::new().await;
+        let (mut app, first, second, key) = dirty_first_browser(&fixture).await;
+
+        let task = open_file(&mut app, &key, "other.txt");
+        settle(&mut app, task).await;
+        assert_eq!(app.workspace.focused(), Some(second));
+        assert_eq!(
+            runtime(&app, second).selected_path(),
+            Some(Path::new("other.txt"))
+        );
+        assert!(runtime(&app, first).is_dirty());
+
+        // A row for the file a browser is editing focuses those edits.
+        let task = open_file(&mut app, &key, "current.txt");
+        settle(&mut app, task).await;
+        assert_eq!(app.workspace.focused(), Some(first));
+        assert!(app.pending_panel_open.is_none());
+        assert_eq!(app.repository_browsers(&fixture.root).count(), 2);
+
+        // With every browser refusing navigation, the row opens a new one.
+        edit_in_editor(&mut app, second).await;
+        let task = open_file(&mut app, &key, "new.txt");
+        let third = app.workspace.focused().unwrap();
+        settle(&mut app, task).await;
         assert_eq!(
             app.repository_browsers(&fixture.root).collect::<Vec<_>>(),
             [first, second, third]
         );
         assert_eq!(
             runtime(&app, third).selected_path(),
-            Some(Path::new("other.txt"))
+            Some(Path::new("new.txt"))
         );
         for card in [first, second] {
             assert!(runtime(&app, card).is_dirty());
         }
+    }
 
-        // A Files row for a file whose unsaved edits hold a browser focuses
-        // those edits instead of opening a copy without them.
-        let task = app.update(Message::Sidebar(SidebarAction::OpenFile {
-            key: key.clone(),
-            path: RepoPath::parse("current.txt").unwrap(),
-        }));
+    /// History and branch rows open committed comparisons through the same
+    /// route.
+    #[tokio::test]
+    async fn committed_files_skip_browsers_that_refuse_navigation() {
+        let fixture = Fixture::new().await;
+        let (mut app, first, second, key) = dirty_first_browser(&fixture).await;
+        let head = std::process::Command::new("/usr/bin/git")
+            .current_dir(&fixture.root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let head =
+            crate::repository::Oid::parse_object(String::from_utf8(head.stdout).unwrap().trim())
+                .unwrap();
+        let basis = DiffBasis::CommitToParent {
+            oid: head,
+            parent: None,
+        };
+
+        let task = app.open_committed_file(
+            key.clone(),
+            RepoPath::parse("other.txt").unwrap(),
+            None,
+            basis.clone(),
+        );
+        settle(&mut app, task).await;
+        assert_eq!(app.workspace.focused(), Some(second));
+        assert_shows(&app, second, "other.txt", &basis);
+        assert!(runtime(&app, first).is_dirty());
+
+        // The edited file's own commit shows in its browser, beside the
+        // buffer.
+        drop(app.update(Message::FocusCard(second)));
+        let task = app.open_committed_file(
+            key.clone(),
+            RepoPath::parse("current.txt").unwrap(),
+            None,
+            basis.clone(),
+        );
         settle(&mut app, task).await;
         assert_eq!(app.workspace.focused(), Some(first));
-        assert!(app.pending_panel_open.is_none());
-        assert_eq!(app.repository_browsers(&fixture.root).count(), 3);
+        assert_shows(&app, first, "current.txt", &basis);
         assert!(runtime(&app, first).is_dirty());
+
+        // A rename cannot be compared beside the buffer. The browser keeps
+        // its edits, and the notice says what to do.
+        let task = app.update(Message::Repository(RepositoryAction::ApplySourceSurface {
+            card: first,
+            diff: false,
+        }));
+        settle(&mut app, task).await;
+        drop(app.update(Message::FocusCard(second)));
+        app.status = None;
+        let task = app.open_committed_file(
+            key.clone(),
+            RepoPath::parse("current.txt").unwrap(),
+            Some(RepoPath::parse("previous.txt").unwrap()),
+            basis,
+        );
+        settle(&mut app, task).await;
+        assert_eq!(app.workspace.focused(), Some(first));
+        assert!(!runtime(&app, first).shows_diff());
+        assert!(runtime(&app, first).is_dirty());
+        assert!(app.status.is_some());
+        assert_eq!(app.repository_browsers(&fixture.root).count(), 2);
     }
 
     #[tokio::test]

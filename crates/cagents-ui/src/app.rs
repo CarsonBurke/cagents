@@ -12832,22 +12832,29 @@ impl Cagents {
     /// in pane order. A browser shows the whole worktree rather than one
     /// fixed file.
     fn repository_browsers<'a>(&'a self, worktree: &'a Path) -> impl Iterator<Item = CardId> + 'a {
-        let channel = self.durable.active_channel;
-        self.durable
-            .cards
-            .iter()
-            .filter(move |card| {
-                card.existence.is_open()
-                    && self
-                        .durable
-                        .channels
-                        .iter()
-                        .find(|channel| channel.cards.contains(&card.id))
-                        .map(|channel| channel.id)
-                        == channel
-                    && matches!(&card.kind, CardKind::Repository(view) if view.selected_file.is_none() && view.worktree == worktree)
+        self.active_repository_panes()
+            .filter_map(move |(card, view)| {
+                (view.selected_file.is_none() && view.worktree == worktree).then_some(card)
             })
-            .map(|card| card.id)
+    }
+
+    /// The open repository panes of the active channel, in pane order.
+    fn active_repository_panes(&self) -> impl Iterator<Item = (CardId, &RepositoryView)> {
+        let channel = self.durable.active_channel;
+        self.durable.cards.iter().filter_map(move |card| {
+            let CardKind::Repository(view) = &card.kind else {
+                return None;
+            };
+            (card.existence.is_open()
+                && self
+                    .durable
+                    .channels
+                    .iter()
+                    .find(|channel| channel.cards.contains(&card.id))
+                    .map(|channel| channel.id)
+                    == channel)
+                .then_some((card.id, view))
+        })
     }
 
     /// The repository browser that sidebar navigation into this worktree
@@ -12885,6 +12892,37 @@ impl Cagents {
             })
     }
 
+    /// The repository pane whose unsaved work on `worktree`'s `path` keeps
+    /// it from navigating, preferring the focused one. A file pane counts as
+    /// well as a browser: either holds edits a second copy would lack.
+    fn repository_editing(&self, worktree: &Path, path: &Path) -> Option<CardId> {
+        let target = worktree.join(path);
+        let editing = |card: CardId| {
+            matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime))
+                if runtime.blocks_navigation()
+                    && runtime
+                        .selected_path()
+                        .is_some_and(|selected| runtime.descriptor.worktree.join(selected) == target))
+        };
+        let mut panes = self.active_repository_panes().map(|(card, _)| card);
+        self.workspace
+            .focused()
+            .filter(|focused| {
+                editing(*focused)
+                    && self
+                        .active_repository_panes()
+                        .any(|(card, _)| card == *focused)
+            })
+            .or_else(|| panes.find(|card| editing(*card)))
+    }
+
+    fn focus_pane(&mut self, card: CardId) -> Task<Message> {
+        self.workspace
+            .focus(card)
+            .map(|update| self.apply_viewport(update, true, DurableChange::None))
+            .unwrap_or_else(|_| Task::none())
+    }
+
     /// Routes one panel row to the worktree's repository card.
     ///
     /// A browser already editing that file is focused as it is. Otherwise the
@@ -12908,21 +12946,14 @@ impl Cagents {
                     .iter()
                     .any(|row| row.path == *path && row.ignored)
             });
-        let path = path.as_path().to_path_buf();
         // A browser that refuses navigation because of this very file's
         // unsaved edits already shows what was asked for. Focus it rather than
         // opening a second copy that would lack those edits.
-        if let Some(card) = self.repository_browser_where(&key.canonical_path, |card| {
-            matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime))
-                if runtime.blocks_navigation() && runtime.selected_path() == Some(path.as_path()))
-        }) {
+        if let Some(card) = self.repository_editing(&key.canonical_path, path.as_path()) {
             self.pending_panel_open = None;
-            return self
-                .workspace
-                .focus(card)
-                .map(|update| self.apply_viewport(update, true, DurableChange::None))
-                .unwrap_or_else(|_| Task::none());
+            return self.focus_pane(card);
         }
+        let path = path.as_path().to_path_buf();
         match self.repository_panel_destination(&key.canonical_path) {
             Some(card) => {
                 self.pending_panel_open = Some(PendingPanelOpen {
@@ -12930,11 +12961,7 @@ impl Cagents {
                     path,
                     ignored,
                 });
-                let focus = self
-                    .workspace
-                    .focus(card)
-                    .map(|update| self.apply_viewport(update, true, DurableChange::None))
-                    .unwrap_or_else(|_| Task::none());
+                let focus = self.focus_pane(card);
                 Task::batch([
                     focus,
                     cosmic::task::message(Message::Repository(RepositoryAction::RefreshFiles {

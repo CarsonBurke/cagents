@@ -5552,6 +5552,12 @@ impl RepositoryRuntime {
             }
     }
 
+    /// Whether the open file can switch to `basis` in place, as the toolbar's
+    /// comparison control does, without leaving its buffer.
+    pub fn can_show_diff_basis(&self, basis: &DiffBasis) -> bool {
+        self.can_select_diff_basis(basis)
+    }
+
     fn can_select_diff_basis(&self, basis: &DiffBasis) -> bool {
         !self.is_saving()
             && !self.directory_only
