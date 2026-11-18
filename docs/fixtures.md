@@ -19,6 +19,7 @@ person.
 | A long saved chat for paging backward and forward | [`tests/fixtures/claude-long-history.py`](../tests/fixtures/claude-long-history.py)` PROJECT`, run through `scripts/native-evidence env python3 ...`; 260 numbered exchanges exceed the retained history window |
 | A Codex chat that answers offline, with tool rows, subagent errors or terminal escapes | A [Codex peer](#an-offline-codex), installed by `native-evidence start SIDE --codex PEER` |
 | Real Codex app-server ownership, saved-history loading or socket behaviour | [An isolated real executable](#a-real-codex-in-the-fixture), selected by `native-evidence start SIDE --codex-executable /absolute/path/to/codex` |
+| A daemon still restoring after an update, or holding its restore for recovery | [The startup recovery marker](#an-update-restore-in-progress-or-held), `home/.cagents-fixture-startup-recovery` |
 | Test a script's contract without a compositor or Cargo | The stubbed Python suites in `tests/*.py`, such as `tests/native_evidence.py` |
 
 From a terminal or chat that cagents hosts, your shell carries
@@ -993,6 +994,31 @@ Every refusal names its cause and the next command. The common ones:
 If a fixture fails in a way that doesn't point to the fix, that is a fixture
 bug: make the message say what is wrong and what to do, and add a test for it
 beside the others in the fixture's contract suite.
+
+## An update restore in progress or held
+
+After an update, the new daemon restores the conversations the old one ran.
+While it restores, and if a restore fails and is held for recovery, it
+admits only some requests, and windows and panes have to say why. To show
+those states without a failed installed update, create
+`.cagents-fixture-startup-recovery` in the fixture `HOME`:
+
+```sh
+scripts/native-evidence env sh -c 'echo restoring >"$CAGENTS_EVIDENCE_FIXTURE/home/.cagents-fixture-startup-recovery"'
+scripts/native-evidence env sh -c 'echo "retained: Codex server did not open its local socket within 15 seconds" >"$CAGENTS_EVIDENCE_FIXTURE/home/.cagents-fixture-startup-recovery"'
+```
+
+`restoring` reports a restore still in progress. `retained: REASON` reports a
+restore held for recovery with that reason, and `retained` alone reports a
+Codex listener that never opened its socket. While the file exists, a debug
+daemon whose `HOME` is inside a native-evidence task answers `StartupState`
+that way and gates requests as it does for a real startup recovery. The file
+is read on each request, so it can also be written or removed while the
+session runs. Remove it to end the hold; the daemon then reports ready, as one
+that finished restoring does. No owner is actually retained, so this shows
+what clients are told and admitted, not how a real restore adopts its owners.
+Release builds and any other home ignore it. Save a seed with open chats
+first, so panes have saved conversations to wait for.
 
 ## A read-only native update review
 
