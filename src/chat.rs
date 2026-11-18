@@ -411,6 +411,12 @@ impl Recovery {
 /// [`Recovery::AfterRestart`]. The protocol has no code of its own for it.
 pub const UNPROVEN_OWNER_REFUSAL: &str = "This conversation's earlier Claude process ended without recording its close, and cagents cannot prove that nothing else still holds the conversation, so nothing was started in its place. It can be reopened after you restart this computer.";
 
+/// How the daemon's refusal under startup recovery's hold on original
+/// ownership begins. The protocol has no code of its own for it, so a client
+/// recognises a non-retryable `TerminalUnavailable` that starts with this
+/// sentence, and can confirm the hold by asking for the startup state.
+pub const STARTUP_RECOVERY_REFUSAL: &str = "Startup recovery retained original ownership";
+
 impl StartFailure {
     pub fn retry(message: impl Into<String>) -> Self {
         Self {

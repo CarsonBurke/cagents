@@ -579,48 +579,13 @@ fn disconnect_client(host: &SharedHost, client_id: ClientId) {
 
 type RequestOutcome<R = ServerResponse> = (R, Vec<ServerMessage>, bool);
 
-/// Recovery is deliberately a subset of existing authority-checked operations.
-/// No visibility operation retries adoption, and no new command may race a
-/// retained original whose commit outcome is unknown.
+/// Startup recovery's hold admits only what touches none of its originals;
+/// see [`super::recovery_admission`].
 fn ensure_startup_recovery_request(
     host: &SharedHost,
     request: &ClientRequest,
 ) -> Result<(), ProtocolError> {
-    let state = host.lock().unwrap_or_else(|p| p.into_inner());
-    let Some(detail) = state.startup_recovery() else {
-        return Ok(());
-    };
-    let inspection = matches!(
-        request,
-        ClientRequest::StartupState
-            | ClientRequest::List
-            | ClientRequest::ChatList
-            | ClientRequest::Attach { .. }
-            | ClientRequest::Detach { .. }
-            | ClientRequest::Snapshot { .. }
-            | ClientRequest::TerminalAcknowledge { .. }
-            | ClientRequest::AcknowledgeRedraw { .. }
-            | ClientRequest::WatchTerminals
-            | ClientRequest::Authenticate { .. }
-            | ClientRequest::CloseTerminalChecked { .. }
-            | ClientRequest::CloseTerminalSource { .. }
-            | ClientRequest::ChatCloseRetained { .. }
-            | ClientRequest::ChatLostProcesses { .. }
-    );
-    let shutdown = matches!(
-        request,
-        ClientRequest::Shutdown | ClientRequest::ShutdownV1 { .. }
-    ) && !state.recovery_owns_work();
-    if inspection || shutdown {
-        return Ok(());
-    }
-    Err(ProtocolError::new(
-        ProtocolErrorCode::TerminalUnavailable,
-        format!(
-            "Startup recovery retained original ownership; inspect available sessions or explicitly Close the original actor: {detail}"
-        ),
-        false,
-    ))
+    super::recovery_admission::admit(host, request)
 }
 
 fn ensure_terminal_close_open(host: &SharedHost) -> Result<(), ProtocolError> {

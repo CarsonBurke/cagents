@@ -298,6 +298,9 @@ pub(crate) struct HostState {
     /// well as its Store handle. This is live custody, not a durable retry or
     /// permission to replay any recipe.
     retained_startup_checkpoint: Option<crate::upgrade::handoff::Checkpoint>,
+    /// What this daemon started while startup recovery held original
+    /// ownership, which that hold therefore does not cover.
+    pub(super) recovery_independence: super::recovery_admission::Independence,
     #[cfg(test)]
     pub(super) test_fail_startup_commit: Option<TerminalId>,
     #[cfg(test)]
@@ -488,6 +491,7 @@ impl HostState {
             paused_update_terminals: BTreeSet::new(),
             startup_recovery: None,
             retained_startup_checkpoint: None,
+            recovery_independence: Default::default(),
             #[cfg(test)]
             test_fail_startup_commit: None,
             #[cfg(test)]
@@ -2168,6 +2172,18 @@ impl HostState {
         })
     }
 
+    pub(super) fn startup_custody_contains(&self, id: TerminalId) -> bool {
+        self.startup_custody.contains(&id)
+    }
+
+    /// The update checkpoint this daemon's restore accepted, which names every
+    /// original its recovery may still hold.
+    pub(super) fn retained_startup_checkpoint(
+        &self,
+    ) -> Option<&crate::upgrade::handoff::Checkpoint> {
+        self.retained_startup_checkpoint.as_ref()
+    }
+
     pub(in crate::host) fn pause_update_terminals(&mut self, ids: &[TerminalId]) {
         self.paused_update_terminals.extend(ids.iter().copied());
     }
@@ -2184,6 +2200,14 @@ impl HostState {
                 awaiting: self.startup_custody.len() as u64,
             },
         }
+    }
+
+    #[cfg(test)]
+    pub(in crate::host) fn retain_startup_checkpoint_for_test(
+        &mut self,
+        checkpoint: crate::upgrade::handoff::Checkpoint,
+    ) {
+        self.retained_startup_checkpoint = Some(checkpoint);
     }
 
     #[cfg(test)]
