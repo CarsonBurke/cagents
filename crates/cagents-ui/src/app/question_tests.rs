@@ -880,9 +880,8 @@ fn an_existing_checkout_offer_takes_the_keyboard_only_where_it_is_seen() {
         let chat = chat_ui::tests::working_chat(app, "elsewhere");
         drop(app.workspace.focus(chat));
     });
-    assert_eq!(
-        tests::focused(&elsewhere.app, elsewhere.opening),
-        None,
+    assert!(
+        takes_nothing(elsewhere.opening),
         "another pane in front keeps the keyboard"
     );
     let behind_popover = existing_checkout_offered(|app, card| {
@@ -894,9 +893,8 @@ fn an_existing_checkout_offer_takes_the_keyboard_only_where_it_is_seen() {
             .review_action(crate::pull_request_review::discussion_ui::Action::ToggleReview);
         drop(app.update(Message::PullRequestReview { card, action }));
     });
-    assert_eq!(
-        tests::focused(&behind_popover.app, behind_popover.opening),
-        None,
+    assert!(
+        takes_nothing(behind_popover.opening),
         "the review popover in front keeps the keyboard"
     );
     let Opened {
@@ -911,11 +909,7 @@ fn an_existing_checkout_offer_takes_the_keyboard_only_where_it_is_seen() {
         };
         pane.file_panel_collapsed = Some(true);
     });
-    assert_eq!(
-        tests::focused(&app, opening),
-        None,
-        "a hidden offer takes nothing"
-    );
+    assert!(takes_nothing(opening), "a hidden offer takes nothing");
     let task = app.update(escape());
     deliver(&mut app, task);
     let card = app.workspace.focused().expect("the pull request pane");
@@ -935,6 +929,101 @@ fn an_existing_checkout_offer_takes_the_keyboard_only_where_it_is_seen() {
         ),
         Some(dismiss),
         "where it is still answerable"
+    );
+}
+
+/// Whether `task` leaves every widget alone, whatever else it does. A focus
+/// operation whose target isn't drawn blurs every control instead, so a
+/// probe of who holds the keyboard afterwards can't tell taking nothing from
+/// taking it away.
+fn takes_nothing(task: Task<Message>) -> bool {
+    let Some(mut stream) = iced::runtime::task::into_stream(task) else {
+        return true;
+    };
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    let mut operated = false;
+    while let Some(action) = executor.block_on(stream.next()) {
+        operated |= matches!(action, iced::runtime::Action::Widget(_));
+    }
+    !operated
+}
+
+/// Preparing goes to GitHub and Git before the offer arrives, so it takes
+/// the keyboard only from Check out pull request, which asked, or from
+/// nowhere: a control the person moved to in the meantime keeps it.
+#[test]
+fn an_existing_checkout_offer_leaves_a_control_the_person_moved_to() {
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::an_existing_checkout_offer_leaves_a_control_the_person_moved_to"
+    )) {
+        return;
+    }
+    let focus = |id: &widget::Id| -> Task<Message> { iced::widget::operation::focus(id.clone()) };
+    let Opened {
+        app,
+        opening,
+        dismiss,
+        _keep,
+        ..
+    } = existing_checkout_offered(|_, _| {});
+    let card = app.workspace.focused().expect("the pull request pane");
+    let (_, _, checkout) = existing_checkout_ids(&app, card);
+    assert_eq!(
+        tests::focused(&app, focus(&checkout)),
+        Some(checkout.clone()),
+        "Check out pull request is drawn beside the offer"
+    );
+    assert_eq!(
+        tests::focused(&app, focus(&checkout).chain(opening)),
+        Some(dismiss),
+        "the offer takes the keyboard from the control that asked"
+    );
+    let Opened {
+        app,
+        opening,
+        _keep,
+        ..
+    } = existing_checkout_offered(|_, _| {});
+    let elsewhere = crate::sidebar::search_toggle_focus_id();
+    assert_eq!(
+        tests::focused(&app, focus(&elsewhere)),
+        Some(elsewhere.clone()),
+        "the sidebar's search is drawn and takes the keyboard"
+    );
+    assert_eq!(
+        tests::focused(&app, focus(&elsewhere).chain(opening)),
+        Some(elsewhere),
+        "but not from a control the person moved to"
+    );
+}
+
+/// The review popover hangs from the side panel's header, so Escape leaves
+/// it, and any question it asks, alone while the panel is hidden.
+#[test]
+fn escape_leaves_a_review_popover_hidden_with_its_panel() {
+    let Opened { mut app, _keep, .. } = open(Question::SubmitReview);
+    let card = app.workspace.focused().expect("the pull request pane");
+    let collapse = |app: &mut Cagents, collapsed| {
+        let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&card) else {
+            panic!("a pull request pane");
+        };
+        pane.file_panel_collapsed = Some(collapsed);
+    };
+    collapse(&mut app, true);
+    let task = app.update(escape());
+    deliver(&mut app, task);
+    collapse(&mut app, false);
+    let Some((_, CardRuntime::PullRequests(pane))) = focused_card(&app) else {
+        panic!("a pull request pane");
+    };
+    assert_eq!(
+        pane.review.review_question(),
+        Some(Question::SubmitReview),
+        "the question is still asked when the panel shows again"
     );
 }
 

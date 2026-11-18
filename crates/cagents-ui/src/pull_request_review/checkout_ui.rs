@@ -114,7 +114,10 @@ impl State {
         self.existing_checkout.target = Some(target);
         self.existing_checkout.plan = Some(plan);
         self.existing_checkout.notice = Some(notice);
-        Question::UseExistingCheckout.focus_task(
+        // Preparing goes to GitHub and Git first, so the person may have moved
+        // on by the time the offer arrives.
+        Question::UseExistingCheckout.focus_task_after(
+            self.question_ids.checkout.clone(),
             self.question_ids.offer_dismiss.clone(),
             self.question_ids.offer_confirm.clone(),
         )

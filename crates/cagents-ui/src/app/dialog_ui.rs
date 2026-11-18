@@ -405,6 +405,19 @@ impl Question {
         iced::widget::operation::focus(self.initial_focus(dismiss, confirm))
     }
 
+    /// [`Self::focus_task`] for a question that arrives once work `asker`
+    /// started has finished: it takes the keyboard from `asker` or from
+    /// nowhere, but not from a control the person moved to meanwhile, such
+    /// as a comment they began typing.
+    pub(crate) fn focus_task_after<T: Send + 'static>(
+        self,
+        asker: widget::Id,
+        dismiss: widget::Id,
+        confirm: widget::Id,
+    ) -> iced::Task<T> {
+        crate::workspace_widget::focus_after_loading(asker, self.initial_focus(dismiss, confirm))
+    }
+
     /// The id of the surface asking it, by which a test finds which question
     /// is on screen.
     pub(crate) fn surface_id(self) -> widget::Id {
@@ -584,6 +597,10 @@ impl Cagents {
         let Some(CardRuntime::PullRequests(pane)) = self.cards.get(&card) else {
             return None;
         };
+        // The popover hangs from the side panel's header and hides with it.
+        if !self.pull_request_side_shown(card, pane) {
+            return None;
+        }
         pane.review
             .review_escape()
             .map(|action| Message::PullRequestReview { card, action })
