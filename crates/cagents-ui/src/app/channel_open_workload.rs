@@ -522,6 +522,7 @@ fn navigation_save_timing() {
     super::projection_oracle::disable();
     let (mut app, channels, directory) = large_workspace(&Scale::LARGE);
     app.shared_views.skip_rediscovery_check();
+    settle_seeds(&mut app);
     let targets = &channels[..Scale::LARGE.chats];
     let click = |app: &mut Cagents, round: usize, index: usize| {
         let channel_id = targets[(index * 7 + round) % targets.len()];
@@ -535,7 +536,8 @@ fn navigation_save_timing() {
         assert!(app.navigation_save.is_none(), "the save ran");
         elapsed
     };
-    for index in 0..5 {
+    // From the second target: the first is already open.
+    for index in 1..6 {
         click(&mut app, 0, index);
         save_due(&mut app);
     }
@@ -547,37 +549,153 @@ fn navigation_save_timing() {
         }
     }
     summary("update(NavigationSaveDue)", &mut updates);
+    let phases = save_phases(&directory, || {
+        for index in 0..targets.len() {
+            click(&mut app, 2, index);
+            save_due(&mut app);
+        }
+    });
+    report_phases(phases);
+}
 
+/// Saves, then acknowledges every seed that save published and lists its
+/// view, as the daemon does once the window's first save reaches it. A
+/// running window publishes into seeded scopes, so a save that still meets
+/// over a thousand unseeded ones measures a state the window is never in.
+fn settle_seeds(app: &mut Cagents) {
+    // The save that seeds every scope the window shows.
+    app.persist();
+    // With no daemon to deliver them, the seeds fail as they are published.
+    let seeds = app
+        .shared_views
+        .seeding_scopes()
+        .into_iter()
+        .chain(app.shared_views.seed_failures.keys().cloned())
+        .collect::<Vec<_>>();
+    assert!(!seeds.is_empty(), "the window seeds its unseeded scopes");
+    for scope in seeds {
+        app.acknowledge_view_edit(scope.clone(), None);
+        if !app
+            .workspace_model
+            .views
+            .iter()
+            .any(|view| view.scope == scope)
+        {
+            let mut view = View::empty(ChannelId::new());
+            view.scope = scope;
+            view.revision = 1;
+            app.workspace_model.views.push(view);
+        }
+    }
+}
+
+/// The save a terminal's start makes once its surface attaches: the start
+/// changes the terminal's saved session, and `persist()` publishes that
+/// change before the handoff is committed. Each round opens a channel with a
+/// terminal, lets its navigation save run, then records a new session for
+/// the terminal and saves, as `terminal_started` does.
+#[test]
+#[ignore = "timing workload; run optimized with --ignored --nocapture"]
+fn terminal_started_save_timing() {
+    super::projection_oracle::disable();
+    let (mut app, channels, directory) = large_workspace(&Scale::LARGE);
+    app.shared_views.skip_rediscovery_check();
+    settle_seeds(&mut app);
+    // The channels whose conversation came with a terminal.
+    let targets = channels[..Scale::LARGE.chats]
+        .iter()
+        .step_by(3)
+        .copied()
+        .collect::<Vec<_>>();
+    let mut starts = 0usize;
+    let mut start = |app: &mut Cagents, index: usize| {
+        let channel_id = targets[index % targets.len()];
+        drop(app.update(Message::Sidebar(SidebarAction::OpenChannel { channel_id })));
+        drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
+        let terminal = app
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == channel_id)
+            .and_then(|channel| {
+                channel.cards.iter().copied().find(|id| {
+                    matches!(
+                        app.card_state(*id).map(|card| &card.kind),
+                        Some(CardKind::Terminal(_))
+                    )
+                })
+            })
+            .expect("the channel holds a terminal");
+        starts += 1;
+        let CardKind::Terminal(session) = &mut app.card_state_mut(terminal).unwrap().kind else {
+            unreachable!();
+        };
+        session.resume_hint = Some(format!("started {starts}"));
+        let started = Instant::now();
+        app.persist();
+        started.elapsed()
+    };
+    for index in 0..5 {
+        start(&mut app, index);
+    }
+    let mut saves = (0..targets.len() * 2)
+        .map(|index| start(&mut app, index))
+        .collect::<Vec<_>>();
+    summary("persist() as a terminal starts", &mut saves);
+    let phases = save_phases(&directory, || {
+        for index in 0..targets.len() {
+            start(&mut app, index);
+        }
+    });
+    report_phases(phases);
+}
+
+/// The save phases `run` traces, by stage. Phases report microseconds since
+/// the previous mark; the snapshot capture after them reports its own
+/// nanoseconds.
+fn save_phases(
+    directory: &tempfile::TempDir,
+    run: impl FnOnce(),
+) -> BTreeMap<String, Vec<Duration>> {
     let log_path = directory.path().join("save-phases.log");
     let log = std::fs::File::create(&log_path).unwrap();
-    let traced = || {
-        let log = log.try_clone().unwrap();
-        tracing_subscriber::fmt()
-            .with_ansi(false)
-            .without_time()
-            .with_env_filter(tracing_subscriber::EnvFilter::new(
-                "cagents::workspace_pipeline=debug",
-            ))
-            .with_writer(move || log.try_clone().unwrap())
-            .finish()
-    };
-    for index in 0..targets.len() {
-        click(&mut app, 2, index);
-        crate::test_tracing::with_thread_subscriber(traced(), || save_due(&mut app));
-    }
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "cagents::workspace_pipeline=debug",
+        ))
+        .with_writer(move || log.try_clone().unwrap())
+        .finish();
+    crate::test_tracing::with_thread_subscriber(subscriber, run);
     let logged = std::fs::read_to_string(log_path).unwrap();
     let field = |line: &str, prefix: &str| {
         line.split_whitespace()
             .find_map(|token| token.strip_prefix(prefix))
             .map(|value| value.trim_matches('"').to_owned())
     };
-    // Phases report microseconds since the previous mark; the snapshot
-    // capture after them reports its own nanoseconds.
     let mut phases = BTreeMap::<String, Vec<Duration>>::new();
+    let mut counts = BTreeMap::<String, usize>::new();
     for line in logged.lines() {
         let Some(stage) = field(line, "stage=") else {
             continue;
         };
+        if matches!(
+            stage.as_str(),
+            "local_scopes" | "local_settled" | "view_index"
+        ) {
+            // Counts, not durations: the shape of each pass.
+            *counts
+                .entry(
+                    line.split_once(stage.as_str())
+                        .map_or(line, |(_, rest)| rest)
+                        .trim_start_matches('"')
+                        .trim()
+                        .to_owned(),
+                )
+                .or_insert(0usize) += 1;
+            continue;
+        }
         let duration = if let Some(micros) = field(line, "phase_us=") {
             micros.parse().ok().map(Duration::from_micros)
         } else {
@@ -589,6 +707,13 @@ fn navigation_save_timing() {
             phases.entry(stage).or_default().push(duration);
         }
     }
+    for (shape, passes) in counts {
+        eprintln!("  {passes:>3} passes: {shape}");
+    }
+    phases
+}
+
+fn report_phases(mut phases: BTreeMap<String, Vec<Duration>>) {
     for (stage, durations) in &mut phases {
         summary(&format!("  {stage}"), durations);
     }
@@ -603,21 +728,7 @@ fn new_worktree_save_timing() {
     super::projection_oracle::disable();
     let (mut app, _channels, _directory) = large_workspace(&Scale::LARGE);
     app.shared_views.skip_rediscovery_check();
-    // The daemon acknowledges each seed and lists its view.
-    for scope in app.shared_views.seeding_scopes() {
-        app.acknowledge_view_edit(scope.clone(), None);
-        if !app
-            .workspace_model
-            .views
-            .iter()
-            .any(|view| view.scope == scope)
-        {
-            let mut view = View::empty(ChannelId::new());
-            view.scope = scope;
-            view.revision = 1;
-            app.workspace_model.views.push(view);
-        }
-    }
+    settle_seeds(&mut app);
     let project = &app.sidebar_model.projects[0];
     // Past the worktrees where `large_workspace` puts a loose terminal or a
     // closed card.
