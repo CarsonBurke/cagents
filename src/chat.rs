@@ -422,9 +422,7 @@ pub const UPDATE_RESTART_STOPPED: &str =
 /// provider's own reason.
 pub fn update_restart_stopped(reason: &str) -> String {
     let reason = reason.trim_end_matches('.');
-    format!(
-        "{UPDATE_RESTART_STOPPED}: {reason}. Nothing of it is running and nothing was resent; reopen it from its pane."
-    )
+    format!("{UPDATE_RESTART_STOPPED}. {reason}. It isn't running, and nothing was resent.")
 }
 
 impl StartFailure {

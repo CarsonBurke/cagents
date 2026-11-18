@@ -1491,7 +1491,7 @@ fn missing_claude_directory_restores_a_hosted_history_reader_without_authority()
     );
     handle.command(chat::Command::Refresh).unwrap();
     let failure = restore_upgrade(&host, &saved).unwrap_err();
-    assert!(failure.contains("No provider was restarted"));
+    assert!(failure.contains("only its conversation history can be opened"));
     assert!(
         host.lock()
             .unwrap_or_else(|p| p.into_inner())
