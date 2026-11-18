@@ -106,6 +106,8 @@ impl<'a, Message: Clone + 'static> TextEditor<'a, Message> {
     /// with text past it fades across the padding and up to a line height
     /// into the text area, so the line at that edge shows that there is more
     /// at every scroll position. An end with nothing past it has no fade.
+    /// The fade keeps off the middle half of the text area and, while the
+    /// editor is focused, off the line being edited.
     /// The editor still scrolls, and reveals its caret, within the text area.
     ///
     /// The fade covers the text's columns, so it clears the border's
@@ -194,14 +196,19 @@ impl<Message: Clone + 'static> TextEditor<'_, Message> {
 /// scroll position, even when the band holds only the gap between lines,
 /// while an end with nothing past it keeps its line crisp. As with a
 /// scrolling strip's fades, less than half a pixel past an end counts as
-/// nothing, so rounding never fades a line that is wholly in view. The two
-/// fades never take more than half the area each.
+/// nothing, so rounding never fades a line that is wholly in view.
+///
+/// The fade reaches no further into the text area than a quarter of its
+/// height, so a short field keeps its middle crisp, and stops short of
+/// `caret`, the line being edited in a focused editor, which stays legible
+/// at the edge it was scrolled to.
 pub(crate) fn padding_fade_geometry(
     bounds: Rectangle,
     padding: Padding,
     overscan: (f32, f32),
     border: f32,
     overflow: (f32, f32),
+    caret: Option<Rectangle>,
     scale_factor: f32,
 ) -> (Rectangle, (f32, f32)) {
     let text = bounds.shrink(padding);
@@ -210,17 +217,26 @@ pub(crate) fn padding_fade_geometry(
         text.y - drawn.y,
         (drawn.y + drawn.height) - (text.y + text.height),
     );
-    let half = drawn.height / 2.0;
-    let depth = |band: f32, overflow: f32| {
+    let reach = text.height / 4.0;
+    let clear = caret.map_or((reach, reach), |caret| {
+        (
+            caret.y - text.y,
+            (text.y + text.height) - (caret.y + caret.height),
+        )
+    });
+    let depth = |band: f32, overflow: f32, clear: f32| {
         if overflow > 0.5 {
-            (band + overflow).min(half)
+            band + overflow.min(reach).min(clear.max(0.0))
         } else {
             0.0
         }
     };
     (
         drawn,
-        (depth(band.0, overflow.0), depth(band.1, overflow.1)),
+        (
+            depth(band.0, overflow.0, clear.0),
+            depth(band.1, overflow.1, clear.1),
+        ),
     )
 }
 
@@ -326,12 +342,23 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for TextEditor<'
             (None, cosmic::iced::Background::Color(color)) => color,
             (None, cosmic::iced::Background::Gradient(_)) => return,
         };
+        let bounds = layout.bounds();
+        let text = bounds.shrink(self.padding);
+        // The line being edited, where the native editor draws its caret.
+        let caret = tree.children[0]
+            .state
+            .downcast_ref::<text_editor::State<PlainText>>()
+            .is_focused()
+            .then(|| self.content.caret())
+            .flatten()
+            .map(|caret| caret + Vector::new(text.x, text.y));
         let (drawn, depth) = padding_fade_geometry(
-            layout.bounds(),
+            bounds,
             self.padding,
             (fade.above, fade.below),
             own.border.width,
             overflow,
+            caret,
             style.scale_factor as f32,
         );
         cosmic::iced::advanced::Renderer::with_layer(renderer, drawn, |renderer| {
@@ -572,8 +599,9 @@ mod tests {
                     let text = bounds.shrink(padding);
                     // The text continues a line past each end.
                     let reach = (19.6, 19.6);
-                    let (drawn, depth) =
-                        padding_fade_geometry(bounds, padding, overscan, own_border, reach, scale);
+                    let (drawn, depth) = padding_fade_geometry(
+                        bounds, padding, overscan, own_border, reach, None, scale,
+                    );
                     let context =
                         format!("border {own_border}, scale {scale}, top {top}: {drawn:?}");
                     let drawn_top = device(drawn.y, scale);
@@ -610,6 +638,7 @@ mod tests {
                         overscan,
                         own_border,
                         (3.0, 0.0),
+                        None,
                         scale,
                     );
                     assert!((depth.0 - (band.0 + 3.0)).abs() < 1e-4, "{context}");
@@ -621,6 +650,7 @@ mod tests {
                         overscan,
                         own_border,
                         (0.4, 1e-4),
+                        None,
                         scale,
                     );
                     assert_eq!(depth, (0.0, 0.0), "{context}");
@@ -632,6 +662,7 @@ mod tests {
                         (0.0, 0.0),
                         own_border,
                         reach,
+                        None,
                         scale,
                     );
                     assert_eq!(drawn, text, "{context}");
@@ -649,22 +680,64 @@ mod tests {
             (f32::INFINITY, f32::INFINITY),
             3.0,
             (2.0, 2.0),
+            None,
             1.0,
         );
         assert_eq!(drawn, bounds.shrink(padding));
         assert_eq!(depth, (2.0, 2.0));
-        // In an area shorter than its two fades, each takes half of it.
+        // A short field keeps the middle half of its text area crisp: each
+        // fade reaches a quarter of it past the band, not a whole line.
         let bounds = Rectangle::new(cosmic::iced::Point::new(0.0, 0.0), Size::new(200.0, 30.0));
         let padding = Padding::new(5.0);
-        let (drawn, depth) = padding_fade_geometry(
-            bounds,
-            padding,
-            (f32::INFINITY, f32::INFINITY),
-            1.0,
-            (19.6, 19.6),
-            1.0,
+        let text = bounds.shrink(padding);
+        let fade = |caret| {
+            padding_fade_geometry(
+                bounds,
+                padding,
+                (f32::INFINITY, f32::INFINITY),
+                1.0,
+                (19.6, 19.6),
+                caret,
+                1.0,
+            )
+        };
+        let (drawn, depth) = fade(None);
+        let band = text.y - drawn.y;
+        assert_eq!(depth, (band + text.height / 4.0, band + text.height / 4.0));
+
+        // In a focused editor the fade stops short of the line being
+        // edited, whichever edge it was scrolled to, and fades only the
+        // band there; an edge away from it fades as usual.
+        let bounds = Rectangle::new(cosmic::iced::Point::new(0.0, 0.0), Size::new(400.0, 110.0));
+        let text = bounds.shrink(padding);
+        let line = |y: f32| {
+            Some(Rectangle::new(
+                cosmic::iced::Point::new(text.x + 30.0, y),
+                Size::new(1.0, 20.0),
+            ))
+        };
+        let fade = |caret| {
+            padding_fade_geometry(
+                bounds,
+                padding,
+                (f32::INFINITY, f32::INFINITY),
+                1.0,
+                (20.0, 20.0),
+                caret,
+                1.0,
+            )
+        };
+        let (drawn, full) = fade(None);
+        let band = (
+            text.y - drawn.y,
+            drawn.y + drawn.height - text.y - text.height,
         );
-        assert_eq!(depth, (drawn.height / 2.0, drawn.height / 2.0));
+        assert_eq!(full, (band.0 + 20.0, band.1 + 20.0));
+        assert_eq!(fade(line(text.y)).1, (band.0, full.1));
+        assert_eq!(fade(line(text.y + text.height - 20.0)).1, (full.0, band.1));
+        // A caret line part way into the reach leaves the fade above it.
+        assert_eq!(fade(line(text.y + 8.0)).1, (band.0 + 8.0, full.1));
+        assert_eq!(fade(line(text.y + 40.0)).1, full);
     }
     #[test]
     fn multiline_selection_maps_unicode_bytes_and_replacement_uses_existing_edit_action() {

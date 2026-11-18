@@ -6941,7 +6941,7 @@ mod tests {
                     height: 12.0 * COMPOSER_LINE_HEIGHT + 2.0 * COMPOSER_INSET_Y,
                 };
                 let (drawn, depth) = crate::ui_controls::field::padding_fade_geometry(
-                    bounds, padding, reach, own_border, reach, scale,
+                    bounds, padding, reach, own_border, reach, None, scale,
                 );
                 let context = format!("scale {scale}, top {top}: {drawn:?}");
                 let border_top = ((bounds.y + design::BORDER_WIDTH) * scale).ceil();

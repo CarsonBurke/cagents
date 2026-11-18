@@ -314,8 +314,8 @@ where
     /// that far into the padding, and draws its text, caret and selection
     /// there only inside its own border (see [`overscan_bounds`]). It still
     /// scrolls, and reveals its cursor, within the text area.
-    /// [`Content::overflow`] tells how far the laid-out text reaches, for
-    /// instance to fade it out.
+    /// [`Content::overflow`] tells how far the text continues past each
+    /// end, for instance to fade it out.
     pub fn overscan(mut self, above: f32, below: f32) -> Self {
         self.overscan = (above.max(0.0), below.max(0.0));
         self
@@ -594,6 +594,12 @@ where
     /// line height at each end, whether or not its overscan draws any of it.
     pub fn overflow(&self) -> (f32, f32) {
         self.0.borrow().editor.overflow()
+    }
+
+    /// cagents: the line the caret is on, relative to the text area of the
+    /// [`TextEditor`] that last laid it out, while nothing is selected.
+    pub fn caret(&self) -> Option<Rectangle> {
+        self.0.borrow().editor.caret()
     }
 }
 
