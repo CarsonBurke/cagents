@@ -110,6 +110,9 @@ impl<E: ProcessExecutor> GitHubService<E> {
         };
         let mut page_info = node.pointer(&format!("{ROLLUP}/pageInfo")).cloned();
         for _ in 1..CHECK_PAGES {
+            if cancellation.is_cancelled() {
+                return;
+            }
             let Some(cursor) = page_info
                 .as_ref()
                 .filter(|info| info["hasNextPage"] == true)
@@ -331,8 +334,14 @@ mod tests {
         assert!(arguments.contains(&"allLimit=100".to_owned()));
     }
 
-    /// Answers each request with the next response, recording the requests.
-    struct Pages(Mutex<Vec<CommandSpec>>, Mutex<Vec<serde_json::Value>>);
+    /// Answers each request with the next response, recording the requests,
+    /// and cancels the read once the first is answered when
+    /// `cancel_after_first` is set.
+    struct Pages {
+        commands: Mutex<Vec<CommandSpec>>,
+        responses: Mutex<Vec<serde_json::Value>>,
+        cancel_after_first: bool,
+    }
 
     impl ProcessExecutor for Pages {
         fn execute(
@@ -340,8 +349,11 @@ mod tests {
             command: &CommandSpec,
             cancellation: &CancellationToken,
         ) -> Result<ProcessOutput, ProcessFailure> {
-            self.0.lock().unwrap().push(command.clone());
-            let response = self.1.lock().unwrap().remove(0);
+            self.commands.lock().unwrap().push(command.clone());
+            let response = self.responses.lock().unwrap().remove(0);
+            if self.cancel_after_first {
+                cancellation.cancel();
+            }
             Answer(Mutex::default(), response.to_string()).execute(command, cancellation)
         }
     }
@@ -386,13 +398,24 @@ mod tests {
     }
 
     fn read(responses: Vec<serde_json::Value>) -> (AuthoredPullRequests, Vec<CommandSpec>) {
-        let executor = Arc::new(Pages(Mutex::default(), Mutex::new(responses)));
+        read_with(responses, false)
+    }
+
+    fn read_with(
+        responses: Vec<serde_json::Value>,
+        cancel_after_first: bool,
+    ) -> (AuthoredPullRequests, Vec<CommandSpec>) {
+        let executor = Arc::new(Pages {
+            commands: Mutex::default(),
+            responses: Mutex::new(responses),
+            cancel_after_first,
+        });
         let service = GitHubService::new("gh", executor.clone());
         let repository = GitHubRepoKey::new("github.com", None, "owner", "repo").unwrap();
         let listing = service
             .authored_pull_requests(&repository, 50, 100, &CancellationToken::new())
             .unwrap();
-        let commands = executor.0.lock().unwrap().clone();
+        let commands = executor.commands.lock().unwrap().clone();
         (listing, commands)
     }
 
@@ -446,6 +469,16 @@ mod tests {
         assert_eq!(open.status_check_rollup.as_ref().unwrap().len(), 100);
         assert_eq!(open.status_check_count, Some(130));
         assert_eq!(open.status_check_state, Some(RemoteValue("FAILURE".into())));
+    }
+
+    #[test]
+    fn a_read_cancelled_after_the_listing_asks_for_no_further_pages() {
+        let (listing, commands) = read_with(vec![listing_of(230, "FAILURE")], true);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            listing.open[0].status_check_rollup.as_ref().unwrap().len(),
+            100
+        );
     }
 
     #[test]
