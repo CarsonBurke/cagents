@@ -3392,11 +3392,14 @@ where
             command: DaemonCommand::Status
         }
     );
-    let no_start = stopping_daemon
-        || reading_daemon_status
+    // The policy a staged owner must inherit. Status is left out: an owner
+    // that predates `--no-start` (v0.1.x) would refuse to parse it, and the
+    // installer reads `--json daemon status` from that owner.
+    let inherited_no_start = stopping_daemon
         || cli.global.no_start
         || std::env::var("CAGENTS_NO_START")
             .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
+    let no_start = inherited_no_start || reading_daemon_status;
     let _start_policy = StartPolicy(NO_START.swap(no_start, std::sync::atomic::Ordering::Relaxed));
     let _output_policy =
         OutputPolicy(JSON_OUTPUT.swap(cli.global.json, std::sync::atomic::Ordering::Relaxed));
@@ -3515,7 +3518,7 @@ where
                 // Carry implicit stop/environment policy into the matched CLI.
                 // An older owner that lacks this flag must refuse parsing
                 // rather than recover/start services before handling the read.
-                if no_start && !cli.global.no_start {
+                if inherited_no_start && !cli.global.no_start {
                     command.arg("--no-start");
                 }
                 command.args(&arguments[1..]);
