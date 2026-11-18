@@ -7,6 +7,10 @@ pub struct Confirmation {
     pub nonce: String,
     #[serde(default)]
     pub stop: Option<floor_display::StopList>,
+    /// The command that reviews stopping blocked work from a terminal, for a
+    /// window's review: a window cannot confirm that stop itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_command: Option<String>,
     pub preview: impact::Preview,
     pub expires_at_unix_ms: u64,
 }
@@ -355,8 +359,17 @@ fn wait_for(
             // before refreshing its nonce, including while observe was busy.
             let _decisions = DecisionLease::acquire(state, &job.id)?;
             check_review_closed(state, job)?;
+            // A window's review of blocked work says where it can be stopped.
+            let terminal_command = (!terminal
+                && preview
+                    .daemon
+                    .as_ref()
+                    .is_some_and(impact::DaemonImpact::blocked))
+            .then(|| floor::terminal_command(state, job))
+            .transpose()?;
             job.confirmation = Some(Confirmation {
                 stop: None,
+                terminal_command,
                 nonce: nonce.clone(),
                 preview: preview.clone(),
                 expires_at_unix_ms: expires,
@@ -389,7 +402,14 @@ fn wait_for(
                 fs::remove_file(&path)?;
                 match decision.choice {
                     Choice::Cancel => return Err(closed(&preview)),
-                    Choice::Confirm => approved = true,
+                    Choice::Confirm => {
+                        // A window cannot confirm stopping blocked work:
+                        // refuse now rather than wait on idle sessions first.
+                        if !terminal && let Some(refused) = refused(&preview, false) {
+                            return Err(refused);
+                        }
+                        approved = true;
+                    }
                     Choice::StopListed { .. } => (),
                     Choice::Policy(next) => {
                         policy = next;
@@ -564,6 +584,7 @@ pub(super) fn wait_stop(
                 nonce: nonce.clone(),
                 preview: preview.clone(),
                 stop: Some(list.clone()),
+                terminal_command: None,
                 expires_at_unix_ms: expires,
             });
             set_phase(
@@ -973,6 +994,7 @@ mod tests {
             confirmation: Some(Confirmation {
                 nonce: "first".into(),
                 stop: None,
+                terminal_command: None,
                 preview,
                 expires_at_unix_ms: u64::MAX,
             }),
@@ -1292,6 +1314,7 @@ mod tests {
         let mut job = job(directory.path());
         job.confirmation = Some(Confirmation {
             stop: None,
+            terminal_command: None,
             nonce: uuid::Uuid::new_v4().to_string(),
             preview: preview(false),
             expires_at_unix_ms: now_ms() + 60_000,
@@ -1334,6 +1357,7 @@ mod tests {
         let nonce = uuid::Uuid::new_v4().to_string();
         job.confirmation = Some(Confirmation {
             stop: None,
+            terminal_command: None,
             nonce: nonce.clone(),
             preview: preview(false),
             expires_at_unix_ms: now_ms() + 60_000,
@@ -1792,17 +1816,30 @@ mod tests {
             let path = directory.path().to_owned();
             // One observation of the same panes throughout: a preview built
             // afresh names new panes, which is a different review.
-            let blocked = impact::tests::blocked_preview();
+            let mut blocked = impact::tests::blocked_preview();
+            if !terminal {
+                // A window refuses at once, without first waiting for a
+                // conversation that is finishing its turn.
+                blocked.daemon.as_mut().unwrap().sessions[1].disposition =
+                    impact::Disposition::WaitsForIdle;
+            }
             let expected = blocked.refusal();
             let worker = thread::spawn(move || {
                 let mut job = job(&path);
                 wait(&path, &mut job, terminal, |_| Ok(blocked.clone()))
             });
             let current = published(directory.path(), None);
+            let review = current.confirmation.as_ref().unwrap();
+            // Only a window's review needs to say where blocked work can be
+            // stopped: a terminal's review goes on to its stop list.
+            assert_eq!(
+                review.terminal_command.as_deref(),
+                (!terminal).then_some("cagents daemon upgrade")
+            );
             decide_at(
                 directory.path(),
                 &current.id,
-                &current.confirmation.as_ref().unwrap().nonce,
+                &review.nonce,
                 Choice::Confirm,
             )
             .unwrap();
