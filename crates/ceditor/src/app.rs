@@ -2118,34 +2118,44 @@ impl Editor {
         }
     }
 
+    /// The control a close prompt for `id` focuses, or nothing when the tab
+    /// can close without asking the user to save, discard, or wait for a
+    /// background operation.
+    fn close_prompt_focus(&self, id: CardId) -> Option<&'static str> {
+        let tab = self.tab(id)?;
+        // Window shutdown keeps untitled notes on disk for the next session,
+        // so only closing one on its own asks what to do with its text.
+        let untitled_note =
+            !self.exiting && self.tab_is_untitled(tab) && self.untitled_has_content(id);
+        let blocked = tab.runtime.blocks_navigation() || tab.mutation.is_some();
+        if !blocked && !(untitled_note && !self.close_confirmed) {
+            return None;
+        }
+        Some(if untitled_note || tab.runtime.can_save() {
+            "ceditor.close.save"
+        } else if tab.runtime.can_abandon_unsaved_changes() && tab.mutation.is_none() {
+            "ceditor.close.discard"
+        } else {
+            "ceditor.close.cancel"
+        })
+    }
+
     fn request_close(&mut self, id: CardId) -> Task<Message> {
-        let untitled_note = self.tab(id).is_some_and(|tab| self.tab_is_untitled(tab))
-            && self.untitled_has_content(id)
-            && !self.exiting;
-        if self
-            .tab(id)
-            .is_some_and(|tab| tab.runtime.blocks_navigation() || tab.mutation.is_some())
-            || (untitled_note && !self.close_confirmed)
-        {
+        if let Some(focus) = self.close_prompt_focus(id) {
             self.active = Some(id);
             self.closing = Some(id);
             self.close_confirmed = false;
-            let tab = self.tab(id).unwrap();
-            let focus = if untitled_note || tab.runtime.can_save() {
-                "ceditor.close.save"
-            } else if tab.runtime.can_abandon_unsaved_changes() && tab.mutation.is_none() {
-                "ceditor.close.discard"
-            } else {
-                "ceditor.close.cancel"
-            };
             return iced::widget::operation::focus(widget::Id::new(focus)).map(cosmic::Action::App);
         }
-        self.remove_tab(id);
         if self.exiting {
-            self.continue_exit()
-        } else {
-            self.resume_pending_files()
+            // This tab is settled; shutdown closes it with the others once
+            // every tab is, so cancelling a later prompt keeps it open.
+            self.closing = None;
+            self.close_confirmed = false;
+            return self.continue_exit();
         }
+        self.remove_tab(id);
+        self.resume_pending_files()
     }
 
     fn continue_exit(&mut self) -> Task<Message> {
@@ -2157,8 +2167,18 @@ impl Editor {
             return Task::none();
         }
 
-        if let Some(tab) = self.tabs.first() {
-            return self.request_close(tab.id);
+        // Settle every tab before closing any: a cancelled prompt must leave
+        // the window exactly as it was.
+        if let Some(id) = self
+            .tabs
+            .iter()
+            .map(|tab| tab.id)
+            .find(|id| self.close_prompt_focus(*id).is_some())
+        {
+            return self.request_close(id);
+        }
+        for id in self.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>() {
+            self.remove_tab(id);
         }
         let reaped = self.lsp.begin_shutdown();
         cosmic::task::future(async move {
@@ -9445,6 +9465,47 @@ mod tests {
             "second\n"
         );
         assert!(app.tabs.is_empty());
+    }
+
+    #[test]
+    fn cancelling_window_close_keeps_tabs_settled_before_the_prompt() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("clean.txt"), "clean\n").unwrap();
+        std::fs::write(directory.path().join("dirty.txt"), "saved\n").unwrap();
+        let mut app = configured(&directory);
+        app.settings_writable = true;
+        let root = directory.path().to_str().unwrap();
+        let clean = add(&mut app, root, Some("clean.txt"));
+        load_selected(&mut app, clean);
+        let dirty = add(&mut app, root, Some("dirty.txt"));
+        load_selected(&mut app, dirty);
+        paste(&mut app, dirty, "unsaved ");
+        assert!(app.tab(dirty).unwrap().runtime.is_dirty());
+        flush_session(&mut app);
+        let session = app.session();
+
+        drop(app.update(Message::CloseWindow));
+        assert_eq!(app.closing, Some(dirty));
+        assert_eq!(app.tabs.len(), 2, "no tab closes before every tab is settled");
+
+        drop(app.update(Message::CancelClose));
+        assert!(!app.exiting);
+        assert_eq!(
+            app.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>(),
+            vec![clean, dirty]
+        );
+        assert!(app.tab(dirty).unwrap().runtime.is_dirty());
+        assert_eq!(app.session(), session);
+
+        // Settling the remaining tab finishes the shutdown.
+        drop(app.update(Message::CloseWindow));
+        assert_eq!(app.closing, Some(dirty));
+        drop(app.update(Message::DiscardClose));
+        assert!(app.tabs.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("dirty.txt")).unwrap(),
+            "saved\n"
+        );
     }
 
     #[test]
