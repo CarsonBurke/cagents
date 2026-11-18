@@ -352,6 +352,7 @@ fn prune_owners(connection: &mut SqliteConnection) -> QueryResult<()> {
     .execute(connection)
     .map(|_| ())
 }
+
 /// The first wait before reopening a journal that failed to open.
 const FIRST_REOPEN: Duration = Duration::from_secs(1);
 /// The longest wait between attempts, so a journal that comes back, such as
@@ -404,9 +405,9 @@ impl Reopening {
         }
         match Journal::open(path) {
             Ok(journal) => std::mem::replace(&mut self.journal, Ok(journal)).err(),
+            // Keep the first error: it is the one the broker reported.
             Err(error) => {
                 tracing::debug!(%error, "the notification journal is still unavailable");
-                self.journal = Err(error);
                 self.delay = (self.delay * 2).min(LAST_REOPEN);
                 self.next_attempt = now + self.delay;
                 None

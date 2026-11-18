@@ -931,8 +931,6 @@ fn withdraw_target(queue: &mut Withdrawals, id: Uuid, target: &Target) {
     queue_withdrawal(queue, id);
 }
 
-/// Desktop revocation must not depend on a successful SQLite rewrite. Preserve
-/// exact attention IDs while removing rich context from the published snapshot.
 /// Reads a journal that just opened into `snapshot`, without the content of
 /// earlier notices when previews are off.
 fn restore(
@@ -966,6 +964,8 @@ fn restore(
     );
 }
 
+/// Desktop revocation must not depend on a successful SQLite rewrite. Preserve
+/// exact attention IDs while removing rich context from the published snapshot.
 fn revoke_previews(snapshot: &mut Snapshot, withdrawals: &mut Withdrawals) {
     withdrawals.protect(
         snapshot
@@ -1187,12 +1187,15 @@ mod tests {
         handle.retire(retired);
         handle.record(attention_event(replaced, "newer"));
         let merged = deferred.followed_by(take_pending(&shared));
+        // A deferred retirement still precedes a later worker's event.
+        handle.record(attention_event(retired, "after-retirement"));
+        let merged = merged.deferred().followed_by(take_pending(&shared));
         let keys = merged
             .events
             .values()
             .map(|event| event.evidence.key.as_str())
             .collect::<BTreeSet<_>>();
-        assert_eq!(keys, BTreeSet::from(["kept", "newer"]));
+        assert_eq!(keys, BTreeSet::from(["kept", "newer", "after-retirement"]));
         assert!(merged.retired.contains(&Target::Session(retired)));
         assert!(merged.acknowledged.contains(&acknowledged));
         assert!(merged.presence_changed);
