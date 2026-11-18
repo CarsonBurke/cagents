@@ -5167,8 +5167,9 @@ impl Runtime {
     }
 
     /// What one item of an exchange, drawn from `cached`, contributes to its
-    /// row's fingerprint beside the item's identity, which the caller adds, and whether it coordinates other agents, so that
-    /// the row also tracks them.
+    /// row's fingerprint beside the item's identity, which the caller adds,
+    /// and whether it coordinates other agents, so that the row also tracks
+    /// them.
     fn hash_turn_item(
         &self,
         item: &chat::Item,
@@ -16094,8 +16095,10 @@ mod tests {
 
     /// The rows of the exchange at `turn`, each with the value that decides
     /// whether it is drawn again.
+    /// The rows' fingerprints at a fixed time, so that only what the test
+    /// changed can change them, never a second ticking over between reads.
     fn row_fingerprints(runtime: &Runtime, turn: usize) -> Vec<(TurnPart, u64)> {
-        runtime.turn_row_fingerprints_at(&runtime.turns[turn], true, runtime.source_now_ms())
+        runtime.turn_row_fingerprints_at(&runtime.turns[turn], true, Some(60_000))
     }
 
     fn message(id: &str, role: chat::Role, text: &str, thinking: bool, at: u64) -> chat::Item {
