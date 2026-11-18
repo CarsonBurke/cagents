@@ -6,7 +6,7 @@ use crate::app::account_ui::ChatAccounts;
 use crate::chat::client::{ClientHandle, Wake};
 use crate::chat::{self, Attachment, Command, ItemContent, PromptMode, Snapshot};
 use crate::file_drop;
-use crate::model::SavedQueue;
+use crate::model::{SavedQueue, SentAfter};
 use crate::performance::chat_stage::{self, Stage};
 use base64::Engine as _;
 use cosmic::widget::text_editor;
@@ -1235,9 +1235,9 @@ pub(super) struct State {
     /// than the rest to bring back.
     confirmed_losses: HashMap<CardId, (TerminalId, ConfirmedLoss)>,
     /// Cards reopening a conversation with the message their last card was
-    /// still sending as it closed. Their composer drops it once the
-    /// transcript shows it arrived.
-    sending_on_close: HashSet<CardId>,
+    /// still sending as it closed, with what the reader had said before it.
+    /// Their composer drops it once the transcript shows it arrived.
+    sending_on_close: HashMap<CardId, SentAfter>,
     /// Drafts another window started, whose cards are attaching to that
     /// conversation. Their carried-over unsent text may repeat its first
     /// message, which is checked once the transcript shows it.
@@ -1286,7 +1286,7 @@ impl Default for State {
             peer_started: HashMap::new(),
             waiting: HashMap::new(),
             confirmed_losses: HashMap::new(),
-            sending_on_close: HashSet::new(),
+            sending_on_close: HashMap::new(),
             started_elsewhere: HashSet::new(),
             default_chats: HashSet::new(),
             parked: HashMap::new(),
@@ -2779,6 +2779,9 @@ struct PendingCommand {
     /// the provider has accepted it. A rejected send is not history: the
     /// draft it came from is still in the composer.
     sent: Option<String>,
+    /// What the reader had said last as `sent` went out, which tells it apart
+    /// from an earlier message reading the same.
+    sent_after: SentAfter,
     sent_attachments: Vec<Attachment>,
     /// Which end of the history this command is extending, where it is a
     /// page request at all. The transcript says so at the edge the rows will
@@ -2932,14 +2935,42 @@ fn unaccounted(
     remaining
 }
 
+/// The reader's messages `snapshot` shows, oldest first, with their item ids.
+fn user_messages(snapshot: &Snapshot) -> impl DoubleEndedIterator<Item = (&str, &str)> {
+    snapshot
+        .items
+        .iter()
+        .filter_map(|item| match &item.content {
+            chat::ItemContent::Text { text, .. } if item.role == chat::Role::User => {
+                Some((item.id.as_str(), text.as_str()))
+            }
+            _ => None,
+        })
+}
+
+/// What the reader had said last in `snapshot`'s conversation, as `sent`
+/// goes to it.
+fn sent_after(snapshot: &Snapshot, sent: &str) -> SentAfter {
+    if snapshot.has_later {
+        // The conversation's latest messages are not in view.
+        return SentAfter::Unseen;
+    }
+    match user_messages(snapshot).next_back() {
+        Some((id, text)) if text.trim() == sent.trim() => SentAfter::Same(id.to_owned()),
+        Some(_) => SentAfter::Different,
+        None if snapshot.has_earlier => SentAfter::Unseen,
+        None => SentAfter::Different,
+    }
+}
+
 /// Which message of the conversation carried-over unsent text may repeat.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum DraftEcho {
     /// The first, which another window started the conversation with.
     First,
     /// The latest, which the conversation's last card was still sending as it
-    /// closed.
-    Latest,
+    /// closed, after the message this says the reader had sent before it.
+    Latest(SentAfter),
 }
 
 /// What came back to the composer from a provider queue that did not survive.
@@ -3985,40 +4016,54 @@ impl Runtime {
     /// which the conversation already has, so it is not offered again. Any
     /// other text is the reader's own and stays.
     fn settle_draft_echo(&mut self) {
-        let Some((revision, echo)) = self.draft_echo else {
+        let Some((revision, echo)) = self.draft_echo.take() else {
             return;
         };
         if revision != self.revision || !self.attachments.is_empty() {
             // Edited since, or more than the text: no longer a copy.
-            self.draft_echo = None;
             return;
         }
         if self.snapshot.history_loading || !self.visible.load(Ordering::Relaxed) {
+            self.draft_echo = Some((revision, echo));
             return;
         }
-        let mut sent = self
-            .snapshot
-            .items
-            .iter()
-            .filter_map(|item| match &item.content {
-                chat::ItemContent::Text { text, .. } if item.role == chat::Role::User => Some(text),
-                _ => None,
-            });
-        let message = match echo {
-            // The first message counts only where the transcript starts.
-            DraftEcho::First => sent.next().filter(|_| !self.snapshot.has_earlier),
-            DraftEcho::Latest => sent.last(),
+        let composer = self.composer.text();
+        let repeated = {
+            let mut sent = user_messages(&self.snapshot);
+            let message = match &echo {
+                // The first message counts only where the transcript starts.
+                DraftEcho::First => sent.next().filter(|_| !self.snapshot.has_earlier),
+                DraftEcho::Latest(SentAfter::Different) => sent.last(),
+                DraftEcho::Latest(SentAfter::Same(before)) => {
+                    // The message sent before it read the same, so only a
+                    // message shown after that one can be this one. Where that
+                    // one is not in view, or the provider shows it under another
+                    // id, nothing here tells them apart, and the text stays.
+                    let sent = sent.collect::<Vec<_>>();
+                    match sent.iter().position(|(id, _)| id == before) {
+                        Some(index) => match sent[index + 1..].last() {
+                            Some(message) => Some(*message),
+                            None => return,
+                        },
+                        None if sent.is_empty() => None,
+                        None => return,
+                    }
+                }
+                // Nothing told the message apart as it was sent.
+                DraftEcho::Latest(SentAfter::Unseen) => return,
+            };
+            let Some((_, message)) = message else {
+                if !self.snapshot.has_earlier {
+                    // The transcript may yet show it.
+                    self.draft_echo = Some((revision, echo));
+                }
+                // Otherwise the message is not in view, so nothing can be shown
+                // to repeat it.
+                return;
+            };
+            composer.trim() == message.trim()
         };
-        let Some(message) = message else {
-            if self.snapshot.has_earlier {
-                // The message is not in view, so nothing can be shown to
-                // repeat it.
-                self.draft_echo = None;
-            }
-            return;
-        };
-        self.draft_echo = None;
-        if self.composer.text().trim() == message.trim() {
+        if repeated {
             self.replace_draft(text_editor::Content::new());
         }
     }
@@ -9239,8 +9284,8 @@ impl Cagents {
         }
         if self.chat_ui.started_elsewhere.remove(&card) {
             runtime.await_draft_echo(DraftEcho::First);
-        } else if self.chat_ui.sending_on_close.remove(&card) {
-            runtime.await_draft_echo(DraftEcho::Latest);
+        } else if let Some(after) = self.chat_ui.sending_on_close.remove(&card) {
+            runtime.await_draft_echo(DraftEcho::Latest(after));
         }
     }
 
@@ -11330,6 +11375,9 @@ impl Cagents {
             Command::Slash { command } => Some(command.clone()),
             _ => None,
         };
+        let sent_after = sent.as_deref().map_or_else(SentAfter::default, |sent| {
+            sent_after(&runtime.snapshot, sent)
+        });
         let sent_attachments = match &command {
             Command::Prompt { attachments, .. } => attachments.clone(),
             _ => Vec::new(),
@@ -11348,6 +11396,7 @@ impl Cagents {
             model,
             page,
             sent,
+            sent_after,
             sent_attachments,
             queued: step,
         });

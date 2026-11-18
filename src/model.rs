@@ -428,7 +428,28 @@ pub struct KeptChatDraft {
     /// closed, which the conversation may have received.
     #[serde(default)]
     pub sending: bool,
+    /// While `sending`, what the reader had said last when `text` was sent,
+    /// which tells a reopened conversation's message `text` from an earlier
+    /// one.
+    #[serde(default)]
+    pub sent_after: SentAfter,
     pub closed_at_unix_ms: i64,
+}
+
+/// The reader's latest message in a conversation as it was sent another,
+/// which the conversation then shows that one after if it received it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SentAfter {
+    /// None, or one that read differently, so a latest message reading the
+    /// same is the one sent. Drafts kept before this was recorded say so.
+    #[default]
+    Different,
+    /// One that read the same, with this transcript item id: only a later
+    /// message can be the one sent.
+    Same(String),
+    /// None was in view, so no message can be told apart as the one sent.
+    Unseen,
 }
 
 impl KeptChatDraft {

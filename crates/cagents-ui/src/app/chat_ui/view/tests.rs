@@ -1778,6 +1778,7 @@ fn timeline_activity_follows_real_work_and_settles_into_the_finished_stamp() {
         first_prompt: None,
         model: sent.is_none().then(|| ("haiku".to_owned(), None)),
         sent: sent.map(str::to_owned),
+        sent_after: Default::default(),
         sent_attachments: Vec::new(),
         page: None,
         queued: None,

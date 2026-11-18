@@ -11,7 +11,7 @@
 //! [`KeptChatDraft::RETENTION_MS`]. Only what the reader confirmed a close
 //! discards is not kept.
 use super::*;
-use crate::model::KeptChatDraft;
+use crate::model::{KeptChatDraft, SentAfter};
 
 /// What the reader confirmed a close discards.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,14 +66,15 @@ impl Cagents {
                     .get(&card)
                     .cloned()
                     .unwrap_or_default(),
-                self.chat_ui.sending_on_close.contains(&card),
+                self.chat_ui.sending_on_close.get(&card).cloned(),
             ),
         };
         KeptChatDraft {
             text,
             attachments,
             waiting: self.chat_waiting_to_save(card).messages,
-            sending,
+            sending: sending.is_some(),
+            sent_after: sending.unwrap_or_default(),
             closed_at_unix_ms: 0,
         }
     }
@@ -134,7 +135,9 @@ impl Cagents {
         if !draft.text.is_empty() {
             self.chat_ui.drafts.insert(closed, draft.text);
             if draft.sending {
-                self.chat_ui.sending_on_close.insert(closed);
+                self.chat_ui
+                    .sending_on_close
+                    .insert(closed, draft.sent_after);
             }
         }
         if !draft.attachments.is_empty() {
@@ -165,8 +168,8 @@ impl Cagents {
         if let Some(draft) = self.chat_ui.drafts.remove(&source) {
             self.chat_ui.drafts.insert(card, draft);
         }
-        if self.chat_ui.sending_on_close.remove(&source) {
-            self.chat_ui.sending_on_close.insert(card);
+        if let Some(after) = self.chat_ui.sending_on_close.remove(&source) {
+            self.chat_ui.sending_on_close.insert(card, after);
         }
         // Only messages no provider holds go with the draft; another
         // card's queue stays its own.
@@ -220,21 +223,26 @@ impl Cagents {
 
 impl Runtime {
     /// What closing this conversation's card would keep of what the reader
-    /// has not sent, with whether it is exactly the message still being
-    /// sent. A first message the provider already took is in the
-    /// conversation, so it is not kept again, nor one `with_first` excludes.
-    fn kept_draft(&self, with_first: bool) -> (String, Vec<Attachment>, bool) {
+    /// has not sent, with what they had said before it where it is exactly
+    /// the message still being sent. A first message the provider already
+    /// took is in the conversation, so it is not kept again, nor one
+    /// `with_first` excludes.
+    fn kept_draft(&self, with_first: bool) -> (String, Vec<Attachment>, Option<SentAfter>) {
         let delivered = self
             .handle()
             .is_some_and(|handle| handle.has_accepted_user_input());
         let (text, attachments) =
             self.unsent_with_held(self.queued.as_ref().filter(|_| with_first && !delivered));
-        let sending = attachments.is_empty()
-            && self
-                .pending
+        let sending =
+            self.pending
                 .as_ref()
-                .and_then(|pending| pending.sent.as_deref())
-                .is_some_and(|sent| !sent.trim().is_empty() && sent.trim() == text.trim());
+                .filter(|pending| {
+                    attachments.is_empty()
+                        && pending.sent.as_deref().is_some_and(|sent| {
+                            !sent.trim().is_empty() && sent.trim() == text.trim()
+                        })
+                })
+                .map(|pending| pending.sent_after.clone());
         (text, attachments, sending)
     }
 }
@@ -519,6 +527,124 @@ mod tests {
                 "arrived {arrived}"
             );
         }
+    }
+
+    /// Closes a chat in `project` showing `items` while it is still sending
+    /// `continue`, with `has_later` saying its latest messages were out of
+    /// view.
+    fn close_sending_continue(
+        project: &Path,
+        items: Vec<Arc<chat::Item>>,
+        has_later: bool,
+    ) -> (Cagents, CardId) {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat_in(&mut app, Provider::Claude, project, Some("kept"));
+        let handle = chat_runtime(&app, card).handle().unwrap().clone();
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.items = items;
+        snapshot.has_later = has_later;
+        handle.publish_snapshot_for_test(snapshot.clone());
+        super::super::show_chat_snapshot_for_test(&mut app, card, snapshot);
+        write(&mut app, card, "continue");
+        submit(&mut app, card);
+        assert!(chat_runtime(&app, card).pending.is_some(), "still sending");
+        close(&mut app, card);
+        assert!(app.durable.kept_chat_drafts[&card].sending);
+        (app, card)
+    }
+
+    /// Someone sends `continue` again and closes the chat while that second
+    /// one is still being sent. The first `continue` in the reopened
+    /// conversation does not count as its arrival; only a later one does.
+    #[test]
+    fn a_repeated_message_still_being_sent_comes_back_unless_it_arrived() {
+        for arrived in [false, true] {
+            let project = tempfile::tempdir().unwrap();
+            let (mut app, card) =
+                close_sending_continue(project.path(), vec![user_said("u-1", "continue")], false);
+            assert_eq!(
+                app.durable.kept_chat_drafts[&card].sent_after,
+                SentAfter::Same("u-1".into())
+            );
+            let mut items = vec![user_said("u-1", "continue")];
+            if arrived {
+                items.push(user_said("u-2", "continue"));
+            }
+            let reopened = reopen_with(&mut app, card, items);
+            assert_eq!(
+                chat_runtime(&app, reopened).composer.text().trim_end(),
+                if arrived { "" } else { "continue" },
+                "arrived {arrived}"
+            );
+        }
+    }
+
+    /// Where the reopened conversation can't show that a `continue` came
+    /// after the one before the repeat, the repeat stays in the composer
+    /// rather than being lost: that one is out of view or under another id,
+    /// or the latest messages were out of view when it was sent.
+    #[test]
+    fn a_repeated_message_that_cannot_be_told_apart_comes_back() {
+        let repeated = || {
+            vec![
+                user_said("item-1", "continue"),
+                user_said("item-2", "continue"),
+            ]
+        };
+        let project = tempfile::tempdir().unwrap();
+        // Under other ids, as a provider that numbers replayed items gives.
+        let (mut app, card) =
+            close_sending_continue(project.path(), vec![user_said("u-1", "continue")], false);
+        let reopened = reopen_with(&mut app, card, repeated());
+        assert_eq!(
+            chat_runtime(&app, reopened).composer.text().trim_end(),
+            "continue"
+        );
+
+        // Sent while reading an earlier page.
+        let (mut app, card) =
+            close_sending_continue(project.path(), vec![user_said("u-1", "continue")], true);
+        assert_eq!(
+            app.durable.kept_chat_drafts[&card].sent_after,
+            SentAfter::Unseen
+        );
+        let reopened = reopen_with(&mut app, card, repeated());
+        assert_eq!(
+            chat_runtime(&app, reopened).composer.text().trim_end(),
+            "continue"
+        );
+    }
+
+    /// A different message sent after `continue` still settles by the latest
+    /// message alone, whatever its id.
+    #[test]
+    fn a_new_message_still_being_sent_settles_by_the_latest_message() {
+        let project = tempfile::tempdir().unwrap();
+        let (mut app, card) =
+            close_sending_continue(project.path(), vec![user_said("u-1", "go on")], false);
+        assert_eq!(
+            app.durable.kept_chat_drafts[&card].sent_after,
+            SentAfter::Different
+        );
+        let reopened = reopen_with(
+            &mut app,
+            card,
+            vec![
+                user_said("item-1", "go on"),
+                user_said("item-2", "continue"),
+            ],
+        );
+        assert!(chat_runtime(&app, reopened).composer.is_empty());
+    }
+
+    /// A draft kept before what the reader said last was recorded settles
+    /// by the latest message, as it did then.
+    #[test]
+    fn a_kept_draft_saved_without_a_position_settles_as_before() {
+        let saved: KeptChatDraft =
+            serde_json::from_str(r#"{"text":"continue","sending":true,"closed_at_unix_ms":1}"#)
+                .unwrap();
+        assert_eq!(saved.sent_after, SentAfter::Different);
     }
 
     /// Reopening the latest closed pane brings a never-started chat back with
