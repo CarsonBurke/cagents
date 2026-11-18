@@ -217,7 +217,7 @@ The candidate drives qualified source daemons through a frozen lifecycle subset:
 the installed builds pinned in `RELEASED_SOURCES` (`src/update/source.rs`),
 protocol 156 (the `991daa43e` desktop build), 173 (`43678f2fb`), 175
 (`c73002744`), 177 (`374370965`), 178 (`3b1e81a4d`, also served by
-`f016f047b`) and 179 (`43f253ef8`), and the
+`f016f047b`), 179 (`43f253ef8`) and 187 (`ccd4134c6`), and the
 matched current protocol. A protocol bump never drops a pinned build; retiring
 one is a deliberate change that `scripts/check-update-sources` enforces.
 Every other source protocol, including 160, 165, 174, 176, the candidate
