@@ -202,10 +202,24 @@ fn attention_summary(daemon: &crate::update::impact::DaemonImpact) -> Option<Str
         (count, _) => format!("{count} sessions are"),
     };
     // The worker observes the daemon again twice a second, so resolving
-    // these is all there is to do: there is nothing to retry.
+    // these is all there is to do: there is nothing to retry, and the update
+    // becomes available by itself.
     Some(format!(
-        "{subject} holding this update back. This list updates as soon as that changes."
+        "{subject} holding this update back. You can update once that's resolved; this list updates as it changes."
     ))
+}
+
+/// Whether the review can be confirmed from a window. What holds an update
+/// back must be resolved first: confirming anyway would save and freeze every
+/// window only for the worker to refuse the stop that a terminal alone can
+/// confirm. A stop list already asks for that terminal.
+fn confirmable(confirmation: &crate::update::UpdateConfirmation) -> bool {
+    confirmation.stop.is_none()
+        && !confirmation
+            .preview
+            .daemon
+            .as_ref()
+            .is_some_and(crate::update::impact::DaemonImpact::blocked)
 }
 
 fn disposition_tone(disposition: crate::update::impact::Disposition) -> design::Tone {
@@ -449,6 +463,22 @@ impl Cagents {
                     .into(),
             );
         }
+        let waits_for_idle = preview.daemon.as_ref().is_some_and(|daemon| {
+            daemon
+                .sessions
+                .iter()
+                .any(|session| session.disposition == Disposition::WaitsForIdle)
+        });
+        // While something holds the update back, the warning above the list
+        // says what, and the update waits until a poll finds it resolved.
+        let confirm = crate::ui_controls::button::primary("Update and reopen")
+            .instead("Continue in terminal", terminal_confirmation)
+            .instead("Update when idle", waits_for_idle)
+            .id(confirm_id())
+            .on_press_maybe(
+                confirmable(confirmation)
+                    .then(|| Message::UpdateUi(Action::ConfirmApply(confirmation.nonce.clone()))),
+            );
         let actions = widget::row::with_children(vec![
             crate::ui_controls::button::quiet("Copy details")
                 .id(widget::Id::new("update.copy"))
@@ -461,22 +491,7 @@ impl Cagents {
                 .into(),
             // Choosing to wait for idle sessions renames the update, and
             // Cancel beside it stays put.
-            crate::ui_controls::button::primary("Update and reopen")
-                .instead("Continue in terminal", terminal_confirmation)
-                .instead(
-                    "Update when idle",
-                    preview.daemon.as_ref().is_some_and(|daemon| {
-                        daemon
-                            .sessions
-                            .iter()
-                            .any(|session| session.disposition == Disposition::WaitsForIdle)
-                    }),
-                )
-                .id(confirm_id())
-                .on_press_maybe((!terminal_confirmation).then_some(Message::UpdateUi(
-                    Action::ConfirmApply(confirmation.nonce.clone()),
-                )))
-                .into(),
+            confirm.into(),
         ])
         .align_y(Alignment::Center)
         .spacing(space::S);
@@ -951,7 +966,7 @@ impl Cagents {
                     .confirmation
                     .as_ref()
                     .is_none_or(|confirmation| {
-                        confirmation.nonce != nonce || confirmation.stop.is_some()
+                        confirmation.nonce != nonce || !confirmable(confirmation)
                     })
                 {
                     return Task::none();
@@ -1843,6 +1858,56 @@ pub(in crate::app) mod tests {
         }
     }
 
+    /// A blocked review offers no update: confirming it from a window would
+    /// save and freeze every window only for the worker to refuse it. The
+    /// update becomes available by itself once a poll finds nothing holding
+    /// it back.
+    #[test]
+    fn a_blocked_review_offers_the_update_once_nothing_holds_it_back() {
+        use crate::update::impact::Disposition;
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let blocked = daemon_preview(vec![
+            session("Shell · project", Disposition::Continues),
+            session("Codex · project", Disposition::Blocked),
+        ]);
+        let mut job = awaiting(&blocked);
+        let poll = review_ready(&mut app, job.clone());
+        drop(app.update(poll));
+        fn enter(app: &Cagents) -> Vec<Message> {
+            crate::app::dialog_ui::tests::key_control(
+                app.update_dialog().expect("the review is up"),
+                confirm_id(),
+                crate::app::dialog_ui::tests::key_press(keyboard::key::Named::Enter),
+            )
+            .0
+        }
+        assert!(
+            enter(&app).is_empty(),
+            "the held-back update can't be pressed"
+        );
+        drop(app.update_update_ui(Action::ConfirmApply(blocked.nonce.clone())));
+        assert!(
+            app.update_ui.submitted_confirmation.is_none(),
+            "nor confirmed by a stale press"
+        );
+        assert!(app.update_ui.confirmation.is_some(), "the review stays up");
+
+        let mut resolved = blocked.clone();
+        resolved.preview.daemon.as_mut().unwrap().sessions[1].disposition = Disposition::Continues;
+        job.confirmation = Some(resolved.clone());
+        drop(app.update(Message::UpdateUi(Action::Polled(
+            Some(job.id.clone()),
+            Ok(Some(job)),
+        ))));
+        assert!(
+            matches!(
+                enter(&app).as_slice(),
+                [Message::UpdateUi(Action::ConfirmApply(nonce))] if *nonce == resolved.nonce
+            ),
+            "the update is available once nothing holds it back"
+        );
+    }
+
     /// Looking at the session that blocks an update must not cost the
     /// verified download, and the review must come back unprompted.
     #[test]
@@ -1939,7 +2004,7 @@ pub(in crate::app) mod tests {
         let daemon = confirmation.preview.daemon.as_mut().unwrap();
         assert_eq!(
             attention_summary(daemon).unwrap(),
-            "1 session is holding this update back. This list updates as soon as that changes."
+            "1 session is holding this update back. You can update once that's resolved; this list updates as it changes."
         );
         assert!(policy_choice(daemon).is_none());
         daemon.sessions[1].disposition = Disposition::WaitsForIdle;

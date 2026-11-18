@@ -206,8 +206,11 @@ whether it continues, resumes, waits for idle, or is blocked. Supported held
 Codex servers keep their process, active turn, and approvals. Other native
 providers wait for idle by default; choosing interruption explicitly authorizes
 ending their active turn before resuming the saved conversation. Accepted agent
-launches and automation prechecks must settle first. Changed ownership or impact
-requires a fresh confirmation. The final check also waits behind previously
+launches and automation prechecks must settle first. While anything blocks the
+update, the application offers no way to confirm it: the update becomes
+available once the blockers clear, and only `daemon upgrade` in a terminal can
+confirm stopping blocked work. Changed ownership or impact requires a fresh
+confirmation. The final check also waits behind previously
 accepted provider commands, so a queued prompt cannot masquerade as idle.
 
 `daemon upgrade` uses the served candidate's worker and this same confirmation.
