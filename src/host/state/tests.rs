@@ -1466,7 +1466,7 @@ for line in sys.stdin:
     changed.id = TerminalId::new();
     assert!(super::super::chat::resolve_upgrade(&replacement, &changed).is_err());
     changed = source.clone();
-    changed.terminal = Some(TerminalSession {
+    changed.terminal = Some(Box::new(TerminalSession {
         owned_codex_listener: None,
         recovery_origin: None,
         predecessor: None,
@@ -1478,7 +1478,7 @@ for line in sys.stdin:
             recipe: source.launch.recipe.clone(),
             last_exit: None,
         },
-    });
+    }));
     assert!(super::super::chat::resolve_upgrade(&replacement, &changed).is_err());
     restore_upgrade_from(
         &replacement,

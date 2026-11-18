@@ -2140,7 +2140,7 @@ fn restore_actor_inner(
         None
     };
     if let Some(replacement) = &replacement {
-        session.terminal = Some(replacement.terminal.clone());
+        session.terminal = Some(Box::new(replacement.terminal.clone()));
     }
     // A paired CLI view whose worker is gone may have been closed by the
     // exit that left this helper. Only its original holder's exact close
@@ -2189,7 +2189,7 @@ fn restore_actor_inner(
                 {
                     return Err("The retained Claude console's exact worker could not be recovered; provider ownership was preserved".into());
                 }
-                *terminal = state
+                **terminal = state
                     .native_terminal_projection(terminal.id)
                     .map_err(SetupError::Unavailable)?;
                 if terminal.continuity.live_proof().as_ref() != Some(proof) {
@@ -2599,13 +2599,13 @@ fn close_with_target(
                 } else {
                     state.native_terminal_projection(terminal.id)?
                 };
-                if observed != *terminal {
+                if observed != **terminal {
                     return Err(
                         "The paired terminal descriptor changed; its replacement was preserved"
                             .into(),
                     );
                 }
-                Some((terminal.clone(), current.handle.clone()))
+                Some(((**terminal).clone(), current.handle.clone()))
             }
             // Cleanup attached without a worker for a view proved closed; the
             // helper's pair is rechecked below before anything is ended.

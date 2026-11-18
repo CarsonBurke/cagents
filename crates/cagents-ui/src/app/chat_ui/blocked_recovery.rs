@@ -183,7 +183,10 @@ impl Cagents {
                     .map_err(|error| error.to_string())
                     .and_then(|result| result);
             action(Action::FreshCloseFinished(
-                target, source, requested, result,
+                target,
+                Box::new(source),
+                Box::new(requested),
+                result,
             ))
         })
     }

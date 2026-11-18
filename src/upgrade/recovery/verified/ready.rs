@@ -97,7 +97,7 @@ fn captured_terminals(census: &Census) -> impl Iterator<Item = &TerminalSession>
         census
             .chats
             .iter()
-            .filter_map(|chat| chat.terminal.as_ref()),
+            .filter_map(|chat| chat.terminal.as_deref()),
     )
 }
 

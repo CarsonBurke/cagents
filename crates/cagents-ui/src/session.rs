@@ -467,10 +467,10 @@ enum ConversionCheckpoint {
         adoptions: Vec<crate::persistence::TerminalPaneAdoption>,
         restorations: Vec<crate::persistence::TerminalPaneRestoration>,
     },
-    IdentityReplacement(IdentityReplacement),
-    ChatRecovery(ChatRecoveryWrite),
+    IdentityReplacement(Box<IdentityReplacement>),
+    ChatRecovery(Box<ChatRecoveryWrite>),
     RetainedChatCopy {
-        copy: crate::persistence::RetainedChatCopy,
+        copy: Box<crate::persistence::RetainedChatCopy>,
         // The first failure is reported once. Data-only retries retain their
         // payload but cannot block on a second reply after the receiver leaves.
         reply: Option<std::sync::mpsc::SyncSender<std::result::Result<(), String>>>,
@@ -487,7 +487,7 @@ enum ChatRecoveryKind {
     Account,
     Upgrade,
     Resume,
-    AuthenticatedUpgrade(crate::chat::client::UpgradeRecovery),
+    AuthenticatedUpgrade(Box<crate::chat::client::UpgradeRecovery>),
 }
 
 #[derive(Debug)]
@@ -561,7 +561,9 @@ impl QueueState {
                     .push_back(ConversionCheckpoint::Snapshot(previous));
             }
             self.conversions
-                .push_back(ConversionCheckpoint::IdentityReplacement(replacement));
+                .push_back(ConversionCheckpoint::IdentityReplacement(Box::new(
+                    replacement,
+                )));
         } else {
             merge_identity_replacement(&mut self.identity_replacements, replacement);
         }
@@ -575,7 +577,9 @@ impl QueueState {
         self.ordered_identities = true;
         for replacement in std::mem::take(&mut self.identity_replacements).into_values() {
             self.conversions
-                .push_back(ConversionCheckpoint::IdentityReplacement(replacement));
+                .push_back(ConversionCheckpoint::IdentityReplacement(Box::new(
+                    replacement,
+                )));
         }
         if let Some(previous) = self.latest.take() {
             self.conversions
@@ -1039,7 +1043,7 @@ impl SessionRuntime {
         queue
             .conversions
             .push_back(ConversionCheckpoint::RetainedChatCopy {
-                copy,
+                copy: Box::new(copy),
                 reply: Some(reply),
             });
         queue.record_snapshot_changes(Some(change_time));
@@ -1058,7 +1062,7 @@ impl SessionRuntime {
         let source = recovery.source().clone();
         let replacement = recovery.replacement().clone();
         self.rebind_chat(
-            ChatRecoveryKind::AuthenticatedUpgrade(recovery),
+            ChatRecoveryKind::AuthenticatedUpgrade(Box::new(recovery)),
             card_id,
             source,
             replacement,
@@ -1083,13 +1087,15 @@ impl SessionRuntime {
         queue.keep_writes_in_order();
         queue
             .conversions
-            .push_back(ConversionCheckpoint::ChatRecovery(ChatRecoveryWrite {
-                kind,
-                card: card_id,
-                source,
-                replacement,
-                reply,
-            }));
+            .push_back(ConversionCheckpoint::ChatRecovery(Box::new(
+                ChatRecoveryWrite {
+                    kind,
+                    card: card_id,
+                    source,
+                    replacement,
+                    reply,
+                },
+            )));
         queue.record_snapshot_changes(Some(change_time));
         changed.notify_one();
         Ok(receiver)
@@ -2460,7 +2466,7 @@ impl PendingWrites {
                         Ok(commit) => {
                             self.workspace_generation = commit.generation;
                             self.card_generations = commit.card_generations;
-                            self.retained_chat_copies.insert(copy.copy.id, copy);
+                            self.retained_chat_copies.insert(copy.copy.id, *copy);
                             if let Some(reply) = reply {
                                 let _ = reply.send(Ok(()));
                             }
@@ -2536,7 +2542,7 @@ impl PendingWrites {
                     match replacement.apply(store) {
                         Ok(()) => self.quarantine.replacement_landed(replacement.card_id),
                         Err(error) if error.refuses_content() => {
-                            self.quarantine.refuse_replacement(replacement, &error);
+                            self.quarantine.refuse_replacement(*replacement, &error);
                         }
                         Err(error) => {
                             self.conversions

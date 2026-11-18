@@ -68,7 +68,7 @@ impl Delivery {
 pub(super) enum Answer {
     Value(Result<Value, String>),
     Watch(Result<UnixStream, String>),
-    Binary(Result<crate::terminal_ipc::ServerResponse, String>),
+    Binary(Result<Box<crate::terminal_ipc::ServerResponse>, String>),
     /// `pinned_directory` sends its directory descriptor beside the frame.
     Directory(Result<(DirectoryIdentity, Arc<File>), String>),
 }

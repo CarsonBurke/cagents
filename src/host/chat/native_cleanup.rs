@@ -222,7 +222,7 @@ fn close_retained_inner(
                     paired: retained_pair(
                         host,
                         source,
-                        source.terminal.as_ref(),
+                        source.terminal.as_deref(),
                         Some(&chat::native_holder::closed_pair_holder(source, &proof)?.ok_or("The native cleanup receipt lacks its original paired holder identity")?),
                         &proof,
                     )?,
@@ -245,7 +245,7 @@ fn close_retained_inner(
                 let paired = retained_pair(
                     host,
                     &recovery.source,
-                    recovery.source.terminal.as_ref(),
+                    recovery.source.terminal.as_deref(),
                     recovery.paired_holder.as_ref(),
                     &proof,
                 )?;

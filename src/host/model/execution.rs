@@ -383,7 +383,7 @@ impl Registry {
                     };
                     let terminal = next
                         .terminal
-                        .as_ref()
+                        .as_deref()
                         .filter(|terminal| {
                             terminal.id == console.id
                                 && (terminal.launch == console.launch || replacement.is_some())
@@ -2080,7 +2080,7 @@ impl Registry {
         let next = HostedSession::Chat(successor.clone());
         super::views::rebind_agent_pane(&tx, agent.id, &previous, &next)?;
         agent.session = Some(next);
-        agent.console = successor.terminal.clone();
+        agent.console = successor.terminal.as_deref().cloned();
         tx.execute(
             "UPDATE agents SET record = ?2, session_id = ?3 WHERE id = ?1",
             params![
@@ -2158,7 +2158,7 @@ impl Registry {
                 [bound.id.to_string()],
             )
             .map_err(|error| error.to_string())?;
-            agent.console = shown.terminal.clone();
+            agent.console = shown.terminal.as_deref().cloned();
             agent.session = Some(next);
             tx.execute(
                 "UPDATE agents SET record = ?2 WHERE id = ?1",
@@ -3974,7 +3974,7 @@ mod tests {
         let MessageHandoff::Accepted(accepted) = handoff else {
             panic!("the pending message becomes a run: {handoff:?}");
         };
-        (message, accepted)
+        (message, *accepted)
     }
 
     /// A pending message to `agent`, bound to `source`, as `message_run`

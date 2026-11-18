@@ -534,7 +534,7 @@ fn prepare_directory_using<T: Send + 'static>(
         Path::new(leaf),
         0o700,
     ) {
-        Ok(DirectoryCreation::Published(publication)) => publication,
+        Ok(DirectoryCreation::Published(publication)) => *publication,
         Ok(DirectoryCreation::Existing(_)) => {
             return Err(RecoveryDirectoryError::Rejected(io::Error::new(
                 io::ErrorKind::AlreadyExists,

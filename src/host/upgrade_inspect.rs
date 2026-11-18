@@ -2259,7 +2259,7 @@ mod tests {
         for is_chat in [false, true] {
             let mut chat = session();
             chat.id = console.session.id;
-            chat.terminal = Some(console.session.clone());
+            chat.terminal = Some(Box::new(console.session.clone()));
             let chats = if is_chat { vec![chat] } else { Vec::new() };
             let roster = vec![console.clone()];
             for requires_migration in [false, true] {
@@ -2603,14 +2603,14 @@ mod tests {
             "no registered owner is no evidence that one ended"
         );
         let mut paired = card.clone();
-        paired.terminal = Some(
+        paired.terminal = Some(Box::new(
             crate::terminal_ipc::TerminalDescriptor::relaunchable(
                 paired.id,
                 paired.launch.recipe.clone(),
                 None,
             )
             .session,
-        );
+        ));
         let mut unowned = card.clone();
         unowned.proof = None;
         let mut reconnect_only = card.clone();
@@ -3279,7 +3279,7 @@ mod tests {
             boot_id: current_boot(),
             host_incarnation: "console".into(),
         };
-        card.terminal = Some(console);
+        card.terminal = Some(Box::new(console));
         assert!(
             matches!(unreadable_kernel.codex_execution(&card), CodexExecution::Unproved { reason } if reason.contains("Cannot enumerate processes"))
         );
@@ -3315,14 +3315,14 @@ mod tests {
         let [card, _] = codex_cards(root.path());
         let live_processes = LiveProcesses::new();
         let mut paired = card.clone();
-        paired.terminal = Some(
+        paired.terminal = Some(Box::new(
             crate::terminal_ipc::TerminalDescriptor::relaunchable(
                 paired.id,
                 paired.launch.recipe.clone(),
                 None,
             )
             .session,
-        );
+        ));
         let mut unowned = card.clone();
         unowned.owned_codex_listener = None;
         let mut foreign = card.clone();
@@ -3733,7 +3733,7 @@ mod tests {
             boot_id: proof.boot_id.clone(),
             host_incarnation: proof.host_incarnation.clone(),
         };
-        live.terminal = Some(paired);
+        live.terminal = Some(Box::new(paired));
         validate_live_chat(&live, true).unwrap();
         qualify(&live, std::slice::from_ref(&live), &proof, |_| {
             panic!("current pair")
@@ -4051,14 +4051,14 @@ mod tests {
                 1 => other.launch.recipe.working_directory = "/elsewhere".into(),
                 2 => other.owned_codex_listener.as_mut().unwrap().allocator = current.clone(),
                 _ => {
-                    other.terminal = Some(
+                    other.terminal = Some(Box::new(
                         crate::terminal_ipc::TerminalDescriptor::relaunchable(
                             other.id,
                             other.launch.recipe.clone(),
                             None,
                         )
                         .session,
-                    )
+                    ))
                 }
             }
             assert!(

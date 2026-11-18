@@ -243,7 +243,7 @@ fn a_window_starting_the_draft_itself_keeps_its_own_start() {
     let target = draft_runtime(&peer.app, peer.card).target;
     peer.app.chat_ui.phases.insert(
         peer.card,
-        Phase::Starting(Attempt {
+        Phase::Starting(Box::new(Attempt {
             target,
             intent: chat::Intent::Start,
             session: own.clone(),
@@ -251,7 +251,7 @@ fn a_window_starting_the_draft_itself_keeps_its_own_start() {
             upgrade_committed: false,
             upgrade_admission: None,
             resume_committed: false,
-        }),
+        })),
     );
 
     drop(project(

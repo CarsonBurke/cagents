@@ -140,7 +140,7 @@ pub enum Settled {
     Registered {
         registry: super::registry::Registry,
         identity: Option<super::Identity>,
-        snapshot: Option<super::UsageSnapshot>,
+        snapshot: Option<Box<super::UsageSnapshot>>,
     },
     Duplicate {
         existing: AccountId,

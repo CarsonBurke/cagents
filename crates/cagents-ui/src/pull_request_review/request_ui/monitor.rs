@@ -40,7 +40,7 @@ pub enum Action {
     SharedLoaded {
         repository: GitHubRepoKey,
         generation: u64,
-        result: Result<shared::PollResult, String>,
+        result: Result<Box<shared::PollResult>, String>,
     },
 }
 
@@ -356,7 +356,7 @@ impl Monitor {
                 Action::SharedLoaded {
                     repository,
                     generation,
-                    result,
+                    result: result.map(Box::new),
                 }
             },
             |action| action,
@@ -434,7 +434,7 @@ mod tests {
             Action::SharedLoaded {
                 repository: repository(),
                 generation,
-                result,
+                result: result.map(Box::new),
             },
             [repository()],
         ));
@@ -506,7 +506,7 @@ mod tests {
             Action::SharedLoaded {
                 repository: repository(),
                 generation: old,
-                result: Ok(result("old", &[1], 1)),
+                result: Ok(Box::new(result("old", &[1], 1))),
             },
             [repository()],
         ));
@@ -568,7 +568,7 @@ mod tests {
             Action::SharedLoaded {
                 repository: repository.clone(),
                 generation,
-                result: Ok(result.clone()),
+                result: Ok(Box::new(result.clone())),
             },
             [repository.clone()],
         );
@@ -610,7 +610,7 @@ mod tests {
             Action::SharedLoaded {
                 repository: repository.clone(),
                 generation,
-                result: Ok(result),
+                result: Ok(Box::new(result)),
             },
             [repository],
         ));

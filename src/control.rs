@@ -10487,7 +10487,7 @@ mod tests {
                     session_id: None,
                 },
                 proof: None,
-                terminal: Some(terminal("claude")),
+                terminal: Some(Box::new(terminal("claude"))),
                 owned_codex_listener: None,
                 native_continuity: Default::default(),
             },

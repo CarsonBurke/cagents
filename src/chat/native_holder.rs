@@ -474,7 +474,7 @@ mod tests {
             boot_id: proof.boot_id.clone(),
             host_incarnation: proof.host_incarnation.clone(),
         };
-        paired.terminal = Some(crate::model::TerminalSession {
+        paired.terminal = Some(Box::new(crate::model::TerminalSession {
             id: paired.id,
             launch: recipe.clone(),
             continuity: live(paired.proof.as_ref().unwrap()),
@@ -483,7 +483,7 @@ mod tests {
             owned_codex_listener: None,
             recovery_origin: None,
             predecessor: None,
-        });
+        }));
         let holder = terminal_holder(&paired);
         assert!(
             recovery
@@ -527,7 +527,7 @@ mod tests {
             .unwrap();
         let mut paired = recovery.source.clone();
         let proof = paired.proof.clone().unwrap();
-        paired.terminal = Some(crate::model::TerminalSession {
+        paired.terminal = Some(Box::new(crate::model::TerminalSession {
             id: paired.id,
             launch: paired.launch.recipe.clone(),
             continuity: crate::model::TerminalContinuity::Live {
@@ -540,7 +540,7 @@ mod tests {
             resume_hint: None,
             recovery_origin: None,
             predecessor: None,
-        });
+        }));
         let mut holder = terminal_holder(&paired);
         holder.application = "dev.cagents.Cagents".into();
         recovery
@@ -613,7 +613,7 @@ mod tests {
             host_incarnation: proof.host_incarnation.clone(),
         };
         let mut paired = recovery.source.clone();
-        paired.terminal = Some(TerminalSession {
+        paired.terminal = Some(Box::new(TerminalSession {
             id: paired.id,
             launch: paired.launch.recipe.clone(),
             continuity: live(paired.proof.as_ref().unwrap()),
@@ -622,7 +622,7 @@ mod tests {
             owned_codex_listener: paired.owned_codex_listener.clone(),
             recovery_origin: None,
             predecessor: None,
-        });
+        }));
         let holder = terminal_holder(&paired);
         assert!(
             recovery.update_source(paired.clone(), None, None).is_err(),

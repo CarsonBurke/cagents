@@ -278,7 +278,7 @@ enum Provider {
     /// It runs a turn or waits on a question; the prompt waits.
     Busy,
     /// It has no running process, so its conversation must be reopened first.
-    Gone(chat::Session),
+    Gone(Box<chat::Session>),
 }
 
 fn provider(
@@ -296,7 +296,7 @@ fn provider(
         .unwrap_or_else(|p| p.into_inner())
         .agent_process_ended(agent.id)?
     {
-        return Ok(Some(Provider::Gone(session.clone())));
+        return Ok(Some(Provider::Gone(Box::new(session.clone()))));
     }
     let handle = host
         .lock()
@@ -316,7 +316,7 @@ fn provider(
                 Provider::Ready
             }
         }
-        _ => Provider::Gone(session.clone()),
+        _ => Provider::Gone(Box::new(session.clone())),
     }))
 }
 
@@ -2192,11 +2192,11 @@ fn create_console(
                 return Err("The exact provider or console changed before pairing".into());
             }
             let record = state.chats.get_mut(&session.id).expect("checked actor");
-            record.session.terminal = Some(descriptor.session.clone());
+            record.session.terminal = Some(Box::new(descriptor.session.clone()));
             record.paired_terminal = Some(console_handle.clone());
         }
         let mut retained = retained_before.clone();
-        retained.terminal = Some(descriptor.session.clone());
+        retained.terminal = Some(Box::new(descriptor.session.clone()));
         handle.update_native_source(
             retained,
             Some(descriptor.session.launch.clone()),
@@ -2216,7 +2216,7 @@ fn create_console(
                 .get_mut(&session.id)
                 .filter(|record| record.handle.same_actor(handle))
                 .ok_or("The provider closed while publishing its console")?;
-            record.session.terminal = Some(descriptor.session.clone());
+            record.session.terminal = Some(Box::new(descriptor.session.clone()));
             record.paired_terminal = Some(console_handle.clone());
         }
         let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());

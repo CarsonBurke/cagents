@@ -1985,6 +1985,8 @@ struct PdfRender {
     pending: Option<PdfView>,
 }
 
+// `Ready` is the steady state, and boxing it would break the nested `Ready(RenderedDiff::…)` patterns.
+#[allow(clippy::large_enum_variant)]
 enum DiffState {
     Loading {
         request: u64,

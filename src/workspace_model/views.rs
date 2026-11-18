@@ -501,7 +501,9 @@ pub struct CapturedTerminalSource {
     pub scope: Scope,
     pub view_revision: u64,
     pub model_sequence: u64,
-    pub before: Pane,
+    /// Boxed so the optional capture does not dominate every receipt and
+    /// change that may carry one.
+    pub before: Box<Pane>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -563,7 +563,7 @@ pub enum Action {
         card: CardId,
         operation: uuid::Uuid,
         terminal: TerminalId,
-        result: Result<StartedTerminal, String>,
+        result: Result<Box<StartedTerminal>, String>,
     },
     /// An unavailable probe's retry time has come. Handling it runs the
     /// update's transcript probe stage, which probes again.
@@ -976,7 +976,7 @@ impl Cagents {
                 card,
                 operation,
                 terminal,
-                result,
+                result: result.map(Box::new),
             })),
             other => other,
         })
@@ -1133,8 +1133,12 @@ impl Cagents {
                 // and decrement the actual start count even after presentation
                 // was replaced or its card was closed.
                 let refusal = result.as_ref().err().cloned();
-                let task =
-                    self.terminal_started_for_operation(card, terminal, result, current_operation);
+                let task = self.terminal_started_for_operation(
+                    card,
+                    terminal,
+                    result.map(|started| *started),
+                    current_operation,
+                );
                 let (Some(prior), Some(refusal)) = (prior, refusal) else {
                     return task;
                 };
@@ -1578,12 +1582,12 @@ mod tests {
             card,
             operation,
             terminal,
-            result: Ok(StartedTerminal {
+            result: Ok(Box::new(StartedTerminal {
                 handle,
                 session,
                 spawned: true,
                 save_failure: None,
-            }),
+            })),
         }));
         assert!(matches!(
             app.cards.get(&card),
@@ -2410,12 +2414,12 @@ mod completion_tests {
             card,
             operation,
             terminal,
-            result: Ok(StartedTerminal {
+            result: Ok(Box::new(StartedTerminal {
                 handle,
                 session,
                 spawned: false,
                 save_failure: None,
-            }),
+            })),
         }));
         assert!(!app.terminal_start_in_flight(card));
         assert!(!app.terminal_failure.attempts.contains_key(&card));
@@ -2574,12 +2578,12 @@ mod ownership_tests {
             card,
             operation: stale,
             terminal,
-            result: Ok(StartedTerminal {
+            result: Ok(Box::new(StartedTerminal {
                 handle,
                 session,
                 spawned: true,
                 save_failure: None,
-            }),
+            })),
         }));
         assert!(app.terminal_runtime_claims(terminal));
         if native_owner {

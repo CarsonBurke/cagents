@@ -142,6 +142,8 @@ impl Action {
     }
 }
 
+// Returned by `update` and consumed at once, so boxing would only add allocations.
+#[allow(clippy::large_enum_variant)]
 pub enum Effect {
     Request { sequence: u64, request: Request },
     OpenRun(RunDetail),
@@ -1388,7 +1390,7 @@ impl State {
                         self.rows.push(automation.summary(None));
                         self.rows.sort_by_key(|row| row.id);
                     }
-                    self.selected = Some(automation);
+                    self.selected = Some(*automation);
                     if matches!(pending, Pending::Save) {
                         self.draft = None;
                         self.all_history = false;
@@ -1487,6 +1489,7 @@ impl State {
                     }
                 }
                 Ok(Response::Detail(detail)) => {
+                    let detail = *detail;
                     self.refresh_last_outcome(&detail.firing, false);
                     if matches!(pending, Pending::OpenRun) {
                         self.run = Some(detail.clone());
@@ -3948,12 +3951,12 @@ mod tests {
             assert_eq!(id, firing.id);
             state.update(Action::Received {
                 sequence,
-                result: std::sync::Arc::new(Ok(Response::Detail(RunDetail {
+                result: std::sync::Arc::new(Ok(Response::Detail(Box::new(RunDetail {
                     definition: owner.definition,
                     firing,
                     agent: None,
                     run: None,
-                }))),
+                })))),
             });
             let detail = Outline::of(&state, 900.0, 700.0);
             detail.text(&format!("Daily review · {expected_state}"));
@@ -4092,12 +4095,12 @@ mod tests {
         };
         state.update(Action::Received {
             sequence,
-            result: std::sync::Arc::new(Ok(Response::Detail(RunDetail {
+            result: std::sync::Arc::new(Ok(Response::Detail(Box::new(RunDetail {
                 definition: automation.definition,
                 firing: old,
                 agent: None,
                 run: None,
-            }))),
+            })))),
         });
         assert_eq!(state.rows[0].last_state, Some(FiringState::Failed));
     }
@@ -4167,7 +4170,7 @@ mod tests {
         assert!(matches!(request, Request::List { .. }));
         state.update(Action::Received {
             sequence: poll,
-            result: std::sync::Arc::new(Ok(Response::Detail(detail))),
+            result: std::sync::Arc::new(Ok(Response::Detail(Box::new(detail)))),
         });
         assert!(state.run.is_none());
         assert_eq!(state.pending.unwrap().0, browse);
@@ -4287,7 +4290,7 @@ mod tests {
             },
         }) = state.update(Action::Received {
             sequence,
-            result: std::sync::Arc::new(Ok(Response::Automation(saved))),
+            result: std::sync::Arc::new(Ok(Response::Automation(Box::new(saved)))),
         })
         else {
             panic!("the saved detail requests its own history");
@@ -4598,7 +4601,7 @@ mod tests {
         assert!(matches!(
             state.update(Action::Received {
                 sequence,
-                result: std::sync::Arc::new(Ok(Response::Automation(owner))),
+                result: std::sync::Arc::new(Ok(Response::Automation(Box::new(owner)))),
             }),
             Some(Effect::Request {
                 request: Request::History { before: None, .. },
@@ -4646,7 +4649,7 @@ mod tests {
         ));
         state.update(Action::Received {
             sequence,
-            result: std::sync::Arc::new(Ok(Response::Automation(owner))),
+            result: std::sync::Arc::new(Ok(Response::Automation(Box::new(owner)))),
         });
         assert!(
             matches!(state.pending, Some((_, Pending::RefreshHistory { .. }))),
@@ -5222,7 +5225,7 @@ mod tests {
             sequence: history, ..
         }) = state.update(Action::Received {
             sequence: show,
-            result: std::sync::Arc::new(Ok(Response::Automation(selected))),
+            result: std::sync::Arc::new(Ok(Response::Automation(Box::new(selected)))),
         })
         else {
             panic!("background history poll");
@@ -5505,7 +5508,7 @@ mod tests {
         assert!(state.selected.is_none());
         let Some(Effect::Request { sequence, request }) = state.update(Action::Received {
             sequence,
-            result: std::sync::Arc::new(Ok(Response::Automation(automation.clone()))),
+            result: std::sync::Arc::new(Ok(Response::Automation(Box::new(automation.clone())))),
         }) else {
             panic!("history request expected after selection");
         };
@@ -5650,7 +5653,7 @@ mod tests {
         };
         state.update(Action::Received {
             sequence: sequence.wrapping_sub(1),
-            result: std::sync::Arc::new(Ok(Response::Automation(automation()))),
+            result: std::sync::Arc::new(Ok(Response::Automation(Box::new(automation())))),
         });
         assert!(state.selected.is_none());
         assert!(state.pending.is_some());
@@ -6036,7 +6039,7 @@ mod tests {
         };
         state.update(Action::Received {
             sequence,
-            result: std::sync::Arc::new(Ok(Response::Automation(created.clone()))),
+            result: std::sync::Arc::new(Ok(Response::Automation(Box::new(created.clone())))),
         });
         assert_eq!(state.selected.as_ref().unwrap().id, created.id);
         assert!(
@@ -6550,7 +6553,7 @@ mod tests {
                     list_refresh_rows(PAGE * 2 + 1)[PAGE..].to_vec(),
                 )),
                 "before" => Ok(Response::Listed(vec![rows[0].clone()])),
-                "wrong response" => Ok(Response::Automation(automation())),
+                "wrong response" => Ok(Response::Automation(Box::new(automation()))),
                 _ => Err("Fixture list read failed".into()),
             };
             state.update(Action::Received {
@@ -6625,7 +6628,7 @@ mod tests {
                     let mut selected = automation();
                     selected.id = id;
                     assert!(
-                        matches!(state.update(Action::Received { sequence, result: std::sync::Arc::new(Ok(Response::Automation(selected))) }), Some(Effect::Request { request: Request::History { id: Some(actual), .. }, .. }) if actual == id)
+                        matches!(state.update(Action::Received { sequence, result: std::sync::Arc::new(Ok(Response::Automation(Box::new(selected)))) }), Some(Effect::Request { request: Request::History { id: Some(actual), .. }, .. }) if actual == id)
                     );
                     assert_eq!(state.selected.as_ref().unwrap().id, id);
                 }
@@ -6663,7 +6666,7 @@ mod tests {
             request: Request::History { id: Some(id), .. },
         }) = state.update(Action::Received {
             sequence,
-            result: std::sync::Arc::new(Ok(Response::Automation(saved.clone()))),
+            result: std::sync::Arc::new(Ok(Response::Automation(Box::new(saved.clone())))),
         })
         else {
             panic!()
@@ -7315,12 +7318,12 @@ mod tests {
                 _ => {}
             }
             let response = if bad == "detail" {
-                Response::Detail(RunDetail {
+                Response::Detail(Box::new(RunDetail {
                     definition: automation().definition,
                     firing: original[0].clone(),
                     agent: None,
                     run: None,
-                })
+                }))
             } else {
                 Response::History(page)
             };
@@ -7355,7 +7358,7 @@ mod tests {
         };
         let Some(Effect::Request { sequence, .. }) = state.update(Action::Received {
             sequence,
-            result: std::sync::Arc::new(Ok(Response::Automation(owner.clone()))),
+            result: std::sync::Arc::new(Ok(Response::Automation(Box::new(owner.clone())))),
         }) else {
             panic!("initial scoped history")
         };
@@ -7386,7 +7389,7 @@ mod tests {
         assert_eq!(id, owner.id);
         let Some(Effect::Request { sequence, .. }) = state.update(Action::Received {
             sequence,
-            result: std::sync::Arc::new(Ok(Response::Automation(owner))),
+            result: std::sync::Arc::new(Ok(Response::Automation(Box::new(owner)))),
         }) else {
             panic!("scoped newest read")
         };
@@ -7443,12 +7446,12 @@ mod tests {
                 _ => {}
             }
             let response = if bad == "detail" {
-                Response::Detail(RunDetail {
+                Response::Detail(Box::new(RunDetail {
                     definition: automation().definition,
                     firing: original[PAGE].clone(),
                     agent: None,
                     run: None,
-                })
+                }))
             } else {
                 Response::History(page)
             };
@@ -7512,7 +7515,7 @@ mod tests {
         for reply in [
             Ok(Response::History(history_page(vec![firing.clone()], false))),
             Err("Temporary history read failure".into()),
-            Ok(Response::Detail(run_of(&owner))),
+            Ok(Response::Detail(Box::new(run_of(&owner)))),
             Ok(Response::History(history_page(vec![firing.clone()], false))),
         ] {
             let Some(Effect::Request {
@@ -7529,7 +7532,7 @@ mod tests {
                 request: Request::History { id, .. },
             }) = state.update(Action::Received {
                 sequence,
-                result: std::sync::Arc::new(Ok(Response::Automation(owner.clone()))),
+                result: std::sync::Arc::new(Ok(Response::Automation(Box::new(owner.clone())))),
             })
             else {
                 panic!("the refresh continues to the selected history");
@@ -7585,7 +7588,7 @@ mod tests {
         assert!(state.error.is_none());
         let Some(Effect::Request { sequence, .. }) = state.update(Action::Received {
             sequence,
-            result: std::sync::Arc::new(Ok(Response::Automation(other.clone()))),
+            result: std::sync::Arc::new(Ok(Response::Automation(Box::new(other.clone())))),
         }) else {
             panic!("read the new subject's history");
         };
@@ -7629,10 +7632,10 @@ mod tests {
                     Response::Listed(vec![owner.summary(None)])
                 }
                 Request::Show { id } if surface == "history" && id == owner.id => {
-                    Response::Automation(owner)
+                    Response::Automation(Box::new(owner))
                 }
                 Request::ShowFiring { id } if surface == "run" && id == detail.firing.id => {
-                    Response::Detail(detail)
+                    Response::Detail(Box::new(detail))
                 }
                 _ => panic!("poll the same {surface} subject"),
             };
@@ -7720,7 +7723,7 @@ mod tests {
         assert_eq!(id, detail.firing.id);
         state.update(Action::Received {
             sequence,
-            result: std::sync::Arc::new(Ok(Response::Detail(detail))),
+            result: std::sync::Arc::new(Ok(Response::Detail(Box::new(detail)))),
         });
         assert_eq!(state.error.as_deref(), Some(refusal));
         assert!(matches!(
@@ -7743,7 +7746,7 @@ mod tests {
                 request: Request::History { id, .. },
             }) = state.update(Action::Received {
                 sequence,
-                result: std::sync::Arc::new(Ok(Response::Automation(value.clone()))),
+                result: std::sync::Arc::new(Ok(Response::Automation(Box::new(value.clone())))),
             })
             else {
                 panic!("the selected definition reads its history")
@@ -7937,7 +7940,7 @@ mod tests {
             assert_eq!(id, firing.firing.id);
             state.update(Action::Received {
                 sequence,
-                result: std::sync::Arc::new(Ok(Response::Detail(firing.clone()))),
+                result: std::sync::Arc::new(Ok(Response::Detail(Box::new(firing.clone())))),
             });
             let Some(Effect::Request {
                 sequence,
@@ -7983,7 +7986,7 @@ mod tests {
             };
             state.update(Action::Received {
                 sequence,
-                result: std::sync::Arc::new(Ok(Response::Detail(first.clone()))),
+                result: std::sync::Arc::new(Ok(Response::Detail(Box::new(first.clone())))),
             });
             assert_eq!(state.notice.as_deref(), Some(message));
             assert_eq!(
@@ -8005,7 +8008,7 @@ mod tests {
             );
             state.update(Action::Received {
                 sequence,
-                result: std::sync::Arc::new(Ok(Response::Detail(other.clone()))),
+                result: std::sync::Arc::new(Ok(Response::Detail(Box::new(other.clone())))),
             });
             assert_eq!(state.run.as_ref().unwrap().firing.id, other.firing.id);
             assert!(state.notice.is_none());
@@ -8185,7 +8188,7 @@ mod tests {
         let owner_id = owner.id;
         let Some(Effect::Request { sequence, request }) = selecting.update(Action::Received {
             sequence,
-            result: std::sync::Arc::new(Ok(Response::Automation(owner))),
+            result: std::sync::Arc::new(Ok(Response::Automation(Box::new(owner)))),
         }) else {
             panic!("selection must finish its foreground history request");
         };

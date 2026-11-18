@@ -3218,7 +3218,7 @@ mod tests {
                 session_id: None,
             },
             proof: None,
-            terminal,
+            terminal: terminal.map(Box::new),
         }
     }
 

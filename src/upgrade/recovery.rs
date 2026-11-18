@@ -389,7 +389,7 @@ impl Census {
                     super::floor::same_allocation(&presentation.session, saved)
                 }
                 crate::model::CardKind::Terminal(saved) => {
-                    presentation.session.terminal.as_ref() == Some(saved)
+                    presentation.session.terminal.as_deref() == Some(saved)
                 }
                 _ => false,
             };
@@ -541,7 +541,7 @@ fn preparation_size(authority: &Authority) -> Result<usize, String> {
                 .census
                 .chats
                 .iter()
-                .filter_map(|chat| chat.terminal.as_ref()),
+                .filter_map(|chat| chat.terminal.as_deref()),
         )
         .collect();
     encoded_size(
@@ -1787,7 +1787,7 @@ fn verified_terminal(
             census
                 .chats
                 .iter()
-                .filter_map(|chat| chat.terminal.as_ref()),
+                .filter_map(|chat| chat.terminal.as_deref()),
         )
         .any(|known| {
             (recovered_terminal(known, &actual.session)

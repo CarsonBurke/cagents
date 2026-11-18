@@ -602,7 +602,7 @@ fn shared_chat_removal_accepts_only_its_original_native_cleanup() {
     };
     let mut paired_owner = fixture.source.clone();
     paired_owner.id = TerminalId::new();
-    paired_owner.terminal = Some(paired.clone());
+    paired_owner.terminal = Some(Box::new(paired.clone()));
     let mut state = fixture.host.lock().unwrap();
     state.native_closing.clear();
     state.native_closing.insert(
@@ -1261,14 +1261,14 @@ fn codex_start_paired_console_without_surviving_execution_starts() {
         return;
     };
     let mut fixture = codex_start_fixture(&root);
-    fixture.source.terminal = Some(
+    fixture.source.terminal = Some(Box::new(
         crate::terminal_ipc::TerminalDescriptor::relaunchable(
             fixture.source.id,
             fixture.source.launch.recipe.clone(),
             None,
         )
         .session,
-    );
+    ));
     std::os::unix::fs::symlink(root.join("missing-socket"), fixture.socket()).unwrap();
     assert_codex_started(&fixture, &root);
 }
@@ -1324,7 +1324,7 @@ fn codex_picker_resume_with_earlier_boot_console_evidence_starts() {
         boot_id: proof.boot_id.clone(),
         host_incarnation: proof.host_incarnation,
     };
-    fixture.source.terminal = Some(console);
+    fixture.source.terminal = Some(Box::new(console));
     let directory = registry::directory(Kind::Terminal).unwrap();
     crate::secure_file::prepare_private_directory(&directory).unwrap();
     Record {
@@ -1370,7 +1370,7 @@ fn codex_picker_reports_unreadable_console_evidence() {
     let path = registry::socket(&directory, console.id).with_extension("json");
     std::fs::write(&path, "unreadable record").unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    fixture.source.terminal = Some(console);
+    fixture.source.terminal = Some(Box::new(console));
     let failure = process_inner(
         &fixture.host,
         1,
@@ -1705,7 +1705,7 @@ fn codex_start_waits_for_a_live_paired_console_without_a_holder_record() {
     .session;
     let descriptor =
         crate::host::state::spawn_terminal(&fixture.host, 1, terminal, Default::default()).unwrap();
-    fixture.source.terminal = Some(descriptor.session);
+    fixture.source.terminal = Some(Box::new(descriptor.session));
     let id = fixture.source.id;
     let handle = fixture.host.lock().unwrap().terminals[&id].handle.clone();
     assert!(

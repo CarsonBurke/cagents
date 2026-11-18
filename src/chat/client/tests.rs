@@ -2376,7 +2376,7 @@ fn a_restarted_daemon_still_resumes_the_conversation_a_card_was_showing() {
     // refuses one outright for any chat that still names a source
     // terminal, and a refused start is a card that does not come back.
     let mut converted = omp_card(Some(CONVERSATION), Some(stale));
-    converted.terminal = Some(crate::model::TerminalSession {
+    converted.terminal = Some(Box::new(crate::model::TerminalSession {
         owned_codex_listener: None,
         recovery_origin: None,
         predecessor: None,
@@ -2388,7 +2388,7 @@ fn a_restarted_daemon_still_resumes_the_conversation_a_card_was_showing() {
         },
         resume_hint: None,
         transcript_path: None,
-    });
+    }));
     let (outcome, _) = negotiate(
         &live,
         converted,

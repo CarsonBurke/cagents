@@ -108,11 +108,8 @@ enum ActorCommand {
         decline_only: bool,
         effects: Arc<AtomicU8>,
     },
-    UpdateSource(
-        super::Session,
-        Option<crate::model::LaunchRecipe>,
-        Option<crate::terminal::holder::Record>,
-    ),
+    /// Boxed: rare, and several times the size of every other command.
+    UpdateSource(Box<SourceUpdate>),
     Provider {
         run: Option<crate::model::RunId>,
         command: Command,
@@ -141,6 +138,13 @@ enum ActorCommand {
         including_subagents: bool,
     },
 }
+
+struct SourceUpdate {
+    source: super::Session,
+    execution_console: Option<crate::model::LaunchRecipe>,
+    paired_holder: Option<crate::terminal::holder::Record>,
+}
+
 /// A refusal before a Step is prepared proves no provider effects; after a
 /// Step is admitted, an uncertain acknowledgement never authorizes replay.
 struct InputEffects(Option<Arc<AtomicU8>>);
@@ -320,9 +324,9 @@ struct Inner {
 }
 
 enum NativeOwnership {
-    New(super::Session, BTreeMap<String, String>),
+    New(Box<super::Session>, BTreeMap<String, String>),
     Adopted(
-        super::native_holder::Holder,
+        Box<super::native_holder::Holder>,
         crate::daemon::holder_registry::Process,
     ),
 }
@@ -390,7 +394,7 @@ impl LocalHandle {
             initial,
             store,
             id,
-            Some(NativeOwnership::New(source, recovery_environment)),
+            Some(NativeOwnership::New(Box::new(source), recovery_environment)),
             notify,
         )
     }
@@ -414,7 +418,7 @@ impl LocalHandle {
             initial,
             store,
             recovery.confirmed_thread,
-            Some(NativeOwnership::Adopted(holder, server)),
+            Some(NativeOwnership::Adopted(Box::new(holder), server)),
             notify,
         )
     }
@@ -559,9 +563,9 @@ impl LocalHandle {
             Some(NativeOwnership::New(source, _))
                 if matches!(spec.transport, TransportSpec::OwnedUnixWebSocket { .. }) =>
             {
-                Some(super::native_holder::spawn(spec.clone(), source)?)
+                Some(super::native_holder::spawn(spec.clone(), *source)?)
             }
-            Some(NativeOwnership::Adopted(holder, _)) => Some(holder),
+            Some(NativeOwnership::Adopted(holder, _)) => Some(*holder),
             _ => None,
         };
         let (wake, reader) = UnixStream::pair().map_err(|e| e.to_string())?;
@@ -1123,7 +1127,11 @@ impl LocalHandle {
         self.0
             .commands
             .try_send((
-                ActorCommand::UpdateSource(source, execution_console, paired_holder),
+                ActorCommand::UpdateSource(Box::new(SourceUpdate {
+                    source,
+                    execution_console,
+                    paired_holder,
+                })),
                 reply,
             ))
             .map_err(|error| format!("Native ownership queue unavailable: {error}"))?;
@@ -3024,7 +3032,12 @@ impl Actor {
                         },
                     )
                 }
-                ActorCommand::UpdateSource(source, execution_console, paired_holder) => {
+                ActorCommand::UpdateSource(update) => {
+                    let SourceUpdate {
+                        source,
+                        execution_console,
+                        paired_holder,
+                    } = *update;
                     let result = self
                         .native_holder
                         .as_mut()

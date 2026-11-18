@@ -286,7 +286,7 @@ impl VerifiedView {
                         .census
                         .chats
                         .iter()
-                        .filter_map(|chat| chat.terminal.as_ref()),
+                        .filter_map(|chat| chat.terminal.as_deref()),
                 )
                 .any(|known| same_terminal(known, original))
     }

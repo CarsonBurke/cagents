@@ -43,7 +43,7 @@ pub(super) fn expire_for_test(host: &SharedHost, client: ClientId) {
 }
 
 pub(in crate::host) enum Attempt {
-    Ready(Grant),
+    Ready(Box<Grant>),
     Spent(uuid::Uuid),
 }
 
@@ -202,7 +202,9 @@ pub(in crate::host) fn resolve(
         ));
     }
     let resolved = grant.resolved.clone();
-    state.chat_resolutions.insert(client, Attempt::Ready(grant));
+    state
+        .chat_resolutions
+        .insert(client, Attempt::Ready(Box::new(grant)));
     Ok(resolved)
 }
 

@@ -1104,7 +1104,7 @@ fn completed_close_preserves_a_replacement_worker_and_exact_native_pair() {
                 session: crate::chat::Session {
                     id,
                     proof: Some(proof),
-                    terminal: Some(current.clone()),
+                    terminal: Some(Box::new(current.clone())),
                     launch: crate::chat::Launch {
                         provider: crate::agent::Provider::Codex,
                         recipe: current.launch.clone(),
@@ -1467,7 +1467,7 @@ fn explicit_close_retains_registered_original_until_actual_holder_receipt() {
     refused_recipe.program = "/missing-retirement-claim-never-started".into();
     let candidate = crate::chat::Session {
         id: TerminalId::new(),
-        terminal: Some(source.clone()),
+        terminal: Some(Box::new(source.clone())),
         proof: Some(proof.clone()),
         launch: crate::chat::Launch {
             provider: crate::agent::Provider::Claude,
@@ -1911,7 +1911,7 @@ fn assert_completed_native_confirmation_case(
                     native_continuity: Default::default(),
                     owned_codex_listener: None,
                     proof: Some(proof),
-                    terminal: Some(session.clone()),
+                    terminal: Some(Box::new(session.clone())),
                     launch: chat::Launch {
                         provider,
                         recipe,
@@ -1977,7 +1977,7 @@ fn assert_completed_native_confirmation_case(
         .get_mut(&session.id)
         .unwrap()
         .session
-        .terminal = Some(session.clone());
+        .terminal = Some(Box::new(session.clone()));
     assert!(matches!(
         retry_retirement_close(&host, || request(true)).0,
         ServerResponse::TerminalCloseChecked {

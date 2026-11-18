@@ -721,7 +721,7 @@ mod tests {
             recipe: source.launch.recipe.clone(),
         }];
         terminal.title = Some("fixture native title 🦀".into());
-        source.terminal = Some(terminal.session.clone());
+        source.terminal = Some(Box::new(terminal.session.clone()));
         assert!(source.has_valid_native_continuity());
         assert!(terminal.session.owns_codex_listener());
         (source, terminal)

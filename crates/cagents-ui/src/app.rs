@@ -4005,6 +4005,8 @@ impl SettingsDraft {
     }
 }
 
+// A return value its caller consumes at once, so boxing would only add an allocation.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 enum SettingsDecision {
     Invalid(String),
@@ -15980,7 +15982,7 @@ impl Application for Cagents {
         for card in &app.durable.cards {
             let terminal = match &card.kind {
                 CardKind::Terminal(terminal) => Some(terminal),
-                CardKind::Chat(chat) => chat.terminal.as_ref(),
+                CardKind::Chat(chat) => chat.terminal.as_deref(),
                 _ => None,
             };
             if let Some(terminal) = terminal {

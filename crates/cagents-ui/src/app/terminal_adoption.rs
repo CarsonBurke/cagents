@@ -786,7 +786,7 @@ mod tests {
                 session_id: Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into()),
             },
             proof: None,
-            terminal: Some(saved.clone()),
+            terminal: Some(Box::new(saved.clone())),
         });
         let origin = saved.id;
         let mut descendant = saved;

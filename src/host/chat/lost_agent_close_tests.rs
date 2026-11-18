@@ -595,7 +595,7 @@ fn a_native_discovery_owner_refuses_lost_agent_close() {
     view_recipe.environment.clear();
     let view = paired_view(view_recipe);
     let paired = view.id;
-    fixture.source.terminal = Some(view.clone());
+    fixture.source.terminal = Some(Box::new(view.clone()));
     let source = &fixture.source;
     register_authority(&host, source);
     let accepted = lost_agent(&host, fixture.directory.path(), source);
@@ -1038,7 +1038,7 @@ fn a_claimed_allocation_or_paired_terminal_refuses_lost_close() {
             let mut fixture = retained_source(&host, "earlier-boot");
             let view = paired_view(fixture.source.launch.recipe.clone());
             let paired = view.id;
-            fixture.source.terminal = Some(view);
+            fixture.source.terminal = Some(Box::new(view));
             let source = fixture.source.clone();
             assert!(source.has_valid_native_continuity());
             register_authority(&host, &source);
@@ -1047,7 +1047,7 @@ fn a_claimed_allocation_or_paired_terminal_refuses_lost_close() {
             let handoff = || {
                 TerminalHandoff::new(
                     source.clone(),
-                    source.terminal.clone().unwrap(),
+                    source.terminal.as_deref().cloned().unwrap(),
                     1,
                     BTreeMap::new(),
                     Instant::now() + Duration::from_secs(60),

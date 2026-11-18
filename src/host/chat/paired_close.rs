@@ -29,7 +29,7 @@ impl Owners {
                         "The retained actor's paired terminal lacks authenticated cleanup ownership",
                     ));
                 }
-                Some((source.clone(), worker.clone()))
+                Some(((**source).clone(), worker.clone()))
             }
             _ => {
                 return Err(unavailable(
