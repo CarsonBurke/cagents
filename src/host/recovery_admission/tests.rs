@@ -285,6 +285,32 @@ fn a_fresh_conversation_sends_and_reopens_while_recovery_holds_retained_owners()
         );
         conversation.unwrap()
     };
+    // The streaming provider fixture needs its saved history for a disk resume.
+    let project: String = fresh
+        .launch
+        .recipe
+        .working_directory
+        .to_str()
+        .unwrap()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let history = root.join("home/.claude/projects").join(project);
+    std::fs::create_dir_all(&history).unwrap();
+    std::fs::write(history.join(format!("{conversation}.jsonl")), b"").unwrap();
+    assert!(matches!(
+        process_request(
+            &host,
+            user,
+            ClientRequest::ChatVisibility {
+                chat_id: fresh.id,
+                visible: true,
+            },
+        )
+        .unwrap()
+        .0,
+        ServerResponse::Accepted
+    ));
     process_request(
         &host,
         user,
