@@ -43,7 +43,9 @@ What a later protocol only added detail to is sent as the CLI knew it: on
 protocols before 166, a subagent waiting on its own background work reads as
 running.
 An admitted CLI from before protocol 179 receives store contention as a
-retryable `Internal` error so it can decode the reply. It keeps the response
+retryable `Internal` error so it can decode the reply. One from before protocol 188
+receives a refusal that came before anything changed (`not_admitted`) as
+`invalid_request`, with the same message. It keeps the response
 timeouts of its original executable.
 Each protocol's postcard wire format is recorded under
 `tests/fixtures/wire-formats/`. A test checks that every listed older protocol

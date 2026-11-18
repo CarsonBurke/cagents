@@ -60,7 +60,7 @@ pub struct OlderClient {
 /// across an update to this release and keep running its CLI.
 const CANDIDATE_LINE: OlderClient = OlderClient {
     protocol: CANDIDATE_LINE_PROTOCOL,
-    proven_at: 187,
+    proven_at: 188,
     client_requests: 74,
     server_messages: 17,
     server_responses: 40,
@@ -105,6 +105,10 @@ pub(crate) const ENDED_TOOL_STATUS: u16 = 177;
 /// Earlier clients receive retryable Internal errors for store contention.
 pub(super) const STORE_BUSY_ERROR: u16 = 179;
 
+/// Earlier clients receive `InvalidRequest`, with the same sentence and
+/// retryability, for a refusal that came before anything changed.
+pub(super) const NOT_ADMITTED_ERROR: u16 = 188;
+
 /// The first protocol whose account usage readings carry reset inventories and
 /// reported plan details. An earlier client is sent the reading without them.
 pub(crate) const PLAN_AND_RESET_READINGS: u16 = 184;
@@ -130,6 +134,11 @@ const RESTATED_VARIANTS: &[(&str, &str, u16)] = &[
         "cagents::terminal::ipc::ProtocolErrorCode",
         "store_busy",
         STORE_BUSY_ERROR,
+    ),
+    (
+        "cagents::terminal::ipc::ProtocolErrorCode",
+        "not_admitted",
+        NOT_ADMITTED_ERROR,
     ),
 ];
 
@@ -490,43 +499,75 @@ mod tests {
     use super::*;
     use crate::terminal_ipc::{ServerResponse, TerminalCloseResult};
 
+    /// Each error code a later protocol appended reaches an older client as
+    /// the code it knows, with its sentence and retryability, while the
+    /// current protocol and unscoped JSON keep the new code.
     #[test]
-    fn store_busy_errors_preserve_retryability_for_current_and_carried_clis() {
+    fn appended_error_codes_reach_carried_clis_as_codes_they_know() {
         use crate::terminal_ipc::{ServerEnvelope, ServerEnvelopeRef, read_frame, write_frame};
-        let error = ProtocolError::new(ProtocolErrorCode::StoreBusy, "database is locked", true);
         let proof = crate::model::HostSessionProof {
-            host_session_id: "store-busy-wire".into(),
+            host_session_id: "appended-error-wire".into(),
             boot_id: "boot".into(),
             host_incarnation: "incarnation".into(),
         };
-        for (version, expected) in [
-            (CANDIDATE_LINE_PROTOCOL, ProtocolErrorCode::Internal),
-            (177, ProtocolErrorCode::Internal),
-            (178, ProtocolErrorCode::Internal),
-            (STORE_BUSY_ERROR, ProtocolErrorCode::StoreBusy),
-        ] {
-            let message = ServerMessage::Error(error.clone());
-            let mut frame = Vec::new();
-            write_frame(
-                &mut frame,
-                &ServerEnvelopeRef {
-                    version,
-                    request_id: Some(17),
-                    proof: &proof,
-                    message: &message,
-                },
-            )
-            .unwrap();
-            let decoded: ServerEnvelope = read_frame(&mut frame.as_slice()).unwrap().unwrap();
-            assert_eq!(decoded.version, version);
-            assert_eq!(decoded.request_id, Some(17));
-            assert_eq!(decoded.proof, proof);
-            assert_eq!(
-                decoded.message,
-                ServerMessage::Error(ProtocolError::new(expected, error.message.clone(), true,))
-            );
-            // Encoding an older frame must not change unscoped JSON output.
-            assert_eq!(serde_json::to_value(&error).unwrap()["code"], "store_busy");
+        let cases = [
+            (
+                ProtocolError::new(ProtocolErrorCode::StoreBusy, "database is locked", true),
+                "store_busy",
+                vec![
+                    (CANDIDATE_LINE_PROTOCOL, ProtocolErrorCode::Internal),
+                    (177, ProtocolErrorCode::Internal),
+                    (178, ProtocolErrorCode::Internal),
+                    (STORE_BUSY_ERROR, ProtocolErrorCode::StoreBusy),
+                    (PROTOCOL_VERSION, ProtocolErrorCode::StoreBusy),
+                ],
+            ),
+            (
+                ProtocolError::new(
+                    ProtocolErrorCode::NotAdmitted,
+                    "This conversation has an explicitly pinned account",
+                    false,
+                ),
+                "not_admitted",
+                vec![
+                    (CANDIDATE_LINE_PROTOCOL, ProtocolErrorCode::InvalidRequest),
+                    (STORE_BUSY_ERROR, ProtocolErrorCode::InvalidRequest),
+                    (NOT_ADMITTED_ERROR - 1, ProtocolErrorCode::InvalidRequest),
+                    (NOT_ADMITTED_ERROR, ProtocolErrorCode::NotAdmitted),
+                    (PROTOCOL_VERSION, ProtocolErrorCode::NotAdmitted),
+                ],
+            ),
+        ];
+        for (error, json, versions) in cases {
+            for (version, expected) in versions {
+                let message = ServerMessage::Error(error.clone());
+                let mut frame = Vec::new();
+                write_frame(
+                    &mut frame,
+                    &ServerEnvelopeRef {
+                        version,
+                        request_id: Some(17),
+                        proof: &proof,
+                        message: &message,
+                    },
+                )
+                .unwrap();
+                let decoded: ServerEnvelope = read_frame(&mut frame.as_slice()).unwrap().unwrap();
+                assert_eq!(decoded.version, version);
+                assert_eq!(decoded.request_id, Some(17));
+                assert_eq!(decoded.proof, proof);
+                assert_eq!(
+                    decoded.message,
+                    ServerMessage::Error(ProtocolError::new(
+                        expected,
+                        error.message.clone(),
+                        error.retryable,
+                    )),
+                    "{json} at protocol {version}"
+                );
+                // Encoding an older frame must not change unscoped JSON output.
+                assert_eq!(serde_json::to_value(&error).unwrap()["code"], json);
+            }
         }
     }
 
