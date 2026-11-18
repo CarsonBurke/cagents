@@ -350,9 +350,9 @@ pub(super) fn group<'c, T: Borrow<Item>>(
     let mut turns: Vec<Turn> = Vec::new();
     let mut state = Open::Closed;
     let mut newest_running = None;
-    // Reasoning that draws nothing still took time. It counts toward the
-    // group it worked in, or, once the agent has handed control back, the
-    // group the work it led to opens.
+    // Reasoning that draws nothing still took time. While a group is taking
+    // work, it counts toward that group; once the agent has handed control
+    // back, by speaking or asking, toward the group the work it led to opens.
     let mut unplaced: Option<Span> = None;
     for (index, item) in items.iter().map(Borrow::borrow).enumerate() {
         if !renders(&item.content) {
@@ -361,6 +361,11 @@ pub(super) fn group<'c, T: Borrow<Item>>(
                     Some(turn) if state == Open::Taking => turn.spans(item),
                     _ => unplaced.get_or_insert_default().takes_in(Span::of(item)),
                 }
+            }
+            // A question asked after it still ends the group, though the
+            // item draws nothing.
+            if asked_after.contains(item.id.as_str()) {
+                state = Open::Closed;
             }
             continue;
         }
@@ -1529,6 +1534,22 @@ mod tests {
         assert_eq!(steps(&turns[0]), [2]);
         assert_eq!(slots(&turns[0]), [(3, Slot::Thinking)]);
         assert_eq!(steps(&turns[1]), [4]);
+    }
+
+    #[test]
+    fn a_question_after_contentless_reasoning_still_ends_its_group() {
+        let items = vec![
+            text("prompt", Role::User, Phase::Final, false),
+            timed(command("c1", ToolStatus::Succeeded), 1_000, 2_000),
+            thought("t", "", 2_000, 3_000),
+            timed(command("c2", ToolStatus::Succeeded), 5_000, 6_000),
+        ];
+        let asked = HashSet::from(["t".to_owned()]);
+        let turns = group(&items, &asked, plain);
+        assert_eq!(turns.len(), 2, "the work after the answer is its own group");
+        assert_eq!(steps(&turns[0]), [1]);
+        assert_eq!(steps(&turns[1]), [3]);
+        assert_eq!(turns[0].working_for(u64::MAX), Some(2_000));
     }
 
     #[test]
