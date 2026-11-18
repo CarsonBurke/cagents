@@ -400,6 +400,10 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
                     tracing::warn!(%error, "could not show the daemon startup notice");
                 }
             })?;
+        // This process opens the window, so its renderer will open the GPUs.
+        // Wake them now, while the daemon, session and app start below.
+        #[cfg(target_os = "linux")]
+        cagents_ui::gpu_wake::spawn();
         let device_source = if device_window_scoped && source.is_some() {
             source.map(str::to_owned)
         } else {

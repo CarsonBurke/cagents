@@ -12,6 +12,8 @@ pub mod automation_ui;
 pub mod browser;
 pub mod capability;
 pub(crate) mod desktop_cursor_blink;
+#[cfg(target_os = "linux")]
+pub mod gpu_wake;
 pub mod diff_view;
 pub mod document_render;
 pub mod editor;
