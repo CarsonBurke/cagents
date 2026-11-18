@@ -9819,6 +9819,11 @@ impl Cagents {
         {
             return Task::none();
         }
+        // Nothing has started in a pane whose reopen failed: it asks the
+        // service to prepare its conversation again.
+        if self.reopen_failed(card) {
+            return self.retry_reopening(card);
+        }
         #[cfg(feature = "integrated-browser")]
         if matches!(
             self.card_state(card).map(|state| &state.kind),
@@ -12242,7 +12247,12 @@ impl Cagents {
                                 .icon()
                                 .size(design::STATUS_ICON_SIZE)
                                 .into(),
-                            design::title(labels.unavailable).into(),
+                            design::title(if self.reopen_failed(id) {
+                                "Couldn't reopen this conversation"
+                            } else {
+                                labels.unavailable
+                            })
+                            .into(),
                         ])
                         .align_y(Alignment::Center)
                         .spacing(space::S)

@@ -8544,12 +8544,15 @@ impl Cagents {
         for card in used {
             self.chat_ui.default_chats.remove(&card);
         }
+        // A pane still reopening holds a conversation nobody knows the
+        // identity of yet; it is saved once it starts.
         let defaults = self
             .chat_ui
             .default_chats
             .iter()
             .copied()
             .chain(self.shared_views.defaults.keys().copied())
+            .chain(self.resume_ui.reopening.keys().copied())
             .collect::<HashSet<_>>();
         let open_cards = self
             .durable
@@ -8877,15 +8880,17 @@ impl Cagents {
     /// Opens a saved conversation in a new card, restoring its manual pane
     /// name before its first shared publication or provider attachment can
     /// report another title. `draft_from` is the card it was closed in, whose
-    /// kept draft the new card takes.
+    /// kept draft the new card takes. With `reopening`, the card waits for
+    /// that preparation, unsaved and unshared, and starts nothing yet.
     pub(super) fn insert_resumed_chat_card(
         &mut self,
         session: chat::Session,
         beside: Option<CardId>,
         user_title: Option<String>,
         draft_from: Option<CardId>,
-    ) -> Task<Message> {
-        self.insert_chat_card_with_lifetime(session, beside, false, draft_from, user_title)
+        reopening: Option<resume_ui::Reopening>,
+    ) -> (CardId, Task<Message>) {
+        self.insert_chat_card_as(session, beside, false, draft_from, user_title, reopening)
     }
 
     fn insert_chat_card_with_lifetime(
@@ -8896,6 +8901,19 @@ impl Cagents {
         draft_from: Option<CardId>,
         user_title: Option<String>,
     ) -> Task<Message> {
+        self.insert_chat_card_as(session, beside, ephemeral, draft_from, user_title, None)
+            .1
+    }
+
+    fn insert_chat_card_as(
+        &mut self,
+        session: chat::Session,
+        beside: Option<CardId>,
+        ephemeral: bool,
+        draft_from: Option<CardId>,
+        user_title: Option<String>,
+        reopening: Option<resume_ui::Reopening>,
+    ) -> (CardId, Task<Message>) {
         let beside = beside.and_then(|source| {
             let index = self.workspace.order().position(|id| id == source)?;
             let durable = self
@@ -8969,15 +8987,12 @@ impl Cagents {
                 self.status = Some(TransientNotice::error(error.to_string()));
                 ViewportUpdate::unchanged()
             });
-        let skills = if session.is_unstarted() {
-            self.open_chat_draft(card_id, session)
-        } else {
-            let intent = if session.native_continuity.retains_provider() {
-                chat::Intent::Restore
-            } else {
-                chat::Intent::Start
-            };
-            self.open_chat(card_id, session, intent)
+        let skills = match reopening {
+            Some(reopening) => {
+                self.resume_ui.reopening.insert(card_id, reopening);
+                Task::none()
+            }
+            None => self.open_placed_chat(card_id, session),
         };
         // An automatic placeholder is neither saved nor shared until someone
         // uses it (see `persistent_workspace`), so opening one, as entering an
@@ -8995,12 +9010,31 @@ impl Cagents {
         };
         // The new pane's input takes the keyboard through the workspace's
         // focus request, now if it is drawn or once it starts.
-        Task::batch([
+        let task = Task::batch([
             skills,
             self.apply_viewport(update, true, DurableChange::None),
             title,
             save,
-        ])
+        ]);
+        (card_id, task)
+    }
+
+    /// Opens the conversation `session` in the card `card` just placed for
+    /// it: its draft, when nothing has ever run it, or else a connection to it.
+    pub(super) fn open_placed_chat(
+        &mut self,
+        card: CardId,
+        session: chat::Session,
+    ) -> Task<Message> {
+        if session.is_unstarted() {
+            return self.open_chat_draft(card, session);
+        }
+        let intent = if session.native_continuity.retains_provider() {
+            chat::Intent::Restore
+        } else {
+            chat::Intent::Start
+        };
+        self.open_chat(card, session, intent)
     }
 
     /// Preserve only the exact explicit launch the failed pane was trying.
@@ -9412,6 +9446,8 @@ impl Cagents {
     /// process with nothing able to read it back.
     pub(super) fn chat_discard(&mut self, card: CardId) {
         self.chat_ui.default_chats.remove(&card);
+        // A late preparation answer for it then finds nothing to start.
+        self.forget_reopening(card);
         // A start still in flight is not dropped with the card: whatever it
         // leaves in the daemon is given up when it answers, as for a close.
         match self.chat_ui.phases.remove(&card) {
@@ -9467,7 +9503,19 @@ impl Cagents {
     }
 
     pub(super) fn chat_start_pending(&self, card: CardId) -> bool {
+        // A reopened conversation still being prepared starts once that ends.
+        self.chat_ui.phases.contains_key(&card) || self.reopen_preparing(card)
+    }
+    /// Whether `card` has begun starting its conversation, as opposed to
+    /// waiting for that start to be allowed.
+    #[cfg(test)]
+    pub(super) fn chat_start_began(&self, card: CardId) -> bool {
         self.chat_ui.phases.contains_key(&card)
+    }
+    /// Unsent text held for a card that has no chat runtime.
+    #[cfg(test)]
+    pub(super) fn held_chat_draft(&self, card: CardId) -> Option<&str> {
+        self.chat_ui.drafts.get(&card).map(String::as_str)
     }
     /// A shared echo may arrive before a starting chat has a runtime. Only
     /// the exact attempted descriptor reserves that attachment; a canonical
@@ -9802,6 +9850,12 @@ impl Cagents {
                 .pending_chat_admissions
                 .remove(&card);
             return remove;
+        }
+        // A reopened conversation still being prepared has started nothing
+        // from this pane, so closing it leaves the conversation as it was
+        // before the reopen; the preparation's answer is then ignored.
+        if self.reopen_pending(card) {
+            return self.remove_chat_card(card, None).unwrap_or_else(Task::none);
         }
         if self.pane_transfer_pending(card) {
             self.status = Some(TransientNotice::warning(

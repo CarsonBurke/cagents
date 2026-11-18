@@ -467,7 +467,6 @@ struct PendingReopen {
 pub(super) enum Reopen {
     Conversation {
         entry: Box<crate::persistence::SavedConversation>,
-        prepared: bool,
         generation: u64,
         replace: Option<CardId>,
     },
@@ -1117,13 +1116,12 @@ impl Cagents {
             match intent {
                 Reopen::Conversation {
                     entry,
-                    prepared,
                     generation,
                     replace,
                 } => {
-                    tasks.push(self.finish_deferred_conversation(
-                        *entry, prepared, generation, replace, same_home,
-                    ));
+                    tasks.push(
+                        self.finish_deferred_conversation(*entry, generation, replace, same_home),
+                    );
                 }
                 Reopen::Pane(card) if same_home => tasks.push(self.reopen_closed_pane(card)),
                 Reopen::Pane(_) => {}

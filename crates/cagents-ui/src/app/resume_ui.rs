@@ -54,8 +54,13 @@ pub(super) struct State {
     pub(super) asked_from: Option<CardId>,
     /// Transcripts read so far and transcripts to read, while indexing.
     indexing: Option<(usize, usize)>,
-    /// Whether a chosen conversation is being prepared to resume.
+    /// Whether a chosen conversation waits for its retiring channel to
+    /// settle before it can reopen there.
     pub(super) loading: bool,
+    /// Panes put in place for conversations still being prepared to resume.
+    pub(super) reopening: HashMap<CardId, Reopening>,
+    /// Numbers each preparation, so only the latest answer is applied.
+    attempts: u64,
     pub(super) error: Option<String>,
     limit: usize,
     selected: usize,
@@ -68,6 +73,18 @@ pub(super) struct State {
     /// The reader's Tab traversal setting while the picker owns Tab, which
     /// chooses where to look and must leave the keyboard in the search.
     restore_keyboard_nav: Option<bool>,
+}
+
+/// A pane put in place for a saved conversation before the service has
+/// prepared it to resume. Until preparation answers, nobody knows which
+/// identity it will hold, so the pane is neither saved nor shared and starts
+/// nothing (see [`Cagents::reopening_prepared`]).
+pub(super) struct Reopening {
+    attempt: u64,
+    /// The conversation as saved, which the pane holds meanwhile.
+    entry: SavedConversation,
+    /// Preparation failed: the pane says why, and Retry prepares it again.
+    failed: bool,
 }
 
 /// A conversation as the picker lists it.
@@ -283,14 +300,11 @@ pub enum Action {
     /// The pointer entered the row at this position among the matches, which
     /// becomes the selection.
     Point(usize, CardId),
-    /// The service's answer to preparing a resume. `Ok(None)` means it could
-    /// not be reached to prepare an unstarted successor, which then resumes as
-    /// a conversation of its own, as it would without one.
-    Prepared(
-        u64,
-        Box<SavedConversation>,
-        Result<Option<Box<chat::Session>>, String>,
-    ),
+    /// The service's answer to preparing the resume pane `CardId` waits on,
+    /// for its numbered attempt. `Ok(None)` means it could not be reached to
+    /// prepare an unstarted successor, which then resumes as a conversation of
+    /// its own, as it would without one.
+    Prepared(CardId, u64, Result<Option<Box<chat::Session>>, String>),
 }
 
 /// What indexing has found so far, in the order it is found.
@@ -950,7 +964,8 @@ impl Cagents {
             }
             Action::Close => {
                 self.close_resume();
-                // Whatever was being prepared is abandoned with the picker.
+                // A reopen still waiting for its channel is abandoned with
+                // the picker.
                 self.resume_ui.loading = false;
                 self.resume_ui.generation = self.resume_ui.generation.wrapping_add(1);
                 self.workspace
@@ -1036,29 +1051,8 @@ impl Cagents {
                     .map(|&index| self.resume_ui.rows[index].card);
                 card.map_or_else(Task::none, |card| self.update_resume(Action::Resume(card)))
             }
-            Action::Prepared(generation, mut entry, result) => {
-                if generation != self.resume_ui.generation {
-                    return Task::none();
-                }
-                self.resume_ui.loading = false;
-                match result {
-                    Ok(Some(session)) => {
-                        if !prepared_resume_matches(&entry.session, &session) {
-                            self.resume_error("The service did not prepare this exact saved conversation. Its original identity was retained.");
-                            return Task::none();
-                        }
-                        entry.session = *session;
-                        if self.existing_conversation_card(&entry.session).is_some() {
-                            return self.resume_saved_conversation(*entry);
-                        }
-                        self.insert_resumed_conversation(*entry, true)
-                    }
-                    Ok(None) => self.insert_resumed_conversation(*entry, false),
-                    Err(error) => {
-                        self.resume_error(&error);
-                        Task::none()
-                    }
-                }
+            Action::Prepared(card, attempt, result) => {
+                self.reopening_prepared(card, attempt, result)
             }
         }
     }
@@ -1189,12 +1183,19 @@ impl Cagents {
         state.counts = counts;
     }
 
-    fn existing_conversation_card(&self, session: &chat::Session) -> Option<CardId> {
+    /// The open pane, other than `except`, that already holds the
+    /// conversation of `session`.
+    fn existing_conversation_card(
+        &self,
+        session: &chat::Session,
+        except: Option<CardId>,
+    ) -> Option<CardId> {
         self.durable
             .cards
             .iter()
             .find(|card| {
-                card.existence.is_open()
+                Some(card.id) != except
+                    && card.existence.is_open()
                     && !self.chat_awaiting_admission(card.id)
                     && match &card.kind {
                         CardKind::Chat(current) => same_conversation(current, session),
@@ -1211,26 +1212,10 @@ impl Cagents {
             return Task::none();
         }
         self.resume_ui.error = None;
-        let existing = self.existing_conversation_card(&entry.session);
-        if let Some(card) = existing {
+        // Includes a pane still being reopened for this conversation.
+        if let Some(card) = self.existing_conversation_card(&entry.session, None) {
             self.close_resume();
-            let scope = if let Some(channel) = self
-                .durable
-                .channels
-                .iter()
-                .find(|channel| channel.cards.contains(&card))
-                .map(|channel| channel.id)
-            {
-                self.select_channel(channel)
-            } else {
-                let owner = self
-                    .card_state(card)
-                    .and_then(|card| self.card_worktree(card))
-                    .map(Path::to_path_buf)
-                    .unwrap_or_else(|| entry.session.launch.recipe.working_directory.clone());
-                self.select_worktree(owner, false)
-            };
-            return Task::batch([scope, cosmic::task::message(Message::FocusCard(card))]);
+            return self.reveal_conversation_card(card, &entry.session);
         }
         let local_pending = self.chat_awaiting_admission(entry.card)
             && matches!(self.card_state(entry.card).map(|card| &card.kind),
@@ -1239,50 +1224,10 @@ impl Cagents {
             self.resume_error("This conversation is open outside this window. Return to its original window before resuming.");
             return Task::none();
         }
-        if let Some(task) = self.defer_retiring_conversation(&entry, false) {
+        if let Some(task) = self.defer_retiring_conversation(&entry) {
             return task;
         }
         let session = &entry.session;
-        if session.native_continuity.retains_provider() || unstarted_successor(session) {
-            let generation = self.resume_ui.generation;
-            self.resume_ui.loading = true;
-            let unstarted = unstarted_successor(session);
-            return cosmic::task::future(async move {
-                let source = entry.session.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    let socket = crate::terminal::ipc::daemon_socket_path()
-                        .map_err(|error| error.to_string())?;
-                    let mut client = match crate::control::ControlClient::connect(&socket) {
-                        Ok(client) => client,
-                        // Nothing runs to vouch for it, or to refuse it.
-                        Err(crate::control::ControlError::Connect(_)) if unstarted => {
-                            return Ok(None);
-                        }
-                        Err(error) => return Err(error.to_string()),
-                    };
-                    client
-                        .prepare_chat_resume(source)
-                        .map(|session| Some(Box::new(session)))
-                        .map_err(|error| error.to_string())
-                })
-                .await
-                .unwrap_or_else(|error| Err(error.to_string()));
-                Message::ResumeConversation(Action::Prepared(generation, Box::new(entry), result))
-            });
-        }
-        self.insert_resumed_conversation(entry, false)
-    }
-
-    fn insert_resumed_conversation(
-        &mut self,
-        entry: SavedConversation,
-        prepared: bool,
-    ) -> Task<Message> {
-        if let Some(task) = self.defer_retiring_conversation(&entry, prepared) {
-            return task;
-        }
-        let user_title = self.chrome_ui.user_titles.get(&entry.card).cloned();
-        let mut session = entry.session;
         if !session.launch.recipe.working_directory.is_dir()
             && !session.launch.needs_read_only_history()
         {
@@ -1293,15 +1238,232 @@ impl Cagents {
             self.resume_error(&error);
             return Task::none();
         }
-        // Preparation may either retain a live actor or allocate its exact
-        // successor after proved retirement. Both answers must survive intact;
-        // a second locally allocated ID loses the daemon's issued lineage.
-        if !prepared {
-            session.reset_owned_codex_listener();
-            session.id = TerminalId::new();
-            session.proof = None;
-            session.terminal = None;
+        if session.native_continuity.retains_provider() || unstarted_successor(session) {
+            return self.reopen_before_preparation(entry);
         }
+        let mut session = entry.session.clone();
+        // A conversation resumed without the service's preparation runs
+        // under an identity of its own.
+        session.reset_owned_codex_listener();
+        session.id = TerminalId::new();
+        session.proof = None;
+        session.terminal = None;
+        self.place_resumed_conversation(entry, session, None).1
+    }
+
+    /// Selects where the open `card` is and focuses it.
+    fn reveal_conversation_card(&mut self, card: CardId, session: &chat::Session) -> Task<Message> {
+        let scope = if let Some(channel) = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.cards.contains(&card))
+            .map(|channel| channel.id)
+        {
+            self.select_channel(channel)
+        } else {
+            let owner = self
+                .card_state(card)
+                .and_then(|card| self.card_worktree(card))
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| session.launch.recipe.working_directory.clone());
+            self.select_worktree(owner, false)
+        };
+        Task::batch([scope, cosmic::task::message(Message::FocusCard(card))])
+    }
+
+    /// Puts the pane of a conversation the service must prepare in place at
+    /// once, then asks the service to prepare it. Preparation either keeps
+    /// a live actor or allocates its exact successor, and the pane holds the
+    /// saved conversation, starting nothing, until it answers.
+    fn reopen_before_preparation(&mut self, entry: SavedConversation) -> Task<Message> {
+        self.resume_ui.attempts = self.resume_ui.attempts.wrapping_add(1);
+        let attempt = self.resume_ui.attempts;
+        let session = entry.session.clone();
+        let (card, placed) = self.place_resumed_conversation(entry, session, Some(attempt));
+        Task::batch([placed, self.prepare_reopening(card)])
+    }
+
+    /// Asks the service to prepare the conversation the pane `card` is
+    /// reopening, for its current attempt.
+    fn prepare_reopening(&mut self, card: CardId) -> Task<Message> {
+        let Some(reopening) = self.resume_ui.reopening.get(&card) else {
+            return Task::none();
+        };
+        let attempt = reopening.attempt;
+        let source = reopening.entry.session.clone();
+        let unstarted = unstarted_successor(&source);
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let socket = crate::terminal::ipc::daemon_socket_path()
+                    .map_err(|error| error.to_string())?;
+                let mut client = match crate::control::ControlClient::connect(&socket) {
+                    Ok(client) => client,
+                    // Nothing runs to vouch for it, or to refuse it.
+                    Err(crate::control::ControlError::Connect(_)) if unstarted => {
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(error.to_string()),
+                };
+                client
+                    .prepare_chat_resume(source)
+                    .map(|session| Some(Box::new(session)))
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .unwrap_or_else(|error| Err(error.to_string()));
+            Message::ResumeConversation(Action::Prepared(card, attempt, result))
+        })
+    }
+
+    /// Whether the pane `card` is reopening a conversation the service is
+    /// still preparing.
+    pub(super) fn reopen_preparing(&self, card: CardId) -> bool {
+        self.resume_ui
+            .reopening
+            .get(&card)
+            .is_some_and(|reopening| !reopening.failed)
+    }
+
+    /// Whether the pane `card` holds a conversation that has not started
+    /// since it was reopened: one being prepared, or whose preparation
+    /// failed. Such a pane is neither saved nor shared.
+    pub(super) fn reopen_pending(&self, card: CardId) -> bool {
+        self.resume_ui.reopening.contains_key(&card)
+    }
+
+    /// Whether preparing the conversation the pane `card` reopens failed.
+    pub(super) fn reopen_failed(&self, card: CardId) -> bool {
+        self.resume_ui
+            .reopening
+            .get(&card)
+            .is_some_and(|reopening| reopening.failed)
+    }
+
+    /// Applies the service's answer to the pane it was asked for. An answer
+    /// for a pane since closed, retried or given another conversation
+    /// changes nothing.
+    fn reopening_prepared(
+        &mut self,
+        card: CardId,
+        attempt: u64,
+        result: Result<Option<Box<chat::Session>>, String>,
+    ) -> Task<Message> {
+        let Some(reopening) = self
+            .resume_ui
+            .reopening
+            .get(&card)
+            .filter(|reopening| reopening.attempt == attempt && !reopening.failed)
+        else {
+            return Task::none();
+        };
+        let source = reopening.entry.session.clone();
+        if !self.card_state(card).is_some_and(|state| {
+            state.existence.is_open()
+                && matches!(&state.kind, CardKind::Chat(current) if *current == source)
+        }) {
+            self.resume_ui.reopening.remove(&card);
+            return Task::none();
+        }
+        let session = match result {
+            Ok(Some(session)) if prepared_resume_matches(&source, &session) => *session,
+            Ok(Some(_)) => {
+                return self.fail_reopening(
+                    card,
+                    "The service did not prepare this exact saved conversation. Its original identity was retained.",
+                );
+            }
+            Ok(None) => {
+                let mut session = source;
+                session.reset_owned_codex_listener();
+                session.id = TerminalId::new();
+                session.proof = None;
+                session.terminal = None;
+                session
+            }
+            Err(error) => return self.fail_reopening(card, &error),
+        };
+        // Opened in another pane meanwhile, which is then where it is. The
+        // placeholder still records its reopen while it closes, so its close
+        // asks nothing of the conversation the other pane holds.
+        if let Some(existing) = self.existing_conversation_card(&session, Some(card)) {
+            return Task::batch([
+                self.close_card_unasked(card),
+                self.reveal_conversation_card(existing, &session),
+            ]);
+        }
+        self.start_reopened(card, session)
+    }
+
+    /// Starts the prepared `session` in the pane put in place for it, which
+    /// from now on is saved and shared like any other.
+    fn start_reopened(&mut self, card: CardId, session: chat::Session) -> Task<Message> {
+        let Some(reopening) = self.resume_ui.reopening.remove(&card) else {
+            return Task::none();
+        };
+        if let Some(state) = self.card_state_mut(card) {
+            state.kind = CardKind::Chat(session.clone());
+        }
+        // What it had not sent when its card closed comes back with it.
+        if self.reclaim_kept_draft(reopening.entry.card) {
+            self.move_chat_draft(reopening.entry.card, card);
+        }
+        self.persist();
+        self.open_placed_chat(card, session)
+    }
+
+    /// Shows in the pane why its conversation could not be prepared. It
+    /// keeps the saved conversation, and Retry asks again.
+    fn fail_reopening(&mut self, card: CardId, error: &str) -> Task<Message> {
+        if let Some(reopening) = self.resume_ui.reopening.get_mut(&card) {
+            reopening.failed = true;
+        }
+        self.cards.insert(card, CardRuntime::Failed(error.into()));
+        Task::none()
+    }
+
+    /// Prepares the conversation of a pane whose preparation failed again.
+    pub(super) fn retry_reopening(&mut self, card: CardId) -> Task<Message> {
+        self.resume_ui.attempts = self.resume_ui.attempts.wrapping_add(1);
+        let attempt = self.resume_ui.attempts;
+        let Some(reopening) = self.resume_ui.reopening.get_mut(&card) else {
+            return Task::none();
+        };
+        reopening.attempt = attempt;
+        reopening.failed = false;
+        self.cards.remove(&card);
+        self.prepare_reopening(card)
+    }
+
+    /// Forgets the reopen of a pane being closed. A draft kept from the
+    /// pane it reopened is kept for this one instead, which a later reopen
+    /// brings back.
+    pub(super) fn forget_reopening(&mut self, card: CardId) {
+        let Some(reopening) = self.resume_ui.reopening.remove(&card) else {
+            return;
+        };
+        let source = reopening.entry.card;
+        if !self.durable.kept_chat_drafts.contains_key(&card)
+            && let Some(draft) = Arc::make_mut(&mut self.durable)
+                .kept_chat_drafts
+                .remove(&source)
+        {
+            Arc::make_mut(&mut self.durable)
+                .kept_chat_drafts
+                .insert(card, draft);
+        }
+    }
+
+    /// Opens the conversation `session` in a new pane where it belongs,
+    /// returning that pane. With `attempt`, the pane waits for that
+    /// preparation and starts nothing yet.
+    fn place_resumed_conversation(
+        &mut self,
+        entry: SavedConversation,
+        session: chat::Session,
+        attempt: Option<u64>,
+    ) -> (CardId, Task<Message>) {
+        let user_title = self.chrome_ui.user_titles.get(&entry.card).cloned();
         let replace = self.resume_ui.replace;
         self.close_resume();
         // Read before forgetting the closed card, which records where it was.
@@ -1314,25 +1476,28 @@ impl Cagents {
         let replace = replace.filter(|card| {
             self.chat_is_unused(*card) && self.workspace.order().any(|id| id == *card)
         });
-        // What it had not sent when its card closed comes back with it.
-        let draft_from = self.reclaim_kept_draft(entry.card).then_some(entry.card);
-        let insert = self.insert_resumed_chat_card(session, replace, user_title, draft_from);
+        // What it had not sent when its card closed comes back with it, once
+        // it starts.
+        let draft_from =
+            (attempt.is_none() && self.reclaim_kept_draft(entry.card)).then_some(entry.card);
+        let title = entry.title.clone();
+        let reopening = attempt.map(|attempt| Reopening {
+            attempt,
+            entry,
+            failed: false,
+        });
+        let (card, insert) =
+            self.insert_resumed_chat_card(session, replace, user_title, draft_from, reopening);
         // Manual names were installed before insertion. Otherwise publish
         // the saved automatic title instead of the provider's generic name.
-        if let Some(card) = self.durable.focused
-            && self.apply_reported_title(card, entry.title)
-        {
+        if self.apply_reported_title(card, title) {
             self.persist();
         }
         let discard = replace.map_or_else(Task::none, |card| self.close_card_unasked(card));
-        Task::batch([scope, insert, discard])
+        (card, Task::batch([scope, insert, discard]))
     }
 
-    fn defer_retiring_conversation(
-        &mut self,
-        entry: &SavedConversation,
-        prepared: bool,
-    ) -> Option<Task<Message>> {
+    fn defer_retiring_conversation(&mut self, entry: &SavedConversation) -> Option<Task<Message>> {
         let home @ channel_ui::ClosedCardHome::Pending(_) = self.closed_card_home(entry.card)?
         else {
             return None;
@@ -1341,7 +1506,6 @@ impl Cagents {
             home,
             channel_ui::Reopen::Conversation {
                 entry: Box::new(entry.clone()),
-                prepared,
                 generation: self.resume_ui.generation,
                 replace: self.resume_ui.replace,
             },
@@ -1353,7 +1517,6 @@ impl Cagents {
     pub(super) fn finish_deferred_conversation(
         &mut self,
         entry: SavedConversation,
-        prepared: bool,
         generation: u64,
         replace: Option<CardId>,
         same_home: bool,
@@ -1369,11 +1532,7 @@ impl Cagents {
             return Task::none();
         }
         self.resume_ui.replace = replace;
-        if prepared && self.existing_conversation_card(&entry.session).is_none() {
-            self.insert_resumed_conversation(entry, true)
-        } else {
-            self.resume_saved_conversation(entry)
-        }
+        self.resume_saved_conversation(entry)
     }
 
     pub(super) fn fail_deferred_conversation(&mut self, generation: u64, error: &str) -> bool {
@@ -2071,38 +2230,119 @@ mod tests {
         let _ = app.update_resume(Action::Indexed(generation, Progress::Counted(0)));
     }
 
-    #[test]
-    fn retained_claude_resume_waits_for_preparation_and_keeps_its_exact_allocation() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut app = crate::app::tests::context_inspector_test_app(false);
-        let mut entry = saved(directory.path());
+    /// A saved conversation the service must prepare: its retained actor
+    /// either still runs or has ended.
+    fn retained(directory: &Path) -> SavedConversation {
+        let mut entry = saved(directory);
         entry.session.native_continuity =
             chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
         assert!(entry.session.has_valid_native_continuity());
-        let source = entry.session.clone();
-        // Do not execute this UI task: HOST preparation/retirement is covered
-        // by the real-helper tests. This tests dispatch and reply admission.
-        drop(app.resume_saved_conversation(entry.clone()));
-        assert!(app.resume_ui.loading);
-        assert!(app.durable.cards.is_empty());
+        entry
+    }
+
+    /// The reconnect-only successor the daemon allocates for the ended actor
+    /// of `source`, never another retained actor.
+    fn successor(source: &chat::Session) -> chat::Session {
         let mut prepared = source.clone();
         prepared.reset_owned_codex_listener();
         prepared.id = TerminalId::new();
         prepared.proof = None;
         prepared.terminal = None;
-        // The daemon answers for an ended actor with its reconnect-only
-        // successor, never another retained actor.
         prepared.native_continuity = chat::NativeContinuity::ReconnectOnly;
-        let generation = app.resume_ui.generation;
+        prepared
+    }
+
+    /// The pane put in place for a reopen, and the attempt it waits on.
+    fn reopening(app: &Cagents) -> (CardId, u64) {
+        let card = app.workspace.focused().expect("the reopened pane");
+        (card, app.resume_ui.reopening[&card].attempt)
+    }
+
+    #[test]
+    fn retained_claude_reopen_places_its_pane_before_preparation_answers() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let entry = retained(directory.path());
+        let source = entry.session.clone();
+        // Do not execute this UI task: HOST preparation/retirement is covered
+        // by the real-helper tests. This tests placement and reply admission.
+        drop(app.resume_saved_conversation(entry.clone()));
+
+        // The pane is there before any answer, holding the saved
+        // conversation, and nothing has started in it.
+        let (card, attempt) = reopening(&app);
+        assert!(app.workspace.order().any(|id| id == card));
+        let state = app.card_state(card).unwrap();
+        assert!(state.existence.is_open());
+        assert_eq!(state.kind, CardKind::Chat(source.clone()));
+        assert_eq!(state.title, "Review peripheral Rust modules");
+        assert!(app.cards.get(&card).is_none(), "drawn as starting");
+        assert!(!app.chat_start_began(card));
+        assert!(app.chat_start_pending(card));
+        assert!(!app.resume_ui.loading, "other conversations stay resumable");
+        // Its identity is not known yet, so it is neither saved nor shared.
+        let saved = app.persistent_workspace();
+        assert!(saved.cards.iter().all(|saved| saved.id != card));
+        assert_ne!(saved.focused, Some(card));
+
+        let prepared = successor(&source);
         drop(app.update_resume(Action::Prepared(
-            generation,
-            Box::new(entry),
+            card,
+            attempt,
             Ok(Some(Box::new(prepared.clone()))),
         )));
-        let card = app.card_state(app.workspace.focused().unwrap()).unwrap();
-        assert_eq!(card.kind, CardKind::Chat(prepared));
-        assert_eq!(card.title, "Review peripheral Rust modules");
-        assert!(!app.resume_ui.loading);
+        // The same pane starts the exact allocation the daemon answered with.
+        assert_eq!(app.workspace.focused(), Some(card));
+        let state = app.card_state(card).unwrap();
+        assert_eq!(state.kind, CardKind::Chat(prepared));
+        assert_eq!(state.title, "Review peripheral Rust modules");
+        assert!(!app.reopen_pending(card));
+        assert!(app.chat_start_began(card), "its start began");
+        assert!(
+            app.persistent_workspace()
+                .cards
+                .iter()
+                .any(|saved| saved.id == card)
+        );
+        assert_eq!(app.durable.cards.len(), 1);
+    }
+
+    #[test]
+    fn reopening_a_closed_chat_puts_its_pane_back_before_any_answer() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.select_worktree(directory.path().to_path_buf(), false);
+        let entry = retained(directory.path());
+        let closed = CardState {
+            id: entry.card,
+            generation: app.durable.generation,
+            title: entry.title.clone(),
+            width_fraction: app.settings.default_native_pane_fraction,
+            existence: Existence::Closed {
+                tombstone: crate::model::Tombstone {
+                    operation_id: None,
+                    closed_at_unix_ms: 1,
+                    reason: Some("closed by user".into()),
+                },
+            },
+            kind: CardKind::Chat(entry.session.clone()),
+        };
+        app.recently_closed
+            .push((closed, app.active_workspace_destination()));
+
+        drop(app.reopen_closed_pane(entry.card));
+
+        let (card, _) = reopening(&app);
+        assert!(app.workspace.order().any(|id| id == card));
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Chat(entry.session.clone())
+        );
+        assert!(app.recently_closed.is_empty());
+        // Asked again meanwhile, it shows the pane already reopening.
+        drop(app.resume_saved_conversation(entry));
+        assert_eq!(app.durable.cards.len(), 1);
+        assert_eq!(app.workspace.focused(), Some(card));
     }
 
     #[test]
@@ -2111,37 +2351,24 @@ mod tests {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         app.settings_path = Some(directory.path().join("settings.toml"));
         app.settings_write_blocked = false;
-        let mut entry = saved(directory.path());
+        let mut entry = retained(directory.path());
         entry.title = "Parser recovery".into();
         app.chrome_ui
             .user_titles
             .insert(entry.card, entry.title.clone());
-        entry.session.proof = Some(crate::model::HostSessionProof {
-            host_session_id: "saved-owner".into(),
-            boot_id: "fixture-boot".into(),
-            host_incarnation: "saved-incarnation".into(),
-        });
-        entry.session.native_continuity =
-            chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
-        let mut prepared = entry.session.clone();
-        prepared.reset_owned_codex_listener();
-        prepared.id = TerminalId::new();
-        prepared.proof = None;
-        prepared.terminal = None;
-        drop(app.resume_saved_conversation(entry.clone()));
-        assert!(app.resume_ui.loading);
-        let generation = app.resume_ui.generation;
+        let prepared = successor(&entry.session);
         let before_settings = app.settings_save_generation;
+        drop(app.resume_saved_conversation(entry.clone()));
+        let (card, attempt) = reopening(&app);
+        // The pane carries its manual name while it waits.
+        assert_eq!(app.card_state(card).unwrap().title, "Parser recovery");
         drop(app.update_resume(Action::Prepared(
-            generation,
-            Box::new(entry),
+            card,
+            attempt,
             Ok(Some(Box::new(prepared.clone()))),
         )));
 
-        let card = app
-            .card_state(app.workspace.focused().unwrap())
-            .unwrap()
-            .clone();
+        let card = app.card_state(card).unwrap().clone();
         assert_eq!(card.kind, CardKind::Chat(prepared));
         assert_eq!(card.title, "Parser recovery");
         assert_eq!(app.chrome_ui.user_titles[&card.id], "Parser recovery");
@@ -2166,6 +2393,7 @@ mod tests {
             open: false,
             updated_at_unix_ms: 2,
         };
+        let generation = app.resume_ui.generation;
         app.resume_ui.open = true;
         list(&mut app, generation, vec![saved]);
         drop(app.update_resume(Action::Indexed(
@@ -2197,45 +2425,99 @@ mod tests {
         assert!(unstarted_successor(&entry.session));
         let source = entry.session.clone();
         drop(app.resume_saved_conversation(entry.clone()));
-        assert!(app.resume_ui.loading, "the daemon keeps its lineage");
-        assert!(app.durable.cards.is_empty());
+        let (card, attempt) = reopening(&app);
+        assert!(app.chat_start_pending(card), "the daemon keeps its lineage");
         let mut prepared = source.clone();
         prepared.id = TerminalId::new();
-        let generation = app.resume_ui.generation;
         drop(app.update_resume(Action::Prepared(
-            generation,
-            Box::new(entry.clone()),
+            card,
+            attempt,
             Ok(Some(Box::new(prepared.clone()))),
         )));
-        let card = app.card_state(app.workspace.focused().unwrap()).unwrap();
-        assert_eq!(card.kind, CardKind::Chat(prepared));
-
-        // A refusal, such as another pane still writing to the conversation,
-        // is shown and starts nothing.
-        let mut app = crate::app::tests::context_inspector_test_app(false);
-        app.resume_ui.open = true;
-        drop(app.resume_saved_conversation(entry.clone()));
-        let generation = app.resume_ui.generation;
-        drop(app.update_resume(Action::Prepared(
-            generation,
-            Box::new(entry.clone()),
-            Err("Another pane may still be writing to this Claude conversation".into()),
-        )));
-        assert!(app.durable.cards.is_empty());
-        assert!(app.resume_ui.error.is_some());
+        assert_eq!(app.card_state(card).unwrap().kind, CardKind::Chat(prepared));
 
         // With no daemon to vouch for it or refuse it, it resumes on its own.
         let mut app = crate::app::tests::context_inspector_test_app(false);
-        drop(app.resume_saved_conversation(entry.clone()));
-        let generation = app.resume_ui.generation;
-        drop(app.update_resume(Action::Prepared(generation, Box::new(entry), Ok(None))));
-        let card = app.card_state(app.workspace.focused().unwrap()).unwrap();
-        let CardKind::Chat(session) = &card.kind else {
+        drop(app.resume_saved_conversation(entry));
+        let (card, attempt) = reopening(&app);
+        drop(app.update_resume(Action::Prepared(card, attempt, Ok(None))));
+        let CardKind::Chat(session) = &app.card_state(card).unwrap().kind else {
             panic!("the conversation resumes as a chat");
         };
         assert_ne!(session.id, source.id);
         assert_eq!(session.launch, source.launch);
-        assert!(app.resume_ui.error.is_none());
+        assert!(app.chat_start_began(card));
+    }
+
+    #[test]
+    fn a_refused_preparation_says_so_in_the_pane_and_retry_asks_again() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let entry = retained(directory.path());
+        let source = entry.session.clone();
+        drop(app.resume_saved_conversation(entry));
+        let (card, attempt) = reopening(&app);
+        // A refusal, such as another pane still writing to the conversation,
+        // is shown where the pane is, and starts nothing.
+        let refusal = "Another pane may still be writing to this Claude conversation";
+        drop(app.update_resume(Action::Prepared(card, attempt, Err(refusal.into()))));
+        assert!(matches!(app.cards.get(&card),
+            Some(CardRuntime::Failed(failure)) if failure.message() == refusal));
+        assert!(app.reopen_failed(card));
+        assert!(!app.chat_start_pending(card), "Retry is offered");
+        assert!(!app.chat_start_began(card));
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Chat(source.clone())
+        );
+        assert!(
+            app.persistent_workspace()
+                .cards
+                .iter()
+                .all(|saved| saved.id != card)
+        );
+        // The same answer arriving twice changes nothing more.
+        drop(app.update_resume(Action::Prepared(
+            card,
+            attempt,
+            Ok(Some(Box::new(successor(&source)))),
+        )));
+        assert!(app.reopen_failed(card));
+
+        // Retry waits for a new answer, and only that one applies.
+        drop(app.update(Message::RetryCard(card)));
+        assert!(app.cards.get(&card).is_none());
+        assert!(app.chat_start_pending(card));
+        let retried = app.resume_ui.reopening[&card].attempt;
+        assert_ne!(retried, attempt);
+        drop(app.update_resume(Action::Prepared(
+            card,
+            attempt,
+            Ok(Some(Box::new(successor(&source)))),
+        )));
+        assert!(app.reopen_preparing(card), "a stale answer is ignored");
+        let prepared = successor(&source);
+        drop(app.update_resume(Action::Prepared(
+            card,
+            retried,
+            Ok(Some(Box::new(prepared.clone()))),
+        )));
+        assert_eq!(app.card_state(card).unwrap().kind, CardKind::Chat(prepared));
+        assert!(app.chat_start_began(card));
+
+        // A reply that is not this exact conversation is refused in place too.
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let entry = retained(directory.path());
+        drop(app.resume_saved_conversation(entry.clone()));
+        let (card, attempt) = reopening(&app);
+        let mut altered = successor(&entry.session);
+        altered.launch.session_id = Some("another-thread".into());
+        drop(app.update_resume(Action::Prepared(card, attempt, Ok(Some(Box::new(altered))))));
+        assert!(app.reopen_failed(card));
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Chat(entry.session)
+        );
     }
 
     #[test]
@@ -2389,42 +2671,105 @@ mod tests {
     }
 
     #[test]
-    fn cancelling_resume_ignores_late_preparation_and_allows_another_attempt() {
+    fn a_pane_closed_while_reopening_takes_nothing_from_a_late_answer() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = crate::app::tests::context_inspector_test_app(false);
-        let entry = saved(directory.path());
-        app.resume_ui.open = true;
-        app.resume_ui.loading = true;
-        app.resume_ui.generation = 7;
-        let _ = app.update_resume(Action::Close);
-        assert!(!app.resume_ui.loading);
-        let _ = app.update_resume(Action::Prepared(
-            7,
-            Box::new(entry.clone()),
-            Ok(Some(Box::new(entry.session.clone()))),
-        ));
-        assert!(app.durable.cards.is_empty());
-        let _ = app.resume_saved_conversation(entry);
-        assert_eq!(app.durable.cards.len(), 1);
+        let entry = retained(directory.path());
+        let kept = crate::model::KeptChatDraft {
+            text: "Unsent question".into(),
+            closed_at_unix_ms: unix_millis(),
+            ..Default::default()
+        };
+        Arc::make_mut(&mut app.durable)
+            .kept_chat_drafts
+            .insert(entry.card, kept);
+        drop(app.resume_saved_conversation(entry.clone()));
+        let (card, attempt) = reopening(&app);
+        drop(app.update(Message::CloseCard(card)));
+        drop(app.update(Message::CommitClose(card)));
+        assert!(!app.card_state(card).unwrap().existence.is_open());
+        assert!(!app.reopen_pending(card));
+
+        drop(app.update_resume(Action::Prepared(
+            card,
+            attempt,
+            Ok(Some(Box::new(successor(&entry.session)))),
+        )));
+        assert!(!app.card_state(card).unwrap().existence.is_open());
+        assert!(!app.chat_start_began(card));
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Chat(entry.session.clone())
+        );
+        assert!(
+            app.durable
+                .cards
+                .iter()
+                .all(|card| !card.existence.is_open())
+        );
+        // It can be reopened again, with the draft its first pane kept.
+        assert!(
+            app.recently_closed
+                .iter()
+                .any(|(closed, _)| closed.id == card)
+        );
+        assert_eq!(app.durable.kept_chat_drafts[&card].text, "Unsent question");
+        drop(app.reopen_closed_pane(card));
+        let (reopened, attempt) = reopening(&app);
+        assert_ne!(reopened, card);
+        drop(app.update_resume(Action::Prepared(
+            reopened,
+            attempt,
+            Ok(Some(Box::new(successor(&entry.session)))),
+        )));
+        assert_eq!(app.held_chat_draft(reopened), Some("Unsent question"));
+    }
+
+    #[test]
+    fn a_pane_given_another_conversation_while_reopening_keeps_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let entry = retained(directory.path());
+        drop(app.resume_saved_conversation(entry.clone()));
+        let (card, attempt) = reopening(&app);
+        let other = saved(directory.path()).session;
+        app.card_state_mut(card).unwrap().kind = CardKind::Chat(other.clone());
+        drop(app.update_resume(Action::Prepared(
+            card,
+            attempt,
+            Ok(Some(Box::new(successor(&entry.session)))),
+        )));
+        assert_eq!(app.card_state(card).unwrap().kind, CardKind::Chat(other));
+        assert!(!app.reopen_pending(card));
+        assert!(!app.chat_start_began(card));
     }
 
     #[test]
     fn preparation_rechecks_a_conversation_opened_while_waiting() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = crate::app::tests::context_inspector_test_app(false);
-        let entry = saved(directory.path());
-        let _ = app.resume_saved_conversation(entry.clone());
-        let card = app.workspace.focused();
-        app.resume_ui.loading = true;
-        let generation = app.resume_ui.generation;
-        let _ = app.update_resume(Action::Prepared(
-            generation,
-            Box::new(entry.clone()),
-            Ok(Some(Box::new(entry.session))),
-        ));
-        assert_eq!(app.durable.cards.len(), 1);
-        assert_eq!(app.workspace.focused(), card);
-        assert!(!app.resume_ui.loading);
+        // The conversation the daemon will answer with is opened in another
+        // pane while the reopen waits.
+        let entry = retained(directory.path());
+        let prepared = successor(&entry.session);
+        drop(app.resume_saved_conversation(entry));
+        let (card, attempt) = reopening(&app);
+        let (existing, _) = app.insert_resumed_chat_card(prepared.clone(), None, None, None, None);
+        assert_ne!(card, existing);
+        drop(app.update_resume(Action::Prepared(
+            card,
+            attempt,
+            Ok(Some(Box::new(prepared))),
+        )));
+        // The placeholder gives way to the pane already holding it, and its
+        // close stops nothing that pane holds.
+        assert!(!app.chat_start_began(card));
+        drop(app.update(Message::CommitClose(card)));
+        assert!(!app.card_state(card).unwrap().existence.is_open());
+        assert!(!app.reopen_pending(card));
+        assert!(app.card_state(existing).unwrap().existence.is_open());
+        assert!(!app.chat_start_began(card));
+        assert!(!app.chat_close_owned(existing));
     }
 
     #[test]
