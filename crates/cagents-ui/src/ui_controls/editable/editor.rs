@@ -201,7 +201,7 @@ impl<Message: Clone + 'static> TextEditor<'_, Message> {
 /// The fade reaches no further into the text area than a quarter of its
 /// height, so a short field keeps its middle crisp, and stops short of
 /// `caret`, the line being edited in a focused editor, which stays legible
-/// at the edge it was scrolled to.
+/// at the edge it was scrolled to. A caret scrolled out of view is ignored.
 pub(crate) fn padding_fade_geometry(
     bounds: Rectangle,
     padding: Padding,
@@ -218,12 +218,16 @@ pub(crate) fn padding_fade_geometry(
         (drawn.y + drawn.height) - (text.y + text.height),
     );
     let reach = text.height / 4.0;
-    let clear = caret.map_or((reach, reach), |caret| {
-        (
-            caret.y - text.y,
-            (text.y + text.height) - (caret.y + caret.height),
-        )
-    });
+    // A caret scrolled out of the text area is not where the user is
+    // looking, and leaves the fade alone.
+    let clear = caret
+        .filter(|caret| caret.y < text.y + text.height && caret.y + caret.height > text.y)
+        .map_or((reach, reach), |caret| {
+            (
+                caret.y - text.y,
+                (text.y + text.height) - (caret.y + caret.height),
+            )
+        });
     let depth = |band: f32, overflow: f32, clear: f32| {
         if overflow > 0.5 {
             band + overflow.min(reach).min(clear.max(0.0))
@@ -738,6 +742,11 @@ mod tests {
         // A caret line part way into the reach leaves the fade above it.
         assert_eq!(fade(line(text.y + 8.0)).1, (band.0 + 8.0, full.1));
         assert_eq!(fade(line(text.y + 40.0)).1, full);
+        // A caret scrolled out of view past either end leaves both fades,
+        // while one only partly scrolled out still keeps its edge clear.
+        assert_eq!(fade(line(text.y + text.height + 30.0)).1, full);
+        assert_eq!(fade(line(text.y - 50.0)).1, full);
+        assert_eq!(fade(line(text.y - 5.0)).1, (band.0, full.1));
     }
     #[test]
     fn multiline_selection_maps_unicode_bytes_and_replacement_uses_existing_edit_action() {
