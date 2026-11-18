@@ -1134,6 +1134,9 @@ pub enum DiffContent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PathSelection {
     pub path: RepoPath,
+    /// The rename source. Never a copy source: a copy leaves its source in
+    /// place as an independent file, whose own changes a mutation of the copy
+    /// must not stage, unstage or discard.
     pub old_path: Option<RepoPath>,
 }
 
@@ -1145,10 +1148,15 @@ impl PathSelection {
         }
     }
 
+    /// The selection that acts on exactly this row. A copy's source stays on
+    /// the row for its diff, but only a rename's source belongs to the change.
     pub fn from_changed_path(entry: &ChangedPath) -> Self {
         Self {
             path: entry.path.clone(),
-            old_path: entry.old_path.clone(),
+            old_path: entry
+                .old_path
+                .clone()
+                .filter(|_| entry.kind == ChangeKind::Renamed),
         }
     }
 }
@@ -2758,24 +2766,34 @@ fn parse_batch_blobs(
     Ok(objects)
 }
 
-/// The push status flag Git printed for one refspec, or `None` when the
-/// refspec is absent from the output.
+/// Whether Git's porcelain output proves that no destination took the update.
 ///
 /// `--porcelain` lines are `<flag> TAB <from>:<to> TAB <summary>`, and `!`
-/// means the remote refused the update, which is definitive evidence that the
-/// remote ref did not move.
-fn push_ref_flag(output: &[u8], refspec: &str) -> Option<u8> {
-    for line in output.split(|byte| *byte == b'\n') {
-        let mut columns = line.split(|byte| *byte == b'\t');
-        let flag = columns.next()?;
-        let Some(pair) = columns.next() else {
-            continue;
-        };
-        if pair == refspec.as_bytes() {
-            return Some(flag.first().copied().unwrap_or(b' '));
-        }
-    }
-    None
+/// means a remote refused the update, which is definitive evidence that its
+/// ref did not move. A remote with several push URLs is pushed to each in
+/// turn, each reporting under its own `To` header, and one can refuse what
+/// another accepted. So the push was refused only when every destination it
+/// was sent to reported `!`; a destination that reported nothing, perhaps
+/// because it could not be reached, proves nothing either way. Without the
+/// captured destination list there is no count to hold the report to.
+fn push_refused_everywhere(
+    output: &[u8],
+    refspec: &str,
+    destinations: Option<&[OsString]>,
+) -> bool {
+    let flags: Vec<u8> = output
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| {
+            let mut columns = line.split(|byte| *byte == b'\t');
+            let flag = columns.next()?;
+            (columns.next()? == refspec.as_bytes()).then(|| flag.first().copied().unwrap_or(b' '))
+        })
+        .collect();
+    destinations.is_some_and(|destinations| {
+        !destinations.is_empty()
+            && flags.len() == destinations.len()
+            && flags.iter().all(|flag| *flag == b'!')
+    })
 }
 
 /// Classifies raw bytes without ever decoding them lossily.
@@ -4238,7 +4256,13 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     ///
     /// The fetch names exactly two refspecs and forces only the private refs,
     /// with `--no-tags`, no submodule recursion and no `FETCH_HEAD` write, so
-    /// no branch, tag or remote-tracking ref of the user's can move. Fetches
+    /// no branch, tag or remote-tracking ref of the user's can move. The empty
+    /// `--refmap=` is what keeps the remote-tracking refs still: given a
+    /// command-line refspec, Git otherwise also applies the remote's
+    /// configured fetch mapping to every ref it transferred, so fetching the
+    /// base branch would advance `refs/remotes/<remote>/<base>` as well, and
+    /// with it the ahead/behind counts and the expectation an implicit
+    /// `--force-with-lease` checks. Fetches
     /// for one repository are serialized process-wide: two review panes
     /// opening at once would otherwise race Git's own ref lock and one of
     /// them would fail for no reason the user can see.
@@ -4277,6 +4301,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     "--no-tags",
                     "--no-recurse-submodules",
                     "--no-write-fetch-head",
+                    "--refmap=",
                     "--end-of-options",
                     remote,
                     &refspec,
@@ -5789,12 +5814,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 });
             }
             Ok(output) => {
-                let rejected = push_ref_flag(&output.stdout, &refspec) == Some(b'!');
+                let rejected =
+                    push_refused_everywhere(&output.stdout, &refspec, destinations.as_deref());
                 let failure = git_failure(&command, output);
                 if rejected {
-                    // `!` is Git reporting that the remote refused this exact
-                    // update, so the remote ref definitively did not move and
-                    // there is nothing ambiguous to reconcile.
+                    // Every destination refused this exact update, so no
+                    // remote ref moved and there is nothing to reconcile.
                     return Ok(PushOutcome::NotPushed {
                         failure: failure.into(),
                     });
@@ -5807,7 +5832,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 });
             }
             Err(failure) => {
-                if push_ref_flag(&failure.stdout, &refspec) == Some(b'!') {
+                if push_refused_everywhere(&failure.stdout, &refspec, destinations.as_deref()) {
                     return Ok(PushOutcome::NotPushed {
                         failure: failure.into(),
                     });
@@ -10808,6 +10833,45 @@ mod tests {
     }
 
     #[test]
+    fn a_push_is_refused_only_when_every_destination_refused_it() {
+        let refspec = "refs/heads/main:refs/heads/main";
+        let refused = |url: &str| {
+            format!("To {url}\n!\t{refspec}\t[rejected] (fetch first)\nDone\n").into_bytes()
+        };
+        let accepted =
+            |url: &str| format!("To {url}\n \t{refspec}\taaaa..bbbb\nDone\n").into_bytes();
+        let one = [OsString::from("/a")];
+        let two = [OsString::from("/a"), OsString::from("/b")];
+
+        assert!(push_refused_everywhere(&refused("/a"), refspec, Some(&one)));
+        assert!(push_refused_everywhere(
+            &[refused("/a"), refused("/b")].concat(),
+            refspec,
+            Some(&two)
+        ));
+        // The second destination took the branch.
+        assert!(!push_refused_everywhere(
+            &[refused("/a"), accepted("/b")].concat(),
+            refspec,
+            Some(&two)
+        ));
+        // The second destination reported nothing, so it may or may not have.
+        assert!(!push_refused_everywhere(
+            &refused("/a"),
+            refspec,
+            Some(&two)
+        ));
+        // A refusal of some other ref says nothing about this one.
+        assert!(!push_refused_everywhere(
+            b"To /a\n!\trefs/heads/x:refs/heads/x\t[rejected]\nDone\n",
+            refspec,
+            Some(&one)
+        ));
+        // Without the destinations Git pushed to, nothing can be counted.
+        assert!(!push_refused_everywhere(&refused("/a"), refspec, None));
+    }
+
+    #[test]
     fn a_push_that_never_started_is_not_pushed() {
         let service = fake_service(vec![
             success(b""),
@@ -12800,12 +12864,18 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     let _remote =
                         self.checked_remote(&journal.request.repository, remote, cancellation)?;
                     ValidatedBranchName::parse(branch)?;
+                    // `--refmap=`: the refspec names the one cache this
+                    // creation reads, and the remote's configured mapping
+                    // must not also rewrite whatever other refs it routes the
+                    // fetched branch to.
                     let mut fetch = self.git_mutation(
                         &journal.request.repository,
                         [
                             "fetch",
                             "--no-tags",
                             "--no-recurse-submodules",
+                            "--refmap=",
+                            "--end-of-options",
                             remote.as_str(),
                             &format!("+refs/heads/{branch}:{reference}"),
                         ],
@@ -14040,6 +14110,38 @@ mod worktree_journal_tests {
         assert_eq!(
             fixture.git(&["rev-parse", "topic"]),
             remote.git(&["rev-parse", "topic"])
+        );
+    }
+
+    /// The refresh names the one tracking ref the creation reads. A remote
+    /// whose configuration routes its branches to more than one place must not
+    /// have those other refs rewritten by a fetch the user never ran.
+    #[test]
+    fn remote_branch_refresh_writes_only_the_tracking_ref_it_names() {
+        let mut fixture = Fixture::new();
+        let remote = Fixture::new();
+        remote.git(&["branch", "topic"]);
+        fixture.add_remote("origin", &remote);
+        fixture.git(&[
+            "config",
+            "--add",
+            "remote.origin.fetch",
+            "+refs/heads/*:refs/remotes/mirror/*",
+        ]);
+        fixture.resolve(fixture.input("origin/topic"));
+        let report = fixture.run(&CancellationToken::new());
+        assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+        assert_eq!(
+            fixture.git(&["rev-parse", "refs/remotes/origin/topic"]),
+            remote.git(&["rev-parse", "topic"])
+        );
+        assert_eq!(
+            fixture.git(&[
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/remotes/mirror/"
+            ]),
+            ""
         );
     }
 

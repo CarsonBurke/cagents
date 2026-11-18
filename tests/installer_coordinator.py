@@ -5,6 +5,7 @@ The fixtures exercise archive extraction, coordinator selection, re-entry and
 publication without compiling Rust, opening windows or starting a real daemon.
 They do not replace the Rust source-inspection or install-guard contracts.
 """
+import fcntl
 import hashlib
 import json
 import os
@@ -16,6 +17,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
 
 
@@ -128,6 +130,9 @@ elif args[:2] in (['daemon', 'verify-update-census'], ['daemon', 'inspect-update
         sys.exit(1)
 elif args == ['--json', 'daemon', 'status']:
     record('status')
+    if 'FIXTURE_STATUS_REPLY' in os.environ:
+        print(os.environ['FIXTURE_STATUS_REPLY'])
+        sys.exit(0)
     rewrite = os.environ.get('FIXTURE_STATUS_REWRITES')
     rewritten = log.with_suffix('.status-rewritten')
     if rewrite and not rewritten.exists():
@@ -139,6 +144,23 @@ elif args == ['--json', 'daemon', 'status']:
         rewritten.write_text('done\n')
     print(json.dumps({'ok': True, 'command': 'daemon.status', 'data': {'running': pathlib.Path(os.environ['FIXTURE_DAEMON_STATE']).exists()}},
                      separators=(',', ':')))
+elif args == ['daemon', 'stop', '--require-empty']:
+    record('daemon-stop')
+    pathlib.Path(os.environ['FIXTURE_DAEMON_STATE']).unlink()
+    if os.environ.get('FIXTURE_UPDATE_DURING_STOP'):
+        # An in-app update starting now takes its job lock as update.rs does.
+        import fcntl
+        state = pathlib.Path(os.environ['FIXTURE_UPDATE_DURING_STOP']) / '.update'
+        try:
+            state.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        lock = os.open(state / 'lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            record('update-started')
+        except BlockingIOError:
+            record('update-busy')
 elif args == ['daemon', 'start']:
     record('daemon-start-fixture', executable=str(pathlib.Path(sys.argv[0]).resolve()))
     starts = sum(json.loads(line)['event'] == 'daemon-start-fixture' for line in log.read_text().splitlines())
@@ -230,8 +252,8 @@ class InstallerCoordinator(unittest.TestCase):
         self.payload = self.directory / TOP
         self.python(self.payload / "bin/cagents", COORDINATOR)
         self.python(self.payload / "bin/cagentsd", "SOURCE = 'candidate'\n" + INSPECTOR)
-        for name in ("cagents-ui", "cagents-uninstall"):
-            self.executable(self.payload / "bin" / name, '#!/bin/sh\nexit 98\n')
+        self.executable(self.payload / "bin/cagents-ui", '#!/bin/sh\nexit 98\n')
+        self.executable(self.payload / "bin/cagents-uninstall", (ROOT / "packaging/cagents-uninstall").read_text())
         self.write(self.payload / "bin/.cagents-ui-lease-v1", "1\n")
         for name in ("applications/dev.cagents.Cagents.desktop",
                      "autostart/dev.cagents.Cagents.Daemon.desktop",
@@ -899,6 +921,254 @@ os.execv({real_tar!r}, [{real_tar!r}, *args])
         self.assertEqual(os.readlink(self.prefix / 'current'), f'versions/{VERSION}')
         self.assertEqual((candidate / 'bin/cagents').stat().st_ino, original_inode)
 
+    # Uninstall --------------------------------------------------------------
+    # Both entry points run here: the packaged helper from the installation it
+    # removes, as the documentation tells people to run it, and install.sh.
+    UNINSTALLERS = ("packaged helper", "install.sh")
+    # The status producer's reply for a daemon process that holds the runtime
+    # lock without serving yet, or any longer, in both envelope key orders.
+    TRANSITIONING_STATUS = (
+        '{"command":"daemon.status","data":{"cli_version":"9.9.9","daemon_present":true,'
+        '"daemon_version":null,"inherited_lease":false,"instance":"production","running":false,'
+        '"socket":"/run/user/1000/cagents/cagentsd.sock"},"ok":true}',
+        '{"ok":true,"command":"daemon.status","data":{"instance":"production","running":false,'
+        '"daemon_present":true,"socket":"/run/user/1000/cagents/cagentsd.sock","daemon_version":null}}',
+    )
+
+    def uninstall_command(self, uninstaller, *options, prefix=None):
+        prefix = prefix or self.prefix
+        if uninstaller == "packaged helper":
+            command = ["/bin/sh", str(self.prefix / "current/bin/cagents-uninstall"), "--prefix", str(prefix)]
+        else:
+            command = ["/bin/sh", str(ROOT / "install.sh"), "--prefix", str(prefix),
+                       *(() if "--purge" in options else ("--uninstall",))]
+        return [*command, *options]
+
+    def uninstall(self, uninstaller, *options, environment=None, prefix=None):
+        # A typical login umask, which would expose files the uninstaller creates.
+        return subprocess.run(self.uninstall_command(uninstaller, *options, prefix=prefix),
+                              env=environment or self.environment, cwd=self.directory,
+                              capture_output=True, text=True, timeout=INSTALL_TIMEOUT_SECONDS, umask=0o022)
+
+    def install_serving(self):
+        self.assert_installed(self.install(), 'candidate')
+        self.assertTrue(Path(self.environment["FIXTURE_DAEMON_STATE"]).exists())
+        self.calls.unlink()
+
+    def record_update(self):
+        """Leave the updater state an in-app update job leaves in its prefix."""
+        state = self.prefix / ".update"
+        state.mkdir(mode=0o700, exist_ok=True)
+        for name, text in (("lock", ""), ("status.json", '{"phase":"Succeeded"}\n'), (f"{JOB}.log", "updated\n")):
+            (state / name).write_text(text)
+            (state / name).chmod(0o600)
+        return state
+
+    def assert_still_installed(self):
+        self.assertEqual(os.readlink(self.prefix / "current"), f"versions/{VERSION}")
+        self.assertTrue((self.prefix / "current/bin/cagents").is_file())
+        self.assertTrue((self.prefix / ".cagents-install-root").is_file())
+        self.assertTrue(self.managed_link("bin/cagents").is_symlink())
+
+    def test_uninstall_entry_points_share_one_removal_procedure(self):
+        def shared(path):
+            text = path.read_text()
+            begin, end = "# BEGIN shared uninstall\n", "# END shared uninstall\n"
+            self.assertEqual((text.count(begin), text.count(end)), (1, 1), path)
+            return text[text.index(begin):text.index(end) + len(end)]
+        self.assertEqual(shared(ROOT / "install.sh"), shared(ROOT / "packaging/cagents-uninstall"))
+
+    def test_uninstall_keeps_an_installation_whose_daemon_is_starting_or_draining(self):
+        self.install_serving()
+        for uninstaller in self.UNINSTALLERS:
+            for reply in self.TRANSITIONING_STATUS:
+                with self.subTest(uninstaller=uninstaller, reply=reply):
+                    result = self.uninstall(uninstaller, environment=dict(self.environment, FIXTURE_STATUS_REPLY=reply))
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("the daemon is starting or stopping; retry once it has settled", result.stderr)
+                    self.assert_still_installed()
+                    self.assertNotIn("daemon-stop", [e["event"] for e in self.events()])
+
+    def test_uninstall_after_an_update_lets_the_same_prefix_be_reinstalled(self):
+        for uninstaller in self.UNINSTALLERS:
+            with self.subTest(uninstaller=uninstaller):
+                self.install_serving()
+                self.record_update()
+                result = self.uninstall(uninstaller)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual([e["event"] for e in self.events()].count("daemon-stop"), 1)
+                self.assertFalse(self.prefix.exists(), result.stderr)
+                self.assertFalse(self.managed_link("bin/cagents").is_symlink())
+                self.calls.unlink()
+        self.assert_installed(self.install(), 'candidate')
+
+    def test_uninstall_refuses_while_an_update_holds_the_updater_lock(self):
+        self.install_serving()
+        state = self.record_update()
+        with (state / "lock").open("r+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            for uninstaller in self.UNINSTALLERS:
+                with self.subTest(uninstaller=uninstaller):
+                    result = self.uninstall(uninstaller)
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("an application update is in progress", result.stderr)
+                    self.assert_still_installed()
+                    self.assertEqual(sorted(p.name for p in state.iterdir()), sorted(["lock", "status.json", f"{JOB}.log"]))
+                    # The daemon is checked only after the update is excluded.
+                    self.assertFalse(self.calls.exists())
+
+    def test_an_update_cannot_start_while_an_installation_without_updater_state_is_removed(self):
+        for uninstaller in self.UNINSTALLERS:
+            with self.subTest(uninstaller=uninstaller):
+                self.install_serving()
+                self.assertFalse((self.prefix / ".update").exists())
+                result = self.uninstall(uninstaller, environment=dict(
+                    self.environment, FIXTURE_UPDATE_DURING_STOP=str(self.prefix)))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                events = [e["event"] for e in self.events()]
+                self.assertIn("update-busy", events)
+                self.assertNotIn("update-started", events)
+                self.assertFalse(self.prefix.exists(), result.stderr)
+                self.calls.unlink()
+
+    def test_a_refused_uninstall_leaves_updater_state_the_updater_accepts(self):
+        self.install_serving()
+        self.environment["FIXTURE_STATUS_REPLY"] = self.TRANSITIONING_STATUS[0]
+        for uninstaller in self.UNINSTALLERS:
+            with self.subTest(uninstaller=uninstaller):
+                result = self.uninstall(uninstaller)
+                self.assertNotEqual(result.returncode, 0)
+                # update.rs refuses state that others can read or write.
+                self.assertEqual((self.prefix / ".update").stat().st_mode & 0o777, 0o700)
+                self.assertEqual((self.prefix / ".update/lock").stat().st_mode & 0o777, 0o600)
+                self.assert_still_installed()
+
+    def test_uninstall_keeps_the_marker_while_unrecognized_files_remain(self):
+        for uninstaller in self.UNINSTALLERS:
+            with self.subTest(uninstaller=uninstaller):
+                self.install_serving()
+                self.record_update()
+                self.write(self.prefix / "notes.txt", "kept\n")
+                result = self.uninstall(uninstaller)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(f"kept {self.prefix} and its installation marker because it also contains:\n"
+                              f"{self.prefix / 'notes.txt'}\n", result.stderr)
+                self.assertEqual(sorted(p.name for p in self.prefix.iterdir()), [".cagents-install-root", "notes.txt"])
+                self.calls.unlink()
+        self.assert_installed(self.install(), 'candidate')
+
+    def test_uninstall_refuses_a_symlinked_prefix(self):
+        self.install_serving()
+        link = self.directory / "linked prefix"
+        link.symlink_to(self.prefix)
+        for uninstaller in self.UNINSTALLERS:
+            with self.subTest(uninstaller=uninstaller):
+                result = self.uninstall(uninstaller, prefix=link)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(f"refusing to uninstall through symlink {link}", result.stderr)
+                self.assert_still_installed()
+                self.assertFalse(self.calls.exists())
+
+    def waiting_uninstall(self, uninstaller, state):
+        """Start an uninstall that waits on the updater lock this test holds."""
+        process = subprocess.Popen(self.uninstall_command(uninstaller), env=self.environment, cwd=self.directory,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(process.kill)
+        deadline = time.monotonic() + 5
+        # The waiter holds its own descriptor of the lock once it reaches flock.
+        while not any(os.path.realpath(f"/proc/{pid}/fd/9") == str(state / "lock")
+                      for pid in [process.pid, *self.children(process.pid)]):
+            if process.poll() is not None:
+                self.fail(f"the uninstall exited before waiting: {process.communicate()}")
+            self.assertLess(time.monotonic(), deadline, "the uninstall never waited on the updater lock")
+            time.sleep(0.02)
+        return process
+
+    @staticmethod
+    def children(pid):
+        try:
+            return [int(child) for child in Path(f"/proc/{pid}/task/{pid}/children").read_text().split()]
+        except OSError:
+            return []
+
+    def test_an_uninstall_waiting_on_another_finds_the_installation_gone(self):
+        for uninstaller in self.UNINSTALLERS:
+            with self.subTest(uninstaller=uninstaller):
+                self.install_serving()
+                state = self.record_update()
+                with (state / "lock").open("r+") as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    process = self.waiting_uninstall(uninstaller, state)
+                    # The first uninstall removes everything, then exits.
+                    shutil.rmtree(self.prefix)
+                stdout, stderr = process.communicate(timeout=INSTALL_TIMEOUT_SECONDS)
+                self.assertEqual(process.returncode, 0, stdout + stderr)
+                self.assertIn(f"no install.sh installation found at {self.prefix}", stderr)
+                self.assertNotIn("No such file", stderr)
+                self.assertFalse(self.prefix.exists())
+                self.calls.unlink(missing_ok=True)
+
+    def test_an_uninstall_whose_updater_state_was_replaced_while_waiting_refuses(self):
+        self.install_serving()
+        state = self.record_update()
+        for uninstaller in self.UNINSTALLERS:
+            with self.subTest(uninstaller=uninstaller):
+                with (state / "lock").open("r+") as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    process = self.waiting_uninstall(uninstaller, state)
+                    shutil.rmtree(state)
+                stdout, stderr = process.communicate(timeout=INSTALL_TIMEOUT_SECONDS)
+                self.assertNotEqual(process.returncode, 0, stdout + stderr)
+                self.assertIn("the installation changed while waiting for the updater lock; retry", stderr)
+                self.assert_still_installed()
+                state = self.record_update()
+
+    def test_uninstall_refuses_an_updater_lock_that_is_not_a_regular_file(self):
+        self.install_serving()
+        state = self.prefix / ".update"
+        state.mkdir(mode=0o700)
+        os.mkfifo(state / "lock", 0o600)
+        for uninstaller in self.UNINSTALLERS:
+            with self.subTest(uninstaller=uninstaller):
+                result = self.uninstall(uninstaller)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(f"unsafe updater state at {state}", result.stderr)
+                self.assert_still_installed()
+
+    def purge_environment(self):
+        environment = dict(self.environment, XDG_CACHE_HOME=str(self.home / "custom cache"),
+                           XDG_STATE_HOME=str(self.home / "custom state"))
+        for variable in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"):
+            for name in ("cagents", "cagents-development", "unrelated"):
+                self.write(Path(environment[variable]) / name / "saved", "private fixture\n")
+        return environment
+
+    def test_purge_removes_production_state_under_a_custom_xdg_state_home(self):
+        for uninstaller in self.UNINSTALLERS:
+            with self.subTest(uninstaller=uninstaller):
+                self.install_serving()
+                environment = self.purge_environment()
+                result = self.uninstall(uninstaller, "--purge", environment=environment)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertFalse(self.prefix.exists())
+                for variable in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"):
+                    base = Path(environment[variable])
+                    self.assertFalse((base / "cagents").exists(), variable)
+                    for name in ("cagents-development", "unrelated"):
+                        self.assertEqual((base / name / "saved").read_text(), "private fixture\n")
+                self.calls.unlink()
+
+    def test_purge_with_a_relative_xdg_state_home_changes_nothing(self):
+        self.install_serving()
+        environment = dict(self.purge_environment(), XDG_STATE_HOME="relative state")
+        for uninstaller in self.UNINSTALLERS:
+            with self.subTest(uninstaller=uninstaller):
+                result = self.uninstall(uninstaller, "--purge", environment=environment)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("XDG_STATE_HOME must be an absolute path", result.stderr)
+                self.assert_still_installed()
+                self.assertEqual((self.home / "data/cagents/saved").read_text(), "private fixture\n")
+                self.assertFalse(self.calls.exists())
 
 if __name__ == "__main__":
     unittest.main()

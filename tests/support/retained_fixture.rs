@@ -4,7 +4,7 @@
 //! harness itself a subreaper.
 use std::{
     collections::BTreeSet,
-    io,
+    io::{self, Read, Seek, Write},
     os::unix::process::CommandExt,
     process::{Child, Command, ExitStatus},
     sync::atomic::{AtomicBool, Ordering},
@@ -69,7 +69,7 @@ pub fn run_isolated_with_timeout(timeout: Duration) -> bool {
                 .expect("fixture family must exit and be completely reaped");
             assert!(status.success(), "isolated fixture failed: {status}");
             if killed > 0 {
-                eprintln!("retained fixture {test}: killed {killed} surviving descendant(s)");
+                eprintln!("{}{killed} surviving descendant(s)", killed_report(test));
             }
             true
         }
@@ -88,16 +88,51 @@ pub fn run_isolated_with_timeout(timeout: Duration) -> bool {
                 1,
                 "--exact {test} must select exactly this test"
             );
-            let status = test_command(test)
+            let mut command = test_command(test);
+            command
                 .env(OWNER_ENV, supervisor)
                 .env(PARENT_ENV, std::process::id().to_string())
-                .process_group(0)
-                .status()
-                .expect("start retained fixture supervisor");
-            assert!(status.success(), "fixture supervisor failed: {status}");
+                .process_group(0);
+            let (status, output) = supervise(command).expect("run retained fixture supervisor");
+            // The supervisor, its worker and the fixture body all write to
+            // inherited descriptors, beyond libtest's capture. Replay them
+            // through it, so a lane log shows them with this test's failure
+            // instead of interleaved with every other test's output.
+            eprint!("{output}");
+            // A product that leaves processes behind must stay visible in a
+            // passing lane, so this line alone bypasses the capture.
+            let report = killed_report(test);
+            for line in output.lines().filter(|line| line.starts_with(&report)) {
+                let _ = writeln!(io::stderr(), "{line}");
+            }
+            assert!(
+                status.success(),
+                "fixture supervisor failed: {status}; its output, including the \
+                 fixture's own failure, is above"
+            );
             true
         }
     }
+}
+
+fn killed_report(test: &str) -> String {
+    format!("retained fixture {test}: killed ")
+}
+
+/// Runs the supervisor with its stdout and stderr in one unnamed file, in the
+/// order they were written, and returns its status and that output. A file,
+/// not a pipe: a descendant that outlives a killed supervisor would hold a
+/// pipe open and stall this test until it exited.
+fn supervise(mut command: Command) -> io::Result<(ExitStatus, String)> {
+    let mut output = tempfile::tempfile_in("/var/tmp")?;
+    let status = command
+        .stdout(output.try_clone()?)
+        .stderr(output.try_clone()?)
+        .status()?;
+    output.rewind()?;
+    let mut bytes = Vec::new();
+    output.read_to_end(&mut bytes)?;
+    Ok((status, String::from_utf8_lossy(&bytes).into_owned()))
 }
 
 fn test_command(test: &str) -> Command {

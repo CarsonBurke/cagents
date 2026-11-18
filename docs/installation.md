@@ -377,13 +377,15 @@ installations are described in [Daemon and upgrades](daemon.md#full-daemon-upgra
 ## Uninstall or purge
 
 For an `install.sh` installation, run the installed helper. A normal uninstall
-keeps settings, sessions, transcripts, and caches:
+keeps settings, sessions, transcripts, caches and diagnostics:
 
 ```sh
 "${XDG_DATA_HOME:-$HOME/.local/share}/cagents-install/current/bin/cagents-uninstall"
 ```
 
-To remove both program files and all cagents user data:
+To remove both program files and all cagents user data, meaning the `cagents`
+directories under `$XDG_CONFIG_HOME`, `$XDG_DATA_HOME`, `$XDG_CACHE_HOME` and
+`$XDG_STATE_HOME` (see [Files and directories](configuration.md#files-and-directories)):
 
 ```sh
 "${XDG_DATA_HOME:-$HOME/.local/share}/cagents-install/current/bin/cagents-uninstall" --purge
@@ -397,7 +399,13 @@ options, and both scripts refuse to run as root. If you installed with a custom
 Both entry points shut the daemon down only if it is empty, atomically. If live
 terminals or spawn reservations remain, removal fails without terminating them
 or removing program files. Finish them, or run `cagents daemon stop --confirm`
-first.
+first. Removal also refuses, without removing anything, while the daemon is
+still starting or stopping or an application update is in progress; retry once
+it settles. It removes the updater's state with the program files, so the same
+prefix can be reinstalled. Files you added to the prefix are kept, along with
+its installation marker. Like installation, removal refuses a `--prefix` that is
+a symlink; pass the real directory. It uses util-linux `flock` to hold the
+updater's lock.
 
 Remove a Debian installation with:
 
