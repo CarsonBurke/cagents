@@ -12924,6 +12924,17 @@ fn nested_agents_at_every_depth_stay_out_of_the_lead_conversation() {
     assert_eq!(subagent_ids(&snapshot), [LEVEL_ONE]);
     assert_eq!(agent_counts(&snapshot), (1, 0, 0, 0));
 
+    // Level one's own command finishes while level one waits on it, and its
+    // notice resumes level one: it is working again, not a second agent.
+    replay_until(&mut adapter, &mut snapshot, &mut frames, |frame| {
+        frame["subtype"] == "task_notification" && frame["task_id"] == "bshw00wt6"
+    });
+    replay_until(&mut adapter, &mut snapshot, &mut frames, |frame| {
+        frame["subtype"] == "task_started" && frame["tool_use_id"] == LEVEL_ONE
+    });
+    assert_eq!(subagent_ids(&snapshot), [LEVEL_ONE]);
+    assert_eq!(agent_counts(&snapshot), (1, 0, 0, 0));
+
     for line in frames {
         crate::chat::runtime::project_events_for_test(
             &mut snapshot,
@@ -12938,8 +12949,9 @@ fn nested_agents_at_every_depth_stay_out_of_the_lead_conversation() {
         !format!("{:?}", snapshot.items).contains(LEVEL_THREE),
         "level three's call belongs to level two's transcript"
     );
-    // The recording ends with level one resumed by its command's notice.
-    assert_eq!(agent_counts(&snapshot), (1, 0, 0, 0));
+    // The recording ends with level one's completion and an empty background
+    // level: nothing is still working.
+    assert_eq!(agent_counts(&snapshot), (0, 0, 0, 0));
     let command = snapshot
         .items
         .iter()
