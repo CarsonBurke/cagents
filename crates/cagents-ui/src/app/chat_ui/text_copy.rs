@@ -169,7 +169,9 @@ impl Runtime {
             })
     }
     /// The source of a step's whole output when its row shows only an
-    /// excerpt of it, which the store does for a long output.
+    /// excerpt of it, which the store does for a long output. An output too
+    /// large for the clipboard has none: its Copy, and the note beneath it,
+    /// are about the excerpt it shows.
     pub(super) fn excerpted_output_source(
         &self,
         item: &chat::Item,
@@ -178,8 +180,9 @@ impl Runtime {
             ItemContent::Command { output, .. } | ItemContent::Tool { output, .. } => output,
             _ => return None,
         };
-        self.message_copy_source(item)
-            .filter(|source| source.bytes > output.len() as u64)
+        self.message_copy_source(item).filter(|source| {
+            source.bytes > output.len() as u64 && source.bytes <= chat::TEXT_COPY_LIMIT_BYTES as u64
+        })
     }
     fn contains_copy_source(&self, captured: &chat::TextCopySource) -> bool {
         let sources = match (&captured.scope, self.selected_subagent.as_deref()) {

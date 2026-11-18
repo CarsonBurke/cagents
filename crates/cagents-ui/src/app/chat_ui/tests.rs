@@ -19204,8 +19204,16 @@ fn an_excerpted_output_copies_whole_from_its_source() {
     let excerpt = &format!("line\n{}line\n", chat::excerpt_gap(1_000_000));
     let excerpted = source(1, whole.len());
     let mut snapshot = (*handle.snapshot()).clone();
-    snapshot.items = vec![step("long", excerpt), step("short", "done\n")];
-    snapshot.text_copy_sources.conversation = vec![Some(excerpted.clone()), Some(source(2, 5))];
+    snapshot.items = vec![
+        step("long", excerpt),
+        step("short", "done\n"),
+        step("huge", excerpt),
+    ];
+    snapshot.text_copy_sources.conversation = vec![
+        Some(excerpted.clone()),
+        Some(source(2, 5)),
+        Some(source(3, chat::TEXT_COPY_LIMIT_BYTES + 1)),
+    ];
     snapshot.generation += 1;
     handle.publish_snapshot_for_test(snapshot);
     app.chat_runtime_mut(target).unwrap().refresh();
@@ -19218,6 +19226,11 @@ fn an_excerpted_output_copies_whole_from_its_source() {
         runtime.excerpted_output_source(runtime.active_item("short").unwrap()),
         None,
         "a row showing all of its output copies what it shows"
+    );
+    assert_eq!(
+        runtime.excerpted_output_source(runtime.active_item("huge").unwrap()),
+        None,
+        "an output past the clipboard limit copies the excerpt it shows, as its note says"
     );
     assert_eq!(
         step::excerpt_note(&CopyPart::Output, true),

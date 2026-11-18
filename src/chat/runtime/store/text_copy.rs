@@ -128,11 +128,11 @@ impl Store {
         offset: u64,
     ) -> Result<TextCopyPage, String> {
         if source.scope != TextCopyScope::Conversation || source.cache != self.copy_cache {
-            return Err("Full message is unavailable in this owned cache".into());
+            return Err("The full text is unavailable in this owned cache".into());
         }
         if source.bytes > crate::chat::TEXT_COPY_LIMIT_BYTES as u64 {
             return Err(
-                "Message exceeds the 32 MiB clipboard limit; use its provider transcript".into(),
+                "This text exceeds the 32 MiB clipboard limit; use its provider transcript".into(),
             );
         }
         let record: Option<(String, i64, u64, u64)> = self
@@ -145,21 +145,21 @@ impl Store {
             .optional()
             .map_err(|error| error.to_string())?;
         let Some((id, field, revision, total)) = record else {
-            return Err("Full message is no longer available in the owned cache".into());
+            return Err("The full text is no longer available in the owned cache".into());
         };
         if revision != source.revision || source.bytes > total {
-            return Err("Message changed; copy its current text again".into());
+            return Err("This text changed; copy it again".into());
         }
         if offset > source.bytes {
-            return Err("Invalid message copy range".into());
+            return Err("Invalid text copy range".into());
         }
-        let start = usize::try_from(offset).map_err(|_| "Invalid message copy offset")?;
+        let start = usize::try_from(offset).map_err(|_| "Invalid text copy offset")?;
         let mut end = start
             .saturating_add(crate::chat::TEXT_COPY_PAGE_BYTES)
             .min(source.bytes as usize);
         let mut bytes = self.field(&id, field, start, end)?;
         if bytes.len() != end - start {
-            return Err("Full message has an unavailable cached range".into());
+            return Err("The full text has an unavailable cached range".into());
         }
         if end < source.bytes as usize {
             while std::str::from_utf8(&bytes).is_err_and(|error| error.error_len().is_none()) {
@@ -167,9 +167,9 @@ impl Store {
                 end -= 1;
             }
         }
-        let text = String::from_utf8(bytes).map_err(|_| "Invalid UTF-8 message copy range")?;
+        let text = String::from_utf8(bytes).map_err(|_| "Invalid UTF-8 text copy range")?;
         if text.is_empty() && offset < source.bytes {
-            return Err("Message copy made no progress".into());
+            return Err("Text copy made no progress".into());
         }
         Ok(TextCopyPage {
             source: source.clone(),
