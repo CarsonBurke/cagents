@@ -3470,18 +3470,21 @@ impl Drop for AccountSwitchReservation {
 }
 
 /// The original conversation an automatic account switch may close, held
-/// against every other start of it until its successor starts.
+/// against every other start of it until its successor starts, and the copy
+/// of its history the alternate account will resume.
 struct AdmittedSwitch {
     handle: Handle,
     reservation: AccountSwitchReservation,
+    history: crate::account::handoff::Staged,
 }
 
 /// Everything [`recover_account`] checks before it changes anything. An
 /// automatic switch is given its original's actor and a reservation of it; an
 /// explicit recovery, whose original is no longer hosted, is given nothing.
 ///
-/// Every refusal here leaves the original exactly as it was: the only thing
-/// held is the reservation, which drops with the refusal.
+/// Every refusal here leaves the original exactly as it was: what is held is
+/// the reservation and the staged copy of its history, which both drop with
+/// the refusal.
 fn admit_account_recovery(
     host: &SharedHost,
     source: &Session,
@@ -3519,7 +3522,7 @@ fn admit_account_recovery(
     {
         return Err(error("This conversation has an explicitly pinned account"));
     }
-    let admitted = {
+    let (handle, reservation) = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         validate_proof(source.proof.as_ref(), state.proof())?;
         let record = state.chats.get(&source.id).ok_or_else(|| {
@@ -3539,13 +3542,13 @@ fn admit_account_recovery(
         }
         let handle = record.handle.clone();
         state.chat_spawning.insert(source.id, source.clone());
-        AdmittedSwitch {
+        (
             handle,
-            reservation: AccountSwitchReservation {
+            AccountSwitchReservation {
                 host: host.clone(),
                 source: source.clone(),
             },
-        }
+        )
     };
     // A refused replacement must leave the original actor and history
     // intact. The temporary source reservation drops on this error;
@@ -3553,8 +3556,15 @@ fn admit_account_recovery(
     // An account the registry no longer lists is the replacement's, not the
     // original's, so it is refused as any other replacement would be.
     check_launch_account(&replacement.launch)?;
-    crate::account::handoff::preflight(source, replacement).map_err(unavailable)?;
-    Ok(Some(admitted))
+    // Copy the history while the original still runs, so an alternate
+    // account that cannot take it refuses before anything closes. A refused
+    // copy removes itself.
+    let history = crate::account::handoff::stage(source, replacement).map_err(unavailable)?;
+    Ok(Some(AdmittedSwitch {
+        handle,
+        reservation,
+        history,
+    }))
 }
 
 fn recover_account(
@@ -3584,6 +3594,7 @@ fn recover_account(
         Some(AdmittedSwitch {
             handle,
             reservation: held,
+            history,
         }),
     ) = (idle_generation, admitted)
     {
@@ -3593,7 +3604,8 @@ fn recover_account(
         handle
             .close_if_idle_for_resume(generation)
             .map_err(unavailable)?;
-        crate::account::handoff::prepare(&source, &replacement).map_err(unavailable)?;
+        // Publish what the conversation wrote between staging and its close.
+        history.commit().map_err(unavailable)?;
     }
     {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
