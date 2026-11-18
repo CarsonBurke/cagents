@@ -9,7 +9,7 @@ use super::*;
 
 mod conversation;
 
-pub(super) use conversation::WorkKey;
+pub(super) use conversation::{Phase as WorkPhase, WorkKey};
 // The inspected conversation's chats label their links from the same list.
 pub(super) use conversation::Watch as ConversationWatch;
 
@@ -294,20 +294,25 @@ impl Cagents {
         self.worktree_paths.lists(path)
     }
 
-    /// Whether `card`'s Work section has anything to list.
-    pub(super) fn work_listed(&self, card: CardId) -> bool {
-        self.pull_request_inspector
-            .conversation(card)
-            .is_some_and(conversation::State::lists_work)
+    /// Whether `card`'s inspector keeps a Work section: a chat's, while the
+    /// settings show it, whatever its list holds, so the list arriving never
+    /// moves what is beneath it.
+    pub(super) fn work_reserved(&self, card: CardId) -> bool {
+        self.settings.inspector_show_work && self.pane_conversation(card).is_some()
     }
 
-    /// Whether `card`'s Mentioned section has anything to list.
-    pub(super) fn mentions_listed(&self, card: CardId) -> bool {
-        self.settings.show_mentioned_pull_requests
-            && self
-                .pull_request_inspector
-                .conversation(card)
-                .is_some_and(conversation::State::mentions_any)
+    /// Whether `card`'s inspector keeps a Mentioned section, as
+    /// [`Self::work_reserved`] keeps Work.
+    pub(super) fn mentions_reserved(&self, card: CardId) -> bool {
+        self.settings.show_mentioned_pull_requests && self.pane_conversation(card).is_some()
+    }
+
+    /// Where `card`'s conversation's list is: a pane whose inspector has not
+    /// followed its conversation yet is still reading it.
+    pub(super) fn work_phase(&self, card: CardId) -> conversation::Phase {
+        self.pull_request_inspector
+            .conversation(card)
+            .map_or(conversation::Phase::Reading, conversation::State::phase)
     }
 
     /// What `card`'s Work and Mentioned sections and the section beneath
@@ -607,7 +612,10 @@ mod tests {
             },
         ) = conversation_app();
         app.sync_pull_request_inspector();
-        assert!(!app.work_listed(chat));
+        // The section is there before its list, saying it is reading it.
+        assert!(app.work_reserved(chat));
+        assert_eq!(app.work_phase(chat), WorkPhase::Reading);
+        let reserved = app.work_section_height(chat);
         drop(app.handle_pull_request_ui(listed(
             conversation,
             1,
@@ -617,15 +625,20 @@ mod tests {
         // Mentions are left out unless the settings ask for them, and then
         // are listed in their own section rather than counted with the work.
         assert!(!app.settings.show_mentioned_pull_requests);
-        assert!(app.work_listed(chat));
-        assert!(!app.mentions_listed(chat));
+        assert_eq!(app.work_phase(chat), WorkPhase::Listed);
+        assert_eq!(
+            app.work_section_height(chat),
+            reserved,
+            "the list's arrival moves nothing beneath it"
+        );
+        assert!(!app.mentions_reserved(chat));
         let unexpanded = |height: conversation::Height| height.content - height.expanded;
         let row = design::list::TWO_LINE_HEIGHT;
         let summary = app.work_summary(chat);
         assert_eq!((summary.count, summary.mentioned), (1, 0));
         assert_eq!(unexpanded(summary.height), row);
         app.settings.show_mentioned_pull_requests = true;
-        assert!(app.mentions_listed(chat));
+        assert!(app.mentions_reserved(chat));
         let summary = app.work_summary(chat);
         assert_eq!((summary.count, summary.mentioned), (1, 1));
         assert_eq!(
@@ -643,10 +656,13 @@ mod tests {
             &[(5, Relation::Mentioned)],
             false,
         )));
-        assert!(!app.work_listed(chat));
-        assert!(app.mentions_listed(chat));
+        let summary = app.work_summary(chat);
+        assert_eq!((summary.count, summary.mentioned), (0, 1));
+        assert!(app.work_reserved(chat), "Work stays, saying it has none");
+        assert_eq!(app.work_section_height(chat), reserved);
         app.settings.show_mentioned_pull_requests = false;
-        assert!(!app.mentions_listed(chat));
+        assert!(!app.mentions_reserved(chat));
+        assert_eq!(app.work_summary(chat).mentioned, 0);
 
         // Focusing another pane keeps this pane's inspector on its
         // conversation, and the other pane's lists nothing of it.
@@ -655,7 +671,9 @@ mod tests {
         app.sync_pull_request_inspector();
         drop(app.handle_pull_request_ui(listed(conversation, 3, &[(6, Relation::Pushed)], false)));
         assert_eq!(app.work_summary(chat).count, 1);
-        assert!(!app.work_listed(terminal));
+        assert!(!app.work_reserved(terminal));
+        app.settings.inspector_show_work = false;
+        assert!(!app.work_reserved(chat));
     }
 
     #[test]

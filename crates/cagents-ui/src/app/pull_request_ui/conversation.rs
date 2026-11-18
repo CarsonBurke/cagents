@@ -140,6 +140,20 @@ pub struct State {
     /// The previous conversation listed pull requests, so the section stays
     /// while this one's list is on its way rather than flickering away.
     listed_before: bool,
+    /// The daemon could not be asked for a list, and none has arrived. The
+    /// watch keeps trying.
+    lost: bool,
+}
+
+/// Where the inspected conversation's list is, for what its sections show
+/// in place of rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Phase {
+    /// Asked for, not yet arrived.
+    Reading,
+    /// Could not be asked for; asked again shortly.
+    Unavailable,
+    Listed,
 }
 
 /// The work the user chose to show in each conversation they chose any in,
@@ -172,6 +186,7 @@ impl State {
                 }
                 self.revision = revision;
                 self.list = Some(list);
+                self.lost = false;
             }
             // The last list stays: it is what was true, and the daemon's own
             // health is reported elsewhere.
@@ -181,6 +196,7 @@ impl State {
             } => {
                 if self.conversation == Some(conversation) {
                     self.listed_before = false;
+                    self.lost = self.list.is_none();
                 }
                 tracing::debug!(%conversation, %error, "conversation pull requests unavailable")
             }
@@ -365,10 +381,12 @@ impl State {
         }
     }
 
-    /// Whether the conversation mentioned any pull request it did not work
-    /// on.
-    pub(super) fn mentions_any(&self) -> bool {
-        self.rows().iter().any(|row| !row.relation.worked_on())
+    pub(crate) fn phase(&self) -> Phase {
+        match (&self.list, self.lost) {
+            (Some(_), _) => Phase::Listed,
+            (None, true) => Phase::Unavailable,
+            (None, false) => Phase::Reading,
+        }
     }
 }
 
@@ -1207,7 +1225,8 @@ mod tests {
         assert_eq!(state.work(None, &|_| true).len(), 1);
         assert!(state.mentioned(false).is_empty(), "unless the settings ask");
         assert_eq!(state.mentioned(true).len(), 1);
-        assert!(state.lists_work() && state.mentions_any());
+        assert!(state.lists_work());
+        assert_eq!(state.phase(), Phase::Listed);
         // Another conversation's list is not this one's.
         state.update(listed(TerminalId::new(), 9, Vec::new(), true));
         assert_eq!(state.rows().len(), 2);
@@ -1218,6 +1237,28 @@ mod tests {
         assert!(state.retarget(None));
         assert!(state.conversation.is_none());
         assert!(!state.lists_work());
+    }
+
+    #[test]
+    fn a_list_is_read_then_listed_and_a_lost_watch_says_so_only_until_one_arrives() {
+        let conversation = TerminalId::new();
+        let mut state = State::default();
+        state.retarget(Some(conversation));
+        assert_eq!(state.phase(), Phase::Reading);
+        let lost = || Watch::Lost {
+            conversation,
+            error: "refused".to_owned(),
+        };
+        state.update(lost());
+        assert_eq!(state.phase(), Phase::Unavailable);
+        state.update(listed(conversation, 1, Vec::new(), true));
+        assert_eq!(state.phase(), Phase::Listed, "an empty list is listed");
+        // A list that arrived stays what was true when the watch is lost.
+        state.update(lost());
+        assert_eq!(state.phase(), Phase::Listed);
+        // Another conversation starts reading again.
+        state.retarget(Some(TerminalId::new()));
+        assert_eq!(state.phase(), Phase::Reading);
     }
 
     fn worktree(path: &str, pull_request: Option<u64>) -> ConversationWorktree {

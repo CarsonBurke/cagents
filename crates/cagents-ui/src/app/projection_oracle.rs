@@ -125,16 +125,6 @@ pub(super) fn sorted_entries<K: Debug, V: Debug>(map: impl IntoIterator<Item = (
     format!("{{{}}}", entries.join(", "))
 }
 
-/// A set's items as text, ordered by their text.
-pub(super) fn sorted_items<T: Debug>(set: impl IntoIterator<Item = T>) -> String {
-    let mut items = set
-        .into_iter()
-        .map(|item| format!("{item:?}"))
-        .collect::<Vec<_>>();
-    items.sort_unstable();
-    format!("{{{}}}", items.join(", "))
-}
-
 /// Fails unless the derived state is what a full projection makes it: the
 /// updates so far have left nothing stale.
 #[cfg(test)]
