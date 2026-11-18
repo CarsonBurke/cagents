@@ -2349,7 +2349,7 @@ impl ControlClient {
                 // A subscribed connection can be told about another client's
                 // terminal at any point, including mid-replay.
                 message => {
-                    if let Err(message) = self.absorb(message) {
+                    if let Some(message) = self.absorb(message) {
                         return Err(ControlError::UnexpectedMessage {
                             expected: "the terminal attachment replay",
                             actual: message_name(&message),
@@ -2556,19 +2556,19 @@ impl ControlClient {
                 }
                 Some(_) => return response_from_message(envelope.message),
                 None => match self.absorb(envelope.message) {
-                    Ok(()) => {}
-                    Err(message)
+                    None => {}
+                    Some(message)
                         if streaming_terminal.is_some_and(|id| message_targets(&message, id)) => {}
                     // The daemon's notice that it is dropping this connection,
                     // such as an overflowing delivery queue, says why.
-                    Err(ServerMessage::Error(error)) => {
+                    Some(ServerMessage::Error(error)) => {
                         return Err(ControlError::ConnectionRejected {
                             code: error.code,
                             message: error.message,
                             retryable: error.retryable,
                         });
                     }
-                    Err(message) => {
+                    Some(message) => {
                         return Err(ControlError::UnexpectedMessage {
                             expected: "a correlated response",
                             actual: message_name(&message),
@@ -2585,7 +2585,7 @@ impl ControlClient {
     /// Only a connection that subscribed or attached receives these, at any
     /// point between a request and its response, and it must survive the
     /// request they interrupt.
-    fn absorb(&mut self, message: ServerMessage) -> Result<(), ServerMessage> {
+    fn absorb(&mut self, message: ServerMessage) -> Option<ServerMessage> {
         match message {
             ServerMessage::TerminalWorker { .. } => {}
             ServerMessage::TerminalCreated { terminal } => self.observed.push_back(terminal),
@@ -2657,9 +2657,9 @@ impl ControlClient {
             | ServerMessage::Event { terminal_id, .. }
             | ServerMessage::Synchronized { terminal_id, .. }
                 if self.terminal_streams.contains(&terminal_id) => {}
-            message => return Err(message),
+            message => return Some(message),
         }
-        Ok(())
+        None
     }
 
     fn read_envelope(&mut self) -> Result<ServerEnvelope, ControlError> {

@@ -6198,13 +6198,13 @@ mod tests {
                     3 => {
                         let task = app.update(Message::Checkout(checkout::Action::Prepared(
                             id,
-                            Ok(prepared.clone()),
+                            Ok(Box::new(prepared.clone())),
                         )));
                         run_tasks(&mut app, task);
                     }
                     _ => {
                         let task = app.update(Message::Checkout(
-                            checkout::Action::ExistingFinished(id, Ok(completed_receipt.unwrap())),
+                            checkout::Action::ExistingFinished(id, Ok(Box::new(completed_receipt.unwrap()))),
                         ));
                         run_tasks(&mut app, task);
                     }

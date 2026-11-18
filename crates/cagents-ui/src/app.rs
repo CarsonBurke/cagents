@@ -5267,7 +5267,7 @@ enum CardRuntime {
     Terminal(TerminalSurface),
     Chat(Box<chat_ui::Runtime>),
     #[cfg(feature = "integrated-browser")]
-    Browser(BrowserRuntime),
+    Browser(Box<BrowserRuntime>),
     Repository(Box<RepositoryRuntime>),
     PullRequests(Box<PullRequestPane>),
     /// The settings pane. Its drafts are the window's, not the card's, so
@@ -8117,7 +8117,8 @@ impl Cagents {
                 Some(factory),
             ) {
                 Ok(runtime) => {
-                    self.cards.insert(card_id, CardRuntime::Browser(runtime));
+                    self.cards
+                        .insert(card_id, CardRuntime::Browser(Box::new(runtime)));
                 }
                 Err(error) => {
                     startup_error = Some(error.clone());
@@ -9925,7 +9926,8 @@ impl Cagents {
                     Some(factory),
                 ) {
                     Ok(runtime) => {
-                        self.cards.insert(card, CardRuntime::Browser(runtime));
+                        self.cards
+                            .insert(card, CardRuntime::Browser(Box::new(runtime)));
                     }
                     Err(error) => {
                         self.fail_runtime(card, error.clone());
@@ -11181,7 +11183,8 @@ impl Cagents {
                             Some(factory),
                         ) {
                             Ok(runtime) => {
-                                self.cards.insert(card, CardRuntime::Browser(runtime));
+                                self.cards
+                                    .insert(card, CardRuntime::Browser(Box::new(runtime)));
                                 deferred_browser_started = true;
                             }
                             Err(message) => {

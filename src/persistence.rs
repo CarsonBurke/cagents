@@ -5161,13 +5161,12 @@ fn validate_chat_identity(
     }
     if let Some(previous) = previous.filter(|previous| previous.kind == PersistedCardKind::Chat)
         && let Some(stored) = stored_chat_session(transaction, card, previous)?
+        && let Some(check) = chat_identity_change(&stored, session)
     {
-        if let Some(check) = chat_identity_change(&stored, session) {
-            return Err(StoreError::InvalidState(Violation::new(
-                check,
-                check.replace("{card}", &card.to_string()),
-            )));
-        }
+        return Err(StoreError::InvalidState(Violation::new(
+            check,
+            check.replace("{card}", &card.to_string()),
+        )));
     }
     Ok(())
 }

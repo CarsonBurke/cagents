@@ -25,15 +25,17 @@ pub(crate) enum Action {
     Branch(String),
     Destination(String),
     Resolve,
-    Resolved(OperationId, Result<CreateWorktreeRequest, String>),
+    // A background step's result is boxed: each dwarfs the other actions,
+    // which would otherwise all pay its size.
+    Resolved(OperationId, Result<Box<CreateWorktreeRequest>, String>),
     Prepared(
         OperationId,
-        Result<cagents_ui::pull_request_review::checkout::PreparedCheckout, String>,
+        Result<Box<cagents_ui::pull_request_review::checkout::PreparedCheckout>, String>,
     ),
     Create,
     ReconcileExisting,
-    ExistingFinished(OperationId, Result<VerifiedPrCheckout, String>),
-    Finished(OperationId, Result<WorktreeOperationReport, String>),
+    ExistingFinished(OperationId, Result<Box<VerifiedPrCheckout>, String>),
+    Finished(OperationId, Result<Box<WorktreeOperationReport>, String>),
     Cancel,
     Edit,
     Open(PathBuf),
@@ -350,7 +352,8 @@ impl Editor {
                         })
                         .await
                         .map_err(|error| error.to_string())
-                        .and_then(|result| result);
+                        .and_then(|result| result)
+                        .map(Box::new);
                         Message::Checkout(Action::Prepared(id, result))
                     });
                 }
@@ -384,7 +387,8 @@ impl Editor {
                     })
                     .await
                     .map_err(|e| e.to_string())
-                    .and_then(|r| r);
+                    .and_then(|r| r)
+                    .map(Box::new);
                     Message::Checkout(Action::Resolved(id, result))
                 });
             }
@@ -420,7 +424,7 @@ impl Editor {
                         }
                         dialog.branch = plan.branch_input.clone();
                         let existing = plan.reconciliation.is_some();
-                        dialog.prepared = Some(plan);
+                        dialog.prepared = Some(*plan);
                         if !existing {
                             return self.checkout_action(Action::Resolve);
                         }
@@ -440,7 +444,7 @@ impl Editor {
                         );
                     } else {
                         match result {
-                            Ok(request) => dialog.request = Some(request),
+                            Ok(request) => dialog.request = Some(*request),
                             Err(error) => dialog.error = Some(error),
                         }
                     }
@@ -485,7 +489,8 @@ impl Editor {
                     })
                     .await
                     .map_err(|error| error.to_string())
-                    .and_then(|result| result);
+                    .and_then(|result| result)
+                    .map(Box::new);
                     Message::Checkout(Action::ExistingFinished(id, result))
                 });
             }
@@ -499,7 +504,7 @@ impl Editor {
                 };
                 dialog.cancellation = None;
                 if let Ok(receipt) = &result {
-                    dialog.existing_receipt = Some(receipt.clone());
+                    dialog.existing_receipt = Some(VerifiedPrCheckout::clone(receipt));
                 }
                 if !origin_current {
                     dialog.completed = None;
@@ -569,7 +574,8 @@ impl Editor {
                         )
                     })
                     .await
-                    .map_err(|e| e.to_string());
+                    .map_err(|e| e.to_string())
+                    .map(Box::new);
                     Message::Checkout(Action::Finished(id, result))
                 });
             }
@@ -577,7 +583,8 @@ impl Editor {
                 if let Ok(report) = &result {
                     self.checkout_history
                         .retain(|r| r.operation_id != report.operation_id);
-                    self.checkout_history.push(report.clone());
+                    self.checkout_history
+                        .push(WorktreeOperationReport::clone(report));
                     self.trim_checkout_history();
                 }
                 if let Some(dialog) = self.checkout_dialog.as_mut().filter(|d| d.id == id) {

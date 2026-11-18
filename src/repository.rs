@@ -3427,16 +3427,18 @@ pub enum RepositoryError {
     Validation(#[from] ValidationError),
     #[error(transparent)]
     Parse(#[from] GitParseError),
+    // The process output is diagnostic and rarely built, so it is boxed to
+    // keep every `Result<_, RepositoryError>` small.
     #[error("invalid Git output: {error}")]
     InvalidGitOutput {
         error: GitParseError,
-        process: ProcessOutput,
+        process: Box<ProcessOutput>,
     },
     #[error("invalid Git command response: {source}")]
     InvalidResponse {
         #[source]
         source: Box<RepositoryError>,
-        process: ProcessOutput,
+        process: Box<ProcessOutput>,
     },
     #[error(transparent)]
     Process(#[from] ProcessFailure),
@@ -3881,7 +3883,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             }
             Err(error) => Err(RepositoryError::InvalidGitOutput {
                 error,
-                process: output,
+                process: Box::new(output),
             }),
         }
     }
@@ -3910,7 +3912,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             }
             Err(error) => Err(RepositoryError::InvalidGitOutput {
                 error,
-                process: output,
+                process: Box::new(output),
             }),
         }
     }
@@ -7155,7 +7157,10 @@ fn invalid_output<T>(
     result: Result<T, GitParseError>,
     process: ProcessOutput,
 ) -> Result<T, RepositoryError> {
-    result.map_err(|error| RepositoryError::InvalidGitOutput { error, process })
+    result.map_err(|error| RepositoryError::InvalidGitOutput {
+        error,
+        process: Box::new(process),
+    })
 }
 
 fn validate_destination(root: &Path, destination: &Path) -> Result<(), ValidationError> {
@@ -7257,7 +7262,7 @@ fn attach_repository_process<T>(
 ) -> Result<T, RepositoryError> {
     result.map_err(|source| RepositoryError::InvalidResponse {
         source: Box::new(source),
-        process: process.clone(),
+        process: Box::new(process.clone()),
     })
 }
 
