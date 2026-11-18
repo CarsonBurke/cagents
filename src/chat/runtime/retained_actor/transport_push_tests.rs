@@ -535,6 +535,7 @@ fn semantic_metadata_wakes_after_confirmation_without_hidden_body_ticks() {
                 sent.send(id).unwrap();
             }
         })),
+        Default::default(),
         |_| {},
     )
     .unwrap();

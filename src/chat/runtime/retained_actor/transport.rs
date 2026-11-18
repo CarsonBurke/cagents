@@ -445,6 +445,28 @@ impl RemoteActor {
     pub(in crate::chat::runtime) fn fixture() -> Self {
         Self::fixture_at(PathBuf::from("/nonexistent/cagents-actor-fixture"))
     }
+    /// A fixture proxy for `source`'s retained actor, held under `scope`, whose
+    /// helper socket is `socket`. Its holder record names `source`'s terminal
+    /// and boot, so the daemon can register and settle its exact ownership.
+    #[cfg(test)]
+    fn scripted_fixture(
+        socket: PathBuf,
+        source: chat::Session,
+        scope: Result<crate::account::scope::LaunchAccountScope, String>,
+    ) -> Self {
+        let mut actor = Self::fixture_at(socket);
+        let remote = Arc::get_mut(&mut actor.0).expect("a new fixture proxy is unshared");
+        let proof = source
+            .proof
+            .clone()
+            .expect("a retained source carries its proof");
+        remote.identity.record.terminal = source.id;
+        remote.identity.record.boot = proof.boot_id.clone();
+        remote.proof = proof;
+        remote.source = source;
+        remote.launch_account_scope = scope;
+        actor
+    }
     /// A fixture proxy whose helper socket is `socket`. The in-process peer
     /// authenticates, because the fixture names this process as its holder.
     #[cfg(test)]
@@ -2587,12 +2609,12 @@ impl Server {
             initial,
             store,
             startup.source.clone(),
-            move |update| {
+            move |update, confirmed: Option<String>| {
                 if matches!(update, Update::PromptAvailable) {
                     available.fetch_add(1, Ordering::Release);
                 }
                 let mut journal = outcomes.lock().unwrap_or_else(|p| p.into_inner());
-                if let Err(error) = journal.append(&update) {
+                if let Err(error) = journal.append(&update, confirmed.as_deref()) {
                     let _ = journal.record_loss(&format!(
                         "Retained actor outcome continuity is unconfirmed: {error}"
                     ));
@@ -2721,12 +2743,14 @@ impl Server {
         let available = self.prompt_revision.clone();
         let reports = self.account_reports.clone();
         let watcher = self.watcher.clone();
+        let confirmed = self.actor.0.confirmed_session.clone();
         move |update| {
             if matches!(update, Update::PromptAvailable) {
                 available.fetch_add(1, Ordering::Release);
             }
+            let followed = confirmed.lock().unwrap_or_else(|p| p.into_inner()).clone();
             let mut journal = outcomes.lock().unwrap_or_else(|p| p.into_inner());
-            if let Err(error) = journal.append(&update) {
+            if let Err(error) = journal.append(&update, followed.as_deref()) {
                 let _ = journal.record_loss(&format!(
                     "Retained actor outcome continuity is unconfirmed: {error}"
                 ));
@@ -2901,6 +2925,19 @@ impl Server {
             }
         }
         sources
+    }
+    /// Whether `source` projects an issued alias onto one of the `followed`
+    /// conversations, as [`Self::published_sources`] projects the current one.
+    fn follows(&self, source: &chat::Session, followed: &[String]) -> bool {
+        let continuity = chat::NativeContinuity::RetainedClaudeActor { protocol: PROTOCOL };
+        source.launch.session_id.as_ref().is_some_and(|session| {
+            followed.contains(session)
+                && self
+                    .lineage
+                    .iter()
+                    .chain(std::iter::once(&self.source))
+                    .any(|issued| &published_source(issued, Some(session), &continuity) == source)
+        })
     }
     /// Journal commit precedes every public identity-bearing response. The
     /// journal skips exact duplicates, so ordinary observation does not write.
@@ -3137,13 +3174,34 @@ impl Server {
                 }
                 // The journal and authenticated update_source path record exact
                 // issued aliases. No descriptor normalization grants authority.
-                let journal = self.journal.lock().unwrap_or_else(|p| p.into_inner());
-                if !sources.iter().all(|source| {
-                    source == &self.source
-                        || self.lineage.contains(source)
-                        || journal.published_sources().contains(source)
-                }) {
-                    return Err("Retained execution source is not an exact issued alias".into());
+                // An unacknowledged outcome also issues the projections of the
+                // conversation it followed, which the daemon publishes before
+                // committing it, even after a reset replaced that conversation.
+                // Once recognized, such a projection is a published alias like
+                // any other: the census keeps naming it after the outcome is
+                // acknowledged, until the daemon publishes a later one.
+                let followed = {
+                    let journal = self.journal.lock().unwrap_or_else(|p| p.into_inner());
+                    let followed = journal.followed_sessions()?;
+                    let mut issued = Vec::new();
+                    for source in &sources {
+                        if source == &self.source
+                            || self.lineage.contains(source)
+                            || journal.published_sources().contains(source)
+                        {
+                            continue;
+                        }
+                        if !self.follows(source, &followed) {
+                            return Err(
+                                "Retained execution source is not an exact issued alias".into()
+                            );
+                        }
+                        issued.push(source.clone());
+                    }
+                    issued
+                };
+                for source in &followed {
+                    self.remember_descriptor(source)?;
                 }
                 Ok(Value::Null)
             }
@@ -4234,6 +4292,10 @@ mod connection_tests;
 #[cfg(test)]
 #[path = "transport_push_tests.rs"]
 mod push_tests;
+
+#[cfg(test)]
+#[path = "transport_scripted_helper.rs"]
+pub(crate) mod scripted_helper;
 
 #[path = "transport_push.rs"]
 mod push;

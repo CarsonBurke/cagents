@@ -2,7 +2,7 @@
 //! callbacks only wake it; neither callback return nor enqueueing acknowledges
 //! a durable outcome. No RPC, SQLite transaction or journal wait holds HostState.
 use super::*;
-use crate::chat::runtime::{RetirementInspection, VerifiedRetirement};
+use crate::chat::runtime::{OutboxEntry, RetirementInspection, VerifiedRetirement};
 use crate::host::model::NativeActorEvent;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -381,10 +381,14 @@ fn capture_execution_owner<'a>(
 /// its resident source with the conversation the helper itself confirmed.
 /// Read it before taking the Registry lock.
 fn confirmed_projection(handle: &Handle, source: &Session) -> Option<Session> {
-    let confirmed = handle.confirmed_session_id()?;
+    Some(projection(source, handle.confirmed_session_id()?))
+}
+
+/// `source` naming the provider conversation `confirmed`.
+fn projection(source: &Session, confirmed: String) -> Session {
     let mut projected = source.clone();
     projected.launch.session_id = Some(confirmed);
-    Some(projected)
+    projected
 }
 
 /// Recheck the exact captured row under the same Registry mutex as settlement.
@@ -417,12 +421,15 @@ fn require_execution_owner(
     Ok(())
 }
 
-/// A run transition requires the conversation the helper has confirmed to be
-/// durable in the actor census first: `persist_confirmed_identity` publishes
-/// it, and this refuses a transition that would outrun it. The helper confirms
-/// before it journals the outcomes that follow, and every outcome read
-/// refreshes that identity after reading its page, so no run settles while the
-/// helper's current conversation is absent from the census. Close-only cleanup
+/// A run transition requires the conversation it followed to be durable in the
+/// actor census first: `persist_identity` publishes it, and this refuses a
+/// transition that would outrun it. The helper journals with each outcome the
+/// conversation it had confirmed then, so a later reset that clears or replaces
+/// the helper's conversation cannot release an outcome whose own conversation
+/// was never published. Outcomes from a helper that predates that record, and
+/// continuity losses, require the helper's current conversation: the helper
+/// confirms before it journals the outcomes that follow, and every outcome read
+/// refreshes that identity after reading its page. Close-only cleanup
 /// attachments publish no identity and require none.
 fn require_published_identity(
     registry: &super::super::model::Registry,
@@ -476,14 +483,42 @@ impl SemanticTarget {
     }
 
     /// The conversation `require_published_identity` requires before an
-    /// `execution` transition: the one `persist_confirmed_identity` publishes.
-    /// A close-only cleanup attachment publishes none. Read it before taking
-    /// the Registry lock.
-    fn required_identity(&self, execution: bool) -> Option<String> {
+    /// `execution` transition: the one `followed` names when the helper
+    /// recorded it with the outcome, otherwise the helper's current one. A
+    /// close-only cleanup attachment publishes none. Read it before taking the
+    /// Registry lock.
+    fn required_identity(&self, execution: bool, followed: Option<&str>) -> Option<String> {
         if !execution || self.handle.is_close_only() {
             return None;
         }
-        self.handle.confirmed_session_id()
+        followed
+            .map(str::to_owned)
+            .or_else(|| self.handle.confirmed_session_id())
+    }
+
+    /// The census descriptor an outcome requiring `required` is checked
+    /// against: its projection, or the current one when it requires none.
+    fn required_projection(&self, required: Option<&String>) -> Option<Session> {
+        match required {
+            Some(required) => Some(projection(&self.source, required.clone())),
+            None => self.confirmed_projection(),
+        }
+    }
+
+    /// Publish the conversation an execution outcome requires. Publication
+    /// replaces the census row an earlier capture authenticated, so it drops
+    /// that capture; the next commit authenticates the published row.
+    fn publish_required(
+        &self,
+        host: &SharedHost,
+        registry: &super::super::agent_execution::SharedRegistry,
+        required: Option<&str>,
+        execution_owner: &mut Option<ExecutionOwner>,
+    ) -> Result<(), String> {
+        if persist_identity(host, self, registry, required)? {
+            *execution_owner = None;
+        }
+        Ok(())
     }
 }
 
@@ -601,7 +636,7 @@ impl AnswerSync {
                     &self.target,
                     &self.registry,
                     &mut self.owner,
-                    (entry.sequence, entry.update),
+                    entry,
                     false,
                     deadline,
                 )?;
@@ -623,12 +658,29 @@ fn persist_confirmed_identity(
     host: &SharedHost,
     target: &SemanticTarget,
     registry: &super::super::agent_execution::SharedRegistry,
-) -> Result<(), String> {
+) -> Result<bool, String> {
+    persist_identity(
+        host,
+        target,
+        registry,
+        target.handle.confirmed_session_id().as_deref(),
+    )
+}
+
+/// Publish the projection of `confirmed`, a conversation the helper confirmed,
+/// to the agent and the actor census. True when it replaced the census row.
+fn persist_identity(
+    host: &SharedHost,
+    target: &SemanticTarget,
+    registry: &super::super::agent_execution::SharedRegistry,
+    confirmed: Option<&str>,
+) -> Result<bool, String> {
     if target.handle.is_close_only() {
-        return Ok(());
+        return Ok(false);
     }
-    let Some(projected) = target.confirmed_projection() else {
-        return Ok(());
+    let Some(projected) = confirmed.map(|confirmed| projection(&target.source, confirmed.into()))
+    else {
+        return Ok(false);
     };
     let (ownership, bound) = {
         let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
@@ -642,7 +694,7 @@ fn persist_confirmed_identity(
     // Cleanup intent can report attention without installed writer authority.
     // Keep its existing semantic drain; it cannot publish a new identity.
     let Some(ownership) = ownership.filter(|owner| !owner.is_pending()) else {
-        return Ok(());
+        return Ok(false);
     };
     let confirmed = &projected.launch.session_id;
     if &ownership.source().launch.session_id == confirmed
@@ -652,7 +704,7 @@ fn persist_confirmed_identity(
                 if &source.launch.session_id == confirmed)
         })
     {
-        return Ok(());
+        return Ok(false);
     }
     let owner = ExecutionOwner::authenticate(
         Some(ownership),
@@ -694,9 +746,11 @@ fn persist_confirmed_identity(
             .native_actor_ownership(owner.0.actor())?
             .is_some_and(|current| current == published)
         {
-            Ok(())
+            Ok(false)
         } else {
-            registry.confirm_native_actor_identity(&owner.0, &projected)
+            registry
+                .confirm_native_actor_identity(&owner.0, &projected)
+                .map(|()| true)
         };
         (changed, registered)
     };
@@ -747,7 +801,7 @@ fn drain(host: &SharedHost, id: TerminalId) -> Result<bool, String> {
             &mut execution_owner,
         )?;
         let confirmed = target.confirmed_projection();
-        let required = target.required_identity(execution);
+        let required = target.required_identity(execution, None);
         let changed = {
             let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
             require_execution_owner(&registry, owner, execution, confirmed.as_ref())?;
@@ -790,10 +844,14 @@ fn drain(host: &SharedHost, id: TerminalId) -> Result<bool, String> {
             &target,
             &registry,
             &mut execution_owner,
-            (entry.sequence, entry.update),
+            entry,
             loss.is_some(),
             deadline,
         )?;
+    }
+    if more {
+        // An outcome that followed a conversation since reset republished it.
+        persist_confirmed_identity(host, &target, &registry)?;
     }
     // One bounded page per actor per pass. A detached actor can have many
     // pages without another latest-sequence edge; explicitly revisit it until
@@ -862,7 +920,7 @@ fn commit_semantic_entry(
     target: &SemanticTarget,
     registry: &super::super::agent_execution::SharedRegistry,
     execution_owner: &mut Option<ExecutionOwner>,
-    entry: (u64, Update),
+    entry: OutboxEntry,
     lost: bool,
     deadline: Instant,
 ) -> Result<(), String> {
@@ -870,7 +928,11 @@ fn commit_semantic_entry(
         return Err("Retained semantic acknowledgement deadline expired".into());
     }
     target.require_current(host)?;
-    let (sequence, update) = entry;
+    let OutboxEntry {
+        sequence,
+        update,
+        confirmed_session: followed,
+    } = entry;
     let semantic = match update {
         Update::Execution { run, update } => NativeActorEvent::Execution { run, update },
         Update::Attention(evidence) => NativeActorEvent::Attention(evidence),
@@ -880,10 +942,9 @@ fn commit_semantic_entry(
         _ => return Err("The retained semantic outbox contains an unsupported event".into()),
     };
     let execution = matches!(semantic, NativeActorEvent::Execution { .. });
-    if execution {
-        // The page was read before the identity it follows was refreshed.
-        persist_confirmed_identity(host, target, registry)?;
-    }
+    let required = target.required_identity(execution, followed.as_deref());
+    // The page was read before the identity it follows was refreshed.
+    target.publish_required(host, registry, required.as_deref(), execution_owner)?;
     capture_execution_owner(
         registry,
         &target.handle,
@@ -893,8 +954,7 @@ fn commit_semantic_entry(
         execution_owner,
     )?;
     let authenticated = execution || execution_owner.is_some();
-    let confirmed = target.confirmed_projection();
-    let required = target.required_identity(execution);
+    let confirmed = target.required_projection(required.as_ref());
     let (changed, automation) = {
         let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
         require_execution_owner(
@@ -2991,6 +3051,12 @@ fn close_verified_unattached(
 
 /// These IDs came from the authenticated actor's journal at attachment, not
 /// from a user pane, busy bit, or a prior daemon's accepted dispatch record.
+/// Each run is paired with the attachment's resident source, its confirmed
+/// projection, and the descriptor its agent is bound to when that names the
+/// same process. `persist_identity` rebinds the agent to the projection of the
+/// conversation an outcome followed before the census row and the outcome
+/// commit; a failure or restart in between leaves the agent on that projection,
+/// and its runs stay protected for the helper's outcome.
 pub(in crate::host) fn retained_runs(
     host: &SharedHost,
 ) -> Vec<(crate::model::RunId, crate::agent_execution::HostedSession)> {
@@ -3006,21 +3072,54 @@ pub(in crate::host) fn retained_runs(
             })
             .collect::<Vec<_>>()
     };
+    let registry = super::super::agent_execution::registry(host).ok();
     actors
         .into_iter()
         .flat_map(|(handle, source)| {
-            handle.retained_runs().into_iter().map(move |run| {
-                (
-                    run,
-                    crate::agent_execution::HostedSession::Chat(source.clone()),
-                )
-            })
+            let bound = registry.as_ref().and_then(|registry| {
+                match registry
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .agent_for_session(source.id)
+                    .ok()??
+                    .session?
+                {
+                    crate::agent_execution::HostedSession::Chat(bound)
+                        if crate::agent_execution::same_chat_process(&bound, &source) =>
+                    {
+                        Some(bound)
+                    }
+                    _ => None,
+                }
+            });
+            let mut aliases = vec![source.clone()];
+            for alias in confirmed_projection(&handle, &source)
+                .into_iter()
+                .chain(bound)
+            {
+                if !aliases.contains(&alias) {
+                    aliases.push(alias);
+                }
+            }
+            let aliases = aliases
+                .into_iter()
+                .map(crate::agent_execution::HostedSession::Chat)
+                .collect::<Vec<_>>();
+            handle
+                .retained_runs()
+                .into_iter()
+                .flat_map(move |run| aliases.clone().into_iter().map(move |alias| (run, alias)))
         })
         .collect()
 }
 
-/// Boot must record a known loss before deciding which accepted runs remain
-/// protected by the surviving actor. Ordinary deferred delivery still retries.
+/// Boot records each known loss before deciding which accepted runs remain
+/// protected by the surviving actor. A loss that cannot commit yet, because its
+/// confirmed conversation cannot be published, its owner cannot be
+/// authenticated or the helper cannot be reached, holds back only that actor:
+/// the helper keeps the loss unacknowledged, its affected runs stay retained
+/// and so protected, and the outcome broker retries it as it retries any
+/// uncommitted outcome. Recovery continues for every other actor and pane.
 pub(in crate::host) fn reconcile_startup_losses(host: &SharedHost) -> Result<(), String> {
     let actors = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -3031,76 +3130,77 @@ pub(in crate::host) fn reconcile_startup_losses(host: &SharedHost) -> Result<(),
                 record
                     .handle
                     .actor_identity()
-                    .map(|identity| (record.handle.clone(), record.session.clone(), identity))
+                    .map(|identity| SemanticTarget {
+                        handle: record.handle.clone(),
+                        source: record.session.clone(),
+                        identity,
+                        notifications: state.notifications.clone(),
+                    })
             })
             .collect::<Vec<_>>()
     };
     let registry = super::super::agent_execution::registry(host)?;
-    let notifications = host
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .notifications
-        .clone();
-    for (handle, source, identity) in actors {
-        let mut execution_owner = None;
-        handle.refresh_retained_state()?;
-        if let Some(loss) = handle.continuity_loss() {
-            let execution = !loss.affected_runs.is_empty();
-            let target = SemanticTarget {
-                handle: handle.clone(),
-                source: source.clone(),
-                identity: identity.clone(),
-                notifications: notifications.clone(),
-            };
-            if execution {
-                // The loss settles runs; their conversation must be durable.
-                persist_confirmed_identity(host, &target, &registry)?;
-            }
-            let owner = capture_execution_owner(
-                &registry,
-                &handle,
-                &identity,
-                &source,
-                execution,
-                &mut execution_owner,
-            )?;
-            let confirmed = confirmed_projection(&handle, &source);
-            let required = target.required_identity(execution);
-            let changed = {
-                let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-                require_execution_owner(&registry, owner, execution, confirmed.as_ref())?;
-                require_published_identity(&registry, identity.instance, required.as_deref())?;
-                registry.commit_native_actor_loss(
-                    identity.instance,
-                    &identity.record,
-                    &source,
-                    &loss.affected_runs,
-                    &loss.reason,
-                    chat::now_ms().unwrap_or(0),
-                )?
-            };
-            if changed {
-                super::super::agent_execution::announce(host, &registry);
-            }
-            let current = host
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .chats
-                .get(&source.id)
-                .is_some_and(|record| {
-                    record.handle.same_attachment(&handle)
-                        && record.execution_instance == identity.instance
-                        && record.session == source
-                });
-            if !current {
-                return Err(
-                    "Retained startup ownership changed before loss acknowledgement".into(),
-                );
-            }
-            handle.ack_continuity_loss(loss.id)?;
+    for target in actors {
+        if let Err(error) = reconcile_startup_loss(host, &registry, &target) {
+            tracing::warn!(id = %target.source.id, %error,
+                "retained continuity loss is not committed yet; the helper retains it for the outcome broker");
+            wake(host, target.source.id);
         }
     }
     Ok(())
+}
+
+fn reconcile_startup_loss(
+    host: &SharedHost,
+    registry: &super::super::agent_execution::SharedRegistry,
+    target: &SemanticTarget,
+) -> Result<(), String> {
+    let SemanticTarget {
+        handle,
+        source,
+        identity,
+        ..
+    } = target;
+    handle.refresh_retained_state()?;
+    let Some(loss) = handle.continuity_loss() else {
+        return Ok(());
+    };
+    let execution = !loss.affected_runs.is_empty();
+    if execution {
+        // The loss settles runs; their conversation must be durable.
+        persist_confirmed_identity(host, target, registry)?;
+    }
+    let mut execution_owner = None;
+    let owner = capture_execution_owner(
+        registry,
+        handle,
+        identity,
+        source,
+        execution,
+        &mut execution_owner,
+    )?;
+    let confirmed = target.confirmed_projection();
+    let required = target.required_identity(execution, None);
+    let changed = {
+        let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+        require_execution_owner(&registry, owner, execution, confirmed.as_ref())?;
+        require_published_identity(&registry, identity.instance, required.as_deref())?;
+        registry.commit_native_actor_loss(
+            identity.instance,
+            &identity.record,
+            source,
+            &loss.affected_runs,
+            &loss.reason,
+            chat::now_ms().unwrap_or(0),
+        )?
+    };
+    if changed {
+        super::super::agent_execution::announce(host, registry);
+    }
+    target
+        .require_current(host)
+        .map_err(|_| "Retained startup ownership changed before loss acknowledgement")?;
+    handle.ack_continuity_loss(loss.id)
 }
 
 /// A completed task from a previous kernel boot is saved history, not ownership
@@ -3527,7 +3627,7 @@ pub(in crate::host) fn finish_close(
             &mut execution_owner,
         )?;
         let confirmed = target.confirmed_projection();
-        let required = target.required_identity(execution);
+        let required = target.required_identity(execution, None);
         let changed = {
             let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
             require_execution_owner(&registry, owner, execution, confirmed.as_ref())?;
@@ -3565,9 +3665,8 @@ pub(in crate::host) fn finish_close(
         if page.is_empty() {
             break;
         }
-        // The page was read before the identity it follows was refreshed.
-        persist_confirmed_identity(host, &target, &registry)?;
         for entry in page {
+            let followed = entry.confirmed_session;
             let event = match entry.update {
                 Update::Execution { run, update } => NativeActorEvent::Execution { run, update },
                 Update::Attention(evidence) => NativeActorEvent::Attention(evidence),
@@ -3581,6 +3680,9 @@ pub(in crate::host) fn finish_close(
                 }
             };
             let execution = matches!(event, NativeActorEvent::Execution { .. });
+            let required = target.required_identity(execution, followed.as_deref());
+            // The page was read before the identity it follows was refreshed.
+            target.publish_required(host, &registry, required.as_deref(), &mut execution_owner)?;
             let owner = capture_execution_owner(
                 &registry,
                 &handle,
@@ -3589,8 +3691,7 @@ pub(in crate::host) fn finish_close(
                 execution,
                 &mut execution_owner,
             )?;
-            let confirmed = target.confirmed_projection();
-            let required = target.required_identity(execution);
+            let confirmed = target.required_projection(required.as_ref());
             let (changed, automation) = {
                 let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
                 require_execution_owner(&registry, owner, execution, confirmed.as_ref())?;
@@ -3649,6 +3750,8 @@ pub(in crate::host) fn finish_close(
             }
         }
     }
+    // An outcome that followed a conversation since reset republished it.
+    persist_confirmed_identity(host, &target, &registry)?;
     publish_retirement(host, handle, &source)
 }
 

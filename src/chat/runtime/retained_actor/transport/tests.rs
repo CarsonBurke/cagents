@@ -1172,10 +1172,13 @@ fn stopped_provider_keeps_its_semantic_journal_until_outcome_and_loss_ack() {
             .journal
             .lock()
             .unwrap()
-            .append(&Update::Attention(crate::notifications::Evidence {
-                key: "final-turn".into(),
-                kind: crate::notifications::Kind::Succeeded,
-            }))
+            .append(
+                &Update::Attention(crate::notifications::Evidence {
+                    key: "final-turn".into(),
+                    kind: crate::notifications::Kind::Succeeded,
+                }),
+                None,
+            )
             .unwrap();
         assert!(server.check_retirement().is_err());
         assert_eq!(
@@ -1424,6 +1427,69 @@ fn protocol_one_attachment_is_refused_without_starting_or_retiring_its_owner() {
     assert!(!original.0.stop.load(Ordering::Acquire));
     assert!(identity.record.root.is_current());
     assert!(original.pending_inputs().is_empty());
+}
+/// #2849 follow-up: each journaled outcome names the conversation the
+/// provider had confirmed, and the daemon publishes that conversation
+/// before committing it. After a reset replaces the conversation, the
+/// helper must still recognize that projection while the outcome is
+/// unacknowledged. A recognized projection stays a published alias, since the
+/// census keeps naming it; an unrecognized one is not issued after the ack.
+#[test]
+fn an_unacknowledged_outcome_keeps_its_conversation_recognized_after_a_reset() {
+    let mut fixture = resident_fixture();
+    let followed = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let current = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    let unrelated = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    *fixture.server.actor.0.confirmed_session.lock().unwrap() = Some(followed.into());
+    let notify = fixture.server.notifier();
+    notify(Update::Execution {
+        run: crate::model::RunId::new(),
+        update: crate::agent_execution::Update::Finished {
+            state: crate::agent_execution::State::Succeeded,
+            result: Default::default(),
+        },
+    });
+    *fixture.server.actor.0.confirmed_session.lock().unwrap() = Some(current.into());
+    let page = fixture.server.journal.lock().unwrap().page(0).unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].confirmed_session.as_deref(), Some(followed));
+    let continuity = chat::NativeContinuity::RetainedClaudeActor { protocol: PROTOCOL };
+    let call = |server: &mut Server, method: &str, args: Value| {
+        let (proof, epoch) = (server.proof.clone(), server.epoch);
+        server.invoke(Invocation {
+            proof,
+            epoch: Some(epoch),
+            method: method.into(),
+            args,
+        })
+    };
+    let recognize = |server: &mut Server, session| {
+        let projected = published_source(&server.source, Some(session), &continuity);
+        call(server, "recognize_sources", json!([[projected]]))
+    };
+    recognize(&mut fixture.server, followed).unwrap();
+    assert!(recognize(&mut fixture.server, unrelated).is_err());
+    call(&mut fixture.server, "ack_outbox", json!([page[0].sequence])).unwrap();
+    // The daemon's census now names the followed projection. Republishing
+    // the current conversation authenticates that row first.
+    recognize(&mut fixture.server, followed).unwrap();
+    // An outcome acknowledged without its projection ever being recognized
+    // leaves nothing issued.
+    *fixture.server.actor.0.confirmed_session.lock().unwrap() = Some(unrelated.into());
+    notify(Update::Execution {
+        run: crate::model::RunId::new(),
+        update: crate::agent_execution::Update::Finished {
+            state: crate::agent_execution::State::Succeeded,
+            result: Default::default(),
+        },
+    });
+    *fixture.server.actor.0.confirmed_session.lock().unwrap() = Some(current.into());
+    let sequence = fixture.server.journal.lock().unwrap().latest().unwrap();
+    call(&mut fixture.server, "ack_outbox", json!([sequence])).unwrap();
+    assert!(
+        recognize(&mut fixture.server, unrelated).is_err(),
+        "an acknowledged outcome issues no further conversation"
+    );
 }
 #[test]
 fn inspection_commits_the_exact_captured_alias_before_a_concurrent_reset() {
@@ -2457,6 +2523,7 @@ fn an_outcome_page_is_never_newer_than_the_identity_read_with_it() {
                 result: Default::default(),
             },
         },
+        confirmed_session: None,
     };
     // The helper confirms and journals the outcome right after answering
     // the first request of the read, whichever request that is.

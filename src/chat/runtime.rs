@@ -33,6 +33,11 @@ pub(crate) use handle::RetainedInputOutcome;
 /// Process evidence only, without the reader lease: no retirement authority.
 pub(crate) use retained_actor::execution_exit::abandoned as retained_actor_abandoned;
 pub(crate) use retained_actor::execution_exit::codex_abandoned as codex_execution_abandoned;
+#[cfg(test)]
+pub(crate) use retained_actor::journal::ContinuityLoss;
+pub(crate) use retained_actor::journal::OutboxEntry;
+#[cfg(test)]
+pub(crate) use retained_actor::transport::scripted_helper::{Script, ScriptedHelper};
 pub(crate) use retained_actor::transport::{
     ActorIdentity, RetirementInspection, VerifiedRetirement,
 };
@@ -424,18 +429,30 @@ impl LocalHandle {
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         Self::start_with_scope(
-            spec, adapter, initial, store, session_id, ownership, None, None, notify,
+            spec,
+            adapter,
+            initial,
+            store,
+            session_id,
+            ownership,
+            None,
+            None,
+            Default::default(),
+            notify,
         )
     }
 
     /// The helper captures its immutable physical account before spawning.
+    /// `notify` also receives the conversation the provider had confirmed
+    /// when it published each update. A frame's confirmation is installed
+    /// before the outcomes it settles are published.
     pub(super) fn start_retained(
         spec: ProcessSpec,
         adapter: Box<dyn Adapter>,
         initial: Step,
         store: Store,
         source: super::Session,
-        notify: impl Fn(Update) + Send + Sync + 'static,
+        notify: impl Fn(Update, Option<String>) + Send + Sync + 'static,
         resident_changed: impl Fn() + Send + Sync + 'static,
     ) -> Result<Self, String> {
         if source.launch.provider != crate::agent::Provider::Claude {
@@ -446,6 +463,8 @@ impl LocalHandle {
             &spec.working_directory,
             |name| spec.environment.get(name).map(std::ffi::OsString::from),
         )?;
+        let confirmed_session = Arc::new(Mutex::new(None));
+        let followed = confirmed_session.clone();
         Self::start_with_scope(
             spec,
             adapter,
@@ -455,7 +474,11 @@ impl LocalHandle {
             None,
             Some(scope),
             Some(Arc::new(resident_changed)),
-            notify,
+            confirmed_session,
+            move |update| {
+                let confirmed = followed.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                notify(update, confirmed)
+            },
         )
     }
 
@@ -468,6 +491,7 @@ impl LocalHandle {
         ownership: Option<NativeOwnership>,
         launch_account_scope: Option<crate::account::scope::LaunchAccountScope>,
         resident_changed: Option<Arc<dyn Fn() + Send + Sync>>,
+        confirmed_session: Arc<Mutex<Option<String>>>,
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         spec.withhold_environment();
@@ -557,7 +581,6 @@ impl LocalHandle {
         let draining = Arc::new(AtomicBool::new(false));
         let failure = Arc::new(Mutex::new(None));
         let store = Arc::new(Mutex::new(store));
-        let confirmed_session = Arc::new(Mutex::new(None));
         let agent_addresses = AgentAddresses::default();
         let preserve_native = Arc::new(AtomicBool::new(false));
         let release_native = Arc::new(AtomicBool::new(false));
