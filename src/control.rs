@@ -708,7 +708,7 @@ pub enum ControlError {
     Configure(#[source] io::Error),
     #[error(transparent)]
     Frame(#[from] FrameError),
-    #[error("the daemon did not answer within {} s", timeout.as_secs_f64())]
+    #[error("the daemon did not answer within {:.1} s", timeout.as_secs_f64())]
     ReplyTimeout {
         timeout: Duration,
         #[source]
