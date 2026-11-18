@@ -1739,7 +1739,7 @@ fn perform_update(
         Installation::detect()?;
         turns.apply(observe_impact(&staged.identity, policy)?)
     };
-    let confirmed = confirmation::wait(state, job, |policy| {
+    let confirmed = confirmation::wait(state, job, terminal, |policy| {
         Ok(context.apply(observe(policy)?.with_inspection(&inspection)))
     })?;
     if confirmed.replaces_daemon {
