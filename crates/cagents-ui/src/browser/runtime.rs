@@ -1065,6 +1065,7 @@ impl CardSession {
         let pending_clipboard = Rc::new(RefCell::new(HashMap::new()));
         let pending_file_pickers = Rc::new(RefCell::new(HashMap::new()));
         let navigation = Rc::new(RefCell::new(NavigationState::restored(
+            &restore.url,
             &restore.history,
             restore.history_index,
         )));
@@ -2128,6 +2129,7 @@ mod tests {
             .build();
         let events = EventBus::new();
         let navigation = Rc::new(RefCell::new(NavigationState::restored(
+            &first,
             std::slice::from_ref(&first),
             0,
         )));
@@ -2195,12 +2197,16 @@ mod tests {
         spin_until("Back", &|history, loaded| {
             *history == (both.clone(), 0) && loaded && webview.url() == Some(first.clone())
         });
+        // Servo went back within its own list rather than loading the first
+        // page again as a third entry.
+        assert_eq!(navigation.borrow().servo_entries(), both.as_slice());
         assert!(!traverse_webview(&webview, &navigation, -1));
 
         assert!(traverse_webview(&webview, &navigation, 1));
         spin_until("Forward", &|history, loaded| {
             *history == (both.clone(), 1) && loaded && webview.url() == Some(second.clone())
         });
+        assert_eq!(navigation.borrow().servo_entries(), both.as_slice());
         assert!(!traverse_webview(&webview, &navigation, 1));
     }
 }
