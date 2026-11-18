@@ -30,6 +30,24 @@ fi
 
 login=fixture
 viewer_id=U_kgDOFixture
+# GitHub's state of a check rollup, over every check in it, and a seeded
+# rollup's checks in GraphQL's shape, a hundred per page from offset $from.
+checks_jq='
+    def aggregate:
+        map((.conclusion // .state // .status // "UNKNOWN") | ascii_upcase) as $states
+        | if any($states[]; IN("FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE")) then "FAILURE"
+          elif any($states[]; IN("PENDING", "QUEUED", "IN_PROGRESS", "REQUESTED", "WAITING", "EXPECTED")) then "PENDING"
+          elif all($states[]; IN("SUCCESS", "NEUTRAL", "SKIPPED")) then "SUCCESS"
+          else "ERROR" end;
+    def contexts($from):
+        {totalCount: length,
+         pageInfo: {hasNextPage: (length > $from + 100),
+             endCursor: (if length > $from + 100 then ($from + 100 | tostring) else null end)},
+         nodes: (.[$from:$from + 100] | map(
+            if .__typename == "CheckRun"
+            then del(.workflowName) + {checkSuite: (if .workflowName
+                then {workflowRun: {workflow: {name: .workflowName}}} else null end)}
+            else . end))};'
 pull_requests=$config/fixture-forge-prs.json
 
 # Opt-in native polling evidence. Record operation labels, never query bodies.
@@ -300,7 +318,7 @@ pr() {
 }
 
 api() {
-    include=false method= endpoint= query= number= fields=false owner= name= limit=50
+    include=false method= endpoint= query= number= cursor= fields=false owner= name= limit=50
     search_open= search_all= open_limit=50 all_limit=100 if_none_match=
     while [ "$#" -gt 0 ]; do
         case $1 in
@@ -320,6 +338,7 @@ api() {
                 case $1 in
                     query=*) query=${1#query=} ;;
                     number=*) number=${1#number=} ;;
+                    cursor=*) cursor=${1#cursor=} ;;
                     owner=*) owner=${1#owner=} ;;
                     name=*) name=${1#name=} ;;
                     limit=*) limit=${1#limit=} ;;
@@ -346,7 +365,7 @@ api() {
         trace "api graphql CagentsAuthoredPullRequests repository=$slug"
         check_seed
         ! "$include" || headers '200 OK' graphql
-        seeded "$slug" | jq -c --arg login "$login" --argjson open "$open_limit" --argjson all "$all_limit" '
+        seeded "$slug" | jq -c --arg login "$login" --argjson open "$open_limit" --argjson all "$all_limit" "$checks_jq"'
             map(select(.author.login == $login)) | sort_by(.updatedAt) | reverse
             | def identity: {number, title, state, isDraft, headRefName, headRefOid,
                 headRepository, headRepositoryOwner, baseRefName, updatedAt, url};
@@ -355,11 +374,7 @@ api() {
                     reviewDecision, additions, deletions,
                     commits: {nodes: [{commit: {statusCheckRollup:
                         (if (.statusCheckRollup // [] | length) == 0 then null
-                         else {contexts: {nodes: (.statusCheckRollup | map(
-                            if .__typename == "CheckRun"
-                            then del(.workflowName) + {checkSuite: (if .workflowName
-                                then {workflowRun: {workflow: {name: .workflowName}}} else null end)}
-                            else . end))}} end)}}]}}))},
+                         else .statusCheckRollup | {state: aggregate, contexts: contexts(0)} end)}}]}}))},
                 all: {nodes: (.[:$all] | map(identity))}}}'
         return
     fi
@@ -372,13 +387,7 @@ api() {
                 ! "$include" || headers '200 OK' graphql
                 open=false
                 case $query in 'query SidebarPullRequests('*) open=true ;; esac
-                seeded "$owner/$name" | jq -c --argjson open "$open" --argjson limit "$limit" '
-                    def aggregate:
-                        map((.conclusion // .state // .status // "UNKNOWN") | ascii_upcase) as $states
-                        | if any($states[]; IN("FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE")) then "FAILURE"
-                          elif any($states[]; IN("PENDING", "QUEUED", "IN_PROGRESS", "REQUESTED", "WAITING", "EXPECTED")) then "PENDING"
-                          elif all($states[]; IN("SUCCESS", "NEUTRAL", "SKIPPED")) then "SUCCESS"
-                          else "ERROR" end;
+                seeded "$owner/$name" | jq -c --argjson open "$open" --argjson limit "$limit" "$checks_jq"'
                     map(select(($open | not) or .state == "OPEN")) | .[:$limit]
                     | map(.headRepository.owner = .headRepositoryOwner
                         | if $open then
@@ -401,6 +410,18 @@ api() {
             *'search(type:ISSUE'*)
                 ! "$include" || headers '200 OK' graphql
                 printf '%s\n' '{"data":{"search":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}'
+                ;;
+            'query CagentsPullRequestChecks('*)
+                # The Work board's further pages of a seeded rollup.
+                check_seed
+                found=$(seeded "$owner/$name" | jq -c --argjson number "${number:-0}" \
+                    'map(select(.number == $number)) | .[0] // empty')
+                [ -n "$found" ] || unsupported api graphql CagentsPullRequestChecks
+                ! "$include" || headers '200 OK' graphql
+                printf '%s\n' "$found" | jq -c --argjson from "${cursor:-0}" "$checks_jq"'
+                    {data: {repository: {pullRequest: {commits: {nodes: [{commit: {oid: .headRefOid,
+                        statusCheckRollup: {contexts: (.statusCheckRollup // [] | contexts($from)
+                            | del(.totalCount))}}}]}}}}}'
                 ;;
             *'pullRequest(number:'*)
                 # GitHub answers 200 with an error; gh prints it and fails.

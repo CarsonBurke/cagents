@@ -45,6 +45,11 @@ pub fn checks_settling(pull_requests: &[PullRequest]) -> bool {
         .any(|pull_request| {
             let checks = pull_request.check_summaries();
             checks.iter().any(|check| check.bucket.0 == "pending")
+                // Pending beyond the checks a rollup lists.
+                || pull_request
+                    .status_check_state
+                    .as_ref()
+                    .is_some_and(|state| matches!(state.0.as_str(), "PENDING" | "EXPECTED"))
                 || (checks.is_empty() && recent(pull_request))
         })
 }
@@ -212,6 +217,10 @@ mod tests {
             serde_json::json!([])
         )]));
         assert!(!checks_settling(&[pull_request("MERGED", &now, pending)]));
+        // A check still running beyond those the rollup lists.
+        let mut beyond = pull_request("OPEN", old, serde_json::json!([]));
+        beyond.status_check_state = Some(crate::github::RemoteValue("PENDING".into()));
+        assert!(checks_settling(&[beyond]));
     }
 
     #[test]

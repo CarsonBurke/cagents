@@ -193,6 +193,24 @@ fn the_fixture_forge_answers_with_a_seeded_pull_request() {
     assert_eq!(authored.all.len(), 1);
     assert_eq!(authored.open[0].check_summaries()[0].state.0, "FAILURE");
     assert_eq!(authored.all[0].status_check_rollup, None);
+    // A rollup longer than GitHub's hundred-check page is read to its end.
+    let mut matrix = seed.clone();
+    matrix[0]["statusCheckRollup"] = (0..230)
+        .map(|index| {
+            serde_json::json!({"__typename": "CheckRun", "name": format!("job {index}"),
+                "status": "COMPLETED",
+                "conclusion": if index == 170 { "FAILURE" } else { "SUCCESS" }})
+        })
+        .collect();
+    std::fs::write(&forge.seed, matrix.to_string()).unwrap();
+    let authored = service
+        .authored_pull_requests(&key, 50, 100, &cancellation)
+        .unwrap();
+    let checks = authored.open[0].check_summaries();
+    assert_eq!(checks.len(), 230);
+    assert_eq!(checks[170].state.0, "FAILURE");
+    assert_eq!(authored.open[0].status_check_count, Some(230));
+    std::fs::write(&forge.seed, seeded_checks.to_string()).unwrap();
 
     // The board's probe is unchanged until a seed it covers changes.
     let probe = "repos/Fixture-Owner/fixture-app/issues?creator=fixture&state=all&sort=updated&direction=desc&per_page=20";

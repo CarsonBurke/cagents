@@ -140,7 +140,9 @@ Work board's `CagentsAuthoredPullRequests`, use seeded rows too; the board's
 lists `fixture`'s seeds, newest `updatedAt` first, and moves each check run's
 `workflowName` to `checkSuite.workflowRun.workflow.name`, where GraphQL keeps
 it. The open query computes the aggregate check state from the seed's
-`statusCheckRollup`; history omits checks. This exercises the native sidebar's
+`statusCheckRollup`; history omits checks. As GitHub does, the board's open
+search lists a hundred checks per pull request with their total and a cursor,
+and its `CagentsPullRequestChecks` reads the next hundred from there. This exercises the native sidebar's
 actual query and decoder without a GitHub account.
 
 For polling evidence, create `home/.config/fixture-forge-trace`. The forge then

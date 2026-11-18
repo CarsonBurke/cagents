@@ -357,6 +357,14 @@ pub struct PullRequest {
     pub changed_files: Option<u64>,
     #[serde(default)]
     pub status_check_rollup: Option<Vec<PullRequestCheckRollup>>,
+    /// GitHub's verdict over every check, `SUCCESS`, `FAILURE`, `ERROR`,
+    /// `PENDING` or `EXPECTED`, where a listing asked for it: the rollup may
+    /// list only some of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_check_state: Option<RemoteValue>,
+    /// How many checks there are, listed or not, where a listing asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_check_count: Option<u64>,
 }
 
 /// An open pull request numbered `number`, for tests here and in the UI crate.
