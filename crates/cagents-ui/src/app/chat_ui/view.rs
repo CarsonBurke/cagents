@@ -6453,23 +6453,20 @@ impl Runtime {
             }
         }
         // Like a step or a thought, a delivery is a line of the timeline
-        // until its detail is open, and only that detail carries the
-        // message's actions beneath it.
+        // until its detail is open. Open, the whole message, its row
+        // included, carries the message's actions beneath it, so hovering
+        // the row that opened it shows them.
         let body: Element<'static, Message> = if rows.is_empty() {
             heading_row
         } else {
-            widget::column::with_children(vec![
-                heading_row,
-                message_actions(
-                    widget::column::with_children(rows)
-                        .spacing(step::GAP_XS)
-                        .into(),
-                    self.message_copy(item),
-                    Alignment::Start,
-                ),
-            ])
-            .spacing(step::GAP_XS)
-            .into()
+            rows.insert(0, heading_row);
+            message_actions(
+                widget::column::with_children(rows)
+                    .spacing(step::GAP_XS)
+                    .into(),
+                self.message_copy(item),
+                Alignment::Start,
+            )
         };
         widget::container(body)
             .max_width(design::READABLE_MEASURE)
