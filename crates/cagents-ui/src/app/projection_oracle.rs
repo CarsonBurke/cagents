@@ -407,11 +407,13 @@ impl Cagents {
     fn may_project_narrowly(&self, message: &Message) -> bool {
         repaint_tick(message)
             || background_poll(message)
-            || self.navigation_save_is_stale(message)
             || matches!(message, Message::ChatUi(action) if action.local_scope().is_some())
+            || matches!(message, Message::TerminalFailure(action) if action.only_touches_probes())
             || matches!(
                 message,
                 Message::ReplicaCaptureDue(_)
+                    | Message::NavigationSaveDue(_)
+                    | Message::AcknowledgeVisiblePane { .. }
                     | Message::TerminalWake { .. }
                     | Message::WorkspaceModelObserved(_)
                     | Message::KeyEvent { .. }

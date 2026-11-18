@@ -513,8 +513,9 @@ fn worktree_open_timing() {
 
 /// What the save a channel click defers costs the UI thread when it comes
 /// due, clicking channels in `channel_open_timing`'s order. The whole
-/// `NavigationSaveDue` update is timed untraced: the save, then the full
-/// projection that follows it. A second pass traces only those updates and
+/// `NavigationSaveDue` update is timed untraced: the save, and the projection
+/// it needs, which is none when the save changed nothing the projection
+/// reads. A second pass traces only those updates and
 /// reports the workspace pipeline's own timing of each phase of the save.
 #[test]
 #[ignore = "timing workload; run optimized with --ignored --nocapture"]
@@ -944,13 +945,17 @@ fn pull_request_label_upkeep_timing() {
 /// What the projection that ends an update costs in the large workspace, in
 /// full and stage by stage, and the whole update for messages that change
 /// nothing the projection reads: a modifier key's event, which every keystroke
-/// delivers beside the text it types, and an animation frame.
+/// delivers beside the text it types, an animation frame, a transcript probe's
+/// retry, a superseded visibility dwell and the save a channel click defers.
 #[test]
 #[ignore = "timing workload; run optimized with --ignored --nocapture"]
 fn projection_tail_timing() {
     super::projection_oracle::disable();
     const ROUNDS: usize = 64;
     let (mut app, channels, _directory) = large_workspace(&Scale::LARGE);
+    // A save publishes views; production skips the test build's check that
+    // rediscovery agrees with the incremental result.
+    app.shared_views.skip_rediscovery_check();
     drop(app.update(Message::Sidebar(SidebarAction::OpenChannel {
         channel_id: channels[1],
     })));
@@ -985,6 +990,46 @@ fn projection_tail_timing() {
     timed("update(ChatUi Tick)", &mut app, &mut |app| {
         drop(app.update(Message::ChatUi(chat_ui::Action::Tick)))
     });
+    timed(
+        "update(TerminalFailure ProbeRetryDue)",
+        &mut app,
+        &mut |app| {
+            drop(app.update(Message::TerminalFailure(
+                terminal_failure::Action::ProbeRetryDue,
+            )))
+        },
+    );
+    timed(
+        "update(AcknowledgeVisiblePane superseded)",
+        &mut app,
+        &mut |app| {
+            let card = app.workspace.focused().expect("the channel focuses a pane");
+            drop(app.update(Message::AcknowledgeVisiblePane {
+                card,
+                epoch: app.attention_focus_epoch.wrapping_sub(1),
+            }))
+        },
+    );
+    // The save a channel click defers, which falls due with nothing left to
+    // project: the click projected its navigation.
+    let mut saves = Vec::with_capacity(ROUNDS);
+    let mut projected = 0;
+    for round in 0..ROUNDS + 8 {
+        drop(app.update(Message::Sidebar(SidebarAction::OpenChannel {
+            channel_id: channels[1 + round % 2],
+        })));
+        assert!(app.navigation_save.is_some(), "the click defers its save");
+        let before = super::terminal_output_tests::projections();
+        let started = Instant::now();
+        drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
+        if round >= 8 {
+            saves.push(started.elapsed());
+            projected += super::terminal_output_tests::projections() - before;
+        }
+        assert!(app.navigation_save.is_none(), "the save ran");
+    }
+    summary("update(NavigationSaveDue after a click)", &mut saves);
+    eprintln!("  of which {projected} of {ROUNDS} projected the whole workspace");
     timed("project_workspace (Full)", &mut app, &mut |app| {
         drop(app.project_workspace(false))
     });

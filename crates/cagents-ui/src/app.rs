@@ -1192,6 +1192,10 @@ enum Projection {
     Chrome,
     /// Stable shared presentation, including retained local scope members.
     ScopedChrome(Vec<CardId>),
+    /// Only a terminal's transcript probe changed, or its retry time came.
+    /// Nothing but the probe stage reads probes, and that stage starts the
+    /// probes now due.
+    TranscriptProbes,
     /// Anything else, including every user action.
     Full,
 }
@@ -1203,6 +1207,7 @@ impl Projection {
             Self::Unchanged => "Unchanged",
             Self::Chrome => "Chrome",
             Self::ScopedChrome(_) => "ScopedChrome",
+            Self::TranscriptProbes => "TranscriptProbes",
             Self::Full => "Full",
         }
     }
@@ -1620,6 +1625,42 @@ impl Default for PanePresence {
 /// nothing outside this window reads it before then. A channel name another
 /// window gave, which the shared registry already holds, waits the same way.
 const NAVIGATION_SAVE_DELAY: Duration = Duration::from_secs(1);
+
+/// What a save writes that a projection reads.
+///
+/// The navigation it saves was projected when it happened. A save then
+/// snapshots the strip into the active channel, which can reorder its panes
+/// and drops closed cards from every channel, and prunes pending terminal
+/// creations; worktree protections read where editors are
+/// (`repository_navigation`). It also writes where the window is
+/// (`active_worktree`, `worktree_focus`), its history, drafts and shared-view
+/// bookkeeping, none of which a projection reads. When none of these changed,
+/// the save leaves nothing to project.
+struct SavedProjectionInputs {
+    channels: Vec<crate::model::ProjectChannel>,
+    focused: Option<CardId>,
+    pending_terminal_creations: HashSet<CardId>,
+    repository_navigation: HashMap<CardId, crate::model::RepositoryNavigation>,
+}
+
+impl SavedProjectionInputs {
+    fn capture(app: &Cagents) -> Self {
+        Self {
+            channels: app.durable.channels.clone(),
+            focused: app.durable.focused,
+            pending_terminal_creations: app.durable.pending_terminal_creations.clone(),
+            repository_navigation: app.durable.repository_navigation.clone(),
+        }
+    }
+
+    fn unchanged(&self, app: &Cagents) -> bool {
+        let durable = &app.durable;
+        self.channels == durable.channels
+            && self.focused == durable.focused
+            && self.pending_terminal_creations == durable.pending_terminal_creations
+            && self.repository_navigation == durable.repository_navigation
+    }
+}
 
 /// What a save deferred by [`NAVIGATION_SAVE_DELAY`] has to do when it falls
 /// due. Ordered so that merging two requests keeps the larger one.
@@ -10878,6 +10919,16 @@ impl Cagents {
             .filter(|_| generation == self.navigation_save_generation)
     }
 
+    /// Whether the work every update does after its handler, committing
+    /// settings on blur and settling queued or pending closes, may change
+    /// what a projection reads. A handler's narrower projection describes
+    /// only what the handler changed.
+    fn update_tail_may_close_or_commit(&self) -> bool {
+        self.settings_blur_pending()
+            || !self.queued_card_closes.is_empty()
+            || self.workspace.pending_close().is_some()
+    }
+
     /// A navigation save timer with nothing left to save changes nothing a
     /// projection reads, so it skips the sidebar and chrome rebuild.
     fn navigation_save_is_stale(&self, message: &Message) -> bool {
@@ -16170,7 +16221,12 @@ impl Application for Cagents {
             Projection::Full
         };
         let task = match message {
-            Message::TerminalFailure(action) => self.update_terminal_failure(action),
+            Message::TerminalFailure(action) => {
+                if action.only_touches_probes() && !self.update_tail_may_close_or_commit() {
+                    projection = Projection::TranscriptProbes;
+                }
+                self.update_terminal_failure(action)
+            }
             Message::TerminalSave(action) => self.update_terminal_save(action),
             Message::SavedTerminal(action) => self.update_saved_terminal(action),
             Message::Device(action) => self.update_device(action),
@@ -16582,9 +16638,15 @@ impl Application for Cagents {
                 }
             }
             Message::AcknowledgeVisiblePane { card, epoch } => {
-                if epoch == self.attention_focus_epoch && self.pane_is_active(card) {
-                    self.acknowledge_visible_pane()
-                } else { Task::none() }
+                let due = epoch == self.attention_focus_epoch && self.pane_is_active(card);
+                // A dwell that marks nothing read records only that it ended,
+                // which only the notification presence reads.
+                if (!due || self.visible_dwell_reads_nothing())
+                    && !self.update_tail_may_close_or_commit()
+                {
+                    projection = Projection::Unchanged;
+                }
+                if due { self.acknowledge_visible_pane() } else { Task::none() }
             }
             Message::FocusCard(id) => {
                 // Explicit activation also cancels a pending entry on this same
@@ -17285,10 +17347,16 @@ impl Application for Cagents {
                 Task::none()
             }
             Message::NavigationSaveDue(generation) => {
-                match self.navigation_save_due(generation) {
-                    Some(DeferredSave::Views) => self.persist(),
-                    Some(DeferredSave::Snapshot) => self.save_snapshot(),
-                    None => {}
+                // A stale timer already projects nothing.
+                if let Some(save) = self.navigation_save_due(generation) {
+                    let before = SavedProjectionInputs::capture(self);
+                    match save {
+                        DeferredSave::Views => self.persist(),
+                        DeferredSave::Snapshot => self.save_snapshot(),
+                    }
+                    if before.unchanged(self) && !self.update_tail_may_close_or_commit() {
+                        projection = Projection::Unchanged;
+                    }
                 }
                 Task::none()
             }
@@ -18182,9 +18250,7 @@ impl Application for Cagents {
         // Scoped proof was established during dispatch. Settings commit and
         // close processing can invalidate it before chrome is projected.
         if matches!(projection, Projection::ScopedChrome(_))
-            && (self.settings_blur_pending()
-                || !self.queued_card_closes.is_empty()
-                || self.workspace.pending_close().is_some())
+            && self.update_tail_may_close_or_commit()
         {
             projection = Projection::Full;
         }
@@ -18259,6 +18325,10 @@ impl Application for Cagents {
                 };
                 Task::batch([chrome, notices, snapshot])
             }
+            Projection::TranscriptProbes => Task::batch([
+                self.reconcile_notice_popup(),
+                projection_stage!("transcript_probes", self.terminal_transcript_probes()),
+            ]),
             // Panning and resizing the workspace move no label, selected
             // worktree or repository binding. A frame can end an animation
             // that releases a pane, so its worktree protection is kept.

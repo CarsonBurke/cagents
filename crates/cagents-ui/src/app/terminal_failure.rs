@@ -565,11 +565,18 @@ pub enum Action {
         terminal: TerminalId,
         result: Result<StartedTerminal, String>,
     },
-    /// An unavailable probe's retry time has come. Handling it runs the full
-    /// update tail, which probes again.
+    /// An unavailable probe's retry time has come. Handling it runs the
+    /// update's transcript probe stage, which probes again.
     ProbeRetryDue,
 }
 impl Action {
+    /// Whether handling the action changes nothing but a transcript probe,
+    /// so the update projects only the probe stage
+    /// (`Projection::TranscriptProbes`).
+    pub(super) fn only_touches_probes(&self) -> bool {
+        matches!(self, Self::Probed { .. } | Self::ProbeRetryDue)
+    }
+
     pub(super) fn is_user_action(&self) -> bool {
         matches!(self, Self::Copy(_) | Self::Reveal(_))
     }
@@ -2246,9 +2253,13 @@ mod tests {
         assert_eq!(app.terminal_failure.probes[&card].failures, 0);
     }
     /// Delivering the timer reprobes a visible ended terminal whose retry time
-    /// has come, carrying its failure count forward.
+    /// has come, carrying its failure count forward. A probe's answer and its
+    /// retry project only the probe stage; the projection oracle checks that
+    /// against the full projection, unsettled, so the retry's own stage must
+    /// start the probe.
     #[test]
     fn a_due_retry_probes_again() {
+        use super::super::terminal_output_tests::projections;
         let (mut app, card, session) = app_and_session();
         app.cards.insert(card, CardRuntime::Completed);
         let _ = app.workspace.resize_viewport(1200.0);
@@ -2257,17 +2268,24 @@ mod tests {
             Some(VisibilityClass::Visible)
         );
         let operation = probing(&mut app, card, &session);
-        drop(app.update_terminal_failure(Action::Probed {
+        // Project the arrangement, then judge each update as it stands.
+        drop(app.project_workspace(false));
+        super::super::projection_oracle::disable_settling();
+        let projected = projections();
+        drop(app.update(Message::TerminalFailure(Action::Probed {
             card,
             operation,
             available: false,
-        }));
+        })));
+        assert!(!app.terminal_failure.probes[&card].pending);
+        // The retry time is due by the next update, as when its timer fires.
         app.terminal_failure.probes.get_mut(&card).unwrap().retry_at = Instant::now();
         drop(app.update(Message::TerminalFailure(Action::ProbeRetryDue)));
         let probe = &app.terminal_failure.probes[&card];
         assert_ne!(probe.operation, operation, "a new probe started");
         assert!(probe.pending);
         assert_eq!(probe.failures, 1);
+        assert_eq!(projections(), projected, "neither projected everything");
     }
     /// Retries back off and stop arming timers, so an idle app with a lost
     /// transcript goes quiet. A remote transcript is never armed for.
