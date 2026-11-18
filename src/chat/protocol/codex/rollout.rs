@@ -116,7 +116,9 @@ pub(crate) fn parse(reader: impl Read) -> Vec<Item> {
                 turn.calls.push((items.len(), item(line_id(), call)));
             }
             (Some("event_msg"), Some("item_completed")) => {
-                turn.supersede();
+                if records_tool_work(&payload["item"]) {
+                    turn.supersede();
+                }
                 if let Some(entry) = turn_item(&payload["item"]) {
                     let id = payload["item"]["id"]
                         .as_str()
@@ -176,12 +178,14 @@ pub(crate) fn parse(reader: impl Read) -> Vec<Item> {
 }
 
 /// One turn's raw tool calls. Codex writes a raw call for every tool the
-/// model invokes, and a writer that records turn items also records the same
-/// work as richer `item_completed` items, though not one for one: a single
-/// `exec` call can run several commands. A turn with any turn item is
-/// therefore read from its turn items alone, and a turn without one, written
-/// by an older Codex or replayed from a parent thread, from its raw calls.
-/// Turns begin at `task_started`; an interrupted turn ends at the next one.
+/// model invokes, and a writer that records tool turn items also records the
+/// same work as richer `item_completed` items, though not one for one: a
+/// single `exec` call can run several commands. A turn with any tool turn
+/// item is therefore read from its turn items alone, and a turn without one
+/// from its raw calls: one written by an older Codex, replayed from a parent
+/// thread, written by a Codex that records only message items, or
+/// interrupted before its first tool item completed. Turns begin at
+/// `task_started`; an interrupted turn ends at the next one.
 #[derive(Default)]
 struct RawTurn {
     calls: Vec<(usize, Item)>,
@@ -256,6 +260,18 @@ fn agent_message(payload: &Value) -> Option<(Role, ItemContent)> {
             body: body.trim().to_owned(),
         },
     ))
+}
+
+/// Whether a turn item records tool work, which supersedes its turn's raw
+/// calls. Messages, reasoning and compaction say nothing about the tools the
+/// turn ran, and some Codex versions record only those.
+fn records_tool_work(item: &Value) -> bool {
+    item["type"].as_str().is_some_and(|kind| {
+        !matches!(
+            kind,
+            "UserMessage" | "AgentMessage" | "Reasoning" | "ContextCompaction"
+        )
+    })
 }
 
 fn turn_item(item: &Value) -> Option<(Role, ItemContent)> {
@@ -550,7 +566,7 @@ mod tests {
     }
 
     #[test]
-    fn a_newer_writer_supersedes_raw_calls_only_in_the_turns_it_wrote() {
+    fn tool_turn_items_supersede_raw_calls_only_in_their_own_turn() {
         let started = json!({"type":"event_msg","payload":{"type":"task_started"}});
         let raw = |name: &str| json!({"type":"response_item","payload":{"type":"custom_tool_call","name":name,"input":name}});
         let rollout = lines(&[
@@ -565,9 +581,13 @@ mod tests {
             message("user", "Run the old checks"),
             raw("older"),
             message("assistant", "Old checks pass."),
-            // A newer Codex resumed the same rollout and records turn items.
+            // A newer Codex resumed the same rollout and records turn items;
+            // its message items come before the tool items that supersede.
             started.clone(),
             message("user", "Run the new checks"),
+            completed(
+                json!({"type":"UserMessage","id":"u1","content":[{"type":"Text","text":"Run the new checks"}]}),
+            ),
             raw("exec"),
             completed(
                 json!({"type":"CommandExecution","id":"c1","command":"cargo test","status":"completed","exit_code":0}),
@@ -577,14 +597,19 @@ mod tests {
             ),
             raw("exec"),
             message("assistant", "New checks pass."),
-            // A later turn of the newer writer with no tool: its raw call
-            // still yields to the turn's own items.
+            // A turn from a Codex that records only message items keeps its
+            // raw calls, as does one interrupted before a tool item completed.
             started,
-            message("user", "Thanks"),
+            message("user", "Tidy up"),
             completed(
-                json!({"type":"UserMessage","id":"u2","content":[{"type":"Text","text":"Thanks"}]}),
+                json!({"type":"UserMessage","id":"u2","content":[{"type":"Text","text":"Tidy up"}]}),
             ),
+            completed(json!({"type":"Reasoning","id":"r1"})),
             raw("plan"),
+            completed(
+                json!({"type":"AgentMessage","id":"a2","content":[{"type":"Text","text":"Tidied."}]}),
+            ),
+            message("assistant", "Tidied."),
         ]);
         let items = parse(rollout.as_bytes());
         let summary: Vec<String> = items
@@ -611,7 +636,9 @@ mod tests {
                 "command cargo test",
                 "command cargo clippy",
                 "New checks pass.",
-                "Thanks",
+                "Tidy up",
+                "tool plan",
+                "Tidied.",
             ]
         );
     }
