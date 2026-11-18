@@ -4114,24 +4114,48 @@ fn describe_unattached(
     conversations: &[crate::upgrade::handoff::UnattachedSummary],
     evidence: Option<&Path>,
 ) -> String {
-    let mut text = format!(
-        "{} retained native conversation{} could not be reattached after the daemon update. Nothing was restarted or resent for them and their providers were left as they were; open each in cagents to see why, then recover or close it.",
-        conversations.len(),
-        if conversations.len() == 1 { "" } else { "s" },
-    );
-    for conversation in conversations {
+    use crate::upgrade::handoff::UnattachedDisposition;
+    let plural = |count: usize| if count == 1 { "" } else { "s" };
+    let mut text = String::new();
+    for (disposition, headline) in [
+        (
+            UnattachedDisposition::Retained,
+            "retained native conversation{s} could not be reattached after the daemon update. Nothing was restarted or resent for them and their providers were left as they were; open each in cagents to see why, then recover or close it.",
+        ),
+        (
+            UnattachedDisposition::Stopped,
+            "native conversation{s} could not be restarted after the daemon update. Each restart was stopped and nothing was resent; open each in cagents to reopen it.",
+        ),
+    ] {
+        let group = conversations
+            .iter()
+            .filter(|conversation| conversation.disposition == disposition)
+            .collect::<Vec<_>>();
+        if group.is_empty() {
+            continue;
+        }
+        if !text.is_empty() {
+            text.push('\n');
+        }
         text.push_str(&format!(
-            "\n  {} {} in {}: {}",
-            conversation.provider.label(),
-            printable(
-                conversation
-                    .conversation
-                    .as_deref()
-                    .unwrap_or("(unconfirmed conversation)")
-            ),
-            printable(&conversation.working_directory.to_string_lossy()),
-            printable(&conversation.reason),
+            "{} {}",
+            group.len(),
+            headline.replace("{s}", plural(group.len()))
         ));
+        for conversation in group {
+            text.push_str(&format!(
+                "\n  {} {} in {}: {}",
+                conversation.provider.label(),
+                printable(
+                    conversation
+                        .conversation
+                        .as_deref()
+                        .unwrap_or("(unconfirmed conversation)")
+                ),
+                printable(&conversation.working_directory.to_string_lossy()),
+                printable(&conversation.reason),
+            ));
+        }
     }
     if let Some(evidence) = evidence {
         text.push_str(&format!(
@@ -7054,6 +7078,7 @@ mod tests {
             conversation: Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into()),
             working_directory: "/work/project".into(),
             reason: reason.into(),
+            disposition: crate::upgrade::handoff::UnattachedDisposition::Retained,
         };
         let one = describe_unattached(
             &[conversation("no rollout found for thread id")],
@@ -7091,6 +7116,25 @@ mod tests {
             "{hostile}"
         );
         assert_eq!(hostile.lines().count(), 2, "{hostile}");
+
+        // A restart the update stopped is described as stopped, never as a
+        // provider that was left running, and is grouped apart from those.
+        let mut stopped =
+            conversation("Codex server did not open its local socket within 15 seconds");
+        stopped.disposition = crate::upgrade::handoff::UnattachedDisposition::Stopped;
+        let mixed = describe_unattached(&[conversation("unavailable"), stopped], None);
+        let lines = mixed.lines().collect::<Vec<_>>();
+        assert!(
+            lines[0].starts_with("1 retained native conversation could not be reattached"),
+            "{mixed}"
+        );
+        assert!(lines[1].ends_with(": unavailable"), "{mixed}");
+        assert!(
+            lines[2].starts_with("1 native conversation could not be restarted"),
+            "{mixed}"
+        );
+        assert!(lines[2].contains("Each restart was stopped"), "{mixed}");
+        assert!(lines[3].ends_with("within 15 seconds"), "{mixed}");
     }
 
     #[test]
