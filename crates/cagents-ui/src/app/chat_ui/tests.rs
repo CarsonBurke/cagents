@@ -19201,7 +19201,7 @@ fn an_excerpted_output_copies_whole_from_its_source() {
         revision: 1,
         bytes: bytes as u64,
     };
-    let excerpt = "line\n\u{22ef} 1.0 MB not shown \u{22ef}\nline\n";
+    let excerpt = &format!("line\n{}line\n", chat::excerpt_gap(1_000_000));
     let excerpted = source(1, whole.len());
     let mut snapshot = (*handle.snapshot()).clone();
     snapshot.items = vec![step("long", excerpt), step("short", "done\n")];
@@ -19220,9 +19220,32 @@ fn an_excerpted_output_copies_whole_from_its_source() {
         "a row showing all of its output copies what it shows"
     );
     assert_eq!(
-        step::excerpt_note(whole.len() as u64),
-        "Only the start and end of this 1.0 MB output are shown. Copy includes all of it."
+        step::excerpt_note(&CopyPart::Output, true),
+        "Only the start and end of this output are shown. Copy includes all of it."
     );
+    assert!(chat::is_excerpt(excerpt) && !chat::is_excerpt("done\n"));
+    // The step's own Copy starts with its command, as a step shown whole
+    // does; its output's Copy is the output alone.
+    let long = runtime.active_item("long").unwrap().content.clone();
+    assert_eq!(
+        super::step_copy_prefix(&CopyPart::Text, &long).as_deref(),
+        Some("cargo build")
+    );
+    assert_eq!(
+        super::step_copy_prefix(&CopyPart::Output, &long).as_deref(),
+        Some("")
+    );
+    let tool = ItemContent::Tool {
+        name: "shell".into(),
+        input: "{\"cmd\":\"ls\"}".into(),
+        output: excerpt.into(),
+        status: chat::ToolStatus::Succeeded,
+    };
+    assert_eq!(
+        super::step_copy_prefix(&CopyPart::Text, &tool).as_deref(),
+        Some("{\"cmd\":\"ls\"}")
+    );
+    assert_eq!(super::step_copy_prefix(&CopyPart::Input, &tool), None);
     let request = text_copy::Request::for_test(handle.clone(), excerpted.clone());
     let task = app.handle_chat_ui(Action::MessageCopied(
         target,

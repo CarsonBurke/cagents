@@ -1735,6 +1735,28 @@ pub fn approximate_size(bytes: u64) -> String {
     }
 }
 
+const EXCERPT_GAP_OPEN: &str = "\u{22ef} ";
+const EXCERPT_GAP_CLOSE: &str = " not shown \u{22ef}";
+
+/// The line a step's long input or output is shown with between its start
+/// and end, saying how much of it lies between them.
+pub fn excerpt_gap(omitted: u64) -> String {
+    format!(
+        "{EXCERPT_GAP_OPEN}{}{EXCERPT_GAP_CLOSE}\n",
+        approximate_size(omitted)
+    )
+}
+
+/// Whether a step's input or output, as a transcript row presents it, is an
+/// excerpt: it holds a line [`excerpt_gap`] wrote.
+pub fn is_excerpt(text: &str) -> bool {
+    text.match_indices(EXCERPT_GAP_CLOSE).any(|(at, _)| {
+        text[text[..at].rfind('\n').map_or(0, |start| start + 1)..at]
+            .strip_prefix(EXCERPT_GAP_OPEN)
+            .is_some_and(|size| !size.is_empty())
+    })
+}
+
 /// Where a presented part after the first sits in its transcript item. The
 /// first part keeps the item's own ID; each later part's ID names the item,
 /// the part's position, the item's layout and the byte range it shows of each

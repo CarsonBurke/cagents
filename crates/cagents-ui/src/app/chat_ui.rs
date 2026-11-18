@@ -255,6 +255,21 @@ pub enum CopyPart {
     Change(usize),
 }
 
+/// What a copy of an excerpted step puts ahead of the whole output it reads,
+/// joined as `copy_text` joins a step shown whole: the command or input for
+/// the step's own Copy, nothing for its output's. `None` for a part that has
+/// no whole output to read.
+fn step_copy_prefix(part: &CopyPart, content: &ItemContent) -> Option<String> {
+    match (part, content) {
+        (CopyPart::Text, ItemContent::Command { command, .. }) => Some(command.clone()),
+        (CopyPart::Text, ItemContent::Tool { input, .. }) => Some(input.clone()),
+        (CopyPart::Output, ItemContent::Command { .. } | ItemContent::Tool { .. }) => {
+            Some(String::new())
+        }
+        _ => None,
+    }
+}
+
 /// Why a chat with no daemon handoff did not give its actor up.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReturnRefused {
@@ -14404,19 +14419,10 @@ impl Cagents {
                 return self.start_message_copy(target, id, source, String::new());
             }
             Action::CopyStep(target, id, part, source) => {
-                // What the step's copy adds ahead of its output, as
-                // `copy_text` would join it.
                 let prefix = self
                     .chat_runtime_mut(target)
                     .and_then(|runtime| runtime.active_item(&id))
-                    .and_then(|item| match (&part, &item.content) {
-                        (CopyPart::Text, ItemContent::Command { command, .. }) => {
-                            Some(command.clone())
-                        }
-                        (CopyPart::Text, ItemContent::Tool { input, .. }) => Some(input.clone()),
-                        (CopyPart::Output, _) => Some(String::new()),
-                        _ => None,
-                    });
+                    .and_then(|item| step_copy_prefix(&part, &item.content));
                 if let Some(prefix) = prefix {
                     return self.start_message_copy(target, id, Some(source), prefix);
                 }

@@ -306,12 +306,12 @@ impl Cagents {
             return Task::none();
         };
         let Some(source) = source.filter(|source| runtime.contains_copy_source(source)) else {
-            runtime.error = Some("This message is unavailable in the local copy cache. Open the provider transcript to recover its text.".into());
+            runtime.error = Some("This text is unavailable in the local copy cache. Open the provider transcript to recover it.".into());
             return Task::none();
         };
         let Some(handle) = runtime.handle().cloned() else {
             runtime.error =
-                Some("Reconnect this conversation before copying its full message.".into());
+                Some("Reconnect this conversation before copying all of this text.".into());
             return Task::none();
         };
         let request = Request {

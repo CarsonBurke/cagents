@@ -1303,10 +1303,7 @@ impl Store {
         if !excerpt.ends_with('\n') {
             excerpt.push('\n');
         }
-        excerpt.push_str(&format!(
-            "\u{22ef} {} not shown \u{22ef}\n",
-            crate::chat::approximate_size((tail - head) as u64)
-        ));
+        excerpt.push_str(&crate::chat::excerpt_gap((tail - head) as u64));
         excerpt.push_str(&text(tail, length)?);
         Ok(excerpt)
     }
@@ -1831,11 +1828,6 @@ fn brief(id: &str) -> &str {
     }
     &id[..end]
 }
-/// Names how a variant's payload is spread across the chunk fields, for the
-/// part IDs of a paged item. Which field a byte offset belongs to is decided by
-/// the variant, so a rewritten item can hold entirely different bytes at the
-/// same offset of the same field: a tool call keeps its input in field 0 and a
-/// command keeps its output there.
 /// The most an excerpted field's presentation carries, charged against the
 /// window before it is read.
 fn excerpt_bytes(length: usize) -> usize {
@@ -1845,6 +1837,11 @@ fn excerpt_bytes(length: usize) -> usize {
         EXCERPT_HEAD_BYTES + EXCERPT_TAIL_BYTES + EXCERPT_GAP_BYTES
     }
 }
+/// Names how a variant's payload is spread across the chunk fields, for the
+/// part IDs of a paged item. Which field a byte offset belongs to is decided by
+/// the variant, so a rewritten item can hold entirely different bytes at the
+/// same offset of the same field: a tool call keeps its input in field 0 and a
+/// command keeps its output there.
 fn layout(content: &ItemContent) -> &'static str {
     match content {
         ItemContent::Text { .. } => "text",
@@ -3310,8 +3307,7 @@ mod tests {
             assert_eq!((path, diff), (&change.path, &change.diff));
         }
     }
-    /// Command output is the one field of a command that pages, so it must come
-    /// back from the chunk it was written to rather than from an empty one.
+    /// A finished command that printed `output`.
     fn command(id: &str, output: &str) -> Item {
         Item {
             id: id.into(),
@@ -3362,6 +3358,58 @@ mod tests {
         ));
     }
 
+    /// An output of exactly the excerpt size is shown whole; one byte more is
+    /// excerpted.
+    #[test]
+    fn excerpting_starts_just_past_its_size() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        let whole = "x".repeat(EXCERPT_BYTES - 1) + "\n";
+        let over = whole.clone() + "y";
+        store.apply(Event::Item(command("whole", &whole))).unwrap();
+        store.apply(Event::Item(command("over", &over))).unwrap();
+        let window = store.window().unwrap();
+        let shown: Vec<&str> = window
+            .items
+            .iter()
+            .map(|item| match &item.content {
+                ItemContent::Command { output, .. } => output.as_str(),
+                _ => panic!("commands stay commands"),
+            })
+            .collect();
+        assert_eq!(shown[0], whole);
+        assert!(!crate::chat::is_excerpt(shown[0]));
+        assert!(crate::chat::is_excerpt(shown[1]));
+        assert!(shown[1].len() < over.len());
+    }
+
+    /// Output with no line breaks is cut between whole characters, so the
+    /// excerpt is still the output's own start and end.
+    #[test]
+    fn an_excerpt_of_one_long_line_cuts_between_characters() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        // Two- and three-byte characters, so no fixed offset is a boundary.
+        let output = "\u{3bb}\u{2026}".repeat(30_000);
+        store.apply(Event::Item(command("exec", &output))).unwrap();
+        let window = store.window().unwrap();
+        let ItemContent::Command { output: shown, .. } = &window.items[0].content else {
+            panic!("the command is still a command");
+        };
+        assert!(crate::chat::is_excerpt(shown));
+        let mut lines = shown.split('\n');
+        let (head, gap, tail) = (
+            lines.next().unwrap(),
+            lines.next().unwrap(),
+            lines.next().unwrap(),
+        );
+        assert_eq!(lines.next(), None);
+        assert!(!head.is_empty() && !tail.is_empty());
+        assert!(output.starts_with(head) && output.ends_with(tail));
+        assert_eq!(
+            format!("{gap}\n"),
+            crate::chat::excerpt_gap((output.len() - head.len() - tail.len()) as u64)
+        );
+    }
+
     /// One enormous output is one row among the conversation around it,
     /// showing its first and last lines and how much was left out between
     /// them, while Copy still reads every byte.
@@ -3406,12 +3454,10 @@ mod tests {
         assert!(tail.len() > head.len(), "the end is the larger share");
         let omitted = output.len() - head.len() - tail.len();
         assert_eq!(
-            lines[gap],
-            format!(
-                "\u{22ef} {} not shown \u{22ef}",
-                crate::chat::approximate_size(omitted as u64)
-            )
+            format!("{}\n", lines[gap]),
+            crate::chat::excerpt_gap(omitted as u64)
         );
+        assert!(crate::chat::is_excerpt(shown));
         let source = store.copy_projection[1]
             .clone()
             .expect("output copy source");
@@ -3513,6 +3559,58 @@ mod tests {
             "an append keeps the source"
         );
         assert_eq!(source.bytes as usize, output.len());
+    }
+
+    /// A step's copy source follows the field its output is kept in. A
+    /// rewrite that extends what it copied keeps the source, as an append
+    /// does, even when the step changes kind; one that changes those bytes
+    /// replaces it, so a pending copy cannot mix the two.
+    #[test]
+    fn a_step_copy_source_survives_only_a_rewrite_that_extends_it() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        let output = build_log("tool", 2_000);
+        store
+            .apply(Event::Item(Item {
+                id: "step".into(),
+                role: Role::Assistant,
+                content: ItemContent::Tool {
+                    name: "shell".into(),
+                    input: "cargo test".into(),
+                    output: output.clone(),
+                    status: crate::chat::ToolStatus::Running,
+                },
+                started_at: None,
+                at: None,
+            }))
+            .unwrap();
+        let tool = store.copy_parent_source("step").unwrap().unwrap();
+        assert_eq!(tool.bytes as usize, output.len());
+        let extended = output.clone() + &build_log("command", 2_000);
+        store
+            .apply(Event::Item(command("step", &extended)))
+            .unwrap();
+        let kept = store.copy_parent_source("step").unwrap().unwrap();
+        assert_eq!((kept.token, kept.revision), (tool.token, tool.revision));
+        assert_eq!(kept.bytes as usize, extended.len());
+        let rewritten = build_log("final", 4_000);
+        store
+            .apply(Event::Item(command("step", &rewritten)))
+            .unwrap();
+        let replaced = store.copy_parent_source("step").unwrap().unwrap();
+        assert_ne!(
+            (replaced.token, replaced.revision),
+            (kept.token, kept.revision)
+        );
+        assert_eq!(replaced.bytes as usize, rewritten.len());
+        let mut copied = String::new();
+        loop {
+            let page = store.text_copy(&replaced, copied.len() as u64).unwrap();
+            copied.push_str(&page.text);
+            if page.done {
+                break;
+            }
+        }
+        assert_eq!(copied, rewritten);
     }
 
     /// Paging through history holding several enormous outputs keeps whole
