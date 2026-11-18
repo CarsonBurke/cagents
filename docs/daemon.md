@@ -156,7 +156,8 @@ cagents daemon stop --confirm
   the output lists every channel that was deleted.
 - `project close` and `channel list --repository` accept the key `project
   list` prints after the project's checkout was deleted from disk. On this
-  computer, the deleted checkout's directory works too.
+  computer, the directory of a deleted checkout that held the project's `.git`
+  works too, even through `..`.
 
 ## Compatible upgrades
 

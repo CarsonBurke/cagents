@@ -5412,6 +5412,8 @@ fn execute_channel_with(
     let mutation = channel_command_mutates(&command);
     // Reject invalid filesystem paths before starting a daemon. The shared
     // registry then takes precedence over fresh Git discovery for open folders.
+    // A listing may name a project whose checkout is gone, which only the
+    // registry can recognize, so it is only checked for shape here.
     let selected = match &command {
         ChannelCommand::Spawn { repository, .. } => Some(project_directory(repository.clone())?),
         ChannelCommand::List {
@@ -5643,29 +5645,27 @@ fn resolve_registered_repository(
     path: Option<PathBuf>,
     model: Option<&WorkspaceModel>,
 ) -> Result<PathBuf, AppError> {
-    // Lexically, since a removed checkout has nothing left to resolve: a
-    // `..` in `cagents project close ../old` would otherwise match no key.
-    let named = registered_project_path(path.clone())?.components().fold(
-        PathBuf::new(),
-        |mut named, component| {
-            match component {
-                std::path::Component::ParentDir => {
-                    named.pop();
-                }
-                component => named.push(component),
-            }
-            named
-        },
-    );
+    let given = registered_project_path(path.clone())?;
     let registered = model.and_then(|model| {
-        model.project(&named).or_else(|| {
-            // Locally only: a remote device's paths cannot be checked here,
-            // and its discovery answers for the paths that exist.
-            let removed = !crate::device::is_remote() && !named.exists();
-            removed
-                .then(|| model.project(&named.join(".git")))
-                .flatten()
-        })
+        // As given: a remote device's paths cannot be checked here, and its
+        // discovery answers for the paths that exist.
+        if crate::device::is_remote() {
+            return model.project(&given);
+        }
+        match given.canonicalize() {
+            // A path that exists is named by what it resolves to: folding a
+            // `..` that follows a symbolic link would name another directory.
+            Ok(existing) => model.project(&existing),
+            // Lexically, since a removed checkout has nothing left to resolve:
+            // a `..` in `cagents project close ../old` would otherwise match no
+            // key.
+            Err(_) => {
+                let named = lexically_normal(&given);
+                model
+                    .project(&named)
+                    .or_else(|| model.project(&named.join(".git")))
+            }
+        }
     });
     match registered {
         // The registry's spelling, not the caller's: a trailing slash compares
@@ -5673,6 +5673,21 @@ fn resolve_registered_repository(
         Some(project) => Ok(project.repository.clone()),
         None => resolve_repository(path, model),
     }
+}
+
+/// `path` with each `..` removing the component before it, without asking the
+/// filesystem.
+fn lexically_normal(path: &Path) -> PathBuf {
+    path.components()
+        .fold(PathBuf::new(), |mut normal, component| {
+            match component {
+                std::path::Component::ParentDir => {
+                    normal.pop();
+                }
+                component => normal.push(component),
+            }
+            normal
+        })
 }
 
 fn resolve_repository(
@@ -8166,8 +8181,7 @@ mod tests {
 
     /// A project whose checkout was removed is still closed, and its channels
     /// still listed, by the key `project list` printed for it, or by the
-    /// checkout directory that held its `.git`. Nothing on disk is consulted,
-    /// so nothing on disk has to exist.
+    /// checkout directory that held its `.git`. Nothing on disk has to exist.
     #[test]
     fn a_removed_checkout_is_named_by_its_registered_key() {
         let directory = tempfile::tempdir().unwrap();
@@ -8229,6 +8243,41 @@ mod tests {
             panic!("an unknown missing path names no project");
         };
         assert_eq!(error.kind, "repository");
+    }
+
+    /// A `..` after a symbolic link in a path that exists climbs out of the
+    /// link's target, as the filesystem resolves it, so the registered project
+    /// the folded spelling would name is not the one closed.
+    #[test]
+    fn an_existing_path_through_a_link_names_the_project_it_resolves_to() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("real/target")).unwrap();
+        std::fs::create_dir_all(root.join("real/sibling")).unwrap();
+        std::os::unix::fs::symlink(root.join("real/target"), root.join("link")).unwrap();
+        let mut model = model_with_channels(&root.join("unrelated/.git"), &[]);
+        // `folded` is what `link/../sibling` would name if its `..` were
+        // folded lexically; `resolved` is the directory it names.
+        let folded = root.join("sibling");
+        let resolved = root.join("real/sibling");
+        for (ordinal, repository) in [(2, &folded), (3, &resolved)] {
+            model.projects.push(ModelProject {
+                kind: crate::model::ProjectKind::Folder,
+                repository: repository.clone(),
+                name: "sibling".into(),
+                ordinal,
+            });
+        }
+        let named = root.join("link/../sibling");
+        let ResolvedProject::Close { repository, .. } = (ProjectCommand::Close {
+            path: Some(named.clone()),
+            yes: false,
+        })
+        .resolved_with_model(Some(&model))
+        .unwrap_or_else(|error| panic!("{}: {}", named.display(), error.message)) else {
+            panic!("expected a resolved close");
+        };
+        assert_eq!(repository, resolved, "{}", named.display());
     }
 
     /// A registry holding one project and the channels named in it.
