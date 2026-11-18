@@ -357,19 +357,13 @@ mod tests {
             .unwrap()
             .handle
             .clone();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let snapshot = loop {
-            let snapshot = handle.snapshot(None).unwrap();
-            if snapshot.read_only_reason.is_some() {
-                break snapshot;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "stopped reader did not initialize"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        };
-        assert!(snapshot.exited);
+        // The reader applies its frame's read-only reason before its exit,
+        // so wait for the exit, which ends the frame (#2964).
+        let snapshot =
+            crate::test_timing::wait_for("the stopped reader to apply its saved frame", || {
+                handle.snapshot(None).filter(|snapshot| snapshot.exited)
+            });
+        assert!(snapshot.read_only_reason.is_some(), "{:?}", snapshot.error);
         assert_eq!(snapshot.title.as_deref(), Some("kept transcript"));
         assert_eq!(snapshot.session_id, source.launch.session_id);
         assert!(handle.is_read_only_history());
