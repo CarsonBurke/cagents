@@ -565,13 +565,13 @@ mod flow_tests {
                 .unwrap()
                 .handle
                 .clone();
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while !handle.snapshot(None).unwrap().exited {
-                assert!(Instant::now() < deadline);
-                thread::sleep(Duration::from_millis(5));
-            }
+            // The reader applies its saved frame after attach returns; its exit
+            // ends that frame.
+            let snapshot =
+                crate::test_timing::wait_for("the stopped reader to apply its saved frame", || {
+                    handle.snapshot(None).filter(|snapshot| snapshot.exited)
+                });
             assert!(!handle.owns_work());
-            let snapshot = handle.snapshot(None).unwrap();
             assert!(snapshot.items.iter().any(|item|matches!(&item.content,chat::ItemContent::Text {text,..} if text == "Final source answer remains visible")));
             if original.launch.session_id.is_none() {
                 assert!(

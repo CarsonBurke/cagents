@@ -1,7 +1,7 @@
 //! Read-only inspection of the wire-proven source inventory subset.
 use crate::{
     chat::Session,
-    model::HostSessionProof,
+    model::{HostSessionProof, TerminalId},
     terminal::ipc::{
         self, ClientEnvelope, ClientRequest, ServerEnvelope, ServerMessage, ServerResponse,
     },
@@ -14,6 +14,10 @@ use std::{
 };
 
 const MAX_FRAME: usize = 4 * 1024 * 1024;
+/// How long a saved-history reader may take to apply its saved frame once
+/// inspection shows it. Readiness is the reader's own change announcement;
+/// this only fails a wedged reader, leaving the rest of inspection its time.
+const HISTORY_READER_DEADLINE: Duration = Duration::from_secs(5);
 
 pub(in crate::host) struct Client {
     stream: UnixStream,
@@ -97,6 +101,17 @@ impl Client {
         request: ClientRequest,
         authenticated: bool,
     ) -> Result<ServerResponse, String> {
+        self.exchange(request, authenticated)
+            .map(|(response, _)| response)
+    }
+
+    /// Send one request and return its response, and whether the source
+    /// announced a presentation change for the addressed chat meanwhile.
+    fn exchange(
+        &mut self,
+        request: ClientRequest,
+        authenticated: bool,
+    ) -> Result<(ServerResponse, bool), String> {
         if !matches!(
             request,
             ClientRequest::Connect { .. }
@@ -136,11 +151,10 @@ impl Client {
         // Legacy ChatStart installs its hidden subscriber before responding.
         // Activity can arrive first, including during Detach. Drain only that
         // exact chat's qualified events under the same absolute deadline.
+        let mut changed = false;
         for _ in 0..256 {
             let envelope = if bootstrap_chat.is_some() {
-                let payload = read_payload_with_limit(&mut stream, ipc::MAX_FRAME_BYTES)?;
-                postcard::from_bytes::<ServerEnvelope>(&payload)
-                    .map_err(|_| "Unsupported legacy retained-owner response")?
+                read_chat_envelope(&mut stream)?
             } else {
                 read_response(&mut stream)?
             };
@@ -149,28 +163,44 @@ impl Client {
             }
             if envelope.request_id == Some(request_id) {
                 return match envelope.message {
-                    ServerMessage::Response { response } => Ok(response),
+                    ServerMessage::Response { response } => Ok((response, changed)),
                     _ => Err("Source response is outside the inspection contract".into()),
                 };
             }
-            let event_chat = match envelope.message {
-                ServerMessage::ChatActivity { chat_id, .. }
-                | ServerMessage::ChatObserved { chat_id, .. }
-                | ServerMessage::ChatChanged { chat_id }
-                | ServerMessage::ChatAccountUsage { chat_id, .. }
-                | ServerMessage::ChatActiveModel { chat_id, .. }
-                | ServerMessage::ChatLimit { chat_id, .. }
-                | ServerMessage::ChatAgentAddresses { chat_id, .. } => Some(chat_id),
-                _ => None,
-            };
-            if envelope.request_id.is_some()
-                || bootstrap_chat.is_none()
-                || event_chat != bootstrap_chat
-            {
-                return Err("Source inspection request or event identity changed".into());
+            match bootstrap_chat {
+                Some(chat_id) => changed |= chat_event_changed(&envelope, chat_id)?,
+                None => return Err("Source inspection request or event identity changed".into()),
             }
         }
         Err("Retained-owner events exceeded the bounded inspection budget".into())
+    }
+
+    /// Wait for the source to announce that `chat_id`'s presentation changed.
+    /// Only that chat's qualified events may arrive; no request is in flight.
+    /// `deadline` fails a reader that never changes; a frame that has begun
+    /// arriving is read under the connection's own deadline.
+    fn await_chat_change(&mut self, chat_id: TerminalId, deadline: Instant) -> Result<(), String> {
+        #[cfg(test)]
+        note_chat_change_wait(chat_id);
+        loop {
+            if !readable(&self.stream, deadline.min(self.deadline))? {
+                return Err(if Instant::now() < self.deadline {
+                    unsettled_reader()
+                } else {
+                    "Source migration inspection timed out".into()
+                });
+            }
+            let envelope = read_chat_envelope(&mut DeadlineStream {
+                stream: &mut self.stream,
+                deadline: self.deadline,
+            })?;
+            if envelope.version != self.protocol || envelope.proof != self.proof {
+                return Err("Source inspection ownership or protocol changed".into());
+            }
+            if chat_event_changed(&envelope, chat_id)? {
+                return Ok(());
+            }
+        }
     }
 
     pub(super) fn list(&mut self) -> Result<Vec<Session>, String> {
@@ -233,6 +263,16 @@ impl Client {
         }
     }
 
+    /// Whether a history inspection has waited for `chat_id` to announce a
+    /// presentation change.
+    #[cfg(test)]
+    pub(in crate::host) fn fixture_awaited_change(chat_id: TerminalId) -> bool {
+        CHAT_CHANGE_WAITS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&chat_id)
+    }
+
     /// Use only the existing forced-history Attach API. The request's current
     /// proof addresses that read-only API; it is never persisted as a recovered
     /// descriptor or presented as evidence of an old provider's execution.
@@ -262,24 +302,29 @@ impl Client {
                     "Saved history changed its exact account, recipe or conversation".into(),
                 );
             }
-            if !matches!(
-                self.request(
-                    ClientRequest::ChatVisibility {
-                        chat_id: source.id,
-                        visible: true
-                    },
-                    true
-                )?,
-                ServerResponse::Accepted
-            ) {
+            let (visible, _) = self.exchange(
+                ClientRequest::ChatVisibility {
+                    chat_id: source.id,
+                    visible: true,
+                },
+                true,
+            )?;
+            if !matches!(visible, ServerResponse::Accepted) {
                 return Err("Saved history could not be inspected".into());
             }
-            for _ in 0..64 {
-                if snapshot.exited
-                    && snapshot.read_only_reason.is_some()
-                    && !snapshot.history_loading
-                {
-                    if snapshot.session_id == source.launch.session_id
+            // A reader applies its saved frame on its own worker after the
+            // source attaches it, so the attached snapshot may predate it.
+            // While visible, the reader announces each applied frame as a
+            // presentation change; read once now, since the attached snapshot
+            // predates visibility, then again after each announced change.
+            let reader_deadline = Instant::now() + HISTORY_READER_DEADLINE;
+            let mut changed = true;
+            loop {
+                // An exit ends the reader's frame and follows its read-only
+                // reason, so an exited, loaded snapshot is final.
+                if snapshot.exited && !snapshot.history_loading {
+                    if snapshot.read_only_reason.is_some()
+                        && snapshot.session_id == source.launch.session_id
                         && matches!(
                             snapshot.native_continuity,
                             crate::chat::NativeContinuity::ReconnectOnly
@@ -296,14 +341,20 @@ impl Client {
                             .into(),
                     );
                 }
-                std::thread::sleep(Duration::from_millis(5));
-                match self.request(
+                if !changed {
+                    self.await_chat_change(source.id, reader_deadline)?;
+                } else if Instant::now() >= reader_deadline {
+                    return Err(unsettled_reader());
+                }
+                let (read, changed_meanwhile) = self.exchange(
                     ClientRequest::ChatRead {
                         chat_id: source.id,
                         after_generation: None,
                     },
                     true,
-                )? {
+                )?;
+                changed = changed_meanwhile;
+                match read {
                     ServerResponse::ChatSnapshot {
                         chat_id,
                         snapshot: Some(current),
@@ -311,7 +362,6 @@ impl Client {
                     _ => return Err("Saved history did not publish its exact transcript".into()),
                 }
             }
-            Err("Saved history exceeded the bounded readiness budget".into())
         })();
         let detached = self.request(ClientRequest::ChatDetach { chat_id: source.id }, true)?;
         if !matches!(detached, ServerResponse::Detached) {
@@ -322,6 +372,80 @@ impl Client {
         // generation and invalidates every unrelated live owner's consent.
         // Other attached history views remain attached; no cache is evicted.
         inspection
+    }
+}
+
+/// Chats whose inspection has waited for a presentation change, so a test can
+/// hold a reader until inspection depends on that event rather than a poll.
+#[cfg(test)]
+static CHAT_CHANGE_WAITS: std::sync::Mutex<Vec<TerminalId>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn note_chat_change_wait(chat_id: TerminalId) {
+    CHAT_CHANGE_WAITS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push(chat_id);
+}
+
+fn unsettled_reader() -> String {
+    format!(
+        "Saved history reader did not settle its saved frame within {} seconds",
+        HISTORY_READER_DEADLINE.as_secs()
+    )
+}
+
+/// Read one frame of the chat bootstrap subset: a response or an event.
+fn read_chat_envelope(reader: &mut impl Read) -> Result<ServerEnvelope, String> {
+    let payload = read_payload_with_limit(reader, ipc::MAX_FRAME_BYTES)?;
+    postcard::from_bytes::<ServerEnvelope>(&payload)
+        .map_err(|_| "Unsupported legacy retained-owner response".into())
+}
+
+/// Accept only an unsolicited qualified event for `chat_id`, reporting whether
+/// it announces a presentation change.
+fn chat_event_changed(envelope: &ServerEnvelope, expected: TerminalId) -> Result<bool, String> {
+    let (event_chat, changed) = match envelope.message {
+        ServerMessage::ChatChanged { chat_id } => (Some(chat_id), true),
+        ServerMessage::ChatActivity { chat_id, .. }
+        | ServerMessage::ChatObserved { chat_id, .. }
+        | ServerMessage::ChatAccountUsage { chat_id, .. }
+        | ServerMessage::ChatActiveModel { chat_id, .. }
+        | ServerMessage::ChatLimit { chat_id, .. }
+        | ServerMessage::ChatAgentAddresses { chat_id, .. } => (Some(chat_id), false),
+        _ => (None, false),
+    };
+    if envelope.request_id.is_some() || event_chat != Some(expected) {
+        return Err("Source inspection request or event identity changed".into());
+    }
+    Ok(changed)
+}
+
+/// Whether `stream` has input before `deadline`, without consuming any.
+fn readable(stream: &UnixStream, deadline: Instant) -> Result<bool, String> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        let mut fd = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // Round up so a sub-millisecond remainder still waits.
+        let timeout = remaining
+            .as_micros()
+            .div_ceil(1000)
+            .min(libc::c_int::MAX as u128) as libc::c_int;
+        // SAFETY: poll receives one initialized entry whose descriptor the
+        // borrowed stream keeps open for the entire call.
+        match unsafe { libc::poll(&mut fd, 1, timeout) } {
+            0 => continue,
+            n if n > 0 => return Ok(true),
+            _ if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => continue,
+            _ => return Err("Cannot wait for the source service".into()),
+        }
     }
 }
 
@@ -1090,5 +1214,63 @@ mod tests {
         let observed = peer.read(&mut [0u8; 1]).unwrap_err().kind();
         assert!(refused);
         assert_eq!(observed, io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn history_change_wait_needs_a_presentation_change_and_fails_a_wedged_reader_cleanly() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let chat = super::super::tests::session().id;
+        let mut client = Client {
+            stream,
+            proof: proof(),
+            next: 1,
+            protocol: ipc::PROTOCOL_VERSION,
+            deadline: Instant::now() + Duration::from_secs(30),
+        };
+        let event = |message| ServerEnvelope {
+            version: ipc::PROTOCOL_VERSION,
+            request_id: None,
+            proof: proof(),
+            message,
+        };
+        // Observation never authorizes a presentation read, so it does not end
+        // the wait; with nothing else, the reader's own deadline does.
+        ipc::write_frame(
+            &mut peer,
+            &event(ServerMessage::ChatObserved {
+                chat_id: chat,
+                epoch: 1,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            client
+                .await_chat_change(chat, Instant::now() + Duration::from_millis(20))
+                .unwrap_err(),
+            unsettled_reader()
+        );
+        // That failure consumed no partial frame: the connection stays in step
+        // for the change that follows and for detach.
+        ipc::write_frame(
+            &mut peer,
+            &event(ServerMessage::ChatChanged { chat_id: chat }),
+        )
+        .unwrap();
+        client
+            .await_chat_change(chat, Instant::now() + Duration::from_secs(30))
+            .unwrap();
+        ipc::write_frame(
+            &mut peer,
+            &event(ServerMessage::ChatChanged {
+                chat_id: crate::model::TerminalId::new(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            client
+                .await_chat_change(chat, Instant::now() + Duration::from_secs(30))
+                .unwrap_err(),
+            "Source inspection request or event identity changed"
+        );
     }
 }
