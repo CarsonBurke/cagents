@@ -918,6 +918,16 @@ pub struct ControlClient {
     terminal_streams: BTreeSet<TerminalId>,
 }
 
+impl std::fmt::Debug for ControlClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ControlClient")
+            .field("proof", &self.proof)
+            .field("protocol", &self.protocol)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Linux AF_UNIX backlog pressure returns EAGAIN without connecting. Retry
 /// fresh nonblocking sockets within the same establishment deadline, rather
 /// than treating writability/SO_ERROR as evidence that EAGAIN completed.
@@ -3125,6 +3135,31 @@ fn control_daemon_socket() -> Result<PathBuf, AppError> {
     }
 }
 
+/// A connection to the daemon [`control_daemon_socket`] selects. A daemon this
+/// call may start is reached on the connection that proved it ready, rather
+/// than proven ready and then connected to again.
+fn control_daemon_client() -> Result<ControlClient, AppError> {
+    if daemon_autostart_disabled() {
+        let socket = control_daemon_socket()?;
+        return ControlClient::connect(&socket)
+            .map_err(|error| AppError::new("daemon_connection", error));
+    }
+    connect_ready_daemon_client()
+}
+
+/// [`terminal::connect_ready_daemon`], failing as a CLI command reports a
+/// daemon that would not start or could not be reached.
+fn connect_ready_daemon_client() -> Result<ControlClient, AppError> {
+    terminal::connect_ready_daemon()
+        .map(|ready| ready.client)
+        .map_err(|error| match error {
+            terminal::HostedTerminalStartError::Connect(error) => {
+                AppError::new("daemon_connection", error)
+            }
+            error => AppError::new("daemon_start", error),
+        })
+}
+
 fn daemon_missing(error: &io::Error) -> bool {
     matches!(
         error.kind(),
@@ -4847,10 +4882,7 @@ fn execute_terminal(command: TerminalCommand) -> Result<CommandOutput, AppError>
         return execute_terminal_as(command, &ProjectChannelContext::capture());
     }
     // Keep the four global read verbs on their existing unauthenticated route.
-    let socket = control_daemon_socket()?;
-    let client = ControlClient::connect(&socket)
-        .map_err(|error| AppError::new("daemon_connection", error))?;
-    terminal_output(command, client)
+    terminal_output(command, control_daemon_client()?)
 }
 
 fn execute_terminal_as(
@@ -5026,11 +5058,10 @@ impl ServiceRequestContext {
 
     fn connect(&self) -> Result<ControlClient, AppError> {
         self.admit_remote()?;
-        let socket = if self.scoped() {
-            daemon_socket_path().map_err(|error| AppError::new("socket_path", error))?
-        } else {
-            control_daemon_socket()?
-        };
+        if !self.scoped() {
+            return control_daemon_client();
+        }
+        let socket = daemon_socket_path().map_err(|error| AppError::new("socket_path", error))?;
         ControlClient::connect(&socket).map_err(|error| AppError::new("daemon_connection", error))
     }
 }
@@ -5063,7 +5094,7 @@ impl ProjectChannelContext {
                     control_daemon_socket()
                 }
             },
-            control_daemon_socket,
+            control_daemon_client,
             ControlClient::connect,
         )
     }
@@ -5078,22 +5109,22 @@ impl ProjectChannelContext {
         Ok(())
     }
 
+    /// `ready` connects to the daemon on the connection that proved it
+    /// ready; `connect` reaches the `existing` one.
     fn connect_with(
         &self,
         mutation: bool,
         existing: impl FnOnce() -> Result<PathBuf, AppError>,
-        ready: impl FnOnce() -> Result<PathBuf, AppError>,
+        ready: impl FnOnce() -> Result<ControlClient, AppError>,
         connect: impl FnOnce(&Path) -> Result<ControlClient, ControlError>,
     ) -> Result<ControlClient, AppError> {
         let scoped = self.authority.token().is_some();
         self.admit_remote()?;
-        let socket = if (scoped && mutation) || self.no_start {
-            existing()?
+        let mut client = if (scoped && mutation) || self.no_start {
+            connect(&existing()?).map_err(|error| AppError::new("daemon_connection", error))?
         } else {
             ready()?
         };
-        let mut client =
-            connect(&socket).map_err(|error| AppError::new("daemon_connection", error))?;
         // Lists are deliberately global reads, including for an invalid or
         // empty inherited capability. Only legacy mutations bind the stream.
         if scoped && mutation {

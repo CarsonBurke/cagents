@@ -32,9 +32,7 @@ pub(super) fn parse_home(value: &str) -> Result<String, String> {
 pub(super) fn execute(provider: Provider, home: String) -> Result<CommandOutput, AppError> {
     parse_provider(provider.executable()).map_err(|error| AppError::new("account_link", error))?;
     let home = parse_home(&home).map_err(|error| AppError::new("account_link", error))?;
-    let socket = control_daemon_socket()?;
-    let mut client = ControlClient::connect(&socket)
-        .map_err(|error| AppError::new("daemon_connection", error))?;
+    let mut client = control_daemon_client()?;
     execute_with(&mut client, provider, home)
 }
 

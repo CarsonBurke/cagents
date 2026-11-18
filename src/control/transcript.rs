@@ -69,9 +69,7 @@ pub(super) fn read(arguments: TranscriptArgs) -> Result<CommandOutput, AppError>
         tools: arguments.tools,
         full: arguments.full,
     };
-    let socket = control_daemon_socket()?;
-    let mut client =
-        ControlClient::connect(&socket).map_err(|e| AppError::new("daemon_connection", e))?;
+    let mut client = control_daemon_client()?;
     let page = match client
         .agent(
             Authority::from_environment(),

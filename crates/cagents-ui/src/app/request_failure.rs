@@ -127,6 +127,21 @@ pub(super) fn message(error: ControlError, activity: Activity, scoped: bool) -> 
     Failure::control(error, activity, scoped).message
 }
 
+/// A User connection to the daemon, started if need be, on the connection
+/// whose handshake proved it ready. Only a remote device's daemon, which
+/// readiness doesn't prove, is reached by a connection that fails in the
+/// words of `activity`.
+pub(super) fn connect_ready(activity: Activity) -> Result<crate::control::ControlClient, String> {
+    crate::terminal::connect_ready_daemon()
+        .map(|ready| ready.client)
+        .map_err(|error| match error {
+            crate::terminal::HostedTerminalStartError::Connect(error) => {
+                message(error, activity, false)
+            }
+            error => error.to_string(),
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

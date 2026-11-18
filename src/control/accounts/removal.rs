@@ -12,9 +12,7 @@ struct Revision {
 
 pub(super) fn execute(account: AccountId, confirmed: bool) -> Result<CommandOutput, AppError> {
     confirm(&account, confirmed)?;
-    let socket = control_daemon_socket()?;
-    let mut client = ControlClient::connect(&socket)
-        .map_err(|error| AppError::new("daemon_connection", error))?;
+    let mut client = control_daemon_client()?;
     execute_with(&mut client, account)
 }
 

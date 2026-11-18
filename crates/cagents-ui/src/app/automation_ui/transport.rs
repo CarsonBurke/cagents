@@ -74,7 +74,7 @@ impl Context {
         self.connect_with(
             activity,
             || crate::terminal::existing_daemon_socket_path().map_err(|error| error.to_string()),
-            || crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string()),
+            || super::super::request_failure::connect_ready(activity),
             |socket| {
                 ControlClient::connect(socket).map_err(|error| {
                     super::super::request_failure::message(error, activity, scoped)
@@ -94,7 +94,7 @@ impl Context {
         self,
         request: Request,
         selected: impl FnOnce() -> Result<PathBuf, String>,
-        start: impl FnOnce() -> Result<PathBuf, String>,
+        start: impl FnOnce() -> Result<ControlClient, String>,
         connect: impl FnOnce(&Path) -> Result<ControlClient, String>,
     ) -> Result<Response, String> {
         self.connect_with(Activity::automation(&request), selected, start, connect)?
@@ -102,11 +102,13 @@ impl Context {
             .map_err(|error| error.to_string())
     }
 
+    /// `start` connects to a daemon it may start, on the connection that
+    /// proved it ready; `connect` reaches the `selected` one.
     fn connect_with(
         self,
         activity: Activity,
         selected: impl FnOnce() -> Result<PathBuf, String>,
-        start: impl FnOnce() -> Result<PathBuf, String>,
+        start: impl FnOnce() -> Result<ControlClient, String>,
         connect: impl FnOnce(&Path) -> Result<ControlClient, String>,
     ) -> Result<Connection, String> {
         // Resolving a remote socket can establish an SSH bridge. Refuse before
@@ -114,12 +116,11 @@ impl Context {
         if self.remote && self.authority.token().is_some() {
             return Err(Failure::remote(activity));
         }
-        let socket = if self.authority.token().is_some() || self.no_start {
-            selected()
+        let client = if self.authority.token().is_some() || self.no_start {
+            connect(&selected()?)?
         } else {
-            start()
-        }?;
-        let client = connect(&socket)?;
+            start()?
+        };
         // Automation carries its authority in the existing request envelope.
         // A refusal or lost connection never retries with User authority.
         Ok(Connection {

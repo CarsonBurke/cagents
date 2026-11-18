@@ -110,8 +110,8 @@ impl Peer {
                 if let Some(auth) = read_frame::<ClientEnvelope>(&mut peer).unwrap() {
                     break (peer, auth);
                 }
-                // Service the old genuine readiness probe all the way through.
-                // Diagnose its policy only after real authentication/business.
+                // A connection that only handshakes is a separate readiness
+                // probe. Diagnose it only after real authentication/business.
                 readiness += 1;
                 assert!(readiness <= 1, "no repeated readiness or fallback");
             };
@@ -192,14 +192,28 @@ fn exercise(role: &str, policy: &str) {
     } else {
         assert_eq!(result.unwrap(), home());
     }
-    let readiness = peer.finished();
+    assert_eq!(
+        peer.finished(),
+        0,
+        "readiness hands its connection to the request rather than handshaking twice"
+    );
     // Real public authentication/business already completed before this oracle.
     // No resolver counters or the private request_as seam replace this entry.
+    // On the wire, a readiness handshake is the request's own, so the path is
+    // told apart with the daemon gone: only readiness would start one, and an
+    // update's launch fence turns that start into its refusal before any
+    // daemon binary is looked for.
+    let _update = crate::instance::UiUpdateGuard::acquire().unwrap();
+    let absent = request(Operation::Home).unwrap_err();
     let inherited_no_start = matches!(policy, "1" | "TRUE" | "yes");
     assert_eq!(
-        readiness,
-        usize::from(expected.token().is_none() && !inherited_no_start),
-        "direct entry must honor inherited no-start without CLI setup"
+        absent
+            == crate::terminal::HostedTerminalStartError::UpdateInProgress(
+                crate::instance::UpdateInProgress
+            )
+            .to_string(),
+        expected.token().is_none() && !inherited_no_start,
+        "direct entry must honor inherited no-start without CLI setup: {absent}"
     );
 }
 fn child(selector: &str, role: &str, policy: &str) {
