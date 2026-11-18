@@ -31,7 +31,10 @@ fn failed_upgrade_stop_requires_its_listener_to_be_unserved() {
     assert!(session.claim_owned_codex_listener(root.path(), &proof));
     let socket = &session.owned_codex_listener.as_ref().unwrap().socket;
     let allocation = socket.parent().unwrap();
-    std::fs::DirBuilder::new().mode(0o700).create(allocation).unwrap();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(allocation)
+        .unwrap();
     let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
 
     assert_eq!(
