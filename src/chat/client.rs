@@ -77,6 +77,7 @@ fn start_failure(error: ipc::ProtocolError) -> StartFailure {
         ipc::ProtocolErrorCode::AccountRemoved => super::Recovery::Account,
         ipc::ProtocolErrorCode::ChatCapacity => super::Recovery::Capacity,
         _ if error.is_daemon_busy() => super::Recovery::Busy,
+        ipc::ProtocolErrorCode::NotAdmitted => super::Recovery::NotAdmitted,
         _ if error.retryable => super::Recovery::Retry,
         // Only the daemon's own whole sentence, never text that quotes it.
         _ if [
@@ -135,26 +136,31 @@ fn connect_daemon(path: &std::path::Path) -> io::Result<UnixStream> {
     result
 }
 
-fn frame_read_error(error: ipc::FrameError, timeout: Option<Duration>) -> String {
-    match &error {
+/// Whether a read failed because its timeout passed with no answer.
+fn frame_timed_out(error: &ipc::FrameError) -> bool {
+    matches!(
+        error,
         ipc::FrameError::Io(io_error)
             if matches!(
                 io_error.kind(),
                 io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-            ) =>
-        {
-            timeout.map_or_else(
-                || "Timed out waiting for the daemon response".into(),
-                |timeout| {
-                    format!(
-                        "the daemon did not answer within {} s",
-                        timeout.as_secs_f64()
-                    )
-                },
             )
-        }
-        _ => format!("Cannot decode matched daemon protocol: {error}"),
+    )
+}
+
+fn frame_read_error(error: ipc::FrameError, timeout: Option<Duration>) -> String {
+    if !frame_timed_out(&error) {
+        return format!("Cannot decode matched daemon protocol: {error}");
     }
+    timeout.map_or_else(
+        || "Timed out waiting for the daemon response".into(),
+        |timeout| {
+            format!(
+                "the daemon did not answer within {} s",
+                timeout.as_secs_f64()
+            )
+        },
+    )
 }
 
 /// A conversation's subagents by the address their provider gives them, each
@@ -1258,6 +1264,9 @@ enum HandshakeError {
     /// No response from a different proof can attach. Only its well-framed
     /// explicit refusal can describe why an initial hard target was rejected.
     ProofChanged(Option<ipc::ProtocolError>),
+    /// The daemon took the connection but its answer did not arrive before the
+    /// read timeout.
+    Unanswered(String),
     Transport(String),
 }
 impl From<String> for HandshakeError {
@@ -1279,7 +1288,7 @@ fn receive(
     receive_handshake(stream, codec, request_id, proof).map_err(|error| match error {
         HandshakeError::Protocol(error) => error.message,
         HandshakeError::ProofChanged(_) => "Daemon proof changed".into(),
-        HandshakeError::Transport(message) => message,
+        HandshakeError::Unanswered(message) | HandshakeError::Transport(message) => message,
     })
 }
 fn receive_start(
@@ -1293,26 +1302,99 @@ fn receive_start(
         HandshakeError::ProofChanged(error) => StartFailure::retry(
             error.map_or_else(|| "Daemon proof changed".into(), |error| error.message),
         ),
-        HandshakeError::Transport(message) => StartFailure::retry(message),
+        HandshakeError::Unanswered(message) | HandshakeError::Transport(message) => {
+            StartFailure::retry(message)
+        }
     })
 }
+#[cfg(test)]
 fn receive_connect(
     stream: &mut UnixStream,
     codec: &mut FrameCodec,
     request_id: u64,
     expected: Option<&HostSessionProof>,
 ) -> Result<ServerResponse, StartFailure> {
-    receive_handshake(stream, codec, request_id, expected).map_err(|error| match error {
+    receive_handshake(stream, codec, request_id, expected)
+        .map_err(|error| connect_failure(error, expected.is_some()))
+}
+/// Why a native chat connection could not be opened, for a start whose
+/// `Connect` named the daemon it `expected`, or none.
+fn connect_failure(error: HandshakeError, expected: bool) -> StartFailure {
+    match error {
         HandshakeError::Protocol(error) | HandshakeError::ProofChanged(Some(error)) => {
             start_failure(error)
         }
-        HandshakeError::ProofChanged(None) if expected.is_some() => StartFailure {
+        HandshakeError::ProofChanged(None) if expected => StartFailure {
             message: "Daemon proof changed".into(),
             recovery: super::Recovery::Blocked,
         },
         HandshakeError::ProofChanged(None) => StartFailure::retry("Daemon proof changed"),
-        HandshakeError::Transport(message) => StartFailure::retry(message),
-    })
+        HandshakeError::Unanswered(message) | HandshakeError::Transport(message) => {
+            StartFailure::retry(message)
+        }
+    }
+}
+/// An account switch whose connection failed before its request was
+/// written. Nothing was asked of the daemon, so the conversation it would
+/// have moved is untouched whatever the cause, as with [`switch_unadmitted`]
+/// for the readiness check before it.
+fn switch_unasked(error: HandshakeError) -> StartFailure {
+    let (message, recovery) = match error {
+        HandshakeError::Protocol(error) | HandshakeError::ProofChanged(Some(error))
+            if error.is_daemon_busy() =>
+        {
+            (error.message, super::Recovery::Busy)
+        }
+        HandshakeError::Protocol(error) | HandshakeError::ProofChanged(Some(error))
+            if error.code == ipc::ProtocolErrorCode::UnsupportedVersion =>
+        {
+            (error.message, super::Recovery::Unreached)
+        }
+        HandshakeError::Protocol(error) | HandshakeError::ProofChanged(Some(error)) => {
+            (error.message, super::Recovery::NotAdmitted)
+        }
+        HandshakeError::ProofChanged(None) => {
+            ("Daemon proof changed".into(), super::Recovery::Unreached)
+        }
+        HandshakeError::Unanswered(message) => (message, super::Recovery::Unresponsive),
+        HandshakeError::Transport(message) => (message, super::Recovery::Unreached),
+    };
+    StartFailure { message, recovery }
+}
+/// Opens a native chat connection with its `Connect` handshake, and returns
+/// the daemon's proof. No request has been written yet when this fails.
+fn connect_handshake(
+    stream: &mut UnixStream,
+    codec: &mut FrameCodec,
+    expected: Option<&HostSessionProof>,
+) -> Result<HostSessionProof, HandshakeError> {
+    stream
+        .set_read_timeout(Some(CHAT_ATTACH_TIMEOUT))
+        .map_err(|e| e.to_string())?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| e.to_string())?;
+    codec
+        .write(
+            stream,
+            &ClientEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: 1,
+                proof: None,
+                request: ClientRequest::Connect {
+                    expected_host: expected.cloned(),
+                    resume: Vec::new(),
+                },
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    match receive_handshake(stream, codec, 1, expected)? {
+        ServerResponse::Connected { proof, .. } if proof.is_complete() => Ok(proof),
+        ServerResponse::Connected { .. } => {
+            Err("Daemon returned an incomplete native chat ownership proof".into())
+        }
+        _ => Err("Daemon did not complete native chat handshake".into()),
+    }
 }
 fn receive_handshake(
     stream: &mut UnixStream,
@@ -1330,7 +1412,15 @@ fn receive_handshake(
         _ => {}
     }
     let envelope: ServerEnvelope = frame
-        .map_err(|error| frame_read_error(error, stream.read_timeout().ok().flatten()))?
+        .map_err(|error| {
+            let unanswered = frame_timed_out(&error);
+            let message = frame_read_error(error, stream.read_timeout().ok().flatten());
+            if unanswered {
+                HandshakeError::Unanswered(message)
+            } else {
+                HandshakeError::Transport(message)
+            }
+        })?
         .ok_or("Daemon disconnected")?;
     if envelope.version != PROTOCOL_VERSION {
         #[cfg(feature = "ui")]
@@ -2270,11 +2360,18 @@ impl ClientHandle {
         wake: impl Fn(Wake) + Send + Sync + 'static,
     ) -> Result<Self, StartFailure> {
         if !super::is_account_recovery(&source, &replacement) {
-            return Err("Account switch changed the saved conversation".into());
+            return Err(StartFailure {
+                message: "Account switch changed the saved conversation".into(),
+                recovery: super::Recovery::NotAdmitted,
+            });
         }
         let socket = crate::terminal::ensure_daemon_ready_for_explicit_action()
             .map_err(switch_unadmitted)?;
-        let stream = connect_daemon(&socket).map_err(|error| error.to_string())?;
+        // The daemon answered its readiness check, but may since have gone.
+        let stream = connect_daemon(&socket).map_err(|error| StartFailure {
+            message: error.to_string(),
+            recovery: super::Recovery::Unreached,
+        })?;
         Self::connect_on(
             stream,
             replacement,
@@ -2365,7 +2462,19 @@ impl ClientHandle {
         pane: Option<ipc::PaneChatStart>,
         wake: impl Fn(Wake) + Send + Sync + 'static,
     ) -> Result<Self, StartFailure> {
-        let retirement = ClientRetirement::for_client(session.id)?;
+        // Nothing has been asked of the daemon until the request below is
+        // written. A switch that fails before then moved nothing.
+        let unasked = account_recovery.is_some();
+        let retirement = ClientRetirement::for_client(session.id).map_err(|message| {
+            if unasked {
+                StartFailure {
+                    message,
+                    recovery: super::Recovery::NotAdmitted,
+                }
+            } else {
+                message.into()
+            }
+        })?;
         if intent == Intent::RestoreExisting
             && (source.is_some()
                 || terminate_source
@@ -2413,38 +2522,19 @@ impl ClientHandle {
             return Err("The canonical chat is not an exact upgrade of the saved source".into());
         }
         let wake: Arc<dyn Fn(Wake) + Send + Sync> = Arc::new(wake);
-        stream
-            .set_read_timeout(Some(CHAT_ATTACH_TIMEOUT))
-            .map_err(|e| e.to_string())?;
-        stream
-            .set_write_timeout(Some(Duration::from_secs(5)))
-            .map_err(|e| e.to_string())?;
         let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
         let expected = upgrade_expected
             .as_ref()
             .and_then(|session| session.proof.clone())
             .or_else(|| source.clone());
-        codec
-            .write(
-                &mut stream,
-                &ClientEnvelope {
-                    version: PROTOCOL_VERSION,
-                    request_id: 1,
-                    proof: None,
-                    request: ClientRequest::Connect {
-                        expected_host: expected.clone(),
-                        resume: Vec::new(),
-                    },
-                },
-            )
-            .map_err(|e| e.to_string())?;
-        let proof = match receive_connect(&mut stream, &mut codec, 1, expected.as_ref())? {
-            ServerResponse::Connected { proof, .. } => proof,
-            _ => return Err("Daemon did not complete native chat handshake".into()),
-        };
-        if !proof.is_complete() {
-            return Err("Daemon returned an incomplete native chat ownership proof".into());
-        }
+        let proof =
+            connect_handshake(&mut stream, &mut codec, expected.as_ref()).map_err(|error| {
+                if unasked {
+                    switch_unasked(error)
+                } else {
+                    connect_failure(error, expected.is_some())
+                }
+            })?;
         let mut session = session;
         if intent == Intent::Start
             && source.is_none()
@@ -4110,6 +4200,140 @@ mod tests {
             .recovery,
             Recovery::Busy
         );
+    }
+
+    /// A refusal the daemon marks as coming before any effect is typed as
+    /// such whatever its sentence or retryability, and keeps the sentence.
+    /// The daemon's busy refusal stays busy.
+    #[test]
+    fn a_refusal_before_any_effect_is_typed_not_admitted_with_its_reason() {
+        use super::super::Recovery;
+        use ipc::ProtocolErrorCode;
+
+        for retryable in [false, true] {
+            let failure = start_failure(ipc::ProtocolError::new(
+                ProtocolErrorCode::NotAdmitted,
+                "This conversation has an explicitly pinned account",
+                retryable,
+            ));
+            assert_eq!(failure.recovery, Recovery::NotAdmitted, "{retryable}");
+            assert_eq!(
+                failure.message,
+                "This conversation has an explicitly pinned account"
+            );
+        }
+        assert!(!Recovery::NotAdmitted.is_blocked());
+        // The same sentence under the code an older daemon sent proves
+        // nothing about what changed.
+        assert_eq!(
+            start_failure(ipc::ProtocolError::new(
+                ProtocolErrorCode::InvalidRequest,
+                "This conversation has an explicitly pinned account",
+                false,
+            ))
+            .recovery,
+            Recovery::Blocked
+        );
+        assert_eq!(
+            start_failure(ipc::ProtocolError::new(
+                ProtocolErrorCode::NotAdmitted,
+                ipc::DAEMON_BUSY,
+                true,
+            ))
+            .recovery,
+            Recovery::Busy
+        );
+    }
+
+    /// A switch's connection that fails before its request is written asked
+    /// the daemon nothing, so no outcome of it reads as a removed account or
+    /// a plain retry: a timed out handshake is unanswered, a dropped or
+    /// mismatched one unreached, a busy refusal busy, and any other refusal
+    /// of the handshake keeps its reason.
+    #[test]
+    fn a_switch_that_failed_before_its_request_asked_nothing() {
+        use super::super::Recovery;
+        use ipc::{ProtocolError, ProtocolErrorCode};
+
+        let unanswered = switch_unasked(HandshakeError::Unanswered(
+            "the daemon did not answer within 70 s".into(),
+        ));
+        assert_eq!(unanswered.recovery, Recovery::Unresponsive);
+        assert_eq!(unanswered.message, "the daemon did not answer within 70 s");
+        for unreached in [
+            HandshakeError::Transport("Daemon disconnected".into()),
+            HandshakeError::Transport(
+                "Daemon version mismatch; use matched cagents executables".into(),
+            ),
+            HandshakeError::ProofChanged(None),
+            HandshakeError::Protocol(ProtocolError::new(
+                ProtocolErrorCode::UnsupportedVersion,
+                "unsupported protocol",
+                false,
+            )),
+        ] {
+            assert_eq!(switch_unasked(unreached).recovery, Recovery::Unreached);
+        }
+        assert_eq!(
+            switch_unasked(HandshakeError::Protocol(ProtocolError::new(
+                ProtocolErrorCode::Internal,
+                ipc::DAEMON_BUSY,
+                true,
+            )))
+            .recovery,
+            Recovery::Busy
+        );
+        for code in [
+            ProtocolErrorCode::InvalidRequest,
+            ProtocolErrorCode::TerminalUnavailable,
+            // The handshake names no account, so this is not the source's.
+            ProtocolErrorCode::AccountRemoved,
+        ] {
+            let refused = switch_unasked(HandshakeError::Protocol(ProtocolError::new(
+                code,
+                "the daemon's exact reason",
+                true,
+            )));
+            assert_eq!(refused.recovery, Recovery::NotAdmitted, "{code:?}");
+            assert_eq!(refused.message, "the daemon's exact reason");
+        }
+        // Any other start keeps the existing classification of the same
+        // failures.
+        assert_eq!(
+            connect_failure(
+                HandshakeError::Unanswered("the daemon did not answer within 70 s".into()),
+                false
+            )
+            .recovery,
+            Recovery::Retry
+        );
+        assert_eq!(
+            connect_failure(HandshakeError::ProofChanged(None), true).recovery,
+            Recovery::Blocked
+        );
+    }
+
+    /// A switch's handshake that the daemon leaves unanswered past its read
+    /// timeout is unresponsive, and one whose connection closes first is
+    /// unreached.
+    #[test]
+    fn a_switch_handshake_that_times_out_or_closes_is_typed_by_how_it_ended() {
+        use super::super::Recovery;
+
+        for (closes, expected) in [(false, Recovery::Unresponsive), (true, Recovery::Unreached)] {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .unwrap();
+            if closes {
+                drop(server);
+            }
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            let failure = receive_handshake(&mut client, &mut codec, 1, None)
+                .map_err(switch_unasked)
+                .unwrap_err();
+            assert_eq!(failure.recovery, expected, "{failure:?}");
+        }
     }
 
     #[test]

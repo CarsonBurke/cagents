@@ -453,7 +453,17 @@ impl State {
             return None;
         }
         let (key, summary, guidance, kind, explained) =
-            if let Some(failure) = Failure::parse(provider, text) {
+            if chat::failure::account_switch_refusal_reason(text).is_some() {
+                // Before any provider wording: the daemon's reason after the
+                // summary is not a provider's report, and is kept for Details.
+                (
+                    diagnostic_key(text),
+                    chat::failure::ACCOUNT_SWITCH_REFUSED.to_owned(),
+                    chat::failure::ACCOUNT_SWITCH_REFUSED_ACTION,
+                    None,
+                    false,
+                )
+            } else if let Some(failure) = Failure::parse(provider, text) {
                 (
                     diagnostic_key(failure.key.as_ref()),
                     failure.summary,

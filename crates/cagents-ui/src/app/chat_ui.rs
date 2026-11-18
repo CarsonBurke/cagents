@@ -12409,6 +12409,7 @@ impl Cagents {
                             chat::Recovery::Busy
                                 | chat::Recovery::Unresponsive
                                 | chat::Recovery::Unreached
+                                | chat::Recovery::NotAdmitted
                         ) && account_source.is_some()
                             && automatic_submit.is_some() =>
                     {
@@ -12436,18 +12437,18 @@ impl Cagents {
                             }
                         }
                         if !runtime.disconnected && !runtime.snapshot.exited {
-                            runtime.error = Some(
-                                match failure.recovery {
-                                    chat::Recovery::Busy => {
-                                        chat::failure::delivery::ACCOUNT_SWITCH_BUSY
-                                    }
-                                    chat::Recovery::Unresponsive => {
-                                        chat::failure::delivery::ACCOUNT_SWITCH_UNANSWERED
-                                    }
-                                    _ => chat::failure::delivery::ACCOUNT_SWITCH_UNREACHED,
+                            runtime.error = Some(match failure.recovery {
+                                chat::Recovery::Busy => {
+                                    chat::failure::delivery::ACCOUNT_SWITCH_BUSY.to_owned()
                                 }
-                                .to_owned(),
-                            );
+                                chat::Recovery::Unresponsive => {
+                                    chat::failure::delivery::ACCOUNT_SWITCH_UNANSWERED.to_owned()
+                                }
+                                chat::Recovery::NotAdmitted => {
+                                    chat::failure::account_switch_refused(&failure.message)
+                                }
+                                _ => chat::failure::delivery::ACCOUNT_SWITCH_UNREACHED.to_owned(),
+                            });
                         }
                         // As a wake read now would have left it.
                         let session = runtime.session.clone();
@@ -19485,131 +19486,154 @@ pub(in crate::app) mod tests {
         assert!(!app.chat_start_pending(card), "no switch was attempted");
     }
 
-    /// A switch the daemon refused only because it was finishing another
-    /// operation moved nothing. The conversation stays on its own account and
-    /// attached, offers no restore of an account that was never removed, says
-    /// plainly that the message wasn't sent, and sending again retries.
+    /// A switch the daemon refused before changing anything moved nothing,
+    /// whether it was finishing another operation or refused it for a reason
+    /// of its own. The conversation stays on its own account and attached,
+    /// offers no restore of an account that was never removed, says plainly
+    /// that the message wasn't sent, and sending again retries. A refusal for
+    /// a reason of its own keeps the daemon's sentence under Details.
     #[test]
     fn a_busy_daemon_refusing_an_automatic_switch_keeps_the_conversation_on_its_account() {
-        let mut app = crate::app::tests::context_inspector_test_app(false);
-        let (card, target) = limited_automatic_chat(&mut app, "Keep this message");
-        app.chat_runtime_mut(target)
-            .unwrap()
-            .attachments
-            .push(Attachment {
-                path: "kept.png".into(),
-                reference: None,
-            });
-        let source = chat_runtime(&app, card).session.clone();
-        let handle = chat_runtime(&app, card).handle().unwrap().clone();
-        drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send))));
-        let attempt = chat_runtime_attempt(&app, card);
-        assert!(
-            app.chat_ui.attempt(card).unwrap().recovery.is_some(),
-            "sending asked for an account switch"
-        );
-        answer_start(
-            &mut app,
-            attempt,
-            Err(chat::StartFailure {
-                message: crate::terminal_ipc::DAEMON_BUSY.into(),
-                recovery: chat::Recovery::Busy,
-            }),
-        );
-        assert!(!app.chat_start_pending(card));
-        assert!(!app.chat_ui.removed_accounts.contains(&card));
-        assert!(!app.chat_ui.restorable_accounts.contains_key(&card));
-        assert!(app.account_recovery_controls(card).is_none());
-        assert!(
-            app.chat_ui
-                .retiring
+        const REASON: &str = "The conversation history could not be prepared on the alternate account: Transcript diverged from the existing account-switch copy";
+        for (recovery, message, notice, guidance, explained) in [
+            (
+                chat::Recovery::Busy,
+                crate::terminal_ipc::DAEMON_BUSY,
+                chat::failure::delivery::ACCOUNT_SWITCH_BUSY.to_owned(),
+                "Send again in a moment.",
+                true,
+            ),
+            (
+                chat::Recovery::NotAdmitted,
+                REASON,
+                chat::failure::account_switch_refused(REASON),
+                chat::failure::ACCOUNT_SWITCH_REFUSED_ACTION,
+                false,
+            ),
+        ] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let (card, target) = limited_automatic_chat(&mut app, "Keep this message");
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .attachments
+                .push(Attachment {
+                    path: "kept.png".into(),
+                    reference: None,
+                });
+            let source = chat_runtime(&app, card).session.clone();
+            let handle = chat_runtime(&app, card).handle().unwrap().clone();
+            drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send))));
+            let attempt = chat_runtime_attempt(&app, card);
+            assert!(
+                app.chat_ui.attempt(card).unwrap().recovery.is_some(),
+                "sending asked for an account switch"
+            );
+            answer_start(
+                &mut app,
+                attempt,
+                Err(chat::StartFailure {
+                    message: message.into(),
+                    recovery,
+                }),
+            );
+            assert!(!app.chat_start_pending(card));
+            assert!(
+                !app.chat_ui.removed_accounts.contains(&card),
+                "{recovery:?}"
+            );
+            assert!(!app.chat_ui.restorable_accounts.contains_key(&card));
+            assert!(app.account_recovery_controls(card).is_none());
+            assert!(
+                app.chat_ui
+                    .retiring
+                    .iter()
+                    .all(|retiring| retiring.card != card),
+                "the daemon admitted nothing, so nothing is given up"
+            );
+            assert_eq!(
+                app.card_state(card).unwrap().kind,
+                CardKind::Chat(source.clone())
+            );
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(runtime.target, target, "the original attachment is kept");
+            assert!(Arc::ptr_eq(runtime.handle().unwrap(), &handle));
+            assert!(!runtime.disconnected);
+            assert_eq!(runtime.session, source);
+            assert_eq!(runtime.error.as_deref(), Some(notice.as_str()));
+            assert_eq!(runtime.composer.text().trim(), "Keep this message");
+            assert_eq!(runtime.attachments.len(), 1, "the attachment is kept too");
+            assert_eq!(runtime.attachments[0].path, PathBuf::from("kept.png"));
+            // It answers the send; the conversation and its last turn are fine.
+            assert_eq!(runtime.reported_errors().next(), None);
+            // As drawn on screen.
+            app.chat_runtime_mut(target).unwrap().reconcile_failure_ui();
+            let notice = chat_runtime(&app, card)
+                .failure_ui
+                .incidents
                 .iter()
-                .all(|retiring| retiring.card != card),
-            "the daemon admitted nothing, so nothing is given up"
-        );
-        assert_eq!(
-            app.card_state(card).unwrap().kind,
-            CardKind::Chat(source.clone())
-        );
-        let runtime = chat_runtime(&app, card);
-        assert_eq!(runtime.target, target, "the original attachment is kept");
-        assert!(Arc::ptr_eq(runtime.handle().unwrap(), &handle));
-        assert!(!runtime.disconnected);
-        assert_eq!(runtime.session, source);
-        assert_eq!(
-            runtime.error.as_deref(),
-            Some(chat::failure::delivery::ACCOUNT_SWITCH_BUSY)
-        );
-        assert_eq!(runtime.composer.text().trim(), "Keep this message");
-        assert_eq!(runtime.attachments.len(), 1, "the attachment is kept too");
-        assert_eq!(runtime.attachments[0].path, PathBuf::from("kept.png"));
-        // It answers the send; the conversation and its last turn are fine.
-        assert_eq!(runtime.reported_errors().next(), None);
-        // As drawn on screen.
-        app.chat_runtime_mut(target).unwrap().reconcile_failure_ui();
-        let notice = chat_runtime(&app, card)
-            .failure_ui
-            .incidents
-            .iter()
-            .find(|incident| incident.guidance == "Send again in a moment.")
-            .expect("the refusal is shown");
-        assert!(notice.summary.starts_with("Your message wasn't sent."));
-        assert!(notice.explained, "no details that would only repeat it");
+                .find(|incident| incident.guidance == guidance)
+                .expect("the refusal is shown");
+            assert!(notice.summary.starts_with("Your message wasn't sent."));
+            // A fixed outcome has no details that would only repeat it; the
+            // daemon's own reason is kept under Details.
+            assert_eq!(notice.explained, explained, "{recovery:?}");
+            assert!(!notice.summary.contains("diverged"));
 
-        drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send))));
-        assert!(
-            app.chat_ui
-                .attempt(card)
-                .is_some_and(|attempt| attempt.recovery.is_some()),
-            "sending again retries the switch"
-        );
-        assert_eq!(
-            chat_runtime(&app, card).error,
-            None,
-            "the earlier refusal does not stand over the retry"
-        );
+            drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send))));
+            assert!(
+                app.chat_ui
+                    .attempt(card)
+                    .is_some_and(|attempt| attempt.recovery.is_some()),
+                "sending again retries the switch"
+            );
+            assert_eq!(
+                chat_runtime(&app, card).error,
+                None,
+                "the earlier refusal does not stand over the retry"
+            );
 
-        // The operation the daemon was finishing ended this conversation's
-        // connection during the wait. Its wake arrives while the switch is
-        // pending and goes unread there, so the refusal reads the connection
-        // itself: the card offers its reconnect rather than advice to send
-        // again, which a disconnected card can't, and the account is still
-        // not called removed.
-        handle.disconnect_for_test();
-        drop(app.update(Message::ChatUi(Action::Wake(
-            target,
-            Wake::Disconnected("The daemon stopped".into()),
-        ))));
-        assert!(app.chat_start_pending(card));
-        assert!(
-            !chat_runtime(&app, card).disconnected,
-            "the wake was not read while the switch was pending"
-        );
-        let attempt = chat_runtime_attempt(&app, card);
-        answer_start(
-            &mut app,
-            attempt,
-            Err(chat::StartFailure {
-                message: crate::terminal_ipc::DAEMON_BUSY.into(),
-                recovery: chat::Recovery::Busy,
-            }),
-        );
-        assert!(!app.chat_ui.removed_accounts.contains(&card));
-        assert!(
-            app.chat_ui
-                .retiring
-                .iter()
-                .all(|retiring| retiring.card != card)
-        );
-        let runtime = chat_runtime(&app, card);
-        assert!(runtime.disconnected, "the lost connection is shown");
-        assert_eq!(runtime.error, None, "no advice to send again");
-        assert_eq!(runtime.composer.text().trim(), "Keep this message");
-        assert!(
-            app.automatic_chat_account(target, PromptMode::Send)
-                .is_none(),
-            "a disconnected card starts no switch from its old connection"
-        );
+            // The operation the daemon was finishing ended this conversation's
+            // connection during the wait. Its wake arrives while the switch is
+            // pending and goes unread there, so the refusal reads the connection
+            // itself: the card offers its reconnect rather than advice to send
+            // again, which a disconnected card can't, and the account is still
+            // not called removed.
+            handle.disconnect_for_test();
+            drop(app.update(Message::ChatUi(Action::Wake(
+                target,
+                Wake::Disconnected("The daemon stopped".into()),
+            ))));
+            assert!(app.chat_start_pending(card));
+            assert!(
+                !chat_runtime(&app, card).disconnected,
+                "the wake was not read while the switch was pending"
+            );
+            let attempt = chat_runtime_attempt(&app, card);
+            answer_start(
+                &mut app,
+                attempt,
+                Err(chat::StartFailure {
+                    message: message.into(),
+                    recovery,
+                }),
+            );
+            assert!(!app.chat_ui.removed_accounts.contains(&card));
+            assert!(
+                app.chat_ui
+                    .retiring
+                    .iter()
+                    .all(|retiring| retiring.card != card)
+            );
+            let runtime = chat_runtime(&app, card);
+            assert!(runtime.disconnected, "the lost connection is shown");
+            assert_eq!(runtime.error, None, "no advice to send again");
+            assert_eq!(runtime.composer.text().trim(), "Keep this message");
+            assert!(
+                app.automatic_chat_account(target, PromptMode::Send)
+                    .is_none(),
+                "a disconnected card starts no switch from its old connection"
+            );
+        }
     }
 
     /// The conversation's provider exited while the daemon was busy, which
