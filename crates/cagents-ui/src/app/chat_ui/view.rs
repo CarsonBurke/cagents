@@ -2142,12 +2142,7 @@ impl Runtime {
                             self.selection_item(&mut builder, item, turn::Slot::Prose, true);
                         }
                     }
-                    if self
-                        .opened
-                        .get(&turn.key)
-                        .copied()
-                        .unwrap_or(self.tool_groups_expanded)
-                    {
+                    if self.steps_shown(turn) {
                         for placed in &turn.steps {
                             if let Some(item) = items.get(placed.index) {
                                 self.selection_item(&mut builder, item, placed.slot, true);

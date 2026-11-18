@@ -11555,3 +11555,24 @@ fn a_group_of_one_step_draws_the_step_alone() {
         "{texts:?}"
     );
 }
+
+/// A lone step the reader opened stays open when a second step joins it:
+/// the strip the two now share opens by default, unless the reader closed
+/// it. A lone step's own text is always selectable, as its row is drawn.
+#[test]
+fn a_group_opens_over_the_step_the_reader_opened_before_it_grew() {
+    let first = bash("toolu_first", "", "cargo check --workspace", "");
+    let (runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&first));
+    assert!(runtime.steps_shown(&runtime.turns[0]));
+    let mut second = bash("toolu_second", "", "cargo test -q", "");
+    second.started_at = Some(5_000);
+    second.at = Some(6_000);
+    let (mut grown, _handle) = frame_cost::live_runtime(&[first, second]);
+    let turn = grown.turns[0].clone();
+    assert!(!grown.group_open(&turn));
+    grown.expanded.insert("toolu_first".into());
+    assert!(grown.group_open(&turn));
+    assert!(grown.steps_shown(&turn));
+    grown.opened.insert(turn.key.clone(), false);
+    assert!(!grown.steps_shown(&turn));
+}

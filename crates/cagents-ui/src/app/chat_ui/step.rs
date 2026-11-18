@@ -288,6 +288,28 @@ impl Runtime {
         }
     }
 
+    /// Whether a group's strip is open. The reader's choice comes first.
+    /// Without one, it follows the setting, and is open where the reader
+    /// already opened one of its steps: a lone step is drawn as its own row,
+    /// and a second step arriving must not fold away the first one the
+    /// reader was reading.
+    pub(super) fn group_open(&self, turn: &turn::Turn) -> bool {
+        self.opened.get(&turn.key).copied().unwrap_or_else(|| {
+            self.tool_groups_expanded
+                || turn.steps.iter().any(|placed| {
+                    self.step_items()
+                        .get(placed.index)
+                        .is_some_and(|item| self.item_expanded(&item.id))
+                })
+        })
+    }
+
+    /// Whether a group's steps are on screen: a lone step always is, as its
+    /// own row, and the steps of several when their strip is open.
+    pub(super) fn steps_shown(&self, turn: &turn::Turn) -> bool {
+        turn.steps.len() == 1 || self.group_open(turn)
+    }
+
     /// One group's activity: a summary line and how long the work took,
     /// disclosing the individual steps.
     ///
@@ -307,12 +329,7 @@ impl Runtime {
     ) -> Element<'a, Message> {
         let target = self.target;
         let key = turn.key.as_str();
-        // Explicit reader choices override the configured default.
-        let open = self
-            .opened
-            .get(key)
-            .copied()
-            .unwrap_or(self.tool_groups_expanded);
+        let open = self.group_open(turn);
         let elapsed = if turn.running {
             self.source_now_ms()
                 .and_then(|now| turn.duration_label(now))
@@ -509,6 +526,13 @@ impl Runtime {
             && item.content.status() != Some(ToolStatus::Running)
         {
             said.push_str(&format!(" · {word}"));
+        } else if coordinated.is_some()
+            && item.content.status() == Some(ToolStatus::Running)
+            && status != Some(ToolStatus::Running)
+        {
+            // A coordinating step says what it did in the past tense, so
+            // one still working without the spinner says so in words.
+            said.push_str(" · working");
         }
         let label = if verb.is_empty() {
             said.clone()

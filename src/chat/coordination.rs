@@ -413,7 +413,7 @@ fn cli(line: &str, output: &str) -> Option<Coordination> {
     let incidental = commands.iter().enumerate().all(|(at, other)| match at {
         at if at == index => true,
         at if at < first => sets_up(other),
-        at if at < index => piped_text(other).is_some(),
+        at if at < index => piped_text(other).is_some() || piped_file(other).is_some(),
         at if at <= last => trims(other),
         _ => reports(other),
     });
@@ -423,10 +423,14 @@ fn cli(line: &str, output: &str) -> Option<Coordination> {
     let stdin = match &simple.stdin {
         shell::Stdin::Text(text) => Text::Inline(text.clone()),
         shell::Stdin::File(path) => Text::File(path.clone()),
-        shell::Stdin::Pipe => commands
-            .get(first)
-            .and_then(piped_text)
-            .map_or(Text::Unseen, Text::Inline),
+        shell::Stdin::Pipe => match commands.get(first) {
+            Some(before) => match (piped_text(before), piped_file(before)) {
+                (Some(text), _) => Text::Inline(text),
+                (None, Some(file)) => Text::File(file.to_owned()),
+                (None, None) => Text::Unseen,
+            },
+            None => Text::Unseen,
+        },
         shell::Stdin::Unknown => Text::Unseen,
     };
     let mut kind = crate::control::invocation::coordination(argv, stdin)?;
@@ -460,32 +464,60 @@ fn sets_up(simple: &shell::Simple) -> bool {
 }
 
 /// Whether `simple`, reading an invocation's output through a pipe, only
-/// trims, filters or formats what it printed.
+/// trims, filters or formats what it printed. One that names a file to read
+/// as well, as `head -50 build.log` does, reads something else.
 fn trims(simple: &shell::Simple) -> bool {
-    matches!(
-        program(simple),
-        "head"
-            | "tail"
-            | "jq"
-            | "grep"
-            | "egrep"
-            | "fgrep"
-            | "rg"
-            | "sed"
-            | "awk"
-            | "cut"
-            | "sort"
-            | "uniq"
-            | "wc"
-            | "tee"
-            | "cat"
-            | "column"
-            | "tr"
-            | "fold"
-            | "nl"
-            | "less"
-            | "more"
-    )
+    // The program's operands besides its input files: a pattern, a script or
+    // a filter. `tee` writes its files, so they are not input.
+    let (programs, valued): (usize, &[&str]) = match program(simple) {
+        "tee" => return true,
+        "head" | "tail" => (0, &["-n", "-c"]),
+        "sort" => (0, &["-k", "-t", "-o"]),
+        "wc" | "cat" | "nl" | "less" | "more" => (0, &[]),
+        "uniq" | "fold" => (0, &["-w"]),
+        "column" => (0, &["-s", "-c"]),
+        "cut" => (0, &["-d", "-f", "-c", "-b"]),
+        "tr" => (2, &[]),
+        "grep" | "egrep" | "fgrep" | "rg" => (1, &["-m", "-A", "-B", "-C", "-e", "-f"]),
+        "sed" => (1, &["-e", "-f"]),
+        "awk" => (1, &["-F", "-v", "-f"]),
+        "jq" => (1, &["--arg", "--argjson", "--indent"]),
+        _ => return false,
+    };
+    let mut operands = 0;
+    // A pattern or script given by option leaves no operand for one.
+    let mut programs = programs;
+    let mut words = simple.argv[1..].iter();
+    while let Some(word) = words.next() {
+        if word == "--" {
+            operands += words.len();
+            break;
+        }
+        if word.starts_with('-') && word.len() > 1 {
+            if valued.contains(&word.as_str()) {
+                if matches!(word.as_str(), "-e" | "-f") {
+                    programs = 0;
+                }
+                words.next();
+                // `--arg NAME VALUE` takes two.
+                if matches!(word.as_str(), "--arg" | "--argjson") {
+                    words.next();
+                }
+            }
+            continue;
+        }
+        operands += 1;
+    }
+    operands <= programs
+}
+
+/// Whether `simple`, piped into an invocation, is `cat` of one file: the
+/// message is that file, as `< file` would give it.
+fn piped_file(simple: &shell::Simple) -> Option<&str> {
+    match simple.argv.as_slice() {
+        [_, file] if program(simple) == "cat" && !file.starts_with('-') => Some(file),
+        _ => None,
+    }
 }
 
 /// Whether `simple`, run after an invocation's pipeline, only reports how it
@@ -977,6 +1009,9 @@ mod tests {
             "gh pr view 3110 --json title | cagents send reviewer -",
             "/bin/bash -lc 'ls -la && cagents sessions'",
             "for host in fw16 local; do cagents --device \"$host\" sessions; done",
+            // A filter that also reads a file of its own.
+            "cagents sessions | head -50 build.log",
+            "cagents inbox | grep -n error notes.md",
         ] {
             assert!(cli(line, output).is_none(), "{line}");
         }
@@ -995,6 +1030,8 @@ mod tests {
             "sleep 30; cagents sessions 2>/dev/null || echo 'daemon unreachable'",
             "cd /repo || exit 1; export CAGENTS_DEVICE=fw16; cagents sessions",
             "bash -lc 'cagents sessions | tail -5'",
+            "cagents --json sessions | jq -r --arg d fw16 '.[] | select(.device == $d) | .id' | head -n 3",
+            "cagents sessions 2>&1 | grep -E 'Relocate|Review' | cut -d ' ' -f 1",
         ] {
             assert_eq!(
                 cli(line, "").map(|step| step.kind),
@@ -1007,6 +1044,12 @@ mod tests {
             panic!("a message");
         };
         assert_eq!(message.body, Text::Inline("Done.\n".into()));
+        // `cat` of a file into it is the file, as `<` gives it.
+        let fed = cli("cat review.md | cagents send reviewer -", "").unwrap();
+        let Kind::Message(message) = fed.kind else {
+            panic!("a message");
+        };
+        assert_eq!(message.body, Text::File("review.md".into()));
     }
 
     #[test]
