@@ -265,7 +265,10 @@ use crate::{
 /// fresh conversation cannot take a pane another window already started.
 /// Version 187 lets a transcript query's `before` name its entry by the short
 /// cursor `cagents transcript` prints, which a daemon before it cannot match.
-pub const PROTOCOL_VERSION: u16 = 187;
+/// Version 188 appends `ModelEdit::CloseConfirmedProject`, which `project
+/// close` sends with the channels it confirmed so the daemon refuses the close
+/// if they changed. A daemon before it could not decode the edit.
+pub const PROTOCOL_VERSION: u16 = 188;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";

@@ -465,8 +465,15 @@ fn public_user_close_and_move_preserve_exact_destructive_intent_and_receipts() {
             let request = first_edit(peer, verb, &model);
             match &request.request {
                 ClientRequest::EditWorkspaceModel {
-                    edit: ModelEdit::CloseProject { repository: actual },
-                } if verb == "project-close" => assert_eq!(actual, &repository),
+                    edit:
+                        ModelEdit::CloseConfirmedProject {
+                            repository: actual,
+                            channels,
+                        },
+                } if verb == "project-close" => {
+                    assert_eq!(actual, &repository);
+                    assert_eq!(channels, &[source, destination].into());
+                }
                 ClientRequest::EditWorkspaceModel {
                     edit: ModelEdit::DeleteChannel { id },
                 } if verb == "channel-close" => assert_eq!(*id, source),
@@ -738,20 +745,8 @@ fn public_path_validation_and_project_confirmation_remain_effective() {
             missing.to_str().unwrap().into(),
         ],
         vec![
-            "project".into(),
-            "close".into(),
-            missing.to_str().unwrap().into(),
-            "--yes".into(),
-        ],
-        vec![
             "channel".into(),
             "spawn".into(),
-            "--repository".into(),
-            missing.to_str().unwrap().into(),
-        ],
-        vec![
-            "channel".into(),
-            "list".into(),
             "--repository".into(),
             missing.to_str().unwrap().into(),
         ],
@@ -762,6 +757,38 @@ fn public_path_validation_and_project_confirmation_remain_effective() {
         .err()
         .unwrap();
         assert_eq!(error.kind, "repository");
+    }
+    // A missing path may still be the key of a project whose checkout was
+    // removed, which only the registry knows. One it does not hold is refused
+    // after that single read, with nothing edited.
+    for args in [
+        vec![
+            "project".into(),
+            "close".into(),
+            missing.to_str().unwrap().into(),
+            "--yes".into(),
+        ],
+        vec![
+            "channel".into(),
+            "list".into(),
+            "--repository".into(),
+            missing.to_str().unwrap().into(),
+        ],
+    ] {
+        let model = fixture.model.clone();
+        let peer = Peer::new(connected(), move |peer| read_model(peer, &model));
+        let context = ProjectChannelContext {
+            authority: Authority::default(),
+            remote: false,
+            no_start: true,
+        };
+        let error = dispatch(parse(&args), |mutation| {
+            selected(&context, mutation, &peer.socket)
+        })
+        .err()
+        .unwrap();
+        assert_eq!(error.kind, "repository");
+        peer.finished();
     }
     for has_channels in [false, true] {
         let mut model = fixture.model.clone();
@@ -778,7 +805,10 @@ fn public_path_validation_and_project_confirmation_remain_effective() {
                 assert_eq!(
                     request.request,
                     ClientRequest::EditWorkspaceModel {
-                        edit: ModelEdit::CloseProject { repository }
+                        edit: ModelEdit::CloseConfirmedProject {
+                            repository,
+                            channels: Default::default(),
+                        }
                     }
                 );
                 model_reply(peer, &request, WorkspaceModel::default());
