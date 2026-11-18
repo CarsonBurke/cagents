@@ -303,6 +303,14 @@ impl Store {
             .map(drop)
             .map_err(failed)
     }
+
+    /// Forgets a reference Linear no longer answers with an issue.
+    pub(super) fn forget_ticket(&mut self, reference: &str) -> Result<(), String> {
+        diesel::delete(tickets::table.filter(tickets::reference.eq(reference)))
+            .execute(&mut self.0)
+            .map(drop)
+            .map_err(failed)
+    }
 }
 
 #[cfg(test)]
@@ -375,6 +383,12 @@ mod tests {
         };
         store.save_ticket("uuid", &ticket("MAIN-1")).unwrap();
         store.save_ticket("uuid", &ticket("CORE-2")).unwrap();
+        assert_eq!(
+            store.tickets().unwrap(),
+            BTreeMap::from([("uuid".to_owned(), ticket("CORE-2"))])
+        );
+        store.save_ticket("TEAM-1", &ticket("TEAM-1")).unwrap();
+        store.forget_ticket("TEAM-1").unwrap();
         assert_eq!(
             store.tickets().unwrap(),
             BTreeMap::from([("uuid".to_owned(), ticket("CORE-2"))])

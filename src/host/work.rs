@@ -1494,23 +1494,36 @@ impl Handle {
         // daemon never reaches for Linear credentials unattended.
         let wanted = {
             let shared = self.shared();
-            shared.board_being_read().then(|| {
-                shared
-                    .wanted_tickets()
-                    .into_iter()
-                    .filter(|reference| !shared.tickets.contains_key(&reference.id))
-                    .collect::<BTreeSet<_>>()
-            })
+            shared
+                .board_being_read()
+                .then(|| (shared.wanted_tickets(), shared.tickets.clone()))
         };
-        if let Some(wanted) = wanted {
-            let resolved = tickets::resolve(&wanted, tickets, &self.0.cancellation);
-            for (reference, ticket) in &resolved {
+        if let Some((wanted, shown)) = wanted {
+            let round = tickets::resolve(&wanted, &shown, tickets, &self.0.cancellation);
+            for (reference, ticket) in &round.resolved {
                 self.store(|store| store.save_ticket(reference, ticket));
             }
-            let unavailable = tickets.unavailable_for(&wanted);
+            for reference in &round.gone {
+                self.store(|store| store.forget_ticket(reference));
+            }
+            // Only tickets no card shows yet are missing for want of Linear.
+            let unavailable = tickets.unavailable_for(
+                &wanted
+                    .into_iter()
+                    .filter(|reference| !shown.contains_key(&reference.id))
+                    .collect(),
+            );
             let mut shared = self.shared();
-            let changed = !resolved.is_empty() || shared.linear_unavailable != unavailable;
-            shared.tickets.extend(resolved);
+            let changed = round
+                .resolved
+                .iter()
+                .any(|(reference, ticket)| shared.tickets.get(reference) != Some(ticket))
+                || !round.gone.is_empty()
+                || shared.linear_unavailable != unavailable;
+            for reference in &round.gone {
+                shared.tickets.remove(reference);
+            }
+            shared.tickets.extend(round.resolved);
             shared.linear_unavailable = unavailable;
             drop(shared);
             if changed {
