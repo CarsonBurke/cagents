@@ -4,8 +4,10 @@
 //! saw it, including history a forked or resumed thread replays before its
 //! first turn. Codex's own harness context travels among the user messages
 //! and is left out. Tool calls come from the richer `item_completed` turn
-//! items, which carry exit codes and edited paths; rollouts written before
-//! Codex recorded turn items fall back to the raw calls.
+//! items, which carry exit codes and edited paths; turns written before Codex
+//! recorded turn items fall back to the raw calls. One rollout can hold both:
+//! a newer Codex appends to a conversation an older one began, and a forked
+//! thread replays its parent's turns with their raw calls alone.
 
 use std::{
     io::{BufRead, BufReader, Read},
@@ -57,10 +59,10 @@ pub(crate) fn read(path: &Path) -> Result<Vec<Item>, String> {
 /// conversation.
 pub(crate) fn parse(reader: impl Read) -> Vec<Item> {
     let mut items = Vec::new();
-    // Raw tool calls, kept with their place in `items` until the rollout
-    // proves to have no turn items to supersede them.
+    // Raw tool calls of turns without turn items, each with its place in
+    // `items`, and those of the current turn until it proves to have none.
     let mut raw_tools = Vec::new();
-    let mut turn_items = false;
+    let mut turn = RawTurn::default();
     for (line, text) in BufReader::new(reader).split(b'\n').enumerate() {
         let Ok(text) = text else { break };
         let Ok(record) = serde_json::from_slice::<Value>(&text) else {
@@ -98,7 +100,10 @@ pub(crate) fn parse(reader: impl Read) -> Vec<Item> {
                     items.push(item(id, entry));
                 }
             }
-            (Some("response_item"), Some("function_call" | "custom_tool_call")) if !turn_items => {
+            (Some("event_msg"), Some("task_started")) => turn.finish(&mut raw_tools),
+            (Some("response_item"), Some("function_call" | "custom_tool_call"))
+                if !turn.superseded =>
+            {
                 let call = (
                     Role::Assistant,
                     ItemContent::Tool {
@@ -108,10 +113,12 @@ pub(crate) fn parse(reader: impl Read) -> Vec<Item> {
                         status: ToolStatus::Succeeded,
                     },
                 );
-                raw_tools.push((items.len(), item(line_id(), call)));
+                turn.calls.push((items.len(), item(line_id(), call)));
             }
             (Some("event_msg"), Some("item_completed")) => {
-                turn_items = true;
+                if records_tool_work(&payload["item"]) {
+                    turn.supersede();
+                }
                 if let Some(entry) = turn_item(&payload["item"]) {
                     let id = payload["item"]["id"]
                         .as_str()
@@ -154,7 +161,8 @@ pub(crate) fn parse(reader: impl Read) -> Vec<Item> {
             _ => {}
         }
     }
-    if !turn_items && !raw_tools.is_empty() {
+    turn.finish(&mut raw_tools);
+    if !raw_tools.is_empty() {
         let mut merged = Vec::with_capacity(items.len() + raw_tools.len());
         let mut raw_tools = raw_tools.into_iter().peekable();
         for (index, item) in items.into_iter().enumerate() {
@@ -167,6 +175,33 @@ pub(crate) fn parse(reader: impl Read) -> Vec<Item> {
         items = merged;
     }
     items
+}
+
+/// One turn's raw tool calls. Codex writes a raw call for every tool the
+/// model invokes, and a writer that records tool turn items also records the
+/// same work as richer `item_completed` items, though not one for one: a
+/// single `exec` call can run several commands. A turn with any tool turn
+/// item is therefore read from its turn items alone, and a turn without one
+/// from its raw calls: one written by an older Codex, replayed from a parent
+/// thread, written by a Codex that records only message items, or
+/// interrupted before its first tool item completed. Turns begin at
+/// `task_started`; an interrupted turn ends at the next one.
+#[derive(Default)]
+struct RawTurn {
+    calls: Vec<(usize, Item)>,
+    superseded: bool,
+}
+
+impl RawTurn {
+    fn supersede(&mut self) {
+        self.superseded = true;
+        self.calls.clear();
+    }
+
+    /// Ends this turn, keeping its raw calls unless turn items superseded them.
+    fn finish(&mut self, kept: &mut Vec<(usize, Item)>) {
+        kept.append(&mut std::mem::take(self).calls);
+    }
 }
 
 /// A person's or the agent's message. Developer instructions and the
@@ -225,6 +260,18 @@ fn agent_message(payload: &Value) -> Option<(Role, ItemContent)> {
             body: body.trim().to_owned(),
         },
     ))
+}
+
+/// Whether a turn item records tool work, which supersedes its turn's raw
+/// calls. Messages, reasoning and compaction say nothing about the tools the
+/// turn ran, and some Codex versions record only those.
+fn records_tool_work(item: &Value) -> bool {
+    item["type"].as_str().is_some_and(|kind| {
+        !matches!(
+            kind,
+            "UserMessage" | "AgentMessage" | "Reasoning" | "ContextCompaction"
+        )
+    })
 }
 
 fn turn_item(item: &Value) -> Option<(Role, ItemContent)> {
@@ -516,6 +563,84 @@ mod tests {
         ] {
             assert!(!serialized.contains(hidden), "{hidden} leaked");
         }
+    }
+
+    #[test]
+    fn tool_turn_items_supersede_raw_calls_only_in_their_own_turn() {
+        let started = json!({"type":"event_msg","payload":{"type":"task_started"}});
+        let raw = |name: &str| json!({"type":"response_item","payload":{"type":"custom_tool_call","name":name,"input":name}});
+        let rollout = lines(&[
+            // A forked thread's replayed parent turn, interrupted mid-call.
+            started.clone(),
+            message("user", "Replayed request"),
+            raw("replayed"),
+            raw("replayed again"),
+            json!({"type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted"}}),
+            // A turn an older Codex wrote: raw calls alone.
+            started.clone(),
+            message("user", "Run the old checks"),
+            raw("older"),
+            message("assistant", "Old checks pass."),
+            // A newer Codex resumed the same rollout and records turn items;
+            // its message items come before the tool items that supersede.
+            started.clone(),
+            message("user", "Run the new checks"),
+            completed(
+                json!({"type":"UserMessage","id":"u1","content":[{"type":"Text","text":"Run the new checks"}]}),
+            ),
+            raw("exec"),
+            completed(
+                json!({"type":"CommandExecution","id":"c1","command":"cargo test","status":"completed","exit_code":0}),
+            ),
+            completed(
+                json!({"type":"CommandExecution","id":"c2","command":"cargo clippy","status":"completed","exit_code":0}),
+            ),
+            raw("exec"),
+            message("assistant", "New checks pass."),
+            // A turn from a Codex that records only message items keeps its
+            // raw calls, as does one interrupted before a tool item completed.
+            started,
+            message("user", "Tidy up"),
+            completed(
+                json!({"type":"UserMessage","id":"u2","content":[{"type":"Text","text":"Tidy up"}]}),
+            ),
+            completed(json!({"type":"Reasoning","id":"r1"})),
+            raw("plan"),
+            completed(
+                json!({"type":"AgentMessage","id":"a2","content":[{"type":"Text","text":"Tidied."}]}),
+            ),
+            message("assistant", "Tidied."),
+        ]);
+        let items = parse(rollout.as_bytes());
+        let summary: Vec<String> = items
+            .iter()
+            .map(|item| match &item.content {
+                ItemContent::Text { text, .. } => text.clone(),
+                ItemContent::Tool { name, .. } => format!("tool {name}"),
+                ItemContent::Command { command, .. } => format!("command {command}"),
+                ItemContent::Delivery { summary, .. } => summary.clone(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                "Replayed request",
+                "tool replayed",
+                "tool replayed again",
+                "Turn interrupted",
+                "Run the old checks",
+                "tool older",
+                "Old checks pass.",
+                "Run the new checks",
+                "command cargo test",
+                "command cargo clippy",
+                "New checks pass.",
+                "Tidy up",
+                "tool plan",
+                "Tidied.",
+            ]
+        );
     }
 
     #[test]
