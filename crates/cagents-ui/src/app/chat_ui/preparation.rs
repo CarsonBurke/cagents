@@ -2240,7 +2240,7 @@ pub(super) fn local_reply_for_test(runtime: &mut Runtime) -> (u64, Ready) {
 #[cfg(test)]
 pub(super) fn drain_fixture(runtime: &mut Runtime) {
     let permits = Arc::new(tokio::sync::Semaphore::new(1));
-    for _ in 0..512 {
+    for _ in 0..4096 {
         let Some((id, run, shared)) = runtime
             .preparation
             .entries

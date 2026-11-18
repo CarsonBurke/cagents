@@ -227,7 +227,7 @@ paths, entity IDs or event payloads:
 | 2 | Child preparation | `prepare_child_cache`, including empty selection |
 | 3 | Parse | Markdown source advance and content append/restart |
 | 4 | Highlight | Fence scan and syntax-block update |
-| 5 | Turn build | Actual `turn_rows` construction, including retained cache misses |
+| 5 | Turn build | Actual `turn_part_view` construction of one row of an exchange, including retained cache misses |
 | 6 | Shape | Cold selectable-prose `ParagraphBuffer::with_spans` |
 | 7 | Retained clone | Cached layout `Node::clone` on a retained layout hit |
 
