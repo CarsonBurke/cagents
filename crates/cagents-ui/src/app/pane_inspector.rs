@@ -130,8 +130,10 @@ pub(super) struct SyncInputs {
 #[derive(Debug)]
 struct Synced {
     /// The durable workspace the cards came from. Copy-on-write gives every
-    /// changed workspace a new address, and the weak reference keeps the old
-    /// one from being reused.
+    /// changed workspace a new address: while this weak reference lives,
+    /// `Arc::make_mut` moves the value rather than changing it in place, and
+    /// the old allocation cannot be reused. A change made through
+    /// `Arc::get_mut` would fail while it lives instead.
     cards: std::sync::Weak<WorkspaceState>,
     inputs: SyncInputs,
 }
@@ -1058,7 +1060,7 @@ mod tests {
             let mut full = PaneInspectors::restore(open, legacy);
             let now = Instant::now();
             for step in 0..200 {
-                match next(10) {
+                match next(12) {
                     0 => {
                         let card = CardId::new();
                         let source = window.cards[next(window.cards.len())].0;
@@ -1117,6 +1119,30 @@ mod tests {
                         let at = now + Duration::from_millis(step) + DIALOG_TRANSITION_DURATION;
                         incremental.advance(at);
                         full.advance(at);
+                    }
+                    // A pane leaves the strip, as a scope switch takes it
+                    // off screen, or comes back. Outside the strip it has no
+                    // width, so it is never narrow: only `constrained`
+                    // brings a narrowed pane that left back into the sync.
+                    9 => {
+                        let card = window.cards[next(window.cards.len())].0;
+                        if let Some(index) = window.strip.iter().position(|id| *id == card) {
+                            window.strip.remove(index);
+                            window.narrow.remove(&card);
+                            window.on_screen.remove(&card);
+                            if window.focused == Some(card) {
+                                window.focused = window.strip.first().copied();
+                            }
+                        } else {
+                            window.strip.push(card);
+                        }
+                        window.geometry += 1;
+                    }
+                    // A card changes kind under the same card list.
+                    10 => {
+                        let index = next(window.cards.len());
+                        window.cards[index].1 = kinds[next(4)];
+                        window.cards_changed();
                     }
                     _ => window.cards_changed(),
                 }
