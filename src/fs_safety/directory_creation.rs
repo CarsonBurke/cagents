@@ -489,17 +489,19 @@ impl DirectoryCreation {
 #[must_use = "creation failures may retain live staging authority"]
 pub struct DirectoryCreateError {
     cause: ResolveError,
-    recovery: Option<DirectoryPreparation>,
+    /// Boxed: a failure is rare and the preparation is large, while every
+    /// `Result` that may carry this error pays for its size.
+    recovery: Option<Box<DirectoryPreparation>>,
 }
 impl DirectoryCreateError {
     pub fn cause(&self) -> &ResolveError {
         &self.cause
     }
     pub fn recovery(&self) -> Option<&DirectoryPreparation> {
-        self.recovery.as_ref()
+        self.recovery.as_deref()
     }
     pub fn take_recovery(&mut self) -> Option<DirectoryPreparation> {
-        self.recovery.take()
+        self.recovery.take().map(|recovery| *recovery)
     }
 }
 impl std::fmt::Display for DirectoryCreateError {
@@ -708,7 +710,7 @@ impl DirectoryPreparation {
                 self.cleanup_error = Some(error.to_string());
                 DirectoryCreateError {
                     cause,
-                    recovery: Some(self),
+                    recovery: Some(Box::new(self)),
                 }
             }
         }

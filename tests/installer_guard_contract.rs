@@ -117,15 +117,19 @@ mod coordinator_fixture {
     // product cancellation without substituting fixture deadline cleanup.
     fn owner_event(owner: &mut UnixStream) -> io::Result<u8> {
         let mut byte = [0];
-        loop {
-            match owner.read(&mut byte) {
-                Ok(0) => return Ok(0),
-                Ok(1) if byte[0] == b'T' => return Ok(b'T'),
-                Ok(_) => return Err(io::Error::other("unexpected owner control data")),
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(b'.'),
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(b'.'),
-                Err(e) => return Err(e),
+        match owner.read(&mut byte) {
+            Ok(0) => Ok(0),
+            Ok(1) if byte[0] == b'T' => Ok(b'T'),
+            Ok(_) => Err(io::Error::other("unexpected owner control data")),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                Ok(b'.')
             }
+            Err(e) => Err(e),
         }
     }
 

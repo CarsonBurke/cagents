@@ -110,7 +110,7 @@ pub enum UpdateError {
     #[error("another update is already running")]
     Busy,
     #[error(transparent)]
-    TargetRecoveryRequired(#[from] recovery::TargetRecoveryRequired),
+    TargetRecoveryRequired(Box<recovery::TargetRecoveryRequired>),
     #[error("Update cancelled")]
     Cancelled,
     /// The review was closed, or expired, while something it named had to
@@ -137,6 +137,12 @@ pub enum UpdateError {
         operation: Box<UpdateError>,
         cleanup: io::Error,
     },
+}
+
+impl From<recovery::TargetRecoveryRequired> for UpdateError {
+    fn from(required: recovery::TargetRecoveryRequired) -> Self {
+        Self::TargetRecoveryRequired(Box::new(required))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -2334,7 +2340,7 @@ fn finish_handoff(
             return report_recovery_failure(
                 state,
                 job,
-                UpdateError::TargetRecoveryRequired(required),
+                UpdateError::TargetRecoveryRequired(Box::new(required)),
             );
         }
     }
