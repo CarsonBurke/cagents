@@ -19,6 +19,7 @@ import stat
 import subprocess
 import sys
 import time
+import tomllib
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -31,6 +32,11 @@ LANES = {
     "shared-ui": ("cagents", ROOT / "Cargo.toml", ("--features", "ui")),
     "ui": ("cagents-ui", ROOT / "crates/cagents-ui/Cargo.toml", ()),
 }
+# The mise lane each is checked in: built only under cfg(test), an item only
+# tests use looks used, so once the tests pass the lane's library, binaries and
+# examples are checked as main's build check does. mise.toml's [vars] define
+# the lanes.
+CHECKED_AS = {"cli": "cli", "host": "host", "shared-ui": "ui", "ui": "ui"}
 SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
 # The first argument Cargo gives this script when it runs it as the harness's
 # runner, followed by the lane, the harness and the arguments after `--`.
@@ -165,7 +171,12 @@ def main():
         command += ["--prefix", prefix]
     if args.test_threads is not None:
         command += ["--test-threads", str(args.test_threads)]
-    sys.exit(supervise(command))
+    status = supervise(command)
+    if status:
+        sys.exit(status)
+    lane = tomllib.loads((ROOT / "mise.toml").read_text())["vars"][CHECKED_AS[args.lane]].split()
+    sys.stdout.flush()
+    os.execv(ROOT / "scripts/cargo-lane", [str(ROOT / "scripts/cargo-lane"), "check", *lane, "--lib", "--bins", "--examples"])
 
 
 def terminal():

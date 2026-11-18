@@ -171,6 +171,13 @@ SCRIPT
 # the script, so what a connection started is gone once it closes.
 remote_lifetime=$(cat <<'LIFETIME'
 watcher=
+# Whether a process runs: one that exited is gone, though until its parent
+# reaps it, `kill -0` still finds it.
+running() {
+    case $(sed 's/.*) //' "/proc/$1/stat" 2>/dev/null) in
+        '' | Z* | X*) return 1 ;;
+    esac
+}
 end_with_connection() {
     local main=$1 connection=$$
     while [ "$connection" -gt 1 ]; do
@@ -186,7 +193,7 @@ end_with_connection() {
         # for whoever adopts the orphans here.
         nap=
         trap '[ -z "$nap" ] || kill "$nap" 2>/dev/null; wait; exit 0' TERM
-        while kill -0 "$connection" 2>/dev/null && kill -0 "$main" 2>/dev/null; do
+        while running "$connection" && kill -0 "$main" 2>/dev/null; do
             sleep 2 &
             nap=$!
             wait "$nap" || :

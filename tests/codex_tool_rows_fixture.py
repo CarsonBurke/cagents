@@ -175,6 +175,25 @@ class CodexToolRowsFixture(unittest.TestCase):
             self.assertTrue(all(step["status"] == "completed" for step in done))
             self.assertEqual(replies[-1]["method"], "turn/completed")
 
+    def test_unnamed_child_is_named_only_by_its_own_thread_read(self):
+        with tempfile.TemporaryDirectory(prefix="codex-unnamed-child-") as directory:
+            home = Path(directory)
+            (home / "fixture-unnamed-child").touch()
+            scenario = PEER["Scenario"]()
+            replies = scenario.request({"id": 1, "method": "turn/start", "params": {
+                "threadId": scenario.thread}}, str(home))
+            states = [reply["params"]["item"]["agentsStates"][scenario.child]
+                      for reply in replies
+                      if reply.get("params", {}).get("item", {}).get("type") == "collabAgentToolCall"]
+            self.assertTrue(states)
+            self.assertTrue(all(state["agentNickname"] is None for state in states))
+            listed = scenario.request({"id": 2, "method": "thread/list"}, str(home))
+            self.assertEqual([thread["agentNickname"] for thread in listed[0]["result"]["data"]],
+                             [None])
+            read = scenario.request({"id": 3, "method": "thread/resume", "params": {
+                "threadId": scenario.child}}, str(home))
+            self.assertEqual(read[0]["result"]["thread"]["agentNickname"], "Quinn")
+
     def test_interrupt_private_web_scene_fences_delayed_results(self):
         with tempfile.TemporaryDirectory(prefix="codex-web-rows-") as directory:
             home = Path(directory)
