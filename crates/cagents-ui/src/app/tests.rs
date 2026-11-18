@@ -7798,6 +7798,10 @@ mod repository_clone_lsp_ownership {
     include!("repository_clone_lsp_ownership_tests.rs");
 }
 
+mod navigation_saves {
+    include!("navigation_save_tests.rs");
+}
+
 #[test]
 fn pane_title_rename_task_persists_the_override_for_window_reload() {
     let directory = tempfile::tempdir().unwrap();

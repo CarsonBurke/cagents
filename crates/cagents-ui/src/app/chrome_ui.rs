@@ -2756,19 +2756,20 @@ impl Cagents {
                     return focus;
                 }
                 self.synchronize_sidebar_selection();
-                if let Some(row) = self.reveal_card_row(id) {
-                    self.persist();
-                    let reveal = sidebar::focus_and_reveal(sidebar::selection_row_focus_id(row))
-                        .map(cosmic::Action::App);
-                    Task::batch([focus, reveal])
-                } else {
-                    focus
-                }
+                // Unfolding the sidebar to the row changes only the window's
+                // view, which lives in its settings; the focus move saves
+                // the workspace with the navigation burst.
+                let reveal = self.reveal_card_row(id).map_or_else(Task::none, |row| {
+                    sidebar::focus_and_reveal(sidebar::selection_row_focus_id(row))
+                        .map(cosmic::Action::App)
+                });
+                Task::batch([focus, reveal, self.save_settings_task(false)])
             }
+            // Whether the projects sidebar is folded belongs to the window's
+            // view, saved with its settings, not to the workspace.
             Action::ToggleProjects => {
                 self.chrome_ui.projects_collapsed = !self.chrome_ui.projects_collapsed;
-                self.persist();
-                Task::none()
+                self.save_settings_task(false)
             }
             Action::AttentionPage(page) => {
                 if !self.attention_is_open() || !self.attention_backend_current() {

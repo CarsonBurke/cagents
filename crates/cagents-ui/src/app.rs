@@ -1731,8 +1731,8 @@ enum DurableChange {
     /// Nothing: a change of focus alone is saved within
     /// [`NAVIGATION_SAVE_DELAY`].
     None,
-    /// The channel or worktree this window shows, saved within
-    /// [`NAVIGATION_SAVE_DELAY`] like focus.
+    /// The channel or worktree this window shows, or a utility pane shown in
+    /// it, saved within [`NAVIGATION_SAVE_DELAY`] like focus.
     Navigation,
     /// Anything else, saved now.
     Content,
@@ -7712,13 +7712,15 @@ impl Cagents {
             && view.selected_number != number
         {
             view.selected_number = number;
-            self.persist();
+            // Choosing a pull request is browsing, saved with the
+            // navigation burst like moving between panes.
+            tasks.push(self.save_navigation_soon());
         }
         for url in links {
             tasks.push(self.open_clicked_link(url));
         }
         if let Some(path) = checkout_open {
-            tasks.push(self.select_worktree(path, false));
+            tasks.push(self.navigate_to_worktree(path, false));
         }
         if let Some((project, target)) = checkout {
             tasks.push(self.prepare_pr_checkout(card, project, target));
@@ -8784,12 +8786,14 @@ impl Cagents {
         let channel = channels_holding(&self.durable.channels, id)
             .next()
             .map(|channel| channel.id);
+        // Going to a pane that is already open changes only where this
+        // window is.
         let scope = if let Some(channel) = channel {
-            self.select_channel(channel)
+            self.navigate_to_channel(channel)
         } else {
             let directory = self.unchanneled_card_worktree(&card).map(Path::to_path_buf);
             directory.map_or_else(Task::none, |directory| {
-                self.select_worktree(directory, false)
+                self.navigate_to_worktree(directory, false)
             })
         };
         let focus = self.focus_workspace_card(id);
@@ -14912,8 +14916,9 @@ impl Cagents {
         self.set_presence(id, Exposure::Visible, Residency::Hot);
         self.register_channel_card(id);
         self.cards.insert(id, runtime);
-        self.persist();
-        self.apply_viewport(update, true, DurableChange::None)
+        // No shared view holds a utility pane, so showing one is saved like
+        // any other move of where this window is.
+        self.apply_viewport(update, true, DurableChange::Navigation)
     }
 
     /// Moves an open utility pane into the strip on screen, beside the
@@ -14957,8 +14962,9 @@ impl Cagents {
                 return Task::none();
             }
         };
-        self.persist();
-        self.apply_viewport(update, true, DurableChange::Content)
+        // Leaving a channel takes nothing out of its view, which never held
+        // the pane: this moves only where the window shows it.
+        self.apply_viewport(update, true, DurableChange::Navigation)
     }
 
     fn prune_pane_title_overrides(&mut self) {
