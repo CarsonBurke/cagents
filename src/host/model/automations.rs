@@ -1285,17 +1285,19 @@ fn require_closed_reuse(tx: &Transaction<'_>, automation: &Automation) -> Result
     let Some(agent) = automation.reuse_agent else {
         return Ok(());
     };
-    let closed: bool = tx
-        .query_row(
-            "SELECT closed FROM agents WHERE id=?1",
-            [agent.to_string()],
-            |row| row.get(0),
-        )
-        .map_err(|error| error.to_string())?;
-    if !closed {
+    if !agent_closed(tx, agent)? {
         return Err("Close the automation's idle provider before changing its launch settings or removing it".into());
     }
     Ok(())
+}
+
+fn agent_closed(tx: &Transaction<'_>, agent: crate::model::AgentId) -> Result<bool, String> {
+    tx.query_row(
+        "SELECT closed FROM agents WHERE id=?1",
+        [agent.to_string()],
+        |row| row.get(0),
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn require_revision(automation: &Automation, expected: u64) -> Result<(), String> {
@@ -1320,24 +1322,25 @@ pub(super) fn require_project(tx: &Transaction<'_>, definition: &Definition) -> 
     if let Some(placement) = &definition.agent.target.placement {
         super::execution::require_placement(tx, placement, &definition.agent.target.repository)?;
     }
-    if let Some(channel) = definition.agent.target.channel() {
-        let owned: bool = tx
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM channels WHERE id=?1 AND repository=?2)",
-                params![
-                    channel.to_string(),
-                    super::repository_key(&definition.agent.target.repository)?
-                ],
-                |row| row.get(0),
-            )
-            .map_err(|error| error.to_string())?;
-        if !owned {
-            return Err(
-                "The automation's selected channel no longer belongs to its project".into(),
-            );
-        }
+    if let Some(channel) = definition.agent.target.channel()
+        && !channel_in_project(tx, channel, &definition.agent.target.repository)?
+    {
+        return Err("The automation's selected channel no longer belongs to its project".into());
     }
     Ok(())
+}
+
+fn channel_in_project(
+    tx: &Transaction<'_>,
+    channel: crate::model::ChannelId,
+    repository: &std::path::Path,
+) -> Result<bool, String> {
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM channels WHERE id=?1 AND repository=?2)",
+        params![channel.to_string(), super::repository_key(repository)?],
+        |row| row.get(0),
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn encode(value: &impl Serialize) -> Result<String, String> {
@@ -1645,6 +1648,21 @@ fn accept_firing(
         agent_execution::{Destination, Origin, Submit},
         automations::SessionMode,
     };
+    // Someone may close the automation's agent between firings, and closing
+    // a channel's last conversation removes the channel. A closed agent never
+    // runs again and a removed channel cannot hold one, so this firing starts
+    // the automation's next agent, in a new channel when needed, as its first
+    // firing did. A removed channel the definition names itself still fails.
+    if let Some(agent) = automation.reuse_agent
+        && agent_closed(tx, agent)?
+    {
+        automation.reuse_agent = None;
+    }
+    if let Some(channel) = automation.channel
+        && !channel_in_project(tx, channel, &definition.agent.target.repository)?
+    {
+        automation.channel = None;
+    }
     let destination = if definition.session_mode == SessionMode::Reuse
         && let Some(agent) = automation.reuse_agent
     {
@@ -3515,6 +3533,80 @@ mod tests {
                 .active_firing
                 .is_none()
         );
+    }
+
+    #[test]
+    fn closing_an_idle_reused_agent_lets_the_next_firing_start_a_new_one() {
+        let (mut registry, _directory, definition) = fixture();
+        let (automation, firing, agent) = completed_reusable_run(&mut registry, definition);
+        registry
+            .finish_automation_release(firing.id, &agent, 230)
+            .unwrap();
+        registry.close_agent(&agent.origin, agent.id).unwrap();
+        let claim = registry
+            .claim_automation(
+                automation.id,
+                1,
+                None,
+                crate::automations::Trigger::Manual {
+                    request: Uuid::new_v4(),
+                },
+                None,
+                true,
+                300,
+            )
+            .unwrap();
+        assert_eq!(claim.firing.diagnostic, None);
+        let accepted = claim.accepted.expect("the next firing starts a new agent");
+        assert_ne!(accepted.agent.id, agent.id);
+        assert_eq!(accepted.agent.channel(), agent.channel());
+        assert_eq!(
+            registry.automation(automation.id).unwrap().reuse_agent,
+            Some(accepted.agent.id)
+        );
+    }
+
+    #[test]
+    fn removing_the_automations_channel_lets_the_next_firing_open_a_new_one() {
+        for mode in [SessionMode::Reuse, SessionMode::Fresh] {
+            let (mut registry, _directory, mut definition) = fixture();
+            definition.session_mode = mode;
+            let (automation, firing, agent) = completed_reusable_run(&mut registry, definition);
+            let removed = agent.channel().unwrap();
+            // Closing the channel's last conversation closes the agent and
+            // then removes the channel.
+            let closed = registry.close_agent(&agent.origin, agent.id).unwrap();
+            registry
+                .finish_automation_release(firing.id, &closed, 230)
+                .unwrap();
+            registry
+                .apply(&ModelEdit::DeleteChannel { id: removed })
+                .unwrap();
+            let claim = registry
+                .claim_automation(
+                    automation.id,
+                    1,
+                    None,
+                    crate::automations::Trigger::Manual {
+                        request: Uuid::new_v4(),
+                    },
+                    None,
+                    true,
+                    300,
+                )
+                .unwrap();
+            assert_eq!(claim.firing.diagnostic, None, "{mode:?}");
+            let channel = claim.accepted.unwrap().agent.channel().unwrap();
+            assert_ne!(channel, removed);
+            assert_eq!(
+                registry.automation(automation.id).unwrap().channel,
+                Some(channel)
+            );
+            assert_eq!(
+                registry.model().unwrap().channel(channel).unwrap().title,
+                automation.definition.name
+            );
+        }
     }
 
     #[test]

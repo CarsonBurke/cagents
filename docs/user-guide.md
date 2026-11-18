@@ -671,7 +671,10 @@ are skipped, and the finished prompt is never resent. History shows “session
 release pending” during cleanup. Explicitly pausing the schedule stays effective
 after cleanup. Permission requests and uncertain ownership still require attention.
 If you take over the conversation, automatic cleanup and reuse
-stop until ownership is resolved. Removing the chosen account or replacing the
+stop until ownership is resolved. Closing the automation's conversation does not
+stop the schedule: the next occurrence starts a new one. If that removed the
+channel the automation opened, the new conversation opens another channel named
+after the automation. Removing the chosen account or replacing the
 target directory cannot silently redirect a future run to another account or
 directory. Closing a project pauses its schedules.
 
