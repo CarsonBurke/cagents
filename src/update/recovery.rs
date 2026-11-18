@@ -1236,6 +1236,8 @@ enum RetirementTrigger {
     ColdStart,
 }
 
+// Built once per retirement attempt and destructured at once, so boxing would only add allocations.
+#[allow(clippy::large_enum_variant)]
 enum RetirementWork {
     NotRequired,
     AlreadyCompleted,
@@ -2000,7 +2002,7 @@ mod tests {
         let mut no_proof = original.clone();
         no_proof.proof = None;
         let mut changed_pair = original.clone();
-        changed_pair.terminal = Some(terminal().session);
+        changed_pair.terminal = Some(Box::new(terminal().session));
         let mut changed_continuity = original.clone();
         changed_continuity.native_continuity = crate::chat::NativeContinuity::ReconnectOnly;
         for current in [no_proof, changed_pair, changed_continuity] {

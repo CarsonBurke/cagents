@@ -466,7 +466,7 @@ struct PendingReopen {
 #[derive(Debug)]
 pub(super) enum Reopen {
     Conversation {
-        entry: crate::persistence::SavedConversation,
+        entry: Box<crate::persistence::SavedConversation>,
         prepared: bool,
         generation: u64,
         replace: Option<CardId>,
@@ -1122,7 +1122,7 @@ impl Cagents {
                     replace,
                 } => {
                     tasks.push(self.finish_deferred_conversation(
-                        entry, prepared, generation, replace, same_home,
+                        *entry, prepared, generation, replace, same_home,
                     ));
                 }
                 Reopen::Pane(card) if same_home => tasks.push(self.reopen_closed_pane(card)),
@@ -2888,7 +2888,7 @@ pub(in crate::app) mod tests {
         };
         let mut chat = chat_session();
         chat.launch.provider = crate::agent::Provider::Codex;
-        chat.terminal = Some(source.clone());
+        chat.terminal = Some(Box::new(source.clone()));
         let cards = vec![
             CardKind::Chat(chat.clone()),
             CardKind::Terminal(source.clone()),
@@ -4352,7 +4352,7 @@ pub(in crate::app) mod close_tests {
     fn paired_source() -> crate::chat::Session {
         let mut source = captured_source();
         let host = proof();
-        source.terminal = Some(crate::model::TerminalSession {
+        source.terminal = Some(Box::new(crate::model::TerminalSession {
             id: source.id,
             launch: source.launch.recipe.clone(),
             owned_codex_listener: None,
@@ -4365,7 +4365,7 @@ pub(in crate::app) mod close_tests {
                 boot_id: host.boot_id,
                 host_incarnation: host.host_incarnation,
             },
-        });
+        }));
         source
     }
 

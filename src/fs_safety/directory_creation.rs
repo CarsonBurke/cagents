@@ -456,7 +456,7 @@ impl OwnedPrivateSibling {
 #[derive(Debug)]
 pub enum DirectoryCreation {
     Existing(Root),
-    Published(DirectoryPublication),
+    Published(Box<DirectoryPublication>),
     Unverified { directory: Root, reason: String },
 }
 impl DirectoryCreation {
@@ -1032,7 +1032,7 @@ fn create_with_preparation_hook(
     };
     after_capture(&parent, &name);
     match stage.publish_to(parent, name.clone(), after_publish) {
-        Ok(publication) => Ok(DirectoryCreation::Published(publication)),
+        Ok(publication) => Ok(DirectoryCreation::Published(Box::new(publication))),
         Err((failure, true)) if failure.recovery.is_none() => resolve_directory(root, relative)
             .map(DirectoryCreation::Existing)
             .map_err(Into::into),
@@ -1890,7 +1890,7 @@ mod tests {
 
     fn published(result: DirectoryCreation) -> DirectoryPublication {
         match result {
-            DirectoryCreation::Published(p) => p,
+            DirectoryCreation::Published(p) => *p,
             other => panic!("expected published receipt, got {other:?}"),
         }
     }

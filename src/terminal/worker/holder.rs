@@ -146,7 +146,7 @@ enum Report {
     Detached,
     Inspected {
         record: Record,
-        recovery: Recovery,
+        recovery: Box<Recovery>,
         screen_lost: bool,
     },
     /// Carries the PTY master, then a pidfd for the root, to a successor.
@@ -1728,7 +1728,7 @@ fn hand_over(
                 successor,
                 &Report::Inspected {
                     record: record.clone(),
-                    recovery,
+                    recovery: Box::new(recovery),
                     screen_lost,
                 },
                 &[],
@@ -1852,7 +1852,7 @@ pub(crate) fn inspect(
         return Err("holder discovery evidence changed".into());
     }
     recovery.validate(&record.boot, record.terminal)?;
-    Ok((recovery, screen_lost))
+    Ok((*recovery, screen_lost))
 }
 
 fn authorize_successor(pid: i32, proof: &crate::model::HostSessionProof) -> io::Result<()> {

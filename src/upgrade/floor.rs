@@ -633,7 +633,7 @@ mod tests {
         let mut later_chat = chat();
         later_chat.id = TerminalId::new();
         later_chat.proof = Some(later.clone());
-        later_chat.terminal = Some(crate::model::TerminalSession {
+        later_chat.terminal = Some(Box::new(crate::model::TerminalSession {
             id: paired,
             launch: later_chat.launch.recipe.clone(),
             owned_codex_listener: None,
@@ -646,7 +646,7 @@ mod tests {
                 boot_id: later.boot_id.clone(),
                 host_incarnation: later.host_incarnation.clone(),
             },
-        });
+        }));
         let mut ledger = Ledger {
             records: vec![Record::new(source(), vec![original.clone()], vec![paired])],
         };

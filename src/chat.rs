@@ -634,8 +634,10 @@ pub struct Session {
     pub launch: Launch,
     pub proof: Option<crate::model::HostSessionProof>,
     /// Original terminal identity for an explicit return to the CLI view.
+    /// Boxed because it is rarely present and would otherwise more than double
+    /// every session, and every enum that carries one.
     #[serde(default)]
-    pub terminal: Option<crate::model::TerminalSession>,
+    pub terminal: Option<Box<crate::model::TerminalSession>>,
     /// Daemon-issued allocation evidence, independent of the reader's TMPDIR.
     #[serde(default)]
     pub owned_codex_listener: Option<OwnedCodexListener>,
@@ -3064,7 +3066,7 @@ mod retained_native_pair_tests {
                 session_id: confirmed.then(|| uuid::Uuid::new_v4().to_string()),
             },
             proof: Some(proof.clone()),
-            terminal: Some(TerminalSession {
+            terminal: Some(Box::new(TerminalSession {
                 id,
                 launch: recipe,
                 continuity: live(&proof),
@@ -3073,7 +3075,7 @@ mod retained_native_pair_tests {
                 owned_codex_listener: None,
                 recovery_origin: None,
                 predecessor: None,
-            }),
+            })),
             owned_codex_listener: None,
             native_continuity: NativeContinuity::RetainedClaudeActor { protocol: 2 },
         };

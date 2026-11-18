@@ -538,7 +538,7 @@ fn main() -> Result<()> {
             .unwrap()
             .revision,
         model_sequence: model.sequence,
-        before: before.clone(),
+        before: Box::new(before.clone()),
     };
     let terminal = if conditional {
         let ServerResponse::TerminalRemovalBasis(basis) =

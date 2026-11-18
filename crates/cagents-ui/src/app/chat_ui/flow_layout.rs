@@ -137,6 +137,8 @@ impl Drop for RawSource {
         }
     }
 }
+// Markdown is the common entry, so boxing its style would add an allocation to most entries.
+#[allow(clippy::large_enum_variant)]
 enum SourceData {
     Markdown {
         text: markdown::FlowText,

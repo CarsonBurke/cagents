@@ -2916,7 +2916,7 @@ mod tests {
             native_continuity: Default::default(),
             id: console.id,
             proof: console.continuity.live_proof(),
-            terminal: Some(console.clone()),
+            terminal: Some(Box::new(console.clone())),
             owned_codex_listener: None,
             launch: crate::chat::Launch {
                 provider: agent.spec.provider,
@@ -2962,7 +2962,7 @@ mod tests {
             native_continuity: Default::default(),
             id: console.id,
             proof: console.continuity.live_proof(),
-            terminal: Some(console.clone()),
+            terminal: Some(Box::new(console.clone())),
             owned_codex_listener: None,
             launch: crate::chat::Launch {
                 provider: agent.spec.provider,

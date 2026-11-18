@@ -63,7 +63,7 @@ pub enum Action {
         terminal: TerminalId,
         proof: HostSessionProof,
         operation: uuid::Uuid,
-        result: Result<crate::workspace_model::WorkspaceModel, SaveError>,
+        result: Result<Box<crate::workspace_model::WorkspaceModel>, SaveError>,
     },
     CopyDetails(CardId, TerminalId),
 }
@@ -417,7 +417,7 @@ impl Cagents {
                         terminal,
                         proof,
                         operation,
-                        result,
+                        result: result.map(Box::new),
                     })
                 })
             }
@@ -442,7 +442,7 @@ impl Cagents {
                         // Keep the operation until canonical completion can
                         // return focus from the retiring Retry save control.
                         let applied = self.apply_workspace_model_update(
-                            workspace_model_sync::ModelUpdate::Read(model),
+                            workspace_model_sync::ModelUpdate::Read(*model),
                         );
                         if let Some(entry) = self.terminal_save.entries.get_mut(&card)
                             && entry.retry == Some(operation)
@@ -649,7 +649,7 @@ mod tests {
         assert!(
             matches!(app.cards.get(&card), Some(CardRuntime::Terminal(handle)) if handle.terminal_id() == terminal)
         );
-        let result = Ok(saved_model(&app, card));
+        let result = Ok(Box::new(saved_model(&app, card)));
         drop(app.update(Message::TerminalSave(Action::Finished {
             card,
             terminal,
@@ -689,7 +689,7 @@ mod tests {
                 terminal,
                 proof,
                 operation,
-                result: Ok(model),
+                result: Ok(Box::new(model)),
             }));
             assert_eq!(
                 app.terminal_save.focus_after_save,
@@ -712,7 +712,7 @@ mod tests {
             terminal,
             proof,
             operation,
-            result: Ok(model),
+            result: Ok(Box::new(model)),
         }));
         assert!(app.notice_stands(NoticeKey::TerminalSave(card, terminal)));
         assert!(app.terminal_save.entries[&card].retry.is_none());
@@ -754,7 +754,7 @@ mod tests {
                 .is_some_and(|s| s.contains("Internal"))
         }));
         let (operation, proof) = retry(&mut app, card, terminal);
-        let result = Ok(saved_model(&app, card));
+        let result = Ok(Box::new(saved_model(&app, card)));
         drop(app.update(Message::TerminalSave(Action::Finished {
             card,
             terminal,
@@ -865,7 +865,7 @@ mod tests {
     fn stale_save_callbacks_cannot_clear_or_replace_a_newer_save_attempt() {
         let (mut app, card, terminal, _directory) = fixture();
         let (operation, proof) = retry(&mut app, card, terminal);
-        let result = Ok(saved_model(&app, card));
+        let result = Ok(Box::new(saved_model(&app, card)));
         let stale = Action::Finished {
             card,
             terminal,

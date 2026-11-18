@@ -209,7 +209,11 @@ pub(super) fn prepare(
             target.resume_hint = None;
             let mut aliases: Vec<_> = aliases
                 .into_iter()
-                .chain(sources.iter().filter_map(|s| s.terminal.clone()))
+                .chain(
+                    sources
+                        .iter()
+                        .filter_map(|s| s.terminal.as_deref().cloned()),
+                )
                 .chain(std::iter::once(original.clone()))
                 .filter(|alias| alias.continuity.live_proof().is_some())
                 .collect();

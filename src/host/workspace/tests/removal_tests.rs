@@ -72,7 +72,7 @@ fn prepared() -> (
                 scope,
                 view_revision: model.views[0].revision,
                 model_sequence: model.sequence,
-                before: pane.clone(),
+                before: Box::new(pane.clone()),
             }),
         },
     };

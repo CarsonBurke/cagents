@@ -1058,7 +1058,8 @@ fn reserve_quiet_allocation(
     let fence = reserve_unhosted_allocation(host, session, console)?;
     let terminals = session
         .terminal
-        .iter()
+        .as_deref()
+        .into_iter()
         .chain(console)
         .map(|terminal| terminal.id)
         .collect::<Vec<_>>();
@@ -1087,7 +1088,8 @@ fn reserve_unhosted_allocation(
 ) -> Result<capacity::Reservation, ()> {
     let mut terminals: Vec<TerminalId> = session
         .terminal
-        .iter()
+        .as_deref()
+        .into_iter()
         .chain(console)
         .map(|terminal| terminal.id)
         .collect();
@@ -2590,7 +2592,7 @@ fn start_with_execution(
             // Capture this worker's current daemon proof, not the raw launch
             // continuity retained before it was first attached.
             let current = state.descriptor(client, session.id)?.session;
-            session.terminal = Some(if restart_launch.is_some() {
+            session.terminal = Some(Box::new(if restart_launch.is_some() {
                 restored_terminal_source(
                     session
                         .terminal
@@ -2601,7 +2603,7 @@ fn start_with_execution(
                 .map_err(error)?
             } else {
                 current
-            });
+            }));
             Some(handle)
         } else {
             if state.terminals.contains_key(&session.id) && !recovering {
@@ -2888,7 +2890,7 @@ fn start_with_execution(
                 && let Some(terminal) = &delegated_source.terminal
             {
                 aliases.push(crate::agent_execution::HostedSession::Terminal(
-                    terminal.clone(),
+                    (**terminal).clone(),
                 ));
             }
             session = retained_actor::publish_authenticated_source_for_start(
@@ -3298,12 +3300,12 @@ fn codex_terminal_view(
                 .ok_or_else(|| unavailable("The thread closed while opening its CLI view."))?;
             // Retain local cleanup ownership even if the holder acknowledgment
             // is lost. Neither owner is rediscovered through a reusable ID.
-            record.session.terminal = Some(descriptor.session.clone());
+            record.session.terminal = Some(Box::new(descriptor.session.clone()));
             record.paired_terminal = Some(paired_terminal.clone());
             owners = paired_close::Owners::capture(&state, &state.chats[&chat_id])?;
         }
         let mut updated = before.clone();
-        updated.terminal = Some(descriptor.session.clone());
+        updated.terminal = Some(Box::new(descriptor.session.clone()));
         handle
             .update_native_source(updated, None, paired_terminal.holder_identity().cloned())
             .map_err(unavailable)?;
@@ -5096,7 +5098,7 @@ pub(super) fn restore_upgrade(
                     .descriptor(0, terminal.id)
                     .map_err(|error| error.message)?
                     .session;
-                *terminal = restored_terminal_source(terminal, &current)?;
+                **terminal = restored_terminal_source(terminal, &current)?;
             } else {
                 terminal.continuity = crate::model::TerminalContinuity::RelaunchAvailable {
                     recipe: session

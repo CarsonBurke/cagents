@@ -264,7 +264,7 @@ fn acknowledged_pair_and_proof_aliases_keep_the_original_durable_execution_owner
     let proof = fixture.source.proof.as_mut().unwrap();
     proof.host_incarnation = "successor-attachment".into();
     let proof = proof.clone();
-    fixture.source.terminal = Some(crate::model::TerminalSession {
+    fixture.source.terminal = Some(Box::new(crate::model::TerminalSession {
         id: fixture.source.id,
         launch: crate::model::LaunchRecipe {
             program: "/bin/cat".into(),
@@ -283,7 +283,7 @@ fn acknowledged_pair_and_proof_aliases_keep_the_original_durable_execution_owner
         owned_codex_listener: None,
         recovery_origin: None,
         predecessor: None,
-    });
+    }));
     fixture.issued_sources.push(fixture.source.clone());
     fixture
         .registry

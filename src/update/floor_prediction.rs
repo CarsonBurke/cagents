@@ -201,7 +201,7 @@ mod tests {
             boot_id: daemon.capability.proof.boot_id.clone(),
             host_incarnation: daemon.capability.proof.host_incarnation.clone(),
         };
-        chat.terminal = Some(terminal.session.clone());
+        chat.terminal = Some(Box::new(terminal.session.clone()));
         assert!(!inventory_needs_service_stop(
             &daemon,
             &[chat.clone()],

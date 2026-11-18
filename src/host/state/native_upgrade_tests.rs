@@ -261,7 +261,7 @@ fn committed_upgrade_shutdown_preserves_real_native_owner_even_if_final_save_fai
             let (mut holder, retained) =
                 crate::chat::native_holder::adopt(&record, &source, &current_proof).unwrap();
             let mut paired_source = retained.source.clone();
-            paired_source.terminal = Some(descriptor.session.clone());
+            paired_source.terminal = Some(Box::new(descriptor.session.clone()));
             holder
                 .update_source(
                     paired_source.clone(),
@@ -987,7 +987,7 @@ fn upgrade_restore_isolates_a_retained_conversation_whose_rollout_is_missing() {
         .terminal_recipe()
         .expect("a confirmed Codex conversation has a terminal recipe");
     paired.source.launch = paired.recipe.clone();
-    with_view.chats[0].source.terminal = Some(paired.source.clone());
+    with_view.chats[0].source.terminal = Some(Box::new(paired.source.clone()));
     with_view.terminals.push(paired.clone());
     store().save(&with_view).unwrap();
     let viewer = replace_daemon("viewer");

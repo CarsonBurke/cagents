@@ -1738,14 +1738,14 @@ fn close_only_discards_only_an_unowned_historical_terminal_view() {
     for actual_owner in ["none", "pair", "console"] {
         let mut fixture = resident_fixture();
         fixture.server.close_only = true;
-        fixture.server.source.terminal = Some(
+        fixture.server.source.terminal = Some(Box::new(
             crate::terminal_ipc::TerminalDescriptor::relaunchable(
                 fixture.server.source.id,
                 fixture.server.source.launch.recipe.clone(),
                 None,
             )
             .session,
-        );
+        ));
         if actual_owner == "pair" {
             let mut pair = fixture.server.identity.record.clone();
             pair.kind = Kind::Terminal;

@@ -388,7 +388,7 @@ mod tests {
             match create_directory_beneath(placement.directory(), Path::new("holding"), 0o700)
                 .unwrap()
             {
-                DirectoryCreation::Published(publication) => publication,
+                DirectoryCreation::Published(publication) => *publication,
                 other => panic!("expected owned publication, got {other:?}"),
             };
         placement

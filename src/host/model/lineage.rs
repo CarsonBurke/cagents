@@ -570,7 +570,7 @@ mod tests {
                 session_id: Some(uuid::Uuid::new_v4().to_string()),
             },
             proof: None,
-            terminal: Some(shell(id, recovery_origin)),
+            terminal: Some(Box::new(shell(id, recovery_origin))),
             owned_codex_listener: None,
         })
     }

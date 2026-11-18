@@ -2252,13 +2252,15 @@ fn chat_recovery_io_failure_is_acknowledged_without_a_later_retry() {
         let mut writes = empty_writes();
         writes
             .conversions
-            .push_back(ConversionCheckpoint::ChatRecovery(ChatRecoveryWrite {
-                kind,
-                card: CardId::new(),
-                source,
-                replacement,
-                reply,
-            }));
+            .push_back(ConversionCheckpoint::ChatRecovery(Box::new(
+                ChatRecoveryWrite {
+                    kind,
+                    card: CardId::new(),
+                    source,
+                    replacement,
+                    reply,
+                },
+            )));
         assert!(
             writes.flush(&store).is_empty(),
             "failure belongs to the explicit request"
@@ -2316,13 +2318,15 @@ fn upgrade_recovery_translates_queued_source_snapshots_before_the_next_save() {
     let (raw_reply, raw_receipt) = std::sync::mpsc::sync_channel(1);
     writes
         .conversions
-        .push_back(ConversionCheckpoint::ChatRecovery(ChatRecoveryWrite {
-            kind: ChatRecoveryKind::Upgrade,
-            card,
-            source: source.clone(),
-            replacement: replacement.clone(),
-            reply: raw_reply,
-        }));
+        .push_back(ConversionCheckpoint::ChatRecovery(Box::new(
+            ChatRecoveryWrite {
+                kind: ChatRecoveryKind::Upgrade,
+                card,
+                source: source.clone(),
+                replacement: replacement.clone(),
+                reply: raw_reply,
+            },
+        )));
     assert!(writes.flush(&store).is_empty());
     assert!(
         raw_receipt.recv().unwrap().is_err(),
@@ -2351,13 +2355,15 @@ fn upgrade_recovery_translates_queued_source_snapshots_before_the_next_save() {
     let (reply, receipt) = std::sync::mpsc::sync_channel(1);
     writes
         .conversions
-        .push_back(ConversionCheckpoint::ChatRecovery(ChatRecoveryWrite {
-            kind: ChatRecoveryKind::AuthenticatedUpgrade(recovery),
-            card,
-            source,
-            replacement: replacement.clone(),
-            reply,
-        }));
+        .push_back(ConversionCheckpoint::ChatRecovery(Box::new(
+            ChatRecoveryWrite {
+                kind: ChatRecoveryKind::AuthenticatedUpgrade(Box::new(recovery)),
+                card,
+                source,
+                replacement: replacement.clone(),
+                reply,
+            },
+        )));
     // An autosave produced while Ready awaits the receipt still carries
     // the old descriptor. It must not undo the authenticated handoff.
     snapshot.cards[0].title = "Saved during recovery".into();
@@ -2418,7 +2424,7 @@ fn retained_copy_keeps_its_typed_payload_for_io_retry_but_not_content_refusal() 
         writes
             .conversions
             .push_back(ConversionCheckpoint::RetainedChatCopy {
-                copy: copy.clone(),
+                copy: Box::new(copy.clone()),
                 reply: Some(reply),
             });
         let failed = writes.flush(&store);
@@ -2432,7 +2438,7 @@ fn retained_copy_keeps_its_typed_payload_for_io_retry_but_not_content_refusal() 
         drop(receipt);
         if transient {
             assert!(
-                matches!(writes.conversions.front(), Some(ConversionCheckpoint::RetainedChatCopy { copy: retained, reply: None }) if retained == &copy)
+                matches!(writes.conversions.front(), Some(ConversionCheckpoint::RetainedChatCopy { copy: retained, reply: None }) if **retained == copy)
             );
             // The existing explicit retry path does not reconstruct the
             // failed canonical snapshot or a different source descriptor.
@@ -2585,7 +2591,7 @@ fn retained_copy_explicit_retry_commits_real_bytes_after_its_initial_error() {
     let queue = Arc::new((
         Mutex::new(QueueState {
             conversions: VecDeque::from([ConversionCheckpoint::RetainedChatCopy {
-                copy: copy.clone(),
+                copy: Box::new(copy.clone()),
                 reply: Some(reply),
             }]),
             ordered_identities: true,

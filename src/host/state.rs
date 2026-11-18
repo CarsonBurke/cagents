@@ -3692,7 +3692,7 @@ fn restore_upgrade_from(
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             if paired && let Some(chat) = state.chats.get_mut(&terminal.source.id) {
                 chat.returning_terminal = false;
-                chat.session.terminal = Some(descriptor.session);
+                chat.session.terminal = Some(Box::new(descriptor.session));
             }
             state
                 .adopt_upgrade_lineage(
