@@ -874,6 +874,44 @@ fn projection_tail_timing() {
     timed("update(ChatUi Tick)", &mut app, &mut |app| {
         drop(app.update(Message::ChatUi(chat_ui::Action::Tick)))
     });
+    timed(
+        "update(TerminalFailure ProbeRetryDue)",
+        &mut app,
+        &mut |app| {
+            drop(app.update(Message::TerminalFailure(
+                terminal_failure::Action::ProbeRetryDue,
+            )))
+        },
+    );
+    timed(
+        "update(AcknowledgeVisiblePane superseded)",
+        &mut app,
+        &mut |app| {
+            let card = app.workspace.focused().expect("the channel focuses a pane");
+            drop(app.update(Message::AcknowledgeVisiblePane {
+                card,
+                epoch: app.attention_focus_epoch.wrapping_sub(1),
+            }))
+        },
+    );
+    // The save a channel click defers, which falls due with nothing left to
+    // project: the click projected its navigation.
+    let mut saves = Vec::with_capacity(ROUNDS);
+    let mut projected = 0;
+    for round in 0..ROUNDS + 8 {
+        drop(app.update(Message::Sidebar(SidebarAction::OpenChannel {
+            channel_id: channels[1 + round % 2],
+        })));
+        let before = super::terminal_output_tests::projections();
+        let started = Instant::now();
+        drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
+        if round >= 8 {
+            saves.push(started.elapsed());
+            projected += super::terminal_output_tests::projections() - before;
+        }
+    }
+    summary("update(NavigationSaveDue after a click)", &mut saves);
+    eprintln!("  of which {projected} of {ROUNDS} projected the whole workspace");
     timed("project_workspace (Full)", &mut app, &mut |app| {
         drop(app.project_workspace(false))
     });
