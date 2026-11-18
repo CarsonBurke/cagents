@@ -3391,7 +3391,7 @@ impl Runtime {
             .height(Length::Shrink)
             .max_height(composer_ceiling)
             .padding(composer_editor_padding())
-            .fade_into_padding(COMPOSER_TEXT_REACH, COMPOSER_TEXT_REACH, composer_fill)
+            .fade_into_surface(COMPOSER_TEXT_REACH, COMPOSER_TEXT_REACH, composer_fill)
             .class(cosmic::theme::iced::TextEditor::Custom(Box::new(
                 composer_editor_style,
             )));
@@ -6925,6 +6925,13 @@ mod tests {
     fn composer_text_reach_stops_inside_its_border() {
         let padding = composer_editor_padding();
         let reach = (COMPOSER_TEXT_REACH, COMPOSER_TEXT_REACH);
+        // The editor itself is borderless: the border is the composer's.
+        let own_border = composer_editor_style(
+            &cosmic::Theme::dark(),
+            iced::widget::text_editor::Status::Active,
+        )
+        .border
+        .width;
         for scale in [0.8, 1.0, 1.25, 1.5, 1.75, 2.0, 3.0] {
             for top in [0.0, 573.73, 580.4, 580.5, 611.15, 777.95] {
                 let bounds = iced::Rectangle {
@@ -6934,7 +6941,7 @@ mod tests {
                     height: 12.0 * COMPOSER_LINE_HEIGHT + 2.0 * COMPOSER_INSET_Y,
                 };
                 let (drawn, depth) = crate::ui_controls::field::padding_fade_geometry(
-                    bounds, padding, reach, reach, scale,
+                    bounds, padding, reach, own_border, reach, scale,
                 );
                 let context = format!("scale {scale}, top {top}: {drawn:?}");
                 let border_top = ((bounds.y + design::BORDER_WIDTH) * scale).ceil();
