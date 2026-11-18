@@ -407,7 +407,11 @@ pub(crate) fn observe_fixture_startup(phase: &'static str, error: Option<&str>) 
 /// Saves the conversation IDs an abandoned update's checkpoint alone records,
 /// so the chats they name resume their conversations rather than start new
 /// ones. The archive stays as evidence; a later start finds nothing to save.
-fn save_abandoned_identities(registry: &mut model::Registry) {
+fn save_abandoned_identities(host: &SharedHost) {
+    // A daemon without its shared model has nothing to save them to.
+    let Ok(registry) = agent_execution::registry(host) else {
+        return;
+    };
     let checkpoint = crate::upgrade::handoff::Store::existing()
         .and_then(|store| store.map(|store| store.load_abandoned()).transpose())
         .map(Option::flatten);
@@ -419,25 +423,26 @@ fn save_abandoned_identities(registry: &mut model::Registry) {
             return;
         }
     };
-    // A conversation whose native holder still runs is the holder's to
-    // name: its reattachment saves the identity it confirmed, through the
-    // lineage it authenticates.
-    let held: std::collections::BTreeSet<_> = match crate::daemon::holder_registry::observed(
-        crate::daemon::holder_registry::Kind::Native,
-    ) {
-        Ok(records) => records.into_iter().map(|record| record.terminal).collect(),
-        Err(error) => {
-            tracing::warn!(%error, "cannot tell which abandoned conversations still have a holder; their IDs were not saved");
-            return;
-        }
-    };
+    // A conversation restore reattached is its holder's to name: that
+    // reattachment saves the identity it confirmed, through the lineage it
+    // authenticates.
+    let restored: std::collections::BTreeSet<_> = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .chats
+        .keys()
+        .copied()
+        .collect();
     let unheld: Vec<_> = checkpoint
         .chats
         .iter()
-        .filter(|chat| !held.contains(&chat.source.id))
+        .filter(|chat| !restored.contains(&chat.source.id))
         .cloned()
         .collect();
-    let saved = registry.save_checkpoint_identities(&unheld);
+    let saved = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .save_checkpoint_identities(&unheld);
     if !saved.written.is_empty() {
         tracing::info!(chats = ?saved.written, "saved conversation IDs only the abandoned update recorded");
     }
@@ -454,7 +459,7 @@ fn save_abandoned_identities(registry: &mut model::Registry) {
         );
     }
     for (chat, error) in saved.failed {
-        tracing::warn!(%chat, %error, "cannot save the abandoned update's ID for this chat; the next start tries again");
+        tracing::warn!(%chat, %error, "cannot save the abandoned update's ID for this chat; a later start tries again unless it is reopened first");
     }
 }
 
@@ -504,13 +509,10 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("opening workspace model", None);
     match model::Registry::open() {
-        Ok(mut registry) => {
-            // Before any client can restore a chat that would otherwise start over.
-            save_abandoned_identities(&mut registry);
-            host.lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .install_model(registry)
-        }
+        Ok(registry) => host
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .install_model(registry),
         Err(error) => {
             tracing::error!(%error, "the shared workspace model is unavailable; channels will \
                                     not be shared between windows")
@@ -568,6 +570,9 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
             update_recovery::restore_ordinary(&host).map_err(io::Error::other)?;
             Ok(())
         })();
+        // After restore has reattached every holder it could, and before
+        // the listener accepts a client that would restore a chat afresh.
+        save_abandoned_identities(&host);
         match restored {
             Ok(()) => Ok(()),
             Err(error) => {
