@@ -56,7 +56,10 @@ pub fn spawn() {
 /// enumerates Vulkan unless `WGPU_BACKEND` leaves it out.
 fn renderer_enumerates_vulkan(iced_backend: Option<&str>, wgpu_backend: Option<&str>) -> bool {
     let wgpu = iced_backend.is_none_or(|candidates| {
-        let mut candidates = candidates.split(',').filter(|candidate| !candidate.is_empty()).peekable();
+        let mut candidates = candidates
+            .split(',')
+            .filter(|candidate| !candidate.is_empty())
+            .peekable();
         candidates.peek().is_none() || candidates.any(|candidate| candidate == "wgpu")
     });
     let vulkan = wgpu_backend.is_none_or(|backends| {
@@ -97,7 +100,10 @@ mod tests {
         assert!(renderer_enumerates_vulkan(None, None));
         assert!(renderer_enumerates_vulkan(Some("wgpu"), None));
         assert!(renderer_enumerates_vulkan(Some(""), None));
-        assert!(renderer_enumerates_vulkan(Some("tiny-skia,wgpu"), Some("VK,gl")));
+        assert!(renderer_enumerates_vulkan(
+            Some("tiny-skia,wgpu"),
+            Some("VK,gl")
+        ));
     }
 
     #[test]

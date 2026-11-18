@@ -12,8 +12,6 @@ pub mod automation_ui;
 pub mod browser;
 pub mod capability;
 pub(crate) mod desktop_cursor_blink;
-#[cfg(target_os = "linux")]
-pub mod gpu_wake;
 pub mod diff_view;
 pub mod document_render;
 pub mod editor;
@@ -23,6 +21,8 @@ pub mod external_editor;
 pub mod file_drop;
 pub mod file_icon;
 pub mod file_manager;
+#[cfg(target_os = "linux")]
+pub mod gpu_wake;
 pub mod inspector;
 pub mod interaction;
 #[cfg(feature = "latency-harness")]
