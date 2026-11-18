@@ -910,6 +910,7 @@ mod tests {
         let lock = std::fs::File::create(&path).unwrap();
         assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
         let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        let lock_descriptor = lock.as_raw_fd();
         // As with Codex behind its launcher, a child of the group's leader
         // blocks, so the wait is attributed through the process group. Only
         // async-signal-safe calls run after fork.
@@ -917,6 +918,9 @@ mod tests {
         assert!(leader >= 0);
         if leader == 0 {
             unsafe {
+                // flock follows the inherited open file description. Neither
+                // child may retain the parent's lock while waiting for it.
+                libc::close(lock_descriptor);
                 libc::setpgid(0, 0);
                 let blocked = libc::fork();
                 if blocked == 0 {
