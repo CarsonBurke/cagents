@@ -1306,6 +1306,9 @@ fn upgrade_restore_stops_only_the_conversations_whose_restart_fails() {
     let proof = daemon("updated");
     let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
     let mut state = HostState::new(proof);
+    // The fixture allocated each listener under `root`, as this daemon would
+    // under its runtime directory; reopening a stopped thread keeps its own.
+    state.codex_listeners = super::super::chat::CodexListenerRoots::at(root.clone());
     state.install_model(crate::host::model::Registry::at(&root.join("updated.sqlite3")).unwrap());
     let updated = Arc::new(crate::host::state::HostLock::new(state));
     updated.lock().unwrap().register_client(0);
@@ -1314,8 +1317,15 @@ fn upgrade_restore_stops_only_the_conversations_whose_restart_fails() {
             .ok()
             .and_then(|pid| registry::Process::read(pid.trim().parse().ok()?).ok())
     };
-    let restored = restore_upgrade_from(&updated, store(), &empty_proc, Some(&holders)).unwrap();
-    assert!(restored.is_empty(), "no retained conversation was refused");
+    let unattached = restore_upgrade_from(&updated, store(), &empty_proc, Some(&holders)).unwrap();
+    // Only the two stopped restarts are left unattached, so startup's orphan
+    // recovery skips them; no retained conversation was refused.
+    assert_eq!(
+        unattached
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        [ids[stalled], ids[refused]].into_iter().collect(),
+    );
 
     // The update finished: no checkpoint and no daemon-wide recovery hold,
     // and every conversation whose restart worked is running.
@@ -1405,6 +1415,28 @@ fn upgrade_restore_stops_only_the_conversations_whose_restart_fails() {
     assert_eq!(unattached.len(), 1);
     assert_eq!(unattached[0].id, ids[refused]);
 
+    // The restored ones are attached as their panes would attach them.
+    for thread in [retained, restarted] {
+        let crate::terminal::ipc::ServerResponse::UpgradeChatResolved { session: resolved } =
+            super::super::client::process_request(
+                &updated,
+                0,
+                crate::terminal::ipc::ClientRequest::ResolveUpgradeChat {
+                    source: saved(thread).source,
+                },
+            )
+            .unwrap()
+            .0
+        else {
+            panic!("a restored conversation did not resolve");
+        };
+        super::super::client::process_request(
+            &updated,
+            0,
+            crate::terminal::ipc::ClientRequest::ChatAttach { session: resolved },
+        )
+        .unwrap();
+    }
     for thread in [retained, restarted, stalled] {
         assert!(matches!(
             super::super::client::process_request(

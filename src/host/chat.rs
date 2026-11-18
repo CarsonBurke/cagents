@@ -5176,7 +5176,7 @@ fn restore_upgrade_with_queue_limit(
         return Ok(());
     }
     if saved.launch.needs_read_only_history() {
-        return Err("The saved Claude working directory is unavailable. No provider was restarted; open the saved pane to read its conversation history.".into());
+        return Err("The saved Claude working directory is unavailable, so only its conversation history can be opened".into());
     }
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut session = crate::upgrade::handoff::restored_chat(&saved.source, &saved.launch)?;
@@ -5272,19 +5272,14 @@ fn restore_upgrade_with_queue_limit(
         }
         if let Some(actual) = handle.confirmed_session_id() {
             if Some(&actual) != saved.launch.session_id.as_ref() {
-                return Err(
-                    "Restored provider confirmed a different conversation; checkpoint retained"
-                        .into(),
-                );
+                return Err("The restarted provider confirmed a different conversation".into());
             }
             break;
         }
         // Time its server spent queued behind another Codex's startup lock is
         // not this conversation's own startup; its listener wait bounds that.
         if Instant::now() >= deadline + queued {
-            return Err(
-                "Native provider did not confirm its exact conversation within 30 seconds".into(),
-            );
+            return Err("The restarted provider did not confirm its conversation in time".into());
         }
         thread::sleep(Duration::from_millis(20));
     }

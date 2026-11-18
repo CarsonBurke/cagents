@@ -416,13 +416,14 @@ pub const UNPROVEN_OWNER_REFUSAL: &str = "This conversation's earlier Claude pro
 /// resent, so an ordinary start of its saved conversation reopens it; a client
 /// may read this prefix to offer that instead of treating the card as blocked.
 pub const UPDATE_RESTART_STOPPED: &str =
-    "Cagents could not restart this conversation after the update";
+    "This conversation could not be restarted after the update";
 
 /// The daemon's full refusal for [`UPDATE_RESTART_STOPPED`], naming the
 /// provider's own reason.
 pub fn update_restart_stopped(reason: &str) -> String {
+    let reason = reason.trim_end_matches('.');
     format!(
-        "{UPDATE_RESTART_STOPPED}: {reason}. It was stopped and nothing was resent; reopen it to start it again."
+        "{UPDATE_RESTART_STOPPED}: {reason}. Nothing of it is running and nothing was resent; reopen it from its pane."
     )
 }
 
