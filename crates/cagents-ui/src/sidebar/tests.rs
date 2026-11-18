@@ -374,6 +374,132 @@ fn compact_attention_projection_counts_open_logical_conversations_once_and_reuse
 }
 
 #[test]
+fn attention_cache_survives_workspace_edits_the_fold_does_not_read() {
+    let projects = vec![project()];
+    let project = projects[0].id;
+    let first = projects[0].worktrees[0].clone();
+    let second = projects[0].worktrees[1].clone();
+    let card = compact_attention_terminal(CardId::new());
+    let other = compact_attention_terminal(CardId::new());
+    let mut durable = Arc::new(crate::model::WorkspaceState {
+        card_scopes: std::collections::HashMap::from([(card.id, first.path.clone())]),
+        cards: vec![card.clone(), other.clone()].into(),
+        ..Default::default()
+    });
+    let mut state = SidebarState::default();
+    state.observe_card_update(card.id);
+    state.refresh_attention_projection(&durable, &projects);
+    assert_eq!(state.worktree_attention(project, first.id).unread, 1);
+    let rebuilt = state.attention_projection_rebuilds;
+
+    // Focus, titles, drafts and the active checkout are not attention's.
+    let edits: [fn(&mut crate::model::WorkspaceState, CardId); 4] = [
+        |durable, card| durable.focused = Some(card),
+        |durable, _| {
+            durable
+                .cards
+                .iter_mut()
+                .for_each(|card| card.title = "Renamed".into())
+        },
+        |durable, card| {
+            durable.chat_drafts.insert(card, "unsent".into());
+        },
+        |durable, _| durable.active_worktree = Some("/elsewhere".into()),
+    ];
+    for edit in edits {
+        let before = Arc::clone(&durable);
+        edit(Arc::make_mut(&mut durable), card.id);
+        assert!(
+            !Arc::ptr_eq(&before, &durable),
+            "the edit moves the workspace"
+        );
+        state.refresh_attention_projection(&durable, &projects);
+        assert_eq!(state.attention_projection_rebuilds, rebuilt);
+        assert_eq!(state.worktree_attention(project, first.id).unread, 1);
+    }
+
+    // A new scope files the card elsewhere.
+    Arc::make_mut(&mut durable)
+        .card_scopes
+        .insert(card.id, second.path.clone());
+    state.refresh_attention_projection(&durable, &projects);
+    assert_eq!(state.attention_projection_rebuilds, rebuilt + 1);
+    assert_eq!(state.worktree_attention(project, first.id).unread, 0);
+    assert_eq!(state.worktree_attention(project, second.id).unread, 1);
+
+    // Joining a channel takes the card off its checkout's row.
+    Arc::make_mut(&mut durable)
+        .channels
+        .push(crate::model::ProjectChannel {
+            title_source: Default::default(),
+            id: ChannelId::new(),
+            project_id: project,
+            title: "Channel".into(),
+            ordinal: 0,
+            shared: false,
+            cards: vec![card.id],
+            focused: None,
+        });
+    state.refresh_attention_projection(&durable, &projects);
+    assert_eq!(state.attention_projection_rebuilds, rebuilt + 2);
+    assert_eq!(state.worktree_attention(project, second.id).unread, 0);
+    assert_eq!(state.project_attention(project).unread, 1);
+
+    // A card that closes takes its attention with it.
+    Arc::make_mut(&mut durable).channels.clear();
+    state.refresh_attention_projection(&durable, &projects);
+    let rebuilt = state.attention_projection_rebuilds;
+    Arc::make_mut(&mut durable)
+        .cards
+        .iter_mut()
+        .for_each(|open| {
+            if open.id == card.id {
+                open.existence = crate::model::Existence::Closed {
+                    tombstone: crate::model::Tombstone {
+                        operation_id: None,
+                        closed_at_unix_ms: 0,
+                        reason: Some("closed".into()),
+                    },
+                };
+            }
+        });
+    state.refresh_attention_projection(&durable, &projects);
+    assert_eq!(state.attention_projection_rebuilds, rebuilt + 1);
+    assert_eq!(state.project_attention(project).unread, 0);
+}
+
+#[test]
+fn attention_cache_refolds_when_kept_pane_rows_go() {
+    let mut model = SidebarModel::ready(SidebarMode::Expanded, vec![project()]);
+    let project = model.projects[0].id;
+    let worktree = model.projects[0].worktrees[1].id;
+    let card = compact_attention_terminal(CardId::new());
+    let durable = Arc::new(crate::model::WorkspaceState {
+        cards: vec![card.clone()].into(),
+        ..Default::default()
+    });
+    let mut state = SidebarState::default();
+    state.apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
+    state.observe_agent_update(card.id, project, worktree);
+    refresh_attention(&mut state, &mut model, &durable);
+    read(&mut state, &model, card.id, Vec::new());
+    refresh_attention(&mut state, &mut model, &durable);
+    assert_eq!(
+        state.pane_cards().collect::<Vec<_>>(),
+        vec![card.id],
+        "the read pane keeps its row"
+    );
+    // Leaving the filter forgets the kept row. Nothing else places a pane
+    // with no scope and nothing to show, so its row goes, though neither
+    // attention nor the workspace changed.
+    let rebuilt = state.attention_projection_rebuilds;
+    state.apply(&SidebarAction::SetFilter(SidebarFilter::All));
+    refresh_attention(&mut state, &mut model, &durable);
+    assert_eq!(state.attention_projection_rebuilds, rebuilt + 1);
+    assert_eq!(state.pane_cards().count(), 0);
+}
+
+#[test]
 fn attention_cache_refiles_unchanged_workspace_when_root_inventory_changes() {
     let mut projects = vec![project()];
     let project = projects[0].id;
