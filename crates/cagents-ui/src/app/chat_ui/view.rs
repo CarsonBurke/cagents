@@ -282,7 +282,9 @@ pub(super) fn message_actions<'a>(
             message,
             widget::Space::new().height(MESSAGE_ACTION_HEIGHT).into(),
         ])
-        .spacing(step::GAP_XS),
+        .spacing(step::GAP_XS)
+        // Should the message ever fill the row, it keeps its side.
+        .align_x(alignment),
         widget::container(actions)
             .width(Length::Fill)
             .height(Length::Fill)
@@ -5797,12 +5799,8 @@ impl Runtime {
             .into()
     }
 
-    /// The user's own message.
-    ///
-    /// Set on the accent wash and tucked to the right, with the corner nearest
-    /// its author squared off. That asymmetry is what identifies the author
-    /// without printing "You" above every message, and the narrower measure
-    /// keeps a turn's opening findable when scrolling back.
+    /// A user message's shown text, before its prepared form is ready: the
+    /// text, whether it is an attachment, and whether it folds.
     fn prompt_text(&self, item: &chat::Item) -> (String, bool, bool) {
         if let ItemContent::Image {
             reference: Some(reference),
@@ -5827,6 +5825,12 @@ impl Runtime {
         }
     }
 
+    /// The user's own message.
+    ///
+    /// Set on the accent wash and tucked to the right. That placement is what
+    /// identifies the author without printing "You" above every message, and
+    /// the narrower measure keeps a turn's opening findable when scrolling
+    /// back.
     fn prompt_view(&self, item: &chat::Item) -> Element<'static, Message> {
         let prepared = self.prepared_prompt(item);
         let attachment = matches!(item.content, ItemContent::Image { .. });

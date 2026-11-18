@@ -122,7 +122,8 @@ fn every_user_message_is_anchored_on_the_right_at_any_length_and_fold() {
         ),
         ("long, folded", markdown(24), Some(false)),
         ("long, unfolded", markdown(24), Some(true)),
-        // Past 2048 characters the shown text is drawn from a shaped flow.
+        // Past 2048 characters the shown text is drawn from a shaped flow,
+        // which only the unfolded message reaches: a fold shows at most 2000.
         ("very long, folded", markdown(160), Some(false)),
         ("very long, unfolded", markdown(160), Some(true)),
     ];
