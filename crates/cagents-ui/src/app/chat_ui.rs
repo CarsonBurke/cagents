@@ -5137,13 +5137,28 @@ impl Runtime {
                 && cache
                     .get(&item.id)
                     .is_none_or(|cached| cached.report_expanded != Some(true));
-            let coordinated = chat::coordination::may_recognize(item, provider);
-            let reader_only = !reader_proofs.is_empty()
+            // An item already held exactly, with no preparation outstanding,
+            // has nothing to stage: only its reader context is refreshed
+            // below. Streaming republishes every item of the window, so this
+            // keeps an unchanged one from paying the staging checks.
+            let staged = report_reveal
+                || self.preparation.contains(&item.id)
+                || cache.get(&item.id).is_none_or(|cached| {
+                    cached.preparing
+                        || cached
+                            .item
+                            .as_ref()
+                            .is_none_or(|previous| !Arc::ptr_eq(previous, item))
+                });
+            let coordinated = staged && chat::coordination::may_recognize(item, provider);
+            let reader_only = staged
+                && !reader_proofs.is_empty()
                 && preparation::has_tool_reader_proofs(item, &reader_proofs);
-            if CachedItem::prose(&item.content).is_some()
-                || literal_content::Prepared::required(&item.content)
-                || reader_only
-                || coordinated
+            if staged
+                && (CachedItem::prose(&item.content).is_some()
+                    || literal_content::Prepared::required(&item.content)
+                    || reader_only
+                    || coordinated)
             {
                 // Only validated append lineage with equal endpoint lengths
                 // proves unchanged text without scanning a large body on UI.
@@ -5275,7 +5290,6 @@ impl Runtime {
                     continue;
                 }
             }
-            let token = ChangeToken::of(&item.content);
             let mut image_changed = false;
             let append_proven = cache
                 .get(&item.id)
@@ -5321,7 +5335,7 @@ impl Runtime {
                 {
                     cached.extend(body, growing, theme);
                     presentation_changed = true;
-                    cached.token = token;
+                    cached.token = ChangeToken::of(&item.content);
                     cached.item = Some(item.clone());
                     continue;
                 }
@@ -5774,17 +5788,6 @@ impl Runtime {
             self.presentation_revision = self.presentation_revision.wrapping_add(1);
             self.find_navigation.changed_document();
         }
-        let live_ids: HashSet<&str> = snapshot
-            .items
-            .iter()
-            .chain(
-                snapshot
-                    .subagents
-                    .iter()
-                    .flat_map(|agent| agent.items.iter()),
-            )
-            .map(|item| item.id.as_str())
-            .collect();
         if self
             .selected_subagent
             .as_ref()
@@ -5843,10 +5846,25 @@ impl Runtime {
         // Keep disclosure choices across page eviction, with a bounded budget.
         // Question anchors only describe the currently loaded window.
         let parent_items_pruned = self.expanded.len() > 4096;
-        if parent_items_pruned {
-            self.expanded.retain(|id| live_ids.contains(id.as_str()));
+        // Streaming republishes the whole window, so the live set is only
+        // gathered when there is something to prune with it.
+        if parent_items_pruned || !self.asked_after.is_empty() {
+            let live_ids: HashSet<&str> = snapshot
+                .items
+                .iter()
+                .chain(
+                    snapshot
+                        .subagents
+                        .iter()
+                        .flat_map(|agent| agent.items.iter()),
+                )
+                .map(|item| item.id.as_str())
+                .collect();
+            if parent_items_pruned {
+                self.expanded.retain(|id| live_ids.contains(id.as_str()));
+            }
+            self.asked_after.retain(|id| live_ids.contains(id.as_str()));
         }
-        self.asked_after.retain(|id| live_ids.contains(id.as_str()));
         let retired_metadata = self.prepare_transcript_cache(&snapshot);
         if self.selected_subagent.is_some() {
             // Parent payload preparation stays lazy while a child is selected,

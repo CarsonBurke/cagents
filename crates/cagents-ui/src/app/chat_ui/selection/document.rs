@@ -192,11 +192,16 @@ impl Builder {
     ) {
         let identity = identity(item, path);
         self.logical_copying(identity, text, copies);
-        let owner = self
-            .owner_pool
-            .entry(item.to_owned())
-            .or_insert_with(|| Arc::from(item));
-        self.owners.insert(identity, owner.clone());
+        // An item names many blocks; only its first allocates the name.
+        let owner = match self.owner_pool.get(item) {
+            Some(owner) => owner.clone(),
+            None => {
+                let owner: Arc<str> = Arc::from(item);
+                self.owner_pool.insert(item.to_owned(), owner.clone());
+                owner
+            }
+        };
+        self.owners.insert(identity, owner);
     }
     pub fn indexed(
         &mut self,

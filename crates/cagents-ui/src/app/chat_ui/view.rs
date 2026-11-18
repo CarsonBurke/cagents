@@ -1358,27 +1358,40 @@ fn reasoning_elapsed(
     finished: bool,
     finished_at: Option<u64>,
 ) -> Option<String> {
+    reasoning_elapsed_ms(
+        item,
+        || {
+            items
+                .iter()
+                .skip_while(|candidate| candidate.id != item.id)
+                .nth(1)
+                .map(AsRef::as_ref)
+        },
+        items.last().is_some_and(|last| last.id == item.id),
+        finished,
+        finished_at,
+    )
+    .map(disclosure::duration)
+}
+
+/// How long a finished thought took, unformatted, given the observation
+/// after it in its stream and whether it is that stream's last.
+fn reasoning_elapsed_ms<'a>(
+    item: &chat::Item,
+    next: impl FnOnce() -> Option<&'a chat::Item>,
+    last: bool,
+    finished: bool,
+    finished_at: Option<u64>,
+) -> Option<u64> {
     if !finished {
         return None;
     }
     let start = item.started_at?;
     let end = item
         .at
-        .or_else(|| {
-            items
-                .iter()
-                .skip_while(|candidate| candidate.id != item.id)
-                .skip(1)
-                .next()
-                .and_then(|candidate| candidate.started_at.or(candidate.at))
-        })
-        .or_else(|| {
-            items
-                .last()
-                .filter(|last| last.id == item.id)
-                .and(finished_at)
-        })?;
-    Some(disclosure::duration(end.saturating_sub(start)))
+        .or_else(|| next().and_then(|candidate| candidate.started_at.or(candidate.at)))
+        .or_else(|| finished_at.filter(|_| last))?;
+    Some(end.saturating_sub(start))
 }
 
 /// The providers a draft offers, in the order its picker lists them after
@@ -5102,7 +5115,7 @@ impl Runtime {
         let coordinating = match part {
             TurnPart::Prompt(index) => {
                 0u8.hash(&mut hasher);
-                self.hash_turn_item(&items[index], cached, None, now, &mut hasher)
+                self.hash_turn_item(index, cached, None, now, &mut hasher)
             }
             TurnPart::Steps => {
                 1u8.hash(&mut hasher);
@@ -5126,7 +5139,7 @@ impl Runtime {
                     };
                     item.id.hash(&mut hasher);
                     coordinating |= self.hash_turn_item(
-                        item,
+                        placed.index,
                         self.cache.get(&item.id),
                         Some(placed.slot),
                         now,
@@ -5139,7 +5152,7 @@ impl Runtime {
                 2u8.hash(&mut hasher);
                 let placed = &turn.prose[prose];
                 self.hash_turn_item(
-                    &items[placed.index],
+                    placed.index,
                     cached,
                     Some(placed.slot),
                     now,
@@ -5172,13 +5185,15 @@ impl Runtime {
     /// them.
     fn hash_turn_item(
         &self,
-        item: &chat::Item,
+        index: usize,
         cached: Option<&CachedItem>,
         slot: Option<turn::Slot>,
         now: Option<u64>,
         hasher: &mut std::hash::DefaultHasher,
     ) -> bool {
         use std::hash::Hash;
+        let items = &self.snapshot.items;
+        let item = &items[index];
         // The latest observation can change at provider heartbeat speed even
         // when the rendered content and elapsed second are unchanged.
         (
@@ -5194,22 +5209,24 @@ impl Runtime {
         }
         if slot == Some(turn::Slot::Thinking) {
             // A newer turn starting does not revive old reasoning that
-            // already has another item after it.
-            let finished = reasoning_finished(
-                &self.snapshot.items,
-                self.snapshot.busy && !self.snapshot.has_later,
-                &item.id,
-            );
+            // already has another item after it. The item's own place in
+            // the stream decides, rather than a search for it, which would
+            // make every exchange's rows cost the length of the window.
+            let last = index + 1 == items.len();
+            let streaming = self.snapshot.busy && !self.snapshot.has_later;
+            let finished = !streaming || !last;
             (
                 finished,
-                reasoning_elapsed(
+                reasoning_elapsed_ms(
                     item,
-                    &self.snapshot.items,
+                    || items.get(index + 1).map(AsRef::as_ref),
+                    last,
                     finished,
                     self.snapshot
                         .finished_at
                         .filter(|_| !self.snapshot.has_later),
-                ),
+                )
+                .map(|millis| millis / 1_000),
             )
                 .hash(hasher);
         }

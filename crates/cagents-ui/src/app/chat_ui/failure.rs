@@ -1,6 +1,7 @@
 //! Presentation-only incidents. Sources remain in the original snapshot/history.
 use super::*;
 use chat::failure::{DeliveryOutcome, Failure, FailureKind};
+use std::rc::Rc;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Source {
@@ -535,24 +536,25 @@ impl State {
         }
     }
 
+    /// Most items carry no provider failure, so their source is only named
+    /// once the item proves to have text to classify.
     fn metadata_for_item(
         runtime: &Runtime,
         item: &Arc<chat::Item>,
-        source: &Source,
+        source: impl FnOnce() -> Source,
         context: &str,
-    ) -> Option<Metadata> {
-        if let Some((previous, old_context, meta)) = runtime.failure_ui.item_metadata.get(source)
+    ) -> Option<(Source, Metadata)> {
+        let text = provider_item_text(runtime.session.launch.provider, item)?;
+        let source = source();
+        if let Some((previous, old_context, meta)) = runtime.failure_ui.item_metadata.get(&source)
             && Arc::ptr_eq(previous, item)
             && old_context == context
         {
-            return Some(meta.clone());
+            let meta = meta.clone();
+            return Some((source, meta));
         }
-        Self::metadata(
-            runtime.session.launch.provider,
-            provider_item_text(runtime.session.launch.provider, item)?,
-            false,
-            context,
-        )
+        let meta = Self::metadata(runtime.session.launch.provider, text, false, context)?;
+        Some((source, meta))
     }
 
     // A provider may split one diagnostic into a cause block and raw request
@@ -568,8 +570,8 @@ impl State {
         for item in items {
             if let Some(carrier) =
                 chat::failure::provider_error_carrier(runtime.session.launch.provider, item)
-                && let Some(meta) =
-                    Self::metadata_for_item(runtime, item, &source(item), &context(item))
+                && let Some((_, meta)) =
+                    Self::metadata_for_item(runtime, item, || source(item), &context(item))
             {
                 let prior = causes
                     .entry(carrier.to_owned())
@@ -586,11 +588,11 @@ impl State {
         &mut self,
         runtime: &Runtime,
         item: &Arc<chat::Item>,
-        source: Source,
+        source: impl FnOnce() -> Source,
         context: &str,
         causes: &HashMap<String, Metadata>,
     ) {
-        if let Some(mut meta) = Self::metadata_for_item(runtime, item, &source, context) {
+        if let Some((source, mut meta)) = Self::metadata_for_item(runtime, item, source, context) {
             // Cache intrinsic classification, never a sibling's projected cause.
             self.item_metadata.insert(
                 source.clone(),
@@ -655,8 +657,10 @@ impl State {
         let provider = runtime.session.launch.provider;
         // Only explicit provider/system failures and failed operations are
         // classified. User messages and ordinary assistant prose remain verbatim.
-        let mut contexts = HashMap::new();
-        let mut context = String::new();
+        // A scope is shared by every item of its prompt, so each item holds
+        // it without a copy of its own.
+        let mut contexts: HashMap<&str, Rc<str>> = HashMap::new();
+        let mut context: Rc<str> = Rc::from("");
         let mut user_carriers = HashMap::new();
         for item in &runtime.snapshot.items {
             if item.role == chat::Role::User
@@ -669,35 +673,37 @@ impl State {
                     let scope = user_carriers
                         .entry(carrier)
                         .or_insert_with(|| prompt_scope(provider, &item.id));
-                    context.clone_from(scope);
+                    context = Rc::from(scope.as_str());
                 } else {
-                    context = prompt_scope(provider, &item.id);
+                    context = Rc::from(prompt_scope(provider, &item.id));
                 }
             }
-            contexts.insert(item.id.as_str(), context.clone());
+            contexts.insert(item.id.as_str(), Rc::clone(&context));
         }
         let causes = Self::carrier_causes(
             runtime,
             &runtime.snapshot.items,
             |item| Source::Item(item.id.clone()),
-            |item| contexts.get(item.id.as_str()).cloned().unwrap_or_default(),
+            |item| {
+                contexts
+                    .get(item.id.as_str())
+                    .map(ToString::to_string)
+                    .unwrap_or_default()
+            },
         );
         for item in &runtime.snapshot.items {
             state.push_item(
                 runtime,
                 item,
-                Source::Item(item.id.clone()),
-                contexts
-                    .get(item.id.as_str())
-                    .map(String::as_str)
-                    .unwrap_or(""),
+                || Source::Item(item.id.clone()),
+                contexts.get(item.id.as_str()).map_or("", |scope| scope),
                 &causes,
             );
         }
         for child in &runtime.snapshot.subagents {
             let child_context = contexts
                 .get(child.id.as_str())
-                .cloned()
+                .map(ToString::to_string)
                 .unwrap_or_else(|| format!("child:{}", child.id));
             // Child inputs are not a trustworthy turn boundary: some providers
             // expose them as System text. Preserve separate typed error IDs.
@@ -721,7 +727,7 @@ impl State {
                     state.push_item(
                         runtime,
                         item,
-                        Source::ChildItem(child.id.clone(), item.id.clone()),
+                        || Source::ChildItem(child.id.clone(), item.id.clone()),
                         &context,
                         &causes,
                     );
@@ -817,7 +823,7 @@ impl State {
             .map(|note| match note.message.as_deref() {
                 Some(id) => contexts
                     .get(id)
-                    .cloned()
+                    .map(ToString::to_string)
                     .unwrap_or_else(|| prompt_scope(provider, id)),
                 None => String::new(),
             })
@@ -853,7 +859,7 @@ impl State {
                         && note_destination(runtime, note, &item_groups, &user_carriers).is_some()
                 })
             })
-            .map_or(context.as_str(), |index| note_contexts[index].as_str());
+            .map_or(&*context, |index| note_contexts[index].as_str());
         state.local_error = if runtime.failure_ui.local_error.as_deref() == runtime.error.as_deref()
         {
             runtime.failure_ui.local_error.clone()
@@ -876,7 +882,7 @@ impl State {
             {
                 let scope = match source {
                     Source::Snapshot => snapshot_context,
-                    _ => context.as_str(),
+                    _ => &*context,
                 };
                 state.push(provider, text, source, false, scope);
             }

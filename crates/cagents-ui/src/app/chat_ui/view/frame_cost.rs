@@ -2183,3 +2183,25 @@ fn measure_pull_request_labels(transcript: fn(usize) -> Vec<chat::Item>, named: 
     unchanged.report("labels unchanged (update)");
     pane.stream_prose().row("streaming, labelled");
 }
+
+// TEMPORARY profiling harness (not to be committed).
+#[test]
+#[ignore = "profiling"]
+fn zz_profile_streaming_window() {
+    let turns: usize = std::env::var("ZZ_TURNS").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+    let frames: usize = std::env::var("ZZ_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(1000);
+    let mut pane = Pane::new(transcript(turns));
+    pane.metadata.busy = true;
+    let start = Instant::now();
+    for frame in 0..frames {
+        let text = pane.tail();
+        text.push_str(CHUNK);
+        if frame % 8 == 7 {
+            text.push_str("\n\n");
+        }
+        pane.publish();
+        pane.prepare_publication();
+        pane.frame();
+    }
+    println!("ZZ {turns} turns {frames} frames in {:?}", start.elapsed());
+}
