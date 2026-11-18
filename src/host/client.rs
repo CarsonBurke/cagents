@@ -326,7 +326,8 @@ fn serve_with<R: Into<crate::terminal_ipc::PreparedResponse>>(
             }
             connected = true;
             // A resumed terminal's live events follow its handshake and replay.
-            let hold = delivery.hold_broadcasts();
+            // Held messages are not coalesced, so hold only to resume.
+            let hold = (!resume.is_empty()).then(|| delivery.hold_broadcasts());
             let (resumed, replay) = match prepare_resume(&host, client_id, resume) {
                 Ok(prepared) => prepared,
                 Err(error) => {
@@ -348,15 +349,17 @@ fn serve_with<R: Into<crate::terminal_ipc::PreparedResponse>>(
                 break;
             }
             for message in replay {
-                if hold
-                    .push(ServerEnvelope {
-                        version: PROTOCOL_VERSION,
-                        request_id: None,
-                        proof: proof.clone(),
-                        message,
-                    })
-                    .is_err()
-                {
+                let message = ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: None,
+                    proof: proof.clone(),
+                    message,
+                };
+                let queued = match &hold {
+                    Some(hold) => hold.push(message),
+                    None => delivery.push(message),
+                };
+                if queued.is_err() {
                     break;
                 }
             }

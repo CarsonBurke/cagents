@@ -378,7 +378,8 @@ impl DeliveryQueue {
     /// replay: a live event published after the attachment would otherwise
     /// overtake them, refusing the handshake or advancing the client's cursor
     /// past events still waiting in the replay. Replies are never held, and
-    /// held messages count toward the queue's capacity.
+    /// held messages count toward the queue's capacity; they are not
+    /// coalesced until released. Closing the queue sends them at once.
     pub(crate) fn hold_broadcasts(&self) -> BroadcastHold<'_> {
         let mut state = self.lock();
         debug_assert!(state.held.is_none(), "one connection holds at a time");
@@ -1163,8 +1164,6 @@ mod tests {
         assert!(queue.pop().is_none());
     }
 
-    /// Pushes come from threads holding the host lock. An overflow discards
-    /// a queue that can hold full terminal frames, so the writer frees them.
     #[test]
     fn held_broadcasts_follow_what_the_connection_queues_through_its_hold() {
         let id = TerminalId::new();
@@ -1226,6 +1225,8 @@ mod tests {
         assert_eq!(order(&queue), ["event 1"]);
     }
 
+    /// Pushes come from threads holding the host lock. An overflow discards
+    /// a queue that can hold full terminal frames, so the writer frees them.
     #[test]
     fn overflow_leaves_freeing_the_discarded_messages_to_the_writer() {
         let proof = Arc::new(redraw(TerminalId::new(), 0).proof);
