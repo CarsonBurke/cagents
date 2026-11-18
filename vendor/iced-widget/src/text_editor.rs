@@ -65,16 +65,17 @@ pub use text::editor::{
 
 /// cagents: where a [`TextEditor`] with this `padding` and `overscan` draws
 /// text: `text_bounds` extended by the overscan, which is limited to the
-/// padding. An extended edge is moved inward onto a whole device pixel at
-/// `scale_factor`, so the band never shares a device row with what lies just
-/// outside it, such as an antialiased border. The renderer rounds clip
-/// rectangles to device pixels, so a fractional edge could otherwise take in
-/// part of that row and paint over it. An edge with no overscan is the text
-/// area's own, as upstream.
+/// padding inside the editor's own `border` width. An extended edge is moved
+/// inward onto a whole device pixel at `scale_factor`, so the band never
+/// shares a device row with what lies just outside it, such as an
+/// antialiased border. The renderer rounds clip rectangles to device pixels,
+/// so a fractional edge could otherwise take in part of that row and paint
+/// over it. An edge with no overscan is the text area's own, as upstream.
 pub fn overscan_bounds(
     text_bounds: Rectangle,
     padding: Padding,
     overscan: (f32, f32),
+    border: f32,
     scale_factor: f32,
 ) -> Rectangle {
     let scale = if scale_factor.is_finite() && scale_factor > 0.0 {
@@ -82,8 +83,9 @@ pub fn overscan_bounds(
     } else {
         1.0
     };
-    let above = overscan.0.clamp(0.0, padding.top);
-    let below = overscan.1.clamp(0.0, padding.bottom);
+    let border = if border.is_finite() { border.max(0.0) } else { 0.0 };
+    let above = overscan.0.clamp(0.0, (padding.top - border).max(0.0));
+    let below = overscan.1.clamp(0.0, (padding.bottom - border).max(0.0));
     let text_top = text_bounds.y;
     let text_bottom = text_bounds.y + text_bounds.height;
 
@@ -308,9 +310,11 @@ where
 
     /// cagents: lets text scrolled past the top or the bottom of the text
     /// area carry on up to `above` and `below` into the vertical padding,
-    /// rather than stop at the padding's inner edge. The editor still
+    /// rather than stop at the padding's inner edge. The editor lays out
+    /// that far into the padding, and draws its text, caret and selection
+    /// there only inside its own border (see [`overscan_bounds`]). It still
     /// scrolls, and reveals its cursor, within the text area.
-    /// [`Content::overflow`] tells how far the drawn text reaches, for
+    /// [`Content::overflow`] tells how far the laid-out text reaches, for
     /// instance to fade it out.
     pub fn overscan(mut self, above: f32, below: f32) -> Self {
         self.overscan = (above.max(0.0), below.max(0.0));
@@ -318,8 +322,26 @@ where
     }
 
     /// The text area extended by the overscan: where text is drawn.
-    fn drawn_bounds(&self, text_bounds: Rectangle, scale_factor: f64) -> Rectangle {
-        overscan_bounds(text_bounds, self.padding, self.overscan, scale_factor as f32)
+    fn drawn_bounds(
+        &self,
+        text_bounds: Rectangle,
+        border: f32,
+        scale_factor: f64,
+    ) -> Rectangle {
+        overscan_bounds(
+            text_bounds,
+            self.padding,
+            self.overscan,
+            border,
+            scale_factor as f32,
+        )
+    }
+
+    /// cagents: the style the [`TextEditor`] is drawn with in `theme`, for
+    /// the status it was last drawn in, such as to fade its overscan into
+    /// its own background.
+    pub fn current_style(&self, theme: &Theme) -> Style {
+        theme.style(&self.class, self.last_status.unwrap_or(Status::Active))
     }
 
     fn clamped_overscan(&self) -> (f32, f32) {
@@ -1123,8 +1145,12 @@ where
             |highlight| (self.highlighter_format)(highlight, theme),
         );
 
-        let style = theme
-            .style(&self.class, self.last_status.unwrap_or(Status::Active));
+        let style = self.current_style(theme);
+        let drawn_bounds = self.drawn_bounds(
+            bounds.shrink(self.padding),
+            style.border.width,
+            defaults.scale_factor,
+        );
 
         renderer.fill_quad(
             renderer::Quad {
@@ -1164,7 +1190,7 @@ where
                 &internal.editor,
                 text_bounds.position(),
                 style.value,
-                self.drawn_bounds(text_bounds, defaults.scale_factor),
+                drawn_bounds,
             );
         }
 
@@ -1187,8 +1213,7 @@ where
                         );
 
                     if let Some(clipped_cursor) =
-                        self.drawn_bounds(text_bounds, defaults.scale_factor)
-                            .intersection(&cursor)
+                        drawn_bounds.intersection(&cursor)
                     {
                         renderer.fill_quad(
                             renderer::Quad {
@@ -1200,9 +1225,6 @@ where
                     }
                 }
                 Selection::Range(ranges) => {
-                    let drawn_bounds =
-                        self.drawn_bounds(text_bounds, defaults.scale_factor);
-
                     for range in ranges.into_iter().filter_map(|range| {
                         drawn_bounds.intersection(&(range + translation))
                     }) {

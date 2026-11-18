@@ -3959,7 +3959,7 @@ impl Runtime {
             .height(Length::Shrink)
             .max_height(composer_ceiling)
             .padding(composer_editor_padding())
-            .fade_into_padding(COMPOSER_TEXT_REACH, COMPOSER_TEXT_REACH, composer_fill)
+            .fade_into_surface(COMPOSER_TEXT_REACH, COMPOSER_TEXT_REACH, composer_fill)
             .class(cosmic::theme::iced::TextEditor::Custom(Box::new(
                 composer_editor_style,
             )));
