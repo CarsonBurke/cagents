@@ -11,7 +11,7 @@ pub(super) const RESTART_GUIDANCE: &str = "Leave this tab open and restart this 
 pub(super) const RESTART_FRESH_TRADEOFF: &str = "Starting a new conversation keeps the message; closing the tab discards it. Either way, the old conversation won't reopen here, though it isn't deleted.";
 pub(super) const RESTART_CLOSE_TRADEOFF: &str = "Closing the tab discards the message, and the conversation won't reopen, though it isn't deleted.";
 pub(super) const UNNAMED_AGENT_HEADLINE: &str = "This agent's conversation can't be reopened.";
-pub(super) const UNNAMED_AGENT_GUIDANCE: &str = "The agent stays open until you close this tab. Closing ends the agent and discards any unsent message.";
+pub(super) const UNNAMED_AGENT_GUIDANCE: &str = "Closing this tab ends the agent and discards any unsent message.";
 pub(super) const CLOSE_GUIDANCE: &str = "Details say why. Closing this tab discards any unsent message; the conversation itself isn't deleted.";
 
 /// When a permanently refused saved conversation can come back, as far as

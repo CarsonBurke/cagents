@@ -1126,7 +1126,7 @@ fn draft_start_backend() -> Option<(String, String, String)> {
 /// reopen it; [`blocked_recovery::Reopen::UnnamedAgent`] says what to do.
 fn unnamed_agent_conversation(session: &chat::Session) -> String {
     format!(
-        "{} named this agent's conversation only after it was saved, and the ID was lost when its daemon stopped, so nothing can reconnect to it. Nothing new was started.",
+        "{} hadn't reported this agent's conversation ID when the daemon stopped, so this tab can't reconnect to it. Nothing new was started.",
         session.launch.provider.label()
     )
 }
@@ -6648,6 +6648,20 @@ fn retire_conversation(
     end_conversation(handle, session, super::channel_ui::close_sessions)
 }
 
+/// Gives up a failed start the card replaced on its own, like
+/// [`retire_conversation`], but never retires an open agent that runs as it:
+/// the card's agent check can predate the agents the daemon reports.
+fn give_up_failed_start(
+    handle: Option<Arc<ClientHandle>>,
+    session: Option<chat::Session>,
+) -> Result<(), String> {
+    end_conversation(
+        handle,
+        session,
+        super::channel_ui::close_sessions_sparing_agents,
+    )
+}
+
 /// Closes a conversation the reader closed, like [`retire_conversation`],
 /// and also retires the agent still bound to it after a daemon stop. Giving
 /// up a failed start must not do that, so only an explicit Close comes here.
@@ -9642,6 +9656,19 @@ impl Cagents {
                     None
                 }
             }
+            CardKind::Chat(_)
+                if self
+                    .chat_ui
+                    .blocked_starts
+                    .get(&card)
+                    .is_some_and(|blocked| {
+                        blocked.reopen == blocked_recovery::Reopen::UnnamedAgent
+                    }) =>
+            {
+                Some(Cow::Borrowed(
+                    "This agent's conversation can't be reopened, so there is nothing to open in a terminal.",
+                ))
+            }
             CardKind::Chat(_) => match self.cards.get(&card) {
                 Some(CardRuntime::Chat(runtime)) => {
                     let named = runtime.connected()
@@ -12534,7 +12561,12 @@ impl Cagents {
                         let skills = self.open_chat_draft(target.card, draft);
                         return Task::batch([
                             skills,
-                            self.retire_chat(target.card, None, Some(attempt.session)),
+                            self.end_chat(
+                                target.card,
+                                None,
+                                Some(attempt.session),
+                                give_up_failed_start,
+                            ),
                         ]);
                     }
                     Err(mut failure) => {

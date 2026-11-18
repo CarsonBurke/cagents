@@ -22,6 +22,14 @@ pub(super) fn close_sessions_retiring_agents(sessions: Vec<CardKind>) -> Result<
     close_sessions_with(sessions, OpenAgents::Retire)
 }
 
+/// [`close_sessions`] for a failed start a card gives up on its own, which
+/// must leave an open agent that runs as the conversation alone, even where
+/// the conversation's retained owner would otherwise be closed: that close
+/// retires the agent too.
+pub(super) fn close_sessions_sparing_agents(sessions: Vec<CardKind>) -> Result<(), String> {
+    close_sessions_with(sessions, OpenAgents::Spare)
+}
+
 /// Fresh replaces this exact conversation, rather than whichever conversation
 /// currently occupies its native ID. A changed owner must be reconciled before
 /// Fresh can be attempted again; inventory alone cannot authorize that change.
@@ -108,6 +116,7 @@ fn captured_chat_changed() -> String {
 enum OpenAgents {
     Keep,
     Retire,
+    Spare,
 }
 
 fn close_sessions_with(sessions: Vec<CardKind>, open_agents: OpenAgents) -> Result<(), String> {
@@ -227,8 +236,8 @@ fn close_sessions_through(
 
 /// Whether a conversation no actor hosts needs the daemon's retained close.
 /// A retained owner may still hold it, and closing for good also retires an
-/// open agent that runs as it. That close always retires such an agent, so
-/// giving the conversation up while keeping agents leaves it to the agent.
+/// open agent that runs as it. That close always retires such an agent, so a
+/// give-up that spares agents leaves the conversation to the agent.
 fn closes_unhosted(
     session: &crate::chat::Session,
     open_agents: OpenAgents,
@@ -237,7 +246,8 @@ fn closes_unhosted(
 ) -> Result<bool, String> {
     let retained = may_have_retained_owner(session);
     Ok(match open_agents {
-        OpenAgents::Keep => {
+        OpenAgents::Keep => retained,
+        OpenAgents::Spare => {
             retained && !bound_to_open_agent(session, read_open_agents(agents, client)?)
         }
         OpenAgents::Retire => {
@@ -4418,7 +4428,7 @@ pub(in crate::app) mod close_tests {
         };
         // The agent keeps its conversation and whatever still holds it.
         close(
-            OpenAgents::Keep,
+            OpenAgents::Spare,
             vec![
                 (ClientRequest::ChatList, listed(vec![])),
                 (read_agents(), model(vec![agent(&source)])),
@@ -4427,7 +4437,7 @@ pub(in crate::app) mod close_tests {
         .unwrap();
         // Without an agent, the retained owner is still closed.
         close(
-            OpenAgents::Keep,
+            OpenAgents::Spare,
             vec![
                 (ClientRequest::ChatList, listed(vec![])),
                 (read_agents(), model(vec![])),
@@ -4435,12 +4445,15 @@ pub(in crate::app) mod close_tests {
             ],
         )
         .unwrap();
-        // Closing the conversation for good still retires its agent.
-        close(
-            OpenAgents::Retire,
-            vec![(ClientRequest::ChatList, listed(vec![])), close_retained()],
-        )
-        .unwrap();
+        // Closing the conversation for good still retires its agent, as does
+        // any other give-up, such as a card closed while it was reopening.
+        for open_agents in [OpenAgents::Retire, OpenAgents::Keep] {
+            close(
+                open_agents,
+                vec![(ClientRequest::ChatList, listed(vec![])), close_retained()],
+            )
+            .unwrap();
+        }
     }
 
     fn paired_source() -> crate::chat::Session {

@@ -16218,6 +16218,9 @@ fn an_agents_never_named_conversation_stays_its_card_when_its_daemon_is_gone() {
         // Starting over would retire the agent's pane, and reconnecting finds
         // nothing, so Close is its only recovery.
         assert!(!app.chat_offers_fresh_conversation(card));
+        // Nor does it open in a terminal, which would give the card up and
+        // leave the agent without one.
+        assert!(app.chat_switch_blocker(card).is_some());
         if kept_runtime {
             let runtime = chat_runtime(&app, card);
             assert!(!runtime.is_draft());
