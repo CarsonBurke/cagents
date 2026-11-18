@@ -1127,7 +1127,9 @@ impl Cagents {
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into(),
-                None => iced::widget::Space::new().into(),
+                // Up, with nothing to draw: a blank body would read as a
+                // preview still loading.
+                None => notice("No messages to show"),
             },
             // The screen's own background reaches the edges; its text keeps
             // the same inset as a conversation's.
@@ -1214,12 +1216,16 @@ impl Cagents {
             }
             None => Cow::Borrowed(title),
         };
+        // A shell's reported title is often its tab's name already.
+        let doing = self
+            .workspace_switcher_pane_doing(card)
+            .filter(|doing| !title.contains(doing.as_str()));
         let mut text = vec![
             crate::ui_controls::fade_text(title)
                 .width(Length::Fill)
                 .into(),
         ];
-        if let Some(doing) = self.workspace_switcher_pane_doing(card) {
+        if let Some(doing) = doing {
             text.push(
                 crate::ui_controls::FadeText::caption(doing)
                     .width(Length::Fill)
