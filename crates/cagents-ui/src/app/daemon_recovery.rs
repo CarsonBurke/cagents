@@ -1165,8 +1165,13 @@ mod tests {
             while let Some(request) = read_frame::<ClientEnvelope>(&mut stream).unwrap() {
                 assert_eq!(request.proof, Some(proof.clone()));
                 let response = match request.request {
+                    // A daemon lists in identity order.
                     ClientRequest::ListPage { after: None } => ServerResponse::ListedPage {
-                        terminals: terminals.clone(),
+                        terminals: {
+                            let mut terminals = terminals.clone();
+                            terminals.sort_by_key(|terminal| terminal.session.id);
+                            terminals
+                        },
                         complete: true,
                     },
                     ClientRequest::StartupState => ServerResponse::StartupState(state.clone()),
@@ -2406,8 +2411,13 @@ mod tests {
                                     StartupState::Ready
                                 })
                             }
+                            // A daemon lists in identity order.
                             ClientRequest::ListPage { after: None } => ServerResponse::ListedPage {
-                                terminals: inventory.terminals.clone(),
+                                terminals: {
+                                    let mut terminals = inventory.terminals.clone();
+                                    terminals.sort_by_key(|terminal| terminal.session.id);
+                                    terminals
+                                },
                                 complete: true,
                             },
                             ClientRequest::ChatList => ServerResponse::ChatListed {

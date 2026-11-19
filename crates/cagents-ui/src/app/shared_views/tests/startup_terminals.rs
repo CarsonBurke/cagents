@@ -65,8 +65,13 @@ fn serve(mut stream: std::os::unix::net::UnixStream, hosted: Vec<TerminalSession
                     proof: proof.clone(),
                     resumed: Vec::new(),
                 },
+                // A daemon lists in identity order.
                 ClientRequest::ListPage { after: None } => ServerResponse::ListedPage {
-                    terminals: hosted.iter().map(descriptor).collect(),
+                    terminals: {
+                        let mut terminals = hosted.iter().map(descriptor).collect::<Vec<_>>();
+                        terminals.sort_by_key(|terminal| terminal.session.id);
+                        terminals
+                    },
                     complete: true,
                 },
                 ClientRequest::Attach { terminal_id, .. } => ServerResponse::Attached {
