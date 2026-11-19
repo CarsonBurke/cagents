@@ -11809,8 +11809,8 @@ fn a_chosen_language_wins_over_the_content_and_outlives_a_reload() {
     }));
     assert!(!editable(&runtime).markdown);
     assert_eq!(
-        runtime.language_choices().collect::<Vec<_>>(),
-        vec![(Path::new("Untitled"), DocumentLanguage::PlainText)]
+        runtime.language_choice(Path::new("Untitled")),
+        Some(DocumentLanguage::PlainText)
     );
 
     // Markdown, chosen, previews at once.
@@ -11832,7 +11832,7 @@ fn a_chosen_language_wins_over_the_content_and_outlives_a_reload() {
         language: None,
     }));
     assert_eq!(runtime.language_offer(), Some((true, None)));
-    assert_eq!(runtime.language_choices().count(), 0);
+    assert_eq!(runtime.language_choice(Path::new("Untitled")), None);
 }
 
 #[test]
@@ -11845,7 +11845,7 @@ fn a_named_buffer_offers_no_language_and_highlights_by_its_name() {
         language: Some(DocumentLanguage::Markdown),
     }));
     assert!(!editable(&runtime).markdown);
-    assert_eq!(runtime.language_choices().count(), 0);
+    assert_eq!(runtime.language_choice(Path::new("notes.txt")), None);
     paste(&mut runtime, card, "x");
     assert!(!editable(&runtime).language_stale());
     assert_eq!(highlight_token(&runtime), "txt");
