@@ -706,7 +706,9 @@ fn an_older_source_may_omit_only_the_fields_read_as_absent() {
     );
     let unmarked = lifecycle_differences(&older, &current, &restated, &[], &selected);
     assert!(
-        unmarked.iter().any(|difference| difference.contains("snapshot")),
+        unmarked
+            .iter()
+            .any(|difference| difference.contains("snapshot")),
         "{unmarked:?}"
     );
 }
@@ -771,7 +773,8 @@ fn inspector_proof_detects_each_request_response_and_reachable_history_change() 
         };
         fields.push(("future_history_field".into(), Shape::Bool));
         assert!(
-            !lifecycle_differences(&baseline, &changed, &[], &[], &selected_for(protocol)).is_empty()
+            !lifecycle_differences(&baseline, &changed, &[], &[], &selected_for(protocol))
+                .is_empty()
         );
     }
 }

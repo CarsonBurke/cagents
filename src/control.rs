@@ -1062,7 +1062,9 @@ impl ControlClient {
 
     /// Handshake with an update source at its own protocol number. Only the
     /// update source client calls this, for a number whose wire is this
-    /// release's for the frozen lifecycle subset.
+    /// release's for the frozen lifecycle subset, except for fields a later
+    /// protocol added, which its replies are read without (see
+    /// `terminal_ipc::decoding_from`).
     pub(crate) fn from_stream_at_source_protocol(
         stream: UnixStream,
         deadline: Instant,
