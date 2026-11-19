@@ -5534,49 +5534,6 @@ pub(super) fn preflight_for_terminal_close(
     Ok(())
 }
 
-/// A terminal card restored after a GUI restart has no parked UI runtime, but
-/// the daemon still owns its exact native actor. Explicit card close retires both.
-#[cfg(test)]
-pub(super) fn close_for_terminal(
-    host: &SharedHost,
-    terminal_id: TerminalId,
-) -> Result<(), ProtocolError> {
-    let handle = {
-        let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        state
-            .chats
-            .get(&terminal_id)
-            .filter(|record| {
-                (record.session.launch.provider == Provider::Codex
-                    || record.owns_execution_console())
-                    && record
-                        .session
-                        .terminal
-                        .as_ref()
-                        .is_some_and(|terminal| terminal.id == terminal_id)
-            })
-            .map(|record| {
-                let owned = record.paired_terminal.as_ref().is_some_and(|expected| {
-                    state
-                        .terminals
-                        .get(&terminal_id)
-                        .is_some_and(|actual| actual.handle.same_worker(expected))
-                });
-                if !owned {
-                    return Err(unavailable(
-                        "The terminal worker no longer belongs to this provider pairing",
-                    ));
-                }
-                Ok(record.handle.clone())
-            })
-            .transpose()?
-    };
-    if let Some(handle) = handle {
-        close_terminal_actor(host, terminal_id, &handle)?;
-    }
-    Ok(())
-}
-
 /// Close only the actor inspected before leaving the host lock. A replacement
 /// with the same durable ID must not be stopped or retired by an old receipt.
 pub(super) fn close_terminal_actor(
