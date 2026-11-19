@@ -15274,7 +15274,22 @@ impl Cagents {
                         Task::none()
                     } else {
                         match result {
-                            Ok(Some(paths)) => self.stage_chat_attachments(target, id, paths),
+                            Ok(Some(paths)) => {
+                                let rules = chat::AttachmentRules::for_provider(
+                                    runtime.session.launch.provider,
+                                );
+                                if rules.images_only
+                                    && paths.iter().any(|path| !chat::is_image_path(path))
+                                {
+                                    runtime.cancel_attachment_insert(
+                                        id.id,
+                                        Some("This chat can attach only images (PNG, JPEG, GIF or WebP). Paste the contents of other files into your message instead.".into()),
+                                    );
+                                    Task::none()
+                                } else {
+                                    self.stage_chat_attachments(target, id, paths)
+                                }
+                            }
                             Ok(None) => {
                                 runtime.cancel_attachment_insert(id.id, None);
                                 Task::none()

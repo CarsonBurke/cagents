@@ -7798,6 +7798,113 @@ fn empty_paste_callbacks_resume_explicit_submit_once_after_the_last_job() {
 }
 
 #[test]
+fn attach_files_refuses_a_non_image_for_an_images_only_provider() {
+    let _admission = attachment_draft::test_admission();
+    chat::attachment_assets::with_test_image(|image| {
+        let directory = tempfile::tempdir().unwrap();
+        let notes = directory.path().join("notes.txt");
+        let shot = directory.path().join("shot.png");
+        std::fs::write(&notes, "Meeting notes").unwrap();
+        std::fs::copy(&image.path, &shot).unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat_for_provider(&mut app, Provider::Codex, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        Arc::make_mut(&mut runtime.snapshot)
+            .capabilities
+            .attachments = true;
+        assert!(runtime.accepts_draft_attachments());
+        let ticket = runtime.try_attachment_insert().unwrap();
+        runtime.attachment_chooser_pending = Some(ticket.id);
+
+        let task = app.handle_chat_ui(Action::Attached(
+            target,
+            ticket.clone(),
+            Ok(Some(vec![notes, shot])),
+        ));
+
+        assert_eq!(task.units(), 0, "refused selection must stage no files");
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.attachments.is_empty());
+        assert_eq!(runtime.pastes_pending, 0);
+        assert!(!runtime.attachment_bookmarks.contains_key(&ticket.id));
+        assert!(runtime.attachment_jobs.is_empty());
+        assert!(runtime.attachment_order.is_empty());
+        assert!(runtime.attachment_chooser_pending.is_none());
+        assert_eq!(
+            runtime.error.as_deref(),
+            Some(
+                "This chat can attach only images (PNG, JPEG, GIF or WebP). Paste the contents of other files into your message instead."
+            )
+        );
+    });
+}
+
+#[test]
+fn attach_files_still_stages_images_for_an_images_only_provider() {
+    let _admission = attachment_draft::test_admission();
+    chat::attachment_assets::with_test_image(|image| {
+        let directory = tempfile::tempdir().unwrap();
+        let shot = directory.path().join("shot.png");
+        std::fs::copy(&image.path, &shot).unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat_for_provider(&mut app, Provider::Codex, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        Arc::make_mut(&mut runtime.snapshot)
+            .capabilities
+            .attachments = true;
+        assert!(runtime.accepts_draft_attachments());
+        let ticket = runtime.try_attachment_insert().unwrap();
+        runtime.attachment_chooser_pending = Some(ticket.id);
+
+        let task = app.handle_chat_ui(Action::Attached(
+            target,
+            ticket.clone(),
+            Ok(Some(vec![shot])),
+        ));
+
+        assert!(task.units() > 0, "accepted images must schedule staging");
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.error.is_none());
+        assert_eq!(runtime.pastes_pending, 1);
+        assert!(runtime.attachment_bookmarks.contains_key(&ticket.id));
+        assert!(runtime.attachment_chooser_pending.is_none());
+    });
+}
+
+#[test]
+fn attach_files_takes_any_file_for_a_provider_that_accepts_files() {
+    let _admission = attachment_draft::test_admission();
+    let directory = tempfile::tempdir().unwrap();
+    let notes = directory.path().join("notes.txt");
+    std::fs::write(&notes, "Meeting notes").unwrap();
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
+    let target = chat_runtime(&app, card).target;
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    Arc::make_mut(&mut runtime.snapshot)
+        .capabilities
+        .attachments = true;
+    assert!(runtime.accepts_draft_attachments());
+    let ticket = runtime.try_attachment_insert().unwrap();
+    runtime.attachment_chooser_pending = Some(ticket.id);
+
+    let task = app.handle_chat_ui(Action::Attached(
+        target,
+        ticket.clone(),
+        Ok(Some(vec![notes])),
+    ));
+
+    assert!(task.units() > 0, "accepted files must schedule staging");
+    let runtime = chat_runtime(&app, card);
+    assert!(runtime.error.is_none());
+    assert_eq!(runtime.pastes_pending, 1);
+    assert!(runtime.attachment_bookmarks.contains_key(&ticket.id));
+    assert!(runtime.attachment_chooser_pending.is_none());
+}
+
+#[test]
 fn cancelled_chooser_and_repeated_drops_cannot_queue_unbounded_image_staging() {
     let _admission = attachment_draft::test_admission();
     chat::attachment_assets::with_test_image(|image| {
