@@ -1509,6 +1509,25 @@ impl TerminalDescriptor {
     }
 }
 
+/// Whether a `ListedPage` continues a listing whose last terminal was `after`:
+/// its identities ascend strictly from past `after`, and only the final page
+/// may be empty. A listing that accepts only such pages ends and holds each
+/// terminal once.
+pub fn page_follows(
+    after: Option<TerminalId>,
+    page: &[TerminalDescriptor],
+    complete: bool,
+) -> bool {
+    let mut previous = after;
+    for terminal in page {
+        if previous.is_some_and(|previous| terminal.session.id <= previous) {
+            return false;
+        }
+        previous = Some(terminal.session.id);
+    }
+    complete || !page.is_empty()
+}
+
 /// A terminal repaint on the wire.
 ///
 /// `VisualResources::capture` already rebuilds only the rows Ghostty marked
@@ -2541,6 +2560,40 @@ mod tests {
     use crate::model::{BootId, HostIncarnation, HostSessionId};
 
     use super::*;
+
+    #[test]
+    fn a_page_follows_only_when_it_ascends_past_the_last_and_only_the_final_one_is_empty() {
+        let page = |ids: &[u128]| {
+            ids.iter()
+                .map(|&id| {
+                    TerminalDescriptor::relaunchable(
+                        TerminalId::from_uuid(uuid::Uuid::from_u128(id)),
+                        LaunchRecipe {
+                            program: "/bin/sh".into(),
+                            arguments: Vec::new(),
+                            working_directory: "/".into(),
+                            environment: Default::default(),
+                            unset_environment: Default::default(),
+                        },
+                        None,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let after = |id: u128| Some(TerminalId::from_uuid(uuid::Uuid::from_u128(id)));
+        assert!(page_follows(None, &page(&[1, 2]), false));
+        assert!(page_follows(after(2), &page(&[3]), false));
+        assert!(page_follows(after(3), &page(&[]), true));
+        assert!(page_follows(None, &page(&[]), true));
+        // An empty page that is not the last never ends the listing.
+        assert!(!page_follows(after(3), &page(&[]), false));
+        // One that repeats or goes back past `after`.
+        assert!(!page_follows(after(2), &page(&[2, 3]), true));
+        assert!(!page_follows(after(2), &page(&[1]), true));
+        // One out of order or repeating within itself.
+        assert!(!page_follows(None, &page(&[2, 1]), true));
+        assert!(!page_follows(None, &page(&[1, 1]), true));
+    }
 
     #[test]
     fn active_model_sidechannel_round_trips_without_changing_snapshot_encoding() {

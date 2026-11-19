@@ -116,6 +116,7 @@ impl Client {
             request,
             ClientRequest::Connect { .. }
                 | ClientRequest::List
+                | ClientRequest::ListPage { .. }
                 | ClientRequest::ChatList
                 | ClientRequest::ResolveUpgradeChat { .. }
                 | ClientRequest::ChatDetach { .. }
@@ -215,11 +216,36 @@ impl Client {
     }
 
     pub(super) fn terminals(&mut self) -> Result<Vec<ipc::TerminalDescriptor>, String> {
-        match self.request(ClientRequest::List, true)? {
-            ServerResponse::Listed { terminals } if terminals.len() <= 1024 => Ok(terminals),
-            _ => Err(
-                "Source terminal inventory is unsupported or exceeds the inspection limit".into(),
-            ),
+        const LIMIT: usize = 1024;
+        let unsupported =
+            || "Source terminal inventory is unsupported or exceeds the inspection limit".into();
+        if self.protocol < ipc::LIST_PAGES_PROTOCOL {
+            return match self.request(ClientRequest::List, true)? {
+                ServerResponse::Listed { terminals } if terminals.len() <= LIMIT => Ok(terminals),
+                _ => Err(unsupported()),
+            };
+        }
+        // A source that pages its inventory is read page by page, each one
+        // strictly after the last, so no single reply outgrows a frame.
+        let mut terminals = Vec::new();
+        loop {
+            let after = terminals
+                .last()
+                .map(|terminal: &ipc::TerminalDescriptor| terminal.session.id);
+            let ServerResponse::ListedPage {
+                terminals: page,
+                complete,
+            } = self.request(ClientRequest::ListPage { after }, true)?
+            else {
+                return Err(unsupported());
+            };
+            if !ipc::page_follows(after, &page, complete) || terminals.len() + page.len() > LIMIT {
+                return Err(unsupported());
+            }
+            terminals.extend(page);
+            if complete {
+                return Ok(terminals);
+            }
         }
     }
 

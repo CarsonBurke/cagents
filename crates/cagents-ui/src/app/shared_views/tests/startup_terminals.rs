@@ -65,8 +65,9 @@ fn serve(mut stream: std::os::unix::net::UnixStream, hosted: Vec<TerminalSession
                     proof: proof.clone(),
                     resumed: Vec::new(),
                 },
-                ClientRequest::List => ServerResponse::Listed {
+                ClientRequest::ListPage { after: None } => ServerResponse::ListedPage {
                     terminals: hosted.iter().map(descriptor).collect(),
+                    complete: true,
                 },
                 ClientRequest::Attach { terminal_id, .. } => ServerResponse::Attached {
                     terminal: descriptor(

@@ -2379,11 +2379,7 @@ fn serve_connection(
                 Ok(ServerResponse::ListedPage {
                     terminals,
                     complete,
-                }) if (complete || !terminals.is_empty())
-                    && terminals
-                        .iter()
-                        .all(|terminal| after.is_none_or(|after| terminal.session.id > after)) =>
-                {
+                }) if super::ipc::page_follows(after, &terminals, complete) => {
                     (terminals, complete)
                 }
                 Err(end) => return end,

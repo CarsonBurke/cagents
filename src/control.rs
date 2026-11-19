@@ -1158,11 +1158,7 @@ impl ControlClient {
                 } => {
                     // Each page must move past `after`, or the listing would
                     // never end.
-                    if !complete && terminals.is_empty()
-                        || terminals
-                            .iter()
-                            .any(|terminal| after.is_some_and(|after| terminal.session.id <= after))
-                    {
+                    if !crate::terminal_ipc::page_follows(after, &terminals, complete) {
                         return Err(ControlError::StalledListPage);
                     }
                     inventory.extend(terminals);
