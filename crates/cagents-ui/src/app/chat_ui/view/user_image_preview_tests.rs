@@ -175,9 +175,7 @@ fn restored_user_image_opens_viewer_from_its_rendered_preview() {
         .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
     drop(app.handle_chat_ui(open));
     let gallery = app
-        .chat_ui
-        .image_viewer
-        .as_ref()
+        .image_viewer(images::ViewerHost::Pane(target))
         .expect("clicked user image opens viewer");
     assert!(
         gallery.url().is_none(),
@@ -316,8 +314,9 @@ fn selected_child_user_image_uses_its_own_preview_despite_parent_id_collision() 
         unreachable!()
     };
     drop(app.handle_chat_ui(open));
-    assert!(app.chat_ui.image_viewer.is_some());
-    drop(app.handle_chat_ui(Action::CloseImage));
+    let host = images::ViewerHost::Pane(target);
+    assert!(app.image_viewer(host).is_some());
+    drop(app.handle_chat_ui(Action::CloseImage(host)));
     drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
     let runtime = app.chat_runtime_mut(target).unwrap();
     let Clicked { messages, .. } = click_prompt(&renderer, runtime, &parent);

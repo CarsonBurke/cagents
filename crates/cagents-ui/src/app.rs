@@ -10370,52 +10370,12 @@ impl Cagents {
         if let keyboard::Event::ModifiersChanged(modifiers) = &event {
             self.keyboard_modifiers = *modifiers;
         }
-        if let Some(gallery) = &self.chat_ui.image_viewer {
-            if let keyboard::Event::KeyPressed {
-                key,
-                physical_key,
-                modifiers,
-                repeat,
-                ..
-            } = &event
-            {
-                match key {
-                    // Layout-independent, like the other Ctrl chords.
-                    keyboard::Key::Character(_)
-                        if modifiers.command()
-                            && !modifiers.shift()
-                            && !modifiers.alt()
-                            && !modifiers.logo()
-                            && key
-                                .to_latin(*physical_key)
-                                .is_some_and(|key| key.eq_ignore_ascii_case(&'c')) =>
-                    {
-                        // A held chord copies once.
-                        if *repeat {
-                            return (Task::none(), Projection::Unchanged);
-                        }
-                        let image = gallery.selected_image();
-                        return (
-                            self.handle_chat_ui(chat_ui::Action::Image(
-                                image,
-                                chat_ui::images::ImageCommand::Copy,
-                            )),
-                            Projection::Full,
-                        );
-                    }
-                    // Escape is the viewer's own (`Gallery::view`), so that
-                    // one an open context menu claims closes only the menu.
-                    keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => {
-                        self.chat_ui.image_viewer.as_mut().unwrap().next(false);
-                    }
-                    keyboard::Key::Named(keyboard::key::Named::ArrowRight) => {
-                        self.chat_ui.image_viewer.as_mut().unwrap().next(true);
-                    }
-                    _ => {}
-                }
-            }
-            // Stepping through the gallery changes only the viewer.
-            return (Task::none(), Projection::Unchanged);
+        // The viewer dialog, a modal, takes every key. Its own Escape and an
+        // open context menu's are answered in `Gallery::dialog_view`.
+        if self.chat_ui.image_dialog.is_some() {
+            return self
+                .image_key(chat_ui::images::ViewerHost::Dialog, &event)
+                .unwrap_or((Task::none(), Projection::Unchanged));
         }
         if !captured
             && !self.workspace_inputs_blocked()
@@ -10686,6 +10646,10 @@ impl Cagents {
         if let Some(task) = self.chat_picker_key(&event) {
             return (task, Projection::Full);
         }
+        // Behind every popup, question and overlay in front of the pane.
+        if let Some(answer) = self.pane_image_key(&event, captured) {
+            return answer;
+        }
         if let Some(card) = self.workspace.focused()
             && !self.pane_content_inputs_blocked(card)
             && self.terminal_find.get(&card).is_some_and(|find| find.open)
@@ -10850,6 +10814,17 @@ impl Cagents {
             // Until its input is drawn the pane's title holds the keyboard
             // in its place: a focus aimed at a control that is not in the
             // tree blurs every widget instead. See `focus_pane_keyboard`.
+            // An image viewer over the transcript holds the pane's keyboard
+            // in the composer's place, so a press on the image or a return
+            // to the pane leaves the arrows browsing. What is typed still
+            // reaches the composer (`type_into_chat_input`).
+            Some(CardRuntime::Chat(runtime))
+                if self.chat_input_drawn(card)
+                    && runtime.image_viewer.is_some()
+                    && runtime.focus_control() == "chat-composer" =>
+            {
+                chat_ui::images::viewer_focus(card)
+            }
             Some(CardRuntime::Chat(runtime)) if self.chat_input_drawn(card) => {
                 card_control_id(card, runtime.focus_control())
             }
@@ -14550,7 +14525,7 @@ impl Cagents {
             || self.dirty_repository_close.is_some()
             || self.transient_work_close.is_some()
             || self.automation_ui.draft_dialog_open()
-            || self.chat_ui.image_viewer.is_some()
+            || self.chat_ui.image_dialog.is_some()
             || self.terminal_paste.is_some()
             || self.terminal_close_dialog_visible()
             || self.chat_close_dialog_visible()
@@ -15853,7 +15828,7 @@ impl Cagents {
             && self.transient_work_close.is_none()
             && !self.automation_ui.draft_dialog_open()
             && !self.device_ui.open
-            && self.chat_ui.image_viewer.is_none()
+            && self.chat_ui.image_dialog.is_none()
             && self.terminal_paste.is_none()
             && !self.session_recovery.open()
             && !self.daemon_health_ui.confirmation
@@ -16602,8 +16577,8 @@ impl Application for Cagents {
                 1.0,
             ));
         }
-        if let Some(gallery) = &self.chat_ui.image_viewer {
-            return Some(gallery.view());
+        if let Some(gallery) = &self.chat_ui.image_dialog {
+            return Some(gallery.dialog_view());
         }
         if let Some(dialog) = self.terminal_paste_dialog() {
             return Some(dialog);
@@ -17327,7 +17302,7 @@ impl Cagents {
             && (matches!(&message, Message::Sidebar(action) if workspace_destination(action).is_some())
                 || self.update_prepared
                 || self.workspace_inputs_blocked()
-                || self.chat_ui.image_viewer.is_some())
+                || self.chat_ui.image_dialog.is_some())
         {
             self.cancel_workspace_preview();
         }

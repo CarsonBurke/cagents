@@ -961,8 +961,8 @@ impl Gallery {
         }
     }
     /// The pixels the viewer shows now; Ctrl+C copies these.
-    pub(in crate::app) fn selected_image(&self) -> ImageRef {
-        ImageRef::Viewer(self.entries[self.selected].handle.id())
+    pub(in crate::app) fn selected_image(&self, host: ViewerHost) -> ImageRef {
+        ImageRef::Viewer(host, self.entries[self.selected].handle.id())
     }
     /// The viewer entry drawn with `image`, if it is still the one shown. A
     /// menu left open across navigation must not act on another image.
@@ -979,37 +979,125 @@ impl Gallery {
             url: self.entry_url(entry),
         })
     }
-    pub(in crate::app) fn view(&self) -> Element<'_, Message> {
+    /// The viewer over the transcript of the conversation `target` shows,
+    /// in a pane `width` wide. It holds the pane's keyboard while it is
+    /// open (see [`viewer_focus`]); the composer below it keeps its own.
+    pub(in crate::app) fn pane_view(&self, target: Target, width: f32) -> Element<'_, Message> {
+        let [toolbar, label, canvas, hint] =
+            self.parts(ViewerHost::Pane(target), width < COMPACT_TOOLBAR);
+        // A press on the image leaves the keyboard here rather than in the
+        // composer, so the arrows browse and Escape closes the viewer. The
+        // holder is no Tab stop and draws nothing of its own.
+        let canvas = widget::button::custom(canvas)
+            .id(viewer_focus(target.card))
+            .padding(0)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .class(cosmic::theme::Button::Custom {
+                active: Box::new(|_, _| widget::button::Style::new()),
+                disabled: Box::new(|_| widget::button::Style::new()),
+                hovered: Box::new(|_, _| widget::button::Style::new()),
+                pressed: Box::new(|_, _| widget::button::Style::new()),
+            });
+        widget::column::with_children(vec![toolbar, label, canvas.into(), hint])
+            .spacing(step::GAP_S)
+            .padding(iced::Padding::from([step::GAP_S, step::GAP_M]))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+    /// The viewer as a dialog over the workspace, for an image that no
+    /// conversation shows. It answers Escape itself, so nothing focused
+    /// beneath it can claim the key first.
+    pub(in crate::app) fn dialog_view(&self) -> Element<'_, Message> {
+        let host = ViewerHost::Dialog;
+        let dialog = dialog_ui::overlay(
+            dialog_ui::surface(
+                widget::column::with_children(self.parts(host, false))
+                    .spacing(step::GAP_S)
+                    .height(Length::Fill),
+                f32::MAX,
+            ),
+            Some(action(Action::CloseImage(host))),
+            1.0,
+        );
+        // Escape that an open context menu claims closes only the menu.
+        crate::interaction::unclaimed_key(dialog, move |event| {
+            matches!(
+                event,
+                iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+                    ..
+                }
+            )
+            .then(|| action(Action::CloseImage(host)))
+        })
+    }
+    /// The toolbar, the image's label, the canvas and the gesture hint, each
+    /// acting on the viewer `host` shows. A `compact` toolbar names its
+    /// commands by icon and tooltip, so a narrow pane keeps all of them.
+    fn parts(&self, host: ViewerHost, compact: bool) -> [Element<'_, Message>; 4] {
         let entry = &self.entries[self.selected];
-        let image = ImageRef::Viewer(entry.handle.id());
+        let image = ImageRef::Viewer(host, entry.handle.id());
         let navigation = self.entries.len() > 1;
+        let command = |glyph: Icon,
+                       label: &'static str,
+                       tip: &'static str,
+                       message: Option<Action>|
+         -> Element<'_, Message> {
+            if compact {
+                crate::ui_controls::icon_button(glyph, tip)
+                    .on_press_maybe(message.map(action))
+                    .into()
+            } else {
+                crate::interaction::tooltip(
+                    crate::ui_controls::button::secondary(label)
+                        .on_press_maybe(message.map(action)),
+                    tip,
+                )
+            }
+        };
         let toolbar = widget::row::with_children(vec![
             icon(
                 Icon::ChevronLeft,
                 "Previous image (Left)",
                 navigation,
-                Action::ImageNext(false),
+                Action::ImageNext(host, false),
             ),
-            design::caption(format!("{} / {}", self.selected + 1, self.entries.len())).into(),
+            design::caption(format!("{} / {}", self.selected + 1, self.entries.len()))
+                .wrapping(iced::widget::text::Wrapping::None)
+                .into(),
             icon(
                 Icon::ChevronRight,
                 "Next image (Right)",
                 navigation,
-                Action::ImageNext(true),
+                Action::ImageNext(host, true),
             ),
             iced::widget::Space::new().width(Length::Fill).into(),
-            crate::interaction::tooltip(
-                crate::ui_controls::button::secondary("Copy")
-                    .on_press(action(Action::Image(image, ImageCommand::Copy))),
+            command(
+                Icon::Copy,
+                "Copy",
                 "Copy image (Ctrl+C)",
+                Some(Action::Image(image, ImageCommand::Copy)),
             ),
-            crate::ui_controls::button::secondary("Fit")
-                .on_press(action(Action::ImageFit))
-                .into(),
-            crate::ui_controls::button::secondary("Open externally")
-                .on_press_maybe(self.url().map(|_| action(Action::ImageExternal)))
-                .into(),
-            icon(Icon::Close, "Close image (Esc)", true, Action::CloseImage),
+            command(
+                Icon::Compress,
+                "Fit",
+                "Fit the image to the viewer",
+                Some(Action::ImageFit(host)),
+            ),
+            command(
+                Icon::PopOut,
+                "Open externally",
+                "Open in another app",
+                self.url().map(|_| Action::ImageExternal(host)),
+            ),
+            icon(
+                Icon::Close,
+                "Close image (Esc)",
+                true,
+                Action::CloseImage(host),
+            ),
         ])
         .spacing(step::GAP_S)
         .align_y(iced::Alignment::Center);
@@ -1028,37 +1116,203 @@ impl Gallery {
                 self.entry_url(entry).is_some(),
             ),
         );
-        // Escape that an open context menu claims closes only the menu.
-        let dialog = dialog_ui::overlay(
-            dialog_ui::surface(
-                widget::column::with_children(vec![
-                    toolbar.into(),
-                    design::caption(entry.label.as_str()).into(),
-                    canvas,
-                    design::caption(
-                        "Scroll to zoom · Drag to pan · Left / Right to browse · Ctrl+C to copy",
-                    )
-                    .into(),
-                ])
-                .spacing(step::GAP_S)
-                .height(Length::Fill),
-                f32::MAX,
-            ),
-            Some(action(Action::CloseImage)),
-            1.0,
-        );
-        crate::interaction::unclaimed_key(dialog, |event| {
-            matches!(
-                event,
-                iced::keyboard::Event::KeyPressed {
-                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
-                    ..
-                }
+        [
+            toolbar.into(),
+            design::caption(entry.label.as_str()).into(),
+            canvas,
+            design::caption(
+                "Scroll to zoom · Drag to pan · Left / Right to browse · Ctrl+C to copy",
             )
-            .then(|| action(Action::CloseImage))
-        })
+            .into(),
+        ]
     }
 }
+
+/// Below this pane width the viewer's toolbar names its commands by icon:
+/// their labels and the navigation no longer fit on one row.
+const COMPACT_TOOLBAR: f32 = 520.0;
+
+/// Where an open image viewer is drawn, and so which one an action means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ViewerHost {
+    /// Over the transcript of the conversation `Target` shows. The pane's
+    /// composer and the rest of the workspace stay usable around it.
+    Pane(Target),
+    /// A dialog over the workspace, for an image no conversation shows: a
+    /// file opened from the device browser, itself a dialog.
+    Dialog,
+}
+
+/// The control that holds a pane's keyboard while its image viewer is open.
+pub(in crate::app) fn viewer_focus(card: CardId) -> iced::widget::Id {
+    card_control_id(card, "image-viewer")
+}
+
+impl Cagents {
+    /// The gallery the viewer `host` shows, if it is open.
+    pub(in crate::app) fn image_viewer(&self, host: ViewerHost) -> Option<&Gallery> {
+        match host {
+            ViewerHost::Pane(target) => match self.cards.get(&target.card) {
+                Some(CardRuntime::Chat(runtime)) if runtime.target == target => {
+                    runtime.image_viewer.as_ref()
+                }
+                _ => None,
+            },
+            ViewerHost::Dialog => self.chat_ui.image_dialog.as_ref(),
+        }
+    }
+    fn image_viewer_mut(&mut self, host: ViewerHost) -> Option<&mut Gallery> {
+        match host {
+            ViewerHost::Pane(target) => self.chat_runtime_mut(target)?.image_viewer.as_mut(),
+            ViewerHost::Dialog => self.chat_ui.image_dialog.as_mut(),
+        }
+    }
+    /// Answers a viewer control or key: `None` for an action that isn't one.
+    pub(super) fn image_viewer_action(&mut self, action: &Action) -> Option<Task<Message>> {
+        match *action {
+            Action::OpenImage(target, ref id) => {
+                let runtime = self.chat_runtime_mut(target)?;
+                let Some(gallery) = Gallery::new(runtime, id) else {
+                    return Some(Task::none());
+                };
+                runtime.image_viewer = Some(gallery);
+                // The keyboard moves to the viewer, as a press on the image
+                // would leave it, unless the pane doesn't hold it.
+                Some(self.focus_image_viewer(target))
+            }
+            Action::FocusImage(target) => Some(self.focus_image_viewer(target)),
+            Action::CloseImage(host) => {
+                match host {
+                    ViewerHost::Pane(target) => {
+                        let runtime = self.chat_runtime_mut(target)?;
+                        runtime.image_viewer = None;
+                        // Its controls go with it, so the keyboard returns
+                        // to the pane's own: the composer, usually.
+                        if self.card_holds_keyboard(target.card) {
+                            return Some(
+                                iced::widget::operation::focus(
+                                    self.card_keyboard_focus(target.card),
+                                )
+                                .map(cosmic::Action::App),
+                            );
+                        }
+                    }
+                    ViewerHost::Dialog => self.chat_ui.image_dialog = None,
+                }
+                Some(Task::none())
+            }
+            Action::ImageNext(host, forward) => {
+                if let Some(gallery) = self.image_viewer_mut(host) {
+                    gallery.next(forward);
+                }
+                Some(Task::none())
+            }
+            Action::ImageFit(host) => {
+                if let Some(gallery) = self.image_viewer_mut(host) {
+                    gallery.reset = gallery.reset.wrapping_add(1);
+                }
+                Some(Task::none())
+            }
+            Action::ImageExternal(host) => Some(
+                match self
+                    .image_viewer(host)
+                    .map(|gallery| gallery.selected_image(host))
+                {
+                    Some(image) => self.image_command(image, ImageCommand::OpenExternally),
+                    None => Task::none(),
+                },
+            ),
+            _ => None,
+        }
+    }
+    fn focus_image_viewer(&self, target: Target) -> Task<Message> {
+        if !self.card_holds_keyboard(target.card) {
+            return Task::none();
+        }
+        iced::widget::operation::focus(viewer_focus(target.card)).map(cosmic::Action::App)
+    }
+    /// A key for the focused pane's image viewer, which holds that pane's
+    /// keyboard rather than the whole window's. A key a control took, such
+    /// as an arrow or Ctrl+C in the composer, is that control's; so is
+    /// Escape there, which hands the keyboard to the viewer
+    /// ([`Action::FocusImage`]) for a second Escape to close it.
+    pub(in crate::app) fn pane_image_key(
+        &mut self,
+        event: &iced::keyboard::Event,
+        captured: bool,
+    ) -> Option<(Task<Message>, Projection)> {
+        if captured {
+            return None;
+        }
+        let card = self.workspace.focused()?;
+        if !self.card_holds_keyboard(card) {
+            return None;
+        }
+        let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
+            return None;
+        };
+        runtime.image_viewer.as_ref()?;
+        self.image_key(ViewerHost::Pane(runtime.target), event)
+    }
+    /// What `event` does in the open viewer `host`: Left and Right browse,
+    /// Ctrl+C copies the image shown and Escape closes a pane's viewer. The
+    /// dialog answers its own Escape (see [`Gallery::dialog_view`]).
+    pub(in crate::app) fn image_key(
+        &mut self,
+        host: ViewerHost,
+        event: &iced::keyboard::Event,
+    ) -> Option<(Task<Message>, Projection)> {
+        use iced::keyboard::{Key, key::Named};
+        let iced::keyboard::Event::KeyPressed {
+            key,
+            physical_key,
+            modifiers,
+            repeat,
+            ..
+        } = event
+        else {
+            return None;
+        };
+        let image = self.image_viewer(host)?.selected_image(host);
+        let plain = modifiers.is_empty();
+        match key {
+            Key::Named(Named::Escape) if plain && matches!(host, ViewerHost::Pane(_)) => Some((
+                self.image_viewer_action(&Action::CloseImage(host))
+                    .unwrap_or_else(Task::none),
+                Projection::Full,
+            )),
+            Key::Named(direction @ (Named::ArrowLeft | Named::ArrowRight)) if plain => {
+                drop(self.image_viewer_action(&Action::ImageNext(
+                    host,
+                    *direction == Named::ArrowRight,
+                )));
+                // Stepping through the gallery changes only the viewer.
+                Some((Task::none(), Projection::Unchanged))
+            }
+            // Layout-independent, like the other Ctrl chords.
+            Key::Character(_)
+                if modifiers.command()
+                    && !modifiers.shift()
+                    && !modifiers.alt()
+                    && !modifiers.logo()
+                    && key
+                        .to_latin(*physical_key)
+                        .is_some_and(|key| key.eq_ignore_ascii_case(&'c')) =>
+            {
+                // A held chord copies once.
+                if *repeat {
+                    return Some((Task::none(), Projection::Unchanged));
+                }
+                Some((
+                    self.image_command(image, ImageCommand::Copy),
+                    Projection::Full,
+                ))
+            }
+            _ => None,
+        }
+    }
+}
+
 impl Runtime {
     pub(super) fn image_preview(
         &self,

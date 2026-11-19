@@ -3167,18 +3167,28 @@ impl Runtime {
             )
         };
         // Keep the transcript mounted in its original layer slot while the
-        // chooser is open, preserving its native scroll and selection state.
+        // chooser or the image viewer covers it, preserving its native scroll
+        // and selection state, and what arrives meanwhile, such as a message
+        // sent while looking at an image. Either holds the slot's extent, so
+        // the composer below doesn't move as it opens or closes. The chooser
+        // is the transient one, opened over the viewer and closed back to it.
         content.push(crate::interaction::exclusive_layer(
             transcript_layer,
-            self.child_picker_view().map(|picker| {
-                widget::container(
-                    widget::container(picker)
-                        .width(Length::Fill)
-                        .max_width(super::layout::READING_COLUMN),
-                )
-                .center_x(Length::Fill)
-                .into()
-            }),
+            self.child_picker_view()
+                .map(|picker| {
+                    widget::container(
+                        widget::container(picker)
+                            .width(Length::Fill)
+                            .max_width(super::layout::READING_COLUMN),
+                    )
+                    .center_x(Length::Fill)
+                    .into()
+                })
+                .or_else(|| {
+                    self.image_viewer
+                        .as_ref()
+                        .map(|gallery| gallery.pane_view(target, content_width))
+                }),
         ));
         if selected.is_none() && self.unseen_activity && !self.active_scroll().at_bottom() {
             content.push(
@@ -3601,6 +3611,7 @@ impl Runtime {
             // the queue, and is not left to fall through to that walk.
             let take_back =
                 !recall_newer && (self.newest_take_back().is_some() || !self.recalling.is_empty());
+            let viewing = self.image_viewer.is_some() && self.child_picker.is_none();
             editor
                 .on_action(move |event| action(Action::Composer(target, event)))
                 .on_cursor(move |cursor| action(Action::ComposerCursor(target, cursor)))
@@ -3681,6 +3692,14 @@ impl Runtime {
                     }
                     let binding =
                         word_delete(&press).or_else(|| text_editor::Binding::from_key_press(press));
+                    // Escape leaves the draft for the image viewer above it
+                    // rather than for nowhere. Claiming the key keeps this
+                    // press from closing the viewer too; the next one does.
+                    if viewing && matches!(binding, Some(text_editor::Binding::Unfocus)) {
+                        return Some(text_editor::Binding::Custom(action(Action::FocusImage(
+                            target,
+                        ))));
+                    }
                     if matches!(binding, Some(text_editor::Binding::Paste)) {
                         Some(text_editor::Binding::Custom(action(Action::Paste(target))))
                     } else {
@@ -7333,6 +7352,9 @@ mod issue1506_tests;
 
 #[cfg(test)]
 mod user_image_preview_tests;
+
+#[cfg(test)]
+mod image_viewer_tests;
 
 #[cfg(test)]
 mod figure_tests;

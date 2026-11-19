@@ -472,10 +472,12 @@ pub enum Action {
     Figure(Target, u64, images::figure::Command),
     ThumbnailLoaded(Target, Arc<PathBuf>, images::Loaded),
     RetryThumbnails(Target),
-    CloseImage,
-    ImageNext(bool),
-    ImageFit,
-    ImageExternal,
+    /// Keyboard to the pane's image viewer, from its composer's Escape.
+    FocusImage(Target),
+    CloseImage(images::ViewerHost),
+    ImageNext(images::ViewerHost, bool),
+    ImageFit(images::ViewerHost),
+    ImageExternal(images::ViewerHost),
     /// A context menu, viewer control or shortcut acting on displayed pixels.
     Image(images::ImageRef, images::ImageCommand),
     /// PNG encoding finished; `None` when a newer copy superseded it first.
@@ -906,10 +908,11 @@ impl Action {
             Self::Figure(..) => "Figure",
             Self::ThumbnailLoaded(..) => "ThumbnailLoaded",
             Self::RetryThumbnails(..) => "RetryThumbnails",
-            Self::CloseImage => "CloseImage",
+            Self::FocusImage(..) => "FocusImage",
+            Self::CloseImage(..) => "CloseImage",
             Self::ImageNext(..) => "ImageNext",
-            Self::ImageFit => "ImageFit",
-            Self::ImageExternal => "ImageExternal",
+            Self::ImageFit(..) => "ImageFit",
+            Self::ImageExternal(..) => "ImageExternal",
             Self::Image(..) => "Image",
             Self::ImageCopied(..) => "ImageCopied",
             Self::CopyLiteral(..) => "CopyLiteral",
@@ -1045,11 +1048,13 @@ impl Action {
                 | Self::Files(..)
                 | Self::Tick
                 | Self::AccountPicker(_, false)
-                | Self::CloseImage
-                | Self::ImageNext(_)
-                | Self::ImageFit
-                | Self::ImageExternal
-                | Self::Image(images::ImageRef::Viewer(_), _)
+                // The dialog's own controls; a pane's viewer sits under a
+                // dialog like the rest of its pane.
+                | Self::CloseImage(images::ViewerHost::Dialog)
+                | Self::ImageNext(images::ViewerHost::Dialog, _)
+                | Self::ImageFit(images::ViewerHost::Dialog)
+                | Self::ImageExternal(images::ViewerHost::Dialog)
+                | Self::Image(images::ImageRef::Viewer(images::ViewerHost::Dialog, _), _)
                 | Self::ImageCopied(..)
         )
     }
@@ -1279,7 +1284,9 @@ pub(super) struct State {
     /// while the window runs for a channel with no name: `None` while the
     /// read runs, then the name it found, if any.
     opening_names: HashMap<(CardId, String), Option<Option<String>>>,
-    pub(super) image_viewer: Option<images::Gallery>,
+    /// The image viewer as a dialog, for an image no conversation shows. A
+    /// conversation's own images open in its pane: [`Runtime::image_viewer`].
+    pub(super) image_dialog: Option<images::Gallery>,
     files: HashMap<PathBuf, Arc<Vec<String>>>,
     sender: async_channel::Sender<(Target, Wake)>,
     receiver: async_channel::Receiver<(Target, Wake)>,
@@ -1356,7 +1363,7 @@ impl Default for State {
     fn default() -> Self {
         let (sender, receiver) = async_channel::unbounded();
         Self {
-            image_viewer: None,
+            image_dialog: None,
             channel_names: HashMap::new(),
             opening_names: HashMap::new(),
             files: HashMap::new(),
@@ -3216,6 +3223,10 @@ pub(super) struct Runtime {
     /// The images answers' Markdown shows, decoded as they come into view.
     figures: images::figure::Figures,
     child_picker: Option<child_navigation::Picker>,
+    /// The image viewer over this conversation's transcript. It stays open
+    /// as the conversation moves on, and closes only when the reader closes
+    /// it, searches the transcript, or the pane goes.
+    pub(super) image_viewer: Option<images::Gallery>,
     /// The child whose tab holds keyboard focus. The tab strip reports it, so
     /// the next frame keeps that tab mounted wherever its state sorts it.
     child_tab_focus: std::rc::Rc<std::cell::RefCell<Option<String>>>,
@@ -4401,6 +4412,7 @@ impl Runtime {
             scroll_memory: Default::default(),
             figures: Default::default(),
             child_picker: None,
+            image_viewer: None,
             child_tab_focus: Default::default(),
             child_ordinals: Default::default(),
             asked_after: HashSet::new(),
@@ -7634,6 +7646,8 @@ impl Cagents {
             return None;
         };
         runtime.find.get_or_insert_with(String::new);
+        // Find shows its matches in the transcript the viewer covers.
+        runtime.image_viewer = None;
         Some(
             iced::widget::operation::focus(card_control_id(card, "chat-find"))
                 .map(cosmic::Action::App),
@@ -8585,6 +8599,10 @@ impl Cagents {
         let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) else {
             return None;
         };
+        // An image viewer covers the transcript: it would scroll unseen.
+        if runtime.image_viewer.is_some() {
+            return None;
+        }
         use keyboard::key::Named;
         let id = card_control_id(card, "chat-transcript");
         let task = match key {
@@ -15102,32 +15120,13 @@ impl Cagents {
                     }
                 }
             }
-            Action::OpenImage(target, id) => {
-                if let Some(runtime) = self.chat_runtime_mut(target) {
-                    let gallery = images::Gallery::new(runtime, &id);
-                    self.chat_ui.image_viewer = gallery;
-                }
-            }
-            Action::CloseImage => self.chat_ui.image_viewer = None,
-            Action::ImageNext(forward) => {
-                if let Some(gallery) = &mut self.chat_ui.image_viewer {
-                    gallery.next(forward);
-                }
-            }
-            Action::ImageFit => {
-                if let Some(gallery) = &mut self.chat_ui.image_viewer {
-                    gallery.reset = gallery.reset.wrapping_add(1);
-                }
-            }
-            Action::ImageExternal => {
-                if let Some(image) = self
-                    .chat_ui
-                    .image_viewer
-                    .as_ref()
-                    .map(images::Gallery::selected_image)
-                {
-                    return self.image_command(image, images::ImageCommand::OpenExternally);
-                }
+            Action::OpenImage(..)
+            | Action::FocusImage(_)
+            | Action::CloseImage(_)
+            | Action::ImageNext(..)
+            | Action::ImageFit(_)
+            | Action::ImageExternal(_) => {
+                return self.image_viewer_action(&action).unwrap_or_else(Task::none);
             }
             Action::Image(image, command) => return self.image_command(image, command),
             // A superseded copy reports nothing, not even its failure.
