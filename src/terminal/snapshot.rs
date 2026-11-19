@@ -685,7 +685,8 @@ mod tests {
         .unwrap();
         let uri = format!("https://example.com/{}", "a".repeat(1200));
         terminal.vt_write(
-            format!("\x1b]8;;{uri}\x1b\\linked\x1b]8;;\x1b\\\r\na漢b\r\na👩‍💻b").as_bytes(),
+            format!("\x1b]8;;{uri}\x1b\\linked\x1b]8;;\x1b\\\r\na漢b\r\n\x1b[?2027ha👩‍💻b")
+                .as_bytes(),
         );
         let mut visual = VisualResources::new().unwrap();
         let live = visual.capture(&terminal, 1, true, None).unwrap().unwrap();
