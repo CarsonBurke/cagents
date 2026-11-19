@@ -21,6 +21,24 @@ pub(super) fn copy_field(item: &Item) -> Option<i64> {
     }
 }
 
+/// Whether a development build under native evidence should answer a copy
+/// as though its item changed after the client's snapshot: while
+/// `home/.config/fixture-text-copy-changed` exists in the fixture, every
+/// conversation copy is refused, and removing the file lets the same copy
+/// succeed again. The store's sources stay as they are, so the client never
+/// sees a newer one.
+fn changed_by_fixture() -> bool {
+    #[cfg(feature = "development")]
+    if std::env::var_os("CAGENTS_EVIDENCE_FIXTURE").is_some_and(|root| {
+        PathBuf::from(root)
+            .join("home/.config/fixture-text-copy-changed")
+            .exists()
+    }) {
+        return true;
+    }
+    false
+}
+
 impl Store {
     pub(super) fn copy_parent_source(
         &self,
@@ -147,7 +165,7 @@ impl Store {
         let Some((id, field, revision, total)) = record else {
             return Err("The full text is no longer available in the owned cache".into());
         };
-        if revision != source.revision || source.bytes > total {
+        if revision != source.revision || source.bytes > total || changed_by_fixture() {
             return Err(crate::chat::TEXT_COPY_CHANGED.into());
         }
         if offset > source.bytes {
