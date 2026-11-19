@@ -11239,18 +11239,27 @@ fn deleted_working_directory_keeps_exact_history_readable_without_a_provider() {
             .unwrap_err()
             .contains("read-only")
     );
-    handle.command(Command::LoadEarlier).unwrap();
-    let snapshot = handle.snapshot(None).unwrap();
-    assert!(snapshot.items.iter().any(
-        |item| matches!(&item.content, ItemContent::Text { text, .. } if text == "Saved prompt 20")
-    ));
-    assert!(snapshot.has_earlier);
-    handle.command(Command::LoadEarlier).unwrap();
-    let snapshot = handle.snapshot(None).unwrap();
-    assert!(snapshot.items.iter().any(
-        |item| matches!(&item.content, ItemContent::Text { text, .. } if text == "Saved prompt 0")
-    ));
-    assert!(!snapshot.has_earlier);
+    // Each earlier page slides the window back by half of it, so the
+    // history is read a window at a time until its start.
+    let mut seen = std::collections::BTreeSet::new();
+    let mut snapshot = snapshot;
+    let mut pages = 0;
+    while snapshot.has_earlier {
+        pages += 1;
+        assert!(pages <= 20, "paging back never reached the start");
+        handle.command(Command::LoadEarlier).unwrap();
+        snapshot = handle.snapshot(None).unwrap();
+        seen.extend(snapshot.items.iter().filter_map(|item| {
+            match &item.content {
+                ItemContent::Text { text, .. } => text
+                    .strip_prefix("Saved prompt ")
+                    .and_then(|index| index.parse::<usize>().ok()),
+                _ => None,
+            }
+        }));
+    }
+    // Every prompt before the first window was shown on the way.
+    assert!((0..120).all(|index| seen.contains(&index)), "{seen:?}");
     handle.close().unwrap();
 
     let mut traversal = launch.clone();
