@@ -18,8 +18,8 @@
 # The turn reads, searches and tests in one group of steps, starts four
 # general-purpose agents, thinks without anything to read, starts a fifth,
 # thinks again and runs two more commands, the sequence from the issue. It
-# then holds for 30 seconds, working, before the agents report and the
-# answer arrives.
+# then holds for 75 seconds, working, which leaves the narrow scene time to
+# split its panes, before the agents report and the answer arrives.
 #
 # Scenes, each shooting with the side's prefix as native-evidence does, and
 # with LABEL, when given, after "rhythm-":
@@ -188,7 +188,7 @@ working_and_finished() {
     sleep 3
     scroll_top
     shot "rhythm-${label}${1}working"
-    wait_recorded 'rhythm-answer-1' 60
+    wait_recorded 'rhythm-answer-1' 120
     sleep 3
     scroll_top
     shot "rhythm-${label}${1}finished"

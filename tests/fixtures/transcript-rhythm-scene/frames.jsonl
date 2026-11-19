@@ -43,7 +43,7 @@
 {"type":"user","uuid":"rhythm-tokens-@TURN@-result","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"rhythm-tokens-@TURN@","is_error":false,"content":"The fixture spacing tokens are consistent."}]}}
 {"type":"assistant","uuid":"rhythm-lint-@TURN@-call","message":{"id":"rhythm-lint-@TURN@-call","role":"assistant","content":[{"type":"tool_use","id":"rhythm-lint-@TURN@","name":"Bash","input":{"command":"printf lint-clean","description":"Lint the sidebar styles"}}]}}
 {"type":"user","uuid":"rhythm-lint-@TURN@-result","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"rhythm-lint-@TURN@","is_error":false,"content":"No lint findings in the fixture styles."}]}}
-{"_sleep":30}
+{"_sleep":75}
 {"type":"system","subtype":"task_notification","uuid":"rhythm-direction-1-@TURN@-done","task_id":"rhythm-direction-1-task-@TURN@","tool_use_id":"rhythm-direction-1-@TURN@","status":"completed","summary":"Sidebar direction 1 is drafted."}
 {"type":"system","subtype":"task_notification","uuid":"rhythm-direction-2-@TURN@-done","task_id":"rhythm-direction-2-task-@TURN@","tool_use_id":"rhythm-direction-2-@TURN@","status":"completed","summary":"Sidebar direction 2 is drafted."}
 {"type":"system","subtype":"task_notification","uuid":"rhythm-direction-3-@TURN@-done","task_id":"rhythm-direction-3-task-@TURN@","tool_use_id":"rhythm-direction-3-@TURN@","status":"completed","summary":"Sidebar direction 3 is drafted."}
