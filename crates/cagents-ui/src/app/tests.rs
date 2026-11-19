@@ -4415,8 +4415,12 @@ fn surfaces_and_rules_reach_a_free_right_edge_while_controls_keep_out_of_its_bor
         app.window_width = width;
         assert_eq!(app.trailing_edge_inset(), border);
         if inspector {
-            // A pane measured wide enough to dock its inspector.
-            drop(app.workspace.resize_viewport(width - border));
+            // A pane measured wide enough to dock its inspector, as the
+            // strip beside the sidebar measures itself, so the inspector
+            // ends where the window does rather than past it.
+            let sidebar =
+                sidebar::effective_width(app.projects_sidebar_mode(), app.settings.sidebar_width);
+            drop(app.workspace.resize_viewport(width - sidebar));
             let card = app.workspace.focused().unwrap();
             app.open_pane_inspector_now(card);
             assert_eq!(
