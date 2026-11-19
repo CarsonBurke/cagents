@@ -730,7 +730,8 @@ install_acp() {
     [ "$(cat -- "$state/acp" 2>/dev/null)" = 1 ] || return 0
     # Antigravity's sign-in lives in ~/.gemini; an account whose home is
     # missing was never set up.
-    mkdir -p -- "$fixture/libexec/acp" "$fixture/home/.gemini" "$fixture/acp/agy" "$fixture/acp/muse"
+    # Muse keeps its sign-in in $XDG_CONFIG_HOME/muse.
+    mkdir -p -- "$fixture/libexec/acp" "$fixture/home/.gemini" "$fixture/config/muse" "$fixture/acp/agy" "$fixture/acp/muse"
     install -m 644 -t "$fixture/libexec/acp" -- "$tool_root/tests/fixtures/fake-acp-agent.py"
     install -m 755 "$tool_root/tests/fixtures/fixture-acp.sh" "$fixture/bin/agy"
     install -m 755 "$tool_root/tests/fixtures/fixture-acp.sh" "$fixture/bin/muse-upstream"
