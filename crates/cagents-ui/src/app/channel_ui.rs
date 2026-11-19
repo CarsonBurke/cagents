@@ -500,7 +500,6 @@ struct PendingReopen {
 pub(super) enum Reopen {
     Conversation {
         entry: Box<crate::persistence::SavedConversation>,
-        prepared: bool,
         generation: u64,
         replace: Option<CardId>,
     },
@@ -1150,13 +1149,12 @@ impl Cagents {
             match intent {
                 Reopen::Conversation {
                     entry,
-                    prepared,
                     generation,
                     replace,
                 } => {
-                    tasks.push(self.finish_deferred_conversation(
-                        *entry, prepared, generation, replace, same_home,
-                    ));
+                    tasks.push(
+                        self.finish_deferred_conversation(*entry, generation, replace, same_home),
+                    );
                 }
                 Reopen::Pane(card) if same_home => tasks.push(self.reopen_closed_pane(card)),
                 Reopen::Pane(_) => {}
@@ -2202,6 +2200,9 @@ impl Cagents {
             self.sidebar_state.forget_card_attention(card);
             if passive {
                 self.shared_chat_detach(card);
+                // Nothing started in a pane still reopening; its late answer
+                // finds nothing to start.
+                self.forget_reopening(card);
             } else {
                 self.chat_discard(card);
             }

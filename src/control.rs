@@ -713,7 +713,7 @@ pub enum ControlError {
     Configure(#[source] io::Error),
     #[error(transparent)]
     Frame(#[from] FrameError),
-    #[error("the daemon did not answer within {} s", timeout.as_secs_f64())]
+    #[error("the daemon did not answer within {}", reply_budget(*timeout))]
     ReplyTimeout {
         timeout: Duration,
         #[source]
@@ -2862,6 +2862,18 @@ impl HandshakeClient {
         }
     }
 }
+/// How long a reply was awaited, as a person reads it: whole seconds, or a
+/// tenth of a second under one. The budget is often what remained of a
+/// deadline, such as 4.999918217 s of five, which reads as "5 s".
+pub(crate) fn reply_budget(timeout: Duration) -> String {
+    let seconds = timeout.as_secs_f64();
+    if seconds >= 0.95 {
+        format!("{seconds:.0} s")
+    } else {
+        format!("{seconds:.1} s")
+    }
+}
+
 fn reply_error(error: FrameError, timeout: Option<Duration>) -> ControlError {
     if let Some(timeout) = timeout
         && matches!(&error, FrameError::Io(e) if matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock))
@@ -6046,6 +6058,28 @@ fn emit_error(json_output: bool, error: &AppError) {
 #[cfg(test)]
 mod tests {
     use super::ControlError;
+
+    #[test]
+    fn a_reply_timeout_reads_as_the_budget_it_was_given() {
+        use std::time::Duration;
+        let timeout = |budget| ControlError::ReplyTimeout {
+            timeout: budget,
+            error: super::FrameError::Io(std::io::ErrorKind::TimedOut.into()),
+        };
+        // What remained of a five second deadline.
+        assert_eq!(
+            timeout(Duration::from_nanos(4_999_918_217)).to_string(),
+            "the daemon did not answer within 5 s"
+        );
+        assert_eq!(
+            timeout(Duration::from_secs(30)).to_string(),
+            "the daemon did not answer within 30 s"
+        );
+        assert_eq!(
+            timeout(Duration::from_millis(250)).to_string(),
+            "the daemon did not answer within 0.2 s"
+        );
+    }
 
     #[cfg(feature = "host")]
     #[test]
@@ -10833,7 +10867,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("the daemon did not answer within 6."),
+                .contains("the daemon did not answer within 6 s"),
             "{error}"
         );
         server.join().unwrap();
