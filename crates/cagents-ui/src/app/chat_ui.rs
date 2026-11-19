@@ -3288,6 +3288,9 @@ pub(super) struct Runtime {
     /// The tile whose image the composer's caret is on, which the tray shows
     /// as it shows a hovered one.
     caret_reference: Option<uuid::Uuid>,
+    /// The draft image the tray last asked to open; a slower load of an
+    /// earlier one arrives to find it is no longer wanted.
+    opening_attachment: Option<Attachment>,
     thumbnails: thumbnails::Cache,
     /// Clipboard reads and image writes still destined for this draft.
     pastes_pending: usize,
@@ -4682,6 +4685,7 @@ impl Runtime {
             composer_undo: Default::default(),
             composer_undo_stash: None,
             caret_reference: None,
+            opening_attachment: None,
             thumbnails: thumbnails::Cache::default(),
             pastes_pending: 0,
             attachment_bookmarks: HashMap::new(),
@@ -15960,13 +15964,18 @@ impl Cagents {
                 }
             }
             Action::OpenAttachment(target, index) => {
-                let Some(attachment) = self
-                    .chat_runtime_mut(target)
-                    .and_then(|runtime| runtime.attachments.get(index).cloned())
-                    .filter(view::is_image_attachment)
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                let Some(attachment) = runtime
+                    .attachments
+                    .get(index)
+                    .filter(|attachment| view::is_image_attachment(attachment))
+                    .cloned()
                 else {
                     return Task::none();
                 };
+                runtime.opening_attachment = Some(attachment.clone());
                 return cosmic::task::future(async move {
                     let source = attachment.clone();
                     let loaded = images::worker(move || images::attachment_preview(&source)).await;
@@ -15977,7 +15986,12 @@ impl Cagents {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
-                // An image the reader removed while it loaded stays closed.
+                // Only the image asked for last opens, and not one the reader
+                // removed while it loaded.
+                if runtime.opening_attachment.as_ref() != Some(&attachment) {
+                    return Task::none();
+                }
+                runtime.opening_attachment = None;
                 if !runtime.attachments.contains(&attachment) {
                     return Task::none();
                 }
