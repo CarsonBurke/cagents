@@ -14749,7 +14749,7 @@ impl Cagents {
                         // after it, carries the choice to the step's own
                         // row, which it turns back into.
                         let only = match turn.steps.as_slice() {
-                            [only] => runtime
+                            [only] if turn.thinking => runtime
                                 .snapshot
                                 .items
                                 .get(only.index)
