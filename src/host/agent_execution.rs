@@ -2684,7 +2684,16 @@ fn console_line(item: &chat::Item, now: u64) -> Option<String> {
                 .and_then(|verb| label.strip_prefix(verb))
                 .filter(|target| !target.is_empty())
                 .unwrap_or(label);
-            let target = first_line(if label.is_empty() { command } else { label });
+            let target = if *action == CommandAction::Run {
+                // Like native step_label, show what ran: a description reads as a second verb after "Ran".
+                first_line(if command.trim().is_empty() {
+                    label
+                } else {
+                    command
+                })
+            } else {
+                first_line(if label.is_empty() { command } else { label })
+            };
             let exit = match (status, exit_code) {
                 (ToolStatus::Failed, Some(code)) => format!(" (failed, exit {code})"),
                 _ => outcome(status).to_owned(),

@@ -5891,7 +5891,7 @@ fn console_lines_summarize_steps_without_their_payloads() {
         format!(
             "Assistant: Done.\n\
              Ran cargo test --locked\n\
-             Ran Run the tests (failed, exit 101)\n\
+             Ran cargo test --locked (failed, exit 101)\n\
              Read src/app.rs\n\
              Called Agent\n\
              Called Agent (denied)\n\
@@ -5930,6 +5930,34 @@ fn console_lines_summarize_steps_without_their_payloads() {
         .filter_map(|item| console_line(item, 0))
         .collect::<String>();
     assert!(after.starts_with(&before) && after.len() > before.len());
+}
+
+#[test]
+fn a_console_command_line_falls_back_to_its_description_only_without_a_command() {
+    let command = |command: &str| chat::Item {
+        started_at: None,
+        id: "command".into(),
+        role: chat::Role::Assistant,
+        content: chat::ItemContent::Command {
+            label: "Run the tests".into(),
+            command: command.into(),
+            working_directory: String::new(),
+            action: chat::CommandAction::Run,
+            status: chat::ToolStatus::Succeeded,
+            exit_code: None,
+            duration_ms: None,
+            output: String::new(),
+        },
+        at: None,
+    };
+    assert_eq!(
+        console_line(&command(" \n"), 0).as_deref(),
+        Some("Ran Run the tests\n")
+    );
+    assert_eq!(
+        console_line(&command("cargo test --locked\nexit 0"), 0).as_deref(),
+        Some("Ran cargo test --locked\n")
+    );
 }
 
 fn console_snapshot(texts: &[&str], busy: bool) -> chat::Snapshot {
@@ -6156,16 +6184,16 @@ fn console_counts_the_files_a_paged_edit_adds_in_each_part() {
 }
 
 /// A step is never paged, so a label that reads like a part mark is the
-/// provider's own and is printed as given.
+/// provider's own and is printed as given when no command is supplied.
 #[test]
 fn console_keeps_a_label_that_reads_like_a_part_mark() {
-    let command = chat::Item {
+    let command = |command: &str| chat::Item {
         started_at: None,
         id: "command".into(),
         role: chat::Role::Assistant,
         content: chat::ItemContent::Command {
             label: "cargo test (part 1/8)".into(),
-            command: "cargo test".into(),
+            command: command.into(),
             working_directory: String::new(),
             action: chat::CommandAction::Run,
             status: chat::ToolStatus::Succeeded,
@@ -6176,7 +6204,11 @@ fn console_keeps_a_label_that_reads_like_a_part_mark() {
         at: None,
     };
     assert_eq!(
-        console_line(&command, 0).as_deref(),
+        console_line(&command("cargo test"), 0).as_deref(),
+        Some("Ran cargo test\n")
+    );
+    assert_eq!(
+        console_line(&command(""), 0).as_deref(),
         Some("Ran cargo test (part 1/8)\n")
     );
 }
