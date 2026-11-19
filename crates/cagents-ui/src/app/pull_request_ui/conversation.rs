@@ -1291,7 +1291,11 @@ mod tests {
         state.update(pending(2, vec![row(4, Relation::Created)]));
         assert_eq!(state.phase(), Phase::Listed);
         state.update(listed(conversation, 3, Vec::new(), false));
-        assert_eq!(state.phase(), Phase::Listed, "a read transcript with no work");
+        assert_eq!(
+            state.phase(),
+            Phase::Listed,
+            "a read transcript with no work"
+        );
     }
 
     fn worktree(path: &str, pull_request: Option<u64>) -> ConversationWorktree {
