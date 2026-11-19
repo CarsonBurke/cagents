@@ -722,23 +722,32 @@ fn launch_options(spec: &crate::agent_execution::Spec) -> Vec<String> {
     if let Some(model) = &spec.model {
         arguments.extend(["--model".into(), model.clone()]);
     }
+    // An ACP agent's terminal command line names its own modes, which the
+    // spec names by what they mean.
+    let acp = spec.provider.acp();
     if let Some(mode) = &spec.permission_mode {
         let flag = match spec.provider {
-            Provider::Claude => "--permission-mode",
-            Provider::Omp => "--approval-mode",
-            Provider::Codex => "--ask-for-approval",
-            // Their own launch options; no native chat runs them yet.
-            Provider::Antigravity => "--mode",
-            Provider::Muse => "--approval-mode",
+            Provider::Claude => Some("--permission-mode"),
+            Provider::Omp => Some("--approval-mode"),
+            Provider::Codex => Some("--ask-for-approval"),
+            Provider::Antigravity | Provider::Muse => acp.map(|acp| acp.mode_option),
         };
-        arguments.extend([flag.into(), mode.clone()]);
+        let mode = acp.map_or(mode.as_str(), |acp| acp.own_mode(mode));
+        if let Some(flag) = flag
+            && acp.is_none_or(|acp| mode != acp.default_mode)
+        {
+            arguments.extend([flag.into(), mode.to_owned()]);
+        }
     }
     if let Some(effort) = &spec.reasoning_effort {
         arguments.extend(match spec.provider {
             Provider::Claude => ["--effort".into(), effort.clone()],
             Provider::Omp => ["--thinking".into(), effort.clone()],
-            Provider::Antigravity => ["--effort".into(), effort.clone()],
-            Provider::Muse => ["--reasoning-effort".into(), effort.clone()],
+            Provider::Antigravity | Provider::Muse => [
+                acp.map_or("--reasoning-effort", |acp| acp.effort_option)
+                    .into(),
+                effort.clone(),
+            ],
             Provider::Codex => [
                 "--config".into(),
                 format!(

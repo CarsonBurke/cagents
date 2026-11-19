@@ -818,8 +818,8 @@ fn resolve_source(
         Provider::Codex => "This terminal is not associated with a managed thread. Open New thread to use native and CLI views of one conversation.",
         Provider::Claude => "Claude has not published an exact live conversation yet. Retry once its live session is available; the terminal has not been stopped.",
         Provider::Omp => "OMP has not published an exact live conversation or fresh-session boundary for this terminal. The terminal has not been stopped; no recent history will be selected.",
-        // Refused above: they have no native chat to switch to.
-        Provider::Antigravity | Provider::Muse => "This terminal's provider has no native chat yet.",
+        // An ACP agent publishes no live conversation of its own.
+        Provider::Antigravity | Provider::Muse => "This terminal does not name its conversation, so it cannot switch to chat. Resume a conversation by its ID in the terminal, then retry.",
         };
         if provider == Provider::Codex { unavailable(message) } else { retryable_unavailable(message) }
     })?;

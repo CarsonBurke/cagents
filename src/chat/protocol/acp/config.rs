@@ -147,6 +147,25 @@ impl Config {
         (self.model, self.reasoning, self.mode) = (model, reasoning, mode);
     }
 
+    /// Drops the models cagents does not offer from every list of them.
+    pub fn retain_models(&mut self, offered: fn(&str) -> bool) {
+        for select in [self.model.as_mut(), self.legacy_models.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            select.choices.retain(|choice| offered(&choice.value));
+        }
+    }
+
+    /// `model` read as an offered model and an offered reasoning level
+    /// joined by a hyphen, as a combined model identifier names both.
+    pub fn split_model(&self, model: &str) -> Option<(String, String)> {
+        let reasoning = self.reasoning.as_ref()?;
+        let (base, level) = model.rsplit_once('-')?;
+        (self.offers_model(base) && reasoning.name_of(level).is_some())
+            .then(|| (base.to_owned(), level.to_owned()))
+    }
+
     /// The agent changed its mode itself, as `current_mode_update` reports.
     pub fn mode_changed(&mut self, mode: &str) {
         if let Some(select) = self.mode.as_mut().or(self.legacy_modes.as_mut()) {

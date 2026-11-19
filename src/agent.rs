@@ -157,6 +157,9 @@ struct ProviderAdapter {
     /// Whether cagents can run this provider's conversations as native chat.
     /// Without it the provider runs only in a terminal.
     native_chat: bool,
+    /// What cagents knows of a provider whose native chat is the Agent
+    /// Client Protocol, for one that serves it.
+    acp: Option<Acp>,
     #[cfg(feature = "host")]
     forwards_to_native_child: bool,
     #[cfg(feature = "host")]
@@ -169,6 +172,50 @@ struct ProviderAdapter {
         ),
         String,
     >,
+}
+
+/// How a provider that serves the Agent Client Protocol spells its session
+/// settings on its terminal command line, and what its permission modes mean.
+///
+/// A terminal recipe and a native ACP conversation share one launch: the
+/// recipe is what a terminal would run, and the provider's ACP profile reads
+/// these options from it to configure the session it opens.
+#[derive(Debug, Clone, Copy)]
+pub struct Acp {
+    /// The option naming the permission mode, such as agy's `--mode`.
+    pub mode_option: &'static str,
+    /// The option naming the reasoning effort, such as agy's `--effort`.
+    pub effort_option: &'static str,
+    /// Each of the agent's own mode identifiers, beside the cagents mode
+    /// that means the same, which the interface and the CLI name it by. A
+    /// mode not listed keeps its own identifier.
+    pub modes: &'static [(&'static str, &'static str)],
+    /// The agent's mode its terminal starts in without the mode option, which
+    /// its command line may not accept by name.
+    pub default_mode: &'static str,
+}
+
+impl Acp {
+    /// The cagents name for the agent's mode `mode`.
+    pub fn mode_meaning(self, mode: &str) -> &str {
+        self.modes
+            .iter()
+            .find(|(own, _)| *own == mode)
+            .map_or(mode, |(_, meaning)| *meaning)
+    }
+
+    /// The agent's own mode for the cagents mode `meaning`.
+    pub fn own_mode(self, meaning: &str) -> &str {
+        self.modes
+            .iter()
+            .find(|(_, candidate)| *candidate == meaning)
+            .map_or(meaning, |(own, _)| *own)
+    }
+
+    /// The cagents names of the agent's known modes, in its order.
+    pub fn mode_meanings(self) -> impl Iterator<Item = &'static str> {
+        self.modes.iter().map(|(_, meaning)| *meaning)
+    }
 }
 
 const ADAPTERS: [ProviderAdapter; 5] = [
@@ -291,6 +338,17 @@ impl Provider {
         self.adapter().native_chat
     }
 
+    /// How this provider serves the Agent Client Protocol, for one whose
+    /// native chat speaks it.
+    pub fn acp(self) -> Option<Acp> {
+        self.adapter().acp
+    }
+
+    /// Whether this provider's native chat is the Agent Client Protocol.
+    pub fn speaks_acp(self) -> bool {
+        self.adapter().acp.is_some()
+    }
+
     /// Why a native conversation with this provider cannot start, for a
     /// provider without native chat.
     pub fn native_chat_refusal(self) -> String {
@@ -375,7 +433,7 @@ impl Provider {
 
     /// Read only the canonical selector position in an already normalized recipe.
     /// Shared checkpoint validation uses this parser before any daemon starts.
-    pub(crate) fn resume_id(self, arguments: &[String]) -> Option<&str> {
+    pub fn resume_id(self, arguments: &[String]) -> Option<&str> {
         let (selector, id) = if self.adapter().resume_precedes_options {
             match arguments {
                 [selector, id, ..] => (selector, id),

@@ -52,6 +52,13 @@ pub struct Profile {
     pub launch: fn(&Launch) -> Result<Startup, String>,
     /// The largest image a prompt may carry inline.
     pub max_image_bytes: u64,
+    /// Each of the agent's own permission modes beside the cagents mode that
+    /// means the same, which the reader and the CLI choose it by. A mode not
+    /// listed keeps its own identifier.
+    pub modes: &'static [(&'static str, &'static str)],
+    /// Whether a model the agent lists is one cagents offers the reader,
+    /// such as one that does not share their work beyond the conversation.
+    pub offers_model: fn(&str) -> bool,
     /// Whether an error reply means the user has to sign in again. ACP
     /// reserves `-32000` for this; [`auth_required`] checks only that.
     pub sign_in_required: fn(&Value) -> bool,
@@ -78,9 +85,9 @@ pub fn auth_required(error: &Value) -> bool {
     error["code"].as_i64() == Some(rpc::AUTH_REQUIRED)
 }
 
-/// How a sign-in failure begins, which [`chat::requires_sign_in`]'s phrases
-/// recognise once an ACP provider is admitted there.
-pub const SIGN_IN_PREFIX: &str = "Authentication required";
+/// How a sign-in failure begins, which [`chat::requires_sign_in`]
+/// recognises for an ACP provider.
+pub const SIGN_IN_PREFIX: &str = chat::ACP_SIGN_IN_PREFIX;
 
 pub fn create(
     profile: &'static Profile,
@@ -298,7 +305,12 @@ impl Acp {
             compact: self.compacts(),
             model_selection: self.config.model_selection(),
             reasoning_selection: self.config.reasoning_selection(),
-            permission_modes: self.config.mode_ids(),
+            permission_modes: self
+                .config
+                .mode_ids()
+                .iter()
+                .map(|mode| self.profile.mode_meaning(mode).to_owned())
+                .collect(),
             skill_reach: SkillReach::Leading,
             ..Capabilities::default()
         })
@@ -311,7 +323,13 @@ impl Acp {
     }
 
     fn configuration_changed(&self, step: &mut Step) {
-        step.events.extend(self.config.events());
+        step.events
+            .extend(self.config.events().into_iter().map(|event| match event {
+                Event::PermissionMode(Some(mode)) => {
+                    Event::PermissionMode(Some(self.profile.mode_meaning(&mode).to_owned()))
+                }
+                event => event,
+            }));
         if self.stage == Stage::Ready {
             step.events.push(self.capabilities());
         }
@@ -321,9 +339,25 @@ impl Acp {
     /// one is now outstanding.
     fn send_setting(&mut self, step: &mut Step) -> bool {
         while !self.setting_in_flight {
-            let Some(setting) = self.settings.pop_front() else {
+            let Some(mut setting) = self.settings.pop_front() else {
                 return false;
             };
+            // A terminal's model can name a reasoning level too, as agy's
+            // `gemini-3.8-flash-low` does, where the session offers the model
+            // and its level as two options.
+            if let Setting::Model(model) = &setting
+                && !self.config.offers_model(model)
+                && let Some((base, level)) = self.config.split_model(model)
+            {
+                if !self
+                    .settings
+                    .iter()
+                    .any(|queued| matches!(queued, Setting::Reasoning(_)))
+                {
+                    self.settings.push_front(Setting::Reasoning(level));
+                }
+                setting = Setting::Model(base);
+            }
             let (setter, value, offered, what) = match &setting {
                 Setting::Model(model) => (
                     self.config.model_setter(),
@@ -559,6 +593,7 @@ impl Acp {
                     Ok(result) => {
                         if let Some(options) = result["configOptions"].as_array() {
                             self.config.learn_options(options);
+                            self.config.retain_models(self.profile.offers_model);
                         }
                         match &setting {
                             Setting::Model(model) => self.config.model_changed(model),
@@ -670,6 +705,7 @@ impl Acp {
             title: None,
         });
         self.config.learn(result);
+        self.config.retain_models(self.profile.offers_model);
         self.configuration_changed(step);
         self.stage = Stage::Configuring;
         if !self.send_setting(step) {
@@ -841,12 +877,15 @@ impl Acp {
             "current_mode_update" => {
                 if let Some(mode) = update["currentModeId"].as_str() {
                     self.config.mode_changed(mode);
-                    events.push(Event::PermissionMode(Some(mode.to_owned())));
+                    events.push(Event::PermissionMode(Some(
+                        self.profile.mode_meaning(mode).to_owned(),
+                    )));
                 }
             }
             "config_option_update" => {
                 if let Some(options) = update["configOptions"].as_array() {
                     self.config.learn_options(options);
+                    self.config.retain_models(self.profile.offers_model);
                     let mut changed = Step::default();
                     self.configuration_changed(&mut changed);
                     events.extend(changed.events);
@@ -984,6 +1023,61 @@ impl Acp {
             delta,
         });
     }
+}
+
+/// The profile of each provider whose native chat cagents drives over ACP.
+pub fn profile(provider: crate::agent::Provider) -> Option<&'static Profile> {
+    use crate::agent::Provider;
+    match provider {
+        // Each joins here once cagents drives its conversations.
+        Provider::Antigravity | Provider::Muse => None,
+        Provider::Omp | Provider::Claude | Provider::Codex => None,
+    }
+}
+
+impl Profile {
+    /// The cagents mode the agent's own mode `mode` means.
+    pub fn mode_meaning<'a>(&self, mode: &'a str) -> &'a str {
+        self.modes
+            .iter()
+            .find(|(own, _)| *own == mode)
+            .map_or(mode, |(_, meaning)| *meaning)
+    }
+
+    /// The agent's own mode for the cagents mode `meaning`.
+    pub fn own_mode<'a>(&self, meaning: &'a str) -> &'a str {
+        self.modes
+            .iter()
+            .find(|(_, candidate)| *candidate == meaning)
+            .map_or(meaning, |(own, _)| *own)
+    }
+}
+
+/// Names `id` as the conversation `arguments` resume, in place of any other
+/// they named, so the terminal command and the native conversation agree.
+/// The profile's `launch` takes the conversation from the launch's session
+/// ID, never from these arguments.
+pub fn align_resume_identity(
+    provider: crate::agent::Provider,
+    arguments: &mut Vec<String>,
+    id: String,
+) {
+    let mut kept = Vec::with_capacity(arguments.len() + 2);
+    let mut given = std::mem::take(arguments).into_iter();
+    while let Some(argument) = given.next() {
+        let flag = argument
+            .split_once('=')
+            .map_or(argument.as_str(), |(flag, _)| flag);
+        if provider.is_identity_option(flag) {
+            if !argument.contains('=') {
+                given.next();
+            }
+        } else {
+            kept.push(argument);
+        }
+    }
+    provider.append_resume(&mut kept, id);
+    *arguments = kept;
 }
 
 fn tool_item(id: String, content: ItemContent) -> Item {
@@ -1221,10 +1315,11 @@ impl Adapter for Acp {
                 if self.stage != Stage::Ready {
                     return Err(format!("{label} is still starting its conversation."));
                 }
-                if !self.config.offers_mode(&mode) {
+                let own = self.profile.own_mode(&mode).to_owned();
+                if !self.config.offers_mode(&own) {
                     return Err(format!("{label} does not offer the mode {mode:?}."));
                 }
-                self.settings.push_back(Setting::Mode(mode));
+                self.settings.push_back(Setting::Mode(own));
                 let mut step = Step::default();
                 self.send_setting(&mut step);
                 Ok(step)
@@ -1331,6 +1426,8 @@ pub(crate) static TEST_PROFILE: Profile = Profile {
     label: "Fake ACP agent",
     launch: test_launch,
     max_image_bytes: 1024 * 1024,
+    modes: &[("accept-edits", "acceptEdits")],
+    offers_model: |model| !model.ends_with("-contributor"),
     sign_in_required: auth_required,
 };
 

@@ -7029,7 +7029,15 @@ fn draft_snapshot(
                     "bypassPermissions".into(),
                 ],
                 Provider::Codex => vec!["readOnly".into(), "workspaceWrite".into(), "yolo".into()],
-                Provider::Omp | Provider::Antigravity | Provider::Muse => Vec::new(),
+                // An ACP agent's own modes, by what they mean, until its
+                // session lists the ones it offers.
+                Provider::Antigravity | Provider::Muse => provider
+                    .acp()
+                    .into_iter()
+                    .flat_map(|acp| acp.mode_meanings())
+                    .map(str::to_owned)
+                    .collect(),
+                Provider::Omp => Vec::new(),
             },
             skill_reach: match provider {
                 Provider::Codex => chat::SkillReach::Anywhere,
@@ -7087,7 +7095,8 @@ fn draft_permission_mode(recipe: &LaunchRecipe, provider: Provider) -> Option<St
                 .or_else(|| Some("manual".into()))
         }
         Provider::Codex => codex_draft_permission_mode(recipe),
-        Provider::Omp | Provider::Antigravity | Provider::Muse => None,
+        Provider::Antigravity | Provider::Muse => chat::acp_permission_mode(recipe, provider),
+        Provider::Omp => None,
     }
 }
 
@@ -7226,6 +7235,9 @@ fn codex_draft_permission_mode(recipe: &LaunchRecipe) -> Option<String> {
 fn set_draft_permission_mode(recipe: &mut LaunchRecipe, provider: Provider, mode: &str) {
     if provider == Provider::Claude {
         chat::apply_claude_permission_mode(recipe, mode);
+        return;
+    }
+    if chat::apply_acp_permission_mode(recipe, provider, mode) {
         return;
     }
     if provider != Provider::Codex || !matches!(mode, "yolo" | "readOnly" | "workspaceWrite") {
@@ -9820,12 +9832,20 @@ impl Cagents {
     pub(super) fn chat_switch_available(&self, card: CardId) -> bool {
         match self.card_state(card).map(|state| &state.kind) {
             Some(CardKind::Chat(_)) => true,
-            // Only an agent cagents can run as native chat switches to it.
+            // Only an agent cagents can run as native chat switches to it,
+            // and an ACP agent's terminal only once it names its
+            // conversation: it publishes no other sign of which one it is in.
             Some(CardKind::Terminal(session)) => session
                 .agent_resume_recipe()
                 .or_else(|| observed_launch(session))
-                .and_then(|recipe| Provider::from_program(&recipe.program))
-                .is_some_and(Provider::has_native_chat),
+                .and_then(|recipe| {
+                    let provider = Provider::from_program(&recipe.program)?;
+                    (provider.has_native_chat()
+                        && (!provider.speaks_acp()
+                            || provider.resume_id(&recipe.arguments).is_some()))
+                    .then_some(())
+                })
+                .is_some(),
             _ => false,
         }
     }
@@ -10240,11 +10260,15 @@ impl Cagents {
                 return Task::none();
             }
         };
-        if session.launch.provider == Provider::Claude
-            && let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card)
+        if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card)
             && let Some(mode) = runtime.snapshot.permission_mode.as_deref()
         {
-            chat::apply_claude_permission_mode(&mut launch, mode);
+            // The terminal resumes in the mode the conversation is in now.
+            if session.launch.provider == Provider::Claude {
+                chat::apply_claude_permission_mode(&mut launch, mode);
+            } else {
+                chat::apply_acp_permission_mode(&mut launch, session.launch.provider, mode);
+            }
         }
         let resumes = session.launch.session_id.is_some();
         let handle = match self.cards.get(&card) {
