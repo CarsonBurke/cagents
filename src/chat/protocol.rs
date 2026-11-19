@@ -402,8 +402,6 @@ pub struct ServerIdentity {
     pub canonical_home: PathBuf,
     pub reported_home: String,
 }
-/// An adapter is confined to one daemon worker. No UI state, subprocesses,
-/// unbounded transcript storage, credentials, or global mutable state live here.
 /// What became of a stop an adapter held, unsent, until the provider named
 /// the turn it was for.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -419,6 +417,8 @@ pub enum HeldStop {
     Dropped,
 }
 
+/// An adapter is confined to one daemon worker. No UI state, subprocesses,
+/// unbounded transcript storage, credentials, or global mutable state live here.
 pub trait Adapter: Send {
     /// Private launch selection, distinct from a provider-confirmed session.
     /// Only a provider with a retained bootstrap contract supplies this value.
