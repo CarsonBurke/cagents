@@ -6061,15 +6061,6 @@ fn console_prints_a_paged_item_as_one_step() {
         output: "PAYLOAD".into(),
         status: chat::ToolStatus::Succeeded,
     };
-    let later = "tool:native-part:1:tool:0-0:0-0";
-    assert_eq!(
-        console_line(&part("tool", tool("Agent (part 1/3)")), 0).as_deref(),
-        Some("Called Agent\n")
-    );
-    assert_eq!(
-        console_line(&part(later, tool("Agent (part 2/3)")), 0),
-        None
-    );
     // A provider's own ID can contain the store's marker without being a part.
     assert_eq!(
         console_line(&part("provider:native-part:tool", tool("Agent")), 0).as_deref(),
@@ -6084,7 +6075,6 @@ fn console_prints_a_paged_item_as_one_step() {
         console_line(&part("answer:native-part:1:text:0-0:0-0", text), 0).as_deref(),
         Some("and the rest.\n")
     );
-    assert_eq!(chat::without_page_mark("Fix (part one)"), "Fix (part one)");
 }
 
 #[test]
@@ -6165,8 +6155,10 @@ fn console_counts_the_files_a_paged_edit_adds_in_each_part() {
     assert_eq!(text, "Edited a.rs\nEdited 2 more files\n");
 }
 
+/// A step is never paged, so a label that reads like a part mark is the
+/// provider's own and is printed as given.
 #[test]
-fn console_names_a_paged_command_once() {
+fn console_keeps_a_label_that_reads_like_a_part_mark() {
     let command = chat::Item {
         started_at: None,
         id: "command".into(),
@@ -6185,7 +6177,7 @@ fn console_names_a_paged_command_once() {
     };
     assert_eq!(
         console_line(&command, 0).as_deref(),
-        Some("Ran cargo test\n")
+        Some("Ran cargo test (part 1/8)\n")
     );
 }
 
@@ -6820,4 +6812,39 @@ fn locked_mailbox_requests_are_retryable_without_accepting_or_consuming_mail() {
                 .is_empty()
         );
     }
+}
+
+#[test]
+fn an_acp_agent_s_launch_names_its_mode_in_its_own_words() {
+    use crate::agent::Provider;
+    use crate::agent_execution::{Spec, Surface, Target};
+    let spec = |mode: &str| Spec {
+        provider: Provider::Antigravity,
+        account: None,
+        target: Target {
+            repository: "/work".into(),
+            directory: "/work".into(),
+            placement: None,
+        },
+        surface: Surface::Chat,
+        model: Some("gemini-3.8-flash".into()),
+        permission_mode: Some(mode.into()),
+        reasoning_effort: Some("low".into()),
+    };
+    assert_eq!(
+        launch_options(&spec("acceptEdits")),
+        [
+            "--model",
+            "gemini-3.8-flash",
+            "--mode",
+            "accept-edits",
+            "--effort",
+            "low"
+        ]
+    );
+    // `agy --mode` does not take its default by name.
+    assert_eq!(
+        launch_options(&spec("default")),
+        ["--model", "gemini-3.8-flash", "--effort", "low"]
+    );
 }

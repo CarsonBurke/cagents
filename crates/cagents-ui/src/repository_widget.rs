@@ -181,6 +181,19 @@ enum BasisChoice {
     Committed(CommittedChoice),
 }
 
+/// Why a pane cannot show a comparison beside its open buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffBasisRefusal {
+    /// A save of the buffer is in flight.
+    Saving,
+    /// The pane shows a folder's files, which have no comparisons.
+    NoComparisons,
+    /// A Git change is being re-read; working comparisons wait for it.
+    Refreshing,
+    /// The pane's file status does not show this comparison yet.
+    NotListed,
+}
+
 /// A comparison the card cannot name without asking Git: a merge base's
 /// default ref comes from the remote's symbolic `HEAD`, and a commit's parent
 /// comes from the commit itself.
@@ -1539,7 +1552,7 @@ fn position_for_offset(text: &str, offset: usize) -> LspPosition {
     // drops a `\r` that the editor treats as a terminator of its own and will
     // happily park a caret after. A column that counted such a `\r` would name
     // a character the protocol's line does not have, and
-    // `Snapshot::to_utf16` refuses that outright — silently failing every
+    // `Snapshot::utf16_position` refuses that outright — silently failing every
     // hover, completion and definition made from that caret.
     let span = line_span(text, line).unwrap_or(0..offset);
     let content = &text[span.start..offset.min(span.end)];
@@ -4024,7 +4037,6 @@ impl RepositoryRuntime {
     /// unfocused [`text_editor`] draws no caret at all, so a jump into a
     /// buffer the user has not clicked into lands invisibly. Callers that
     /// move the caret programmatically chain this after it.
-    #[must_use]
     pub fn focus_editor<Message: 'static>(&self, card: CardId) -> Task<Message> {
         self.editor_focus_target(card)
             .map_or_else(Task::none, iced::widget::operation::focus)
@@ -5552,13 +5564,28 @@ impl RepositoryRuntime {
             }
     }
 
+    /// Why the open file cannot switch to `basis` in place, as the toolbar's
+    /// comparison control does without leaving its buffer, or `None` when it
+    /// can.
+    pub fn diff_basis_refusal(&self, basis: &DiffBasis) -> Option<DiffBasisRefusal> {
+        if self.is_saving() {
+            Some(DiffBasisRefusal::Saving)
+        } else if self.directory_only {
+            Some(DiffBasisRefusal::NoComparisons)
+        } else if self.mutation_refresh_pending && !basis.is_immutable() {
+            Some(DiffBasisRefusal::Refreshing)
+        } else if !self
+            .subject_file()
+            .is_some_and(|file| self.file_has_basis(&file, basis))
+        {
+            Some(DiffBasisRefusal::NotListed)
+        } else {
+            None
+        }
+    }
+
     fn can_select_diff_basis(&self, basis: &DiffBasis) -> bool {
-        !self.is_saving()
-            && !self.directory_only
-            && (!self.mutation_refresh_pending || basis.is_immutable())
-            && self
-                .subject_file()
-                .is_some_and(|file| self.file_has_basis(&file, basis))
+        self.diff_basis_refusal(basis).is_none()
     }
 
     fn can_select_committed_basis(&self, choice: CommittedChoice) -> bool {
@@ -7626,11 +7653,10 @@ impl RepositoryRuntime {
                             .or_else(|| self.current_selection_scope())
                     })
                     .flatten();
-                self.find_selection_revision =
-                    self.find_selection.and_then(|_| match &self.document {
-                        DocumentState::Editable(document) => Some(document.revision),
-                        _ => None,
-                    });
+                self.find_selection_revision = self.find_selection.and(match &self.document {
+                    DocumentState::Editable(document) => Some(document.revision),
+                    _ => None,
+                });
                 // Recapturing the same coordinates after a change must also
                 // replace a cached stale-scope refusal for this revision.
                 self.find_cache = None;
@@ -8310,11 +8336,14 @@ impl RepositoryRuntime {
         self.reveal_diff_row(row);
         // A deleted row shown above the line starts at its top; only the
         // line itself carries the editor's offset within it.
-        let fraction = self
+        let fraction = if self
             .diff_model()
             .is_some_and(|model| diff_row_lines(model, self.diff_mode, row).1 == Some(source.line))
-            .then_some(source.fraction)
-            .unwrap_or_default();
+        {
+            source.fraction
+        } else {
+            Default::default()
+        };
         // The other layout's saved place predates this line; switching
         // layouts now keeps the line on screen.
         self.viewports.diff = [None; 2];
@@ -9223,8 +9252,8 @@ fn assemble_repository_files(
         files.entry(path.clone()).or_insert(false);
     }
     Ok(files
-        .into_iter()
-        .map(|(path, _tracked)| {
+        .into_keys()
+        .map(|path| {
             let status = statuses.get(&path);
             let (staged, unstaged) = status.map_or((false, false), |status| {
                 (status.staged.is_some(), status.unstaged.is_some())
@@ -9457,7 +9486,7 @@ pub fn view_with_review<'a>(
             FileListState::Loading => loading(),
             FileListState::Failed(error) => widget::container(
                 widget::column::with_children(vec![
-                    information_state("Could not list files", error.clone()).into(),
+                    information_state("Could not list files", error.clone()),
                     crate::ui_controls::button::secondary("Retry loading files")
                         .on_press_maybe(
                             (!runtime.file_list_loading)
@@ -10085,9 +10114,10 @@ fn find_strip<'a>(
         selection = selection
             .on_toggle(move |enabled| RepositoryAction::FindSelectionChanged { card, enabled });
     }
-    options.push(
-        crate::interaction::tooltip(selection, "Search the selection captured when enabled").into(),
-    );
+    options.push(crate::interaction::tooltip(
+        selection,
+        "Search the selection captured when enabled",
+    ));
     strips.push(
         widget::row::with_children(options)
             .spacing(space::S)
@@ -10136,7 +10166,6 @@ fn find_strip<'a>(
                         preserve,
                         "Keep each matched word's upper, lower or title case (plain text)",
                     )
-                    .into()
                 },
                 crate::ui_controls::button::secondary("Replace")
                     .on_press_maybe(
@@ -10211,8 +10240,7 @@ fn editor_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Repo
             .width(Length::Fill)
             .height(Length::Fill),
             format!("{width} × {height} pixels"),
-        )
-        .into(),
+        ),
         DocumentState::Pdf {
             source: _,
             path: _,
@@ -10336,25 +10364,22 @@ fn pdf_document_view<'a>(
             .on_press_maybe(to.map(|zoom| RepositoryAction::PdfZoom { card, zoom }))
     };
     controls.push(step(zoom.smaller(), Icon::ZoomOut, "Draw the page smaller").into());
-    controls.push(
-        crate::interaction::tooltip(
-            // A fixed width, because the label is between the two controls a
-            // reader presses repeatedly and "Fit", "50%" and "125%" are three
-            // different widths. The text fills that width so that it is the
-            // label rather than the box that is centred on.
-            widget::container(
-                crate::design::body(
-                    zoom.percent()
-                        .map_or_else(|| "Fit".to_owned(), |percent| format!("{percent}%")),
-                )
-                .width(Length::Fill)
-                .center(),
+    controls.push(crate::interaction::tooltip(
+        // A fixed width, because the label is between the two controls a
+        // reader presses repeatedly and "Fit", "50%" and "125%" are three
+        // different widths. The text fills that width so that it is the
+        // label rather than the box that is centred on.
+        widget::container(
+            crate::design::body(
+                zoom.percent()
+                    .map_or_else(|| "Fit".to_owned(), |percent| format!("{percent}%")),
             )
-            .width(Length::Fixed(ZOOM_LABEL_WIDTH)),
-            "How large the page is drawn, against the size it would print",
+            .width(Length::Fill)
+            .center(),
         )
-        .into(),
-    );
+        .width(Length::Fixed(ZOOM_LABEL_WIDTH)),
+        "How large the page is drawn, against the size it would print",
+    ));
     controls.push(step(zoom.larger(), Icon::ZoomIn, "Draw the page larger").into());
     controls.push(
         // Enabled even while fitted, because this is the mode the viewer is
@@ -10418,8 +10443,7 @@ fn pdf_document_view<'a>(
             .width(Length::Fill)
             .height(Length::Fill),
             format!("Page {} of {pages}, {width} × {height} pixels", page + 1),
-        )
-        .into(),
+        ),
     ])
     .width(Length::Fill)
     .height(Length::Fill)
@@ -11958,8 +11982,7 @@ fn diff_review_gutter(
                 .height(typography.line_height)
                 .class(cosmic::theme::Button::Text),
             "Comment on this line · Shift-click to select a range",
-        )
-        .into(),
+        ),
         None => label,
     }
 }

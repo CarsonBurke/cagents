@@ -165,6 +165,17 @@ pub enum HostedTerminalStartError {
         #[source]
         source: io::Error,
     },
+    /// Connecting to a daemon whose readiness this process does not prove,
+    /// such as a remote device's, failed. Its own words are the caller's.
+    #[error(transparent)]
+    Connect(crate::control::ControlError),
+}
+
+/// A daemon proven ready by the handshake of the connection it hands over.
+#[derive(Debug)]
+pub struct ReadyDaemon {
+    pub socket: PathBuf,
+    pub client: crate::control::ControlClient,
 }
 
 #[derive(Default)]
@@ -666,8 +677,8 @@ impl HostedPublishedState {
     /// credit the daemon withholds its next capture for.
     ///
     /// It deliberately re-arms nothing. Every published generation announces
-    /// itself exactly once, so there is no announcement for a draw to release
-    /// - and no window between clearing a flag and re-reading the published
+    /// itself exactly once, so there is no announcement for a draw to release -
+    /// and no window between clearing a flag and re-reading the published
     /// generation for a publication to fall into.
     fn acknowledge(&self, observed_generation: u64) {
         let previous = self
@@ -965,15 +976,8 @@ impl std::fmt::Debug for HostedTerminalHandle {
 }
 
 impl HostedTerminalHandle {
-    pub fn connect(
-        terminal_id: TerminalId,
-        expected_host: Option<HostSessionProof>,
-        wake: impl Fn(TerminalWake) + Send + Sync + 'static,
-    ) -> Result<Self, HostedTerminalStartError> {
-        let socket = ensure_daemon_ready()?;
-        Self::connect_at(socket, terminal_id, expected_host, wake)
-    }
-
+    /// Attaches through the daemon at `socket`, which the caller has already
+    /// proved ready; the worker's own connection is the attachment.
     pub fn connect_at(
         socket: impl Into<PathBuf>,
         terminal_id: TerminalId,
@@ -987,16 +991,6 @@ impl HostedTerminalHandle {
             expected_host,
             Arc::new(wake),
         )
-    }
-
-    pub fn attach_or_spawn(
-        session: TerminalSession,
-        options: impl Into<TerminalSpawnOptions>,
-        expected_host: Option<HostSessionProof>,
-        wake: impl Fn(TerminalWake) + Send + Sync + 'static,
-    ) -> Result<Self, HostedTerminalStartError> {
-        let socket = ensure_daemon_ready()?;
-        Self::attach_or_spawn_at(socket, session, options, expected_host, wake)
     }
 
     pub fn attach_or_spawn_at(
@@ -1450,6 +1444,13 @@ pub fn ensure_daemon_ready() -> Result<PathBuf, HostedTerminalStartError> {
     ensure_daemon_ready_for(crate::notifications::Application::Cagents)
 }
 
+/// [`ensure_daemon_ready`] for a caller that goes on to talk to the daemon:
+/// the connection that proved it ready is the one returned, so the caller
+/// doesn't connect and handshake again.
+pub fn connect_ready_daemon() -> Result<ReadyDaemon, HostedTerminalStartError> {
+    connect_ready_daemon_for(crate::notifications::Application::Cagents)
+}
+
 pub fn existing_daemon_socket_path() -> io::Result<PathBuf> {
     match crate::device::existing_socket_path()? {
         Some(socket) => Ok(socket),
@@ -1460,38 +1461,69 @@ pub fn existing_daemon_socket_path() -> io::Result<PathBuf> {
 pub fn ensure_daemon_ready_for(
     application: crate::notifications::Application,
 ) -> Result<PathBuf, HostedTerminalStartError> {
+    prove_daemon_ready(application).map(|(socket, _)| socket)
+}
+
+/// [`connect_ready_daemon`] on behalf of `application`.
+pub fn connect_ready_daemon_for(
+    application: crate::notifications::Application,
+) -> Result<ReadyDaemon, HostedTerminalStartError> {
+    let (socket, client) = prove_daemon_ready(application)?;
+    let client = match client {
+        Some(client) => client,
+        // Nothing proved a remote device's daemon ready, so this connection
+        // is the first to reach it.
+        None => crate::control::ControlClient::connect(&socket)
+            .map_err(HostedTerminalStartError::Connect)?,
+    };
+    Ok(ReadyDaemon { socket, client })
+}
+
+/// The daemon socket and, unless the daemon is a remote device's whose
+/// readiness this process doesn't prove, the connection that proved it ready.
+fn prove_daemon_ready(
+    application: crate::notifications::Application,
+) -> Result<(PathBuf, Option<crate::control::ControlClient>), HostedTerminalStartError> {
     let socket = daemon_socket_path().map_err(HostedTerminalStartError::SocketPath)?;
     if crate::instance::window_restore_policy()
         == crate::instance::WindowRestorePolicy::ExistingOnly
     {
         // Background readers and model publishers share this boundary. A
         // recovery window cannot turn an ordinary reconnect into a new daemon.
-        verify_daemon_protocol(crate::control::ControlClient::connect(&socket))?;
-        return Ok(socket);
+        let client = verify_daemon_protocol(crate::control::ControlClient::connect(&socket))?;
+        return Ok((socket, Some(client)));
     }
-    if !crate::device::is_remote() {
-        ensure_daemon_ready_at(&socket, application)?;
+    if crate::device::is_remote() {
+        return Ok((socket, None));
     }
-    Ok(socket)
+    let client = ensure_daemon_ready_at(&socket, application)?;
+    Ok((socket, Some(client)))
 }
 
-/// Provider activation requested by a person, after an attach-only recovery.
-/// Its transport is separate from the window's automatic read-only readers.
-pub fn ensure_daemon_ready_for_explicit_action() -> Result<PathBuf, HostedTerminalStartError> {
+/// [`connect_ready_daemon`] for provider activation requested by a person,
+/// after an attach-only recovery. Its transport is separate from the
+/// window's automatic read-only readers.
+pub fn connect_ready_daemon_for_explicit_action() -> Result<ReadyDaemon, HostedTerminalStartError> {
     if let Some(socket) = crate::device::socket_path_for_explicit_action()
         .map_err(HostedTerminalStartError::SocketPath)?
     {
-        return Ok(socket);
+        // Nothing proves a selected device's daemon ready, so this
+        // connection is the first to reach it.
+        let client = crate::control::ControlClient::connect(&socket)
+            .map_err(HostedTerminalStartError::Connect)?;
+        return Ok(ReadyDaemon { socket, client });
     }
     let socket = daemon_socket_path().map_err(HostedTerminalStartError::SocketPath)?;
-    ensure_daemon_ready_at(&socket, crate::notifications::Application::Cagents)?;
-    Ok(socket)
+    let client = ensure_daemon_ready_at(&socket, crate::notifications::Application::Cagents)?;
+    Ok(ReadyDaemon { socket, client })
 }
 
+/// Proves the daemon at `socket` ready, starting it if nothing listens there,
+/// and returns the connection whose handshake proved it.
 fn ensure_daemon_ready_at(
     socket: &Path,
     application: crate::notifications::Application,
-) -> Result<(), HostedTerminalStartError> {
+) -> Result<crate::control::ControlClient, HostedTerminalStartError> {
     match UnixStream::connect(socket) {
         Ok(stream) => {
             // A listening socket can belong to an older development build.
@@ -1555,7 +1587,7 @@ fn start_and_verify_daemon_at(
     daemon_binary: &Path,
     scoped: bool,
     launch: impl FnMut(bool) -> io::Result<Child>,
-) -> Result<(), HostedTerminalStartError> {
+) -> Result<crate::control::ControlClient, HostedTerminalStartError> {
     let deadline = Instant::now() + timeout;
     start_daemon_at(socket, timeout, daemon_binary, scoped, launch)?;
     // Another launcher can win the daemon lease while we wait for readiness;
@@ -1586,7 +1618,7 @@ fn verify_startup_stream(
     socket: &Path,
     stream: UnixStream,
     deadline: Instant,
-) -> Result<(), HostedTerminalStartError> {
+) -> Result<crate::control::ControlClient, HostedTerminalStartError> {
     // A serving daemon remains usable during review. An ordinary reader of
     // an update's bound-but-unready listener gets the normal handshake budget;
     // only an admitted/inherited launch may need checkpoint restoration time.
@@ -1624,8 +1656,8 @@ fn updating_listener_error(error: HostedTerminalStartError) -> HostedTerminalSta
 
 fn verify_daemon_protocol(
     client: Result<crate::control::ControlClient, crate::control::ControlError>,
-) -> Result<(), HostedTerminalStartError> {
-    client.map(|_| ()).map_err(|error| match error {
+) -> Result<crate::control::ControlClient, HostedTerminalStartError> {
+    client.map_err(|error| match error {
         crate::control::ControlError::UnsupportedVersion { actual } => {
             HostedTerminalStartError::HostIncompatible { actual }
         }
@@ -2371,26 +2403,44 @@ fn serve_connection(
                 );
             }
         }
-        let terminals = match exchange(ClientRequest::List) {
-            Ok(ServerResponse::Listed { terminals }) => terminals,
-            Err(end) => return end,
-            _ => {
-                return reject_handshake(
-                    events,
-                    published,
-                    stop,
-                    ProtocolError::new(
-                        ProtocolErrorCode::InvalidRequest,
-                        "Daemon did not return authenticated terminal inventory",
-                        false,
-                    ),
-                );
+        // Pages arrive in identity order, so the listing stops at the page
+        // that reaches this terminal's identity.
+        let mut after = None;
+        let existing = loop {
+            let (terminals, complete) = match exchange(ClientRequest::ListPage { after }) {
+                Ok(ServerResponse::ListedPage {
+                    terminals,
+                    complete,
+                }) if super::ipc::page_follows(after, &terminals, complete) => {
+                    (terminals, complete)
+                }
+                Err(end) => return end,
+                _ => {
+                    return reject_handshake(
+                        events,
+                        published,
+                        stop,
+                        ProtocolError::new(
+                            ProtocolErrorCode::InvalidRequest,
+                            "Daemon did not return authenticated terminal inventory",
+                            false,
+                        ),
+                    );
+                }
+            };
+            let last = terminals.last().map(|terminal| terminal.session.id);
+            if let Some(terminal) = terminals
+                .into_iter()
+                .find(|terminal| terminal.session.id == terminal_id)
+            {
+                break Some(terminal);
             }
+            if complete || last.is_some_and(|last| last > terminal_id) {
+                break None;
+            }
+            after = last;
         };
-        if let Some(terminal) = terminals
-            .iter()
-            .find(|terminal| terminal.session.id == terminal_id)
-        {
+        if let Some(terminal) = existing {
             if !spawn.matches_source(&terminal.session) {
                 return reject_handshake(
                     events,
@@ -2917,7 +2967,7 @@ fn serve_connection(
                     if let Some(reason) = refusal {
                         // Version, proof and exact request correlation have
                         // passed. Never replay this refused command.
-                        published.reject_input(events, *operation, reason);
+                        published.reject_input(events, operation, reason);
                         continue;
                     }
                 }
@@ -3784,6 +3834,78 @@ mod tests {
         )
         .unwrap();
         assert!(started.elapsed() >= Duration::from_millis(5_600));
+    }
+
+    /// Readiness hands over the connection whose handshake proved it, so
+    /// a caller's next request reaches the daemon without a second accept
+    /// and handshake (#3127).
+    #[test]
+    fn readiness_returns_the_connection_its_handshake_proved() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let (served_tx, served_rx) = std::sync::mpsc::channel();
+        let path = socket.clone();
+        let mut client = start_and_verify_daemon_at(
+            &socket,
+            Duration::from_secs(5),
+            Path::new("fixture-daemon"),
+            false,
+            move |_scoped| {
+                let listener = UnixListener::bind(&path).unwrap();
+                let served_tx = served_tx.clone();
+                thread::spawn(move || {
+                    let proof = proof("ready");
+                    let mut handshakes = 0;
+                    // Readiness probes connect and close; each connection
+                    // that sends a request is served until it lists.
+                    loop {
+                        let mut stream = accept_connection(&listener);
+                        while let Ok(Some(request)) = read_frame::<ClientEnvelope>(&mut stream) {
+                            let response = match request.request {
+                                ClientRequest::Connect { .. } => {
+                                    handshakes += 1;
+                                    ServerResponse::Connected {
+                                        proof: proof.clone(),
+                                        resumed: Vec::new(),
+                                    }
+                                }
+                                ClientRequest::ListPage { after: None } => {
+                                    ServerResponse::ListedPage {
+                                        terminals: Vec::new(),
+                                        complete: true,
+                                    }
+                                }
+                                request => panic!("unexpected request {request:?}"),
+                            };
+                            let listed = matches!(response, ServerResponse::ListedPage { .. });
+                            write_frame(
+                                &mut stream,
+                                &ServerEnvelope {
+                                    version: PROTOCOL_VERSION,
+                                    request_id: Some(request.request_id),
+                                    proof: proof.clone(),
+                                    message: ServerMessage::Response { response },
+                                },
+                            )
+                            .unwrap();
+                            if listed {
+                                served_tx.send(handshakes).unwrap();
+                                return;
+                            }
+                        }
+                    }
+                });
+                Command::new("/bin/true").spawn()
+            },
+        )
+        .unwrap();
+        assert_eq!(client.proof(), &proof("ready"));
+        assert!(client.list().unwrap().is_empty());
+        assert_eq!(
+            served_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            1,
+            "the request after readiness must not need another handshake"
+        );
     }
 
     #[test]

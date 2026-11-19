@@ -73,11 +73,10 @@ mod tests {
                 .observe(TerminalId::new(), uuid::Uuid::new_v4());
         }
         assert!(
-            state
+            !state
                 .published_terminal_workers
                 .latest
-                .get(&source.id)
-                .is_none()
+                .contains_key(&source.id)
         );
         assert!(state.published_terminal_workers.latest.len() <= CAPACITY);
         assert!(

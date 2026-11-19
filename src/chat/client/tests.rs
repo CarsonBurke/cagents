@@ -248,6 +248,147 @@ fn only_the_daemons_busy_refusal_is_typed_busy() {
     );
 }
 
+/// A request the daemon's startup recovery does not admit is refused with
+/// the daemon's own sentence, as `host::client` words it, and only that
+/// unavailable, non-retryable refusal reads as waiting on update recovery.
+#[test]
+fn only_the_startup_recovery_refusal_waits_on_update_recovery() {
+    use super::super::{Recovery, STARTUP_RECOVERY_REFUSAL};
+    use ipc::ProtocolErrorCode;
+
+    let held = format!(
+        "{STARTUP_RECOVERY_REFUSAL}; inspect available sessions or explicitly Close the original actor: Codex server did not open its local socket within 15 seconds"
+    );
+    let failure = start_failure(ipc::ProtocolError::new(
+        ProtocolErrorCode::TerminalUnavailable,
+        held.clone(),
+        false,
+    ));
+    assert_eq!(failure.recovery, Recovery::UpdateRecovery);
+    assert_eq!(
+        failure.message, held,
+        "the daemon's reason stays the details"
+    );
+    assert!(Recovery::UpdateRecovery.is_blocked());
+    // Another code, or a sentence that only quotes it, is an ordinary refusal.
+    for (code, message) in [
+        (ProtocolErrorCode::Internal, held.clone()),
+        (
+            ProtocolErrorCode::TerminalUnavailable,
+            format!("Provider said: {held}"),
+        ),
+    ] {
+        assert_eq!(
+            start_failure(ipc::ProtocolError::new(code, message, false)).recovery,
+            Recovery::Blocked
+        );
+    }
+}
+
+/// The daemon refuses a conversation whose restart after an update failed
+/// and was stopped with a retryable unavailable error, but repeating the
+/// same restore only meets it again. Only the daemon's own sentence reads
+/// as stopped by the update; a message that quotes it stays a retry.
+#[test]
+fn only_the_stopped_restart_refusal_reads_as_stopped_by_the_update() {
+    use super::super::{Recovery, update_restart_stopped};
+    use ipc::ProtocolErrorCode;
+
+    let stopped = update_restart_stopped("Codex server exited before opening its local socket");
+    let failure = start_failure(ipc::ProtocolError::new(
+        ProtocolErrorCode::TerminalUnavailable,
+        stopped.clone(),
+        true,
+    ));
+    assert_eq!(failure.recovery, Recovery::UpdateStopped);
+    assert_eq!(
+        failure.message, stopped,
+        "the daemon's reason stays the details"
+    );
+    assert!(Recovery::UpdateStopped.is_blocked());
+    assert_eq!(
+        start_failure(ipc::ProtocolError::new(
+            ProtocolErrorCode::TerminalUnavailable,
+            format!("Provider said: {stopped}"),
+            true,
+        ))
+        .recovery,
+        Recovery::Retry
+    );
+}
+
+/// A recovery pane whose conversation the update stopped reports that, with
+/// the daemon's words, rather than a retry of the attachment it just made,
+/// and asks the daemon for nothing more.
+#[test]
+fn recovery_restore_reports_a_conversation_the_update_stopped() {
+    let stopped = super::super::update_restart_stopped(
+        "Codex server did not open its local socket within 15 seconds",
+    );
+    let (stream, mut server) = UnixStream::pair().unwrap();
+    let live = host_proof("recovery");
+    let mut saved = omp_card(Some(CONVERSATION), Some(host_proof("old")));
+    saved.launch.provider = crate::agent::Provider::Codex;
+    saved.launch.recipe.program = "codex".into();
+    let expected = saved.clone();
+    let refusal = stopped.clone();
+    let worker = thread::spawn(move || {
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        for step in 0..2 {
+            let envelope: ClientEnvelope = ipc::read_frame(&mut server).unwrap().unwrap();
+            let message = match (step, envelope.request) {
+                (0, ClientRequest::Connect { .. }) => ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: live.clone(),
+                        resumed: vec![],
+                    },
+                },
+                (1, ClientRequest::ResolveUpgradeChat { source }) if source == expected => {
+                    ServerMessage::Error(ipc::ProtocolError::new(
+                        ipc::ProtocolErrorCode::TerminalUnavailable,
+                        refusal.clone(),
+                        true,
+                    ))
+                }
+                other => panic!("recovery must not prepare or start a provider: {other:?}"),
+            };
+            ipc::write_frame(
+                &mut server,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(envelope.request_id),
+                    proof: live.clone(),
+                    message,
+                },
+            )
+            .unwrap();
+        }
+        let extra: Option<ClientEnvelope> = ipc::read_frame(&mut server).unwrap();
+        assert!(
+            extra.is_none(),
+            "a stopped conversation sent an extra request"
+        );
+    });
+    let failure = ClientHandle::connect_on(
+        stream,
+        saved,
+        Intent::RestoreExisting,
+        None,
+        false,
+        None,
+        None,
+        None,
+        |_| {},
+    )
+    .err()
+    .expect("the stopped conversation must refuse");
+    assert_eq!(failure.recovery, super::super::Recovery::UpdateStopped);
+    assert_eq!(failure.message, stopped);
+    worker.join().unwrap();
+}
+
 /// A daemon too busy to finish a switch's handshake refuses it as busy;
 /// one that can't be reached at all does not claim to be busy, and an
 /// update in progress is.
@@ -266,8 +407,39 @@ fn a_switch_whose_handshake_timed_out_is_unanswered_not_busy() {
     assert_eq!(timed_out.recovery, Recovery::Unresponsive);
     assert!(!Recovery::Unresponsive.is_blocked());
     assert!(timed_out.message.contains("did not answer within 30 s"));
+    // A selected device's daemon, first reached by the connection handed to
+    // the switch, fails its handshake as the switch's own handshake did.
+    let device_timed_out = switch_unadmitted(HostedTerminalStartError::Connect(
+        crate::control::ControlError::ReplyTimeout {
+            timeout: Duration::from_secs(30),
+            error: ipc::FrameError::Io(io::ErrorKind::WouldBlock.into()),
+        },
+    ));
+    assert_eq!(device_timed_out.recovery, Recovery::Unresponsive);
+    assert!(
+        device_timed_out
+            .message
+            .contains("did not answer within 30 s")
+    );
+    let refused = |message: &str, retryable| {
+        switch_unadmitted(HostedTerminalStartError::Connect(
+            crate::control::ControlError::Remote {
+                code: ipc::ProtocolErrorCode::Internal,
+                message: message.into(),
+                retryable,
+            },
+        ))
+    };
+    let busy = refused(ipc::DAEMON_BUSY, true);
+    assert_eq!(busy.recovery, Recovery::Busy);
+    assert_eq!(busy.message, ipc::DAEMON_BUSY);
+    assert_eq!(
+        refused("refused before any effect", false).recovery,
+        Recovery::NotAdmitted
+    );
     for unreachable in [
         HostedTerminalStartError::HostProtocol(crate::control::ControlError::ConnectionClosed),
+        HostedTerminalStartError::Connect(crate::control::ControlError::ConnectionClosed),
         HostedTerminalStartError::HostSocket {
             path: "/run/cagents.sock".into(),
             source: io::ErrorKind::ConnectionRefused.into(),
@@ -1593,14 +1765,14 @@ fn explicit_retry_classifies_exact_history_reader_and_live_successor() {
                 let request: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
                 let response = match (step, request.request) {
                     (0, ClientRequest::ChatList) => ServerResponse::ChatListed {
-                        sessions: if state < 3 || state >= 5 {
+                        sessions: if !(3..5).contains(&state) {
                             vec![expected.clone()]
                         } else {
                             vec![]
                         },
                     },
                     (1, ClientRequest::ChatPrepareResume { source })
-                        if (state < 3 || state >= 5) && source == expected =>
+                        if !(3..5).contains(&state) && source == expected =>
                     {
                         ServerResponse::ChatResumePrepared {
                             session: expected.clone(),
@@ -6401,5 +6573,236 @@ fn retirement_initialization_retries_after_a_thread_factory_error() {
     assert_eq!(
         completion.recv_timeout(Duration::from_secs(5)).unwrap(),
         worker
+    );
+}
+
+/// A fixture daemon end of one connection: answers each `Connect` as
+/// `live`, refuses everything else with `refusal`, and returns, once the
+/// chat closes the connection, how many `Connect`s it read and the other
+/// requests in order.
+fn count_handshakes(
+    mut peer: UnixStream,
+    live: HostSessionProof,
+    refusal: &'static str,
+) -> (usize, Vec<ClientRequest>) {
+    peer.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut connects = 0;
+    let mut requests = Vec::new();
+    while let Some(envelope) = ipc::read_frame::<ClientEnvelope>(&mut peer).unwrap() {
+        let message = match envelope.request {
+            ClientRequest::Connect { .. } => {
+                connects += 1;
+                ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: live.clone(),
+                        resumed: Vec::new(),
+                    },
+                }
+            }
+            request => {
+                requests.push(request);
+                ServerMessage::Error(ipc::ProtocolError::new(
+                    ipc::ProtocolErrorCode::InvalidRequest,
+                    refusal,
+                    false,
+                ))
+            }
+        };
+        ipc::write_frame(
+            &mut peer,
+            &ServerEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: Some(envelope.request_id),
+                proof: live.clone(),
+                message,
+            },
+        )
+        .unwrap();
+    }
+    (connects, requests)
+}
+
+/// A chat handed the connection that proved its daemon ready goes on over
+/// it: its first request follows that handshake, with no second `Connect`
+/// (#3155).
+#[test]
+fn a_chat_on_its_readiness_connection_handshakes_once() {
+    const REFUSAL: &str = "fixture refuses the start";
+    let (stream, peer) = UnixStream::pair().unwrap();
+    let live = host_proof("current");
+    let daemon = thread::spawn(move || count_handshakes(peer, live, REFUSAL));
+    let ready = crate::control::ControlClient::from_stream(stream).unwrap();
+    let failure = ClientHandle::connect_on(
+        ready,
+        omp_card(None, None),
+        Intent::Start,
+        None,
+        false,
+        None,
+        None,
+        None,
+        |_| {},
+    )
+    .err()
+    .expect("the fixture refuses the start");
+    assert_eq!(failure.message, REFUSAL);
+    let (connects, requests) = daemon.join().unwrap();
+    assert_eq!(connects, 1, "the chat handshook again: {requests:?}");
+    assert_eq!(requests.len(), 1, "{requests:?}");
+}
+
+/// A proven connection to a daemon other than the one a chat must reach
+/// fails as that daemon's own refusal of the chat's `Connect` would, and
+/// asks it nothing.
+#[test]
+fn a_proven_connection_to_another_daemon_fails_as_its_refusal_would() {
+    let expected = host_proof("source");
+    let live = host_proof("current");
+    // The daemon's refusal of a `Connect` naming another incarnation.
+    let (bare, mut peer) = UnixStream::pair().unwrap();
+    let refused = live.clone();
+    let daemon = thread::spawn(move || {
+        let hello: ClientEnvelope = ipc::read_frame(&mut peer).unwrap().unwrap();
+        let ClientRequest::Connect { expected_host, .. } = hello.request else {
+            panic!("expected the chat's handshake");
+        };
+        ipc::write_frame(
+            &mut peer,
+            &ServerEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: Some(hello.request_id),
+                proof: refused.clone(),
+                message: ServerMessage::Error(
+                    ipc::validate_proof(expected_host.as_ref(), &refused).unwrap_err(),
+                ),
+            },
+        )
+        .unwrap();
+    });
+    let start = |stream: ChatStream| {
+        ClientHandle::connect_on(
+            stream,
+            omp_card(None, None),
+            Intent::Start,
+            Some(expected.clone()),
+            false,
+            None,
+            None,
+            None,
+            |_| {},
+        )
+        .err()
+        .expect("another daemon refuses the chat")
+    };
+    let refusal = start(ChatStream::Bare(bare));
+    daemon.join().unwrap();
+
+    let (stream, peer) = UnixStream::pair().unwrap();
+    let daemon = thread::spawn(move || count_handshakes(peer, live, "asked after the refusal"));
+    let ready = crate::control::ControlClient::from_stream(stream).unwrap();
+    assert_eq!(start(ready.into()), refusal);
+    let (connects, requests) = daemon.join().unwrap();
+    assert_eq!(connects, 1);
+    assert!(requests.is_empty(), "{requests:?}");
+}
+
+/// Starting a chat makes one connection to the daemon, the one whose
+/// handshake proved it ready, rather than a readiness check and then a
+/// connection of its own (#3155).
+#[test]
+fn starting_a_chat_connects_to_the_daemon_once() {
+    const CHILD: &str = "CAGENTS_TEST_CHAT_START_CONNECTS_ONCE";
+    const REFUSAL: &str = "fixture refuses the start";
+    if std::env::var_os(CHILD).is_some() {
+        let paths = crate::daemon::RuntimePaths::discover().unwrap();
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&paths.directory)
+            .unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&paths.socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let returned = Arc::new(AtomicBool::new(false));
+        let chat_returned = returned.clone();
+        let daemon = thread::spawn(move || {
+            // Every connection the chat made, read until it closed each.
+            let mut connections: Vec<thread::JoinHandle<_>> = Vec::new();
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        let live = host_proof("current");
+                        connections.push(thread::spawn(move || {
+                            count_handshakes(stream, live, REFUSAL)
+                        }));
+                    }
+                    // The chat has returned, so all its connections were
+                    // made: none is still to come once the backlog is empty.
+                    Err(error)
+                        if error.kind() == io::ErrorKind::WouldBlock
+                            && chat_returned.load(Ordering::Acquire) =>
+                    {
+                        break;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            }
+            connections
+                .into_iter()
+                .map(|connection| connection.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let failure = ClientHandle::connect(
+            omp_card(None, None),
+            Intent::Start,
+            None,
+            false,
+            None,
+            |_| {},
+        )
+        .err()
+        .expect("the fixture refuses the start");
+        returned.store(true, Ordering::Release);
+        assert_eq!(failure.message, REFUSAL);
+        let handshakes = daemon.join().unwrap();
+        assert_eq!(
+            handshakes.len(),
+            1,
+            "a chat start connected more than once: {handshakes:?}"
+        );
+        assert_eq!(handshakes[0].0, 1, "{handshakes:?}");
+        assert_eq!(handshakes[0].1.len(), 1, "{handshakes:?}");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    for directory in ["home", "runtime", "config", "data", "cache"] {
+        std::fs::create_dir(root.path().join(directory)).unwrap();
+    }
+    let name = std::thread::current().name().unwrap().to_owned();
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", &name, "--nocapture"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", root.path().join("home"))
+        .env("XDG_RUNTIME_DIR", root.path().join("runtime"))
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("XDG_DATA_HOME", root.path().join("data"))
+        .env("XDG_CACHE_HOME", root.path().join("cache"))
+        .env(CHILD, "1");
+    if let Some(authority) = std::env::var_os(crate::agent_execution::AUTHORITY_ENV) {
+        command.env(crate::agent_execution::AUTHORITY_ENV, authority);
+    }
+    let output = command.output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed; 0 failed"),
+        "{stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }

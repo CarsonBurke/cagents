@@ -90,7 +90,7 @@ click() {
     sleep 2
 }
 shot() {
-    "$ne" drive move 1,1 >/dev/null 2>&1
+    "$ne" drive hover 1,1 >/dev/null 2>&1
     sleep 1
     "$ne" shot "$1" >/dev/null && log "shot $1" || log "shot failed: $1"
 }
@@ -131,7 +131,7 @@ opened=
 # A busy host can take a minute or two to answer the first turn.
 for _ in $(seq 20); do
     sleep 4
-    "$ne" drive move 1,1 >/dev/null 2>&1
+    "$ne" drive hover 1,1 >/dev/null 2>&1
     sleep 1
     row=$("$ne" drive observe 2>/dev/null | grep -E 'New channel|t3code repo moved' | head -1 |
         sed -E 's/^ *\[t[0-9]+\] +([0-9]+), +([0-9]+) +([0-9]+)x([0-9]+).*/\1 \2 \3 \4/' |
@@ -174,7 +174,7 @@ if [ "$scene" = keys ]; then
     first=$(locate 'The repo is now|repo is now')
     [ -n "$first" ] || first=$(locate_top 'Queued')
     if [ -n "$first" ]; then
-        "$ne" drive move "$first" >/dev/null 2>&1
+        "$ne" drive hover "$first" >/dev/null 2>&1
         sleep 3
         "$ne" shot long-name-hover >/dev/null && log "shot long-name-hover" ||
             log "shot failed: long-name-hover"
@@ -207,7 +207,7 @@ if [ "$scene" = cards ]; then
     # The long message, by the start of its text.
     long=$(locate 'The checkout moved')
     if [ -n "$long" ]; then
-        "$ne" drive move "$long" >/dev/null 2>&1 || log "hover failed"
+        "$ne" drive hover "$long" >/dev/null 2>&1 || log "hover failed"
         sleep 3
         "$ne" shot message-hover >/dev/null && log "shot message-hover" || log "shot failed: message-hover"
         "$ne" drive click --button right "$long" >/dev/null 2>&1 || log "right click failed"
@@ -221,7 +221,7 @@ if [ "$scene" = cards ]; then
     # The refused message, its reason in the tooltip.
     refused=$(locate 'release-notes')
     if [ -n "$refused" ]; then
-        "$ne" drive move "$refused" >/dev/null 2>&1 || log "hover failed"
+        "$ne" drive hover "$refused" >/dev/null 2>&1 || log "hover failed"
         sleep 3
         "$ne" shot message-refused-hover >/dev/null && log "shot message-refused-hover" ||
             log "shot failed: message-refused-hover"

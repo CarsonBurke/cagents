@@ -33,7 +33,7 @@ impl Cagents {
             Effect::Refresh => control(
                 transport::Purpose::Read,
                 |client| client.refresh_work_board(),
-                |result| Action::Refreshed(result),
+                Action::Refreshed,
             ),
             Effect::Pin {
                 project,
@@ -42,7 +42,7 @@ impl Cagents {
             } => control(
                 transport::Purpose::Mutation,
                 move |client| client.pin_work_card(project, item, column),
-                |result| Action::Pinned(result),
+                Action::Pinned,
             ),
             Effect::OpenWorktree { project, path } => {
                 let opened = self
@@ -62,7 +62,7 @@ impl Cagents {
                         })
                     });
                 match opened {
-                    Some(action) => self.update(Message::Sidebar(action)),
+                    Some(action) => self.dispatch(Message::Sidebar(action)),
                     // A worktree the sidebar has not listed yet still opens.
                     None => self.navigate_to_worktree(path, false),
                 }
@@ -82,7 +82,7 @@ impl Cagents {
                     .find(|candidate| candidate.repository == project)
                 {
                     Some(project) => {
-                        self.update(Message::Sidebar(SidebarAction::OpenPullRequest {
+                        self.dispatch(Message::Sidebar(SidebarAction::OpenPullRequest {
                             project_id: project.id,
                             number,
                             url,

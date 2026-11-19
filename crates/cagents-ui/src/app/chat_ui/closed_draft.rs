@@ -122,7 +122,7 @@ impl Runtime {
     }
 
     fn closed_draft_can_discard(&self) -> bool {
-        self.pending.is_none()
+        self.commands.is_idle()
             && self.queued.is_none()
             && self.followups.is_empty()
             && self.recalling.is_empty()
@@ -308,10 +308,8 @@ mod tests {
             panic!("chat retained");
         };
         sending.queued = Some(Queued {
-            source: prompt::LocalSource::new("the first message".into()),
-            presentation: prompt::LocalPresentation::default(),
+            prompt: prompt::LocalPrompt::new("the first message".into(), Vec::new()),
             resolved_text: "the first message".into(),
-            attachments: Vec::new(),
             model: None,
             draft: sending.session.clone(),
             since: None,
@@ -360,8 +358,10 @@ mod tests {
         let (mut app, target, channel, _) = fixture("survives registry replacement");
         retire(&mut app, channel, target.card);
         assert!(runtime(&app, target).closed_elsewhere);
-        let mut replacement = crate::workspace_model::WorkspaceModel::default();
-        replacement.identity = uuid::Uuid::new_v4();
+        let replacement = crate::workspace_model::WorkspaceModel {
+            identity: uuid::Uuid::new_v4(),
+            ..crate::workspace_model::WorkspaceModel::default()
+        };
         drop(app.apply_workspace_model_update(
             crate::app::workspace_model_sync::ModelUpdate::Connected(replacement),
         ));

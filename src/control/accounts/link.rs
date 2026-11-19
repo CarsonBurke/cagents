@@ -17,7 +17,10 @@ pub(super) fn parse_provider(value: &str) -> Result<Provider, String> {
     let provider = crate::control::agents::parse_provider(value)
         .map_err(|_| "Choose claude or codex".to_owned())?;
     if !crate::account::Account::PROVIDERS.contains(&provider) {
-        return Err("Omp manages its own logins; link supports claude and codex".into());
+        return Err(format!(
+            "{} manages its own logins; link supports claude and codex",
+            provider.label()
+        ));
     }
     Ok(provider)
 }
@@ -32,9 +35,7 @@ pub(super) fn parse_home(value: &str) -> Result<String, String> {
 pub(super) fn execute(provider: Provider, home: String) -> Result<CommandOutput, AppError> {
     parse_provider(provider.executable()).map_err(|error| AppError::new("account_link", error))?;
     let home = parse_home(&home).map_err(|error| AppError::new("account_link", error))?;
-    let socket = control_daemon_socket()?;
-    let mut client = ControlClient::connect(&socket)
-        .map_err(|error| AppError::new("daemon_connection", error))?;
+    let mut client = control_daemon_client()?;
     execute_with(&mut client, provider, home)
 }
 

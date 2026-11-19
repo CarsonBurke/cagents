@@ -47,7 +47,22 @@ pub(super) fn retry_draft(denial: &chat::PermissionDenial) -> Option<String> {
     ))
 }
 
-fn mode_description(mode: &str) -> &str {
+fn mode_description(provider: Provider, mode: &str) -> &str {
+    match (provider, mode) {
+        // Antigravity's own descriptions of its modes.
+        (Provider::Antigravity, "default") => "Ask before edits and commands",
+        (Provider::Antigravity, "acceptEdits") => {
+            "Approve file edits in the workspace without asking"
+        }
+        (Provider::Antigravity, "auto") => {
+            "Approve edits and safe commands; ask before irreversible actions"
+        }
+        (Provider::Antigravity, "plan") => "Plan carefully before carrying out a task",
+        _ => generic_mode_description(mode),
+    }
+}
+
+fn generic_mode_description(mode: &str) -> &str {
     match mode {
         "manual" | "default" => "Review tool requests before allowing them",
         "acceptEdits" => "Allow file edits; review other tool requests",
@@ -164,7 +179,7 @@ impl Runtime {
                     .into(),
             );
         }
-        if self.pending.is_some() {
+        if self.commands.awaiting_permissions() {
             content.push(design::caption("Waiting for provider confirmation…").into());
         }
         if self.session.launch.provider == Provider::Claude && !self.is_draft() {
@@ -284,7 +299,7 @@ impl Runtime {
                     widget::button::custom(
                         widget::column::with_children(vec![
                             design::body(view::permission_mode_label(mode)).into(),
-                            design::caption(mode_description(mode))
+                            design::caption(mode_description(self.session.launch.provider, mode))
                                 .class(cosmic::theme::Text::Custom(design::muted_text))
                                 .into(),
                         ])
@@ -296,7 +311,7 @@ impl Runtime {
                     ))
                     .width(Length::Fill)
                     .class(crate::ui_controls::control_style(
-                        snapshot.permission_mode.as_ref() == Some(mode),
+                        self.chosen_permission_mode() == Some(mode.as_str()),
                         None,
                     ))
                     .on_press_maybe(

@@ -27,6 +27,169 @@ pub(super) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
     .map_err(|error| error.to_string())
 }
 
+impl Registry {
+    pub(in crate::host) fn pane_chat_start(&self, pane: CardId) -> Result<Option<Binding>, String> {
+        let raw: Option<(String, String)> = self
+            .db
+            .query_row(
+                "SELECT candidate,current_allocation FROM pane_chat_starts WHERE pane=?1",
+                [pane.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        raw.map(|(raw, current)| {
+            Ok(Binding {
+                candidate: serde_json::from_str(&raw).map_err(|error| error.to_string())?,
+                current: current
+                    .parse()
+                    .map_err(|_| "Stored pane allocation is invalid".to_owned())?,
+            })
+        })
+        .transpose()
+    }
+
+    pub(in crate::host) fn pane_chat_allocation(
+        &self,
+        allocation: TerminalId,
+    ) -> Result<Option<TerminalId>, String> {
+        allocation_in(&self.db, allocation)
+    }
+
+    pub(in crate::host) fn pane_chat_allocation_is_current(
+        &mut self,
+        allocation: TerminalId,
+    ) -> Result<bool, String> {
+        // Coordinate with the execution registry's separate SQLite connection,
+        // not just this workspace writer's mutex. Capacity is already reserved.
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let current = allocation_in(&tx, allocation)?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(current.is_none_or(|current| current == allocation))
+    }
+
+    /// The caller holds the workspace writer while checking the previous
+    /// allocation's ownership. An independent writer cannot replace that basis.
+    pub(in crate::host) fn bind_pane_chat_start(
+        &mut self,
+        pane: CardId,
+        previous: Option<&Binding>,
+        candidate: &Session,
+    ) -> Result<bool, String> {
+        let current = candidate.id.to_string();
+        let candidate = serde_json::to_string(candidate).map_err(|error| error.to_string())?;
+        let tx = self.db.transaction().map_err(|error| error.to_string())?;
+        let changed = match previous {
+            Some(previous) => tx.execute(
+                "UPDATE pane_chat_starts SET candidate=?1,current_allocation=?4 WHERE pane=?2 AND candidate=?3 AND current_allocation=?5",
+                params![
+                    candidate,
+                    pane.to_string(),
+                    serde_json::to_string(&previous.candidate).map_err(|error| error.to_string())?,
+                    current,
+                    previous.current.to_string()
+                ],
+            ),
+            None => tx.execute(
+                "INSERT OR IGNORE INTO pane_chat_starts(pane,candidate,current_allocation) VALUES(?1,?2,?3)",
+                params![pane.to_string(), candidate, current],
+            ),
+        }
+        .map_err(|error| error.to_string())?;
+        if changed == 1 {
+            record_allocation(&tx, &current, &pane.to_string())?;
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(changed == 1)
+    }
+}
+
+pub(super) fn allocation_in(
+    db: &Connection,
+    allocation: TerminalId,
+) -> Result<Option<TerminalId>, String> {
+    let raw: Option<String> = db
+        .query_row(
+            "SELECT b.current_allocation FROM pane_chat_starts b
+         JOIN pane_chat_allocations a ON a.pane=b.pane WHERE a.allocation=?1",
+            [allocation.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    raw.map(|raw| {
+        raw.parse()
+            .map_err(|_| "Stored pane allocation is invalid".to_owned())
+    })
+    .transpose()
+}
+
+pub(super) fn retained_owner(allocation: TerminalId) -> Result<bool, String> {
+    use crate::daemon::holder_registry::{self as registry, Kind};
+    for kind in [Kind::Native, Kind::Terminal] {
+        let directory = registry::directory(kind)?;
+        if registry::recovery_candidate(&registry::socket(&directory, allocation), kind)
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Called in the same transaction as typed session succession. Replaying an old
+/// transition cannot overwrite a newer owner, even when its lineage is known.
+pub(super) fn advance(
+    tx: &rusqlite::Transaction<'_>,
+    predecessor: TerminalId,
+    successor: TerminalId,
+) -> Result<usize, String> {
+    let mut statement = tx
+        .prepare("SELECT pane FROM pane_chat_starts WHERE current_allocation=?1")
+        .map_err(|error| error.to_string())?;
+    let panes = statement
+        .query_map([predecessor.to_string()], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    drop(statement);
+    for pane in panes {
+        record_allocation(tx, &successor.to_string(), &pane)?;
+    }
+    tx.execute(
+        "UPDATE pane_chat_starts SET current_allocation=?1 WHERE current_allocation=?2",
+        params![successor.to_string(), predecessor.to_string()],
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn record_allocation(
+    tx: &rusqlite::Transaction<'_>,
+    allocation: &str,
+    pane: &str,
+) -> Result<(), String> {
+    tx.execute(
+        "INSERT OR IGNORE INTO pane_chat_allocations(allocation,pane) VALUES(?1,?2)",
+        params![allocation, pane],
+    )
+    .map_err(|error| error.to_string())?;
+    let owner: String = tx
+        .query_row(
+            "SELECT pane FROM pane_chat_allocations WHERE allocation=?1",
+            [allocation],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if owner != pane {
+        return Err("This conversation allocation already belongs to another pane".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,167 +419,4 @@ mod tests {
         assert_eq!(registry.pane_chat_start(card).unwrap(), None);
         assert!(registry.bind_pane_chat_start(card, None, &source).unwrap());
     }
-}
-
-impl Registry {
-    pub(in crate::host) fn pane_chat_start(&self, pane: CardId) -> Result<Option<Binding>, String> {
-        let raw: Option<(String, String)> = self
-            .db
-            .query_row(
-                "SELECT candidate,current_allocation FROM pane_chat_starts WHERE pane=?1",
-                [pane.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?;
-        raw.map(|(raw, current)| {
-            Ok(Binding {
-                candidate: serde_json::from_str(&raw).map_err(|error| error.to_string())?,
-                current: current
-                    .parse()
-                    .map_err(|_| "Stored pane allocation is invalid".to_owned())?,
-            })
-        })
-        .transpose()
-    }
-
-    pub(in crate::host) fn pane_chat_allocation(
-        &self,
-        allocation: TerminalId,
-    ) -> Result<Option<TerminalId>, String> {
-        allocation_in(&self.db, allocation)
-    }
-
-    pub(in crate::host) fn pane_chat_allocation_is_current(
-        &mut self,
-        allocation: TerminalId,
-    ) -> Result<bool, String> {
-        // Coordinate with the execution registry's separate SQLite connection,
-        // not just this workspace writer's mutex. Capacity is already reserved.
-        let tx = self
-            .db
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|error| error.to_string())?;
-        let current = allocation_in(&tx, allocation)?;
-        tx.commit().map_err(|error| error.to_string())?;
-        Ok(current.is_none_or(|current| current == allocation))
-    }
-
-    /// The caller holds the workspace writer while checking the previous
-    /// allocation's ownership. An independent writer cannot replace that basis.
-    pub(in crate::host) fn bind_pane_chat_start(
-        &mut self,
-        pane: CardId,
-        previous: Option<&Binding>,
-        candidate: &Session,
-    ) -> Result<bool, String> {
-        let current = candidate.id.to_string();
-        let candidate = serde_json::to_string(candidate).map_err(|error| error.to_string())?;
-        let tx = self.db.transaction().map_err(|error| error.to_string())?;
-        let changed = match previous {
-            Some(previous) => tx.execute(
-                "UPDATE pane_chat_starts SET candidate=?1,current_allocation=?4 WHERE pane=?2 AND candidate=?3 AND current_allocation=?5",
-                params![
-                    candidate,
-                    pane.to_string(),
-                    serde_json::to_string(&previous.candidate).map_err(|error| error.to_string())?,
-                    current,
-                    previous.current.to_string()
-                ],
-            ),
-            None => tx.execute(
-                "INSERT OR IGNORE INTO pane_chat_starts(pane,candidate,current_allocation) VALUES(?1,?2,?3)",
-                params![pane.to_string(), candidate, current],
-            ),
-        }
-        .map_err(|error| error.to_string())?;
-        if changed == 1 {
-            record_allocation(&tx, &current, &pane.to_string())?;
-        }
-        tx.commit().map_err(|error| error.to_string())?;
-        Ok(changed == 1)
-    }
-}
-
-pub(super) fn allocation_in(
-    db: &Connection,
-    allocation: TerminalId,
-) -> Result<Option<TerminalId>, String> {
-    let raw: Option<String> = db
-        .query_row(
-            "SELECT b.current_allocation FROM pane_chat_starts b
-         JOIN pane_chat_allocations a ON a.pane=b.pane WHERE a.allocation=?1",
-            [allocation.to_string()],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|error| error.to_string())?;
-    raw.map(|raw| {
-        raw.parse()
-            .map_err(|_| "Stored pane allocation is invalid".to_owned())
-    })
-    .transpose()
-}
-
-pub(super) fn retained_owner(allocation: TerminalId) -> Result<bool, String> {
-    use crate::daemon::holder_registry::{self as registry, Kind};
-    for kind in [Kind::Native, Kind::Terminal] {
-        let directory = registry::directory(kind)?;
-        if registry::recovery_candidate(&registry::socket(&directory, allocation), kind)
-            .map_err(|error| error.to_string())?
-            .is_some()
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-/// Called in the same transaction as typed session succession. Replaying an old
-/// transition cannot overwrite a newer owner, even when its lineage is known.
-pub(super) fn advance(
-    tx: &rusqlite::Transaction<'_>,
-    predecessor: TerminalId,
-    successor: TerminalId,
-) -> Result<usize, String> {
-    let mut statement = tx
-        .prepare("SELECT pane FROM pane_chat_starts WHERE current_allocation=?1")
-        .map_err(|error| error.to_string())?;
-    let panes = statement
-        .query_map([predecessor.to_string()], |row| row.get::<_, String>(0))
-        .map_err(|error| error.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())?;
-    drop(statement);
-    for pane in panes {
-        record_allocation(tx, &successor.to_string(), &pane)?;
-    }
-    tx.execute(
-        "UPDATE pane_chat_starts SET current_allocation=?1 WHERE current_allocation=?2",
-        params![successor.to_string(), predecessor.to_string()],
-    )
-    .map_err(|error| error.to_string())
-}
-
-fn record_allocation(
-    tx: &rusqlite::Transaction<'_>,
-    allocation: &str,
-    pane: &str,
-) -> Result<(), String> {
-    tx.execute(
-        "INSERT OR IGNORE INTO pane_chat_allocations(allocation,pane) VALUES(?1,?2)",
-        params![allocation, pane],
-    )
-    .map_err(|error| error.to_string())?;
-    let owner: String = tx
-        .query_row(
-            "SELECT pane FROM pane_chat_allocations WHERE allocation=?1",
-            [allocation],
-            |row| row.get(0),
-        )
-        .map_err(|error| error.to_string())?;
-    if owner != pane {
-        return Err("This conversation allocation already belongs to another pane".into());
-    }
-    Ok(())
 }

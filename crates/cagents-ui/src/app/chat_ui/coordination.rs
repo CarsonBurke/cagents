@@ -858,14 +858,14 @@ impl Row {
     /// name where the row cut it, the outcome's reason, what pressing does
     /// where it opens no agent, and then the message or prompt.
     fn described(&self) -> (String, String) {
-        let reason = self
-            .state
-            .detail
-            .as_deref()
-            .map(|detail| match self.state.tone {
-                Tone::Error => format!("{}: {detail}", self.state.text),
-                _ => detail.to_owned(),
-            });
+        // A warning or a failure names itself, as a narrow row keeps only
+        // its mark; a plain state is either drawn or the working dot.
+        let reason = match (self.state.tone, self.state.detail.as_deref()) {
+            (Tone::Plain, detail) => detail.map(str::to_owned),
+            (_, Some(detail)) => Some(format!("{}: {detail}", self.state.text)),
+            (_, None) => Some(self.state.text.to_string()),
+        }
+        .filter(|reason| !reason.trim().is_empty());
         let pressing = match (&self.open, self.several) {
             (Some(_), _) => "Opens the agent",
             (None, false) => OPENS_DETAIL,
@@ -902,26 +902,6 @@ impl Row {
         .join(" · ");
         (tip.join("\n\n"), name)
     }
-}
-
-/// The still mark beside a live caption: the accent, in a dot the size of
-/// the caption's lowercase letters.
-fn live_dot() -> Element<'static, Message> {
-    const SIZE: f32 = 6.0;
-    widget::container(widget::Space::new())
-        .width(Length::Fixed(SIZE))
-        .height(Length::Fixed(SIZE))
-        .class(cosmic::theme::Container::custom(|theme| {
-            widget::container::Style {
-                background: Some(iced::Background::Color(design::accent_color(theme))),
-                border: iced::Border {
-                    radius: (SIZE / 2.0).into(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            }
-        }))
-        .into()
 }
 
 /// A row's trailing status: a word or two, with the whole account of it in
@@ -1004,9 +984,11 @@ impl widget::menu::Action for RowCommand<'_> {
     }
 }
 
-/// A glyph at the size and tone of the step rows beside it.
-fn muted_glyph(icon: Icon) -> Element<'static, Message> {
-    crate::ui_controls::passive_icon(icon.handle(), design::COMPACT_ICON_SIZE)
+/// A glyph in the step rows' muted tone, at `size`: a row's lead at
+/// [`design::LEADING_ICON_SIZE`], as a step row's, and its trailing arrow or a
+/// caption's mark at [`design::COMPACT_ICON_SIZE`].
+fn muted_glyph(icon: Icon, size: u16) -> Element<'static, Message> {
+    crate::ui_controls::passive_icon(icon.handle(), size)
 }
 
 /// The transcript's own background, which a row's open detail sits on, so
@@ -1025,47 +1007,58 @@ enum Tone {
     Error,
 }
 
-/// A row's name, its preview and its status. The name and status take their
-/// room before the preview has any, and share it where it runs short; see
-/// [`crate::ui_controls::shared_line`]. A preview that is one term, an
-/// agent's type, is left out whole rather than cut, so the name fades only
-/// once nothing follows it, and a `tag` that tells the name apart is kept
-/// whole after it.
-fn row_line(
+/// A row's words after its glyph, and what of them its state gives way to.
+///
+/// The words are the verb, the name with the `tag` that tells it apart kept
+/// whole after it, and the preview. The name takes its room before the
+/// preview has any, and a preview that is one term, an agent's type, is left
+/// out whole rather than cut, so the name fades only once nothing follows it.
+/// What must not be cut for the state's sake, the second element, is the
+/// verb, the name and the tag, measured and never drawn.
+fn row_words(
+    verb: &'static str,
     name: String,
     tag: String,
     preview: String,
     term: bool,
-    status: Element<'static, Message>,
-) -> Element<'static, Message> {
-    let font = iced::Font {
-        weight: iced::font::Weight::Semibold,
-        ..cosmic::font::default()
-    };
-    let title = crate::ui_controls::fade_text(name)
-        .size(design::TEXT_BODY)
-        .font(font);
+) -> (Element<'static, Message>, Element<'static, Message>) {
+    let title =
+        crate::ui_controls::FadeText::transcript(name.clone()).font(design::transcript_name_font());
+    let tagged =
+        |tag: String| design::transcript_name(tag).wrapping(iced::widget::text::Wrapping::None);
     let title: Element<'static, Message> = if tag.is_empty() {
         title.into()
     } else {
-        crate::ui_controls::trailing(
-            title,
-            chat_title(tag)
-                .size(design::TEXT_BODY)
-                .font(font)
-                .wrapping(iced::widget::text::Wrapping::None),
-            0.0,
-        )
+        crate::ui_controls::trailing(title, tagged(tag.clone()), 0.0)
     };
-    let preview = crate::ui_controls::fade_text(preview)
+    let preview = crate::ui_controls::FadeText::transcript(preview)
         .class(cosmic::theme::Text::Custom(design::muted_text))
         .width(Length::Fill);
-    crate::ui_controls::shared_line(
+    let words = widget::row::with_children(vec![
+        design::transcript(verb)
+            .class(cosmic::theme::Text::Custom(design::muted_text))
+            .wrapping(iced::widget::text::Wrapping::None)
+            .into(),
         title,
-        if term { preview.whole() } else { preview },
-        status,
-        step::GAP_S,
-    )
+        if term { preview.whole() } else { preview }.into(),
+    ])
+    .spacing(step::GAP_S)
+    .align_y(Alignment::Center)
+    .width(Length::Fill);
+    let kept = widget::row::with_children(vec![
+        design::transcript(verb)
+            .wrapping(iced::widget::text::Wrapping::None)
+            .into(),
+        widget::row::with_children(vec![
+            design::transcript_name(name)
+                .wrapping(iced::widget::text::Wrapping::None)
+                .into(),
+            tagged(tag).into(),
+        ])
+        .into(),
+    ])
+    .spacing(step::GAP_S);
+    (words.into(), kept.into())
 }
 
 /// A tracked task's state is independent of the tool that launched it.
@@ -1351,7 +1344,7 @@ impl Runtime {
         };
         let placed = reading
             .cli
-            .then(|| reading.outcome.run.as_ref())
+            .then_some(reading.outcome.run.as_ref())
             .flatten()
             .and_then(|run| run.placed_in.as_ref());
         let destination = placed.map(|placed| {
@@ -1493,7 +1486,7 @@ impl Runtime {
         let failed = row.state.tone == Tone::Error;
         let lead: Element<'static, Message> = if failed {
             widget::icon(Icon::Error.handle())
-                .size(design::COMPACT_ICON_SIZE)
+                .size(design::LEADING_ICON_SIZE)
                 .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(|theme| {
                     cosmic::iced::widget::svg::Style {
                         color: Some(design::destructive_color(theme)),
@@ -1501,46 +1494,54 @@ impl Runtime {
                 })))
                 .into()
         } else {
-            muted_glyph(row.glyph)
+            muted_glyph(row.glyph, design::LEADING_ICON_SIZE)
         };
         let (tip, name) = row.described();
-        // A caption naming what an agent waits on is held to a budget, and
-        // fades where it, or the pane, runs short rather than clipping.
-        let caption = crate::ui_controls::fade_text(row.state.text.clone()).limit(STATUS_CHARS);
-        let caption = match row.state.tone {
-            Tone::Plain => caption.class(cosmic::theme::Text::Custom(design::muted_text)),
-            Tone::Warning => caption.class(cosmic::theme::Text::Custom(design::warning_text)),
-            Tone::Error => caption.class(cosmic::theme::Text::Custom(design::destructive_text)),
-        };
+        let (words, kept) = row_words(
+            row.verb,
+            row.shown.clone(),
+            row.tag.clone(),
+            row.preview.clone(),
+            row.term,
+        );
         // Work under way is marked by a still dot beside its caption; the
         // transcript's one activity indicator says that something moves.
-        let status = if row.state.live && matches!(row.state.tone, Tone::Plain) {
-            widget::row::with_children(vec![live_dot(), caption.into()])
-                .spacing(step::GAP_S)
-                .align_y(Alignment::Center)
-                .into()
-        } else {
-            caption.into()
+        let live = row.state.live && matches!(row.state.tone, Tone::Plain);
+        let mut state = Vec::new();
+        if live {
+            state.push(disclosure::state_dot(design::accent_color));
+        }
+        // A caption naming what an agent waits on is held to the bound its
+        // tab's caption is, so the row says what the tab says.
+        let status =
+            crate::ui_controls::FadeText::transcript(row.state.text.clone()).limit(STATUS_CHARS);
+        let status = match row.state.tone {
+            Tone::Plain => status.class(cosmic::theme::Text::Custom(design::muted_text)),
+            Tone::Warning => status.class(cosmic::theme::Text::Custom(design::warning_text)),
+            Tone::Error => status.class(cosmic::theme::Text::Custom(design::destructive_text)),
         };
-        // The verb takes its room first. The name and status share what is
-        // left before the preview has any: the preview fades out where the
-        // pane runs short, as a step row's summary does, and an agent's type
-        // is left out whole, so the name fades only once nothing follows it.
-        let line: Vec<Element<'static, Message>> = vec![
-            lead,
-            design::body(row.verb)
-                .class(cosmic::theme::Text::Custom(design::muted_text))
-                .wrapping(iced::widget::text::Wrapping::None)
-                .into(),
-            row_line(
-                row.shown.clone(),
-                row.tag.clone(),
-                row.preview.clone(),
-                row.term,
-                status,
-            ),
-        ];
-        let content = widget::row::with_children(line)
+        state.push(status.into());
+        // Where the agent's name and its state no longer both fit, the state
+        // keeps only its mark: the dot of work under way, or one in the
+        // warning colour. A failure keeps the row's leading glyph in the
+        // error colour, and a settled state is told by the absence of either.
+        // A warning's words stay in the row's tooltip, and every state's in
+        // its accessible name.
+        let compact = match row.state.tone {
+            Tone::Plain if live => Some(disclosure::state_dot(design::accent_color)),
+            Tone::Warning => Some(disclosure::state_dot(design::warning_color)),
+            Tone::Plain | Tone::Error => None,
+        };
+        let content = crate::ui_controls::yielding(
+            words,
+            kept,
+            widget::row::with_children(state)
+                .spacing(step::GAP_S)
+                .align_y(Alignment::Center),
+            compact,
+            step::GAP_S,
+        );
+        let content = widget::row::with_children(vec![lead, content])
             .spacing(step::GAP_S)
             .align_y(Alignment::Center)
             .width(Length::Fill);
@@ -1608,7 +1609,7 @@ impl Runtime {
             // pointer is. It only marks the row as one that opens: the row
             // is the control, so a click on the arrow is a click on the
             // row, and keyboard traversal and screen readers meet it once.
-            let arrow = widget::container(muted_glyph(Icon::Open))
+            let arrow = widget::container(muted_glyph(Icon::Open, design::COMPACT_ICON_SIZE))
                 .padding(iced::Padding {
                     right: step::GAP_S,
                     ..iced::Padding::ZERO
@@ -1851,7 +1852,7 @@ impl Runtime {
         widget::container(
             widget::column::with_children(vec![
                 widget::row::with_children(vec![
-                    muted_glyph(Icon::Chat),
+                    muted_glyph(Icon::Chat, design::COMPACT_ICON_SIZE),
                     design::caption(caption).into(),
                 ])
                 .spacing(step::GAP_XS)
@@ -2050,11 +2051,28 @@ mod identity_tests {
             started.state.text,
             "the row and the agent's tab say the same"
         );
-        // The same publication installed again is not scanned again.
+        // The same publication installed again is not scanned again, though
+        // what is shown of it is its prose joined, not the publication.
         let mut again = (*runtime.snapshot).clone();
         again.generation += 1;
+        let message = "joined ".repeat(chat::TRANSCRIPT_PART_BYTES / 3);
+        let cut = super::super::logical_prose::parts("answer", &message, 0..usize::MAX);
+        assert!(cut.len() > 1, "the message is held in parts");
+        let source = chat::TextCopySource {
+            cache: uuid::Uuid::from_u128(7),
+            scope: chat::TextCopyScope::Conversation,
+            token: 3,
+            revision: 1,
+            bytes: message.len() as u64,
+        };
+        again.text_copy_sources.conversation = vec![Some(source); cut.len()];
+        again.items = cut;
         let again = std::sync::Arc::new(again);
         runtime.install_snapshot(again.clone(), None);
+        assert!(
+            !std::sync::Arc::ptr_eq(&runtime.snapshot, &again),
+            "the shown publication is the joined one"
+        );
         runtime.agent_work = Default::default();
         runtime.install_snapshot(again, None);
         assert_eq!(runtime.agent_work.get("toolu_step"), None);
@@ -2246,31 +2264,33 @@ mod identity_tests {
         }
     }
 
-    /// Where a row runs short, its agent's type goes first. Its name and its
-    /// status then share the room: either keeps its width where it needs no
-    /// more than half, and neither takes the other's half, so a long caption
-    /// fades rather than the name, and the number that tells two agents of
-    /// one name apart stays whole.
+    /// Where a row runs short, its agent's type goes first, whole. The name
+    /// keeps its width until nothing follows it, then fades, and the number
+    /// that tells two agents of one name apart stays whole after it. What the
+    /// row's state gives way to is the verb, the name and the number, whole.
     #[test]
     fn a_rows_name_has_room_before_its_agents_type() {
         use iced::advanced::{layout, widget::Tree};
 
         let renderer = crate::app::tests::headless_renderer();
-        let status = "Waiting on scripts/restart-check --verbose --all-platforms";
-        let node = |tag: &str, status: &str, width: f32| {
-            let mut element = row_line(
-                "Review restart safety".into(),
-                tag.into(),
-                "general-purpose".into(),
-                true,
-                crate::ui_controls::fade_text(status.to_owned()).into(),
-            );
+        let lay = |element: Element<'static, Message>, width: f32| {
+            let mut element = element;
             let mut tree = Tree::new(element.as_widget());
             element.as_widget_mut().layout(
                 &mut tree,
                 &renderer,
                 &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 100.0)),
             )
+        };
+        let words = |tag: &str, width: f32| {
+            let (words, _) = row_words(
+                "Started",
+                "Review restart safety".into(),
+                tag.into(),
+                "general-purpose".into(),
+                true,
+            );
+            lay(words, width)
         };
         let parts = |node: &layout::Node| {
             node.children()
@@ -2280,38 +2300,37 @@ mod identity_tests {
         };
         let gap = step::GAP_S;
         // With room to spare, each part is laid out at its own width.
-        let wide = parts(&node("", status, 4000.0));
-        let (name, caption) = (wide[0], wide[2]);
-        assert!(name > 0.0 && caption > name, "{wide:?}");
-        // Room for the name and status but not the type: the type has only
-        // what is left, which is too little to draw it whole.
-        let short = parts(&node("", status, name + caption + 2.0 * gap + 20.0));
-        assert_eq!((short[0], short[2]), (name, caption), "{short:?}");
-        assert!(short[1] <= 20.0, "{short:?}");
-        // Less room: the name keeps its width and the caption fades.
-        let room = 2.0 * name + gap + 10.0;
-        let narrow = parts(&node("", status, room));
-        assert_eq!(narrow[0], name, "the name keeps its room: {narrow:?}");
-        assert_eq!(narrow[1], 0.0, "the type is gone: {narrow:?}");
-        assert_eq!(
-            narrow[2],
-            room - gap - name,
-            "the caption fades: {narrow:?}"
-        );
-        // A short status keeps its width, and the name fades before it.
-        let done = parts(&node("", "Finished", name));
-        let finished = parts(&node("", "Finished", 4000.0))[2];
-        assert!(finished <= (name - gap) / 2.0, "{finished} {name}");
-        assert_eq!(done[2], finished, "{done:?}");
-        assert_eq!(done[0], name - gap - finished, "{done:?}");
-        // The number that tells two agents of one name apart stays whole
-        // where the name fades before it.
-        let number = |width: f32| parts(&node(" 2", "Finished", width).children()[0]);
+        let wide = parts(&words("", 4000.0));
+        let (verb, name, kind) = (wide[0], wide[1], wide[2]);
+        assert!(verb > 0.0 && name > 0.0 && kind > 0.0, "{wide:?}");
+        // Room for the name but not the type: the type has only what is
+        // left, which is too little to draw it whole.
+        let short = parts(&words("", verb + name + 2.0 * gap + 20.0));
+        assert_eq!((short[0], short[1]), (verb, name), "{short:?}");
+        assert!(short[2] <= 20.0, "{short:?}");
+        // Less room: the type is gone and the name fades.
+        let room = verb + gap + name / 2.0;
+        let narrow = parts(&words("", room));
+        assert_eq!(narrow[0], verb, "{narrow:?}");
+        assert!(narrow[1] < name, "the name fades: {narrow:?}");
+        // The number stays whole where the name fades before it.
+        let number = |width: f32| parts(&words(" 2", width).children()[1]);
         let whole = number(4000.0);
-        let cut = number(name);
+        let cut = number(room);
         assert!(whole[1] > 0.0, "{whole:?}");
         assert_eq!(cut[1], whole[1], "the number keeps its room: {cut:?}");
-        assert_eq!(cut[0] + cut[1], name - gap - finished, "{cut:?}");
+        assert!(cut[0] < whole[0], "the name fades before it: {cut:?}");
+        // The state gives way to the verb, the name and the number whole,
+        // however long the type that follows them.
+        let (_, kept) = row_words(
+            "Started",
+            "Review restart safety".into(),
+            " 2".into(),
+            "general-purpose ".repeat(40),
+            false,
+        );
+        let kept = lay(kept, 4000.0).size().width;
+        assert_eq!(kept, verb + gap + whole[0] + whole[1]);
     }
 
     /// Claude addresses an agent by the agent ID it gave it, never by the

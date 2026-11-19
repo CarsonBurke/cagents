@@ -4,6 +4,7 @@ use std::path::PathBuf;
 pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
     provider: Provider::Codex,
     executable: "codex",
+    aliases: &[],
     label: "Codex",
     recognizes_script: |path| {
         matches!(
@@ -11,6 +12,7 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
             Some("codex" | "codex.js")
         )
     },
+    background_command: super::shared_background_command,
     session_file_id: |stem| {
         (stem.starts_with("rollout-") && stem.len() >= 36).then_some(())?;
         stem.get(stem.len() - 36..)
@@ -65,6 +67,10 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
     ],
     resume_flag: "resume",
     resume_precedes_options: true,
+    resume_picker: true,
+    latest_selectors: &["--last"],
+    native_chat: true,
+    acp: None,
     #[cfg(feature = "host")]
     forwards_to_native_child: true,
     #[cfg(feature = "host")]

@@ -123,6 +123,7 @@ pub struct Event {
     pub target: Target,
     /// Focus and preferred-window metadata only, never lifecycle authority.
     pub source_session: Option<TerminalId>,
+    #[serde(serialize_with = "crate::agent::absent_where_unknown")]
     pub provider: Option<Provider>,
     pub directory: Option<PathBuf>,
     #[serde(default)]
@@ -151,18 +152,17 @@ impl Event {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if let Some(content) = &self.content {
-            if content.conversation.chars().count() > presentation::TITLE_LIMIT
+        if let Some(content) = &self.content
+            && (content.conversation.chars().count() > presentation::TITLE_LIMIT
                 || content.preview.chars().count() > presentation::PREVIEW_LIMIT
                 || content
                     .conversation
                     .chars()
                     .chain(content.preview.chars())
                     .any(char::is_control)
-                || (content.request.is_some() && self.evidence.kind != Kind::Waiting)
-            {
-                return Err("Notification preview exceeds its text boundary".into());
-            }
+                || (content.request.is_some() && self.evidence.kind != Kind::Waiting))
+        {
+            return Err("Notification preview exceeds its text boundary".into());
         }
         if self.evidence.key.len() > 1024
             || self
@@ -525,9 +525,11 @@ mod tests {
         let mut unsafe_event = event.clone();
         unsafe_event.directory = Some("/private/message-content".into());
         assert!(unsafe_event.validate().is_err());
-        let mut preferences = Preferences::default();
-        preferences.enabled = true;
-        preferences.waiting = false;
+        let preferences = Preferences {
+            enabled: true,
+            waiting: false,
+            ..Preferences::default()
+        };
         assert!(!preferences.allows(Kind::MessageReceived, false));
     }
 

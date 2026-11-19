@@ -33,6 +33,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::BuildInfo
         | R::StartupState
         | R::List
+        | R::ListPage { .. }
         | R::WatchTerminals
         | R::WatchWorkspaceModel
         | R::ReadWorkspaceModel

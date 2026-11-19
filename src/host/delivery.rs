@@ -199,6 +199,8 @@ struct QueueState {
     /// free. Pushes come from threads holding the host lock, and the
     /// discarded messages can be full terminal frames.
     discarded: VecDeque<Outbound>,
+    /// Unsolicited messages that wait while a [`BroadcastHold`] is held.
+    held: Option<VecDeque<Outbound>>,
     close_after_drain: bool,
     aborted: bool,
 }
@@ -250,7 +252,52 @@ impl QueueState {
         self.popped += self.messages.len() as u64;
         self.slots.clear();
         self.queued_bulk_pages = 0;
-        std::mem::take(&mut self.messages)
+        let mut discarded = std::mem::take(&mut self.messages);
+        if let Some(held) = self.held.as_mut() {
+            discarded.append(held);
+        }
+        discarded
+    }
+
+    /// Messages queued or held, which together are bounded by the capacity.
+    fn backlog(&self) -> usize {
+        self.messages.len() + self.held.as_ref().map_or(0, VecDeque::len)
+    }
+}
+
+/// Holds this client's unsolicited messages, such as live terminal events,
+/// behind the replies its connection is queueing; see
+/// [`DeliveryQueue::hold_broadcasts`].
+#[must_use = "unsolicited messages are held only while this lives"]
+pub(crate) struct BroadcastHold<'a> {
+    queue: &'a DeliveryQueue,
+}
+
+impl BroadcastHold<'_> {
+    /// Queues `message` ahead of the held messages.
+    pub(crate) fn push(&self, message: impl Into<Outbound>) -> Result<(), DeliveryError> {
+        let mut state = self.queue.lock();
+        if state.aborted || state.close_after_drain {
+            return Err(DeliveryError::Closed);
+        }
+        self.queue.admit(&mut state, message.into())
+    }
+}
+
+impl Drop for BroadcastHold<'_> {
+    fn drop(&mut self) {
+        let mut state = self.queue.lock();
+        let held = state.held.take().unwrap_or_default();
+        let mut refused = VecDeque::new();
+        for message in held {
+            if state.aborted || state.close_after_drain {
+                refused.push_back(message);
+            } else {
+                let _ = self.queue.admit(&mut state, message);
+            }
+        }
+        drop(state);
+        drop(refused);
     }
 }
 
@@ -276,6 +323,7 @@ impl DeliveryQueue {
                 popped: 0,
                 queued_bulk_pages: 0,
                 discarded: VecDeque::new(),
+                held: None,
                 close_after_drain: false,
                 aborted: false,
             }),
@@ -308,14 +356,48 @@ impl DeliveryQueue {
     /// callers push while holding the host lock.
     pub(crate) fn push(&self, message: impl Into<Outbound>) -> Result<(), DeliveryError> {
         let message = message.into();
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self.lock();
         if state.aborted || state.close_after_drain {
             return Err(DeliveryError::Closed);
         }
+        if message.request_id.is_none() && state.held.is_some() {
+            if state.backlog() >= self.capacity {
+                return Err(self.overflow(&mut state, message));
+            }
+            if let Some(held) = state.held.as_mut() {
+                held.push_back(message);
+            }
+            return Ok(());
+        }
+        self.admit(&mut state, message)
+    }
 
+    /// Defers every unsolicited message pushed while the returned hold lives,
+    /// queueing them after what is pushed through the hold. A connection
+    /// holds broadcasts while it attaches a terminal and queues its reply and
+    /// replay: a live event published after the attachment would otherwise
+    /// overtake them, refusing the handshake or advancing the client's cursor
+    /// past events still waiting in the replay. Replies are never held, and
+    /// held messages count toward the queue's capacity; they are not
+    /// coalesced until released. Closing the queue sends them at once.
+    pub(crate) fn hold_broadcasts(&self) -> BroadcastHold<'_> {
+        let mut state = self.lock();
+        debug_assert!(state.held.is_none(), "one connection holds at a time");
+        if !state.aborted && !state.close_after_drain {
+            state.held.get_or_insert_with(VecDeque::new);
+        }
+        BroadcastHold { queue: self }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, QueueState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Queues `message` in order, coalescing it or disconnecting the client
+    /// when its backlog is full.
+    fn admit(&self, state: &mut QueueState, message: Outbound) -> Result<(), DeliveryError> {
         // Coalesce through the indexed slot instead of scanning the queue.
         if let Some(key) = coalescible(&message.message)
             && let Some(index) = state.slot(key)
@@ -389,44 +471,51 @@ impl DeliveryQueue {
 
         let bulk_backlog =
             bulk_page(&message.message) && state.queued_bulk_pages >= MAX_QUEUED_BULK_PAGES;
-        if state.messages.len() >= self.capacity || bulk_backlog {
-            let queued = state.messages.len();
-            tracing::warn!(
-                client = self.client_id,
-                queued,
-                capacity = self.capacity,
-                bulk_pages = state.queued_bulk_pages,
-                "disconnecting a cagents daemon client that fell behind its delivery queue"
-            );
-            let proof = Arc::clone(&message.proof);
-            let mut discarded = state.discard();
-            discarded.push_back(message);
-            debug_assert!(
-                state.discarded.is_empty(),
-                "a queue closes when it overflows, so it overflows once"
-            );
-            state.discarded = discarded;
-            state.enqueue(Outbound {
-                encoded_response: None,
-                version: PROTOCOL_VERSION,
-                request_id: None,
-                proof,
-                message: ServerMessage::Error(ProtocolError::new(
-                    ProtocolErrorCode::QueueFull,
-                    format!(
-                        "the cagents daemon dropped this connection: {queued} undelivered messages \
-                         reached the per-client queue limit. Reconnect to resynchronize."
-                    ),
-                    true,
-                )),
-            });
-            state.close_after_drain = true;
-            self.available.notify_all();
-            return Err(DeliveryError::Full);
+        if state.backlog() >= self.capacity || bulk_backlog {
+            return Err(self.overflow(state, message));
         }
         state.enqueue(message);
         self.available.notify_one();
         Ok(())
+    }
+
+    /// Replaces the backlog with a retryable `QueueFull` error and closes the
+    /// queue after it drains. `message`, the one refused, and the backlog are
+    /// left for the writer to free.
+    fn overflow(&self, state: &mut QueueState, message: Outbound) -> DeliveryError {
+        let queued = state.backlog();
+        tracing::warn!(
+            client = self.client_id,
+            queued,
+            capacity = self.capacity,
+            bulk_pages = state.queued_bulk_pages,
+            "disconnecting a cagents daemon client that fell behind its delivery queue"
+        );
+        let proof = Arc::clone(&message.proof);
+        let mut discarded = state.discard();
+        discarded.push_back(message);
+        debug_assert!(
+            state.discarded.is_empty(),
+            "a queue closes when it overflows, so it overflows once"
+        );
+        state.discarded = discarded;
+        state.enqueue(Outbound {
+            encoded_response: None,
+            version: PROTOCOL_VERSION,
+            request_id: None,
+            proof,
+            message: ServerMessage::Error(ProtocolError::new(
+                ProtocolErrorCode::QueueFull,
+                format!(
+                    "the cagents daemon dropped this connection: {queued} undelivered messages \
+                     reached the per-client queue limit. Reconnect to resynchronize."
+                ),
+                true,
+            )),
+        });
+        state.close_after_drain = true;
+        self.available.notify_all();
+        DeliveryError::Full
     }
 
     /// The next message to write, waiting for one. Run by the connection's
@@ -453,13 +542,21 @@ impl DeliveryQueue {
                 return None;
             }
             if let Some(message) = state.dequeue() {
-                match self.older.get() {
-                    None => return Some(message),
-                    Some(client) => match message.for_older(*client) {
-                        Some(message) => return Some(message),
-                        None => continue,
-                    },
+                let Some(client) = self.older.get() else {
+                    return Some(message);
+                };
+                // Not under the queue lock: converting may encode the whole
+                // message, and a push waits for that lock. Only this writer
+                // pops, so the order is kept.
+                drop(state);
+                if let Some(message) = message.for_older(*client) {
+                    return Some(message);
                 }
+                state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                continue;
             }
             if state.close_after_drain {
                 return None;
@@ -491,10 +588,13 @@ impl DeliveryQueue {
     }
 
     pub(crate) fn close_after_drain(&self) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self.lock();
+        // What was held is still sent, ahead of the close.
+        for message in state.held.take().unwrap_or_default() {
+            if self.admit(&mut state, message).is_err() {
+                break;
+            }
+        }
         state.close_after_drain = true;
         self.available.notify_all();
     }
@@ -1070,6 +1170,67 @@ mod tests {
         assert_eq!(error.code, ProtocolErrorCode::QueueFull);
         assert!(error.retryable);
         assert!(queue.pop().is_none());
+    }
+
+    #[test]
+    fn held_broadcasts_follow_what_the_connection_queues_through_its_hold() {
+        let id = TerminalId::new();
+        let event = |sequence| {
+            let mut envelope = redraw(id, 0);
+            envelope.message = ServerMessage::Event {
+                terminal_id: id,
+                sequence,
+                event: crate::terminal_ipc::WireTerminalEvent::ConversationTitleChanged {
+                    title: format!("title {sequence}"),
+                },
+            };
+            envelope
+        };
+        let mut reply = redraw(id, 0);
+        reply.request_id = Some(1);
+        reply.message = ServerMessage::Response {
+            response: ServerResponse::Accepted,
+        };
+        let order = |queue: &DeliveryQueue| {
+            queue.close_after_drain();
+            std::iter::from_fn(|| queue.pop())
+                .map(|queued| match queued.message {
+                    ServerMessage::Event { sequence, .. } => format!("event {sequence}"),
+                    ServerMessage::Response { .. } => "reply".into(),
+                    ServerMessage::Error(error) => format!("{:?}", error.code),
+                    other => panic!("{other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let queue = DeliveryQueue::new(7, 8);
+        let hold = queue.hold_broadcasts();
+        // A live event from the terminal's worker thread.
+        queue.push(event(2)).unwrap();
+        queue.push(reply.clone()).unwrap();
+        hold.push(event(1)).unwrap();
+        drop(hold);
+        queue.push(event(3)).unwrap();
+        assert_eq!(order(&queue), ["reply", "event 1", "event 2", "event 3"]);
+
+        // Held messages count toward the bound on what a client may owe.
+        let queue = DeliveryQueue::new(7, 2);
+        let hold = queue.hold_broadcasts();
+        queue.push(event(2)).unwrap();
+        hold.push(event(1)).unwrap();
+        assert_eq!(queue.push(event(3)), Err(DeliveryError::Full));
+        assert_eq!(hold.push(event(4)), Err(DeliveryError::Closed));
+        drop(hold);
+        assert_eq!(order(&queue), ["QueueFull"]);
+
+        // Closing still sends what was held, ahead of the close.
+        let queue = DeliveryQueue::new(7, 8);
+        let hold = queue.hold_broadcasts();
+        queue.push(event(1)).unwrap();
+        queue.close_after_drain();
+        assert_eq!(queue.push(event(2)), Err(DeliveryError::Closed));
+        drop(hold);
+        assert_eq!(order(&queue), ["event 1"]);
     }
 
     /// Pushes come from threads holding the host lock. An overflow discards

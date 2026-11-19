@@ -362,13 +362,13 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
     let _device_cleanup = cagents::device::Cleanup;
     cagents::device::select(device)?;
     cagents::device::prepare()?;
-    if !cagents::device::is_remote() {
-        if let Some(executable) = cagents::control::staged_ui_executable()? {
-            // exec preserves the launcher handshake pipe and window arguments.
-            let mut command = std::process::Command::new(executable);
-            command.args(std::env::args_os().skip(1));
-            return Err(command.exec().into());
-        }
+    if !cagents::device::is_remote()
+        && let Some(executable) = cagents::control::staged_ui_executable()?
+    {
+        // exec preserves the launcher handshake pipe and window arguments.
+        let mut command = std::process::Command::new(executable);
+        command.args(std::env::args_os().skip(1));
+        return Err(command.exec().into());
     }
     let unique_slot = uuid::Uuid::new_v4().to_string();
     let remote_new_window = new_window && cagents::device::is_remote();

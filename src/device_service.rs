@@ -1260,7 +1260,7 @@ mod tests {
         // bypasses ordinary file permissions, so this assertion is non-root.
         if unsafe { libc::geteuid() } != 0 {
             std::fs::write(&reference, valid_commit).unwrap();
-            std::fs::set_permissions(&reference, std::fs::Permissions::from_mode(0)).unwrap();
+            std::fs::set_permissions(&reference, std::fs::Permissions::from_mode(0o000)).unwrap();
             let outcome = invoke();
             std::fs::set_permissions(&reference, std::fs::Permissions::from_mode(0o600)).unwrap();
             assert!(outcome.is_err());
@@ -1660,7 +1660,7 @@ pub fn request(operation: Operation) -> Result<Reply, String> {
         crate::control::daemon_autostart_disabled(),
         crate::device::is_remote(),
         || crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string()),
-        || crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string()),
+        ready_client,
     )
 }
 
@@ -1677,7 +1677,7 @@ pub fn request_for_reader(operation: Operation) -> Result<Reply, String> {
         crate::control::daemon_autostart_disabled(),
         crate::device::is_remote(),
         || crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string()),
-        || crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string()),
+        ready_client,
         reader_message,
     )
 }
@@ -1693,9 +1693,17 @@ pub fn request_unless_busy(operation: Operation) -> Result<Reply, crate::control
         crate::control::daemon_autostart_disabled(),
         crate::device::is_remote(),
         || crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string()),
-        || crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string()),
+        ready_client,
         crate::control::RequestError::from,
     )
+}
+
+/// A User connection to the daemon, started if need be, on the connection
+/// whose handshake proved it ready.
+fn ready_client() -> Result<crate::control::ControlClient, String> {
+    crate::terminal::connect_ready_daemon()
+        .map(|ready| ready.client)
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(any(feature = "ui", test))]
@@ -1712,7 +1720,7 @@ fn request_as(
     no_start: bool,
     remote: bool,
     selected_socket: impl FnOnce() -> Result<PathBuf, String>,
-    ready_socket: impl FnOnce() -> Result<PathBuf, String>,
+    ready_client: impl FnOnce() -> Result<crate::control::ControlClient, String>,
 ) -> Result<Reply, String> {
     request_described(
         operation,
@@ -1720,7 +1728,7 @@ fn request_as(
         no_start,
         remote,
         selected_socket,
-        ready_socket,
+        ready_client,
         |error| error.to_string(),
     )
 }
@@ -1731,7 +1739,7 @@ fn request_described<E: From<String>>(
     no_start: bool,
     remote: bool,
     selected_socket: impl FnOnce() -> Result<PathBuf, String>,
-    ready_socket: impl FnOnce() -> Result<PathBuf, String>,
+    ready_client: impl FnOnce() -> Result<crate::control::ControlClient, String>,
     describe: impl FnOnce(crate::control::ControlError) -> E,
 ) -> Result<Reply, E> {
     // Resolving a remote socket can launch its SSH bridge before authentication.
@@ -1745,13 +1753,12 @@ fn request_described<E: From<String>>(
     }
     // Presence, including an empty/invalid capability, must never become User
     // startup or scope. Use the same captured authority after resolving a socket.
-    let socket = if authority.token().is_some() || no_start {
-        selected_socket()?
+    let mut client = if authority.token().is_some() || no_start {
+        crate::control::ControlClient::connect(&selected_socket()?)
+            .map_err(|error| error.to_string())?
     } else {
-        ready_socket()?
+        ready_client()?
     };
-    let mut client =
-        crate::control::ControlClient::connect(&socket).map_err(|error| error.to_string())?;
     client
         .authenticate(authority)
         .map_err(|error| error.to_string())?;
@@ -1978,6 +1985,12 @@ fn account_login(account: crate::account::Account) -> Result<Reply, String> {
         Provider::Claude => vec!["auth".into(), "login".into(), "--claudeai".into()],
         Provider::Codex => vec!["login".into(), "--device-auth".into()],
         Provider::Omp => return Err("open an Omp terminal on this device and use /login".into()),
+        Provider::Antigravity | Provider::Muse => {
+            return Err(format!(
+                "open {} in a terminal on this device to sign in",
+                account.provider.label()
+            ));
+        }
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

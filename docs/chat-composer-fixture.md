@@ -51,9 +51,8 @@ fixture_env scripts/run-development --browserless --debug --log-file "$fixture_r
 ```
 
 Keep the existing Cargo target/cache configuration when using a worktree; do
-not start another build while the runner builds its matched executables. If the
-harness help exposes `session start NAME --root ROOT --cmd CMD`, start a nested
-Niri session with `niri-harness session start composer --root "$fixture_root/niri" --no-window-wait --cmd WRAPPER`,
+not start another build while the runner builds its matched executables. Start a nested
+Niri session with `niri-harness start --name composer --root "$fixture_root/niri" --no-window-wait -- sh -c WRAPPER`,
 where `WRAPPER` is a shell command that runs the fixture runner script. Before replacing
 `XDG_RUNTIME_DIR`, convert the inherited relative `WAYLAND_DISPLAY` to an
 absolute path (`$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY`). Keep the inherited
@@ -137,6 +136,13 @@ change, with that outcome before sending anything, then removes the file, so
 the request after it goes through. Production's own refusals usually come with
 more: an unavailable conversation's process has also stopped, which this
 fixture does not reproduce.
+
+To see a send while it is still on its way, write a number of seconds, up to
+8, to `.cagents-fixture-delay-input` in the fixture `HOME`:
+`scripts/native-evidence env sh -c 'echo 5 >"$HOME/.cagents-fixture-delay-input"'`.
+A debug build holds the next request to Claude that long before admitting it,
+then removes the file. With `.cagents-fixture-refuse-input` as well, the
+request is held and then refused, as a send that fails after a wait is.
 
 To check where a failure is drawn after delivered work, write a diagnostic to
 `fixture-delivery-error` instead. Every prompt then gets a reply, a background

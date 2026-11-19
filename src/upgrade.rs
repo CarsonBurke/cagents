@@ -965,6 +965,7 @@ pub(crate) mod handoff {
     pub(crate) const MAX_CHATS: usize = crate::native_chat_capacity::MAX_LIMIT as usize;
     pub(crate) const MAX_SESSIONS: usize = MAX_TERMINALS + MAX_CHATS;
     const FILE: &str = "daemon-upgrade.json";
+    const ABANDONED_FILE: &str = "daemon-upgrade.abandoned.json";
 
     /// Enforce the durable limit while serializing, before allocating a full
     /// report. Launch environments and recovery lineages are client supplied.
@@ -1577,6 +1578,16 @@ pub(crate) mod handoff {
     const UNATTACHED_FILE: &str = "daemon-upgrade.unattached.json";
     const UNATTACHED_VERSION: u16 = 1;
 
+    /// A conversation whose provider-confirmed ID only an update checkpoint
+    /// records.
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+    pub(crate) struct CheckpointIdentity {
+        pub id: crate::model::TerminalId,
+        pub provider: crate::agent::Provider,
+        pub conversation: String,
+        pub working_directory: PathBuf,
+    }
+
     /// What any client may read about an unattached conversation. The host
     /// writes the exact evidence beside it; readers ignore that payload.
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
@@ -1588,6 +1599,24 @@ pub(crate) mod handoff {
         pub working_directory: PathBuf,
         /// Why reattachment was refused, as the daemon reported it.
         pub reason: String,
+        /// Evidence written before this field existed always described a
+        /// retained provider.
+        #[serde(default)]
+        pub disposition: UnattachedDisposition,
+    }
+
+    /// What became of an unattached conversation's provider.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub(crate) enum UnattachedDisposition {
+        /// It outlived the previous daemon and was left exactly as it was:
+        /// nothing was restarted or resent for it.
+        #[default]
+        Retained,
+        /// The previous daemon stopped it for the update. Its restart failed,
+        /// and what that restart started was stopped again, so nothing of it
+        /// runs; reopening the conversation starts it again.
+        Stopped,
     }
 
     #[cfg(any(feature = "host", test))]
@@ -1616,10 +1645,19 @@ pub(crate) mod handoff {
                     conversation: evidence.launch.session_id.clone(),
                     working_directory: evidence.launch.recipe.working_directory.clone(),
                     reason,
+                    disposition: UnattachedDisposition::Retained,
                 },
                 evidence,
                 terminal: None,
             }
+        }
+
+        /// A conversation whose restart this restore started, then stopped.
+        #[cfg(feature = "host")]
+        pub fn stopped(evidence: Chat, reason: String) -> Self {
+            let mut chat = Self::new(evidence, reason);
+            chat.summary.disposition = UnattachedDisposition::Stopped;
+            chat
         }
     }
 
@@ -2208,12 +2246,60 @@ pub(crate) mod handoff {
         /// removing the record once nothing in it needs attention.
         #[cfg(any(feature = "host", test))]
         pub fn retire_unattached(&self, id: crate::model::TerminalId) -> Result<(), String> {
+            self.retire_unattached_where(id, |_| true)
+        }
+
+        /// Why this restore stopped the conversation an exact descriptor it
+        /// issued names, if it did. Only a complete issued source, or the
+        /// confirmed alias a pane learned once its thread was named,
+        /// retrieves the reason, as with a retained conversation's refusal.
+        #[cfg(feature = "host")]
+        pub fn stopped_reason(&self, source: &crate::chat::Session) -> Option<String> {
+            let _update = self.unattached.lock().unwrap_or_else(|p| p.into_inner());
+            self.read_unattached::<UnattachedChat>()
+                .ok()
+                .flatten()?
+                .into_iter()
+                .find(|entry| {
+                    entry.summary.id == source.id
+                        && entry.summary.disposition == UnattachedDisposition::Stopped
+                        && entry
+                            .evidence
+                            .previous_sources
+                            .iter()
+                            .chain(std::iter::once(&ChatSource {
+                                source: entry.evidence.source.clone(),
+                                launch: entry.evidence.launch.clone(),
+                            }))
+                            .any(|issued| issued_chat_source_matches(issued, source))
+                })
+                .map(|entry| entry.summary.reason)
+        }
+
+        /// Forgets a stopped conversation once it has been started again. A
+        /// retained entry for the same id still names a provider of its own.
+        #[cfg(feature = "host")]
+        pub fn retire_stopped_unattached(
+            &self,
+            id: crate::model::TerminalId,
+        ) -> Result<(), String> {
+            self.retire_unattached_where(id, |entry| {
+                entry.summary.disposition == UnattachedDisposition::Stopped
+            })
+        }
+
+        #[cfg(any(feature = "host", test))]
+        fn retire_unattached_where(
+            &self,
+            id: crate::model::TerminalId,
+            retire: impl Fn(&UnattachedChat) -> bool,
+        ) -> Result<(), String> {
             let _update = self.unattached.lock().unwrap_or_else(|p| p.into_inner());
             let Some(mut conversations) = self.read_unattached::<UnattachedChat>()? else {
                 return Ok(());
             };
             let before = conversations.len();
-            conversations.retain(|entry| entry.summary.id != id);
+            conversations.retain(|entry| entry.summary.id != id || !retire(entry));
             if conversations.len() == before {
                 return Ok(());
             }
@@ -2256,7 +2342,43 @@ pub(crate) mod handoff {
         }
 
         pub fn archive(&self) -> Result<PathBuf, String> {
-            self.archive_as("daemon-upgrade.abandoned.json")
+            self.archive_as(ABANDONED_FILE)
+        }
+
+        /// The conversation IDs a checkpoint holds that its chats' saved
+        /// descriptors lack: providers named those threads after the update
+        /// began, so the checkpoint is their only record. `None` when the
+        /// checkpoint is missing or unreadable.
+        pub fn checkpoint_only_identities(&self) -> Option<Vec<CheckpointIdentity>> {
+            #[derive(Deserialize)]
+            struct Chats {
+                chats: Vec<Chat>,
+            }
+            let bytes = self.read_bytes().ok()??;
+            let Chats { chats } = serde_json::from_slice(&bytes).ok()?;
+            Some(
+                chats
+                    .into_iter()
+                    .filter(|chat| chat.source.launch.session_id.is_none())
+                    .filter_map(|chat| {
+                        Some(CheckpointIdentity {
+                            id: chat.source.id,
+                            provider: chat.launch.provider,
+                            conversation: chat.launch.session_id?,
+                            working_directory: chat.launch.recipe.working_directory,
+                        })
+                    })
+                    .collect(),
+            )
+        }
+
+        /// The checkpoint an operator abandoned. It is never replayed, but the
+        /// daemon saves the conversation IDs that only it records.
+        #[cfg(feature = "host")]
+        pub fn load_abandoned(&self) -> Result<Option<Checkpoint>, String> {
+            self.read_named(ABANDONED_FILE)?
+                .map(|bytes| decode_checkpoint(&bytes))
+                .transpose()
         }
 
         /// Preserve deferred setup evidence without leaving a replayable
@@ -2507,7 +2629,9 @@ pub(crate) mod handoff {
                         .proves(source, current, serving)
                 );
                 assert!(!store.path.with_file_name(RECOVERED_FILE).exists());
-                store.record_recovered(&[entry.clone()]).unwrap();
+                store
+                    .record_recovered(std::slice::from_ref(&entry))
+                    .unwrap();
                 let path = store.path.with_file_name(RECOVERED_FILE);
                 let before = std::fs::read(&path).unwrap();
                 let evidence = store.recovered_chats().unwrap();
@@ -2699,12 +2823,27 @@ pub(crate) mod handoff {
 
 /// Explicitly abandon automatic replay while retaining every source descriptor.
 /// Requires a stopped daemon and never replaces a previous abandoned archive.
-pub fn abandon() -> Result<std::path::PathBuf, String> {
+pub(crate) fn abandon() -> Result<Abandoned, String> {
     let paths = crate::daemon::RuntimePaths::discover().map_err(|error| error.to_string())?;
     let _lease = crate::daemon::HostLease::acquire_for_maintenance(&paths)
         .map_err(|error| error.to_string())?;
     let store = handoff::Store::discover()?;
-    store.archive()
+    // Read first: an unreadable checkpoint is still archived, as abandoning is
+    // how an operator gets past one.
+    let checkpoint_only = store.checkpoint_only_identities();
+    Ok(Abandoned {
+        archive: store.archive()?,
+        checkpoint_only,
+    })
+}
+
+/// An archived checkpoint and the conversation IDs only it recorded, which the
+/// next daemon saves to the agents and panes still showing those chats.
+#[derive(Debug)]
+pub(crate) struct Abandoned {
+    pub archive: std::path::PathBuf,
+    /// `None` when the checkpoint could not be read.
+    pub checkpoint_only: Option<Vec<handoff::CheckpointIdentity>>,
 }
 
 #[cfg(test)]
@@ -2744,6 +2883,46 @@ mod tests {
             previous_sources: Vec::new(),
         });
         checkpoint
+    }
+
+    /// #3095: abandoning says which conversations only the checkpoint
+    /// identifies, and the next daemon reads them from the archive.
+    #[test]
+    fn abandoning_names_conversations_only_the_checkpoint_identifies() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("upgrade")).unwrap();
+        let mut checkpoint = retained_claude_checkpoint(directory.path());
+        let thread = uuid::Uuid::new_v4().to_string();
+        checkpoint.chats[0].launch.session_id = Some(thread.clone());
+        let unnamed = checkpoint.chats[0].source.clone();
+        // Its descriptor already carries its ID.
+        let mut named = checkpoint.chats[0].clone();
+        named.source.id = TerminalId::new();
+        named.source.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        named.launch.session_id = named.source.launch.session_id.clone();
+        // Its provider never named it.
+        let mut nameless = checkpoint.chats[0].clone();
+        nameless.source.id = TerminalId::new();
+        nameless.launch.session_id = None;
+        checkpoint.chats.extend([named, nameless]);
+        store.save(&checkpoint).unwrap();
+        assert_eq!(
+            store.checkpoint_only_identities(),
+            Some(vec![handoff::CheckpointIdentity {
+                id: unnamed.id,
+                provider: crate::agent::Provider::Claude,
+                conversation: thread,
+                working_directory: directory.path().into(),
+            }])
+        );
+        store.archive().unwrap();
+        assert_eq!(store.checkpoint_only_identities(), None);
+        #[cfg(feature = "host")]
+        assert_eq!(
+            store.load_abandoned().unwrap().unwrap().chats.len(),
+            3,
+            "the daemon reads the archive it saves identities from"
+        );
     }
 
     #[cfg(feature = "host")]
@@ -3269,7 +3448,7 @@ mod tests {
         fs::write(process.join("comm"), format!("{name}\n")).unwrap();
         fs::write(process.join("cmdline"), format!("{name}\0")).unwrap();
         fs::write(process.join("environ"), b"PATH=/bin\0").unwrap();
-        fs::set_permissions(process.join("environ"), fs::Permissions::from_mode(0)).unwrap();
+        fs::set_permissions(process.join("environ"), fs::Permissions::from_mode(0o000)).unwrap();
         assert_eq!(
             fs::read(process.join("environ")).unwrap_err().kind(),
             io::ErrorKind::PermissionDenied,

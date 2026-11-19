@@ -399,8 +399,9 @@ fn publish(
     // Unlike the observer, the publisher starts a daemon: a channel the user
     // just created has to reach the registry, and there is no registry without
     // a daemon to hold it.
-    let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
-    let mut client = ControlClient::connect(&socket).map_err(|error| error.to_string())?;
+    let mut client = crate::terminal::connect_ready_daemon()
+        .map_err(|error| error.to_string())?
+        .client;
     // This connection may reach a replaced registry. Its one baseline is a
     // reconnect read; subsequent edits and conflicts read affected scopes only.
     let (model, _) = client
@@ -997,11 +998,10 @@ impl Cagents {
                         .any(|held| held.repository == order.repository)
             });
             model.views.retain(|view| {
-                !self
-                    .shared_views
+                self.shared_views
                     .scope_absences
                     .get(&view.scope)
-                    .is_some_and(|absence| *absence > sequence)
+                    .is_none_or(|absence| *absence <= sequence)
             });
             for view in &self.workspace_model.views {
                 let previous = model.views.iter().find(|held| held.scope == view.scope);
@@ -2210,8 +2210,8 @@ impl Cagents {
     /// rather than by a request of its own.
     ///
     /// Nothing happens at all until a registry has answered. The window
-    /// reconciles on its own events too - a repository finishing loading is one
-    /// - and the cached model starts out as a [`WorkspaceModel::default`], whose
+    /// reconciles on its own events too - a repository finishing loading is one -
+    /// and the cached model starts out as a [`WorkspaceModel::default`], whose
     /// emptiness is not a registry's emptiness. Publishing against it would be
     /// premature and retiring against it would be destruction.
     pub(super) fn reconcile_workspace_model(&mut self) -> Task<Message> {
@@ -2290,13 +2290,27 @@ impl Cagents {
                 Adoption::Retained => {}
             }
         }
-        for project in &mut self.sidebar_model.projects {
-            project.navigation_order = model
+        // Written only where an order changed, so an unchanged sidebar keeps
+        // its revision and the navigation list its cache.
+        let navigation_order = |project: &SidebarProject| {
+            model
                 .navigation_orders
                 .iter()
                 .find(|order| order.repository == project.repository)
-                .map(|order| order.items.clone())
-                .unwrap_or_default();
+                .map_or(&[][..], |order| order.items.as_slice())
+        };
+        if self
+            .sidebar_model
+            .projects
+            .iter()
+            .any(|project| project.navigation_order != navigation_order(project))
+        {
+            for project in &mut self.sidebar_model.projects {
+                let order = navigation_order(project);
+                if project.navigation_order != order {
+                    project.navigation_order = order.to_vec();
+                }
+            }
         }
         for shared in &model.channels {
             if self.channel_ui.is_deleting(shared.id) || self.channel_ui.was_deleted(shared.id) {

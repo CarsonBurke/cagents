@@ -274,6 +274,8 @@ pub fn may_recognize(item: &Item, provider: Provider) -> bool {
                     | "listAgents"
             ),
             Provider::Omp => name == "task",
+            // Their coordination tools aren't read yet.
+            Provider::Antigravity | Provider::Muse => false,
         },
         _ => false,
     }
@@ -379,35 +381,66 @@ fn names_program(line: &str) -> bool {
     })
 }
 
-/// A shell line's one `cagents` invocation. A line running several is left as
-/// the command it is: a card for its first would misreport the rest.
+/// A shell line that is one `cagents` invocation, read as what it did.
+///
+/// The whole line has to be that invocation: a step is labelled by what it
+/// is, not by a command it contains. Around it the line may only set up where
+/// and when it runs (`cd`, `export`, `set`, `sleep`), feed it a message the
+/// line itself holds (`cat <<EOF |`, `echo … |`), trim what it printed
+/// (`| tail -1`, `| jq …`), or say how it went (`|| echo failed`). A line that
+/// also lists a directory, searches files or runs a second invocation is a
+/// command of its own, and its row says so.
 fn cli(line: &str, output: &str) -> Option<Coordination> {
     if !names_program(line) {
         return None;
     }
     let commands = shell::commands(line)?;
-    let mut found = None;
-    for (index, simple) in commands.iter().enumerate() {
-        let Some(argv) = invocation(&simple.argv) else {
-            continue;
-        };
-        // One that may not have run reads as nothing it did.
-        if found.is_some() || simple.guarded {
-            return None;
-        }
-        let stdin = match &simple.stdin {
-            shell::Stdin::Text(text) => Text::Inline(text.clone()),
-            shell::Stdin::File(path) => Text::File(path.clone()),
-            shell::Stdin::Pipe => index
-                .checked_sub(1)
-                .and_then(|before| commands.get(before))
-                .and_then(piped_text)
-                .map_or(Text::Unseen, Text::Inline),
-            shell::Stdin::Unknown => Text::Unseen,
-        };
-        found = Some((argv, stdin));
+    let index = commands
+        .iter()
+        .position(|simple| invocation(&simple.argv).is_some())?;
+    let simple = &commands[index];
+    // One that may not have run reads as nothing it did.
+    if simple.guarded {
+        return None;
     }
-    let (argv, stdin) = found?;
+    let argv = invocation(&simple.argv)?;
+    // The invocation's own pipeline: what feeds it, and what reads it.
+    let feeds = simple.stdin == shell::Stdin::Pipe;
+    let first = if feeds { index.checked_sub(1)? } else { index };
+    let last = index
+        + commands[index + 1..]
+            .iter()
+            .take_while(|after| after.stdin == shell::Stdin::Pipe)
+            .count();
+    // What is piped in reaches the CLI only where it reads standard input,
+    // as a message, a prompt, a ticket body or a definition given as `-`;
+    // piped into anything else, it is a command of its own.
+    if feeds && !crate::control::invocation::reads_stdin(argv) {
+        return None;
+    }
+    let incidental = commands.iter().enumerate().all(|(at, other)| match at {
+        at if at == index => true,
+        at if at < first => sets_up(other),
+        at if at < index => piped_text(other).is_some() || piped_file(other).is_some(),
+        at if at <= last => trims(other),
+        _ => reports(other),
+    });
+    if !incidental {
+        return None;
+    }
+    let stdin = match &simple.stdin {
+        shell::Stdin::Text(text) => Text::Inline(text.clone()),
+        shell::Stdin::File(path) => Text::File(path.clone()),
+        shell::Stdin::Pipe => match commands.get(first) {
+            Some(before) => match (piped_text(before), piped_file(before)) {
+                (Some(text), _) => Text::Inline(text),
+                (None, Some(file)) => Text::File(file.to_owned()),
+                (None, None) => Text::Unseen,
+            },
+            None => Text::Unseen,
+        },
+        shell::Stdin::Unknown => Text::Unseen,
+    };
     let mut kind = crate::control::invocation::coordination(argv, stdin)?;
     let outcome = crate::control::invocation::outcome(&kind, output);
     crate::control::invocation::enrich(&mut kind, &outcome);
@@ -417,6 +450,271 @@ fn cli(line: &str, output: &str) -> Option<Coordination> {
         subagents: Vec::new(),
         cli: true,
     })
+}
+
+/// The program `simple` runs, by its name rather than its path.
+fn program(simple: &shell::Simple) -> &str {
+    simple
+        .argv
+        .first()
+        .and_then(|program| program.rsplit('/').next())
+        .unwrap_or_default()
+}
+
+/// Whether `simple`, run before an invocation, only sets up where and when
+/// it runs. `cd repo || exit 1` gives up when it cannot.
+fn sets_up(simple: &shell::Simple) -> bool {
+    match program(simple) {
+        "cd" | "pushd" | "export" | "set" | "unset" | "sleep" | "true" | ":" => true,
+        "exit" => simple.guarded,
+        _ => false,
+    }
+}
+
+/// Whether `simple`, reading an invocation's output through a pipe, only
+/// trims, filters or formats what it printed. One that names a file to read
+/// as well, as `head -50 build.log` or `jq --slurpfile seen seen.json` do,
+/// or searches a directory, as `grep -r` does, reads something else.
+fn trims(simple: &shell::Simple) -> bool {
+    let Some(filter) = Filter::of(program(simple)) else {
+        return false;
+    };
+    // `tee` writes its files, so they are no input.
+    if filter.program == usize::MAX {
+        return true;
+    }
+    let mut programs = filter.program;
+    let mut operands = 0;
+    let mut words = simple.argv[1..].iter();
+    while let Some(word) = words.next() {
+        if word == "--" {
+            operands += words.len();
+            break;
+        }
+        if let Some(long) = word.strip_prefix("--") {
+            let (name, attached) = match long.split_once('=') {
+                Some((name, _)) => (name, true),
+                None => (long, false),
+            };
+            if filter.reads_more.contains(&name) {
+                return false;
+            }
+            if filter.supplies_program.contains(&name) {
+                programs = 0;
+            }
+            let values = filter
+                .long
+                .iter()
+                .find(|(option, _)| *option == name)
+                .map_or(0, |(_, values)| *values);
+            for _ in 0..values.saturating_sub(usize::from(attached)) {
+                words.next();
+            }
+            continue;
+        }
+        if let Some(cluster) = word.strip_prefix('-').filter(|cluster| !cluster.is_empty()) {
+            // `-ne PATTERN`, `-n5`, `-eerror`: a short option taking a value
+            // takes the rest of its word, or the next word.
+            for (at, option) in cluster.char_indices() {
+                if filter
+                    .reads_more
+                    .contains(&&cluster[at..at + option.len_utf8()])
+                {
+                    return false;
+                }
+                if !filter.short.contains(option) {
+                    continue;
+                }
+                if filter.supplies_program.contains(&&cluster[at..at + 1]) {
+                    programs = 0;
+                }
+                if at + option.len_utf8() == cluster.len() {
+                    words.next();
+                }
+                break;
+            }
+            continue;
+        }
+        operands += 1;
+    }
+    operands <= programs
+}
+
+/// How a program that filters its input reads its command line.
+struct Filter {
+    /// How many operands are its program (a pattern, a script, a filter)
+    /// rather than files to read; `usize::MAX` for one whose operands are
+    /// files it writes.
+    program: usize,
+    /// Short options that take a value.
+    short: &'static str,
+    /// Long options that take values, and how many.
+    long: &'static [(&'static str, usize)],
+    /// Options, short or long, that give the program, so no operand does.
+    supplies_program: &'static [&'static str],
+    /// Options, short or long, that read input besides the piped output: a
+    /// file of data, or a directory searched in place of standard input.
+    reads_more: &'static [&'static str],
+}
+
+impl Filter {
+    fn of(program: &str) -> Option<Self> {
+        let filter = |program, short, long, supplies_program| Self {
+            program,
+            short,
+            long,
+            supplies_program,
+            reads_more: &[],
+        };
+        Some(match program {
+            "tee" => filter(usize::MAX, "", &[], &[]),
+            "head" | "tail" => filter(0, "nc", &[("lines", 1), ("bytes", 1)], &[]),
+            "wc" | "cat" | "less" | "more" => filter(0, "", &[], &[]),
+            "nl" => filter(
+                0,
+                "bdfhilnsvw",
+                &[
+                    ("body-numbering", 1),
+                    ("section-delimiter", 1),
+                    ("footer-numbering", 1),
+                    ("header-numbering", 1),
+                    ("line-increment", 1),
+                    ("join-blank-lines", 1),
+                    ("number-format", 1),
+                    ("number-separator", 1),
+                    ("starting-line-number", 1),
+                    ("number-width", 1),
+                ],
+                &[],
+            ),
+            "sort" => filter(
+                0,
+                "ktoST",
+                &[
+                    ("key", 1),
+                    ("field-separator", 1),
+                    ("output", 1),
+                    ("buffer-size", 1),
+                ],
+                &[],
+            ),
+            "uniq" => filter(
+                0,
+                "fsw",
+                &[("skip-fields", 1), ("skip-chars", 1), ("check-chars", 1)],
+                &[],
+            ),
+            "fold" => filter(0, "w", &[("width", 1)], &[]),
+            "column" => filter(
+                0,
+                "scoNRWTEHOnl",
+                &[
+                    ("separator", 1),
+                    ("output-separator", 1),
+                    ("output-width", 1),
+                    ("table-columns", 1),
+                    ("table-right", 1),
+                    ("table-wrap", 1),
+                    ("table-truncate", 1),
+                    ("table-noextreme", 1),
+                    ("table-hide", 1),
+                    ("table-order", 1),
+                    ("table-name", 1),
+                    ("table-columns-limit", 1),
+                ],
+                &[],
+            ),
+            "cut" => filter(
+                0,
+                "dfcb",
+                &[
+                    ("delimiter", 1),
+                    ("fields", 1),
+                    ("characters", 1),
+                    ("bytes", 1),
+                ],
+                &[],
+            ),
+            "tr" => filter(2, "", &[], &[]),
+            // With no file, `grep -r` searches the working directory, not
+            // what it is piped.
+            "grep" | "egrep" | "fgrep" => Self {
+                reads_more: &["r", "R", "recursive", "dereference-recursive"],
+                ..filter(
+                    1,
+                    "efmABCd",
+                    &[
+                        ("regexp", 1),
+                        ("file", 1),
+                        ("max-count", 1),
+                        ("after-context", 1),
+                        ("before-context", 1),
+                        ("context", 1),
+                        ("label", 1),
+                    ],
+                    &["e", "f", "regexp", "file"],
+                )
+            },
+            // Piped input with no path, `rg` searches that input.
+            "rg" => filter(
+                1,
+                "efmABCgtTrM",
+                &[
+                    ("regexp", 1),
+                    ("file", 1),
+                    ("max-count", 1),
+                    ("after-context", 1),
+                    ("before-context", 1),
+                    ("context", 1),
+                    ("glob", 1),
+                    ("iglob", 1),
+                    ("type", 1),
+                    ("type-not", 1),
+                    ("replace", 1),
+                    ("max-columns", 1),
+                ],
+                &["e", "f", "regexp", "file"],
+            ),
+            "sed" => filter(
+                1,
+                "ef",
+                &[("expression", 1), ("file", 1)],
+                &["e", "f", "expression", "file"],
+            ),
+            "awk" => filter(
+                1,
+                "Fvf",
+                &[("field-separator", 1), ("assign", 1), ("file", 1)],
+                &["f", "file"],
+            ),
+            // `--slurpfile` and `--rawfile` bind a file's contents.
+            "jq" => Self {
+                reads_more: &["slurpfile", "rawfile"],
+                ..filter(
+                    1,
+                    "fL",
+                    &[("arg", 2), ("argjson", 2), ("indent", 1), ("from-file", 1)],
+                    &["f", "from-file"],
+                )
+            },
+            _ => return None,
+        })
+    }
+}
+
+/// Whether `simple`, piped into an invocation, is `cat` of one file: the
+/// message is that file, as `< file` would give it.
+fn piped_file(simple: &shell::Simple) -> Option<&str> {
+    match simple.argv.as_slice() {
+        [_, file] if program(simple) == "cat" && !file.starts_with('-') => Some(file),
+        _ => None,
+    }
+}
+
+/// Whether `simple`, run after an invocation's pipeline, only reports how it
+/// went, as `|| echo failed` or `; echo "exit $?"` do.
+fn reports(simple: &shell::Simple) -> bool {
+    matches!(program(simple), "echo" | "printf" | "true" | ":")
 }
 
 /// `argv` from the `cagents` word on, past the wrappers that only change how
@@ -481,6 +779,7 @@ fn native(
         Provider::Claude => claude(id, name, input, output),
         Provider::Codex => codex(name, input, output),
         Provider::Omp => omp(name, input),
+        Provider::Antigravity | Provider::Muse => None,
     }
 }
 
@@ -874,6 +1173,8 @@ mod tests {
         assert!(cli("true || cagents send x hi", "").is_none());
         assert!(cli("for s in a b; do\n  cagents send \"$s\" hi\ndone", "").is_none());
         assert!(cli("cagents send x hi || echo failed", "").is_some());
+        // A line that only contains an invocation is not that invocation.
+        assert!(cli("git diff | cagents send reviewer -", "").is_none());
         // A checkout named for the program puts it in paths, not commands.
         assert!(!names_program(
             "cd ~/src/cagents/.worktrees/x && cargo test"
@@ -882,6 +1183,109 @@ mod tests {
             "~/src/cagents/target/debug/cagents send x hi"
         ));
         assert!(names_program("echo hi|cagents"));
+    }
+
+    /// The line from the issue that labelled a look around the
+    /// configuration directory "Listed live sessions", and the compound
+    /// commands agents run alongside an invocation. A step is what the
+    /// whole line is.
+    #[test]
+    fn a_compound_command_is_not_the_invocation_it_contains() {
+        let output = r#"[{"id":"95fcd1b9","title":"Relocate the repo"}]"#;
+        for line in [
+            "ls ~/.config/cagents/ 2>/dev/null; find ~/.config/cagents -maxdepth 2 -name '*.toml' 2>/dev/null; timeout 20 cagents --device fw16 --no-start sessions --json 2>&1 | head -50",
+            "cat ~/.config/cagents/devices.toml && cagents --device fw16 sessions",
+            "cagents sessions --json | jq length; git status --short",
+            "cargo build -q && cagents send parent 'build passed'",
+            "cagents whoami && cagents inbox",
+            "gh pr view 3110 --json title | cagents send reviewer -",
+            "/bin/bash -lc 'ls -la && cagents sessions'",
+            "for host in fw16 local; do cagents --device \"$host\" sessions; done",
+            // A filter that also reads a file of its own.
+            "cagents sessions | head -50 build.log",
+            "cagents inbox | grep -n error notes.md",
+            "cagents sessions | grep -eerror build.log",
+            "cagents sessions | grep --regexp=error build.log",
+            "cagents sessions --json | jq --slurpfile seen seen.json '.'",
+            "cagents sessions --json | jq --rawfile notes notes.md '.'",
+            // With no file, a recursive grep searches the working directory.
+            "cagents sessions | grep -r Relocate",
+            "cagents inbox | grep -rn error",
+            "cagents sessions | grep --recursive Relocate",
+            // What is piped into a command that does not read it: `--file -`
+            // opens a file called `-`.
+            "cat review.md | cagents sessions",
+            "echo hi | cagents send reviewer --file -",
+        ] {
+            assert!(cli(line, output).is_none(), "{line}");
+        }
+    }
+
+    /// What may surround an invocation without changing what the line is:
+    /// where and when it runs, the message it is fed, how its output is
+    /// trimmed, and how its failure is reported.
+    #[test]
+    fn an_invocation_keeps_its_meaning_through_setup_and_plumbing() {
+        let sessions = Kind::Act(Act::Sessions);
+        for line in [
+            "timeout 20 cagents --device fw16 --no-start sessions --json",
+            "cd /repo && timeout 20 cagents --device fw16 --no-start sessions --json 2>&1 | head -50",
+            "set -euo pipefail; cagents sessions | jq -r '.[].id' | sort",
+            "sleep 30; cagents sessions 2>/dev/null || echo 'daemon unreachable'",
+            "cd /repo || exit 1; export CAGENTS_DEVICE=fw16; cagents sessions",
+            "bash -lc 'cagents sessions | tail -5'",
+            "cagents --json sessions | jq -r --arg d fw16 '.[] | select(.device == $d) | .id' | head -n 3",
+            "cagents sessions 2>&1 | grep -E 'Relocate|Review' | cut -d ' ' -f 1",
+            "cagents sessions | head --lines 5",
+            "cagents sessions | grep -A3 -e Relocate -e Review",
+            "cagents sessions | sort -k 2 | uniq -c",
+            "cagents sessions | nl -w 3 -s ': '",
+            "cagents sessions | column -t -N ID,TITLE -R ID",
+            "cagents --json sessions | jq -L lib -r '.[].id'",
+            "cagents sessions | rg -g '*.rs' -t rust -M 80 Relocate",
+            "cagents sessions | rg -r X Relocate",
+        ] {
+            assert_eq!(
+                cli(line, "").map(|step| step.kind),
+                Some(sessions.clone()),
+                "{line}"
+            );
+        }
+        let fed = cli("cat <<'EOF' | cagents send parent -\nDone.\nEOF\n", "").unwrap();
+        let Kind::Message(message) = fed.kind else {
+            panic!("a message");
+        };
+        assert_eq!(message.body, Text::Inline("Done.\n".into()));
+        // `cat` of a file into it is the file, as `<` gives it.
+        let fed = cli("cat review.md | cagents send reviewer -", "").unwrap();
+        let Kind::Message(message) = fed.kind else {
+            panic!("a message");
+        };
+        assert_eq!(message.body, Text::File("review.md".into()));
+        // A ticket body or a definition read from `-` takes what is piped.
+        let commented = cli(
+            "cat <<'EOF' | cagents linear comment add --current --body-file -\nLooks right.\nEOF\n",
+            "",
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                commented.kind,
+                Kind::Act(Act::Linear {
+                    verb: "Commented on",
+                    ..
+                })
+            ),
+            "{:?}",
+            commented.kind
+        );
+        assert!(
+            cli(
+                "cat automation.json | cagents automation create --definition -",
+                ""
+            )
+            .is_some()
+        );
     }
 
     #[test]

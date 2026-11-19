@@ -97,8 +97,7 @@ impl Geometry {
         let width = (window.width - 2.0 * space::XL).clamp(0.0, PANEL_MAX_WIDTH);
         let detail = width >= LIST_WIDTH + DETAIL_MIN_WIDTH;
         let available = (window.height - 2.0 * WINDOW_MARGIN)
-            .max(PANEL_MIN_HEIGHT)
-            .min(PANEL_MAX_HEIGHT)
+            .clamp(PANEL_MIN_HEIGHT, PANEL_MAX_HEIGHT)
             .min((window.height - 2.0 * space::S).max(0.0));
         // Without a preview beside it, the list is only as tall as its rows.
         let height = if detail {
@@ -266,7 +265,7 @@ impl Cagents {
                         .iter()
                         .any(|available| available == action)
             })
-            .map_or_else(Task::none, |action| self.update(Message::Sidebar(action)));
+            .map_or_else(Task::none, |action| self.dispatch(Message::Sidebar(action)));
         self.workspace_history
             .finish(self.active_workspace_destination());
         self.workspace_history
@@ -1013,11 +1012,33 @@ impl Cagents {
             ),
         };
         let chip = sidebar::workspace_mark(mark, sidebar::RowInk::Full);
-        let text = widget::column::with_children(vec![
+        let name_edge = row.name_edge();
+        let name = move |width: Length| -> Element<'a, Message> {
             crate::ui_controls::fade_text(row.name.as_str())
-                .edge(row.name_edge())
-                .width(Length::Fill)
-                .into(),
+                .edge(name_edge)
+                .width(width)
+                .into()
+        };
+        // A channel's name is followed by the faces of the members after
+        // its lead, as in its sidebar row.
+        let name = match mark {
+            sidebar::WorkspaceMark::Channel(Some(channel)) => {
+                let channel_id = channel.id;
+                sidebar::channel_name_with_company(
+                    channel,
+                    row.name.as_str(),
+                    sidebar::RowInk::Full,
+                    move |width| name(Length::Fixed(width)),
+                    move |index| {
+                        widget::Id::new(format!("workspace-switcher.face.{channel_id}.{index}"))
+                    },
+                )
+            }
+            _ => None,
+        }
+        .unwrap_or_else(|| name(Length::Fill));
+        let text = widget::column::with_children(vec![
+            name,
             crate::ui_controls::FadeText::caption(row.place.as_str())
                 .edge(row.place_edge())
                 .width(Length::Fill)

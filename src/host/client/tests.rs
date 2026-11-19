@@ -2904,6 +2904,146 @@ fn a_request_that_panics_is_answered_and_the_connection_keeps_serving() {
     assert!(host.lock().unwrap().clients.is_empty());
 }
 
+/// A terminal's worker can publish an event after a client attaches but
+/// before its reply and replay are queued. That event must still reach the
+/// client after them: ahead of the reply it would make the client retry, and
+/// ahead of the replay it would advance the client's cursor past older events.
+#[test]
+fn a_live_event_follows_the_attach_reply_and_its_replay() {
+    use crate::terminal::{TerminalConfig, TerminalEvent, TerminalHandle};
+
+    fn attach_then_publish(
+        host: &SharedHost,
+        client_id: ClientId,
+        request: ClientRequest,
+    ) -> Result<RequestOutcome, ProtocolError> {
+        let attached = match &request {
+            ClientRequest::Attach { terminal_id, .. } => Some(*terminal_id),
+            _ => None,
+        };
+        let outcome = process_request(host, client_id, request);
+        if let Some(terminal_id) = attached {
+            crate::host::state::record_event(
+                &Arc::downgrade(host),
+                terminal_id,
+                TerminalEvent::ConversationTitleChanged("Live".into()),
+            );
+        }
+        outcome
+    }
+
+    let (proof, host) = panic_test_host("attach-replay-order");
+    let recipe = crate::model::LaunchRecipe {
+        unset_environment: Default::default(),
+        program: "/bin/cat".into(),
+        arguments: Vec::new(),
+        working_directory: "/".into(),
+        environment: Default::default(),
+    };
+    let session = crate::model::TerminalSession {
+        recovery_origin: None,
+        predecessor: None,
+        owned_codex_listener: None,
+        id: TerminalId::new(),
+        launch: recipe.clone(),
+        transcript_path: None,
+        resume_hint: None,
+        continuity: crate::model::TerminalContinuity::RelaunchAvailable {
+            recipe,
+            last_exit: None,
+        },
+    };
+    let terminal_id = session.id;
+    let handle = TerminalHandle::spawn(session.clone(), TerminalConfig::default(), |_| {}).unwrap();
+    host.lock()
+        .unwrap()
+        .finish_spawn(2, session, handle.clone(), false)
+        .unwrap();
+    crate::host::state::record_event(
+        &Arc::downgrade(&host),
+        terminal_id,
+        TerminalEvent::ConversationTitleChanged("Replayed".into()),
+    );
+
+    let (mut stream, server_stream) = UnixStream::pair().unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let server_host = Arc::clone(&host);
+    let server =
+        thread::spawn(move || serve_with(server_stream, 1, server_host, attach_then_publish));
+    let mut writer = FrameCodec::new(MAX_CLIENT_FRAME_BYTES);
+    let mut reader = FrameCodec::new(MAX_FRAME_BYTES);
+    let mut send = |request_id, request| {
+        writer
+            .write(
+                &mut stream,
+                &ClientEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id,
+                    proof: Some(proof.clone()),
+                    request,
+                },
+            )
+            .unwrap();
+    };
+    send(
+        1,
+        ClientRequest::Connect {
+            expected_host: Some(proof.clone()),
+            resume: Vec::new(),
+        },
+    );
+    send(
+        2,
+        ClientRequest::Attach {
+            terminal_id,
+            after_generation: 0,
+            after_event_sequence: 0,
+        },
+    );
+    let mut order = Vec::new();
+    while !order.iter().any(|step: &String| step == "event 2") {
+        let envelope = reader
+            .read::<ServerEnvelope>(&mut stream)
+            .unwrap()
+            .expect("the connection stays open");
+        order.push(match envelope.message {
+            ServerMessage::Response {
+                response: ServerResponse::Connected { .. },
+            } => "connected".into(),
+            ServerMessage::Response {
+                response: ServerResponse::Attached { .. },
+            } => "attached".into(),
+            ServerMessage::Event {
+                terminal_id: id,
+                sequence,
+                ..
+            } if id == terminal_id => format!("event {sequence}"),
+            ServerMessage::Synchronized {
+                terminal_id: id,
+                event_sequence,
+                ..
+            } if id == terminal_id => format!("synchronized {event_sequence}"),
+            _ => continue,
+        });
+    }
+    assert_eq!(
+        order,
+        [
+            "connected",
+            "attached",
+            "event 1",
+            "synchronized 1",
+            "event 2"
+        ]
+    );
+
+    drop(stream);
+    server.join().unwrap();
+    handle.shutdown().unwrap();
+}
+
 #[test]
 fn a_client_thread_that_unwinds_unregisters_its_client_and_releases_its_writer() {
     let (_, host) = panic_test_host("unwinding-client");
@@ -3530,5 +3670,124 @@ fn editing_the_model_announces_to_watchers_but_never_to_its_originator() {
         let view = model.views.iter().find(|view| view.scope == scope).unwrap();
         assert!(view.panes.is_empty());
         assert_eq!(view.retired, [pane.id]);
+    }
+}
+
+#[test]
+fn listing_pages_the_inventory_and_refuses_a_whole_reply_that_cannot_fit() {
+    use crate::model::{BootId, HostIncarnation, HostSessionId, TerminalContinuity};
+
+    let directory = tempfile::tempdir().unwrap();
+    let host = Arc::new(crate::host::state::HostLock::new(
+        super::super::state::HostState::new(HostSessionProof {
+            host_session_id: HostSessionId::new("list-pages-session"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        }),
+    ));
+    host.lock().unwrap().register_client(1);
+    for _ in 0..3 {
+        let recipe = crate::model::LaunchRecipe::shell(directory.path().to_owned()).unwrap();
+        let session = crate::model::TerminalSession {
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+            id: TerminalId::new(),
+            launch: recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
+        let (response, _, _) = process_request(
+            &host,
+            1,
+            ClientRequest::Spawn {
+                session,
+                options: crate::terminal_ipc::TerminalSpawnOptions::default(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(response, ServerResponse::Spawned { .. }));
+    }
+    let whole = host.lock().unwrap().list(1);
+    let ids = |terminals: &[TerminalDescriptor]| {
+        terminals
+            .iter()
+            .map(|terminal| terminal.session.id)
+            .collect::<Vec<_>>()
+    };
+    let mut sorted = ids(&whole);
+    sorted.sort();
+    assert_eq!(ids(&whole), sorted, "the inventory lists in identity order");
+
+    // The reply the client sees at the default budget is one complete page.
+    // The shells keep writing, so compare identities: their activity moves
+    // between reads.
+    let (response, _, _) =
+        process_request(&host, 1, ClientRequest::ListPage { after: None }).unwrap();
+    let ServerResponse::ListedPage {
+        terminals,
+        complete,
+    } = response
+    else {
+        panic!("ListPage answers with a page");
+    };
+    assert_eq!((ids(&terminals), complete), (ids(&whole), true));
+
+    // At a budget one descriptor fills, every page holds exactly one, and
+    // following each page's last identity reads the rest.
+    let budget = whole
+        .iter()
+        .map(|terminal| postcard::experimental::serialized_size(terminal).unwrap())
+        .max()
+        .unwrap();
+    let mut pages = Vec::new();
+    let mut after = None;
+    loop {
+        let (page, complete) = host.lock().unwrap().list_page(1, after, budget);
+        after = page.last().map(|terminal| terminal.session.id);
+        pages.push(page);
+        if complete {
+            break;
+        }
+    }
+    assert_eq!(pages.iter().map(Vec::len).collect::<Vec<_>>(), [1, 1, 1]);
+    assert_eq!(ids(&pages.concat()), ids(&whole));
+    // A descriptor larger than the budget still has a page of its own.
+    let (page, complete) = host.lock().unwrap().list_page(1, None, 1);
+    assert_eq!((ids(&page), complete), (vec![whole[0].session.id], false));
+    // Nothing follows the last terminal.
+    let last = whole.last().map(|terminal| terminal.session.id);
+    assert_eq!(
+        host.lock().unwrap().list_page(1, last, budget),
+        (Vec::new(), true)
+    );
+
+    // An older CLI still gets the whole inventory in one reply while it fits,
+    // and a refusal it can read once it would not.
+    let size = postcard::experimental::serialized_size(&ServerResponse::Listed {
+        terminals: whole.clone(),
+    })
+    .unwrap();
+    assert_eq!(
+        listed_in_one_reply(whole.clone(), size).unwrap(),
+        ServerResponse::Listed {
+            terminals: whole.clone(),
+        }
+    );
+    let refusal = listed_in_one_reply(whole.clone(), size - 1).unwrap_err();
+    assert_eq!(refusal.code, ProtocolErrorCode::InvalidRequest);
+    assert!(refusal.message.contains("too large to list in one reply"));
+
+    for terminal in &whole {
+        let handle = host
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .handle(1, terminal.session.id)
+            .unwrap();
+        handle.shutdown().unwrap();
     }
 }

@@ -96,7 +96,7 @@ fn item() -> Item {
 
 struct Peer(Option<JoinHandle<UnixListener>>);
 impl Peer {
-    fn new(operation: Operation, authority: Authority, expected_probes: usize) -> Self {
+    fn new(operation: Operation, authority: Authority) -> Self {
         let socket = crate::terminal_ipc::daemon_socket_path().unwrap();
         assert!(socket.starts_with(PathBuf::from(std::env::var_os(ROOT).unwrap())));
         fs::create_dir_all(socket.parent().unwrap()).unwrap();
@@ -107,8 +107,7 @@ impl Peer {
         listener.set_nonblocking(true).unwrap();
         Self(Some(thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(5);
-            let mut probes = 0;
-            let (mut peer, mut request) = loop {
+            let (mut peer, mut request) = {
                 let (mut peer, _) = loop {
                     match listener.accept() {
                         Ok(value) => break value,
@@ -133,11 +132,13 @@ impl Peer {
                         resumed: Vec::new(),
                     },
                 );
-                if let Some(request) = read_frame::<ClientEnvelope>(&mut peer).unwrap() {
-                    break (peer, request);
-                }
-                probes += 1;
-                assert!(probes <= 1, "no repeated readiness or User fallback");
+                // A connection that only handshakes would be a separate
+                // readiness probe; readiness hands its connection to the
+                // request instead.
+                let request = read_frame::<ClientEnvelope>(&mut peer)
+                    .unwrap()
+                    .expect("no separate readiness handshake or User fallback");
+                (peer, request)
             };
             assert_eq!(request.proof.as_ref(), Some(&proof()));
             match operation {
@@ -209,10 +210,6 @@ impl Peer {
                 read_frame::<ClientEnvelope>(&mut peer).unwrap().is_none(),
                 "no Work request after refused authentication or User retry after refusal"
             );
-            assert_eq!(
-                probes, expected_probes,
-                "scoped/no-start tasks must not probe or autostart"
-            );
             listener
         })))
     }
@@ -264,7 +261,6 @@ fn exercise_app(role: &str) {
         })
     };
     let scoped = authority.token().is_some();
-    let expected_probes = usize::from(role == "user");
     for operation in [
         Operation::Automation,
         Operation::Pin {
@@ -285,34 +281,8 @@ fn exercise_app(role: &str) {
             continue;
         }
         let mut app = context_inspector_test_app(false);
-        let task = match operation {
-            Operation::Automation => {
-                app.update_automation_ui(crate::automation_ui::Action::Refresh)
-            }
-            Operation::Pin { .. } => {
-                drop(app.update_work_ui(crate::work_ui::Action::Watched(
-                    crate::work_ui::Watch::Board {
-                        revision: 1,
-                        first: true,
-                        board: Arc::new(Board {
-                            generated_at_unix_ms: 1_000,
-                            stale_after_days: 7,
-                            projects: Vec::new(),
-                            items: vec![item()],
-                            linear_unavailable: None,
-                        }),
-                    },
-                )));
-                app.update_work_ui(crate::work_ui::Action::Pin(
-                    crate::work_ui::CardRef {
-                        project: item().project,
-                        key: item().key,
-                    },
-                    Some(Column::Stale),
-                ))
-            }
-        };
-        let peer = Peer::new(operation, authority.clone(), expected_probes);
+        let task = start(&mut app, operation);
+        let peer = Peer::new(operation, authority.clone());
         let completion = complete(task);
         let result = match &completion {
             Message::AutomationUi(crate::automation_ui::Action::Received { result, .. }) => {
@@ -346,6 +316,66 @@ fn exercise_app(role: &str) {
         drop(app.update(completion));
         drop(app);
         peer.finished();
+    }
+    // Readiness hands its connection to the request, so each task's route
+    // shows in how it reports the daemon once it is gone: only readiness
+    // would start it, which the held update launch fence refuses.
+    let socket = crate::terminal_ipc::daemon_socket_path().unwrap();
+    for operation in [
+        Operation::Automation,
+        Operation::Pin {
+            refuse_authentication: false,
+        },
+    ] {
+        assert!(UnixStream::connect(&socket).is_err(), "the daemon is gone");
+        let _fence = request_failure::hold_launch_fence();
+        let mut app = context_inspector_test_app(false);
+        let task = start(&mut app, operation);
+        let error = match complete(task) {
+            Message::AutomationUi(crate::automation_ui::Action::Received { result, .. }) => {
+                result.as_ref().as_ref().unwrap_err().clone()
+            }
+            Message::WorkUi(crate::work_ui::Action::Pinned(result)) => result.unwrap_err(),
+            _ => panic!("unexpected owning completion"),
+        };
+        assert_eq!(
+            error.contains(&request_failure::update_refusal()),
+            role == "user",
+            "scoped/no-start tasks must not probe or autostart: {error}"
+        );
+        assert!(
+            UnixStream::connect(&socket).is_err(),
+            "no daemon was started"
+        );
+    }
+}
+
+/// Starts the owning task for `operation`.
+fn start(app: &mut Cagents, operation: Operation) -> Task<Message> {
+    match operation {
+        Operation::Automation => app.update_automation_ui(crate::automation_ui::Action::Refresh),
+        Operation::Pin { .. } => {
+            drop(app.update_work_ui(crate::work_ui::Action::Watched(
+                crate::work_ui::Watch::Board {
+                    revision: 1,
+                    first: true,
+                    board: Arc::new(Board {
+                        generated_at_unix_ms: 1_000,
+                        stale_after_days: 7,
+                        projects: Vec::new(),
+                        items: vec![item()],
+                        linear_unavailable: None,
+                    }),
+                },
+            )));
+            app.update_work_ui(crate::work_ui::Action::Pin(
+                crate::work_ui::CardRef {
+                    project: item().project,
+                    key: item().key,
+                },
+                Some(Column::Stale),
+            ))
+        }
     }
 }
 

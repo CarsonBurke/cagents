@@ -661,9 +661,11 @@ impl ConversationPullRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TranscriptCoverage {
-    /// Every line the provider has written so far.
+    /// Every line the provider has written so far, which is none while
+    /// the conversation has reported no ID or written no transcript.
     Complete,
-    /// Not read yet, or no conversation ID has been reported.
+    /// Not read yet: the first read has not run, or it has not reached the
+    /// end of what is there.
     Pending,
     /// The transcript is larger than the reader's budget; its newest part
     /// was read.
@@ -699,6 +701,7 @@ pub enum TicketSource {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
     pub id: TerminalId,
+    #[serde(serialize_with = "crate::agent::absent_where_unknown")]
     pub provider: Option<Provider>,
     pub title: Option<String>,
     pub state: ActivityState,

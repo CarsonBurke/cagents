@@ -38,12 +38,54 @@ pub fn restore_intent(intent: Intent, policy: crate::instance::WindowRestorePoli
     }
 }
 
-fn chat_socket(intent: Intent) -> Result<std::path::PathBuf, StartFailure> {
+/// The connection a conversation opened with `intent` goes on over. A
+/// recovery attachment reaches only a daemon that already runs, over a bare
+/// connection; anything else proves the daemon ready, starting it where
+/// none runs, and goes on over the connection that proved it.
+fn chat_stream(intent: Intent) -> Result<ChatStream, StartFailure> {
     if intent == Intent::RestoreExisting {
-        crate::terminal::existing_daemon_socket_path().map_err(|error| error.to_string().into())
+        let socket = crate::terminal::existing_daemon_socket_path()
+            .map_err(|error| StartFailure::from(error.to_string()))?;
+        connect_daemon(&socket)
+            .map(ChatStream::from)
+            .map_err(|e| format!("Cannot connect to the proven chat daemon: {e}").into())
     } else {
-        crate::terminal::ensure_daemon_ready_for_explicit_action()
+        crate::terminal::connect_ready_daemon_for_explicit_action()
+            .map(ChatStream::from)
             .map_err(|error| error.to_string().into())
+    }
+}
+
+/// A connection a native chat goes on over: either one whose control
+/// handshake already proved the daemon, which the chat continues on instead
+/// of connecting and handshaking again, or a bare one it handshakes itself.
+/// The daemon treats a connection after its `Connect` alike whoever sent it.
+/// Only the chat's own `Connect` can name the daemon it must reach, so a
+/// proven connection checks that proof as the daemon would.
+enum ChatStream {
+    Proven {
+        stream: UnixStream,
+        proof: HostSessionProof,
+    },
+    Bare(UnixStream),
+}
+
+impl From<UnixStream> for ChatStream {
+    fn from(stream: UnixStream) -> Self {
+        Self::Bare(stream)
+    }
+}
+
+impl From<crate::control::ControlClient> for ChatStream {
+    fn from(client: crate::control::ControlClient) -> Self {
+        let (stream, proof) = client.into_handshaken_stream();
+        Self::Proven { stream, proof }
+    }
+}
+
+impl From<crate::terminal::ReadyDaemon> for ChatStream {
+    fn from(ready: crate::terminal::ReadyDaemon) -> Self {
+        ready.client.into()
     }
 }
 
@@ -53,12 +95,29 @@ fn chat_socket(intent: Intent) -> Result<std::path::PathBuf, StartFailure> {
 /// the connection but did not finish the handshake in time may be held by a
 /// long operation or hung, which the client cannot tell apart.
 fn switch_unadmitted(error: crate::terminal::HostedTerminalStartError) -> StartFailure {
-    use crate::terminal::HostedTerminalStartError;
+    use crate::{control::ControlError, terminal::HostedTerminalStartError};
     let recovery = match &error {
         HostedTerminalStartError::UpdateInProgress(_) => super::Recovery::Busy,
-        HostedTerminalStartError::HostProtocol(crate::control::ControlError::ReplyTimeout {
-            ..
-        }) => super::Recovery::Unresponsive,
+        HostedTerminalStartError::HostProtocol(ControlError::ReplyTimeout { .. }) => {
+            super::Recovery::Unresponsive
+        }
+        // Nothing proves a selected device's daemon ready, so the connection
+        // handed to the switch is its first, and its handshake fails as the
+        // switch's own did: as `switch_unasked` tells its causes apart.
+        HostedTerminalStartError::Connect(ControlError::ReplyTimeout { .. }) => {
+            return switch_unasked(HandshakeError::Unanswered(error.to_string()));
+        }
+        HostedTerminalStartError::Connect(ControlError::Remote {
+            code,
+            message,
+            retryable,
+        }) => {
+            return switch_unasked(HandshakeError::Protocol(ipc::ProtocolError::new(
+                *code,
+                message.clone(),
+                *retryable,
+            )));
+        }
         _ => super::Recovery::Unreached,
     };
     StartFailure {
@@ -78,7 +137,19 @@ fn start_failure(error: ipc::ProtocolError) -> StartFailure {
         ipc::ProtocolErrorCode::ChatCapacity => super::Recovery::Capacity,
         _ if error.is_daemon_busy() => super::Recovery::Busy,
         ipc::ProtocolErrorCode::NotAdmitted => super::Recovery::NotAdmitted,
+        // The daemon words this refusal retryable, but repeating the same
+        // attachment only meets it again: only a start reopens it.
+        ipc::ProtocolErrorCode::TerminalUnavailable
+            if error.message.starts_with(super::UPDATE_RESTART_STOPPED) =>
+        {
+            super::Recovery::UpdateStopped
+        }
         _ if error.retryable => super::Recovery::Retry,
+        ipc::ProtocolErrorCode::TerminalUnavailable
+            if error.message.starts_with(super::STARTUP_RECOVERY_REFUSAL) =>
+        {
+            super::Recovery::UpdateRecovery
+        }
         // Only the daemon's own whole sentence, never text that quotes it.
         _ if [
             super::UNPROVEN_OWNER_REFUSAL,
@@ -156,8 +227,8 @@ fn frame_read_error(error: ipc::FrameError, timeout: Option<Duration>) -> String
         || "Timed out waiting for the daemon response".into(),
         |timeout| {
             format!(
-                "the daemon did not answer within {} s",
-                timeout.as_secs_f64()
+                "the daemon did not answer within {}",
+                crate::control::reply_budget(timeout)
             )
         },
     )
@@ -1368,12 +1439,7 @@ fn connect_handshake(
     codec: &mut FrameCodec,
     expected: Option<&HostSessionProof>,
 ) -> Result<HostSessionProof, HandshakeError> {
-    stream
-        .set_read_timeout(Some(CHAT_ATTACH_TIMEOUT))
-        .map_err(|e| e.to_string())?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
-        .map_err(|e| e.to_string())?;
+    set_chat_timeouts(stream)?;
     codec
         .write(
             stream,
@@ -1395,6 +1461,36 @@ fn connect_handshake(
         }
         _ => Err("Daemon did not complete native chat handshake".into()),
     }
+}
+/// Opens a native chat on `stream`, handshaking only a bare connection, and
+/// returns the stream with the daemon's proof. A proven connection meets
+/// `expected` as the daemon would have answered its `Connect`.
+fn chat_handshake(
+    stream: ChatStream,
+    codec: &mut FrameCodec,
+    expected: Option<&HostSessionProof>,
+) -> Result<(UnixStream, HostSessionProof), HandshakeError> {
+    match stream {
+        ChatStream::Bare(mut stream) => {
+            connect_handshake(&mut stream, codec, expected).map(|proof| (stream, proof))
+        }
+        ChatStream::Proven { stream, proof } => {
+            set_chat_timeouts(&stream)?;
+            if let Some(expected) = expected {
+                ipc::validate_proof(Some(expected), &proof)
+                    .map_err(|error| HandshakeError::ProofChanged(Some(error)))?;
+            }
+            Ok((stream, proof))
+        }
+    }
+}
+fn set_chat_timeouts(stream: &UnixStream) -> Result<(), String> {
+    stream
+        .set_read_timeout(Some(CHAT_ATTACH_TIMEOUT))
+        .map_err(|e| e.to_string())?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| e.to_string())
 }
 fn receive_handshake(
     stream: &mut UnixStream,
@@ -2256,11 +2352,8 @@ impl ClientHandle {
         // A restore runs right after an application update has stopped the
         // daemon it is about to ask for, so it starts one for the same reason a
         // new conversation does instead of failing on an absent socket.
-        let socket = chat_socket(intent)?;
-        let stream = connect_daemon(&socket)
-            .map_err(|e| format!("Cannot connect to the proven chat daemon: {e}"))?;
         Self::connect_on(
-            stream,
+            chat_stream(intent)?,
             session,
             intent,
             source,
@@ -2277,10 +2370,9 @@ impl ClientHandle {
         session: Session,
         wake: impl Fn(Wake) + Send + Sync + 'static,
     ) -> Result<Self, StartFailure> {
-        let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
-        let stream = connect_daemon(&socket).map_err(|error| error.to_string())?;
+        let ready = crate::terminal::connect_ready_daemon().map_err(|error| error.to_string())?;
         Self::connect_on_with_pane(
-            stream,
+            ready,
             session,
             Intent::Start,
             None,
@@ -2315,10 +2407,8 @@ impl ClientHandle {
         if UpgradeRecovery::candidate(&source, &expected).is_none() {
             return Err("The canonical chat is not an exact upgrade of the saved source".into());
         }
-        let socket = chat_socket(intent)?;
-        let stream = connect_daemon(&socket).map_err(|error| error.to_string())?;
         Self::connect_on(
-            stream,
+            chat_stream(intent)?,
             source,
             intent,
             None,
@@ -2338,10 +2428,8 @@ impl ClientHandle {
         if !super::is_account_recovery(&source, &replacement) {
             return Err("Account recovery changed the saved conversation".into());
         }
-        let socket = chat_socket(Intent::Start)?;
-        let stream = connect_daemon(&socket).map_err(|error| error.to_string())?;
         Self::connect_on(
-            stream,
+            chat_stream(Intent::Start)?,
             replacement,
             Intent::Start,
             None,
@@ -2365,15 +2453,10 @@ impl ClientHandle {
                 recovery: super::Recovery::NotAdmitted,
             });
         }
-        let socket = crate::terminal::ensure_daemon_ready_for_explicit_action()
+        let ready = crate::terminal::connect_ready_daemon_for_explicit_action()
             .map_err(switch_unadmitted)?;
-        // The daemon answered its readiness check, but may since have gone.
-        let stream = connect_daemon(&socket).map_err(|error| StartFailure {
-            message: error.to_string(),
-            recovery: super::Recovery::Unreached,
-        })?;
         Self::connect_on(
-            stream,
+            ready,
             replacement,
             Intent::Start,
             None,
@@ -2426,7 +2509,7 @@ impl ClientHandle {
     }
 
     fn connect_on(
-        stream: UnixStream,
+        stream: impl Into<ChatStream>,
         session: Session,
         intent: Intent,
         source: Option<HostSessionProof>,
@@ -2451,7 +2534,7 @@ impl ClientHandle {
     }
 
     fn connect_on_with_pane(
-        mut stream: UnixStream,
+        stream: impl Into<ChatStream>,
         session: Session,
         intent: Intent,
         source: Option<HostSessionProof>,
@@ -2527,8 +2610,8 @@ impl ClientHandle {
             .as_ref()
             .and_then(|session| session.proof.clone())
             .or_else(|| source.clone());
-        let proof =
-            connect_handshake(&mut stream, &mut codec, expected.as_ref()).map_err(|error| {
+        let (mut stream, proof) = chat_handshake(stream.into(), &mut codec, expected.as_ref())
+            .map_err(|error| {
                 if unasked {
                     switch_unasked(error)
                 } else {

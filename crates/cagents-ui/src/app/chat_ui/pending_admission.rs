@@ -21,6 +21,15 @@ impl Runtime {
             .map(Attachment::label)
             .collect::<Vec<_>>();
         let mut children = Vec::new();
+        // Why the pane waits leads: an update restore the daemon is still
+        // running or holds, when that is the reason, above the draft it kept.
+        if !fenced {
+            let (title, explanation) = self.update_wait.admission();
+            if let Some(title) = title {
+                children.push(design::title(title).into());
+            }
+            children.push(design::body(explanation).into());
+        }
         if fenced {
             // The same heading, explanation and Close as a fenced pane with no
             // chat runtime, which is drawn as an unavailable pane.
@@ -58,9 +67,6 @@ impl Runtime {
                     .spacing(space::M as u16)
                     .into(),
             );
-            if !fenced {
-                children.push(design::body("This saved pane has not been reopened. Your unsent draft is kept here; you can copy its text while the workspace reconnects, or open the conversation from history.").into());
-            }
             // A long draft scrolls inside its card, so it fades into the card's
             // own fill at the card's edges. The vertical inset scrolls with the
             // text; the side inset keeps the fade clear of the rounded corners.
@@ -128,6 +134,7 @@ impl Cagents {
             self.settings.editor_syntax_theme,
         );
         self.restore_saved_draft(card, &mut runtime);
+        runtime.update_wait = self.chat_ui.update_recovery.wait;
         // Deliberately no provider connection, draft skill discovery, retirement,
         // or lifecycle job: this is only a local view of saved bytes.
         self.cards
@@ -182,10 +189,10 @@ impl Cagents {
         &mut self,
         card: CardId,
     ) -> (Task<Message>, Option<CardId>) {
-        if !self
+        if self
             .chat_ui
             .attempt(card)
-            .is_some_and(|attempt| attempt.upgrade_admission.is_some())
+            .is_none_or(|attempt| attempt.upgrade_admission.is_none())
         {
             return (Task::none(), None);
         }

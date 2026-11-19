@@ -117,15 +117,19 @@ mod coordinator_fixture {
     // product cancellation without substituting fixture deadline cleanup.
     fn owner_event(owner: &mut UnixStream) -> io::Result<u8> {
         let mut byte = [0];
-        loop {
-            match owner.read(&mut byte) {
-                Ok(0) => return Ok(0),
-                Ok(1) if byte[0] == b'T' => return Ok(b'T'),
-                Ok(_) => return Err(io::Error::other("unexpected owner control data")),
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(b'.'),
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(b'.'),
-                Err(e) => return Err(e),
+        match owner.read(&mut byte) {
+            Ok(0) => Ok(0),
+            Ok(1) if byte[0] == b'T' => Ok(b'T'),
+            Ok(_) => Err(io::Error::other("unexpected owner control data")),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                Ok(b'.')
             }
+            Err(e) => Err(e),
         }
     }
 
@@ -451,11 +455,11 @@ mod coordinator_fixture {
                 let sent = unsafe { libc::kill(family.child.id() as i32, libc::SIGTERM) };
                 if sent != 0 {
                     let error = io::Error::last_os_error();
-                    if error.raw_os_error() == Some(libc::ESRCH) {
-                        if let Some(status) = family.child.try_wait().unwrap() {
-                            family.reaped = true;
-                            break status;
-                        }
+                    if error.raw_os_error() == Some(libc::ESRCH)
+                        && let Some(status) = family.child.try_wait().unwrap()
+                    {
+                        family.reaped = true;
+                        break status;
                     }
                     panic!("coordinator TERM failed: {error}");
                 }
@@ -511,12 +515,10 @@ exit 0
                 if let (Ok(coordinator), Ok(installer)) = (
                     fs::read_to_string(root.path().join("coordinator.pid")),
                     fs::read_to_string(root.path().join("installer.pid")),
-                ) {
-                    if let (Ok(coordinator), Ok(installer)) =
-                        (coordinator.parse(), installer.parse())
-                    {
-                        break (coordinator, installer);
-                    }
+                ) && let (Ok(coordinator), Ok(installer)) =
+                    (coordinator.parse(), installer.parse())
+                {
+                    break (coordinator, installer);
                 }
                 assert!(
                     Instant::now() < ready_by,
@@ -534,10 +536,10 @@ exit 0
             );
             if mode == "readiness" {
                 // A setup error drops the armed owner before normal completion.
-                let rejected: io::Result<()> = (move || {
+                let rejected: io::Result<()> = {
                     let _child = child;
                     Err(io::Error::other("injected readiness rejection"))
-                })();
+                };
                 assert!(rejected.is_err());
             } else {
                 if mode == "natural" {
@@ -652,13 +654,13 @@ exit 0
 struct OwnedProcess(std::process::Child);
 impl OwnedProcess {
     fn stop_checked(&mut self) -> std::io::Result<()> {
-        if self.0.try_wait()?.is_none() {
-            if let Err(error) = self.0.kill() {
-                // An exit racing the signal is still a checked retirement;
-                // a live original child with a rejected signal is an error.
-                if self.0.try_wait()?.is_none() {
-                    return Err(error);
-                }
+        if self.0.try_wait()?.is_none()
+            && let Err(error) = self.0.kill()
+        {
+            // An exit racing the signal is still a checked retirement;
+            // a live original child with a rejected signal is an error.
+            if self.0.try_wait()?.is_none() {
+                return Err(error);
             }
         }
         self.0.wait()?;
@@ -1558,22 +1560,38 @@ printf '%s\n' "$*"
         &runtime,
         &root.path().join("surviving-ui-ready"),
     );
-    for (args, expected) in [
-        (vec!["--json", "daemon", "status"], "--json daemon status"),
-        (vec!["daemon", "preflight"], "daemon preflight"),
-        // Stop carries its implicit no-start policy to the matched owner.
-        (vec!["daemon", "stop"], "--no-start daemon stop"),
+    for (args, no_start_environment, expected) in [
+        // Status never starts a daemon, but that policy is not forwarded: an
+        // owner older than `--no-start` refuses the flag, and the installer
+        // reads exactly this status from it.
+        (
+            vec!["--json", "daemon", "status"],
+            false,
+            "--json daemon status",
+        ),
+        (vec!["daemon", "preflight"], false, "daemon preflight"),
+        // Stop and an inherited environment policy carry no-start to the
+        // matched owner.
+        (vec!["daemon", "stop"], false, "--no-start daemon stop"),
+        (
+            vec!["--json", "daemon", "status"],
+            true,
+            "--no-start --json daemon status",
+        ),
     ] {
-        let output = Command::new(new.join("cagents"))
+        let mut command = Command::new(new.join("cagents"));
+        command
             .args(&args)
             .env("XDG_RUNTIME_DIR", &runtime)
-            .env("CAGENTS_TEST_RECOVERY_ACTIONS", &actions)
-            .output()
-            .unwrap();
+            .env("CAGENTS_TEST_RECOVERY_ACTIONS", &actions);
+        if no_start_environment {
+            command.env("CAGENTS_NO_START", "1");
+        }
+        let output = command.output().unwrap();
         assert!(output.status.success(), "{output:?}");
         assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), expected);
     }
-    assert_eq!(fs::read_to_string(&actions).unwrap().lines().count(), 3);
+    assert_eq!(fs::read_to_string(&actions).unwrap().lines().count(), 4);
     let handoff = OpenOptions::new()
         .read(true)
         .write(true)
@@ -1599,7 +1617,7 @@ printf '%s\n' "$*"
         !output.status.success(),
         "an update handoff vetoes recovery"
     );
-    assert_eq!(fs::read_to_string(&actions).unwrap().lines().count(), 3);
+    assert_eq!(fs::read_to_string(&actions).unwrap().lines().count(), 4);
     drop(handoff);
     let output = Command::new(new.join("cagents"))
         .args(["daemon", "start"])
@@ -1613,7 +1631,7 @@ printf '%s\n' "$*"
     );
     assert_eq!(
         fs::read_to_string(&actions).unwrap(),
-        "--json daemon status\ndaemon preflight\n--no-start daemon stop\ndaemon start\n"
+        "--json daemon status\ndaemon preflight\n--no-start daemon stop\n--no-start --json daemon status\ndaemon start\n"
     );
     drop(window);
     // A stopped owner does not authorize stale routing: the candidate reports

@@ -116,6 +116,7 @@ impl Client {
             request,
             ClientRequest::Connect { .. }
                 | ClientRequest::List
+                | ClientRequest::ListPage { .. }
                 | ClientRequest::ChatList
                 | ClientRequest::ResolveUpgradeChat { .. }
                 | ClientRequest::ChatDetach { .. }
@@ -215,11 +216,36 @@ impl Client {
     }
 
     pub(super) fn terminals(&mut self) -> Result<Vec<ipc::TerminalDescriptor>, String> {
-        match self.request(ClientRequest::List, true)? {
-            ServerResponse::Listed { terminals } if terminals.len() <= 1024 => Ok(terminals),
-            _ => Err(
-                "Source terminal inventory is unsupported or exceeds the inspection limit".into(),
-            ),
+        const LIMIT: usize = 1024;
+        let unsupported =
+            || "Source terminal inventory is unsupported or exceeds the inspection limit".into();
+        if self.protocol < ipc::LIST_PAGES_PROTOCOL {
+            return match self.request(ClientRequest::List, true)? {
+                ServerResponse::Listed { terminals } if terminals.len() <= LIMIT => Ok(terminals),
+                _ => Err(unsupported()),
+            };
+        }
+        // A source that pages its inventory is read page by page, each one
+        // strictly after the last, so no single reply outgrows a frame.
+        let mut terminals = Vec::new();
+        loop {
+            let after = terminals
+                .last()
+                .map(|terminal: &ipc::TerminalDescriptor| terminal.session.id);
+            let ServerResponse::ListedPage {
+                terminals: page,
+                complete,
+            } = self.request(ClientRequest::ListPage { after }, true)?
+            else {
+                return Err(unsupported());
+            };
+            if !ipc::page_follows(after, &page, complete) || terminals.len() + page.len() > LIMIT {
+                return Err(unsupported());
+            }
+            terminals.extend(page);
+            if complete {
+                return Ok(terminals);
+            }
         }
     }
 
@@ -484,7 +510,7 @@ fn read_response(reader: &mut impl Read) -> Result<ServerEnvelope, String> {
 }
 
 // Postcard encodes a one-field Response struct variant as its tag followed by
-// that field. Accept only that message and the four frozen inventory replies.
+// that field. Accept only that message and the frozen inventory replies.
 #[derive(serde::Deserialize)]
 struct InspectionEnvelope {
     version: u16,
@@ -522,6 +548,11 @@ impl<'de> serde::Deserialize<'de> for InspectionResponse {
                     terminals: Vec<crate::terminal_ipc::TerminalDescriptor>,
                 }
                 #[derive(serde::Deserialize)]
+                struct ListedPage {
+                    terminals: Vec<crate::terminal_ipc::TerminalDescriptor>,
+                    complete: bool,
+                }
+                #[derive(serde::Deserialize)]
                 struct ChatListed {
                     sessions: Vec<Session>,
                 }
@@ -557,6 +588,13 @@ impl<'de> serde::Deserialize<'de> for InspectionResponse {
                         let value: Listed = variant.newtype_variant()?;
                         ServerResponse::Listed {
                             terminals: value.terminals,
+                        }
+                    }
+                    46 => {
+                        let value: ListedPage = variant.newtype_variant()?;
+                        ServerResponse::ListedPage {
+                            terminals: value.terminals,
+                            complete: value.complete,
                         }
                     }
                     13 => {
@@ -832,6 +870,18 @@ mod tests {
             [29]
         );
         assert_eq!(
+            postcard::to_allocvec(&ClientRequest::ListPage { after: None }).unwrap(),
+            [85, 0]
+        );
+        assert_eq!(
+            postcard::to_allocvec(&ServerResponse::ListedPage {
+                terminals: vec![],
+                complete: true
+            })
+            .unwrap(),
+            [46, 0, 1]
+        );
+        assert_eq!(
             postcard::to_allocvec(&ClientRequest::Connect {
                 expected_host: None,
                 resume: vec![]
@@ -876,7 +926,11 @@ mod tests {
                     resumed: vec![],
                 },
                 ServerResponse::Listed {
+                    terminals: vec![terminal.clone()],
+                },
+                ServerResponse::ListedPage {
                     terminals: vec![terminal],
+                    complete: false,
                 },
                 ServerResponse::ChatListed {
                     sessions: vec![source.clone()],
@@ -1038,6 +1092,76 @@ mod tests {
             worker.join().unwrap();
             if count <= crate::upgrade::handoff::MAX_CHATS {
                 assert_eq!(result.unwrap().len(), count);
+            } else {
+                assert!(result.unwrap_err().contains("inspection limit"));
+            }
+        }
+    }
+
+    #[test]
+    fn a_paging_source_inventory_is_read_page_by_page_up_to_the_ceiling() {
+        fn descriptor() -> crate::terminal_ipc::TerminalDescriptor {
+            let source = super::super::tests::session();
+            crate::terminal_ipc::TerminalDescriptor::relaunchable(
+                crate::model::TerminalId::new(),
+                source.launch.recipe,
+                None,
+            )
+        }
+        // Each case is the page sizes the source answers; the last is complete.
+        for pages in [
+            vec![0],
+            vec![2, 3],
+            vec![1, 1, 0],
+            vec![1000, 24],
+            vec![1000, 25],
+        ] {
+            let total: usize = pages.iter().sum();
+            let mut inventory: Vec<_> = (0..total).map(|_| descriptor()).collect();
+            inventory.sort_by_key(|terminal| terminal.session.id);
+            let expected = inventory.clone();
+            let (stream, mut peer) = UnixStream::pair().unwrap();
+            let count = pages.len();
+            let worker = std::thread::spawn(move || {
+                let mut rest = inventory.as_slice();
+                let mut last = None;
+                for (index, size) in pages.into_iter().enumerate() {
+                    let request: ClientEnvelope = ipc::read_frame(&mut peer).unwrap().unwrap();
+                    let ClientRequest::ListPage { after } = request.request else {
+                        panic!("a paging source is read with ListPage");
+                    };
+                    assert_eq!(after, last);
+                    let (page, remaining) = rest.split_at(size);
+                    rest = remaining;
+                    last = page.last().map(|terminal| terminal.session.id).or(last);
+                    ipc::write_frame(
+                        &mut peer,
+                        &ServerEnvelope {
+                            version: ipc::LIST_PAGES_PROTOCOL,
+                            request_id: Some(request.request_id),
+                            proof: proof(),
+                            message: ServerMessage::Response {
+                                response: ServerResponse::ListedPage {
+                                    terminals: page.to_vec(),
+                                    complete: index + 1 == count,
+                                },
+                            },
+                        },
+                    )
+                    .unwrap();
+                }
+            });
+            let mut client = Client {
+                stream,
+                proof: proof(),
+                next: 1,
+                protocol: ipc::LIST_PAGES_PROTOCOL,
+                deadline: Instant::now() + Duration::from_secs(10),
+            };
+            let result = client.terminals();
+            worker.join().unwrap();
+            if total <= 1024 {
+                assert_eq!(result.unwrap(), expected);
             } else {
                 assert!(result.unwrap_err().contains("inspection limit"));
             }

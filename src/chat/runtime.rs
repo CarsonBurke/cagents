@@ -1,7 +1,7 @@
 //! Daemon-owned, non-PTY provider actor. Detaching never stops its transport.
 use super::{
     AgentAddress, Command, Event, Item, ItemContent, Phase, Snapshot, Subagent, ToolStatus,
-    protocol::{Adapter, ProcessSpec, SetupError, Step, TransportSpec},
+    protocol::{Adapter, HeldStop, ProcessSpec, SetupError, Step, TransportSpec},
 };
 use crate::account::LiveReport;
 use crate::agent::ActivityState;
@@ -16,7 +16,7 @@ use std::{
     process::{Child, Command as Process, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -320,6 +320,9 @@ struct Inner {
     native_installed: Arc<AtomicBool>,
     history_only: bool,
     provider_process: Arc<Mutex<Option<crate::daemon::holder_registry::Process>>>,
+    /// Milliseconds a launched server spent blocked behind another process's
+    /// file lock before accepting. See [`Handle::startup_lock_wait`].
+    startup_lock_wait: Arc<AtomicU64>,
     launch_account_scope: Result<crate::account::scope::LaunchAccountScope, String>,
 }
 
@@ -559,6 +562,7 @@ impl LocalHandle {
         let adopted_native = expected_native_peer.is_some();
         let native_installed = Arc::new(AtomicBool::new(false));
         let provider_process = Arc::new(Mutex::new(None));
+        let startup_lock_wait = Arc::new(AtomicU64::new(0));
         let native_holder = match ownership {
             Some(NativeOwnership::New(source, _))
                 if matches!(spec.transport, TransportSpec::OwnedUnixWebSocket { .. }) =>
@@ -621,6 +625,7 @@ impl LocalHandle {
             native_installed: native_installed.clone(),
             history_only: matches!(spec.transport, TransportSpec::History),
             provider_process: provider_process.clone(),
+            startup_lock_wait: startup_lock_wait.clone(),
             launch_account_scope: launch_account_scope
                 .clone()
                 .ok_or_else(|| "This local actor has no retained account scope".to_owned()),
@@ -638,6 +643,7 @@ impl LocalHandle {
                     working_directory: spec.working_directory.clone(),
                     child: None,
                     native_holder,
+                    startup_lock_wait,
                     reconnect_only_reported: false,
                     command_stops: 0,
                     expected_native_peer,
@@ -754,7 +760,7 @@ impl LocalHandle {
                     });
                     *failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error.clone());
                     let stderr =
-                        String::from_utf8_lossy(&actor.stderr.make_contiguous()).into_owned();
+                        String::from_utf8_lossy(actor.stderr.make_contiguous()).into_owned();
                     let message = if stderr.is_empty() {
                         error
                     } else {
@@ -827,9 +833,10 @@ impl LocalHandle {
                     .unwrap_or_else(|p| p.into_inner())
                     .usage
                     .clone();
-                for (run, update) in actor
-                    .execution
-                    .ended(actor.stop.load(Ordering::Acquire), usage)
+                for (run, update) in
+                    actor
+                        .execution
+                        .ended(actor.stop.load(Ordering::Acquire), code, usage)
                 {
                     (actor.notify)(Update::Execution { run, update });
                 }
@@ -1421,6 +1428,14 @@ impl LocalHandle {
     pub(crate) fn is_ready(&self) -> bool {
         self.0.state.lock().unwrap_or_else(|p| p.into_inner()).ready
     }
+    /// How long the server this conversation launched has so far waited
+    /// behind another process's file lock instead of starting, such as Codex
+    /// queueing app-server startups that share one `CODEX_HOME`. Callers that
+    /// bound the whole startup extend their deadline by it.
+    pub(crate) fn startup_lock_wait(&self) -> Duration {
+        Duration::from_millis(self.0.startup_lock_wait.load(Ordering::Acquire))
+    }
+
     /// Identity received from the provider, not the speculative launch selector.
     pub(crate) fn confirmed_session_id(&self) -> Option<String> {
         self.0
@@ -2266,6 +2281,7 @@ struct Actor {
     working_directory: std::path::PathBuf,
     child: Option<ChildGuard>,
     native_holder: Option<super::native_holder::Holder>,
+    startup_lock_wait: Arc<AtomicU64>,
     /// Whether this conversation's lack of durable continuity was logged.
     reconnect_only_reported: bool,
     /// Commands memory exhaustion stopped while this actor ran.
@@ -2580,6 +2596,7 @@ impl Actor {
         let mut closing = None;
         let mut partial_started = None;
         let mut interrupt_sent = false;
+        let mut interrupt_held = false;
         let mut interrupt_error = String::new();
         let mut garbage_lines = 0usize;
         let mut garbage_total = 0u64;
@@ -2594,6 +2611,10 @@ impl Actor {
                 if busy && !interrupt_sent && self.pending.is_empty() {
                     match self.adapter.command(Command::Interrupt) {
                         Ok(step) => {
+                            // A provider that names a turn only once it has
+                            // started holds the stop until then, and sends it
+                            // as it drains.
+                            interrupt_held = self.adapter.held_stop() == HeldStop::Waiting;
                             self.step(step)?;
                             interrupt_sent = true;
                         }
@@ -2614,8 +2635,22 @@ impl Actor {
                     if settled {
                         return Err("The provider settled its turn but did not acknowledge the interruption within 30 seconds, so whether the turn was cancelled is unconfirmed".into());
                     }
+                    let reason = match (interrupt_held, self.adapter.held_stop()) {
+                        (true, HeldStop::Waiting) => {
+                            " (the provider had not yet started the turn to stop)".to_owned()
+                        }
+                        (true, HeldStop::Sent) => {
+                            " (the stop was sent once the turn started)".to_owned()
+                        }
+                        (true, _) => {
+                            " (no stop was sent: the provider refused or had already finished the turn)"
+                                .to_owned()
+                        }
+                        (false, _) if interrupt_error.is_empty() => String::new(),
+                        (false, _) => format!(" ({interrupt_error})"),
+                    };
                     return Err(format!(
-                        "Provider interruption was not confirmed within 30 seconds ({interrupt_error}); backend work may still be active. Inspect exact provider session before recovery"
+                        "Provider interruption was not confirmed within 30 seconds{reason}; backend work may still be active. Inspect exact provider session before recovery"
                     ));
                 }
             }
@@ -2826,35 +2861,35 @@ impl Actor {
                 while self.wake.read(&mut buffer).is_ok_and(|n| n != 0) {}
             }
             self.report_command_stops();
-            if fds[3].revents != 0 {
-                if let Some(line) = self.pending.front() {
-                    match stdin.write(&line[self.offset..]) {
-                        Ok(0) => return Err("Provider closed stdin".into()),
-                        Ok(n) => {
-                            // Input can start a command before any output,
-                            // such as a hook run on a submitted prompt.
-                            self.poke_scope();
-                            self.offset += n;
-                            self.queued -= n;
-                            if self.offset == line.len() {
-                                self.pending.pop_front();
-                                self.offset = 0;
-                                self.write_started = if self.pending.is_empty() {
-                                    None
-                                } else {
-                                    Some(Instant::now())
-                                };
-                            }
+            if fds[3].revents != 0
+                && let Some(line) = self.pending.front()
+            {
+                match stdin.write(&line[self.offset..]) {
+                    Ok(0) => return Err("Provider closed stdin".into()),
+                    Ok(n) => {
+                        // Input can start a command before any output,
+                        // such as a hook run on a submitted prompt.
+                        self.poke_scope();
+                        self.offset += n;
+                        self.queued -= n;
+                        if self.offset == line.len() {
+                            self.pending.pop_front();
+                            self.offset = 0;
+                            self.write_started = if self.pending.is_empty() {
+                                None
+                            } else {
+                                Some(Instant::now())
+                            };
                         }
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                        // The provider closed its input, ordinarily by exiting.
-                        // Drain its output to EOF so its exit status, and any
-                        // final frames, explain the failure instead of EPIPE.
-                        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
-                            stdin_closed = Some(format!("Provider stdin: {e}"));
-                        }
-                        Err(e) => return Err(format!("Provider stdin: {e}")),
                     }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    // The provider closed its input, ordinarily by exiting.
+                    // Drain its output to EOF so its exit status, and any
+                    // final frames, explain the failure instead of EPIPE.
+                    Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                        stdin_closed = Some(format!("Provider stdin: {e}"));
+                    }
+                    Err(e) => return Err(format!("Provider stdin: {e}")),
                 }
             }
             if fds[1].revents != 0 {
@@ -3303,13 +3338,11 @@ impl Actor {
     /// provider left the frame with, when the frame changed it.
     fn apply_step(&mut self, step: Step, confirmed: Option<Option<String>>) -> Result<(), String> {
         let suppress_current_notification = step.suppress_current_notification;
-        if !suppress_current_notification {
-            if let Some(preview) = &step.notification_preview {
-                self.state
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .notification_preview = Arc::new(preview.clone());
-            }
+        if !suppress_current_notification && let Some(preview) = &step.notification_preview {
+            self.state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .notification_preview = Arc::new(preview.clone());
         }
         // A new Codex thread is created asynchronously after initialize; check
         // its RPC boundary too. Interrupts, denials and cleanup remain usable

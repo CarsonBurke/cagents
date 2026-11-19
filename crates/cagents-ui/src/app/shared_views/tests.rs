@@ -5066,7 +5066,7 @@ fn batched_projection_preserves_large_workspace_history_and_pending_starts() {
     let terminal = fresh_terminal_session(LaunchRecipe::shell(paths[0].clone()).unwrap());
     let durable = Arc::make_mut(&mut app.durable);
     durable.cards.clear();
-    for index in 0..1024 {
+    for (index, path) in paths[..1024].iter().enumerate() {
         let id = CardId::new();
         let existence = if index < 172 {
             Existence::Open
@@ -5087,14 +5087,14 @@ fn batched_projection_preserves_large_workspace_history_and_pending_starts() {
             existence,
             kind: if index % 3 == 0 {
                 CardKind::Terminal(fresh_terminal_session(
-                    LaunchRecipe::shell(paths[index].join("src")).unwrap(),
+                    LaunchRecipe::shell(path.join("src")).unwrap(),
                 ))
             } else {
                 pane.kind.clone()
             },
         });
         if index % 3 != 0 {
-            durable.card_scopes.insert(id, paths[index].clone());
+            durable.card_scopes.insert(id, path.clone());
         }
         if index % 7 == 0 {
             durable.channels[0].cards.push(id);
@@ -5830,6 +5830,70 @@ fn a_peer_closing_the_focused_pane_leaves_a_focus_storage_accepts() {
 }
 
 #[test]
+fn a_peer_editing_many_panes_rebuilds_the_strip_once() {
+    let (mut app, a, _, first) = fixture();
+    app.active_workspace = Some(PathBuf::from("/repo"));
+    Arc::make_mut(&mut app.durable).active_channel = Some(a);
+    drop(app.workspace.resize_viewport(1_200.0));
+    let pane = |_| {
+        let mut pane = first.clone();
+        pane.id = CardId::new();
+        if let CardKind::Browser(browser) = &mut pane.kind {
+            browser.id = BrowserId::new();
+        }
+        pane
+    };
+    let mut view = View::empty(a);
+    view.panes = (0..48).map(pane).collect();
+    app.workspace_model.views = vec![view.clone()];
+    drop(app.reconcile_shared_views());
+    let ids = view.panes.iter().map(|pane| pane.id).collect::<Vec<_>>();
+    assert_eq!(app.workspace.order().collect::<Vec<_>>(), ids);
+    let update = app.workspace.focus(ids[10]).unwrap();
+    drop(app.apply_viewport(update, false, DurableChange::None));
+
+    // Another window closes every other pane, the focused one among them,
+    // resizes some, and opens as many new ones, in one snapshot.
+    for id in ids.iter().step_by(2) {
+        view.apply(&Change::Remove { id: *id }).unwrap();
+    }
+    let mut panes = view.panes.clone();
+    for (index, pane) in panes.iter_mut().enumerate() {
+        if index % 3 == 0 {
+            pane.width_fraction = 1.0;
+        }
+    }
+    for index in (0..panes.len()).rev().step_by(2) {
+        panes.insert(index, pane(index));
+    }
+    view.panes = panes;
+    app.workspace_model.views = vec![view.clone()];
+    let (indexed, laid_out, _) = crate::workspace::Workspace::rebuild_counts();
+    drop(app.reconcile_shared_views());
+    let (indexed_after, laid_out_after, _) = crate::workspace::Workspace::rebuild_counts();
+    assert_eq!(indexed_after - indexed, 1, "the strip is indexed once");
+    assert_eq!(laid_out_after - laid_out, 1, "the strip is laid out once");
+
+    assert_eq!(
+        app.workspace.order().collect::<Vec<_>>(),
+        view.panes.iter().map(|pane| pane.id).collect::<Vec<_>>()
+    );
+    assert!(
+        app.workspace
+            .cards()
+            .iter()
+            .zip(&view.panes)
+            .all(|(card, pane)| { card.width == CardWidth::Fraction(pane.width_fraction) })
+    );
+    // The focused pane went; the one after it took focus, and the saved
+    // focus followed it.
+    assert_eq!(app.workspace.focused(), Some(ids[11]));
+    assert_eq!(app.durable.focused, Some(ids[11]));
+    assert!(!app.card_state(ids[10]).unwrap().existence.is_open());
+    crate::persistence::validate_workspace(&app.persistent_workspace()).unwrap();
+}
+
+#[test]
 fn transfer_preserves_runtime_when_destination_is_projected_first() {
     let (mut app, a, b, pane) = fixture();
     Arc::make_mut(&mut app.durable).active_channel = Some(a);
@@ -5866,6 +5930,33 @@ fn transfer_preserves_runtime_when_destination_is_projected_first() {
         );
     }
 }
+
+#[test]
+fn a_transfer_leaves_a_pane_the_user_is_closing_to_that_close() {
+    let (mut app, a, b, pane) = fixture();
+    Arc::make_mut(&mut app.durable).active_channel = Some(a);
+    let owned = HashSet::from([pane.id]);
+    let mut source = View::empty(a);
+    source.panes.push(pane.clone());
+    app.shared_views.applying = true;
+    drop(app.project_shared_view(&source, &owned));
+    app.shared_views.applying = false;
+    app.workspace.request_close(pane.id).unwrap();
+
+    let mut target = View::empty(b);
+    target.panes.push(pane.clone());
+    app.workspace_model.views = vec![target, View::empty(a)];
+    drop(app.reconcile_shared_views());
+    assert!(app.workspace.card(pane.id).is_some());
+    assert_eq!(
+        app.workspace
+            .pending_close()
+            .map(|pending| pending.unmounting),
+        Some(pane.id)
+    );
+    app.workspace.commit_close(pane.id).unwrap();
+}
+
 #[test]
 fn peer_channel_deletion_retains_local_chat_work_in_worktree() {
     let (mut app, a, _, _) = fixture();
@@ -6819,9 +6910,11 @@ fn restored_window_local_terminal_held_for_registry_restores_as_saved_once_it_an
         "a possibly shared terminal waits for the registry"
     );
 
-    let mut model = crate::workspace_model::WorkspaceModel::default();
-    model.identity = identity;
-    model.sequence = 1;
+    let model = crate::workspace_model::WorkspaceModel {
+        identity,
+        sequence: 1,
+        ..crate::workspace_model::WorkspaceModel::default()
+    };
     drop(app.apply_workspace_model_update(
         super::super::workspace_model_sync::ModelUpdate::Connected(model),
     ));
@@ -6888,9 +6981,11 @@ fn restored_terminal_held_for_registry_restores_as_saved_once_it_is_unavailable(
 #[test]
 fn unopened_terminal_no_view_lists_restores_as_saved_once_the_registry_answers() {
     let (mut app, id, identity) = restored_unopened_terminal();
-    let mut model = crate::workspace_model::WorkspaceModel::default();
-    model.identity = identity;
-    model.sequence = 1;
+    let model = crate::workspace_model::WorkspaceModel {
+        identity,
+        sequence: 1,
+        ..crate::workspace_model::WorkspaceModel::default()
+    };
     drop(app.apply_workspace_model_update(
         super::super::workspace_model_sync::ModelUpdate::Connected(model),
     ));
@@ -6952,11 +7047,11 @@ fn terminal_that_cannot_restore_as_saved_only_attaches_when_the_registry_is_unav
     assert!(app.terminal_start_held(id, false));
     drop(app.start_terminal(id, session, true, false));
     assert!(
-        !app.terminal_starts
+        app.terminal_starts
             .lock()
             .unwrap()
             .get(&id)
-            .is_some_and(|starts| *starts > 1),
+            .is_none_or(|starts| *starts <= 1),
         "opening it adds no start of its own"
     );
 }
@@ -6988,10 +7083,12 @@ fn saved_terminal_listed_in_a_view_later_hydrates_as_shared() {
     app.lifecycle
         .register(id, Exposure::Visible, Residency::Hibernated, Instant::now());
     drop(app.reconcile_lifecycle(&HashSet::from([id]), &HashSet::new(), &HashSet::new()));
-    let mut model = crate::workspace_model::WorkspaceModel::default();
-    model.identity = identity;
-    model.sequence = 1;
-    model.channels = channels;
+    let model = crate::workspace_model::WorkspaceModel {
+        identity,
+        sequence: 1,
+        channels,
+        ..crate::workspace_model::WorkspaceModel::default()
+    };
     drop(app.apply_workspace_model_update(
         super::super::workspace_model_sync::ModelUpdate::Connected(model),
     ));
@@ -7042,10 +7139,12 @@ fn restored_shared_terminal_held_for_registry_attaches_once_it_answers() {
     let mut view = View::empty(a);
     view.panes
         .push(Pane::from_card(app.card_state(id).unwrap(), None).unwrap());
-    let mut model = crate::workspace_model::WorkspaceModel::default();
-    model.identity = identity;
-    model.sequence = 1;
-    model.views = vec![view];
+    let model = crate::workspace_model::WorkspaceModel {
+        identity,
+        sequence: 1,
+        views: vec![view],
+        ..crate::workspace_model::WorkspaceModel::default()
+    };
     drop(app.apply_workspace_model_update(
         super::super::workspace_model_sync::ModelUpdate::Connected(model),
     ));
@@ -7668,7 +7767,7 @@ async fn a_pane_name_the_registry_changed_is_saved_so_the_next_start_admits_its_
 
     let directory = tempfile::tempdir().unwrap();
     let (session, _) = SessionRuntime::open(
-        &directory.path().join("window.sqlite3"),
+        directory.path().join("window.sqlite3"),
         crate::model::BootId::new("pane-name-test"),
     )
     .unwrap();
@@ -8575,4 +8674,64 @@ fn unsent_text_survives_replaced_identity_and_transfer() {
             "{case}: autosave"
         );
     }
+}
+
+#[test]
+fn a_pane_reopening_in_a_channel_keeps_its_place_until_it_starts() {
+    let (mut app, channel, _, first) = channel_move_fixture();
+    // The channel on screen, whose strip is the order its panes are in.
+    app.active_workspace = Some("/repo".into());
+    let mut last = first.clone();
+    last.id = CardId::new();
+    if let CardKind::Browser(browser) = &mut last.kind {
+        browser.id = BrowserId::new();
+    }
+    app.workspace_model.views[0].panes.push(last.clone());
+    drop(app.reconcile_shared_views());
+    let order = |app: &Cagents| app.workspace.order().collect::<Vec<_>>();
+    assert_eq!(order(&app), [first.id, last.id]);
+
+    let mut session = crate::chat::fresh_session(
+        crate::agent::Provider::Claude,
+        TerminalId::new(),
+        "/repo".into(),
+        &crate::account::Account::system(crate::agent::Provider::Claude),
+    )
+    .unwrap();
+    // A conversation that ran, so starting it connects rather than drafts.
+    session.launch.session_id = Some("f0e49307-af96-4edd-b23f-60b185fe4fea".into());
+    let held = app.place_reopening_beside(first.id, session.clone());
+    assert_eq!(order(&app), [first.id, held, last.id]);
+
+    // The view does not list it until it starts, and it stays where it was
+    // put rather than moving to the end of the strip.
+    app.workspace_model.views[0].revision += 1;
+    drop(app.reconcile_shared_views());
+    assert_eq!(order(&app), [first.id, held, last.id]);
+    let channel = app
+        .durable
+        .channels
+        .iter()
+        .find(|candidate| candidate.id == channel)
+        .unwrap();
+    assert_eq!(channel.cards, [first.id, held, last.id]);
+
+    // Once it starts, it is published where it is, before the pane after it.
+    drop(app.update(Message::ResumeConversation(
+        crate::app::resume_ui::Action::Prepared(held, 0, Ok(Some(Box::new(session)))),
+    )));
+    assert!(!app.reopen_pending(held));
+    drop(app.reconcile_shared_views());
+    assert!(
+        app.shared_views
+            .pending
+            .iter()
+            .any(|(_, _, change)| matches!(
+                change,
+                Change::Insert { pane, before } if pane.id == held && *before == Some(last.id)
+            )),
+        "{:?}",
+        app.shared_views.pending
+    );
+    assert_eq!(order(&app), [first.id, held, last.id]);
 }

@@ -236,18 +236,14 @@ impl<E: ProcessExecutor> GitHubService<E> {
                 serde_json::from_slice::<serde_json::Value>(graphql_body(&output.stdout)).ok();
             if let Some(limit) = polling::classify(
                 &format!(
-                    "{}\n{}",
-                    format!(
-                        "{}\n{}",
-                        String::from_utf8_lossy(
-                            &output.stdout
-                                [..output.stdout.len() - graphql_body(&output.stdout).len()]
-                        ),
-                        body.as_ref()
-                            .and_then(|body| body.get("errors"))
-                            .map(ToString::to_string)
-                            .unwrap_or_default()
+                    "{}\n{}\n{}",
+                    String::from_utf8_lossy(
+                        &output.stdout[..output.stdout.len() - graphql_body(&output.stdout).len()]
                     ),
+                    body.as_ref()
+                        .and_then(|body| body.get("errors"))
+                        .map(ToString::to_string)
+                        .unwrap_or_default(),
                     String::from_utf8_lossy(&output.stderr)
                 ),
                 polling::now(),
@@ -461,7 +457,7 @@ mod tests {
         let reset = polling::now() + 120;
         executor.outputs.lock().unwrap().push_back(ProcessOutput {
             success: false, exit_code: Some(1), signal: None,
-            stdout: format!("HTTP/2.0 403 Forbidden\r\nRetry-After: 120\r\nX-RateLimit-Remaining: 4000\r\n\r\n{{\"message\":\"secondary rate limit\"}}").into_bytes(),
+            stdout: "HTTP/2.0 403 Forbidden\r\nRetry-After: 120\r\nX-RateLimit-Remaining: 4000\r\n\r\n{\"message\":\"secondary rate limit\"}".to_string().into_bytes(),
             stderr: vec![],
         });
         let service = GitHubService::new("gh", executor.clone());

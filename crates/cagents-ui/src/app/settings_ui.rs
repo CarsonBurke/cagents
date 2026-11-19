@@ -579,6 +579,71 @@ fn settings_category_controls<'a>(
                 .keywords("tool_groups"),
             ],
         )],
+        SettingsCategory::Inspector => vec![
+            settings_group(
+                "Inspector",
+                "The panel beside a pane that shows what its agent is doing, where it works and what it changed.",
+                vec![
+                    crate::settings_widgets::toggle(
+                        "Open with each pane",
+                        "Show a pane's inspector unless you closed it there. Closing or opening one is remembered for that pane.",
+                        draft.inspector_open_by_default,
+                        |enabled| Message::SettingsChanged {
+                            field: SettingsField::InspectorOpenByDefault,
+                            value: enabled.to_string(),
+                        },
+                    )
+                    .keywords("inspector open default closed panel inspector_open_by_default"),
+                    setting_stepper(
+                        "Inspector width",
+                        "Every docked inspector shares this width. Drag an inspector's edge to change it too.",
+                        &draft.inspector_width,
+                        SettingsField::InspectorWidth,
+                        design::INSPECTOR_MIN_WIDTH,
+                        design::INSPECTOR_MAX_WIDTH,
+                        20.0,
+                        design::INSPECTOR_DEFAULT_WIDTH,
+                        " px",
+                    ),
+                ],
+            ),
+            settings_group(
+                "Sections",
+                "Choose what an inspector shows. Changes and files are always available.",
+                vec![
+                    crate::settings_widgets::toggle(
+                        "Activity",
+                        "Lead with what the pane's agent is doing, where it works and its subagents.",
+                        draft.inspector_show_activity,
+                        |enabled| Message::SettingsChanged {
+                            field: SettingsField::InspectorShowActivity,
+                            value: enabled.to_string(),
+                        },
+                    )
+                    .keywords("inspector status doing where subagents inspector_show_activity"),
+                    crate::settings_widgets::toggle(
+                        "Work",
+                        "List the pull requests and worktrees a chat worked on.",
+                        draft.inspector_show_work,
+                        |enabled| Message::SettingsChanged {
+                            field: SettingsField::InspectorShowWork,
+                            value: enabled.to_string(),
+                        },
+                    )
+                    .keywords("inspector pull requests worktrees inspector_show_work"),
+                    crate::settings_widgets::toggle(
+                        "Mentioned pull requests",
+                        "Also list the pull requests a chat only mentioned, below its work.",
+                        draft.show_mentioned_pull_requests,
+                        |enabled| Message::SettingsChanged {
+                            field: SettingsField::ShowMentionedPullRequests,
+                            value: enabled.to_string(),
+                        },
+                    )
+                    .keywords("Show mentioned pull requests show_mentioned_pull_requests"),
+                ],
+            ),
+        ],
         SettingsCategory::Editor => vec![
             settings_group(
                 "Font",
@@ -682,16 +747,6 @@ fn settings_category_controls<'a>(
                         },
                     )
                     .keywords("Show worktree changes icons worktree_changes_icons show_worktree_changes_icons"),
-                    crate::settings_widgets::toggle(
-                        "Show mentioned pull requests",
-                        "In a channel's Pull requests section, also list pull requests it only mentioned, below the ones it worked on.",
-                        draft.show_mentioned_pull_requests,
-                        |enabled| Message::SettingsChanged {
-                            field: SettingsField::ShowMentionedPullRequests,
-                            value: enabled.to_string(),
-                        },
-                    )
-                    .keywords("Mentioned pull requests show_mentioned_pull_requests"),
                 ],
             ),
             settings_group(
@@ -930,6 +985,7 @@ fn category_icon(category: SettingsCategory) -> Icon {
         SettingsCategory::Links => Icon::WebBrowser,
         SettingsCategory::Keyboard => Icon::Keyboard,
         SettingsCategory::NativeChat => Icon::Chat,
+        SettingsCategory::Inspector => Icon::SplitPanel,
         SettingsCategory::Editor => Icon::TextEditor,
         SettingsCategory::Accounts => Icon::Users,
         SettingsCategory::About => Icon::Info,
@@ -1134,7 +1190,7 @@ fn settings_layout<'a>(
                 .padding(design::list::edge_padding(space::M, 0.0))
                 .width(Length::Fill)
                 .into(),
-            categories.into(),
+            categories,
         ])
         .width(Length::Fixed(RAIL_WIDTH))
         .height(Length::Fill)
@@ -1275,23 +1331,15 @@ fn settings_layout<'a>(
             .height(Length::Fill)
             .into();
     if narrow {
-        widget::column::with_children(vec![
-            navigation,
-            crate::design::horizontal_rule().into(),
-            content,
-        ])
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+        widget::column::with_children(vec![navigation, crate::design::horizontal_rule(), content])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     } else {
-        widget::row::with_children(vec![
-            navigation,
-            crate::design::vertical_rule().into(),
-            content,
-        ])
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+        widget::row::with_children(vec![navigation, crate::design::vertical_rule(), content])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 }
 

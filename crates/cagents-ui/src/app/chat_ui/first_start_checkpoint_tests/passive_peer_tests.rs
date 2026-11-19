@@ -215,9 +215,12 @@ fn cleanup_peer(
             for _ in 0..8 {
                 let request = request(&mut stream);
                 let response = match request.request {
-                    ClientRequest::List => {
+                    ClientRequest::ListPage { after: None } => {
                         observed.lock().unwrap().lists += 1;
-                        ServerResponse::Listed { terminals: vec![] }
+                        ServerResponse::ListedPage {
+                            terminals: vec![],
+                            complete: true,
+                        }
                     }
                     ClientRequest::ChatList => {
                         observed.lock().unwrap().chat_lists += 1;

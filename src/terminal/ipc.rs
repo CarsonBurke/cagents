@@ -268,7 +268,18 @@ use crate::{
 /// Version 188 appends `ProtocolErrorCode::NotAdmitted`, which an automatic
 /// account switch is refused with when nothing was changed yet. Older clients
 /// cannot decode it; an admitted older CLI is sent `InvalidRequest` instead.
-pub const PROTOCOL_VERSION: u16 = 188;
+/// Version 189 appends `ModelEdit::CloseConfirmedProject`, which `project
+/// close` sends with the channels it confirmed so the daemon refuses the close
+/// if they changed. A daemon before it could not decode the edit.
+/// Version 190 appends `ListPage` and its `ListedPage` reply, which return the
+/// terminal inventory in pages that each fit a frame. `List` answers an older
+/// CLI as before, or refuses when the whole inventory no longer fits one.
+///
+/// Version 191 appends `Provider::Antigravity` and `Provider::Muse`, which run
+/// as terminals. An older client has no encoding for either: an optional value
+/// naming one reaches it as absent, and any other message naming one is
+/// refused or withheld.
+pub const PROTOCOL_VERSION: u16 = 191;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";
@@ -296,8 +307,11 @@ pub const TERMINAL_CLOSE_SOURCE_ABSENT: &str =
 pub const CANDIDATE_LINE_PROTOCOL: u16 = 128;
 
 mod older_clients;
+#[cfg(test)]
+pub(crate) use older_clients::encoding_for;
 pub(crate) use older_clients::{
-    ENDED_TOOL_STATUS, PLAN_AND_RESET_READINGS, WAITING_TOOL_STATUS, encoding_before,
+    ANTIGRAVITY_AND_MUSE, ENDED_TOOL_STATUS, PLAN_AND_RESET_READINGS, WAITING_TOOL_STATUS,
+    encoding_before,
 };
 pub use older_clients::{OlderClient, is_cli_peer, older_client};
 
@@ -309,6 +323,13 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_CLIENT_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
 pub const MAX_RESUME_TERMINALS: usize = 1024;
+/// Encoded descriptor bytes a `ListedPage` fills before it ends, leaving the
+/// rest of the frame for the envelope. A descriptor larger than this still
+/// gets a page of its own, as every descriptor must fit `Attached`.
+pub const LIST_PAGE_BYTES: usize = 1024 * 1024;
+/// The first protocol that lists terminals in pages. A client speaking an
+/// earlier source's protocol during an update lists with `List`.
+pub const LIST_PAGES_PROTOCOL: u16 = 190;
 /// Maximum scalar values retained in a descriptor's observed terminal title.
 pub const MAX_TERMINAL_TITLE_CHARACTERS: usize = 256;
 /// Production full and browserless builds retain the runtime namespace; a
@@ -725,6 +746,12 @@ pub enum ClientRequest {
         session: crate::chat::Session,
         execution_environment: ChatExecutionEnvironment,
     },
+    /// The terminal inventory in identity order, starting after `after`. A
+    /// terminal present for the whole listing appears exactly once; one
+    /// spawned or closed meanwhile may or may not.
+    ListPage {
+        after: Option<TerminalId>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1088,6 +1115,7 @@ pub enum ServerResponse {
     },
     AgentActivity {
         terminal_id: TerminalId,
+        #[serde(serialize_with = "crate::agent::absent_where_unknown")]
         activity: Option<crate::agent::Activity>,
     },
     UpgradePrepared {
@@ -1181,6 +1209,12 @@ pub enum ServerResponse {
     WorkspaceEdit(crate::workspace_model::delta::EditReceipt),
     WorkspaceMetadata(crate::workspace_model::metadata::Reply),
     TerminalRemovalBasis(crate::workspace_model::views::TerminalRemovalBasis),
+    /// One page of a `ListPage` listing; `complete` when nothing follows its
+    /// last terminal.
+    ListedPage {
+        terminals: Vec<TerminalDescriptor>,
+        complete: bool,
+    },
 }
 
 /// The daemon's startup recovery, as [`ClientRequest::StartupState`] reports it.
@@ -1429,6 +1463,7 @@ pub struct TerminalDescriptor {
     pub attached: bool,
     pub transcript: Option<TranscriptMetadata>,
     pub activity: Option<TerminalOutputActivity>,
+    #[serde(serialize_with = "crate::agent::absent_where_unknown")]
     pub agent_activity: Option<crate::agent::Activity>,
     /// Authenticated former daemon identities retained by durable upgrade restore.
     #[serde(default)]
@@ -1482,6 +1517,25 @@ impl TerminalDescriptor {
             title: None,
         }
     }
+}
+
+/// Whether a `ListedPage` continues a listing whose last terminal was `after`:
+/// its identities ascend strictly from past `after`, and only the final page
+/// may be empty. A listing that accepts only such pages ends and holds each
+/// terminal once.
+pub fn page_follows(
+    after: Option<TerminalId>,
+    page: &[TerminalDescriptor],
+    complete: bool,
+) -> bool {
+    let mut previous = after;
+    for terminal in page {
+        if previous.is_some_and(|previous| terminal.session.id <= previous) {
+            return false;
+        }
+        previous = Some(terminal.session.id);
+    }
+    complete || !page.is_empty()
 }
 
 /// A terminal repaint on the wire.
@@ -1941,6 +1995,7 @@ pub enum WireTerminalEvent {
         message: String,
     },
     AgentActivityChanged {
+        #[serde(serialize_with = "crate::agent::absent_where_unknown")]
         activity: Option<crate::agent::Activity>,
     },
     Completed {
@@ -2518,6 +2573,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_page_follows_only_when_it_ascends_past_the_last_and_only_the_final_one_is_empty() {
+        let page = |ids: &[u128]| {
+            ids.iter()
+                .map(|&id| {
+                    TerminalDescriptor::relaunchable(
+                        TerminalId::from_uuid(uuid::Uuid::from_u128(id)),
+                        LaunchRecipe {
+                            program: "/bin/sh".into(),
+                            arguments: Vec::new(),
+                            working_directory: "/".into(),
+                            environment: Default::default(),
+                            unset_environment: Default::default(),
+                        },
+                        None,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let after = |id: u128| Some(TerminalId::from_uuid(uuid::Uuid::from_u128(id)));
+        assert!(page_follows(None, &page(&[1, 2]), false));
+        assert!(page_follows(after(2), &page(&[3]), false));
+        assert!(page_follows(after(3), &page(&[]), true));
+        assert!(page_follows(None, &page(&[]), true));
+        // An empty page that is not the last never ends the listing.
+        assert!(!page_follows(after(3), &page(&[]), false));
+        // One that repeats or goes back past `after`.
+        assert!(!page_follows(after(2), &page(&[2, 3]), true));
+        assert!(!page_follows(after(2), &page(&[1]), true));
+        // One out of order or repeating within itself.
+        assert!(!page_follows(None, &page(&[2, 1]), true));
+        assert!(!page_follows(None, &page(&[1, 1]), true));
+    }
+
+    #[test]
     fn active_model_sidechannel_round_trips_without_changing_snapshot_encoding() {
         let model = crate::chat::ActiveModel {
             id: "claude-opus-5-5".into(),
@@ -2677,7 +2766,7 @@ mod tests {
             }),
             WireTerminalEvent::Error { .. }
         ));
-        assert!(PROTOCOL_VERSION > 105);
+        const { assert!(PROTOCOL_VERSION > 105) };
     }
 
     #[test]
@@ -3121,10 +3210,12 @@ mod tests {
             postcard::from_bytes::<crate::chat::Attachment>(&legacy).is_err(),
             "JSON defaults cannot repair positional postcard layout"
         );
-        assert!(
-            PROTOCOL_VERSION > 104,
-            "image reference fields require matched positional peers"
-        );
+        const {
+            assert!(
+                PROTOCOL_VERSION > 104,
+                "image reference fields require matched positional peers"
+            )
+        };
     }
 
     #[test]

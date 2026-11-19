@@ -17,6 +17,9 @@ mod daemon_recovery;
 mod daemon_stop;
 mod device_ui;
 pub(crate) mod dialog_ui;
+#[cfg(test)]
+mod dispatch_tests;
+mod inspector_activity;
 use crate::file_manager;
 #[cfg(test)]
 use crate::file_manager::open_system_url_with_opener;
@@ -103,6 +106,7 @@ use worktree_dialog::{
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    ops::ControlFlow,
     path::{Path, PathBuf},
     pin::Pin,
     process::Stdio,
@@ -740,10 +744,7 @@ fn civil_date_from_unix_days(days: i64) -> (i64, i64, i64) {
 }
 
 fn last_success_label(value: Option<i64>) -> String {
-    value.map_or_else(
-        || "none in this run".to_owned(),
-        |value| unix_time_label(value),
-    )
+    value.map_or_else(|| "none in this run".to_owned(), unix_time_label)
 }
 
 fn notice_surface<'a>(
@@ -1231,6 +1232,77 @@ impl Projection {
             Self::Full => "Full",
         }
     }
+
+    /// The projection that brings both declarations' changes up to date:
+    /// either one when the other changed nothing, one declared twice, and
+    /// otherwise the full projection.
+    fn widen(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Unchanged, projection) | (projection, Self::Unchanged) => projection,
+            (projection, other) if projection == other => projection,
+            _ => Self::Full,
+        }
+    }
+}
+
+/// What the messages dispatched since the last projection owe it. `update`
+/// owes what its own message's handler declares, and each message a handler
+/// dispatches within it adds its own, so the update projects once for all
+/// of them (`Cagents::dispatch`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OwedProjection {
+    projection: Projection,
+    /// The full projection is owed only for the camera: panning and
+    /// resizing the workspace, which move no label or binding.
+    camera_only: bool,
+    /// A message that moves the focus or the sidebar's rows owes the
+    /// sidebar's row selection a reconciliation.
+    reconcile_row_selection: bool,
+    /// The shared workspace model changed, so the replica snapshot is
+    /// materialized before chrome reads it.
+    model_update: bool,
+}
+
+impl OwedProjection {
+    /// The full projection, owed for more than the camera.
+    fn full() -> Self {
+        Self {
+            projection: Projection::Full,
+            camera_only: false,
+            reconcile_row_selection: false,
+            model_update: false,
+        }
+    }
+
+    /// What two dispatched messages owe between them.
+    fn merge(self, other: Self) -> Self {
+        let camera_only = self.owes_only_camera() && other.owes_only_camera();
+        let projection = self.projection.widen(other.projection);
+        Self {
+            camera_only: camera_only && projection == Projection::Full,
+            projection,
+            reconcile_row_selection: self.reconcile_row_selection || other.reconcile_row_selection,
+            model_update: self.model_update || other.model_update,
+        }
+    }
+
+    /// Whether this owes nothing beyond what moving the camera does.
+    fn owes_only_camera(&self) -> bool {
+        self.projection == Projection::Unchanged || self.camera_only
+    }
+}
+
+/// What `update` notes before dispatching its message, for the projection
+/// and the postlude that follow it.
+struct UpdateEntry {
+    notice_control: Option<NoticeSeverity>,
+    attention_scope_changed: bool,
+    /// The update's workspace pipeline timing is on, so its chrome
+    /// projection times its phases too.
+    timed: bool,
+    settled_projection: Task<Message>,
+    #[cfg(any(test, feature = "development"))]
+    oracle_message: Option<Box<str>>,
 }
 
 /// What an extracted `update` handler returns; its arm takes it with `handled!`.
@@ -2631,9 +2703,15 @@ struct WindowView {
     #[serde(default)]
     context_inspector_open: bool,
     /// The panes whose inspectors are open. Absent from a window saved
-    /// before each pane had its own.
+    /// before each pane had its own. Still written, for an older version
+    /// reading this back; this one reads `inspector_choices` when present.
     #[serde(default)]
     open_inspectors: Option<Vec<CardId>>,
+    /// The panes whose inspectors the user opened or closed. Absent from a
+    /// window saved while inspectors were closed until opened, where a
+    /// closed one was not a choice.
+    #[serde(default)]
+    inspector_choices: Option<pane_inspector::Choices>,
     #[serde(default)]
     context_sections: context_sections::Sections,
     sidebar: sidebar::SidebarView,
@@ -2742,6 +2820,7 @@ pub enum SettingsCategory {
     Terminal,
     Editor,
     NativeChat,
+    Inspector,
     Links,
     Keyboard,
     Accounts,
@@ -2749,12 +2828,13 @@ pub enum SettingsCategory {
 }
 
 impl SettingsCategory {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 11] = [
         Self::General,
         Self::Notifications,
         Self::Appearance,
         Self::Editor,
         Self::NativeChat,
+        Self::Inspector,
         Self::Terminal,
         Self::Links,
         Self::Keyboard,
@@ -2770,6 +2850,7 @@ impl SettingsCategory {
             Self::Terminal => "Terminal",
             Self::Editor => "Editor",
             Self::NativeChat => "Native chat",
+            Self::Inspector => "Inspector",
             Self::Links => "Browser & links",
             Self::Keyboard => "Keyboard",
             Self::Accounts => "Accounts",
@@ -3359,6 +3440,10 @@ pub enum SettingsField {
     AccountUsageDisplay,
     ShowWorktreeChangesIcons,
     ShowMentionedPullRequests,
+    InspectorOpenByDefault,
+    InspectorShowActivity,
+    InspectorShowWork,
+    InspectorWidth,
     RelaunchAgentsOnUpgrade,
     CheckForUpdates,
     EditorSyntaxTheme,
@@ -3518,6 +3603,10 @@ impl SettingsField {
             Self::AccountUsageDisplay => "Account usage",
             Self::ShowWorktreeChangesIcons => "Worktree changes icons",
             Self::ShowMentionedPullRequests => "Mentioned pull requests",
+            Self::InspectorOpenByDefault => "Open with each pane",
+            Self::InspectorShowActivity => "Activity",
+            Self::InspectorShowWork => "Work",
+            Self::InspectorWidth => "Inspector width",
             Self::AutoDeleteMergedWorktrees => "Notify about merged worktrees",
             Self::RelaunchAgentsOnUpgrade => "Unresumable agents",
             Self::CheckForUpdates => "Automatic checks",
@@ -3556,7 +3645,6 @@ impl SettingsField {
             | Self::UiScale
             | Self::ShowStatusBar
             | Self::ShowWorktreeChangesIcons
-            | Self::ShowMentionedPullRequests
             | Self::AutoDeleteMergedWorktrees
             | Self::DefaultColumnFraction => SettingsCategory::Appearance,
             Self::TerminalLineHeight
@@ -3584,6 +3672,11 @@ impl SettingsField {
                 SettingsCategory::NativeChat
             }
             Self::DefaultNativePaneFraction => SettingsCategory::Appearance,
+            Self::InspectorOpenByDefault
+            | Self::InspectorShowActivity
+            | Self::InspectorShowWork
+            | Self::InspectorWidth
+            | Self::ShowMentionedPullRequests => SettingsCategory::Inspector,
             Self::EditorAutoSave
             | Self::EditorWrapLines
             | Self::EditorSyntaxTheme
@@ -3782,6 +3875,10 @@ struct SettingsDraft {
     account_usage_display: settings::AccountUsageDisplay,
     show_worktree_changes_icons: bool,
     show_mentioned_pull_requests: bool,
+    inspector_open_by_default: bool,
+    inspector_show_activity: bool,
+    inspector_show_work: bool,
+    inspector_width: String,
     relaunch_agents_on_upgrade: bool,
     check_for_updates: bool,
     focus_follows_mouse: bool,
@@ -3850,6 +3947,10 @@ impl SettingsDraft {
             account_usage_display: settings.account_usage_display,
             show_worktree_changes_icons: settings.show_worktree_changes_icons,
             show_mentioned_pull_requests: settings.show_mentioned_pull_requests,
+            inspector_open_by_default: settings.inspector_open_by_default,
+            inspector_show_activity: settings.inspector_show_activity,
+            inspector_show_work: settings.inspector_show_work,
+            inspector_width: settings.inspector_width.to_string(),
             relaunch_agents_on_upgrade: settings.relaunch_agents_on_upgrade,
             check_for_updates: settings.check_for_updates,
             editor_syntax_theme: settings.editor_syntax_theme,
@@ -3925,6 +4026,12 @@ impl SettingsDraft {
             SettingsField::ShowMentionedPullRequests => {
                 self.show_mentioned_pull_requests = value == "true"
             }
+            SettingsField::InspectorOpenByDefault => {
+                self.inspector_open_by_default = value == "true"
+            }
+            SettingsField::InspectorShowActivity => self.inspector_show_activity = value == "true",
+            SettingsField::InspectorShowWork => self.inspector_show_work = value == "true",
+            SettingsField::InspectorWidth => self.inspector_width = value,
             SettingsField::RelaunchAgentsOnUpgrade => {
                 self.relaunch_agents_on_upgrade = value == "true"
             }
@@ -4185,6 +4292,25 @@ fn settings_update(
             .parse::<bool>()
             .map(|enabled| next.show_mentioned_pull_requests = enabled)
             .map_err(|_| "Choose whether mentioned pull requests are listed.".to_owned()),
+        SettingsField::InspectorOpenByDefault => value
+            .parse::<bool>()
+            .map(|enabled| next.inspector_open_by_default = enabled)
+            .map_err(|_| "Choose whether inspectors open with each pane.".to_owned()),
+        SettingsField::InspectorShowActivity => value
+            .parse::<bool>()
+            .map(|enabled| next.inspector_show_activity = enabled)
+            .map_err(|_| "Choose whether the inspector shows activity.".to_owned()),
+        SettingsField::InspectorShowWork => value
+            .parse::<bool>()
+            .map(|enabled| next.inspector_show_work = enabled)
+            .map_err(|_| "Choose whether the inspector lists work.".to_owned()),
+        SettingsField::InspectorWidth => value
+            .parse::<f32>()
+            .map(|width| {
+                next.inspector_width =
+                    width.clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH)
+            })
+            .map_err(|_| "Inspector width must be a number.".to_owned()),
         SettingsField::AutoDeleteMergedWorktrees => value
             .parse::<bool>()
             .map(|enabled| next.auto_delete_merged_worktrees = enabled)
@@ -4593,7 +4719,7 @@ fn grouped_digits(value: usize) -> String {
     let digits = value.to_string();
     let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, digit) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index) % 3 == 0 {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
             grouped.push(',');
         }
         grouped.push(digit);
@@ -5270,7 +5396,7 @@ enum CardRuntime {
     Terminal(TerminalSurface),
     Chat(Box<chat_ui::Runtime>),
     #[cfg(feature = "integrated-browser")]
-    Browser(BrowserRuntime),
+    Browser(Box<BrowserRuntime>),
     Repository(Box<RepositoryRuntime>),
     PullRequests(Box<PullRequestPane>),
     /// The settings pane. Its drafts are the window's, not the card's, so
@@ -5596,6 +5722,9 @@ pub struct Cagents {
     /// numbers against, pinned as `card_indices_source` is.
     terminal_ordinals_source: std::sync::Weak<WorkspaceState>,
     navigation_cache: sidebar::NavigationCache,
+    /// Where each folder Projects lists sits, for the inspectors' activity
+    /// blocks to name a pane's place without scanning every project.
+    place_index: inspector_activity::PlaceIndex,
     palette: palette_ui::State,
     recently_closed: Vec<(CardState, Option<WorkspaceDestination>)>,
     /// Where each open pane is on screen and what its runtime holds. Both
@@ -5763,7 +5892,7 @@ pub struct Cagents {
     refresh_ui: refresh_ui::State,
     source_control_mutations: HashMap<PathBuf, SourceControlMutation>,
     operation_recovery: crate::operation_recovery::Shared,
-    account_ui: account_ui::State,
+    account_ui: account_ui::Accounts,
     automation_ui: crate::automation_ui::State,
     work_ui: crate::work_ui::State,
     automation_approval: automation_approval::State,
@@ -5847,6 +5976,12 @@ pub struct Cagents {
     /// the one the user is waiting on.
     pending_panel_open: Option<PendingPanelOpen>,
     deferred_navigation: VecDeque<Message>,
+    /// What the messages dispatched since the last projection owe it; see
+    /// [`Cagents::dispatch`].
+    owed_projection: Option<OwedProjection>,
+    /// How many updates are running their message's handler: a dispatch
+    /// made while none is has no update to project what it owes.
+    dispatching: u32,
     frame_clock: FrameClock,
     latency: crate::performance::InteractionLatency,
     latency_focus: Option<CardId>,
@@ -6100,15 +6235,19 @@ impl Cagents {
     }
 
     fn rebuild_workspace(state: &WorkspaceState) -> Workspace {
-        let mut workspace = Workspace::new(WorkspaceConfig::default()).unwrap_or_default();
-        for card in state.cards.iter().filter(|card| card.existence.is_open()) {
-            let width = if card.width_fraction.is_finite() && card.width_fraction > 0.0 {
-                CardWidth::Fraction(card.width_fraction.min(1.0))
-            } else {
-                CardWidth::Fraction(0.5)
-            };
-            let index = workspace.cards().len();
-            let _ = workspace.add_card(
+        // Durable state names each card once; a repeat keeps its first place,
+        // as the strip always has.
+        let mut seen = HashSet::new();
+        let cards = state
+            .cards
+            .iter()
+            .filter(|card| card.existence.is_open() && seen.insert(card.id))
+            .map(|card| {
+                let width = if card.width_fraction.is_finite() && card.width_fraction > 0.0 {
+                    CardWidth::Fraction(card.width_fraction.min(1.0))
+                } else {
+                    CardWidth::Fraction(0.5)
+                };
                 WorkspaceCard::new(
                     card.id,
                     if matches!(card.kind, CardKind::Browser(_)) {
@@ -6122,11 +6261,10 @@ impl Cagents {
                     id: card.id,
                     accessible_name: "Workspace card".into(),
                     width: CardWidth::Fraction(0.5),
-                }),
-                index,
-                false,
-            );
-        }
+                })
+            });
+        let mut workspace =
+            Workspace::with_cards(WorkspaceConfig::default(), cards).unwrap_or_default();
         if let Some(focused) = state.focused {
             let _ = workspace.focus(focused);
         }
@@ -6369,9 +6507,13 @@ impl Cagents {
         // browserless build leaves their durable descriptors untouched and
         // renders an explicit external-open path instead.
         Task::batch([
-            self.reconcile_lifecycle(&initially_visible, &HashSet::new(), &initially_prefetch),
+            self.reconcile_lifecycle(&initially_visible, &HashSet::new(), &initially_prefetch)
+                .0,
             self.attach_next_restored_agent(),
             Task::batch(repository_tasks),
+            // Saved panes waiting for their workspace say whether an update
+            // restore is why.
+            self.watch_update_recovery(),
         ])
     }
 
@@ -6422,10 +6564,9 @@ impl Cagents {
                 let mut created = false;
                 let mut save_failure = None;
                 let (recovered, mode) = if shared && (!explicit_retry || reserved) {
-                    let socket = crate::terminal::ensure_daemon_ready()
-                        .map_err(|error| error.to_string())?;
-                    let mut client = crate::control::ControlClient::connect(&socket)
-                        .map_err(|error| error.to_string())?;
+                    let crate::terminal::ReadyDaemon { socket, mut client } =
+                        crate::terminal::connect_ready_daemon()
+                            .map_err(|error| error.to_string())?;
                     let hosted = if let Some(reservation) = reservation {
                         let (hosted, failure) = terminal_save::complete(
                             &mut client,
@@ -6445,7 +6586,7 @@ impl Cagents {
                         )?)
                     };
                     let hosted = hosted.ok_or(SHARED_TERMINAL_DISCONNECTED)?;
-                    shared_terminal_attachment(hosted.session, client.proof().clone())
+                    shared_terminal_attachment(hosted.session, client.proof().clone(), socket)
                 } else {
                     recover_terminal(session, explicit_retry)?
                 };
@@ -6490,12 +6631,8 @@ impl Cagents {
                 if existing_only {
                     return attach_initial_terminal(card, session, sender).map(Some);
                 }
-                let connect = || {
-                    let socket = crate::terminal::ensure_daemon_ready()
-                        .map_err(|error| error.to_string())?;
-                    crate::control::ControlClient::connect(&socket)
-                        .map_err(|error| error.to_string())
-                };
+                let connect =
+                    || crate::terminal::connect_ready_daemon().map_err(|error| error.to_string());
                 let Some((recovered, mode)) = restored_attachment(shared, session, connect)? else {
                     return Ok(None);
                 };
@@ -7133,11 +7270,11 @@ impl Cagents {
         durable.focused = Some(id);
         // The descriptor's directory can be a nested editor directory rather
         // than its containing workspace. Keep the filing across projection.
-        if worktree_ui::card_directory(&card).is_some() {
-            if let Some(owner) = owner {
-                durable.card_scopes.insert(id, owner.clone());
-                self.worktree_owners.insert(id, owner);
-            }
+        if worktree_ui::card_directory(&card).is_some()
+            && let Some(owner) = owner
+        {
+            durable.card_scopes.insert(id, owner.clone());
+            self.worktree_owners.insert(id, owner);
         }
         if let Some(title) = user_title {
             self.chrome_ui.user_titles.insert(id, title);
@@ -8001,7 +8138,7 @@ impl Cagents {
         project: ProjectId,
         repository: PathBuf,
         worktree: PathBuf,
-    ) -> Task<Message> {
+    ) -> (CardId, Task<Message>) {
         let card_id = CardId::new();
         let view = RepositoryView {
             selected_file: None,
@@ -8047,7 +8184,8 @@ impl Cagents {
                 ViewportUpdate::unchanged()
             });
         self.persist();
-        Task::batch([self.apply_viewport(update, true, DurableChange::None), load])
+        let task = Task::batch([self.apply_viewport(update, true, DurableChange::None), load]);
+        (card_id, task)
     }
     fn open_link(&mut self, url: Url) -> Task<Message> {
         self.open_link_in(url, self.settings.link_open_destination)
@@ -8119,7 +8257,8 @@ impl Cagents {
                 Some(factory),
             ) {
                 Ok(runtime) => {
-                    self.cards.insert(card_id, CardRuntime::Browser(runtime));
+                    self.cards
+                        .insert(card_id, CardRuntime::Browser(Box::new(runtime)));
                 }
                 Err(error) => {
                     startup_error = Some(error.clone());
@@ -9804,6 +9943,16 @@ impl Cagents {
     }
 
     fn retry_card(&mut self, card: CardId) -> Task<Message> {
+        self.retry_card_as(card, None)
+    }
+
+    /// Retries `card`; a chat starts with `chat_intent` when given, rather
+    /// than the intent a retry would choose for it.
+    fn retry_card_as(
+        &mut self,
+        card: CardId,
+        chat_intent: Option<crate::chat::Intent>,
+    ) -> Task<Message> {
         // A card whose close is already accepted never starts anything again.
         if self
             .card_state(card)
@@ -9820,6 +9969,11 @@ impl Cagents {
             || self.shared_views.quarantined.contains(&card)
         {
             return Task::none();
+        }
+        // Nothing has started in a pane whose reopen failed: it asks the
+        // service to prepare its conversation again.
+        if self.reopen_failed(card) {
+            return self.retry_reopening(card);
         }
         #[cfg(feature = "integrated-browser")]
         if matches!(
@@ -9927,7 +10081,8 @@ impl Cagents {
                     Some(factory),
                 ) {
                     Ok(runtime) => {
-                        self.cards.insert(card, CardRuntime::Browser(runtime));
+                        self.cards
+                            .insert(card, CardRuntime::Browser(Box::new(runtime)));
                     }
                     Err(error) => {
                         self.fail_runtime(card, error.clone());
@@ -9943,7 +10098,7 @@ impl Cagents {
             CardKind::Repository(view) => self.attach_repository_pane(card, view),
             CardKind::PullRequests(view) => self.attach_pull_request_pane(card, view),
             CardKind::Chat(session) => {
-                let intent = self.chat_retry_intent(card, &session);
+                let intent = chat_intent.unwrap_or_else(|| self.chat_retry_intent(card, &session));
                 self.open_chat(card, session, intent)
             }
             CardKind::Settings | CardKind::Accounts | CardKind::Automations | CardKind::Work => {
@@ -10287,7 +10442,7 @@ impl Cagents {
             let stage = runtime.selected_staging_selection(true).is_some();
             if stage || runtime.selected_staging_selection(false).is_some() {
                 return (
-                    cosmic::task::message(Message::Repository(RepositoryAction::StageSelected {
+                    self.dispatch(Message::Repository(RepositoryAction::StageSelected {
                         card,
                         stage,
                     })),
@@ -10348,7 +10503,7 @@ impl Cagents {
         if is_escape_press(&event)
             && let Some(dismiss) = self.account_question_escape(captured)
         {
-            return (self.update(dismiss), Projection::Full);
+            return (self.dispatch(dismiss), Projection::Full);
         }
         if let Some(task) = self.account_key_event(&event) {
             return (task, Projection::Full);
@@ -10374,10 +10529,7 @@ impl Cagents {
                 return (self.cancel_terminal_close(), Projection::Full);
             }
             if self.chat_close_dialog_visible() {
-                return (
-                    cosmic::task::message(Message::CancelChatClose),
-                    Projection::Full,
-                );
+                return (self.dispatch(Message::CancelChatClose), Projection::Full);
             }
         }
         if self.form_dialog_on_top()
@@ -10414,7 +10566,7 @@ impl Cagents {
         if is_escape_press(&event) && !captured {
             if self.transient_work_close.is_some() {
                 return (
-                    cosmic::task::message(Message::CancelTransientWorkClose),
+                    self.dispatch(Message::CancelTransientWorkClose),
                     Projection::Full,
                 );
             }
@@ -10437,14 +10589,11 @@ impl Cagents {
                 return (self.cancel_terminal_close(), Projection::Full);
             }
             if self.chat_close_dialog_visible() {
-                return (
-                    cosmic::task::message(Message::CancelChatClose),
-                    Projection::Full,
-                );
+                return (self.dispatch(Message::CancelChatClose), Projection::Full);
             }
             if self.sidebar_state.pending_discard().is_some() {
                 return (
-                    cosmic::task::message(Message::Sidebar(SidebarAction::CancelDiscard)),
+                    self.dispatch(Message::Sidebar(SidebarAction::CancelDiscard)),
                     Projection::Full,
                 );
             }
@@ -10473,7 +10622,7 @@ impl Cagents {
                     return (Task::none(), Projection::Unchanged);
                 }
                 return (
-                    cosmic::task::message(Message::CancelRepositoryClose),
+                    self.dispatch(Message::CancelRepositoryClose),
                     Projection::Full,
                 );
             }
@@ -10482,21 +10631,16 @@ impl Cagents {
             // behind the confirmations above because those are modal.
             if let Some(card) = self.focused_repository_card_with_find() {
                 return (
-                    cosmic::task::message(Message::Repository(RepositoryAction::CloseFind {
-                        card,
-                    })),
+                    self.dispatch(Message::Repository(RepositoryAction::CloseFind { card })),
                     Projection::Full,
                 );
             }
             if self.worktree_dialog.is_some() || self.pull_request_dialog.is_some() {
-                return (
-                    cosmic::task::message(Message::CancelDialog),
-                    Projection::Full,
-                );
+                return (self.cancel_form_dialog(), Projection::Full);
             }
             if self.sidebar_state.controls_expanded() {
                 return (
-                    self.update(Message::Sidebar(SidebarAction::ToggleControls)),
+                    self.dispatch(Message::Sidebar(SidebarAction::ToggleControls)),
                     Projection::Full,
                 );
             }
@@ -10510,7 +10654,7 @@ impl Cagents {
             }
             // Last, behind everything drawn in front of the pane.
             if let Some(dismiss) = self.pane_escape() {
-                return (self.update(dismiss), Projection::Full);
+                return (self.dispatch(dismiss), Projection::Full);
             }
         }
         if let Some(backwards) = is_tab_press(&event)
@@ -10538,13 +10682,13 @@ impl Cagents {
                 key: keyboard::Key::Named(key),
                 ..
             } = &event
+            && *key == keyboard::key::Named::Escape
+            && !captured
         {
-            if *key == keyboard::key::Named::Escape && !captured {
-                return (
-                    self.handle_terminal_find(terminal_ui::Action::Close(card)),
-                    Projection::Full,
-                );
-            }
+            return (
+                self.handle_terminal_find(terminal_ui::Action::Close(card)),
+                Projection::Full,
+            );
         }
         if let keyboard::Event::KeyPressed {
             key: keyboard::Key::Named(keyboard::key::Named::F3),
@@ -10557,7 +10701,7 @@ impl Cagents {
             && let Some(card) = self.focused_repository_card_with_find()
         {
             return (
-                cosmic::task::message(Message::Repository(if modifiers.shift() {
+                self.dispatch(Message::Repository(if modifiers.shift() {
                     RepositoryAction::FindPrevious { card }
                 } else {
                     RepositoryAction::FindNext { card }
@@ -10572,7 +10716,7 @@ impl Cagents {
             && matches!(self.cards.get(&card), Some(CardRuntime::Browser(_)))
             && let Some(message) = browser_shortcut(card, &event)
         {
-            return (cosmic::task::message(message), Projection::Full);
+            return (self.dispatch(message), Projection::Full);
         }
         if !captured && let Some(task) = self.chat_scroll_key(&event) {
             return (task, Projection::Full);
@@ -10583,7 +10727,7 @@ impl Cagents {
             && matches!(self.cards.get(&card), Some(CardRuntime::Repository(_)))
         {
             return (
-                cosmic::task::message(Message::Repository(RepositoryAction::Save {
+                self.dispatch(Message::Repository(RepositoryAction::Save {
                     card,
                     overwrite: false,
                 })),
@@ -10643,9 +10787,7 @@ impl Cagents {
         {
             return None;
         }
-        let Some(card) = self.workspace.focused() else {
-            return None;
-        };
+        let card = self.workspace.focused()?;
         if !self.chat_input_drawn(card) || !self.card_holds_keyboard(card) {
             return None;
         }
@@ -10854,6 +10996,15 @@ impl Cagents {
         for transition in update.transitions {
             tracing::debug!(target: "cagents::pane_open", stage = "visibility", card = ?transition.id, to = ?transition.to);
             self.set_exposure(transition.id, transition.to.into());
+            // Whether an unreachable agent still runs can change while its
+            // card is out of sight, so it is asked again whenever it is shown.
+            if transition.to == VisibilityClass::Visible
+                && let Some(source) = self
+                    .unnamed_agent(transition.id)
+                    .map(|blocked| blocked.source.clone())
+            {
+                tasks.push(self.ask_unnamed_agent_running(transition.id, source));
+            }
             let browser_card = self
                 .card_state(transition.id)
                 .is_some_and(|card| matches!(&card.kind, CardKind::Browser(_)));
@@ -10971,6 +11122,16 @@ impl Cagents {
             || self.workspace.pending_close().is_some()
     }
 
+    /// What a lifecycle sweep's update projects: what the sweep changed,
+    /// unless the update's tail may still close or commit something.
+    fn sweep_projection(&self, sweep: Projection) -> Projection {
+        if self.update_tail_may_close_or_commit() {
+            Projection::Full
+        } else {
+            sweep
+        }
+    }
+
     /// A navigation save timer with nothing left to save changes nothing a
     /// projection reads, so it skips the sidebar and chrome rebuild.
     fn navigation_save_is_stale(&self, message: &Message) -> bool {
@@ -11021,32 +11182,43 @@ impl Cagents {
         }
     }
 
-    fn lifecycle_sweep_elapsed(&mut self, generation: u64) -> Task<Message> {
+    fn lifecycle_sweep_elapsed(&mut self, generation: u64) -> (Task<Message>, Projection) {
         if generation != self.lifecycle_sweep_generation {
             // Superseded by a later arming, whose own delivery is still to come.
-            return Task::none();
+            return (Task::none(), Projection::Unchanged);
         }
         // A matching generation carries the deadline it was armed with, because
         // `arm_lifecycle_sweep` writes both together, so neither branch below
         // is reachable through the normal path. They are guards, not flow: a
         // sweep that ran without a deadline has nothing to do, and a timer that
         // woke marginally early must wait out the grace rather than cut it.
+        // Neither changes anything a projection reads.
         let Some(deadline) = self.lifecycle_sweep_deadline else {
-            return Task::none();
+            return (Task::none(), Projection::Unchanged);
         };
         let remaining = deadline.saturating_duration_since(Instant::now());
         if !remaining.is_zero() {
-            return self.arm_lifecycle_sweep(deadline);
+            return (self.arm_lifecycle_sweep(deadline), Projection::Unchanged);
         }
         self.lifecycle_sweep_deadline = None;
-        let sweep = self.lifecycle_sweep();
+        let (sweep, projection) = self.lifecycle_sweep_update();
         // That reconcile made the manager's exposure current, so the next
         // wakeup can be placed exactly when the earliest card still holding
         // its grace exhausts it.
-        Task::batch([sweep, self.reschedule_offscreen_lifecycle_sweep()])
+        (
+            Task::batch([sweep, self.reschedule_offscreen_lifecycle_sweep()]),
+            projection,
+        )
     }
 
     fn lifecycle_sweep(&mut self) -> Task<Message> {
+        self.lifecycle_sweep_update().0
+    }
+
+    /// Brings up the cards on screen and lets go of those that left it, and
+    /// answers how much of the workspace projection that changed: see
+    /// [`Self::reconcile_lifecycle`].
+    fn lifecycle_sweep_update(&mut self) -> (Task<Message>, Projection) {
         let mut visible = HashSet::new();
         // On screen, but only until the camera has gone by.
         let mut passing = HashSet::new();
@@ -11096,10 +11268,8 @@ impl Cagents {
         let retained = self.attach_retained_outputs(visible.iter().copied().collect::<Vec<_>>());
         self.lifecycle_sweep_destination =
             (!passing.is_empty()).then(|| self.workspace.camera().target());
-        Task::batch([
-            self.reconcile_lifecycle(&visible, &passing, &prefetch),
-            retained,
-        ])
+        let (reconciled, projection) = self.reconcile_lifecycle(&visible, &passing, &prefetch);
+        (Task::batch([reconciled, retained]), projection)
     }
 
     /// Whether the cards the last sweep left cold as passing are owed
@@ -11116,16 +11286,32 @@ impl Cagents {
         due
     }
 
+    /// Applies what the lifecycle decides for the cards on screen, beside it
+    /// and passing, and answers how much of the workspace projection that
+    /// changed. A card's exposure is read as runtimes start, attach or wake,
+    /// never by a projection, so a reconcile that only moves exposures, as
+    /// switching between panes that are all running does, changes nothing a
+    /// projection reads. Bringing a card up or letting one go changes its
+    /// runtime and residency, which projections read: the transcript
+    /// probes, for one.
     fn reconcile_lifecycle(
         &mut self,
         visible: &HashSet<CardId>,
         passing: &HashSet<CardId>,
         prefetch: &HashSet<CardId>,
-    ) -> Task<Message> {
+    ) -> (Task<Message>, Projection) {
         let now = Instant::now();
         let actions = self
             .lifecycle
             .reconcile_in_flight(visible, passing, prefetch, now);
+        let projection = if actions
+            .iter()
+            .all(|action| matches!(action, LifecycleAction::SetExposure { .. }))
+        {
+            Projection::Unchanged
+        } else {
+            Projection::Full
+        };
         // Exposure and residency are this run's presence, not the workspace's,
         // so a sweep saves nothing of its own.
         let mut tasks = Vec::new();
@@ -11185,7 +11371,8 @@ impl Cagents {
                             Some(factory),
                         ) {
                             Ok(runtime) => {
-                                self.cards.insert(card, CardRuntime::Browser(runtime));
+                                self.cards
+                                    .insert(card, CardRuntime::Browser(Box::new(runtime)));
                                 deferred_browser_started = true;
                             }
                             Err(message) => {
@@ -11269,7 +11456,7 @@ impl Cagents {
             let delay = Duration::from_millis(self.settings.hibernation_delay_ms);
             tasks.push(self.request_lifecycle_sweep(delay));
         }
-        Task::batch(tasks)
+        (Task::batch(tasks), projection)
     }
 
     fn drain_terminal(&mut self, card: CardId, generation: u64) -> Task<Message> {
@@ -12235,6 +12422,9 @@ impl Cagents {
                 .center(Length::Fill)
                 .into()
             }
+            Some(CardRuntime::Failed(_)) if self.unnamed_agent(id).is_some() => self
+                .unnamed_agent_view(id)
+                .expect("an unreachable agent's card has its own state"),
             Some(CardRuntime::Failed(message)) => widget::container(
                 widget::container(
                     widget::column::with_children(vec![
@@ -12244,7 +12434,12 @@ impl Cagents {
                                 .icon()
                                 .size(design::STATUS_ICON_SIZE)
                                 .into(),
-                            design::title(labels.unavailable).into(),
+                            design::title(if self.reopen_failed(id) {
+                                "Couldn't reopen this conversation"
+                            } else {
+                                labels.unavailable
+                            })
+                            .into(),
                         ])
                         .align_y(Alignment::Center)
                         .spacing(space::S)
@@ -12356,6 +12551,21 @@ impl Cagents {
                                     crate::ui_controls::button::secondary(label)
                                 }
                             };
+                            if self
+                                .blocked_failure(id)
+                                .is_some_and(|blocked| blocked.reopen.reopens())
+                            {
+                                controls.push(
+                                    button(&controls, chat_ui::blocked_recovery::REOPEN_LABEL)
+                                        .id(card_control_id(id, "chat.reopen"))
+                                        .name(chat_ui::blocked_recovery::REOPEN_LABEL)
+                                        // Close owns the card until it settles.
+                                        .on_press_maybe((!closing).then_some(Message::ChatUi(
+                                            chat_ui::Action::ReopenStopped(id),
+                                        )))
+                                        .into(),
+                                );
+                            }
                             if self.chat_offers_fresh_conversation(id) {
                                 controls.push(
                                     button(&controls, "Start a new conversation")
@@ -12829,51 +13039,108 @@ impl Cagents {
         )
     }
 
-    /// The open repository card showing this worktree, if one is open.
-    fn repository_card_for(&self, worktree: &Path) -> Option<CardId> {
-        self.durable
-            .cards
-            .iter()
-            .find(|card| {
-                card.existence.is_open()
-                    && self
-                        .durable
-                        .channels
-                        .iter()
-                        .find(|channel| channel.cards.contains(&card.id))
-                        .map(|channel| channel.id)
-                        == self.durable.active_channel
-                    && matches!(&card.kind, CardKind::Repository(view) if view.selected_file.is_none() && view.worktree == worktree)
+    /// The open repository browsers for this worktree in the active channel,
+    /// in pane order. A browser shows the whole worktree rather than one
+    /// fixed file.
+    fn repository_browsers<'a>(&'a self, worktree: &'a Path) -> impl Iterator<Item = CardId> + 'a {
+        self.active_repository_panes()
+            .filter_map(move |(card, view)| {
+                (view.selected_file.is_none() && view.worktree == worktree).then_some(card)
             })
-            .map(|card| card.id)
     }
 
-    /// Sidebar file navigation follows an eligible focused browser. Other
-    /// callers of `repository_card_for`, including save completion, retain
-    /// their existing first-browser selection.
+    /// The open repository panes of the active channel, in pane order.
+    fn active_repository_panes(&self) -> impl Iterator<Item = (CardId, &RepositoryView)> {
+        let channel = self.durable.active_channel;
+        self.durable.cards.iter().filter_map(move |card| {
+            let CardKind::Repository(view) = &card.kind else {
+                return None;
+            };
+            (card.existence.is_open()
+                && self
+                    .durable
+                    .channels
+                    .iter()
+                    .find(|channel| channel.cards.contains(&card.id))
+                    .map(|channel| channel.id)
+                    == channel)
+                .then_some((card.id, view))
+        })
+    }
+
+    /// The repository browser that sidebar navigation into this worktree
+    /// should drive: the focused browser if it can navigate, otherwise the
+    /// first that can.
+    ///
+    /// A browser holding unsaved edits, a save, editor recovery or a
+    /// durability warning refuses navigation, so routing a click to it would
+    /// only focus it and drop the request. `None` means the caller opens a
+    /// new browser, as a file link does when every file pane is busy.
     fn repository_panel_destination(&self, worktree: &Path) -> Option<CardId> {
+        self.repository_browser_where(worktree, |card| {
+            !matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation())
+        })
+    }
+
+    /// The focused browser for this worktree if it satisfies `accept`,
+    /// otherwise the first that does.
+    fn repository_browser_where(
+        &self,
+        worktree: &Path,
+        accept: impl Fn(CardId) -> bool,
+    ) -> Option<CardId> {
         self.workspace
             .focused()
             .filter(|focused| {
-                self.durable.cards.iter().any(|card| {
-                    card.id == *focused
-                        && card.existence.is_open()
-                        && self
-                            .durable
-                            .channels
-                            .iter()
-                            .find(|channel| channel.cards.contains(&card.id))
-                            .map(|channel| channel.id)
-                            == self.durable.active_channel
-                        && matches!(&card.kind, CardKind::Repository(view) if view.selected_file.is_none() && view.worktree == worktree)
-                })
+                accept(*focused)
+                    && self
+                        .repository_browsers(worktree)
+                        .any(|card| card == *focused)
             })
-            .or_else(|| self.repository_card_for(worktree))
+            .or_else(|| {
+                self.repository_browsers(worktree)
+                    .find(|card| accept(*card))
+            })
+    }
+
+    /// The repository pane whose unsaved work on `worktree`'s `path` keeps
+    /// it from navigating, preferring the focused one. A file pane counts as
+    /// well as a browser: either holds edits a second copy would lack.
+    fn repository_editing(&self, worktree: &Path, path: &Path) -> Option<CardId> {
+        let target = worktree.join(path);
+        let editing = |card: CardId| {
+            matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime))
+            if runtime.blocks_navigation()
+                && runtime
+                    .selected_path()
+                    .is_some_and(|selected| {
+                        same_file(&runtime.descriptor.worktree.join(selected), &target)
+                    }))
+        };
+        let mut panes = self.active_repository_panes().map(|(card, _)| card);
+        self.workspace
+            .focused()
+            .filter(|focused| {
+                editing(*focused)
+                    && self
+                        .active_repository_panes()
+                        .any(|(card, _)| card == *focused)
+            })
+            .or_else(|| panes.find(|card| editing(*card)))
+    }
+
+    fn focus_pane(&mut self, card: CardId) -> Task<Message> {
+        self.workspace
+            .focus(card)
+            .map(|update| self.apply_viewport(update, true, DurableChange::None))
+            .unwrap_or_else(|_| Task::none())
     }
 
     /// Routes one panel row to the worktree's repository card.
     ///
-    /// The card is opened if the worktree has none. Either way the navigation
+    /// A browser already editing that file is focused as it is. Otherwise the
+    /// row goes to [`Self::repository_panel_destination`], and a new browser
+    /// opens if no existing one can navigate. Either way the navigation
     /// is parked in [`Self::pending_panel_open`] and performed when that card's
     /// file list lands, because the card resolves a path against the list it
     /// holds and the sidebar's rows come from a snapshot the list may predate.
@@ -12892,6 +13159,13 @@ impl Cagents {
                     .iter()
                     .any(|row| row.path == *path && row.ignored)
             });
+        // A browser that refuses navigation because of this very file's
+        // unsaved edits already shows what was asked for. Focus it rather than
+        // opening a second copy that would lack those edits.
+        if let Some(card) = self.repository_editing(&key.canonical_path, path.as_path()) {
+            self.pending_panel_open = None;
+            return self.focus_pane(card);
+        }
         let path = path.as_path().to_path_buf();
         match self.repository_panel_destination(&key.canonical_path) {
             Some(card) => {
@@ -12900,11 +13174,7 @@ impl Cagents {
                     path,
                     ignored,
                 });
-                let focus = self
-                    .workspace
-                    .focus(card)
-                    .map(|update| self.apply_viewport(update, true, DurableChange::None))
-                    .unwrap_or_else(|_| Task::none());
+                let focus = self.focus_pane(card);
                 Task::batch([
                     focus,
                     cosmic::task::message(Message::Repository(RepositoryAction::RefreshFiles {
@@ -12916,18 +13186,16 @@ impl Cagents {
                 // `add_repository_card` runs the card's own initial load, so
                 // the parked navigation is answered by that list rather than by
                 // a second one requested here.
-                let task = self.add_repository_card(
+                let (card, task) = self.add_repository_card(
                     key.project_id,
                     key.canonical_path.clone(),
                     key.canonical_path.clone(),
                 );
-                if let Some(card) = self.repository_card_for(&key.canonical_path) {
-                    self.pending_panel_open = Some(PendingPanelOpen {
-                        card,
-                        path,
-                        ignored,
-                    });
-                }
+                self.pending_panel_open = Some(PendingPanelOpen {
+                    card,
+                    path,
+                    ignored,
+                });
                 task
             }
         }
@@ -13678,10 +13946,10 @@ impl Cagents {
                 self.request_lsp(card, LspRequestKind::Completion)
             }
             Action::Hover(at) => {
-                if let Some(state) = self.lsp_contexts.get_mut(&card) {
-                    if let Some((request, _)) = state.editor_hover_request.take() {
-                        self.lsp.cancel(request);
-                    }
+                if let Some(state) = self.lsp_contexts.get_mut(&card)
+                    && let Some((request, _)) = state.editor_hover_request.take()
+                {
+                    self.lsp.cancel(request);
                 }
                 if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
                     runtime.set_editor_hover(None, at);
@@ -13721,10 +13989,10 @@ impl Cagents {
             }
             Action::Choose { index, target } => self.apply_lsp_completion(card, index, &target),
             Action::Next(_) | Action::Diagnostic(_) | Action::Dismiss => {
-                if matches!(action, Action::Dismiss) {
-                    if let Some(state) = self.lsp_contexts.get_mut(&card) {
-                        state.invalidate_answers();
-                    }
+                if matches!(action, Action::Dismiss)
+                    && let Some(state) = self.lsp_contexts.get_mut(&card)
+                {
+                    state.invalidate_answers();
                 }
                 match self.cards.get_mut(&card) {
                     Some(CardRuntime::Repository(runtime)) => {
@@ -14242,7 +14510,7 @@ impl Cagents {
             return self.update_daemon_health_ui(daemon_health_ui::Action::Cancel);
         }
         if self.transient_work_close.is_some() {
-            return cosmic::task::message(Message::CancelTransientWorkClose);
+            return self.dispatch(Message::CancelTransientWorkClose);
         }
         if let Some(action) = self.automation_ui.keep_draft_action() {
             return self.update_automation_ui(action);
@@ -14303,7 +14571,7 @@ impl Cagents {
 
     fn open_sidebar_navigation_row(&mut self, row: sidebar::SelectionRow) -> Task<Message> {
         let action = self.sidebar_navigation_action(row);
-        action.map_or_else(Task::none, |action| self.update(Message::Sidebar(action)))
+        action.map_or_else(Task::none, |action| self.dispatch(Message::Sidebar(action)))
     }
 
     fn sidebar_navigation_action(&self, row: sidebar::SelectionRow) -> Option<SidebarAction> {
@@ -14356,11 +14624,17 @@ impl Cagents {
     fn handle_context_inspector_action(&mut self, action: InspectorAction) -> Task<Message> {
         match action {
             InspectorAction::Resize { width } => {
-                self.settings.inspector_width =
-                    width.clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH);
+                // Whole pixels, as Settings shows and steps them.
+                self.settings.inspector_width = width
+                    .round()
+                    .clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH);
                 Task::none()
             }
-            InspectorAction::ResizeFinished => self.save_settings_task(false),
+            InspectorAction::ResizeFinished => {
+                // Settings, if open, steps from the dragged width.
+                self.settings_draft.inspector_width = self.settings.inspector_width.to_string();
+                self.save_settings_task(false)
+            }
             InspectorAction::CopyLspDiagnostic(diagnostic) => {
                 chat_ui::invalidate_copy_intent();
                 iced::clipboard::write(diagnostic.copy_text()).map(cosmic::Action::App)
@@ -14596,7 +14870,7 @@ impl Cagents {
         let Some(card) = cards.pop_front() else {
             return match intent {
                 DirtyCloseIntent::PaneGroup => self.close_pane_group(),
-                DirtyCloseIntent::Card(card) => self.update(Message::CloseCard(card)),
+                DirtyCloseIntent::Card(card) => self.dispatch(Message::CloseCard(card)),
                 DirtyCloseIntent::Application(_) => self.exit_after_language_servers(),
                 DirtyCloseIntent::Channel(channel) => self.resume_channel_deletion(channel),
             };
@@ -14722,7 +14996,7 @@ impl Cagents {
             DirtyCloseIntent::PaneGroup => self.close_pane_group(),
             // Called rather than sent: a queued pane could start meanwhile and
             // leave this close, the one the reader just asked for, turned away.
-            DirtyCloseIntent::Card(card) => self.update(Message::CloseCard(card)),
+            DirtyCloseIntent::Card(card) => self.dispatch(Message::CloseCard(card)),
             DirtyCloseIntent::Application(_) => self.exit_after_language_servers(),
             DirtyCloseIntent::Channel(channel) => self.resume_channel_deletion(channel),
         }
@@ -15003,6 +15277,7 @@ impl Cagents {
                 .focused()
                 .is_some_and(|card| self.pane_inspectors.is_open(card)),
             open_inspectors: Some(self.saved_open_inspectors()),
+            inspector_choices: Some(self.saved_inspector_choices()),
             context_sections: self.context_sections,
             sidebar: self.sidebar_state.saved_view(),
             worktree_offsets: self.worktree_offsets.clone(),
@@ -15112,12 +15387,12 @@ impl Cagents {
     fn synchronize_terminal_theme(&mut self) {
         let theme = self.effective_terminal_theme();
         for runtime in self.cards.values() {
-            if let CardRuntime::Terminal(surface) = runtime {
-                if let Err(error) = surface.set_theme(theme) {
-                    self.status = Some(TransientNotice::error(format!(
-                        "Could not apply terminal theme: {error}"
-                    )));
-                }
+            if let CardRuntime::Terminal(surface) = runtime
+                && let Err(error) = surface.set_theme(theme)
+            {
+                self.status = Some(TransientNotice::error(format!(
+                    "Could not apply terminal theme: {error}"
+                )));
             }
         }
     }
@@ -15392,6 +15667,13 @@ impl Cagents {
             }
         }
         let mut tasks = Vec::new();
+        if previous.inspector_open_by_default != self.settings.inspector_open_by_default {
+            // Panes whose inspector the user never opened or closed follow
+            // the default; the rest keep what was chosen for them.
+            self.set_inspectors_open_by_default(self.settings.inspector_open_by_default);
+            self.sync_pane_inspectors();
+            tasks.push(self.rebind_source_control());
+        }
         if previous.editor_font_family() != self.settings.editor_font_family()
             || previous.editor_font_size() != self.settings.editor_font_size()
         {
@@ -15693,10 +15975,13 @@ impl Application for Cagents {
             session.save_worktrees(retired);
         }
         let window_view = startup.window_view;
+        let inspector_open_by_default = settings.inspector_open_by_default;
         if let Some(view) = &window_view {
             settings.sidebar_width = sidebar::clamp_expanded_width(view.sidebar_width);
+            // Whole pixels, as a drag leaves it, so Settings steps from it.
             settings.inspector_width = if view.inspector_width.is_finite() {
                 view.inspector_width
+                    .round()
                     .clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH)
             } else {
                 AppSettings::default().inspector_width
@@ -15780,6 +16065,7 @@ impl Application for Cagents {
             card_indices_source: std::sync::Weak::new(),
             terminal_ordinals_source: std::sync::Weak::new(),
             navigation_cache: sidebar::NavigationCache::default(),
+            place_index: inspector_activity::PlaceIndex::default(),
             palette: palette_ui::State::default(),
             recently_closed: Vec::new(),
             presence: HashMap::new(),
@@ -15866,7 +16152,7 @@ impl Application for Cagents {
             source_control_mutations: HashMap::new(),
             operation_recovery: Default::default(),
             device_ui: device_ui::State::default(),
-            account_ui: account_ui::State::installation(),
+            account_ui: account_ui::State::installation().into(),
             automation_ui: crate::automation_ui::State::default(),
             work_ui: crate::work_ui::State::default(),
             automation_approval: automation_approval::State::default(),
@@ -15931,6 +16217,8 @@ impl Application for Cagents {
             worktree_operations: HashMap::new(),
             pending_panel_open: None,
             deferred_navigation: VecDeque::new(),
+            owed_projection: None,
+            dispatching: 0,
             frame_clock: FrameClock::default(),
             latency: crate::performance::InteractionLatency::default(),
             latency_focus: None,
@@ -15938,17 +16226,23 @@ impl Application for Cagents {
             latency_fixture,
             #[cfg(feature = "latency-harness")]
             latency_fixture_started: false,
-            // A window saved before each pane had its own inspector, or none
-            // saved at all, opens the focused pane's as the window's was.
-            pane_inspectors: window_view.as_ref().map_or_else(
-                || pane_inspector::PaneInspectors::restore(None, true),
-                |view| {
-                    pane_inspector::PaneInspectors::restore(
+            // A window saved before each pane had its own inspector opens the
+            // focused pane's as the window's was. Every pane nobody opened or
+            // closed one in, as in a window never saved, follows the default.
+            pane_inspectors: window_view
+                .as_ref()
+                .map_or_else(pane_inspector::PaneInspectors::default, |view| match &view
+                    .inspector_choices
+                {
+                    Some(choices) => {
+                        pane_inspector::PaneInspectors::restore_choices(choices.clone())
+                    }
+                    None => pane_inspector::PaneInspectors::restore(
                         view.open_inspectors.clone(),
                         view.context_inspector_open,
-                    )
-                },
-            ),
+                    ),
+                })
+                .with_default(inspector_open_by_default),
             context_sections: window_view
                 .as_ref()
                 .map_or_else(context_sections::Sections::default, |view| {
@@ -16092,6 +16386,793 @@ impl Application for Cagents {
         &mut self.core
     }
 
+    fn subscription(&self) -> Subscription<Message> {
+        let _trace =
+            crate::performance::ui_trace::scope(crate::performance::ui_trace::Phase::Subscription);
+        let operation_subscriptions = self.worktree_progress_subscriptions();
+        let mut subscriptions = vec![
+            self.chat_subscription(),
+            self.notification_subscription(),
+            self.notice_expiry_subscription(),
+            Subscription::run(crate::daemon_health::stream).map(Message::DaemonHealth),
+            Subscription::run(crate::desktop_cursor_blink::stream).map(Message::CursorBlink),
+            self.refresh_subscription(),
+            self.review_request_subscription(),
+            self.git_subscription(),
+            self.account_subscription(),
+            self.automation_subscription(),
+            self.work_subscription(),
+            self.conversation_pull_request_subscription(),
+            self.automation_approval_subscription(),
+            self.document_tone_subscription(),
+            self.update_subscription(),
+            Subscription::run_with(
+                TerminalWakeSource(self.terminal_wake_rx.clone()),
+                terminal_wake_stream,
+            )
+            .map(|wake| Message::TerminalWake {
+                card: wake.card,
+                generation: wake.generation,
+            }),
+            Subscription::run_with(
+                HostedTerminalSource(self.hosted_terminals_rx.clone()),
+                hosted_terminal_stream,
+            )
+            .map(Message::HostedTerminalsObserved),
+            Subscription::run_with(
+                WorkspaceModelSource(self.workspace_model_rx.clone()),
+                workspace_model_stream,
+            )
+            .map(Message::WorkspaceModelObserved),
+            Subscription::run_with(
+                UiActivationSource(self.activation_rx.clone()),
+                ui_activation_stream,
+            )
+            .map(|activation| match activation.update {
+                Some(request) => Message::UiUpdate(request),
+                None => match activation.session {
+                    Some(session) => Message::ActivateSession {
+                        session,
+                        token: activation.token,
+                    },
+                    None => Message::ActivateUi {
+                        token: activation.token,
+                    },
+                },
+            }),
+            event::listen_with(|event, status, event_window| match event {
+                iced::Event::Keyboard(event) => Some(Message::KeyEvent {
+                    event,
+                    captured: matches!(status, event::Status::Captured),
+                }),
+                iced::Event::Window(window::Event::Rescaled(scale_factor)) => {
+                    Some(Message::WindowScaleFactorChanged(scale_factor))
+                }
+                iced::Event::Window(window::Event::CloseRequested) => {
+                    Some(Message::WindowCloseRequested(event_window))
+                }
+                iced::Event::Window(window::Event::Closed) => {
+                    Some(Message::WindowClosed(event_window))
+                }
+                iced::Event::Window(window::Event::Focused) => Some(Message::RefreshUi(
+                    refresh_ui::Action::Focused(event_window, true),
+                )),
+                iced::Event::Window(window::Event::Unfocused) => Some(Message::RefreshUi(
+                    refresh_ui::Action::Focused(event_window, false),
+                )),
+                iced::Event::Window(event) => window_geometry_message(&event),
+                event @ iced::Event::PlatformSpecific(_) => {
+                    window_edge_message(&event, event_window)
+                }
+                _ => None,
+            }),
+        ];
+        if let Some(session) = &self.session {
+            subscriptions.push(
+                Subscription::run_with(
+                    SessionHealthSource(session.health_receiver()),
+                    session_health_stream,
+                )
+                .map(Message::SessionSaveHealthChanged),
+            );
+        }
+        subscriptions.push(
+            Subscription::run_with(
+                LspEventSource(self.lsp.events(), self.lsp.generation()),
+                lsp_event_stream,
+            )
+            .map(Message::Lsp),
+        );
+        subscriptions.extend(
+            self.cards
+                .iter()
+                .filter_map(|(&card, runtime)| match runtime {
+                    CardRuntime::Repository(runtime) => {
+                        Some(runtime.document_subscription(card).map(Message::Repository))
+                    }
+                    _ => None,
+                }),
+        );
+        subscriptions.push(Subscription::run_with(
+            (self.settings_path.clone(), self.settings_ack_generation),
+            |(path, generation)| {
+                use cosmic::iced::futures::StreamExt;
+                let generation = *generation;
+                settings_ui::shared_preferences_stream(path.clone()).map(move |settings| {
+                    Message::SharedPreferencesObserved {
+                        generation,
+                        settings,
+                    }
+                })
+            },
+        ));
+        subscriptions.extend(operation_subscriptions);
+        if let Some(window) = self.core.main_window_id()
+            && (self.workspace.is_animating() || self.pane_inspectors.is_animating())
+        {
+            subscriptions.push(workspace_widget::animation_frames(window, Message::Frame));
+        }
+        #[cfg(feature = "integrated-browser")]
+        for (&card, runtime) in &self.cards {
+            if let CardRuntime::Browser(browser) = runtime {
+                subscriptions.push(
+                    browser
+                        .handle
+                        .subscription()
+                        .with(card)
+                        .map(|(card, event)| Message::BrowserEvent { card, event }),
+                );
+            }
+        }
+        #[cfg(feature = "integrated-browser")]
+        if self.cards.iter().any(|(card, runtime)| matches!(runtime, CardRuntime::Browser(browser) if browser.load_state.is_some() || browser.lifecycle == BrowserLifecycle::Restoring)
+            && self.workspace.visibility(*card) == Some(VisibilityClass::Visible))
+        {
+            subscriptions.push(iced::time::every(Duration::from_millis(50)).map(|_| Message::BrowserProgressTick));
+        }
+        Subscription::batch(subscriptions)
+    }
+
+    fn dialog(&self) -> Option<Element<'_, Message>> {
+        if let Some(dialog) = self.automation_approval_dialog() {
+            return Some(dialog);
+        }
+        if self.transient_work_close.is_some() {
+            let mut controls: Vec<Element<'_, Message>> = vec![
+                crate::ui_controls::button::secondary("Cancel close")
+                    .id(widget::Id::new(TRANSIENT_CLOSE_CANCEL))
+                    .on_press(Message::CancelTransientWorkClose)
+                    .into(),
+            ];
+            if self.device_ui.dirty() {
+                controls.push(
+                    crate::ui_controls::button::primary("Return to file")
+                        .on_press(Message::ReturnToDeviceBeforeClose)
+                        .into(),
+                );
+            }
+            if self.automation_ui.draft_close_blocker().is_some() {
+                controls.push(
+                    crate::ui_controls::button::primary("Keep editing automation")
+                        .on_press(Message::ReturnToAutomationBeforeClose)
+                        .into(),
+                );
+                if self.automation_ui.draft_dirty() && self.automation_ui.can_discard_draft() {
+                    controls.push(
+                        crate::ui_controls::button::destructive("Discard automation changes")
+                            .id(widget::Id::new(TRANSIENT_CLOSE_DISCARD))
+                            .on_press(Message::DiscardAutomationAndClose(
+                                self.automation_close_generation,
+                            ))
+                            .into(),
+                    );
+                }
+            }
+            return Some(dialog_ui::overlay(
+                dialog_ui::confirmation_surface(
+                    dialog_ui::Question::CloseWithUnsavedWork,
+                    widget::column::with_children(vec![
+                        design::title("Keep unsaved work before closing").into(),
+                        notice_detail(self.window_close_transient_blocker().unwrap_or(
+                            "The pending work is complete. Cancel this dialog and close again.",
+                        )),
+                    ])
+                    .spacing(space::M),
+                    widget::row::with_children(controls)
+                        .spacing(space::S)
+                        .wrap(),
+                    480.0,
+                ),
+                Some(Message::CancelTransientWorkClose),
+                1.0,
+            ));
+        }
+        if let Some(dialog) = self.automation_ui.draft_dialog() {
+            return Some(dialog_ui::overlay(
+                dialog.map(Message::AutomationUi),
+                self.automation_ui
+                    .keep_draft_action()
+                    .map(Message::AutomationUi),
+                1.0,
+            ));
+        }
+        if self.device_ui.open {
+            return Some(dialog_ui::overlay(
+                self.device_dialog(),
+                self.device_ui
+                    .can_close()
+                    .then_some(Message::Device(device_ui::Action::Close)),
+                1.0,
+            ));
+        }
+        if let Some(gallery) = &self.chat_ui.image_viewer {
+            return Some(gallery.view());
+        }
+        if let Some(dialog) = self.terminal_paste_dialog() {
+            return Some(dialog);
+        }
+        #[cfg(feature = "integrated-browser")]
+        if let Some(dialog) = self.browser_import_dialog() {
+            return Some(dialog);
+        }
+        if let Some(dialog) = self.session_recovery_dialog() {
+            return Some(dialog);
+        }
+        if let Some(dialog) = self.daemon_health_dialog() {
+            return Some(dialog);
+        }
+        if let Some(dialog) = self.update_dialog() {
+            return Some(dialog);
+        }
+        if self.chat_close_dialog_visible() {
+            return Some(self.chat_close_dialog());
+        }
+        if let Some(intent) = &self.terminal_close
+            && self.terminal_close_dialog_visible()
+        {
+            return self.terminal_close_dialog().map(|surface| {
+                dialog_ui::overlay(
+                    surface,
+                    (!intent.pending).then_some(Message::CancelTerminalClose),
+                    1.0,
+                )
+            });
+        }
+        // Above the settings surface it is raised from, because it is about to
+        // discard every shortcut, font, theme and language-server entry the
+        // user configured, with no undo.
+        if self.settings_reset_confirm {
+            return Some(dialog_ui::overlay(
+                dialog_ui::confirmation_surface(
+                    dialog_ui::Question::ResetSettings,
+                    widget::column::with_children(vec![
+                        design::title("Reset all settings?").into(),
+                        notice_body(
+                            "Every customization returns to its default: keyboard shortcuts, \
+                             terminal font and theme, editor syntax theme, interface scale, \
+                             pane widths, and the configured language servers.",
+                        ),
+                        notice_detail("This cannot be undone."),
+                    ])
+                    .spacing(space::M),
+                    dialog_ui::confirmation_actions(
+                        crate::ui_controls::button::secondary("Cancel")
+                            .id(widget::Id::new("dialog.reset-settings.cancel"))
+                            .on_press(Message::CancelResetSettings),
+                        crate::ui_controls::button::destructive("Reset settings")
+                            .id(widget::Id::new("dialog.reset-settings.confirm"))
+                            .on_press(Message::ConfirmResetSettings),
+                    ),
+                    480.0,
+                ),
+                Some(Message::CancelResetSettings),
+                1.0,
+            ));
+        }
+        // First, because a discard is the one dialog on screen precisely
+        // because it is about to destroy work that exists nowhere else.
+        if let Some(pending) = self.sidebar_state.pending_discard() {
+            return Some(dialog_ui::overlay(
+                sidebar::discard_confirmation_dialog(pending).map(Message::Sidebar),
+                Some(Message::Sidebar(SidebarAction::CancelDiscard)),
+                1.0,
+            ));
+        }
+        if let Some(close) = self.dirty_repository_close.as_ref() {
+            let card = close.card;
+            let runtime = match self.cards.get(&card) {
+                Some(CardRuntime::Repository(runtime)) => runtime,
+                _ => return None,
+            };
+            // The file at stake, not the repository the pane is rooted at.
+            let title = runtime
+                .selected_path()
+                .map(|path| path.display().to_string())
+                .or_else(|| self.card_state(card).map(|state| state.title.clone()))
+                .unwrap_or_else(|| "Repository".into());
+            let mut rows: Vec<Element<'_, Message>> = vec![
+                design::title(if runtime.has_durability_warning() {
+                    format!("Confirm the save to {title} before closing")
+                } else {
+                    format!("Save changes to {title}?")
+                })
+                .into(),
+                design::body(if runtime.has_durability_warning() {
+                    "The file was replaced on disk, but its durability is still unconfirmed. Retry the save, or cancel and reload from disk before closing; discarding editor changes cannot resolve this warning."
+                } else if matches!(close.intent, DirtyCloseIntent::Channel(_)) {
+                    "This editor has unsaved changes. Save them before the channel is deleted, discard them, or cancel to keep the channel."
+                } else {
+                    "This editor has unsaved changes. Save them before closing, discard them, or keep the repository open."
+                })
+                .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+                .into(),
+            ];
+            if let Some(error) = runtime.save_error() {
+                rows.push(
+                    design::body(error.to_owned())
+                        .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+                        .into(),
+                );
+            }
+            let save_message = runtime
+                .can_save()
+                .then_some(if runtime.has_save_conflict() {
+                    Message::OverwriteAndCloseRepository(card)
+                } else {
+                    Message::SaveAndCloseRepository(card)
+                });
+            let mut controls: Vec<Element<'_, Message>> = vec![
+                crate::ui_controls::button::secondary("Cancel")
+                    .id(dirty_close_control_id(card, DirtyCloseControl::Cancel))
+                    .on_press_maybe(
+                        (!runtime.is_saving()).then_some(Message::CancelRepositoryClose),
+                    )
+                    .into(),
+            ];
+            if runtime.can_abandon_unsaved_changes() {
+                controls.push(
+                    crate::ui_controls::button::destructive("Discard")
+                        .id(dirty_close_control_id(card, DirtyCloseControl::Discard))
+                        .on_press(Message::DiscardAndCloseRepository(card))
+                        .into(),
+                );
+            }
+            controls.push(
+                crate::ui_controls::button::primary("Save and close")
+                    .instead("Overwrite and close", runtime.has_save_conflict())
+                    .instead("Retry save and close", runtime.has_durability_warning())
+                    .id(dirty_close_control_id(card, DirtyCloseControl::Save))
+                    .on_press_maybe(save_message)
+                    .into(),
+            );
+            let dismiss = controls.remove(0);
+            let actions = dialog_ui::confirmation_actions(
+                dismiss,
+                widget::row::with_children(controls).spacing(space::S),
+            );
+            // A long path or save error scrolls; the answers stay in reach.
+            return Some(dialog_ui::overlay(
+                dialog_ui::scrolling_surface_with_actions(
+                    widget::container(widget::column::with_children(rows).spacing(space::M))
+                        .id(widget::Id::new(format!("dialog.dirty-close.{card}"))),
+                    actions,
+                    560.0,
+                    dialog_ui::MAX_HEIGHT,
+                ),
+                (!runtime.is_saving()).then_some(Message::CancelRepositoryClose),
+                1.0,
+            ));
+        }
+        if let Some(surface) = self.sidebar_selection_dialog() {
+            return Some(dialog_ui::overlay(
+                surface,
+                Some(Message::SidebarSelection(
+                    sidebar_selection_ui::Action::Dismiss,
+                )),
+                1.0,
+            ));
+        }
+        if let Some(surface) = self.project_dialog_view() {
+            return Some(dialog_ui::overlay(
+                surface,
+                Some(Message::ProjectUi(project_ui::Action::Dismiss)),
+                1.0,
+            ));
+        }
+        if let Some(surface) = self.channel_dialog_view() {
+            return Some(dialog_ui::overlay(
+                surface,
+                Some(Message::ChannelUi(channel_ui::Action::Dismiss)),
+                1.0,
+            ));
+        }
+        if let Some((surface, dismiss)) = self.worktree_dialog_view() {
+            return Some(dialog_ui::overlay(surface, dismiss, 1.0));
+        }
+
+        if let Some(dialog) = self.resume_dialog() {
+            return Some(dialog);
+        }
+
+        let dialog = self.pull_request_dialog.as_ref()?;
+        let head = dialog.head.trim();
+        let base = dialog.base.trim();
+        let draft = if dialog.draft { ", draft" } else { "" };
+        let route = if head.is_empty() || base.is_empty() {
+            "Choose a head and a base".to_owned()
+        } else {
+            format!("{head} → {base}{draft}")
+        };
+        let context = match &dialog.worktree {
+            Some(path) => format!("{} · {route}", path.display()),
+            None => route,
+        };
+        let mut rows: Vec<Element<'_, Message>> = vec![
+            design::title("Create pull request").into(),
+            design::caption(format!("{} · {context}", dialog.repository.gh_selector())).into(),
+            widget::column::with_children(vec![
+                design::caption("Title").into(),
+                crate::ui_controls::field::text("Title", &dialog.title)
+                    .id(pull_request_dialog_focus_id())
+                    .on_input(Message::PullRequestTitleChanged)
+                    .on_submit_maybe(
+                        self.pull_request_submission_allowed()
+                            .then_some(|_| Message::SubmitPullRequest),
+                    )
+                    .into(),
+            ])
+            .spacing(space::XS)
+            .into(),
+            widget::column::with_children(vec![
+                design::caption("Head branch").into(),
+                crate::ui_controls::field::text("Head branch", &dialog.head)
+                    .id(widget::Id::new("dialog.pull-request.head"))
+                    .on_input(Message::PullRequestHeadChanged)
+                    .on_submit_maybe(
+                        self.pull_request_submission_allowed()
+                            .then_some(|_| Message::SubmitPullRequest),
+                    )
+                    .into(),
+            ])
+            .spacing(space::XS)
+            .into(),
+            widget::column::with_children(vec![
+                design::caption("Base branch").into(),
+                crate::ui_controls::field::text("Base branch", &dialog.base)
+                    .id(widget::Id::new("dialog.pull-request.base"))
+                    .on_input(Message::PullRequestBaseChanged)
+                    .on_submit_maybe(
+                        self.pull_request_submission_allowed()
+                            .then_some(|_| Message::SubmitPullRequest),
+                    )
+                    .into(),
+            ])
+            .spacing(space::XS)
+            .into(),
+            widget::column::with_children(vec![
+                design::caption("Description").into(),
+                crate::ui_controls::field::editor("Pull request description", &dialog.body.0)
+                    .placeholder("Describe the change (Markdown supported)")
+                    .height(160)
+                    .on_action(Message::PullRequestBodyChanged)
+                    .on_cursor(Message::PullRequestBodyCursor)
+                    .into(),
+            ])
+            .spacing(space::XS)
+            .into(),
+            crate::ui_controls::field::checkbox(dialog.draft)
+                .label("Create as draft")
+                .on_toggle(Message::PullRequestDraftChanged)
+                .into(),
+        ];
+        if let Some(confirmed) = dialog.retry_confirmation {
+            rows.push(
+                design::body(
+                    "GitHub may have created this pull request. Check GitHub before retrying to avoid creating a duplicate.",
+                )
+                .into(),
+            );
+            rows.push(
+                crate::ui_controls::field::checkbox(confirmed)
+                    .label("I checked GitHub; no pull request was created")
+                    .on_toggle(Message::PullRequestRetryConfirmed)
+                    .into(),
+            );
+        }
+        let actions = dialog_ui::confirmation_actions(
+            crate::ui_controls::button::secondary("Cancel").on_press(Message::CancelDialog),
+            crate::ui_controls::button::primary("Create").on_press_maybe(
+                self.pull_request_submission_allowed()
+                    .then_some(Message::SubmitPullRequest),
+            ),
+        );
+        Some(dialog_ui::overlay(
+            dialog_ui::scrolling_surface_with_actions(
+                widget::column::with_children(rows).spacing(space::M),
+                actions,
+                620.0,
+                620.0,
+            ),
+            Some(Message::CancelDialog),
+            1.0,
+        ))
+    }
+
+    /// The application opens no window but its main one, which stops being
+    /// the main window only when the exit closes it. libcosmic's default
+    /// panics, and iced may still draw the window before it removes it.
+    fn view_window(&self, _id: window::Id) -> Element<'_, Message> {
+        widget::Space::new().into()
+    }
+
+    fn view(&self) -> Element<'_, Message> {
+        let _trace = crate::performance::ui_trace::scope(crate::performance::ui_trace::Phase::View);
+        let sidebar_mode = self.projects_sidebar_mode();
+        let sidebar = sidebar::view_cached(
+            &self.sidebar_model,
+            &self.sidebar_state,
+            sidebar_mode,
+            self.settings.sidebar_width,
+            self.modal_is_open(),
+            &self.navigation_cache,
+            &self.settings.keyboard_shortcuts,
+            !self.core.window.sharp_corners,
+        )
+        .map(Message::Sidebar);
+        let sidebar = crate::performance::ui_trace::region("sidebar", sidebar);
+
+        // The focused card's own name and path are the card header's job, and
+        // the window's header bar already carries the name; see
+        // `sync_window_title`.
+        let has_multiple_panes = self.workspace.cards().len() > 1;
+
+        let workspace: Element<'_, Message> = if self.workspace.cards().is_empty() {
+            let directory = self
+                .terminal_directory()
+                .unwrap_or_else(|| STARTING_DIRECTORY.clone());
+            let scoped = self.active_workspace.is_some() || self.durable.active_channel.is_some();
+            let scope_name = self
+                .durable
+                .active_channel
+                .and_then(|id| {
+                    self.durable
+                        .channels
+                        .iter()
+                        .find(|channel| channel.id == id)
+                        .map(|channel| channel.title.clone())
+                })
+                .or_else(|| {
+                    directory
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                })
+                .unwrap_or_else(|| "Workspace".into());
+            let quick = |glyph, label, id, message| {
+                Element::from(
+                    crate::ui_controls::icon_button(glyph, label)
+                        .on_press(message)
+                        .id(widget::Id::new(id)),
+                )
+            };
+            let mut actions: Vec<Element<'_, Message>> = vec![
+                crate::interaction::tooltip(
+                    crate::ui_controls::button::primary("New conversation")
+                        .icon(Icon::Chat)
+                        .on_press(Message::ChromeUi(chrome_ui::Action::Launch(
+                            chrome_ui::NewTab::Thread,
+                        ))),
+                    workspace_widget::shortcut_tooltip(
+                        workspace_widget::GlobalShortcut::NewThread,
+                        &self.settings.keyboard_shortcuts,
+                    ),
+                ),
+                quick(
+                    Icon::History,
+                    "Resume conversation".to_owned(),
+                    "empty.resume-conversation",
+                    Message::ResumeConversation(resume_ui::Action::Open),
+                ),
+                quick(
+                    Icon::Terminal,
+                    workspace_widget::shortcut_tooltip(
+                        workspace_widget::GlobalShortcut::NewTerminal,
+                        &self.settings.keyboard_shortcuts,
+                    ),
+                    "empty.new-terminal",
+                    Message::NewTerminal,
+                ),
+                quick(
+                    Icon::Browser,
+                    if cfg!(feature = "integrated-browser") {
+                        "New browser"
+                    } else {
+                        "Open in system browser"
+                    }
+                    .to_owned(),
+                    "empty.new-browser",
+                    Message::NewBrowser,
+                ),
+                quick(
+                    Icon::Avatar,
+                    "Agent accounts".to_owned(),
+                    "empty.accounts",
+                    Message::AccountUi(account_ui::Action::OpenPane),
+                ),
+            ];
+            if !scoped {
+                actions.pop();
+            }
+            let primary = actions.remove(0);
+            let actions = widget::column::with_children(vec![
+                primary,
+                widget::row::with_children(actions)
+                    .align_y(Alignment::Center)
+                    .spacing(space::S)
+                    .into(),
+            ])
+            .spacing(space::M);
+            let mut content: Vec<Element<'_, Message>> = vec![
+                crate::ui_controls::passive_icon(Icon::Chat, 32),
+                design::display(if scoped {
+                    scope_name
+                } else {
+                    "Workspace".into()
+                })
+                .into(),
+                crate::interaction::tooltip(
+                    crate::ui_controls::FadeText::caption(display_path(&directory).into_owned())
+                        .edge(crate::ui_controls::FadeEdge::Start)
+                        .width(Length::Fill),
+                    directory.display().to_string(),
+                ),
+                actions.into(),
+            ];
+            if !scoped {
+                content.push(
+                    // The providers whose accounts the Accounts pane shows.
+                    widget::row::with_children(
+                        crate::agent::Provider::ALL
+                            .into_iter()
+                            .filter(|provider| crate::account::Account::REPORTED.contains(provider))
+                            .map(|provider| {
+                                let status = self.account_ui.provider_status(provider);
+                                let control = crate::ui_controls::icon_button(
+                                    crate::ui_controls::provider_icon(provider),
+                                    format!("{} · {status} · Manage accounts", provider.label()),
+                                )
+                                .on_press(Message::AccountUi(account_ui::Action::OpenPane));
+                                Element::from(if status == "Account available" {
+                                    control.tone(design::Tone::Themed(design::success_color))
+                                } else {
+                                    control
+                                })
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .spacing(space::M)
+                    .into(),
+                );
+            }
+            let surface =
+                widget::container(widget::column::with_children(content).spacing(space::L))
+                    .padding(space::XL)
+                    .width(Length::Fill)
+                    .max_width(440);
+            widget::container(surface)
+                .center(Length::Fill)
+                .padding(space::XL)
+                .into()
+        } else {
+            workspace_widget::view(
+                &self.workspace,
+                &self.settings.keyboard_shortcuts,
+                self.focused_pane(),
+                self.settings.focus_follows_mouse,
+                &self.input_trace,
+                self.workspace.viewport_width(),
+                self.workspace_scroll_id.clone(),
+                move |context| {
+                    self.workspace_card_view(context.id, context.focused, has_multiple_panes)
+                },
+                // `sync_chrome` keeps an entry for every durable card the
+                // strip holds, so the fallback is only reachable for a card
+                // the workspace holds but the durable model does not.
+                |id| {
+                    self.card_chrome.get(&id).map_or_else(
+                        || workspace_widget::card_widget_id(id),
+                        |chrome| chrome.container_id.clone(),
+                    )
+                },
+                workspace_widget::Events {
+                    viewport: {
+                        let generation = self.workspace_view_generation;
+                        move |event| Message::Viewport { generation, event }
+                    },
+                },
+            )
+        };
+
+        // The strip keeps its scrollbars and trailing controls out of the
+        // window's resize border, as the rightmost surface.
+        let workspace: Element<'_, Message> = widget::container(workspace)
+            .padding(Padding::ZERO.right(self.trailing_edge_inset()))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
+        let workspace = crate::performance::ui_trace::region("workspace", workspace);
+        let main_content = self.workspace_chrome(workspace);
+        let surface: Element<'_, Message> = widget::row::with_children(vec![sidebar, main_content])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
+        // The bar comes and goes, but the tree around the workspace must not:
+        // iced matches widget state by position, so wrapping the surface only
+        // while the bar shows would reset every scroll offset and focus in it.
+        let bar = self
+            .status_bar()
+            .unwrap_or_else(|| iced::widget::Space::new().height(Length::Shrink).into());
+        let surface: Element<'_, Message> = widget::column::with_children(vec![
+            surface,
+            self.operation_recovery
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .view()
+                .map(Message::OperationRecovery),
+            self.daemon_health_banner(),
+            self.automation_approval_banner(),
+            bar,
+        ])
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into();
+        // The workspace switcher places itself, over a scrim of its own.
+        let switcher = self
+            .palette_surface()
+            .or_else(|| self.pane_rename_surface())
+            .map(|surface| {
+                widget::container(surface)
+                    .align_x(Alignment::Center)
+                    .padding(2.0 * design::HEADER_HEIGHT)
+                    .width(Length::Fill)
+                    .into()
+            })
+            .or_else(|| self.workspace_switcher())
+            .unwrap_or_else(|| iced::widget::Space::new().into());
+        let surface = crate::interaction::layer(surface, switcher);
+        let surface = crate::interaction::drive_animation(
+            surface,
+            self.workspace.is_animating() || self.pane_inspectors.is_animating(),
+        );
+        let surface = crate::input_trace::observe(surface, &self.input_trace);
+        let surface = crate::file_drop::surface(surface, self.core.scale_factor());
+        let surface = crate::reorder::channel_scope(
+            surface,
+            widget::Id::new("workspace.tabs"),
+            self.workspace_view_generation,
+            !self.workspace_inputs_blocked(),
+            |card, channel| {
+                self.workspace.order().any(|id| id == card)
+                    && self.can_move_pane_to_channel(card, channel)
+            },
+            |card, channel| Message::PaneDropToChannel {
+                generation: self.workspace_view_generation,
+                card,
+                channel,
+            },
+        );
+        let surface = crate::performance::ui_trace::root(surface);
+        #[cfg(feature = "latency-harness")]
+        return latency_ui::instrument(
+            surface,
+            (self.latency_focus == self.workspace.focused())
+                .then(|| self.latency.pending_generation())
+                .flatten(),
+            self.latency_fixture.is_some() && !self.latency_fixture_started,
+        );
+        #[cfg(not(feature = "latency-harness"))]
+        surface
+    }
+
     fn update(&mut self, message: Message) -> Task<Message> {
         let _trace = crate::performance::ui_trace::update(&message);
         // Include dispatch and the shared projection tail. The trace is opt-in;
@@ -16111,25 +17192,6 @@ impl Application for Cagents {
                 },
             )
         });
-        if let Some(settled) = self.settle_chat_close_confirm() {
-            // An answer to the question that just ended must not answer the
-            // next one, which the reader has not seen.
-            if matches!(
-                message,
-                Message::ConfirmChatClose | Message::CancelChatClose
-            ) {
-                return settled;
-            }
-            return Task::batch([settled, self.update(message)]);
-        }
-        if !self.pending_repository_reconciliation.is_empty()
-            && !defers_repository_reconciliation(&message)
-        {
-            // Only a run of background repository loads waits for one
-            // reconciliation; every other message sees it done, in order.
-            let reconciled = self.update(Message::RepositoryReconciliationDue);
-            return Task::batch([reconciled, self.update(message)]);
-        }
         #[cfg(any(test, feature = "development"))]
         let (_running, settled_projection) = self.settle_projection(&message);
         #[cfg(any(test, feature = "development"))]
@@ -16145,21 +17207,84 @@ impl Application for Cagents {
                 | Message::AttachedWorktreePrsResolved { .. }
                 | Message::GitUi(_)
         );
-        // Preserve the existing dispatch layout while every return converges
-        // through the lightweight visibility/presence postlude below.
-        #[rustfmt::skip]
-        let task = (|| {
         self.reconcile_terminal_review_owner();
         self.cancel_stale_pr_creations();
         if let Some(notice) = crate::diagnostics::take_notice() {
             self.notices.record(TransientNotice::warning(notice));
         }
+        self.dispatching += 1;
+        let task = self.dispatch(message);
+        self.dispatching -= 1;
+        self.finish_update(
+            task,
+            UpdateEntry {
+                notice_control,
+                attention_scope_changed,
+                timed: _workspace_timing.is_some(),
+                settled_projection,
+                #[cfg(any(test, feature = "development"))]
+                oracle_message,
+            },
+        )
+    }
+}
+
+impl Cagents {
+    /// Settles what the window owes before any message is handled, whether
+    /// it is an update's own or one a handler dispatches within it, then
+    /// holds the message to the gates every message passes ([`Self::hold`]).
+    /// `Continue` carries the admitted message with what settling started;
+    /// `Break` carries everything a refused message comes to.
+    fn admit(&mut self, message: Message) -> ControlFlow<Task<Message>, (Message, Task<Message>)> {
+        let mut settled = Vec::new();
+        if let Some(task) = self.settle_chat_close_confirm() {
+            // The question has gone and the close queue has moved on, which
+            // the chrome shows.
+            self.owe_projection(OwedProjection::full());
+            // An answer to the question that just ended must not answer the
+            // next one, which the reader has not seen.
+            if matches!(
+                message,
+                Message::ConfirmChatClose | Message::CancelChatClose
+            ) {
+                return ControlFlow::Break(task);
+            }
+            settled.push(task);
+        }
+        if !self.pending_repository_reconciliation.is_empty()
+            && !defers_repository_reconciliation(&message)
+        {
+            // Only a run of background repository loads waits for one
+            // reconciliation; every other message sees it done, in order.
+            // A whole update rather than a dispatch, so the message finds
+            // the reconciled workspace already projected, as it did when
+            // the reconciliation's own message came first.
+            settled.push(self.update(Message::RepositoryReconciliationDue));
+        }
+        match self.hold(message) {
+            ControlFlow::Continue(message) => {
+                ControlFlow::Continue((message, Task::batch(settled)))
+            }
+            ControlFlow::Break(refused) => {
+                settled.push(refused);
+                ControlFlow::Break(Task::batch(settled))
+            }
+        }
+    }
+
+    /// Holds `message` to the gates every message passes before its handler
+    /// runs: a remote device refusing local work, an update being prepared,
+    /// a dialog or the tab chrome holding the workspace, a save in flight,
+    /// and navigation a dialog defers. `Break` carries what a refused
+    /// message comes to. On the way it notes the focus in the tab history
+    /// and ends a workspace preview the message takes the keyboard from.
+    fn hold(&mut self, message: Message) -> ControlFlow<Task<Message>, Message> {
         if crate::device::is_remote() {
             match &message {
                 Message::GitUi(_)
                 | Message::ProjectUi(
                     project_ui::Action::EditorsLoaded(_) | project_ui::Action::AvatarLoaded { .. },
-                ) => return Task::none(),
+                ) => return ControlFlow::Break(Task::none()),
                 Message::ChatUi(
                     chat_ui::Action::Attach(_)
                     | chat_ui::Action::Attached(..)
@@ -16173,10 +17298,14 @@ impl Application for Cagents {
                     self.status = Some(TransientNotice::warning(
                         "File attachments require transfer to the selected device; use files already on that device",
                     ));
-                    return Task::none();
+                    return ControlFlow::Break(Task::none());
                 }
-                Message::OpenRepository => return self.update_device(device_ui::Action::Open),
-                Message::PreviewLocalFile(_) => return self.update_device(device_ui::Action::Open),
+                Message::OpenRepository => {
+                    return ControlFlow::Break(self.update_device(device_ui::Action::Open));
+                }
+                Message::PreviewLocalFile(_) => {
+                    return ControlFlow::Break(self.update_device(device_ui::Action::Open));
+                }
                 Message::ResumeConversation(_)
                 | Message::Repository(_)
                 | Message::ProjectUi(_)
@@ -16184,10 +17313,10 @@ impl Application for Cagents {
                     self.status = Some(TransientNotice::warning(
                         "Use Device files for remote files and Git operations",
                     ));
-                    return Task::none();
+                    return ControlFlow::Break(Task::none());
                 }
                 Message::Sidebar(action) if !device_ui::supports_sidebar_action(action) => {
-                    return self.update_device(device_ui::Action::Open);
+                    return ControlFlow::Break(self.update_device(device_ui::Action::Open));
                 }
                 _ => {}
             }
@@ -16215,7 +17344,7 @@ impl Application for Cagents {
                     "An update is being prepared, so the pane was kept. Close it again if the update doesn't go ahead.",
                 ));
             }
-            return Task::none();
+            return ControlFlow::Break(Task::none());
         }
         if self.modal_is_open() {
             self.chrome_ui.close();
@@ -16223,21 +17352,42 @@ impl Application for Cagents {
             && !matches!(&message, Message::ChromeUi(_))
             && user_workspace_message_blocked_while_modal(&message)
         {
-            return Task::none();
+            return ControlFlow::Break(Task::none());
         }
         if self.modal_is_open() && user_workspace_message_blocked_while_modal(&message) {
-            return Task::none();
+            return ControlFlow::Break(Task::none());
         }
         if self.focused_repository_is_saving() && workspace_navigation_blocked_during_save(&message)
         {
-            return Task::none();
+            return ControlFlow::Break(Task::none());
         }
         if (self.focused_repository_is_saving() || self.modal_is_open())
             && completion_navigates(&message)
         {
             self.deferred_navigation.push_back(message);
-            return Task::none();
+            return ControlFlow::Break(Task::none());
         }
+        ControlFlow::Continue(message)
+    }
+
+    /// Runs `message`'s handler once [`Self::admit`] lets it through, and
+    /// adds the projection the handler declares to `owed_projection` rather
+    /// than projecting. `update` dispatches its own message this way and then
+    /// projects what is owed, once. A handler that acts by way of another
+    /// message dispatches that message the same way, not through an `update`
+    /// of its own, so one input projects once however many messages it comes
+    /// to: a shortcut and the focus move it stands for share one projection.
+    ///
+    /// Outside a handler, where no update would project what it owes, as
+    /// when a test drives a helper directly, it runs a whole update instead.
+    fn dispatch(&mut self, message: Message) -> Task<Message> {
+        if self.dispatching == 0 {
+            return self.update(message);
+        }
+        let (message, settled) = match self.admit(message) {
+            ControlFlow::Continue(admitted) => admitted,
+            ControlFlow::Break(refused) => return refused,
+        };
         if !self.workspace.is_animating() && !self.pane_inspectors.is_animating() {
             // Whatever this message starts is measured from now. Its first
             // frame then moves it by the time since the input that began it,
@@ -16286,6 +17436,10 @@ impl Application for Cagents {
         } else {
             Projection::Full
         };
+        // A handler that returns early, as nothing derived changed, owes no
+        // projection.
+        #[rustfmt::skip]
+        let task = (|| {
         let task = match message {
             Message::TerminalFailure(action) => {
                 if action.only_touches_probes() && !self.update_tail_may_close_or_commit() {
@@ -16608,7 +17762,7 @@ impl Application for Cagents {
                     return Task::none();
                 };
                 let key = source.key.clone();
-                self.update(Message::Sidebar(if stage {
+                self.dispatch(Message::Sidebar(if stage {
                     SidebarAction::Stage {
                         key,
                         selection: vec![selection],
@@ -16633,7 +17787,7 @@ impl Application for Cagents {
                 self.handle_pull_request_review(card, action)
             }
             Message::Repository(RepositoryAction::ZoomFont { card, delta }) => {
-                self.update(Message::ZoomFont {
+                self.dispatch(Message::ZoomFont {
                     card,
                     delta,
                     editor: true,
@@ -16661,7 +17815,7 @@ impl Application for Cagents {
                 } else {
                     (current + f32::from(delta)).clamp(8.0, 40.0).to_string()
                 };
-                self.update(Message::SettingsChanged {
+                self.dispatch(Message::SettingsChanged {
                     field: if editor {
                         SettingsField::EditorFontSize
                     } else {
@@ -17375,8 +18529,16 @@ impl Application for Cagents {
                 let update = self.workspace.tick(elapsed);
                 Task::batch([inspector_task, self.apply_viewport(update, true, DurableChange::None)])
             }
-            Message::LifecycleSweep => self.lifecycle_sweep(),
-            Message::LifecycleSweepElapsed(generation) => self.lifecycle_sweep_elapsed(generation),
+            Message::LifecycleSweep => {
+                let (task, sweep_projection) = self.lifecycle_sweep_update();
+                projection = self.sweep_projection(sweep_projection);
+                task
+            }
+            Message::LifecycleSweepElapsed(generation) => {
+                let (task, sweep_projection) = self.lifecycle_sweep_elapsed(generation);
+                projection = self.sweep_projection(sweep_projection);
+                task
+            }
             Message::WorkspaceSwitcherSelected { since, index } => {
                 if self.chrome_ui.workspace_preview_since == Some(since) {
                     self.select_workspace_preview(index)
@@ -17737,7 +18899,7 @@ impl Application for Cagents {
                     )));
                     return Task::none();
                 }
-                self.update(Message::WorktreeCreated {
+                self.dispatch(Message::WorktreeCreated {
                     project_id: origin.project,
                     repository,
                     result: Ok(outcome),
@@ -17895,7 +19057,7 @@ impl Application for Cagents {
                         .map(cosmic::Action::App);
                 }
                 let generation = self.pull_request_dialog_generation;
-                let submit = cosmic::task::future(async move {
+                cosmic::task::future(async move {
                     let mut dialog = dialog;
                     let result = tokio::task::spawn_blocking(move || {
                         GitHubService::system("gh")
@@ -17914,8 +19076,7 @@ impl Application for Cagents {
                         generation,
                         result,
                     }
-                });
-                submit
+                })
             }
             Message::PullRequestCreated {
                 mut dialog,
@@ -18314,6 +19475,36 @@ impl Application for Cagents {
                 committed,
             } => handled!(self.source_control_mutated(key, operation, report, committed)),
         };
+        self.owe_projection(OwedProjection { projection, camera_only, reconcile_row_selection, model_update });
+        task
+            })();
+        Task::batch([settled, task])
+    }
+
+    fn owe_projection(&mut self, owed: OwedProjection) {
+        self.owed_projection = Some(match self.owed_projection.take() {
+            Some(earlier) => earlier.merge(owed),
+            None => owed,
+        });
+    }
+
+    /// Projects, once, what this update's message and those its handlers
+    /// dispatched within it owe, then settles what every update leaves
+    /// behind: notices, the close queue, attention and keyboard focus.
+    fn finish_update(&mut self, task: Task<Message>, entry: UpdateEntry) -> Task<Message> {
+        let UpdateEntry {
+            notice_control,
+            attention_scope_changed,
+            timed,
+            settled_projection,
+            #[cfg(any(test, feature = "development"))]
+            oracle_message,
+        } = entry;
+        #[rustfmt::skip]
+        let task = (|| {
+        let Some(OwedProjection { mut projection, camera_only, reconcile_row_selection, model_update }) = self.owed_projection.take() else {
+            return task;
+        };
         // Scoped proof was established during dispatch. Settings commit and
         // close processing can invalidate it before chrome is projected.
         if matches!(projection, Projection::ScopedChrome(_))
@@ -18377,7 +19568,7 @@ impl Application for Cagents {
                 }
                 projection_stage!("attention_card_rows", self.refresh_attention_card_rows());
                 let notices = self.reconcile_notice_popup();
-                let mut phase = WorkspaceProjectionTiming::new(_workspace_timing.is_some());
+                let mut phase = WorkspaceProjectionTiming::new(timed);
                 let chrome = match &projection {
                     Projection::ScopedChrome(cards) => {
                         projection_stage!("scoped_chrome", self.sync_scoped_chrome(cards))
@@ -18452,6 +19643,13 @@ impl Application for Cagents {
         // mounted visible chats are inspected by this bounded handoff.
         let limit_usage =
             projection_stage!("chat_limit_accounts", self.refresh_chat_limit_accounts());
+        // Last, after everything above that may change the accounts, so the
+        // frame this update ends in reads its conversations' account choices.
+        projection_stage!(
+            "chat_account_choices",
+            self.account_ui
+                .settle_choices(self.settings.account_usage_display)
+        );
         Task::batch([
             settled_projection,
             task,
@@ -18461,791 +19659,6 @@ impl Application for Cagents {
             preview,
             limit_usage,
         ])
-    }
-
-    fn subscription(&self) -> Subscription<Message> {
-        let _trace =
-            crate::performance::ui_trace::scope(crate::performance::ui_trace::Phase::Subscription);
-        let operation_subscriptions = self.worktree_progress_subscriptions();
-        let mut subscriptions = vec![
-            self.chat_subscription(),
-            self.notification_subscription(),
-            self.notice_expiry_subscription(),
-            Subscription::run(crate::daemon_health::stream).map(Message::DaemonHealth),
-            Subscription::run(crate::desktop_cursor_blink::stream).map(Message::CursorBlink),
-            self.refresh_subscription(),
-            self.review_request_subscription(),
-            self.git_subscription(),
-            self.account_subscription(),
-            self.automation_subscription(),
-            self.work_subscription(),
-            self.conversation_pull_request_subscription(),
-            self.automation_approval_subscription(),
-            self.document_tone_subscription(),
-            self.update_subscription(),
-            Subscription::run_with(
-                TerminalWakeSource(self.terminal_wake_rx.clone()),
-                terminal_wake_stream,
-            )
-            .map(|wake| Message::TerminalWake {
-                card: wake.card,
-                generation: wake.generation,
-            }),
-            Subscription::run_with(
-                HostedTerminalSource(self.hosted_terminals_rx.clone()),
-                hosted_terminal_stream,
-            )
-            .map(Message::HostedTerminalsObserved),
-            Subscription::run_with(
-                WorkspaceModelSource(self.workspace_model_rx.clone()),
-                workspace_model_stream,
-            )
-            .map(Message::WorkspaceModelObserved),
-            Subscription::run_with(
-                UiActivationSource(self.activation_rx.clone()),
-                ui_activation_stream,
-            )
-            .map(|activation| match activation.update {
-                Some(request) => Message::UiUpdate(request),
-                None => match activation.session {
-                    Some(session) => Message::ActivateSession {
-                        session,
-                        token: activation.token,
-                    },
-                    None => Message::ActivateUi {
-                        token: activation.token,
-                    },
-                },
-            }),
-            event::listen_with(|event, status, event_window| match event {
-                iced::Event::Keyboard(event) => Some(Message::KeyEvent {
-                    event,
-                    captured: matches!(status, event::Status::Captured),
-                }),
-                iced::Event::Window(window::Event::Rescaled(scale_factor)) => {
-                    Some(Message::WindowScaleFactorChanged(scale_factor))
-                }
-                iced::Event::Window(window::Event::CloseRequested) => {
-                    Some(Message::WindowCloseRequested(event_window))
-                }
-                iced::Event::Window(window::Event::Closed) => {
-                    Some(Message::WindowClosed(event_window))
-                }
-                iced::Event::Window(window::Event::Focused) => Some(Message::RefreshUi(
-                    refresh_ui::Action::Focused(event_window, true),
-                )),
-                iced::Event::Window(window::Event::Unfocused) => Some(Message::RefreshUi(
-                    refresh_ui::Action::Focused(event_window, false),
-                )),
-                iced::Event::Window(event) => window_geometry_message(&event),
-                event @ iced::Event::PlatformSpecific(_) => {
-                    window_edge_message(&event, event_window)
-                }
-                _ => None,
-            }),
-        ];
-        if let Some(session) = &self.session {
-            subscriptions.push(
-                Subscription::run_with(
-                    SessionHealthSource(session.health_receiver()),
-                    session_health_stream,
-                )
-                .map(Message::SessionSaveHealthChanged),
-            );
-        }
-        subscriptions.push(
-            Subscription::run_with(
-                LspEventSource(self.lsp.events(), self.lsp.generation()),
-                lsp_event_stream,
-            )
-            .map(Message::Lsp),
-        );
-        subscriptions.extend(
-            self.cards
-                .iter()
-                .filter_map(|(&card, runtime)| match runtime {
-                    CardRuntime::Repository(runtime) => {
-                        Some(runtime.document_subscription(card).map(Message::Repository))
-                    }
-                    _ => None,
-                }),
-        );
-        subscriptions.push(Subscription::run_with(
-            (self.settings_path.clone(), self.settings_ack_generation),
-            |(path, generation)| {
-                use cosmic::iced::futures::StreamExt;
-                let generation = *generation;
-                settings_ui::shared_preferences_stream(path.clone()).map(move |settings| {
-                    Message::SharedPreferencesObserved {
-                        generation,
-                        settings,
-                    }
-                })
-            },
-        ));
-        subscriptions.extend(operation_subscriptions);
-        if let Some(window) = self.core.main_window_id()
-            && (self.workspace.is_animating() || self.pane_inspectors.is_animating())
-        {
-            subscriptions.push(workspace_widget::animation_frames(window, Message::Frame));
-        }
-        #[cfg(feature = "integrated-browser")]
-        for (&card, runtime) in &self.cards {
-            if let CardRuntime::Browser(browser) = runtime {
-                subscriptions.push(
-                    browser
-                        .handle
-                        .subscription()
-                        .with(card)
-                        .map(|(card, event)| Message::BrowserEvent { card, event }),
-                );
-            }
-        }
-        #[cfg(feature = "integrated-browser")]
-        if self.cards.iter().any(|(card, runtime)| matches!(runtime, CardRuntime::Browser(browser) if browser.load_state.is_some() || browser.lifecycle == BrowserLifecycle::Restoring)
-            && self.workspace.visibility(*card) == Some(VisibilityClass::Visible))
-        {
-            subscriptions.push(iced::time::every(Duration::from_millis(50)).map(|_| Message::BrowserProgressTick));
-        }
-        Subscription::batch(subscriptions)
-    }
-
-    fn dialog(&self) -> Option<Element<'_, Message>> {
-        if let Some(dialog) = self.automation_approval_dialog() {
-            return Some(dialog);
-        }
-        if self.transient_work_close.is_some() {
-            let mut controls: Vec<Element<'_, Message>> = vec![
-                crate::ui_controls::button::secondary("Cancel close")
-                    .id(widget::Id::new(TRANSIENT_CLOSE_CANCEL))
-                    .on_press(Message::CancelTransientWorkClose)
-                    .into(),
-            ];
-            if self.device_ui.dirty() {
-                controls.push(
-                    crate::ui_controls::button::primary("Return to file")
-                        .on_press(Message::ReturnToDeviceBeforeClose)
-                        .into(),
-                );
-            }
-            if self.automation_ui.draft_close_blocker().is_some() {
-                controls.push(
-                    crate::ui_controls::button::primary("Keep editing automation")
-                        .on_press(Message::ReturnToAutomationBeforeClose)
-                        .into(),
-                );
-                if self.automation_ui.draft_dirty() && self.automation_ui.can_discard_draft() {
-                    controls.push(
-                        crate::ui_controls::button::destructive("Discard automation changes")
-                            .id(widget::Id::new(TRANSIENT_CLOSE_DISCARD))
-                            .on_press(Message::DiscardAutomationAndClose(
-                                self.automation_close_generation,
-                            ))
-                            .into(),
-                    );
-                }
-            }
-            return Some(dialog_ui::overlay(
-                dialog_ui::confirmation_surface(
-                    dialog_ui::Question::CloseWithUnsavedWork,
-                    widget::column::with_children(vec![
-                        design::title("Keep unsaved work before closing").into(),
-                        notice_detail(self.window_close_transient_blocker().unwrap_or(
-                            "The pending work is complete. Cancel this dialog and close again.",
-                        )),
-                    ])
-                    .spacing(space::M),
-                    widget::row::with_children(controls)
-                        .spacing(space::S)
-                        .wrap(),
-                    480.0,
-                ),
-                Some(Message::CancelTransientWorkClose),
-                1.0,
-            ));
-        }
-        if let Some(dialog) = self.automation_ui.draft_dialog() {
-            return Some(dialog_ui::overlay(
-                dialog.map(Message::AutomationUi),
-                self.automation_ui
-                    .keep_draft_action()
-                    .map(Message::AutomationUi),
-                1.0,
-            ));
-        }
-        if self.device_ui.open {
-            return Some(dialog_ui::overlay(
-                self.device_dialog(),
-                self.device_ui
-                    .can_close()
-                    .then_some(Message::Device(device_ui::Action::Close)),
-                1.0,
-            ));
-        }
-        if let Some(gallery) = &self.chat_ui.image_viewer {
-            return Some(gallery.view());
-        }
-        if let Some(dialog) = self.terminal_paste_dialog() {
-            return Some(dialog);
-        }
-        #[cfg(feature = "integrated-browser")]
-        if let Some(dialog) = self.browser_import_dialog() {
-            return Some(dialog);
-        }
-        if let Some(dialog) = self.session_recovery_dialog() {
-            return Some(dialog);
-        }
-        if let Some(dialog) = self.daemon_health_dialog() {
-            return Some(dialog);
-        }
-        if let Some(dialog) = self.update_dialog() {
-            return Some(dialog);
-        }
-        if self.chat_close_dialog_visible() {
-            return Some(self.chat_close_dialog());
-        }
-        if let Some(intent) = &self.terminal_close
-            && self.terminal_close_dialog_visible()
-        {
-            return self.terminal_close_dialog().map(|surface| {
-                dialog_ui::overlay(
-                    surface,
-                    (!intent.pending).then_some(Message::CancelTerminalClose),
-                    1.0,
-                )
-            });
-        }
-        // Above the settings surface it is raised from, because it is about to
-        // discard every shortcut, font, theme and language-server entry the
-        // user configured, with no undo.
-        if self.settings_reset_confirm {
-            return Some(dialog_ui::overlay(
-                dialog_ui::confirmation_surface(
-                    dialog_ui::Question::ResetSettings,
-                    widget::column::with_children(vec![
-                        design::title("Reset all settings?").into(),
-                        notice_body(
-                            "Every customization returns to its default: keyboard shortcuts, \
-                             terminal font and theme, editor syntax theme, interface scale, \
-                             pane widths, and the configured language servers.",
-                        ),
-                        notice_detail("This cannot be undone."),
-                    ])
-                    .spacing(space::M),
-                    dialog_ui::confirmation_actions(
-                        crate::ui_controls::button::secondary("Cancel")
-                            .id(widget::Id::new("dialog.reset-settings.cancel"))
-                            .on_press(Message::CancelResetSettings),
-                        crate::ui_controls::button::destructive("Reset settings")
-                            .id(widget::Id::new("dialog.reset-settings.confirm"))
-                            .on_press(Message::ConfirmResetSettings),
-                    ),
-                    480.0,
-                ),
-                Some(Message::CancelResetSettings),
-                1.0,
-            ));
-        }
-        // First, because a discard is the one dialog on screen precisely
-        // because it is about to destroy work that exists nowhere else.
-        if let Some(pending) = self.sidebar_state.pending_discard() {
-            return Some(dialog_ui::overlay(
-                sidebar::discard_confirmation_dialog(pending).map(Message::Sidebar),
-                Some(Message::Sidebar(SidebarAction::CancelDiscard)),
-                1.0,
-            ));
-        }
-        if let Some(close) = self.dirty_repository_close.as_ref() {
-            let card = close.card;
-            let runtime = match self.cards.get(&card) {
-                Some(CardRuntime::Repository(runtime)) => runtime,
-                _ => return None,
-            };
-            // The file at stake, not the repository the pane is rooted at.
-            let title = runtime
-                .selected_path()
-                .map(|path| path.display().to_string())
-                .or_else(|| self.card_state(card).map(|state| state.title.clone()))
-                .unwrap_or_else(|| "Repository".into());
-            let mut rows: Vec<Element<'_, Message>> = vec![
-                design::title(if runtime.has_durability_warning() {
-                    format!("Confirm the save to {title} before closing")
-                } else {
-                    format!("Save changes to {title}?")
-                })
-                .into(),
-                design::body(if runtime.has_durability_warning() {
-                    "The file was replaced on disk, but its durability is still unconfirmed. Retry the save, or cancel and reload from disk before closing; discarding editor changes cannot resolve this warning."
-                } else if matches!(close.intent, DirtyCloseIntent::Channel(_)) {
-                    "This editor has unsaved changes. Save them before the channel is deleted, discard them, or cancel to keep the channel."
-                } else {
-                    "This editor has unsaved changes. Save them before closing, discard them, or keep the repository open."
-                })
-                .wrapping(cosmic::iced::widget::text::Wrapping::Word)
-                .into(),
-            ];
-            if let Some(error) = runtime.save_error() {
-                rows.push(
-                    design::body(error.to_owned())
-                        .wrapping(cosmic::iced::widget::text::Wrapping::Word)
-                        .into(),
-                );
-            }
-            let save_message = runtime
-                .can_save()
-                .then_some(if runtime.has_save_conflict() {
-                    Message::OverwriteAndCloseRepository(card)
-                } else {
-                    Message::SaveAndCloseRepository(card)
-                });
-            let mut controls: Vec<Element<'_, Message>> = vec![
-                crate::ui_controls::button::secondary("Cancel")
-                    .id(dirty_close_control_id(card, DirtyCloseControl::Cancel))
-                    .on_press_maybe(
-                        (!runtime.is_saving()).then_some(Message::CancelRepositoryClose),
-                    )
-                    .into(),
-            ];
-            if runtime.can_abandon_unsaved_changes() {
-                controls.push(
-                    crate::ui_controls::button::destructive("Discard")
-                        .id(dirty_close_control_id(card, DirtyCloseControl::Discard))
-                        .on_press(Message::DiscardAndCloseRepository(card))
-                        .into(),
-                );
-            }
-            controls.push(
-                crate::ui_controls::button::primary("Save and close")
-                    .instead("Overwrite and close", runtime.has_save_conflict())
-                    .instead("Retry save and close", runtime.has_durability_warning())
-                    .id(dirty_close_control_id(card, DirtyCloseControl::Save))
-                    .on_press_maybe(save_message)
-                    .into(),
-            );
-            let dismiss = controls.remove(0);
-            let actions = dialog_ui::confirmation_actions(
-                dismiss,
-                widget::row::with_children(controls).spacing(space::S),
-            );
-            // A long path or save error scrolls; the answers stay in reach.
-            return Some(dialog_ui::overlay(
-                dialog_ui::scrolling_surface_with_actions(
-                    widget::container(widget::column::with_children(rows).spacing(space::M))
-                        .id(widget::Id::new(format!("dialog.dirty-close.{card}"))),
-                    actions,
-                    560.0,
-                    dialog_ui::MAX_HEIGHT,
-                ),
-                (!runtime.is_saving()).then_some(Message::CancelRepositoryClose),
-                1.0,
-            ));
-        }
-        if let Some(surface) = self.sidebar_selection_dialog() {
-            return Some(dialog_ui::overlay(
-                surface,
-                Some(Message::SidebarSelection(
-                    sidebar_selection_ui::Action::Dismiss,
-                )),
-                1.0,
-            ));
-        }
-        if let Some(surface) = self.project_dialog_view() {
-            return Some(dialog_ui::overlay(
-                surface,
-                Some(Message::ProjectUi(project_ui::Action::Dismiss)),
-                1.0,
-            ));
-        }
-        if let Some(surface) = self.channel_dialog_view() {
-            return Some(dialog_ui::overlay(
-                surface,
-                Some(Message::ChannelUi(channel_ui::Action::Dismiss)),
-                1.0,
-            ));
-        }
-        if let Some((surface, dismiss)) = self.worktree_dialog_view() {
-            return Some(dialog_ui::overlay(surface, dismiss, 1.0));
-        }
-
-        if let Some(dialog) = self.resume_dialog() {
-            return Some(dialog);
-        }
-
-        let dialog = self.pull_request_dialog.as_ref()?;
-        let head = dialog.head.trim();
-        let base = dialog.base.trim();
-        let draft = if dialog.draft { ", draft" } else { "" };
-        let route = if head.is_empty() || base.is_empty() {
-            "Choose a head and a base".to_owned()
-        } else {
-            format!("{head} → {base}{draft}")
-        };
-        let context = match &dialog.worktree {
-            Some(path) => format!("{} · {route}", path.display()),
-            None => route,
-        };
-        let mut rows: Vec<Element<'_, Message>> = vec![
-            design::title("Create pull request").into(),
-            design::caption(format!("{} · {context}", dialog.repository.gh_selector())).into(),
-            widget::column::with_children(vec![
-                design::caption("Title").into(),
-                crate::ui_controls::field::text("Title", &dialog.title)
-                    .id(pull_request_dialog_focus_id())
-                    .on_input(Message::PullRequestTitleChanged)
-                    .on_submit_maybe(
-                        self.pull_request_submission_allowed()
-                            .then_some(|_| Message::SubmitPullRequest),
-                    )
-                    .into(),
-            ])
-            .spacing(space::XS)
-            .into(),
-            widget::column::with_children(vec![
-                design::caption("Head branch").into(),
-                crate::ui_controls::field::text("Head branch", &dialog.head)
-                    .id(widget::Id::new("dialog.pull-request.head"))
-                    .on_input(Message::PullRequestHeadChanged)
-                    .on_submit_maybe(
-                        self.pull_request_submission_allowed()
-                            .then_some(|_| Message::SubmitPullRequest),
-                    )
-                    .into(),
-            ])
-            .spacing(space::XS)
-            .into(),
-            widget::column::with_children(vec![
-                design::caption("Base branch").into(),
-                crate::ui_controls::field::text("Base branch", &dialog.base)
-                    .id(widget::Id::new("dialog.pull-request.base"))
-                    .on_input(Message::PullRequestBaseChanged)
-                    .on_submit_maybe(
-                        self.pull_request_submission_allowed()
-                            .then_some(|_| Message::SubmitPullRequest),
-                    )
-                    .into(),
-            ])
-            .spacing(space::XS)
-            .into(),
-            widget::column::with_children(vec![
-                design::caption("Description").into(),
-                crate::ui_controls::field::editor("Pull request description", &dialog.body.0)
-                    .placeholder("Describe the change (Markdown supported)")
-                    .height(160)
-                    .on_action(Message::PullRequestBodyChanged)
-                    .on_cursor(Message::PullRequestBodyCursor)
-                    .into(),
-            ])
-            .spacing(space::XS)
-            .into(),
-            crate::ui_controls::field::checkbox(dialog.draft)
-                .label("Create as draft")
-                .on_toggle(Message::PullRequestDraftChanged)
-                .into(),
-        ];
-        if let Some(confirmed) = dialog.retry_confirmation {
-            rows.push(
-                design::body(
-                    "GitHub may have created this pull request. Check GitHub before retrying to avoid creating a duplicate.",
-                )
-                .into(),
-            );
-            rows.push(
-                crate::ui_controls::field::checkbox(confirmed)
-                    .label("I checked GitHub; no pull request was created")
-                    .on_toggle(Message::PullRequestRetryConfirmed)
-                    .into(),
-            );
-        }
-        let actions = dialog_ui::confirmation_actions(
-            crate::ui_controls::button::secondary("Cancel").on_press(Message::CancelDialog),
-            crate::ui_controls::button::primary("Create").on_press_maybe(
-                self.pull_request_submission_allowed()
-                    .then_some(Message::SubmitPullRequest),
-            ),
-        );
-        Some(dialog_ui::overlay(
-            dialog_ui::scrolling_surface_with_actions(
-                widget::column::with_children(rows).spacing(space::M),
-                actions,
-                620.0,
-                620.0,
-            ),
-            Some(Message::CancelDialog),
-            1.0,
-        ))
-    }
-
-    /// The application opens no window but its main one, which stops being
-    /// the main window only when the exit closes it. libcosmic's default
-    /// panics, and iced may still draw the window before it removes it.
-    fn view_window(&self, _id: window::Id) -> Element<'_, Message> {
-        widget::Space::new().into()
-    }
-
-    fn view(&self) -> Element<'_, Message> {
-        let _trace = crate::performance::ui_trace::scope(crate::performance::ui_trace::Phase::View);
-        let sidebar_mode = self.projects_sidebar_mode();
-        let sidebar = sidebar::view_cached(
-            &self.sidebar_model,
-            &self.sidebar_state,
-            sidebar_mode,
-            self.settings.sidebar_width,
-            self.modal_is_open(),
-            &self.navigation_cache,
-            &self.settings.keyboard_shortcuts,
-            !self.core.window.sharp_corners,
-        )
-        .map(Message::Sidebar);
-        let sidebar = crate::performance::ui_trace::region("sidebar", sidebar);
-
-        // The focused card's own name and path are the card header's job, and
-        // the window's header bar already carries the name; see
-        // `sync_window_title`.
-        let has_multiple_panes = self.workspace.cards().len() > 1;
-
-        let workspace: Element<'_, Message> = if self.workspace.cards().is_empty() {
-            let directory = self
-                .terminal_directory()
-                .unwrap_or_else(|| STARTING_DIRECTORY.clone());
-            let scoped = self.active_workspace.is_some() || self.durable.active_channel.is_some();
-            let scope_name = self
-                .durable
-                .active_channel
-                .and_then(|id| {
-                    self.durable
-                        .channels
-                        .iter()
-                        .find(|channel| channel.id == id)
-                        .map(|channel| channel.title.clone())
-                })
-                .or_else(|| {
-                    directory
-                        .file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                })
-                .unwrap_or_else(|| "Workspace".into());
-            let quick = |glyph, label, id, message| {
-                Element::from(
-                    crate::ui_controls::icon_button(glyph, label)
-                        .on_press(message)
-                        .id(widget::Id::new(id)),
-                )
-            };
-            let mut actions: Vec<Element<'_, Message>> = vec![
-                crate::interaction::tooltip(
-                    crate::ui_controls::button::primary("New conversation")
-                        .icon(Icon::Chat)
-                        .on_press(Message::ChromeUi(chrome_ui::Action::Launch(
-                            chrome_ui::NewTab::Thread,
-                        ))),
-                    workspace_widget::shortcut_tooltip(
-                        workspace_widget::GlobalShortcut::NewThread,
-                        &self.settings.keyboard_shortcuts,
-                    ),
-                ),
-                quick(
-                    Icon::History,
-                    "Resume conversation".to_owned(),
-                    "empty.resume-conversation",
-                    Message::ResumeConversation(resume_ui::Action::Open),
-                ),
-                quick(
-                    Icon::Terminal,
-                    workspace_widget::shortcut_tooltip(
-                        workspace_widget::GlobalShortcut::NewTerminal,
-                        &self.settings.keyboard_shortcuts,
-                    ),
-                    "empty.new-terminal",
-                    Message::NewTerminal,
-                ),
-                quick(
-                    Icon::Browser,
-                    if cfg!(feature = "integrated-browser") {
-                        "New browser"
-                    } else {
-                        "Open in system browser"
-                    }
-                    .to_owned(),
-                    "empty.new-browser",
-                    Message::NewBrowser,
-                ),
-                quick(
-                    Icon::Avatar,
-                    "Agent accounts".to_owned(),
-                    "empty.accounts",
-                    Message::AccountUi(account_ui::Action::OpenPane),
-                ),
-            ];
-            if !scoped {
-                actions.pop();
-            }
-            let primary = actions.remove(0);
-            let actions = widget::column::with_children(vec![
-                primary,
-                widget::row::with_children(actions)
-                    .align_y(Alignment::Center)
-                    .spacing(space::S)
-                    .into(),
-            ])
-            .spacing(space::M);
-            let mut content: Vec<Element<'_, Message>> = vec![
-                crate::ui_controls::passive_icon(Icon::Chat, 32),
-                design::display(if scoped {
-                    scope_name
-                } else {
-                    "Workspace".into()
-                })
-                .into(),
-                crate::interaction::tooltip(
-                    crate::ui_controls::FadeText::caption(display_path(&directory).into_owned())
-                        .edge(crate::ui_controls::FadeEdge::Start)
-                        .width(Length::Fill),
-                    directory.display().to_string(),
-                ),
-                actions.into(),
-            ];
-            if !scoped {
-                content.push(
-                    widget::row::with_children(
-                        crate::agent::Provider::ALL
-                            .into_iter()
-                            .map(|provider| {
-                                let status = self.account_ui.provider_status(provider);
-                                let control = crate::ui_controls::icon_button(
-                                    crate::ui_controls::provider_icon(provider),
-                                    format!("{} · {status} · Manage accounts", provider.label()),
-                                )
-                                .on_press(Message::AccountUi(account_ui::Action::OpenPane));
-                                Element::from(if status == "Account available" {
-                                    control.tone(design::Tone::Themed(design::success_color))
-                                } else {
-                                    control
-                                })
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                    .spacing(space::M)
-                    .into(),
-                );
-            }
-            let surface =
-                widget::container(widget::column::with_children(content).spacing(space::L))
-                    .padding(space::XL)
-                    .width(Length::Fill)
-                    .max_width(440);
-            widget::container(surface)
-                .center(Length::Fill)
-                .padding(space::XL)
-                .into()
-        } else {
-            workspace_widget::view(
-                &self.workspace,
-                &self.settings.keyboard_shortcuts,
-                self.focused_pane(),
-                self.settings.focus_follows_mouse,
-                &self.input_trace,
-                self.workspace.viewport_width(),
-                self.workspace_scroll_id.clone(),
-                move |context| {
-                    self.workspace_card_view(context.id, context.focused, has_multiple_panes)
-                },
-                // `sync_chrome` keeps an entry for every durable card the
-                // strip holds, so the fallback is only reachable for a card
-                // the workspace holds but the durable model does not.
-                |id| {
-                    self.card_chrome.get(&id).map_or_else(
-                        || workspace_widget::card_widget_id(id),
-                        |chrome| chrome.container_id.clone(),
-                    )
-                },
-                workspace_widget::Events {
-                    viewport: {
-                        let generation = self.workspace_view_generation;
-                        move |event| Message::Viewport { generation, event }
-                    },
-                },
-            )
-        };
-
-        // The strip keeps its scrollbars and trailing controls out of the
-        // window's resize border, as the rightmost surface.
-        let workspace: Element<'_, Message> = widget::container(workspace)
-            .padding(Padding::ZERO.right(self.trailing_edge_inset()))
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into();
-        let workspace = crate::performance::ui_trace::region("workspace", workspace);
-        let main_content = self.workspace_chrome(workspace);
-        let surface: Element<'_, Message> = widget::row::with_children(vec![sidebar, main_content])
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into();
-        // The bar comes and goes, but the tree around the workspace must not:
-        // iced matches widget state by position, so wrapping the surface only
-        // while the bar shows would reset every scroll offset and focus in it.
-        let bar = self
-            .status_bar()
-            .unwrap_or_else(|| iced::widget::Space::new().height(Length::Shrink).into());
-        let surface: Element<'_, Message> = widget::column::with_children(vec![
-            surface,
-            self.operation_recovery
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .view()
-                .map(Message::OperationRecovery),
-            self.daemon_health_banner(),
-            self.automation_approval_banner(),
-            bar,
-        ])
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into();
-        // The workspace switcher places itself, over a scrim of its own.
-        let switcher = self
-            .palette_surface()
-            .or_else(|| self.pane_rename_surface())
-            .map(|surface| {
-                widget::container(surface)
-                    .align_x(Alignment::Center)
-                    .padding(2.0 * design::HEADER_HEIGHT)
-                    .width(Length::Fill)
-                    .into()
-            })
-            .or_else(|| self.workspace_switcher())
-            .unwrap_or_else(|| iced::widget::Space::new().into());
-        let surface = crate::interaction::layer(surface, switcher);
-        let surface = crate::interaction::drive_animation(
-            surface,
-            self.workspace.is_animating() || self.pane_inspectors.is_animating(),
-        );
-        let surface = crate::input_trace::observe(surface, &self.input_trace);
-        let surface = crate::file_drop::surface(surface, self.core.scale_factor());
-        let surface = crate::reorder::channel_scope(
-            surface,
-            widget::Id::new("workspace.tabs"),
-            self.workspace_view_generation,
-            !self.workspace_inputs_blocked(),
-            |card, channel| {
-                self.workspace.order().any(|id| id == card)
-                    && self.can_move_pane_to_channel(card, channel)
-            },
-            |card, channel| Message::PaneDropToChannel {
-                generation: self.workspace_view_generation,
-                card,
-                channel,
-            },
-        );
-        let surface = crate::performance::ui_trace::root(surface);
-        #[cfg(feature = "latency-harness")]
-        return latency_ui::instrument(
-            surface,
-            (self.latency_focus == self.workspace.focused())
-                .then(|| self.latency.pending_generation())
-                .flatten(),
-            self.latency_fixture.is_some() && !self.latency_fixture_started,
-        );
-        #[cfg(not(feature = "latency-harness"))]
-        surface
     }
 }
 
@@ -19476,12 +19889,12 @@ fn load_repository_github(
     let github = GitHubService::system("gh");
     (|| {
         let remotes = service
-            .remotes(&repository.selected_path, &cancellation)
+            .remotes(&repository.selected_path, cancellation)
             .map_err(|error| GitHubAvailability::Failed {
                 detail: error.to_string(),
             })?;
         if !github
-            .has_associated_remote(&remotes, &cancellation)
+            .has_associated_remote(&remotes, cancellation)
             .map_err(GitHubAvailability::from_error)?
         {
             return Err(GitHubAvailability::NotAssociated);
@@ -19491,10 +19904,10 @@ fn load_repository_github(
                 &repository.selected_path,
                 &remotes,
                 revalidate,
-                &cancellation,
+                cancellation,
             )
             .map_err(GitHubAvailability::from_error)?;
-        let validator = match github.sidebar_probe(&key, revalidate, &cancellation) {
+        let validator = match github.sidebar_probe(&key, revalidate, cancellation) {
             // The probe was answered as this account, so it is signed in.
             crate::github::SidebarProbe::Unchanged(pull_requests) => {
                 return Ok(github_ready(key, pull_requests));
@@ -19502,7 +19915,7 @@ fn load_repository_github(
             crate::github::SidebarProbe::Read(validator) => validator,
         };
         let auth = github
-            .auth_status(&key, &cancellation)
+            .auth_status(&key, cancellation)
             .map_err(GitHubAvailability::from_error)?;
         if auth.state != crate::github::GhAuthState::Authenticated {
             return Err(GitHubAvailability::Unauthenticated);
@@ -19512,7 +19925,7 @@ fn load_repository_github(
                 &key,
                 validator,
                 sidebar::PULL_REQUEST_LIST_LIMIT,
-                &cancellation,
+                cancellation,
             )
             .map_err(GitHubAvailability::from_error)?;
         Ok(github_ready(key, pull_requests))
@@ -19560,6 +19973,7 @@ fn attach_initial_terminal(
             expected_host: Some(proof.clone()),
             attach_completed: false,
             recovery_lease: None,
+            socket: Some(socket.clone()),
         },
         socket,
         proof,
@@ -19644,9 +20058,11 @@ fn initial_terminal_attachment(
 
 /// Another client may own a shared terminal's recovery, so a shared pane only
 /// attaches the exact session its daemon hosts, under that daemon's proof.
+/// `socket` is that daemon's, already proven ready.
 fn shared_terminal_attachment(
     hosted: TerminalSession,
     proof: HostSessionProof,
+    socket: std::path::PathBuf,
 ) -> (daemon_recovery::RecoveredTerminal, TerminalStartMode) {
     (
         daemon_recovery::RecoveredTerminal {
@@ -19654,6 +20070,7 @@ fn shared_terminal_attachment(
             expected_host: Some(proof.clone()),
             attach_completed: false,
             recovery_lease: None,
+            socket: Some(socket),
         },
         TerminalStartMode::Attach(proof),
     )
@@ -19664,21 +20081,22 @@ fn shared_terminal_attachment(
 fn restored_attachment(
     shared: bool,
     session: TerminalSession,
-    connect: impl FnOnce() -> Result<crate::control::ControlClient, String>,
+    connect: impl FnOnce() -> Result<crate::terminal::ReadyDaemon, String>,
 ) -> Result<Option<(daemon_recovery::RecoveredTerminal, TerminalStartMode)>, String> {
     let (recovered, mode) = if shared {
-        hosted_shared_terminal(&mut connect()?, session.id)?
+        hosted_shared_terminal(connect()?, session.id)?
     } else {
         recover_terminal(session, false)?
     };
     Ok(matches!(mode, TerminalStartMode::Attach(_)).then_some((recovered, mode)))
 }
 
-/// The exact shared terminal `client`'s daemon hosts, ready to attach.
+/// The exact shared terminal the ready `daemon` hosts, ready to attach.
 fn hosted_shared_terminal(
-    client: &mut crate::control::ControlClient,
+    daemon: crate::terminal::ReadyDaemon,
     terminal: TerminalId,
 ) -> Result<(daemon_recovery::RecoveredTerminal, TerminalStartMode), String> {
+    let crate::terminal::ReadyDaemon { socket, mut client } = daemon;
     let hosted = client
         .list()
         .map_err(|error| error.to_string())?
@@ -19688,6 +20106,7 @@ fn hosted_shared_terminal(
     Ok(shared_terminal_attachment(
         hosted.session,
         client.proof().clone(),
+        socket,
     ))
 }
 
@@ -19720,6 +20139,12 @@ fn open_terminal(
 ) -> Result<StartedTerminal, String> {
     let recovery_lease = recovered.recovery_lease;
     let session = recovered.session;
+    // A daemon the recovery already proved ready isn't proven again; the
+    // worker's own connection is the attachment's. One that died since is
+    // therefore not started again here: its attach fails, and only a
+    // launch with no proof to keep would have gone ahead on a new daemon,
+    // which the pane's Retry still does.
+    let socket = recovered.socket;
     let spawned = matches!(&mode, TerminalStartMode::Spawn(_));
     let wake = move |wake: crate::terminal::TerminalWake| {
         // Each terminal source coalesces visual and semantic edges until the
@@ -19731,14 +20156,24 @@ fn open_terminal(
             generation: wake.generation,
         });
     };
+    let socket = match socket {
+        Some(socket) => socket,
+        None => crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?,
+    };
     let handle = match mode {
         TerminalStartMode::Attach(proof) => {
-            HostedTerminalHandle::connect(session.id, Some(proof), wake)
+            HostedTerminalHandle::connect_at(socket, session.id, Some(proof), wake)
         }
         TerminalStartMode::Spawn(recipe) => {
             let mut session = session.clone();
             session.launch = recipe;
-            HostedTerminalHandle::attach_or_spawn(session, config, recovered.expected_host, wake)
+            HostedTerminalHandle::attach_or_spawn_at(
+                socket,
+                session,
+                config,
+                recovered.expected_host,
+                wake,
+            )
         }
     }
     .map_err(|error| error.to_string())?;
@@ -19806,5 +20241,20 @@ fn unix_millis() -> i64 {
         .try_into()
         .unwrap_or(i64::MAX)
 }
+
+/// Whether two absolute paths name the same file. A repository descriptor
+/// keeps the path its pane was opened with, and a file link's need not be
+/// canonical. Only a candidate already sharing the file name reaches the
+/// filesystem, so routing a click stays cheap.
+fn same_file(candidate: &Path, target: &Path) -> bool {
+    candidate == target
+        || (candidate.file_name() == target.file_name()
+            && candidate
+                .canonicalize()
+                .ok()
+                .zip(target.canonicalize().ok())
+                .is_some_and(|(candidate, target)| candidate == target))
+}
+
 #[cfg(test)]
 mod tests;

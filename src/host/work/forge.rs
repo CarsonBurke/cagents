@@ -17,7 +17,7 @@ use crate::{
         GitHubRepoKey, GitHubService, PullRequest, Revalidation, checks_settling,
         remote_repository_key,
     },
-    repository::{CancellationToken, RepositoryService},
+    repository::{CancellationToken, RemoteRecord, RepositoryService},
 };
 
 /// The user's most recently updated pull requests, in any state.
@@ -119,11 +119,35 @@ pub(super) struct Target {
 /// Facts a poll reuses from earlier ones.
 #[derive(Debug, Clone, Default)]
 pub(super) struct Memory {
-    repository: Option<(GitHubRepoKey, Instant)>,
+    /// The repository `gh` resolved, from which remotes, and when.
+    repository: Option<(GitHubRepoKey, Vec<RemoteRecord>, Instant)>,
     /// Branch to when someone else's pull request was last looked up, at
     /// which head, and what was found.
     others: BTreeMap<String, (Instant, String, Option<PullRequest>)>,
     listing: Option<Listing>,
+}
+
+impl Memory {
+    /// The repository resolved from exactly these remotes, while it is fresh:
+    /// changing `origin`, or `gh repo set-default`, asks `gh` again.
+    fn repository_for(&self, remotes: &[RemoteRecord]) -> Option<&GitHubRepoKey> {
+        self.repository
+            .as_ref()
+            .filter(|(_, from, at)| from == remotes && at.elapsed() < REPOSITORY_FOR)
+            .map(|(repository, _, _)| repository)
+    }
+
+    /// Branch lookups made in another repository don't carry over.
+    fn remember_repository(&mut self, repository: GitHubRepoKey, remotes: Vec<RemoteRecord>) {
+        if self
+            .repository
+            .as_ref()
+            .is_some_and(|(previous, _, _)| *previous != repository)
+        {
+            self.others.clear();
+        }
+        self.repository = Some((repository, remotes, Instant::now()));
+    }
 }
 
 /// The last listing read, and how to ask whether it is still current.
@@ -293,14 +317,14 @@ fn read(
             keys.push(key);
         }
     }
-    let repository = match &memory.repository {
-        Some((repository, at)) if at.elapsed() < REPOSITORY_FOR => repository.clone(),
-        _ => {
+    let repository = match memory.repository_for(&remotes) {
+        Some(repository) => repository.clone(),
+        None => {
             let from = target.root.as_deref().unwrap_or(&target.repository);
             let repository = gh
                 .resolve_repository(from, &remotes, cancellation)
                 .map_err(|error| error.to_string())?;
-            memory.repository = Some((repository.clone(), Instant::now()));
+            memory.remember_repository(repository.clone(), remotes.clone());
             repository
         }
     };
@@ -830,7 +854,6 @@ mod tests {
         forge.pending.store(false, Ordering::SeqCst);
         assert_eq!(poll(Freshness::Watched), ["probe", "listing"]);
         assert_eq!(poll(Freshness::Watched), ["probe"]);
-        drop(poll);
 
         // An old listing is read again: soon while watched, rarely unwatched.
         let age = |memory: &mut Memory, by: Duration| {
@@ -910,6 +933,51 @@ mod tests {
             poll(&mut memory, Freshness::Watched),
             (true, vec!["listing"])
         );
+    }
+
+    #[test]
+    fn a_changed_remote_resolves_the_repository_again() {
+        let remote = |url: &str, resolved: Option<&str>| RemoteRecord {
+            name: "origin".into(),
+            fetch_url: Some(url.into()),
+            push_url: None,
+            gh_resolved: resolved.map(str::to_owned),
+        };
+        let before = vec![remote("git@github.com:me/repo.git", None)];
+        let mut memory = Memory::default();
+        memory.remember_repository(key("me"), before.clone());
+        memory.others.insert(
+            "feature".into(),
+            (
+                Instant::now(),
+                "a".repeat(40),
+                Some(pull_request(
+                    1,
+                    "feature",
+                    "a",
+                    "OPEN",
+                    "2026-10-01T00:00:00Z",
+                )),
+            ),
+        );
+        assert_eq!(memory.repository_for(&before), Some(&key("me")));
+        // A new origin, or a new `gh repo set-default`, is another answer.
+        assert_eq!(
+            memory.repository_for(&[remote("git@github.com:org/repo.git", None)]),
+            None
+        );
+        assert_eq!(
+            memory.repository_for(&[remote("git@github.com:me/repo.git", Some("base"))]),
+            None
+        );
+        // The same repository keeps its branch lookups; another forgets them.
+        memory.remember_repository(key("me"), before.clone());
+        assert_eq!(memory.others.len(), 1);
+        let after = vec![remote("git@github.com:org/repo.git", None)];
+        memory.remember_repository(key("org"), after.clone());
+        assert!(memory.others.is_empty());
+        assert_eq!(memory.repository_for(&after), Some(&key("org")));
+        assert_eq!(memory.repository_for(&before), None);
     }
 
     #[test]

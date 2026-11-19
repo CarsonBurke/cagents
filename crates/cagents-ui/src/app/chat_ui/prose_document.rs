@@ -61,7 +61,11 @@ impl Stats {
         // Estimates never become glyph/source authority. Bound the arithmetic
         // so an extreme recipe cannot publish NaN/Infinity into prefix sums.
         if value.is_finite() {
-            value.clamp(prose_line.min(1.0).max(0.0), 1.0e12) as f32
+            // Unlike `clamp`, `min` then `max` turn a NaN line height into a
+            // bound rather than panicking on it.
+            #[allow(clippy::manual_clamp)]
+            let floor = prose_line.min(1.0).max(0.0);
+            value.clamp(floor, 1.0e12) as f32
         } else {
             1.0e12
         }
@@ -514,7 +518,7 @@ mod tests {
         assert_eq!(data.metadata.stats.leaves, small);
         assert!(!data.metadata.stats.inline());
         assert_eq!(data.outline.len(), small);
-        let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+        let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_TRANSCRIPT);
         assert!(
             data.metadata.stats.estimate(settings) > 800.0 * 10.0,
             "large composite estimates prevent each nested initial window mounting its complete tree"

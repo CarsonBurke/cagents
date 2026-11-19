@@ -5,7 +5,21 @@ use crate::chat::{TextCopyPage, TextCopyScope, TextCopySource};
 pub(super) const SCHEMA: &str = "
 CREATE TABLE copy_sources(
  token INTEGER PRIMARY KEY AUTOINCREMENT, item TEXT UNIQUE NOT NULL,
- revision INTEGER NOT NULL, bytes INTEGER NOT NULL);";
+ field INTEGER NOT NULL, revision INTEGER NOT NULL, bytes INTEGER NOT NULL);";
+
+/// The chunk field whose complete bytes an item's Copy reads: a message's
+/// text, and what a step printed. A window may show only part of either: a
+/// message in parts, a long output as an excerpt.
+pub(super) fn copy_field(item: &Item) -> Option<i64> {
+    if item.logical_copy_body().is_some() {
+        return Some(0);
+    }
+    match item.content {
+        ItemContent::Command { .. } => Some(0),
+        ItemContent::Tool { .. } => Some(1),
+        _ => None,
+    }
+}
 
 impl Store {
     pub(super) fn copy_parent_source(
@@ -29,17 +43,26 @@ impl Store {
             .optional()
             .map_err(StoreError::from)
     }
+    /// Whether `text` extends what the item's current source holds, read
+    /// from the field the source names, which a rewrite may move.
     pub(super) fn copy_parent_prefix(&self, id: &str, text: &str) -> Result<bool, StoreError> {
-        let Some(source) = self.copy_parent_source(id)? else {
+        let Some((field, previous)) = self
+            .db
+            .query_row(
+                "SELECT field,bytes FROM copy_sources WHERE item=?1",
+                [id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? as usize)),
+            )
+            .optional()?
+        else {
             return Ok(false);
         };
-        let previous = source.bytes as usize;
         if previous > text.len() {
             return Ok(false);
         }
         for start in (0..previous).step_by(PART_BYTES) {
             let end = (start + PART_BYTES).min(previous);
-            if self.field(id, 0, start, end)? != text.as_bytes()[start..end] {
+            if self.field(id, field, start, end)? != text.as_bytes()[start..end] {
                 return Ok(false);
             }
         }
@@ -50,7 +73,7 @@ impl Store {
     pub(super) fn copy_parent_put(
         db: &Connection,
         id: &str,
-        bytes: Option<usize>,
+        source: Option<(i64, usize)>,
         prefix: bool,
     ) -> Result<bool, StoreError> {
         let invalidated = !prefix
@@ -59,9 +82,9 @@ impl Store {
                 [id],
                 |row| row.get::<_, bool>(0),
             )?;
-        match bytes {
-            Some(bytes) => {
-                db.execute("INSERT INTO copy_sources(item,revision,bytes) VALUES(?1,1,?2) ON CONFLICT(item) DO UPDATE SET revision=revision+?3,bytes=excluded.bytes",params![id,bytes as i64,i64::from(!prefix)])?;
+        match source {
+            Some((field, bytes)) => {
+                db.execute("INSERT INTO copy_sources(item,field,revision,bytes) VALUES(?1,?4,1,?2) ON CONFLICT(item) DO UPDATE SET revision=revision+?3,bytes=excluded.bytes,field=excluded.field",params![id,bytes as i64,i64::from(!prefix),field])?;
             }
             None => {
                 db.execute("DELETE FROM copy_sources WHERE item=?1", [id])?;
@@ -105,38 +128,38 @@ impl Store {
         offset: u64,
     ) -> Result<TextCopyPage, String> {
         if source.scope != TextCopyScope::Conversation || source.cache != self.copy_cache {
-            return Err("Full message is unavailable in this owned cache".into());
+            return Err("The full text is unavailable in this owned cache".into());
         }
         if source.bytes > crate::chat::TEXT_COPY_LIMIT_BYTES as u64 {
             return Err(
-                "Message exceeds the 32 MiB clipboard limit; use its provider transcript".into(),
+                "This text exceeds the 32 MiB clipboard limit; use its provider transcript".into(),
             );
         }
-        let record: Option<(String, u64, u64)> = self
+        let record: Option<(String, i64, u64, u64)> = self
             .db
             .query_row(
-                "SELECT item,revision,bytes FROM copy_sources WHERE token=?1",
+                "SELECT item,field,revision,bytes FROM copy_sources WHERE token=?1",
                 [source.token],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()
             .map_err(|error| error.to_string())?;
-        let Some((id, revision, total)) = record else {
-            return Err("Full message is no longer available in the owned cache".into());
+        let Some((id, field, revision, total)) = record else {
+            return Err("The full text is no longer available in the owned cache".into());
         };
         if revision != source.revision || source.bytes > total {
-            return Err("Message changed; copy its current text again".into());
+            return Err("This text changed; copy it again".into());
         }
         if offset > source.bytes {
-            return Err("Invalid message copy range".into());
+            return Err("Invalid text copy range".into());
         }
-        let start = usize::try_from(offset).map_err(|_| "Invalid message copy offset")?;
+        let start = usize::try_from(offset).map_err(|_| "Invalid text copy offset")?;
         let mut end = start
             .saturating_add(crate::chat::TEXT_COPY_PAGE_BYTES)
             .min(source.bytes as usize);
-        let mut bytes = self.field(&id, 0, start, end)?;
+        let mut bytes = self.field(&id, field, start, end)?;
         if bytes.len() != end - start {
-            return Err("Full message has an unavailable cached range".into());
+            return Err("The full text has an unavailable cached range".into());
         }
         if end < source.bytes as usize {
             while std::str::from_utf8(&bytes).is_err_and(|error| error.error_len().is_none()) {
@@ -144,9 +167,9 @@ impl Store {
                 end -= 1;
             }
         }
-        let text = String::from_utf8(bytes).map_err(|_| "Invalid UTF-8 message copy range")?;
+        let text = String::from_utf8(bytes).map_err(|_| "Invalid UTF-8 text copy range")?;
         if text.is_empty() && offset < source.bytes {
-            return Err("Message copy made no progress".into());
+            return Err("Text copy made no progress".into());
         }
         Ok(TextCopyPage {
             source: source.clone(),
@@ -219,7 +242,7 @@ mod tests {
         store.apply(Event::Item(context("same", &body))).unwrap();
         let window = store.window().unwrap();
         assert!(window.items.iter().all(|item| item.id != "same"));
-        let descriptors: Vec<_> = store.copy_projection.iter().cloned().collect();
+        let descriptors: Vec<_> = store.copy_projection.to_vec();
         assert!(descriptors.len() > 1);
         let descriptor = descriptors[0]
             .clone()

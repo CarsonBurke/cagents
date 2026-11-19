@@ -119,10 +119,11 @@ fn helper(
             if status.is_none() {
                 status = child.try_wait().map_err(|_| keyring_error())?;
             }
-            if stdout_done && stderr_done {
-                if let Some(status) = status {
-                    break status;
-                }
+            if stdout_done
+                && stderr_done
+                && let Some(status) = status
+            {
+                break status;
             }
             thread::sleep(Duration::from_millis(20));
         };

@@ -135,7 +135,7 @@ impl Cagents {
                     if let sidebar::SelectionRow::Project(project) = row {
                         let expanded = self.sidebar_state.project_expanded(project);
                         if expanded == (key == Named::ArrowLeft) {
-                            return ControlFlow::Break(self.update(Message::Sidebar(SidebarAction::ToggleProject(project))));
+                            return ControlFlow::Break(self.dispatch(Message::Sidebar(SidebarAction::ToggleProject(project))));
                         }
                     }
                     return ControlFlow::Break(Task::none());
@@ -408,11 +408,10 @@ impl Cagents {
                 }
             }
             SidebarAction::RefreshWorktree { key } => {
-                if self.source_control_is_bound(&key) {
-                    if let Some(source) = self.sidebar_model.source_control.as_mut() {
+                if self.source_control_is_bound(&key)
+                    && let Some(source) = self.sidebar_model.source_control.as_mut() {
                         source.ignored_directory_errors.clear();
                     }
-                }
                 self.reload_source_control(&key)
             },
             SidebarAction::OpenFile { key, path } => {

@@ -373,6 +373,25 @@ class Profiles(unittest.TestCase):
         profile = profiles.resolve(name, **changes)
         return Planner(profile, 1, "/nonexistent/fixture").plan()
 
+    def test_every_seeded_channel_survives_the_startup_sweep(self):
+        for name in profiles.PROFILES:
+            with self.subTest(profile=name):
+                planner = self.plan(name)
+                channel_views = {view["scope"]["channel"]: view for view in planner.views
+                                 if "channel" in view["scope"]}
+                for channel in planner.channels:
+                    if not channel["cards"]:
+                        with self.subTest(channel=channel["id"]):
+                            self.assertEqual(channel["title_source"], "Manual")
+                            self.assertTrue(channel["title"])
+                            self.assertEqual(channel_views[channel["id"]]["panes"], [])
+
+    def test_channels_with_cards_keep_their_drawn_title_source(self):
+        planner = self.plan("realistic")
+        sources = {channel["title_source"] for channel in planner.channels if channel["cards"]}
+        self.assertNotEqual(sources, {"Manual"})
+        self.assertIn("Prompt", sources)
+
     def test_each_edge_case_alone_is_the_only_one_planned(self):
         for case in profiles.EDGE_CASES:
             if case in profiles.EXPLICIT_ONLY:

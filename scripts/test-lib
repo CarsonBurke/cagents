@@ -25,18 +25,21 @@ import tomllib
 ROOT = Path(__file__).resolve().parents[1]
 # Each lane's library test harness: package, its manifest, and the features
 # that select the lane's graph. `ui` is the application crate; `shared-ui` is
-# the shared library compiled for the UI.
+# the shared library compiled for the UI; `browser` is the application with the
+# integrated browser, whose `browser::` modules the other lanes compile out.
 LANES = {
     "cli": ("cagents", ROOT / "Cargo.toml", ()),
     "host": ("cagents", ROOT / "Cargo.toml", ("--features", "host")),
     "shared-ui": ("cagents", ROOT / "Cargo.toml", ("--features", "ui")),
     "ui": ("cagents-ui", ROOT / "crates/cagents-ui/Cargo.toml", ()),
+    "browser": ("cagents-ui", ROOT / "crates/cagents-ui/Cargo.toml",
+                ("--features", "browser-protocol-fixture")),
 }
 # The mise lane each is checked in: built only under cfg(test), an item only
 # tests use looks used, so once the tests pass the lane's library, binaries and
 # examples are checked as main's build check does. mise.toml's [vars] define
 # the lanes.
-CHECKED_AS = {"cli": "cli", "host": "host", "shared-ui": "ui", "ui": "ui"}
+CHECKED_AS = {"cli": "cli", "host": "host", "shared-ui": "ui", "ui": "ui", "browser": "browser"}
 SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
 # The first argument Cargo gives this script when it runs it as the harness's
 # runner, followed by the lane, the harness and the arguments after `--`.
@@ -176,7 +179,7 @@ def main():
         sys.exit(status)
     lane = tomllib.loads((ROOT / "mise.toml").read_text())["vars"][CHECKED_AS[args.lane]].split()
     sys.stdout.flush()
-    os.execv(ROOT / "scripts/cargo-lane", [str(ROOT / "scripts/cargo-lane"), "check", *lane, "--lib", "--bins", "--examples"])
+    os.execv(ROOT / "scripts/cargo-lane", [str(ROOT / "scripts/cargo-lane"), "clippy", *lane, "--lib", "--bins", "--examples"])
 
 
 def terminal():

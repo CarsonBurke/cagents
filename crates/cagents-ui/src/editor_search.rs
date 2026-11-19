@@ -61,8 +61,8 @@ fn expanded_size(
             text = &text[2..];
             continue;
         }
-        let reference = if text.starts_with("${") {
-            text[2..].find('}').map(|end| (&text[2..2 + end], 3 + end))
+        let reference = if let Some(braced) = text.strip_prefix("${") {
+            braced.find('}').map(|end| (&braced[..end], 3 + end))
         } else {
             let end = text.as_bytes()[1..]
                 .iter()

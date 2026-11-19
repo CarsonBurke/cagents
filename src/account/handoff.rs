@@ -4,20 +4,57 @@ use crate::{agent::Provider, chat::Session};
 use std::{
     fs,
     io::{self, Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 const MAX_TRANSCRIPT: u64 = 256 * 1024 * 1024;
+/// Names a staged copy beside its destination, which no provider reads.
+const STAGED_PREFIX: &str = ".cagents-handoff-";
+/// How old a staged copy is before it counts as abandoned.
+const ABANDONED: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
-pub fn prepare(source: &Session, replacement: &Session) -> Result<(), String> {
-    transfer(source, replacement, true)
+/// A conversation's history copied beside its place on the alternate account
+/// while the original conversation still runs. Staging is what can fail for
+/// lack of space or permission, so it happens before the original closes;
+/// [`Staged::commit`] then adds only what the conversation wrote since and
+/// renames the copy into place. Dropping it uncommitted removes the copy.
+#[must_use = "a staged transcript is removed unless it is committed"]
+pub struct Staged {
+    source: PathBuf,
+    destination: PathBuf,
+    /// The copy, until it is renamed into place or removed.
+    temporary: Option<PathBuf>,
 }
 
-pub fn preflight(source: &Session, replacement: &Session) -> Result<(), String> {
-    transfer(source, replacement, false)
+/// Stages `source`'s history for `replacement`'s account. It refuses an
+/// alternate account whose copy of the conversation has diverged.
+pub fn stage(source: &Session, replacement: &Session) -> Result<Staged, String> {
+    let (source, destination) = locate(source, replacement)?;
+    stage_transcript(source, destination).map_err(|error| {
+        format!("The conversation history could not be prepared on the alternate account: {error}")
+    })
 }
 
-fn transfer(source: &Session, replacement: &Session, commit: bool) -> Result<(), String> {
+impl Staged {
+    /// Publishes the history once the original conversation has closed,
+    /// including anything it wrote after staging.
+    pub fn commit(mut self) -> Result<(), String> {
+        commit_transcript(&mut self).map_err(|error| {
+            format!("The conversation history could not be moved to the alternate account: {error}")
+        })
+    }
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        if let Some(temporary) = self.temporary.take() {
+            let _ = fs::remove_file(temporary);
+        }
+    }
+}
+
+/// The source transcript and its place under the alternate account's home.
+fn locate(source: &Session, replacement: &Session) -> Result<(PathBuf, PathBuf), String> {
     let provider = source.launch.provider;
     let id = source
         .launch
@@ -44,13 +81,15 @@ fn transfer(source: &Session, replacement: &Session, commit: bool) -> Result<(),
         Provider::Codex => crate::agent::codex_rollout(&original, id)
             .map_err(|error| format!("{error}; the conversation stays on its original account"))?,
         Provider::Omp => return Err("Omp manages its own account rotation".into()),
+        Provider::Antigravity | Provider::Muse => {
+            return Err(format!("{} manages its own logins", provider.label()));
+        }
     };
     let relative = path
         .strip_prefix(&original)
         .map_err(|_| "The transcript escapes the original account home")?;
-    copy_transcript(&path, &target.join(relative), commit).map_err(|error| {
-        format!("The conversation history could not be prepared on the alternate account: {error}")
-    })
+    let destination = target.join(relative);
+    Ok((path, destination))
 }
 
 fn open_transcript(path: &Path) -> io::Result<fs::File> {
@@ -79,9 +118,15 @@ fn read_transcript(path: &Path) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-// Retain the source snapshot until publication, while comparing the destination
-// in fixed-size chunks instead of retaining a second transcript-sized buffer.
+// Compare the destination in fixed-size chunks instead of retaining a second
+// transcript-sized buffer.
 fn matches_existing_transcript(path: &Path, bytes: &[u8]) -> io::Result<bool> {
+    Ok(existing_prefix(path, bytes)? == bytes.len())
+}
+
+/// How much of `bytes` the file at `path` already holds, refusing a file that
+/// is not a prefix of them.
+fn existing_prefix(path: &Path, bytes: &[u8]) -> io::Result<usize> {
     let mut previous = open_transcript(path)?.take(MAX_TRANSCRIPT + 1);
     let mut buffer = [0; 16 * 1024];
     let mut length = 0;
@@ -108,58 +153,131 @@ fn matches_existing_transcript(path: &Path, bytes: &[u8]) -> io::Result<bool> {
             "Alternate account has divergent conversation history; refusing to overwrite it",
         ));
     }
-    Ok(length == bytes.len())
+    Ok(length)
 }
 
-fn copy_transcript(source: &Path, destination: &Path, commit: bool) -> io::Result<()> {
-    let bytes = read_transcript(source)?;
-    let parent = destination
+fn transcript_directory(destination: &Path) -> io::Result<&Path> {
+    destination
         .parent()
-        .ok_or_else(|| io::Error::other("Missing transcript directory"))?;
+        .ok_or_else(|| io::Error::other("Missing transcript directory"))
+}
+
+/// Whether the destination already holds exactly `bytes`. A destination that
+/// diverges from them, or is longer, is refused rather than overwritten.
+fn destination_current(destination: &Path, bytes: &[u8]) -> io::Result<bool> {
     crate::secure_file::reject_symlink_components(destination)?;
-    if destination.exists() && matches_existing_transcript(destination, &bytes)? {
-        return Ok(());
-    }
-    if !commit {
-        return Ok(());
-    }
+    Ok(destination.exists() && matches_existing_transcript(destination, bytes)?)
+}
+
+/// Stages a copy even when the destination already holds the history, so the
+/// commit after the original closes only renames into a directory this
+/// account has already written.
+fn stage_transcript(source: PathBuf, destination: PathBuf) -> io::Result<Staged> {
+    let bytes = read_transcript(&source)?;
+    let mut staged = Staged {
+        source,
+        destination,
+        temporary: None,
+    };
+    destination_current(&staged.destination, &bytes)?;
+    let parent = transcript_directory(&staged.destination)?;
     crate::secure_file::prepare_private_directory(parent)?;
+    remove_abandoned_copies(parent);
+    let temporary = parent.join(format!("{STAGED_PREFIX}{}", uuid::Uuid::new_v4()));
     use std::os::unix::fs::OpenOptionsExt;
-    let temporary = parent.join(format!(".cagents-handoff-{}", uuid::Uuid::new_v4()));
-    let result = (|| {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temporary)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        fs::rename(&temporary, destination)?;
-        fs::File::open(parent)?.sync_all()
-    })();
-    let _ = fs::remove_file(&temporary);
-    result
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&temporary)?;
+    staged.temporary = Some(temporary);
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    Ok(staged)
+}
+
+/// Removes staged copies a daemon left when it stopped between staging and
+/// commit. A copy younger than [`ABANDONED`] may belong to a switch still in
+/// progress, so it stays.
+fn remove_abandoned_copies(directory: &Path) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let abandoned = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(STAGED_PREFIX))
+            && entry.file_type().is_ok_and(|kind| kind.is_file())
+            && entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age >= ABANDONED);
+        if abandoned {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+fn commit_transcript(staged: &mut Staged) -> io::Result<()> {
+    let bytes = read_transcript(&staged.source)?;
+    if destination_current(&staged.destination, &bytes)? {
+        return Ok(());
+    }
+    let parent = transcript_directory(&staged.destination)?.to_owned();
+    let temporary = staged
+        .temporary
+        .clone()
+        .ok_or_else(|| io::Error::other("The staged history was already committed"))?;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = fs::OpenOptions::new();
+    options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    // The staged copy is normally all or nearly all of the history. Only a
+    // source that changed what it had already written is copied again.
+    let (mut file, written) = match existing_prefix(&temporary, &bytes) {
+        Ok(written) => (options.append(true).open(&temporary)?, written),
+        Err(error) if error.kind() == io::ErrorKind::Other => {
+            (options.write(true).truncate(true).open(&temporary)?, 0)
+        }
+        Err(error) => return Err(error),
+    };
+    file.write_all(&bytes[written..])?;
+    file.sync_all()?;
+    fs::rename(&temporary, &staged.destination)?;
+    staged.temporary = None;
+    fs::File::open(&parent)?.sync_all()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stage_at(source: &Path, destination: &Path) -> io::Result<Staged> {
+        stage_transcript(source.to_owned(), destination.to_owned())
+    }
+
+    fn copy_transcript(source: &Path, destination: &Path) -> io::Result<()> {
+        commit_transcript(&mut stage_at(source, destination)?)
+    }
     #[test]
     fn copies_only_history_and_refuses_divergence_and_symlinks() {
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("source.jsonl");
         let target = directory.path().join("account/sessions/target.jsonl");
         fs::write(&source, b"one\ntwo\n").unwrap();
-        copy_transcript(&source, &target, true).unwrap();
+        copy_transcript(&source, &target).unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"one\ntwo\n");
         fs::write(&source, b"one\ntwo\nthree\n").unwrap();
-        copy_transcript(&source, &target, true).unwrap();
+        copy_transcript(&source, &target).unwrap();
         fs::write(&source, b"other\n").unwrap();
-        assert!(copy_transcript(&source, &target, true).is_err());
+        assert!(copy_transcript(&source, &target).is_err());
         assert_eq!(fs::read(&target).unwrap(), b"one\ntwo\nthree\n");
         fs::remove_file(&target).unwrap();
         std::os::unix::fs::symlink(&source, &target).unwrap();
-        assert!(copy_transcript(&source, &target, true).is_err());
+        assert!(copy_transcript(&source, &target).is_err());
     }
 
     #[test]
@@ -173,23 +291,25 @@ mod tests {
             .map(|offset| ((offset / 997) ^ offset) as u8)
             .collect();
         fs::write(&source, &bytes).unwrap();
-        copy_transcript(&source, &target, false).unwrap();
-        assert!(
-            !target.parent().unwrap().exists(),
-            "preflight must stay read-only"
+        drop(stage_at(&source, &target).unwrap());
+        assert!(!target.exists(), "an uncommitted stage publishes nothing");
+        assert_eq!(
+            fs::read_dir(target.parent().unwrap()).unwrap().count(),
+            0,
+            "an uncommitted stage leaves no copy behind"
         );
 
         fs::create_dir_all(target.parent().unwrap()).unwrap();
         fs::write(&target, &bytes[..96 * 1024]).unwrap();
-        copy_transcript(&source, &target, false).unwrap();
+        drop(stage_at(&source, &target).unwrap());
         assert_eq!(fs::read(&target).unwrap(), bytes[..96 * 1024]);
-        copy_transcript(&source, &target, true).unwrap();
+        copy_transcript(&source, &target).unwrap();
         assert_eq!(fs::read(&target).unwrap(), bytes);
         assert_eq!(fs::metadata(&target).unwrap().mode() & 0o777, 0o600);
 
         fs::set_permissions(&target, fs::Permissions::from_mode(0o400)).unwrap();
         let before = fs::metadata(&target).unwrap();
-        copy_transcript(&source, &target, true).unwrap();
+        copy_transcript(&source, &target).unwrap();
         let after = fs::metadata(&target).unwrap();
         assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
         assert_eq!(after.mode(), before.mode(), "identical history is a no-op");
@@ -212,7 +332,11 @@ mod tests {
             fs::write(&target, &previous).unwrap();
             let before = fs::metadata(&target).unwrap();
             for commit in [false, true] {
-                let error = copy_transcript(&source, &target, commit).unwrap_err();
+                let error = if commit {
+                    copy_transcript(&source, &target).unwrap_err()
+                } else {
+                    stage_at(&source, &target).map(drop).unwrap_err()
+                };
                 assert!(error.to_string().contains("divergent conversation history"));
                 assert_eq!(fs::read(&target).unwrap(), previous);
                 assert_eq!(fs::metadata(&target).unwrap().ino(), before.ino());
@@ -241,11 +365,98 @@ mod tests {
             .set_len(MAX_TRANSCRIPT + 1)
             .unwrap();
         for rejected in [fifo.as_path(), directory.path(), oversized.as_path()] {
-            assert!(copy_transcript(&source, rejected, false).is_err());
-            assert!(copy_transcript(rejected, &target, false).is_err());
+            assert!(stage_at(&source, rejected).is_err());
+            assert!(stage_at(rejected, &target).is_err());
         }
         assert_eq!(fs::read(&target).unwrap(), b"retained\n");
         assert_eq!(fs::read(&source).unwrap(), b"source\n");
         assert_eq!(fs::metadata(&oversized).unwrap().len(), MAX_TRANSCRIPT + 1);
+    }
+
+    #[test]
+    fn an_unwritable_destination_fails_while_staging() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.jsonl");
+        let account = directory.path().join("account");
+        fs::write(&source, b"history\n").unwrap();
+        fs::create_dir_all(&account).unwrap();
+        // The destination's directory cannot be created, as on a full or
+        // read-only file system.
+        fs::set_permissions(&account, fs::Permissions::from_mode(0o500)).unwrap();
+        let refused = stage_at(&source, &account.join("sessions/target.jsonl"));
+        let created = account.join("sessions").exists();
+        fs::set_permissions(&account, fs::Permissions::from_mode(0o700)).unwrap();
+        // Root writes through the missing permission, as no daemon user can.
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(
+                refused.is_err(),
+                "staging must prove the destination writable"
+            );
+            assert!(!created);
+        }
+    }
+
+    #[test]
+    fn commit_publishes_what_the_conversation_wrote_after_staging() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.jsonl");
+        let target = directory.path().join("account/sessions/target.jsonl");
+        fs::write(&source, b"one\n").unwrap();
+        let mut staged = stage_at(&source, &target).unwrap();
+        assert!(!target.exists(), "staging publishes nothing");
+        fs::write(&source, b"one\ntwo\n").unwrap();
+        commit_transcript(&mut staged).unwrap();
+        drop(staged);
+        assert_eq!(fs::read(&target).unwrap(), b"one\ntwo\n");
+        assert_eq!(fs::read_dir(target.parent().unwrap()).unwrap().count(), 1);
+
+        // A source that rewrote its staged history is copied again in full.
+        let rewritten = directory.path().join("account/sessions/rewritten.jsonl");
+        let mut staged = stage_at(&source, &rewritten).unwrap();
+        fs::write(&source, b"other\n").unwrap();
+        commit_transcript(&mut staged).unwrap();
+        assert_eq!(fs::read(&rewritten).unwrap(), b"other\n");
+
+        // A destination that already held the history when staged still
+        // gets a staged copy, which takes what was written since.
+        let mut staged = stage_at(&source, &rewritten).unwrap();
+        assert!(staged.temporary.as_ref().is_some_and(|copy| copy.exists()));
+        fs::write(&source, b"other\nmore\n").unwrap();
+        commit_transcript(&mut staged).unwrap();
+        drop(staged);
+        assert_eq!(fs::read(&rewritten).unwrap(), b"other\nmore\n");
+        assert_eq!(fs::read_dir(target.parent().unwrap()).unwrap().count(), 2);
+
+        // A copy a stopped daemon abandoned is swept by the next stage; a
+        // recent one may belong to a switch in progress.
+        let sessions = target.parent().unwrap();
+        let abandoned = sessions.join(format!("{STAGED_PREFIX}abandoned"));
+        let recent = sessions.join(format!("{STAGED_PREFIX}recent"));
+        fs::write(&abandoned, b"old").unwrap();
+        fs::write(&recent, b"new").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&abandoned)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - ABANDONED)
+            .unwrap();
+        fs::write(&source, b"fresh\n").unwrap();
+        drop(stage_at(&source, &sessions.join("fresh.jsonl")).unwrap());
+        assert!(!abandoned.exists());
+        assert!(recent.exists());
+        fs::remove_file(&recent).unwrap();
+        fs::write(&source, b"one\ntwo\n").unwrap();
+
+        // History that diverged on the alternate account since staging stays.
+        fs::write(&source, b"one\ntwo\nthree\n").unwrap();
+        let mut staged = stage_at(&source, &target).unwrap();
+        fs::write(&target, b"elsewhere\n").unwrap();
+        let error = commit_transcript(&mut staged).unwrap_err();
+        assert!(error.to_string().contains("divergent conversation history"));
+        drop(staged);
+        assert_eq!(fs::read(&target).unwrap(), b"elsewhere\n");
+        assert_eq!(fs::read_dir(target.parent().unwrap()).unwrap().count(), 2);
     }
 }

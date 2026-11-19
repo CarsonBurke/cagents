@@ -293,7 +293,41 @@ impl Picker {
     }
 }
 
+/// How a conversation's subagents stand, for the pane's inspector.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(in crate::app) struct SubagentTally {
+    pub total: usize,
+    pub working: usize,
+    /// Asking a question, failed or denied: what the reader may need to act
+    /// on.
+    pub attention: usize,
+}
+
 impl Runtime {
+    /// How the conversation's subagents stand.
+    pub(in crate::app) fn subagent_tally(&self) -> SubagentTally {
+        let children = &self.snapshot.subagents;
+        SubagentTally {
+            total: children.len(),
+            working: children.iter().filter(|child| rank(child) == 0).count(),
+            attention: children
+                .iter()
+                .filter(|child| needs_attention(child))
+                .count(),
+        }
+    }
+
+    /// Opens the pane's searchable list of its subagents.
+    pub(in crate::app) fn open_subagent_picker(&self) -> Message {
+        action(Action::SubagentPicker(self.target, true))
+    }
+
+    /// What the conversation itself is doing, in the glyph and words its
+    /// status line uses; its subagents are summed up apart.
+    pub(in crate::app) fn inspector_status(&self) -> (Option<Icon>, String) {
+        self.own_conversation_status()
+    }
+
     /// While a subagent's transcript is open, the main conversation's own
     /// work, a question for the reader or a failure is marked on its tab,
     /// since its transcript is not there to say so. What its subagents do is
@@ -454,7 +488,7 @@ impl Runtime {
                     mark,
                 ),
                 crate::interaction::overflow_fade_x(crate::interaction::horizontal_wheel(tabs)),
-                crate::interaction::tooltip(trigger, "Search and filter subagents").into(),
+                crate::interaction::tooltip(trigger, "Search and filter subagents"),
             ])
             .spacing(space::XS)
             .align_y(Alignment::Center),

@@ -456,6 +456,28 @@ impl KeyboardShortcuts {
         }
     }
 
+    fn yield_conflicts_to(&mut self, preferred: &KeyboardShortcuts) {
+        while let Some(ShortcutFault {
+            action,
+            conflicts_with: Some(owner),
+            ..
+        }) = self.fault()
+        {
+            let mut changed = false;
+            for index in [action, owner] {
+                if self.actions()[index] != preferred.actions()[index] {
+                    self.set_action(index, preferred.actions()[index].clone());
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+            // Each continuing pass makes at least one more action equal to
+            // preferred and never changes it again, so the loop terminates.
+        }
+    }
+
     fn validate(&self) -> Result<(), SettingsError> {
         self.fault().map_or(Ok(()), |fault| Err(fault.error))
     }
@@ -902,6 +924,18 @@ const fn default_show_worktree_changes_icons() -> bool {
     true
 }
 
+const fn default_inspector_open_by_default() -> bool {
+    true
+}
+
+const fn default_inspector_show_activity() -> bool {
+    true
+}
+
+const fn default_inspector_show_work() -> bool {
+    true
+}
+
 const fn default_relaunch_agents_on_upgrade() -> bool {
     true
 }
@@ -1214,6 +1248,18 @@ pub struct AppSettings {
     /// little about what the channel did.
     #[serde(default)]
     pub show_mentioned_pull_requests: bool,
+    /// Whether a pane's inspector opens with it, unless the user closed
+    /// that pane's. On: the inspector shows what the agent does and where.
+    #[serde(default = "default_inspector_open_by_default")]
+    pub inspector_open_by_default: bool,
+    /// Whether a chat or terminal inspector leads with what its agent is
+    /// doing and where.
+    #[serde(default = "default_inspector_show_activity")]
+    pub inspector_show_activity: bool,
+    /// Whether a chat's inspector lists the pull requests and worktrees its
+    /// conversation worked on.
+    #[serde(default = "default_inspector_show_work")]
+    pub inspector_show_work: bool,
     /// Whether a daemon upgrade relaunches an agent whose conversation cannot
     /// be resumed exactly - into its provider's resume picker, or a fresh
     /// conversation when it had none yet - rather than refusing to upgrade
@@ -1333,6 +1379,9 @@ impl Default for AppSettings {
             usage_preview_rows: HashMap::new(),
             show_worktree_changes_icons: default_show_worktree_changes_icons(),
             show_mentioned_pull_requests: false,
+            inspector_open_by_default: default_inspector_open_by_default(),
+            inspector_show_activity: default_inspector_show_activity(),
+            inspector_show_work: default_inspector_show_work(),
             relaunch_agents_on_upgrade: default_relaunch_agents_on_upgrade(),
             check_for_updates: default_check_for_updates(),
             work_stale_after_days: default_work_stale_after_days(),
@@ -2157,7 +2206,7 @@ impl AppSettings {
             || !(0.25..=1.0).contains(&self.default_native_pane_fraction)
         {
             return Err(SettingsError::Invalid(
-                "Native pane and chat content widths must be between 0.25 and 1.0".into(),
+                "Native pane and chat content widths must be between 0.25 and 1.0",
             ));
         }
         if !(0.25..=1.0).contains(&self.default_column_fraction) {
@@ -2376,7 +2425,9 @@ fn settings_lock(path: &Path) -> Result<crate::instance::OwnedLock, SettingsErro
 }
 
 /// Applies only fields this window changed since its last successful save.
-/// Nested shortcut tables merge by action; list-valued preferences are atomic.
+/// Nested shortcut tables merge by action; list-valued preferences and
+/// [`ATOMIC_SETTINGS`] are replaced whole.
+/// A chord this window bound replaces another window's conflicting binding.
 pub fn save_merged(
     path: impl AsRef<Path>,
     base: &AppSettings,
@@ -2390,11 +2441,29 @@ pub fn save_merged(
         &toml::Value::try_from(base)?,
         &toml::Value::try_from(desired)?,
         &mut current,
+        &ATOMIC_SETTINGS,
     );
-    save_unlocked(path, &current.try_into::<AppSettings>()?.validate()?)
+    let mut merged = current.try_into::<AppSettings>()?;
+    merged
+        .keyboard_shortcuts
+        .yield_conflicts_to(&desired.keyboard_shortcuts);
+    save_unlocked(path, &merged.validate()?)
 }
 
-fn merge_changed_fields(base: &toml::Value, desired: &toml::Value, current: &mut toml::Value) {
+/// Settings chosen as a whole. Merging a palette color by color could save
+/// one that neither window chose.
+const ATOMIC_SETTINGS: [&str; 2] = ["terminal_theme", "custom_terminal_theme"];
+
+/// Writes into `current` what changed from `base` to `desired`. Keys named in
+/// `atomic` apply at this level only. A changed entry that `current` lacks is
+/// written whole, even when it is a table the window edited one field of:
+/// its other fields may be required, so a partial table could not load.
+fn merge_changed_fields(
+    base: &toml::Value,
+    desired: &toml::Value,
+    current: &mut toml::Value,
+    atomic: &[&str],
+) {
     if base == desired {
         return;
     }
@@ -2402,8 +2471,16 @@ fn merge_changed_fields(base: &toml::Value, desired: &toml::Value, current: &mut
         (base.as_table(), desired.as_table(), current.as_table_mut())
     {
         for (key, value) in desired {
-            match (base.get(key), current.get_mut(key)) {
-                (Some(previous), Some(current)) => merge_changed_fields(previous, value, current),
+            let previous = base.get(key);
+            // An entry this window left alone says nothing about the file,
+            // even when another window has since removed it there.
+            if previous == Some(value) {
+                continue;
+            }
+            match (previous, current.get_mut(key)) {
+                (Some(previous), Some(current)) if !atomic.contains(&key.as_str()) => {
+                    merge_changed_fields(previous, value, current, &[]);
+                }
                 _ => {
                     current.insert(key.clone(), value.clone());
                 }
@@ -3547,9 +3624,11 @@ mod tests {
 
     #[test]
     fn editor_font_inherits_terminal_until_overridden() {
-        let mut settings = super::AppSettings::default();
-        settings.terminal_font_family = "Test Mono".into();
-        settings.terminal_font_size = 19.0;
+        let mut settings = super::AppSettings {
+            terminal_font_family: "Test Mono".into(),
+            terminal_font_size: 19.0,
+            ..super::AppSettings::default()
+        };
         assert_eq!(settings.editor_font_family(), "Test Mono");
         assert_eq!(settings.editor_font_size(), 19.0);
         settings.editor_font_family = Some("Editor Mono".into());
@@ -3734,8 +3813,10 @@ mod tests {
     fn palette_recents_survive_save_and_old_settings_default_to_empty() {
         let directory = tempfile::tempdir().unwrap();
         let path = path_in(&directory);
-        let mut settings = AppSettings::default();
-        settings.palette_recents = vec!["command:open_settings".into(), "pane:original".into()];
+        let mut settings = AppSettings {
+            palette_recents: vec!["command:open_settings".into(), "pane:original".into()],
+            ..AppSettings::default()
+        };
         save(&path, &settings).unwrap();
         assert_eq!(
             load(&path).unwrap().palette_recents,
@@ -3772,9 +3853,11 @@ mod tests {
                 LinkOpenGesture::ControlClick,
                 LinkOpenGesture::ControlShiftClick,
             ] {
-                let mut settings = AppSettings::default();
-                settings.link_open_destination = destination;
-                settings.link_open_gesture = system_gesture;
+                let settings = AppSettings {
+                    link_open_destination: destination,
+                    link_open_gesture: system_gesture,
+                    ..AppSettings::default()
+                };
                 save(&path, &settings).unwrap();
                 let settings = load(&path).unwrap();
                 assert_eq!(settings.link_destination(None), destination);
@@ -3855,6 +3938,210 @@ mod tests {
         let restored = load(&path).unwrap();
         assert_eq!(restored.terminal_font_size, 19.0);
         assert_eq!(restored.app_theme, AppTheme::Light);
+    }
+
+    #[test]
+    fn a_stale_windows_shortcut_save_wins_the_chord_another_window_bound() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let base = AppSettings::default();
+        save(&path, &base).unwrap();
+
+        let mut a = base.clone();
+        a.keyboard_shortcuts.command_palette = vec!["Ctrl+K".into()];
+        // An unrelated binding of A's must survive B winning the chord.
+        a.keyboard_shortcuts.cycle_pane_width = vec!["Alt+Shift+R".into()];
+        save_merged(&path, &base, &a).unwrap();
+
+        let mut b = base.clone();
+        b.keyboard_shortcuts.search_projects = vec!["Ctrl+K".into()];
+        save_merged(&path, &base, &b).unwrap();
+
+        let restored = load(&path).unwrap();
+        assert_eq!(restored.keyboard_shortcuts.search_projects, ["Ctrl+K"]);
+        assert_eq!(
+            restored.keyboard_shortcuts.command_palette,
+            base.keyboard_shortcuts.command_palette
+        );
+        assert_eq!(
+            restored.keyboard_shortcuts.cycle_pane_width,
+            ["Alt+Shift+R"]
+        );
+    }
+
+    #[test]
+    fn after_winning_a_chord_a_windows_unrelated_save_still_succeeds() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let base = AppSettings::default();
+        save(&path, &base).unwrap();
+
+        let mut a = base.clone();
+        a.keyboard_shortcuts.command_palette = vec!["Ctrl+K".into()];
+        save_merged(&path, &base, &a).unwrap();
+
+        let mut b = base.clone();
+        b.keyboard_shortcuts.search_projects = vec!["Ctrl+K".into()];
+        save_merged(&path, &base, &b).unwrap();
+        let won = load(&path).unwrap();
+
+        let mut b2 = b.clone();
+        b2.terminal_font_size = 19.0;
+        save_merged(&path, &b, &b2).unwrap();
+
+        let restored = load(&path).unwrap();
+        assert_eq!(restored.terminal_font_size, 19.0);
+        assert_eq!(restored.keyboard_shortcuts, won.keyboard_shortcuts);
+        assert_eq!(restored.keyboard_shortcuts.search_projects, ["Ctrl+K"]);
+        assert_eq!(
+            restored.keyboard_shortcuts.command_palette,
+            base.keyboard_shortcuts.command_palette
+        );
+    }
+
+    #[test]
+    fn a_conflict_inside_one_windows_own_table_is_still_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let base = AppSettings::default();
+        save(&path, &base).unwrap();
+        let before = fs::read(&path).unwrap();
+
+        let mut desired = base.clone();
+        desired.keyboard_shortcuts.command_palette = vec!["Ctrl+K".into()];
+        desired.keyboard_shortcuts.search_projects = vec!["Ctrl+K".into()];
+        assert!(matches!(
+            save_merged(&path, &base, &desired),
+            Err(SettingsError::InvalidShortcut(
+                "keyboard shortcuts must not conflict"
+            ))
+        ));
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn yielding_reaches_a_conflict_free_table_through_chained_conflicts() {
+        let preferred = KeyboardShortcuts::default();
+        let mut merged = preferred.clone();
+        merged.new_terminal = vec!["Ctrl+K".into()];
+        merged.new_channel = vec!["Ctrl+K".into()];
+        merged.clone_pane = preferred.new_channel.clone();
+
+        merged.yield_conflicts_to(&preferred);
+
+        assert!(merged.fault().is_none());
+        assert_eq!(merged.new_terminal, preferred.new_terminal);
+        assert_eq!(merged.new_channel, preferred.new_channel);
+        assert_eq!(merged.clone_pane, preferred.clone_pane);
+    }
+
+    #[test]
+    fn unrelated_save_from_a_stale_window_keeps_another_windows_cleared_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let project = crate::model::ProjectId::new();
+        let other_project = crate::model::ProjectId::new();
+        let mut base = AppSettings {
+            editor_font_size: Some(18.0),
+            ..AppSettings::default()
+        };
+        base.sidebar_worktree_overrides
+            .insert(project, SidebarWorktrees::Expanded);
+        save(&path, &base).unwrap();
+
+        let mut cleared = base.clone();
+        cleared.editor_font_size = None;
+        cleared.sidebar_worktree_overrides.remove(&project);
+        save_merged(&path, &base, &cleared).unwrap();
+
+        let mut stale = base.clone();
+        stale.app_theme = AppTheme::Light;
+        stale
+            .sidebar_worktree_overrides
+            .insert(other_project, SidebarWorktrees::Hidden);
+        save_merged(&path, &base, &stale).unwrap();
+
+        let restored = load(&path).unwrap();
+        assert_eq!(restored.editor_font_size, None);
+        assert!(!restored.sidebar_worktree_overrides.contains_key(&project));
+        assert_eq!(restored.app_theme, AppTheme::Light);
+        assert_eq!(
+            restored.sidebar_worktree_overrides.get(&other_project),
+            Some(&SidebarWorktrees::Hidden)
+        );
+    }
+
+    #[test]
+    fn a_value_this_window_sets_replaces_another_windows_clear() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let base = AppSettings {
+            editor_font_size: Some(18.0),
+            ..AppSettings::default()
+        };
+        save(&path, &base).unwrap();
+        let cleared = AppSettings {
+            editor_font_size: None,
+            ..base.clone()
+        };
+        save_merged(&path, &base, &cleared).unwrap();
+        let resized = AppSettings {
+            editor_font_size: Some(14.0),
+            ..base.clone()
+        };
+        save_merged(&path, &base, &resized).unwrap();
+        assert_eq!(load(&path).unwrap().editor_font_size, Some(14.0));
+    }
+
+    #[test]
+    fn a_palette_is_saved_whole_rather_than_merged_color_by_color() {
+        use crate::terminal::{TerminalTheme, ThemeColor};
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let palette = TerminalTheme::Dracula.palette();
+        let base = AppSettings {
+            terminal_theme: TerminalTheme::Custom(palette),
+            ..AppSettings::default()
+        }
+        .validate()
+        .unwrap();
+        save(&path, &base).unwrap();
+
+        let mut first = palette;
+        first.background = ThemeColor(0x112233);
+        let first = AppSettings {
+            terminal_theme: TerminalTheme::Custom(first),
+            custom_terminal_theme: Some(first),
+            ..base.clone()
+        };
+        save_merged(&path, &base, &first).unwrap();
+        let mut second = palette;
+        second.foreground = ThemeColor(0x445566);
+        let second = AppSettings {
+            terminal_theme: TerminalTheme::Custom(second),
+            custom_terminal_theme: Some(second),
+            ..base.clone()
+        };
+        save_merged(&path, &base, &second).unwrap();
+
+        let restored = load(&path).unwrap();
+        assert_eq!(restored.terminal_theme, second.terminal_theme);
+        assert_eq!(restored.custom_terminal_theme, second.custom_terminal_theme);
+    }
+
+    #[test]
+    fn a_changed_entry_another_window_removed_is_written_whole() {
+        let base: toml::Value = toml::toml! {
+            [entries.kept]
+            size = 1
+            shape = "round"
+        }
+        .into();
+        let mut desired = base.clone();
+        desired["entries"]["kept"]["size"] = 2.into();
+        let mut current: toml::Value = toml::toml! { [entries] }.into();
+        merge_changed_fields(&base, &desired, &mut current, &[]);
+        assert_eq!(current, desired);
     }
 
     #[test]

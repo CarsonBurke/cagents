@@ -14,12 +14,15 @@ pub(crate) mod descriptor_limit;
 mod exit_drain_tests;
 #[cfg(debug_assertions)]
 mod fixture_hold;
+#[cfg(debug_assertions)]
+mod fixture_startup_recovery;
 mod lifecycle;
 mod lock;
 mod model;
 mod notifications;
 #[cfg(all(test, target_os = "linux"))]
 mod provider_shutdown_tests;
+mod recovery_admission;
 mod service;
 #[cfg(all(test, target_os = "linux"))]
 mod shutdown_tests;
@@ -405,6 +408,65 @@ pub(crate) fn observe_fixture_startup(phase: &'static str, error: Option<&str>) 
     exit_drain_tests::observe_startup(phase, error);
 }
 
+/// Saves the conversation IDs an abandoned update's checkpoint alone records,
+/// so the chats they name resume their conversations rather than start new
+/// ones. The archive stays as evidence; a later start finds nothing to save.
+fn save_abandoned_identities(host: &SharedHost) {
+    // A daemon without its shared model has nothing to save them to.
+    let Ok(registry) = agent_execution::registry(host) else {
+        return;
+    };
+    let checkpoint = crate::upgrade::handoff::Store::existing()
+        .and_then(|store| store.map(|store| store.load_abandoned()).transpose())
+        .map(Option::flatten);
+    let checkpoint = match checkpoint {
+        Ok(Some(checkpoint)) => checkpoint,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(%error, "cannot read the abandoned update's conversation IDs");
+            return;
+        }
+    };
+    // A conversation restore reattached is its holder's to name: that
+    // reattachment saves the identity it confirmed, through the lineage it
+    // authenticates.
+    let restored: std::collections::BTreeSet<_> = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .chats
+        .keys()
+        .copied()
+        .collect();
+    let unheld: Vec<_> = checkpoint
+        .chats
+        .iter()
+        .filter(|chat| !restored.contains(&chat.source.id))
+        .cloned()
+        .collect();
+    let saved = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .save_checkpoint_identities(&unheld);
+    if !saved.written.is_empty() {
+        tracing::info!(chats = ?saved.written, "saved conversation IDs only the abandoned update recorded");
+    }
+    for chat in saved.unrecoverable {
+        let conversation = checkpoint
+            .chats
+            .iter()
+            .find(|entry| entry.source.id == chat)
+            .and_then(|entry| entry.launch.session_id.as_deref());
+        tracing::warn!(
+            %chat,
+            conversation,
+            "the chat's pane or agent now shows another process; resume its conversation manually"
+        );
+    }
+    for (chat, error) in saved.failed {
+        tracing::warn!(%chat, %error, "cannot save the abandoned update's ID for this chat; a later start tries again unless it is reopened first");
+    }
+}
+
 pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("host run entered", None);
@@ -512,6 +574,13 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
             update_recovery::restore_ordinary(&host).map_err(io::Error::other)?;
             Ok(())
         })();
+        // After restore has reattached every holder it could, and before
+        // the listener accepts a client that would restore a chat afresh. A
+        // failed restore may not have reached a holder yet; a later start
+        // saves them instead.
+        if restored.is_ok() {
+            save_abandoned_identities(&host);
+        }
         match restored {
             Ok(()) => Ok(()),
             Err(error) => {
@@ -559,10 +628,10 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
             .unwrap_or_else(|p| p.into_inner())
             .startup_recovery()
             .is_some();
-    if !recovery_only {
-        if let Err(error) = account_lifecycle::restore_unregistered_homes(Arc::downgrade(&host)) {
-            tracing::warn!(%error, "lost accounts will not be restored automatically");
-        }
+    if !recovery_only
+        && let Err(error) = account_lifecycle::restore_unregistered_homes(Arc::downgrade(&host))
+    {
+        tracing::warn!(%error, "lost accounts will not be restored automatically");
     }
     if !recovery_only {
         let collect_host = Arc::downgrade(&host);

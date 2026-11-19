@@ -30,6 +30,10 @@ pub(super) enum Press {
     ResumeSaved,
     /// Start a new conversation in this card after checked retirement.
     StartFresh,
+    /// Send a first message a refusal kept, once that refusal is lifted.
+    SendAgain,
+    /// Start again a conversation the update stopped.
+    Reopen,
     Close,
 }
 
@@ -39,6 +43,8 @@ impl Press {
             Self::Reconnect => action(Action::Reconnect(target)),
             Self::ResumeSaved => action(Action::ResumeSaved(target)),
             Self::StartFresh => action(Action::StartFresh(target.card)),
+            Self::SendAgain => action(Action::SendAgain(target)),
+            Self::Reopen => action(Action::ReopenStopped(target.card)),
             Self::Close => Message::CloseCard(target.card),
         }
     }
@@ -61,17 +67,40 @@ impl Runtime {
         let unresumable = fresh_available;
         let saved_history = self.has_connected_saved_history(snapshot);
         let enabled = !transitioning
-            && self.pending.is_none()
+            && self.commands.is_idle()
             && self.attachment_chooser_pending.is_none()
             && self.pastes_pending == 0
             && (!saved_history || !snapshot.history_loading);
         if let Some(reopen) = self.start_blocked {
+            let guidance = reopen.guidance(unresumable, self.is_draft(), self.update_wait);
+            if reopen == blocked_recovery::Reopen::UpdateRecovery {
+                // The pane reopens, or gets its Send back, by itself once the
+                // daemon says its recovery finished. Until it says so, trying
+                // again is offered only when it could not be asked.
+                let retry = (!self.update_wait.holds()).then(|| {
+                    if self.is_draft() {
+                        ("Send again", Press::SendAgain, enabled)
+                    } else {
+                        ("Try again", Press::Reconnect, enabled)
+                    }
+                });
+                return Stopped {
+                    guidance,
+                    primary: retry,
+                    secondary: Some(("Close", Press::Close, !transitioning)),
+                    primary_labels: &[],
+                };
+            }
+            if reopen.reopens() && !self.is_draft() {
+                return Stopped {
+                    guidance,
+                    primary: Some((blocked_recovery::REOPEN_LABEL, Press::Reopen, enabled)),
+                    secondary: Some(("Close", Press::Close, !transitioning)),
+                    primary_labels: &[],
+                };
+            }
             return Stopped {
-                guidance: if self.is_draft() {
-                    blocked_recovery::DRAFT_GUIDANCE.to_owned()
-                } else {
-                    reopen.guidance(unresumable)
-                },
+                guidance,
                 primary: Some(if unresumable {
                     ("Start a new conversation", Press::StartFresh, enabled)
                 } else {

@@ -279,7 +279,7 @@ impl Listing {
                     },
                 ))
             }
-            (Self::Terminals | Self::TerminalShow, ClientRequest::List) => {
+            (Self::Terminals | Self::TerminalShow, ClientRequest::ListPage { after: None }) => {
                 let terminals = if populated {
                     let mut terminal = cagents::terminal::ipc::TerminalDescriptor::relaunchable(
                         "00000000-0000-4000-8000-000000000001".parse().unwrap(),
@@ -307,7 +307,10 @@ impl Listing {
                 } else {
                     vec![]
                 };
-                ServerResponse::Listed { terminals }
+                ServerResponse::ListedPage {
+                    terminals,
+                    complete: true,
+                }
             }
             // The board is scoped to the open Git project containing the
             // current directory, which this fixture's projects do not.

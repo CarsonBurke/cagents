@@ -112,7 +112,7 @@ pub fn shared_entries(provider: Provider) -> &'static [&'static str] {
     match provider {
         Provider::Claude => &["CLAUDE.md", "skills", "agents", "commands"],
         Provider::Codex => &["AGENTS.md", "config.toml", "skills", "prompts", "rules"],
-        Provider::Omp => &[],
+        Provider::Omp | Provider::Antigravity | Provider::Muse => &[],
     }
 }
 
@@ -154,7 +154,7 @@ impl Homes {
             &self.root.join(".lifecycle.lock"),
             libc::LOCK_EX | libc::LOCK_NB,
         )
-        .map_err(|error| super::remote::ListHeld::Lifecycle.from_flock(error))
+        .map_err(|error| super::remote::ListHeld::Lifecycle.flock_error(error))
     }
 
     fn provider_directory(&self, provider: Provider) -> PathBuf {

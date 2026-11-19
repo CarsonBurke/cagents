@@ -41,6 +41,8 @@ pub use automations::AutomationCommand;
 #[cfg(all(test, feature = "host"))]
 mod daemon_stop_tests;
 mod sessions;
+#[cfg(test)]
+mod startup_route;
 mod terminal_list;
 #[cfg(test)]
 mod terminal_start_authority_tests;
@@ -55,6 +57,12 @@ mod work;
 pub use work::{WorkCommand, WorkListArgs};
 #[cfg(feature = "ui")]
 pub(crate) mod invocation;
+
+/// Whether a command's text, file or definition argument names standard
+/// input: a lone `-`, wherever a command reads one.
+pub(crate) fn standard_input(word: impl AsRef<std::ffi::OsStr>) -> bool {
+    word.as_ref() == "-"
+}
 
 use crate::{
     agent_execution::Authority,
@@ -628,7 +636,9 @@ pub enum ProjectCommand {
     List,
     /// Close a project and every channel in it.
     Close {
-        /// A folder or path inside a Git repository (defaults to the current directory).
+        /// A folder or path inside a Git repository, or a key `project list`
+        /// prints, which still names a project whose checkout was removed
+        /// (defaults to the current directory).
         path: Option<PathBuf>,
         /// Confirm deleting the channels the project still holds. Closing a
         /// project takes its channels with it in every window, and a shell has
@@ -661,7 +671,8 @@ pub enum ChannelCommand {
     },
     /// List shared channels, newest first.
     List {
-        /// Only list channels in this repository.
+        /// Only list channels in this repository, or in the project named by
+        /// a key `project list` prints.
         #[arg(long)]
         repository: Option<PathBuf>,
     },
@@ -708,7 +719,7 @@ pub enum ControlError {
     Configure(#[source] io::Error),
     #[error(transparent)]
     Frame(#[from] FrameError),
-    #[error("the daemon did not answer within {} s", timeout.as_secs_f64())]
+    #[error("the daemon did not answer within {}", reply_budget(*timeout))]
     ReplyTimeout {
         timeout: Duration,
         #[source]
@@ -756,6 +767,8 @@ pub enum ControlError {
     },
     #[error("the daemon did not publish a current terminal snapshot before the deadline")]
     SnapshotTimeout,
+    #[error("the daemon returned a terminal list page that does not follow the previous one")]
+    StalledListPage,
     #[error("timed out waiting for terminal {terminal_id} to contain {text:?}")]
     WaitTimeout {
         terminal_id: TerminalId,
@@ -916,6 +929,16 @@ pub struct ControlClient {
     /// are not retained, but queued notifications can outlive a Detach reply,
     /// so remember their IDs for this connection's lifetime.
     terminal_streams: BTreeSet<TerminalId>,
+}
+
+impl std::fmt::Debug for ControlClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ControlClient")
+            .field("proof", &self.proof)
+            .field("protocol", &self.protocol)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Linux AF_UNIX backlog pressure returns EAGAIN without connecting. Retry
@@ -1104,6 +1127,52 @@ impl ControlClient {
         &self.proof
     }
 
+    /// The stream and proof of a connection that has asked nothing since its
+    /// handshake, for a client that goes on in a protocol of its own, as a
+    /// native chat does, without connecting and handshaking again.
+    ///
+    /// Panics if anything was asked on it: a reply or notification it read
+    /// would be lost to the new owner.
+    pub fn into_handshaken_stream(self) -> (UnixStream, HostSessionProof) {
+        assert!(
+            self.protocol == PROTOCOL_VERSION
+                && self.next_request_id == 2
+                && self.observed.is_empty()
+                && self.observed_model.is_empty()
+                && self.observed_notifications.is_empty()
+                && self.observed_work.is_none()
+                && self.observed_conversation.is_none()
+                && self.attached_chats.is_empty()
+                && self.terminal_streams.is_empty(),
+            "only a connection that has asked nothing since its handshake can be handed over"
+        );
+        (self.stream, self.proof)
+    }
+
+    /// Whether nothing has arrived on this connection since its last reply,
+    /// and the daemon still holds it open. Asks nothing of the daemon and
+    /// never blocks.
+    ///
+    /// A daemon that exits tells each connection it is shutting down before
+    /// closing it, and one that crashes just closes it, so neither leaves a
+    /// request-only connection quiet. Unsolicited input of any other kind
+    /// also ends quiet, so a caller that reconnects whenever a kept
+    /// connection isn't quiet never reads a replaced daemon through it.
+    pub fn is_quiet(&self) -> bool {
+        let mut byte = 0_u8;
+        // SAFETY: the descriptor belongs to this live stream, and the one-byte
+        // buffer is valid for the call. MSG_PEEK leaves any byte queued.
+        let read = unsafe {
+            libc::recv(
+                self.stream.as_raw_fd(),
+                (&mut byte as *mut u8).cast(),
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        read < 0 && io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock
+    }
+
     pub(crate) fn protocol(&self) -> u16 {
         self.protocol
     }
@@ -1133,10 +1202,36 @@ impl ControlClient {
         }
     }
 
+    /// The terminal inventory, read a page at a time so that no reply has to
+    /// hold all of it. A terminal present throughout appears exactly once. An
+    /// update source from before pages answers it in one reply.
     pub fn list(&mut self) -> Result<Vec<TerminalDescriptor>, ControlError> {
-        match self.request_strict(ClientRequest::List)? {
-            ServerResponse::Listed { terminals } => Ok(terminals),
-            response => Err(unexpected_response("a terminal list", &response)),
+        if self.protocol() < crate::terminal_ipc::LIST_PAGES_PROTOCOL {
+            return match self.request_strict(ClientRequest::List)? {
+                ServerResponse::Listed { terminals } => Ok(terminals),
+                response => Err(unexpected_response("a terminal list", &response)),
+            };
+        }
+        let mut inventory: Vec<TerminalDescriptor> = Vec::new();
+        loop {
+            let after = inventory.last().map(|terminal| terminal.session.id);
+            match self.request_strict(ClientRequest::ListPage { after })? {
+                ServerResponse::ListedPage {
+                    terminals,
+                    complete,
+                } => {
+                    // Each page must move past `after`, or the listing would
+                    // never end.
+                    if !crate::terminal_ipc::page_follows(after, &terminals, complete) {
+                        return Err(ControlError::StalledListPage);
+                    }
+                    inventory.extend(terminals);
+                    if complete {
+                        return Ok(inventory);
+                    }
+                }
+                response => return Err(unexpected_response("a terminal list", &response)),
+            }
         }
     }
 
@@ -1941,23 +2036,21 @@ impl ControlClient {
         capture: Option<crate::workspace_model::views::CapturedTerminalSource>,
     ) -> Result<terminal::ipc::TerminalCloseResult, ControlError> {
         let terminal_id = session.id;
-        if !completed_only {
-            if let Err(error) = self.attach_and_synchronize(terminal_id) {
-                // The cleanup request has not been sent. Keep disappearance
-                // distinct from an unconfirmed reply after cleanup admission.
-                return Err(match error {
-                    ControlError::Remote {
-                        code: ProtocolErrorCode::TerminalNotFound,
-                        retryable: false,
-                        ..
-                    } => ControlError::Remote {
-                        code: ProtocolErrorCode::TerminalNotFound,
-                        message: terminal::ipc::TERMINAL_CLOSE_SOURCE_ABSENT.into(),
-                        retryable: false,
-                    },
-                    error => error,
-                });
-            }
+        if !completed_only && let Err(error) = self.attach_and_synchronize(terminal_id) {
+            // The cleanup request has not been sent. Keep disappearance
+            // distinct from an unconfirmed reply after cleanup admission.
+            return Err(match error {
+                ControlError::Remote {
+                    code: ProtocolErrorCode::TerminalNotFound,
+                    retryable: false,
+                    ..
+                } => ControlError::Remote {
+                    code: ProtocolErrorCode::TerminalNotFound,
+                    message: terminal::ipc::TERMINAL_CLOSE_SOURCE_ABSENT.into(),
+                    retryable: false,
+                },
+                error => error,
+            });
         }
         let request = ClientRequest::CloseTerminalSource {
             session,
@@ -2351,7 +2444,7 @@ impl ControlClient {
                 // A subscribed connection can be told about another client's
                 // terminal at any point, including mid-replay.
                 message => {
-                    if let Err(message) = self.absorb(message) {
+                    if let Some(message) = self.absorb(message) {
                         return Err(ControlError::UnexpectedMessage {
                             expected: "the terminal attachment replay",
                             actual: message_name(&message),
@@ -2558,19 +2651,19 @@ impl ControlClient {
                 }
                 Some(_) => return response_from_message(envelope.message),
                 None => match self.absorb(envelope.message) {
-                    Ok(()) => {}
-                    Err(message)
+                    None => {}
+                    Some(message)
                         if streaming_terminal.is_some_and(|id| message_targets(&message, id)) => {}
                     // The daemon's notice that it is dropping this connection,
                     // such as an overflowing delivery queue, says why.
-                    Err(ServerMessage::Error(error)) => {
+                    Some(ServerMessage::Error(error)) => {
                         return Err(ControlError::ConnectionRejected {
                             code: error.code,
                             message: error.message,
                             retryable: error.retryable,
                         });
                     }
-                    Err(message) => {
+                    Some(message) => {
                         return Err(ControlError::UnexpectedMessage {
                             expected: "a correlated response",
                             actual: message_name(&message),
@@ -2587,7 +2680,7 @@ impl ControlClient {
     /// Only a connection that subscribed or attached receives these, at any
     /// point between a request and its response, and it must survive the
     /// request they interrupt.
-    fn absorb(&mut self, message: ServerMessage) -> Result<(), ServerMessage> {
+    fn absorb(&mut self, message: ServerMessage) -> Option<ServerMessage> {
         match message {
             ServerMessage::TerminalWorker { .. } => {}
             ServerMessage::TerminalCreated { terminal } => self.observed.push_back(terminal),
@@ -2659,9 +2752,9 @@ impl ControlClient {
             | ServerMessage::Event { terminal_id, .. }
             | ServerMessage::Synchronized { terminal_id, .. }
                 if self.terminal_streams.contains(&terminal_id) => {}
-            message => return Err(message),
+            message => return Some(message),
         }
-        Ok(())
+        None
     }
 
     fn read_envelope(&mut self) -> Result<ServerEnvelope, ControlError> {
@@ -2823,6 +2916,18 @@ impl HandshakeClient {
         }
     }
 }
+/// How long a reply was awaited, as a person reads it: whole seconds, or a
+/// tenth of a second under one. The budget is often what remained of a
+/// deadline, such as 4.999918217 s of five, which reads as "5 s".
+pub(crate) fn reply_budget(timeout: Duration) -> String {
+    let seconds = timeout.as_secs_f64();
+    if seconds >= 0.95 {
+        format!("{seconds:.0} s")
+    } else {
+        format!("{seconds:.1} s")
+    }
+}
+
 fn reply_error(error: FrameError, timeout: Option<Duration>) -> ControlError {
     if let Some(timeout) = timeout
         && matches!(&error, FrameError::Io(e) if matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock))
@@ -2832,7 +2937,9 @@ fn reply_error(error: FrameError, timeout: Option<Duration>) -> ControlError {
         ControlError::Frame(error)
     }
 }
-pub(crate) fn is_timeout_error(error: &ControlError) -> bool {
+/// Whether `error` is a read or write that ran out of time, rather than a
+/// connection the daemon ended or a reply it gave.
+pub fn is_timeout_error(error: &ControlError) -> bool {
     matches!(error, ControlError::ReplyTimeout { .. })
         || matches!(
             error,
@@ -2922,6 +3029,7 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::BuildInfo { .. } => "build_info",
         ServerResponse::Connected { .. } => "connected",
         ServerResponse::Listed { .. } => "listed",
+        ServerResponse::ListedPage { .. } => "listed_page",
         ServerResponse::Spawned { .. } => "spawned",
         ServerResponse::Attached { .. } => "attached",
         ServerResponse::Detached => "detached",
@@ -3125,6 +3233,31 @@ fn control_daemon_socket() -> Result<PathBuf, AppError> {
     }
 }
 
+/// A connection to the daemon [`control_daemon_socket`] selects. A daemon this
+/// call may start is reached on the connection that proved it ready, rather
+/// than proven ready and then connected to again.
+fn control_daemon_client() -> Result<ControlClient, AppError> {
+    if daemon_autostart_disabled() {
+        let socket = control_daemon_socket()?;
+        return ControlClient::connect(&socket)
+            .map_err(|error| AppError::new("daemon_connection", error));
+    }
+    connect_ready_daemon_client()
+}
+
+/// [`terminal::connect_ready_daemon`], failing as a CLI command reports a
+/// daemon that would not start or could not be reached.
+fn connect_ready_daemon_client() -> Result<ControlClient, AppError> {
+    terminal::connect_ready_daemon()
+        .map(|ready| ready.client)
+        .map_err(|error| match error {
+            terminal::HostedTerminalStartError::Connect(error) => {
+                AppError::new("daemon_connection", error)
+            }
+            error => AppError::new("daemon_start", error),
+        })
+}
+
 fn daemon_missing(error: &io::Error) -> bool {
     matches!(
         error.kind(),
@@ -3148,6 +3281,30 @@ fn already_stopped() -> CommandOutput {
         command: "daemon.stop",
         data: json!({"state": "already_stopped"}),
         human: "Daemon already stopped".into(),
+    }
+}
+
+/// `daemon status` for a selected device whose bridge confirmed that no
+/// daemon is running or holding its inventory lease there.
+fn remote_daemon_stopped() -> CommandOutput {
+    let device = crate::device::selected().map(|device| device.name.as_str());
+    CommandOutput {
+        command: "daemon.status",
+        data: json!({
+            "instance": instance::NAME,
+            "device": device,
+            "running": false,
+            "daemon_present": false,
+            "socket": null,
+            "daemon_version": null,
+            "cli_version": crate::version()
+        }),
+        human: format!(
+            "{} daemon on {} stopped; cli {}",
+            instance::NAME,
+            device.unwrap_or("the selected device"),
+            crate::version()
+        ),
     }
 }
 
@@ -3361,10 +3518,21 @@ where
             command: DaemonCommand::Stop { .. }
         }
     );
-    let no_start = stopping_daemon
+    // Reading status must observe the daemon, never start it to answer.
+    let reading_daemon_status = matches!(
+        &cli.command,
+        TopCommand::Daemon {
+            command: DaemonCommand::Status
+        }
+    );
+    // The policy a staged owner must inherit. Status is left out: an owner
+    // that predates `--no-start` (v0.1.x) would refuse to parse it, and the
+    // installer reads `--json daemon status` from that owner.
+    let inherited_no_start = stopping_daemon
         || cli.global.no_start
         || std::env::var("CAGENTS_NO_START")
             .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
+    let no_start = inherited_no_start || reading_daemon_status;
     let _start_policy = StartPolicy(NO_START.swap(no_start, std::sync::atomic::Ordering::Relaxed));
     let _output_policy =
         OutputPolicy(JSON_OUTPUT.swap(cli.global.json, std::sync::atomic::Ordering::Relaxed));
@@ -3483,7 +3651,7 @@ where
                 // Carry implicit stop/environment policy into the matched CLI.
                 // An older owner that lacks this flag must refuse parsing
                 // rather than recover/start services before handling the read.
-                if no_start && !cli.global.no_start {
+                if inherited_no_start && !cli.global.no_start {
                     command.arg("--no-start");
                 }
                 command.args(&arguments[1..]);
@@ -3517,19 +3685,24 @@ where
             }
         };
     }
-    if crate::device::is_remote() && !matches!(cli.command, TopCommand::Ui { .. }) {
-        if let Err(error) = crate::device::prepare() {
-            if crate::device::daemon_absent(&error) {
-                if stopping_daemon {
-                    emit_success(cli.global.json, already_stopped());
-                    return ExitCode::SUCCESS;
-                }
-                emit_error(cli.global.json, &AppError::new("daemon_not_running", error));
-                return ExitCode::FAILURE;
+    if crate::device::is_remote()
+        && !matches!(cli.command, TopCommand::Ui { .. })
+        && let Err(error) = crate::device::prepare()
+    {
+        if crate::device::daemon_absent(&error) {
+            if stopping_daemon {
+                emit_success(cli.global.json, already_stopped());
+                return ExitCode::SUCCESS;
             }
-            emit_error(cli.global.json, &AppError::new("device", error));
+            if reading_daemon_status {
+                emit_success(cli.global.json, remote_daemon_stopped());
+                return ExitCode::SUCCESS;
+            }
+            emit_error(cli.global.json, &AppError::new("daemon_not_running", error));
             return ExitCode::FAILURE;
         }
+        emit_error(cli.global.json, &AppError::new("device", error));
+        return ExitCode::FAILURE;
     }
     match execute_with_model_context(cli.command, project_channel_context, service_context) {
         Ok(output) => {
@@ -4075,24 +4248,48 @@ fn describe_unattached(
     conversations: &[crate::upgrade::handoff::UnattachedSummary],
     evidence: Option<&Path>,
 ) -> String {
-    let mut text = format!(
-        "{} retained native conversation{} could not be reattached after the daemon update. Nothing was restarted or resent for them and their providers were left as they were; open each in cagents to see why, then recover or close it.",
-        conversations.len(),
-        if conversations.len() == 1 { "" } else { "s" },
-    );
-    for conversation in conversations {
+    use crate::upgrade::handoff::UnattachedDisposition;
+    let plural = |count: usize| if count == 1 { "" } else { "s" };
+    let mut text = String::new();
+    for (disposition, headline) in [
+        (
+            UnattachedDisposition::Retained,
+            "retained native conversation{s} could not be reattached after the daemon update. Nothing was restarted or resent for them and their providers were left as they were; open each in cagents to see why, then recover or close it.",
+        ),
+        (
+            UnattachedDisposition::Stopped,
+            "native conversation{s} could not be restarted after the daemon update. Each restart was stopped and nothing was resent; open each in cagents to reopen it.",
+        ),
+    ] {
+        let group = conversations
+            .iter()
+            .filter(|conversation| conversation.disposition == disposition)
+            .collect::<Vec<_>>();
+        if group.is_empty() {
+            continue;
+        }
+        if !text.is_empty() {
+            text.push('\n');
+        }
         text.push_str(&format!(
-            "\n  {} {} in {}: {}",
-            conversation.provider.label(),
-            printable(
-                conversation
-                    .conversation
-                    .as_deref()
-                    .unwrap_or("(unconfirmed conversation)")
-            ),
-            printable(&conversation.working_directory.to_string_lossy()),
-            printable(&conversation.reason),
+            "{} {}",
+            group.len(),
+            headline.replace("{s}", plural(group.len()))
         ));
+        for conversation in group {
+            text.push_str(&format!(
+                "\n  {} {} in {}: {}",
+                conversation.provider.label(),
+                printable(
+                    conversation
+                        .conversation
+                        .as_deref()
+                        .unwrap_or("(unconfirmed conversation)")
+                ),
+                printable(&conversation.working_directory.to_string_lossy()),
+                printable(&conversation.reason),
+            ));
+        }
     }
     if let Some(evidence) = evidence {
         text.push_str(&format!(
@@ -4311,9 +4508,11 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                 daemon_socket_path().map_err(|error| AppError::new("socket_path", error))?;
             let socket = &selected_socket;
             let mut daemon_version = None;
+            let mut startup = None;
             let running = match ControlClient::connect(socket) {
                 Ok(mut client) => {
                     daemon_version = Some(client.daemon_version().map_err(protocol_error)?);
+                    startup = Some(client.startup_state().map_err(protocol_error)?);
                     true
                 }
                 Err(ControlError::Connect(error))
@@ -4337,10 +4536,12 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                 .map_err(|error| AppError::new("daemon_status", error))?;
             let mut data = json!({
                 "instance": instance::NAME,
+                "device": crate::device::selected().map(|device| device.name.as_str()),
                 "running": running,
                 "daemon_present": daemon_present,
                 "socket": socket,
                 "daemon_version": daemon_version,
+                "startup": startup,
                 "inherited_lease": crate::daemon::lease_handoff::has_inherited_lease()
                     .map_err(|error| AppError::new("daemon_status", error))?,
                 "cli_version": crate::version()
@@ -4367,6 +4568,18 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                     crate::version()
                 )
             };
+            match &startup {
+                Some(terminal::ipc::StartupState::Restoring { awaiting }) => {
+                    human.push_str(&format!(
+                        "\nstartup: restoring; {awaiting} original owners await their outcome"
+                    ))
+                }
+                Some(terminal::ipc::StartupState::Retained { detail }) => {
+                    human.push_str("\nstartup: recovery holds original ownership: ");
+                    human.push_str(detail);
+                }
+                Some(terminal::ipc::StartupState::Ready) | None => {}
+            }
             if let Some((attention, warning)) = upgrade_attention() {
                 data["upgrade_attention"] = attention;
                 human.push_str("\nwarning: ");
@@ -4488,15 +4701,41 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                     "pass --yes to archive the interrupted checkpoint; its conversations will require explicit manual recovery",
                 ));
             }
-            let archive = crate::upgrade::abandon()
+            let abandoned = crate::upgrade::abandon()
                 .map_err(|error| AppError::new("upgrade_recovery", error))?;
+            let mut human = format!(
+                "Archived checkpoint at {}; no processes resumed. Recover exact conversations manually after checking their existing writers",
+                abandoned.archive.display()
+            );
+            match &abandoned.checkpoint_only {
+                Some(identities) if identities.is_empty() => {}
+                Some(identities) => {
+                    human.push_str(&format!(
+                        ".\nOnly the checkpoint records the provider conversation of {} chat(s). The next daemon start saves each to the agent and pane still showing it, and logs any it cannot:",
+                        identities.len()
+                    ));
+                    for identity in identities {
+                        human.push_str(&format!(
+                            "\n  {} {} {} in {}",
+                            identity.id,
+                            identity.provider.label(),
+                            identity.conversation,
+                            identity.working_directory.display()
+                        ));
+                    }
+                }
+                None => human.push_str(
+                    ".\nThe checkpoint could not be read, so conversations only it identified may not reconnect",
+                ),
+            }
             Ok(CommandOutput {
                 command: "daemon.abandon_upgrade",
-                data: json!({ "archive": archive, "resumed": false }),
-                human: format!(
-                    "Archived checkpoint at {}; no processes resumed. Recover exact conversations manually after checking their existing writers",
-                    archive.display()
-                ),
+                data: json!({
+                    "archive": abandoned.archive,
+                    "resumed": false,
+                    "checkpoint_only_identities": abandoned.checkpoint_only,
+                }),
+                human,
             })
         }
         DaemonCommand::StopForRebuild {
@@ -4847,10 +5086,7 @@ fn execute_terminal(command: TerminalCommand) -> Result<CommandOutput, AppError>
         return execute_terminal_as(command, &ProjectChannelContext::capture());
     }
     // Keep the four global read verbs on their existing unauthenticated route.
-    let socket = control_daemon_socket()?;
-    let client = ControlClient::connect(&socket)
-        .map_err(|error| AppError::new("daemon_connection", error))?;
-    terminal_output(command, client)
+    terminal_output(command, control_daemon_client()?)
 }
 
 fn execute_terminal_as(
@@ -5026,11 +5262,10 @@ impl ServiceRequestContext {
 
     fn connect(&self) -> Result<ControlClient, AppError> {
         self.admit_remote()?;
-        let socket = if self.scoped() {
-            daemon_socket_path().map_err(|error| AppError::new("socket_path", error))?
-        } else {
-            control_daemon_socket()?
-        };
+        if !self.scoped() {
+            return control_daemon_client();
+        }
+        let socket = daemon_socket_path().map_err(|error| AppError::new("socket_path", error))?;
         ControlClient::connect(&socket).map_err(|error| AppError::new("daemon_connection", error))
     }
 }
@@ -5063,7 +5298,7 @@ impl ProjectChannelContext {
                     control_daemon_socket()
                 }
             },
-            control_daemon_socket,
+            control_daemon_client,
             ControlClient::connect,
         )
     }
@@ -5078,22 +5313,22 @@ impl ProjectChannelContext {
         Ok(())
     }
 
+    /// `ready` connects to the daemon on the connection that proved it
+    /// ready; `connect` reaches the `existing` one.
     fn connect_with(
         &self,
         mutation: bool,
         existing: impl FnOnce() -> Result<PathBuf, AppError>,
-        ready: impl FnOnce() -> Result<PathBuf, AppError>,
+        ready: impl FnOnce() -> Result<ControlClient, AppError>,
         connect: impl FnOnce(&Path) -> Result<ControlClient, ControlError>,
     ) -> Result<ControlClient, AppError> {
         let scoped = self.authority.token().is_some();
         self.admit_remote()?;
-        let socket = if (scoped && mutation) || self.no_start {
-            existing()?
+        let mut client = if (scoped && mutation) || self.no_start {
+            connect(&existing()?).map_err(|error| AppError::new("daemon_connection", error))?
         } else {
             ready()?
         };
-        let mut client =
-            connect(&socket).map_err(|error| AppError::new("daemon_connection", error))?;
         // Lists are deliberately global reads, including for an invalid or
         // empty inherited capability. Only legacy mutations bind the stream.
         if scoped && mutation {
@@ -5181,10 +5416,11 @@ fn execute_project_with(
     let mutation = project_command_mutates(&command);
     // Reject invalid filesystem paths before starting a daemon. The shared
     // registry then takes precedence over fresh Git discovery for open folders.
+    // A close may name a project whose checkout is gone, which only the
+    // registry can recognize, so it is only checked for shape here.
     let selected = match &command {
-        ProjectCommand::Open { path } | ProjectCommand::Close { path, .. } => {
-            Some(project_directory(path.clone())?)
-        }
+        ProjectCommand::Open { path } => Some(project_directory(path.clone())?),
+        ProjectCommand::Close { path, .. } => Some(registered_project_path(path.clone())?),
         ProjectCommand::List => None,
     };
     let mut client = connect(mutation)?;
@@ -5229,7 +5465,7 @@ impl ProjectCommand {
             }
             Self::List => ResolvedProject::List,
             Self::Close { path, yes } => ResolvedProject::Close {
-                repository: resolve_repository(path, model)?,
+                repository: resolve_registered_repository(path, model)?,
                 confirmed: yes,
             },
         })
@@ -5301,41 +5537,57 @@ fn project_output(
 /// the channels rather than counting them. An empty project is not destructive
 /// at all and needs no flag: a confirmation demanded where nothing can be lost
 /// is a confirmation the user learns to pass without reading.
+///
+/// The close carries the channels that read found, and the registry refuses it
+/// in the deleting transaction if they are no longer exactly those: another
+/// window may create a channel between the read and the close. Then the
+/// project is read again. Without `--yes`, a channel that appeared is refused
+/// and named as if it had been there all along; with it, the close is retried,
+/// so the report still names exactly what went.
 fn close_project(
     client: &mut ControlClient,
     repository: PathBuf,
     confirmed: bool,
 ) -> Result<CommandOutput, AppError> {
-    let model = client.read_workspace_model().map_err(protocol_error)?;
-    let project = model.project(&repository).cloned();
-    let mut channels = model
-        .channels
-        .iter()
-        .filter(|channel| channel.repository == repository)
-        .cloned()
-        .collect::<Vec<_>>();
-    channels.sort_by(|left, right| right.ordinal.cmp(&left.ordinal));
-    if !channels.is_empty() && !confirmed {
-        let listed = channels
+    let mut attempt = 0;
+    let (project, channels) = loop {
+        let model = client.read_workspace_model().map_err(protocol_error)?;
+        let project = model.project(&repository).cloned();
+        let mut channels = model
+            .channels
             .iter()
-            .map(channel_line)
-            .collect::<Vec<_>>()
-            .join("\n");
-        return Err(AppError {
-            kind: "confirmation",
-            message: format!(
-                "closing `{}` deletes {} channel(s) in every window; pass --yes to confirm:\n{listed}",
-                repository.display(),
-                channels.len(),
-            ),
-            details: Some(json!({ "channels": channels })),
-        });
-    }
-    client
-        .edit_workspace_model(ModelEdit::CloseProject {
+            .filter(|channel| channel.repository == repository)
+            .cloned()
+            .collect::<Vec<_>>();
+        channels.sort_by(|left, right| right.ordinal.cmp(&left.ordinal));
+        if !channels.is_empty() && !confirmed {
+            let listed = channels
+                .iter()
+                .map(channel_line)
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err(AppError {
+                kind: "confirmation",
+                message: format!(
+                    "closing `{}` deletes {} channel(s) in every window; pass --yes to confirm:\n{listed}",
+                    repository.display(),
+                    channels.len(),
+                ),
+                details: Some(json!({ "channels": channels })),
+            });
+        }
+        match client.edit_workspace_model(ModelEdit::CloseConfirmedProject {
             repository: repository.clone(),
-        })
-        .map_err(protocol_error)?;
+            channels: channels.iter().map(|channel| channel.id).collect(),
+        }) {
+            Ok(_) => break (project, channels),
+            Err(ControlError::Remote {
+                code: ProtocolErrorCode::ViewConflict,
+                ..
+            }) if attempt < 2 => attempt += 1,
+            Err(error) => return Err(protocol_error(error)),
+        }
+    };
     // Exactly what was removed, in the spellings `project list` and
     // `channel list` print: the project's own line, then one line per channel
     // that went with it. A project the registry did not hold removed nothing
@@ -5392,11 +5644,13 @@ fn execute_channel_with(
     let mutation = channel_command_mutates(&command);
     // Reject invalid filesystem paths before starting a daemon. The shared
     // registry then takes precedence over fresh Git discovery for open folders.
+    // A listing may name a project whose checkout is gone, which only the
+    // registry can recognize, so it is only checked for shape here.
     let selected = match &command {
         ChannelCommand::Spawn { repository, .. } => Some(project_directory(repository.clone())?),
         ChannelCommand::List {
             repository: Some(path),
-        } => Some(project_directory(Some(path.clone()))?),
+        } => Some(registered_project_path(Some(path.clone()))?),
         _ => None,
     };
     let mut client = connect(mutation)?;
@@ -5455,7 +5709,7 @@ impl ChannelCommand {
             // directory would silently hide channels the user asked to see.
             Self::List { repository } => ResolvedChannel::List {
                 repository: repository
-                    .map(|path| resolve_repository(Some(path), model))
+                    .map(|path| resolve_registered_repository(Some(path), model))
                     .transpose()?,
             },
             Self::Close { channel_id } => ResolvedChannel::Close { channel_id },
@@ -5604,6 +5858,68 @@ fn project_directory(path: Option<PathBuf>) -> Result<PathBuf, AppError> {
         ));
     }
     Ok(canonical)
+}
+
+/// The absolute path a verb names for a project the registry may hold, before
+/// anything about it is known: it may name a checkout that no longer exists.
+fn registered_project_path(path: Option<PathBuf>) -> Result<PathBuf, AppError> {
+    absolute_working_directory(path).map_err(|error| AppError::new("repository", error))
+}
+
+/// Resolves a path naming a project the registry may already hold.
+///
+/// The key `project list` prints names its project as it is, without asking the
+/// filesystem: a project whose checkout was removed can be named no other way,
+/// and closing it is how its row is cleaned up. A removed Git checkout also
+/// names its project, whose key is the `.git` directory that was inside it.
+/// Any other path is discovered as [`resolve_repository`] discovers it.
+fn resolve_registered_repository(
+    path: Option<PathBuf>,
+    model: Option<&WorkspaceModel>,
+) -> Result<PathBuf, AppError> {
+    let given = registered_project_path(path.clone())?;
+    let registered = model.and_then(|model| {
+        // As given: a remote device's paths cannot be checked here, and its
+        // discovery answers for the paths that exist.
+        if crate::device::is_remote() {
+            return model.project(&given);
+        }
+        match given.canonicalize() {
+            // A path that exists is named by what it resolves to: folding a
+            // `..` that follows a symbolic link would name another directory.
+            Ok(existing) => model.project(&existing),
+            // Lexically, since a removed checkout has nothing left to resolve:
+            // a `..` in `cagents project close ../old` would otherwise match no
+            // key.
+            Err(_) => {
+                let named = lexically_normal(&given);
+                model
+                    .project(&named)
+                    .or_else(|| model.project(&named.join(".git")))
+            }
+        }
+    });
+    match registered {
+        // The registry's spelling, not the caller's: a trailing slash compares
+        // equal here but is another key to the store.
+        Some(project) => Ok(project.repository.clone()),
+        None => resolve_repository(path, model),
+    }
+}
+
+/// `path` with each `..` removing the component before it, without asking the
+/// filesystem.
+fn lexically_normal(path: &Path) -> PathBuf {
+    path.components()
+        .fold(PathBuf::new(), |mut normal, component| {
+            match component {
+                std::path::Component::ParentDir => {
+                    normal.pop();
+                }
+                component => normal.push(component),
+            }
+            normal
+        })
 }
 
 fn resolve_repository(
@@ -5800,6 +6116,28 @@ fn emit_error(json_output: bool, error: &AppError) {
 #[cfg(test)]
 mod tests {
     use super::ControlError;
+
+    #[test]
+    fn a_reply_timeout_reads_as_the_budget_it_was_given() {
+        use std::time::Duration;
+        let timeout = |budget| ControlError::ReplyTimeout {
+            timeout: budget,
+            error: super::FrameError::Io(std::io::ErrorKind::TimedOut.into()),
+        };
+        // What remained of a five second deadline.
+        assert_eq!(
+            timeout(Duration::from_nanos(4_999_918_217)).to_string(),
+            "the daemon did not answer within 5 s"
+        );
+        assert_eq!(
+            timeout(Duration::from_secs(30)).to_string(),
+            "the daemon did not answer within 30 s"
+        );
+        assert_eq!(
+            timeout(Duration::from_millis(250)).to_string(),
+            "the daemon did not answer within 0.2 s"
+        );
+    }
 
     #[cfg(feature = "host")]
     #[test]
@@ -6709,6 +7047,15 @@ mod tests {
                         version: "fixture".into(),
                     },
                 );
+                // Status also reports whether startup recovery holds owners.
+                let request: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+                assert!(matches!(request.request, ClientRequest::StartupState));
+                response(
+                    &mut stream,
+                    &pinned,
+                    request.request_id,
+                    ServerResponse::StartupState(terminal::ipc::StartupState::Ready),
+                );
                 assert!(read_frame::<ClientEnvelope>(&mut stream).unwrap().is_none());
             });
             assert_eq!(
@@ -6926,7 +7273,7 @@ mod tests {
             executable: "cagents".into(),
         })
         .unwrap();
-        crate::device::select(Some("launch-test".into())).unwrap();
+        crate::device::select(Some("launch-test")).unwrap();
         let mut command = Command::new("sh");
         command.args([
             "-c",
@@ -6964,6 +7311,7 @@ mod tests {
             conversation: Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into()),
             working_directory: "/work/project".into(),
             reason: reason.into(),
+            disposition: crate::upgrade::handoff::UnattachedDisposition::Retained,
         };
         let one = describe_unattached(
             &[conversation("no rollout found for thread id")],
@@ -7001,6 +7349,25 @@ mod tests {
             "{hostile}"
         );
         assert_eq!(hostile.lines().count(), 2, "{hostile}");
+
+        // A restart the update stopped is described as stopped, never as a
+        // provider that was left running, and is grouped apart from those.
+        let mut stopped =
+            conversation("Codex server did not open its local socket within 15 seconds");
+        stopped.disposition = crate::upgrade::handoff::UnattachedDisposition::Stopped;
+        let mixed = describe_unattached(&[conversation("unavailable"), stopped], None);
+        let lines = mixed.lines().collect::<Vec<_>>();
+        assert!(
+            lines[0].starts_with("1 retained native conversation could not be reattached"),
+            "{mixed}"
+        );
+        assert!(lines[1].ends_with(": unavailable"), "{mixed}");
+        assert!(
+            lines[2].starts_with("1 native conversation could not be restarted"),
+            "{mixed}"
+        );
+        assert!(lines[2].contains("Each restart was stopped"), "{mixed}");
+        assert!(lines[3].ends_with("within 15 seconds"), "{mixed}");
     }
 
     #[test]
@@ -7862,10 +8229,12 @@ mod tests {
             assert_eq!(
                 edit.request,
                 ClientRequest::EditWorkspaceModel {
-                    edit: ModelEdit::CloseProject {
+                    edit: ModelEdit::CloseConfirmedProject {
                         repository: closed.clone(),
+                        channels: [older, newer].into(),
                     },
                 },
+                "the close carries exactly the channels it will report"
             );
             // What the registry is left with: the project and its channels are
             // gone together, through the store's own cascade.
@@ -7914,6 +8283,284 @@ mod tests {
             vec![newer.to_string(), older.to_string()],
             "and names them under the field name `channel list` uses"
         );
+    }
+
+    /// Another window can create a channel between the read `project close`
+    /// confirms and the close itself. The daemon refuses a close whose channels
+    /// changed; the CLI reads the project again, then either refuses and names
+    /// the new channel, or with `--yes` closes again and reports it.
+    #[test]
+    fn a_channel_created_during_project_close_is_never_taken_unreported() {
+        for confirmed in [false, true] {
+            let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+            let peer_proof = proof("session", "boot", "incarnation");
+            let repository = PathBuf::from("/repo/.git");
+            let late = ChannelId::new();
+            let empty = model_with_channels(&repository, &[]);
+            let raced = model_with_channels(&repository, &[(late, "late", 2)]);
+            let closed = repository.clone();
+            let server = thread::spawn(move || {
+                let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                write_frame(
+                    &mut server_stream,
+                    &connected_envelope(1, peer_proof.clone(), peer_proof.clone()),
+                )
+                .unwrap();
+                let read: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                assert_eq!(read.request, ClientRequest::ReadWorkspaceModel);
+                write_frame(
+                    &mut server_stream,
+                    &model_envelope(read.request_id, peer_proof.clone(), empty.clone()),
+                )
+                .unwrap();
+                let edit: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                assert_eq!(
+                    edit.request,
+                    ClientRequest::EditWorkspaceModel {
+                        edit: ModelEdit::CloseConfirmedProject {
+                            repository: closed.clone(),
+                            channels: Default::default(),
+                        },
+                    },
+                    "an empty project is closed only while it is still empty"
+                );
+                // The window's channel landed first, so the registry refuses.
+                write_frame(
+                    &mut server_stream,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(edit.request_id),
+                        proof: peer_proof.clone(),
+                        message: ServerMessage::Error(crate::terminal_ipc::ProtocolError::new(
+                            ProtocolErrorCode::ViewConflict,
+                            "The project's channels changed since they were confirmed",
+                            true,
+                        )),
+                    },
+                )
+                .unwrap();
+                let read: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                assert_eq!(read.request, ClientRequest::ReadWorkspaceModel);
+                write_frame(
+                    &mut server_stream,
+                    &model_envelope(read.request_id, peer_proof.clone(), raced),
+                )
+                .unwrap();
+                if confirmed {
+                    let edit: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                    assert_eq!(
+                        edit.request,
+                        ClientRequest::EditWorkspaceModel {
+                            edit: ModelEdit::CloseConfirmedProject {
+                                repository: closed,
+                                channels: [late].into(),
+                            },
+                        },
+                    );
+                    write_frame(
+                        &mut server_stream,
+                        &model_envelope(edit.request_id, peer_proof, WorkspaceModel::default()),
+                    )
+                    .unwrap();
+                }
+                read_frame::<ClientEnvelope>(&mut server_stream).unwrap()
+            });
+            let mut client = ControlClient::from_stream(client_stream).unwrap();
+            let result = project_output(
+                &mut client,
+                ResolvedProject::Close {
+                    repository: repository.clone(),
+                    confirmed,
+                },
+            );
+            drop(client);
+            assert_eq!(server.join().unwrap(), None, "nothing else is sent");
+            if confirmed {
+                let output = result.unwrap();
+                assert_eq!(
+                    output.human,
+                    format!("/repo/.git\trepo\n{late}\t/repo/.git\tlate"),
+                    "the report names the channel the close actually took"
+                );
+            } else {
+                let Err(error) = result else {
+                    panic!("a channel nobody confirmed is not closed");
+                };
+                assert_eq!(error.kind, "confirmation");
+                assert!(
+                    error.message.contains(&late.to_string()),
+                    "{}",
+                    error.message
+                );
+            }
+        }
+    }
+
+    /// A project whose channels keep changing is not chased forever: after the
+    /// third refused close the command fails, having closed nothing.
+    #[test]
+    fn a_project_close_gives_up_while_its_channels_keep_changing() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let peer_proof = proof("session", "boot", "incarnation");
+        let repository = PathBuf::from("/repo/.git");
+        let empty = model_with_channels(&repository, &[]);
+        let server = thread::spawn(move || {
+            let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            write_frame(
+                &mut server_stream,
+                &connected_envelope(1, peer_proof.clone(), peer_proof.clone()),
+            )
+            .unwrap();
+            for _ in 0..3 {
+                let read: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                assert_eq!(read.request, ClientRequest::ReadWorkspaceModel);
+                write_frame(
+                    &mut server_stream,
+                    &model_envelope(read.request_id, peer_proof.clone(), empty.clone()),
+                )
+                .unwrap();
+                let edit: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                assert!(matches!(
+                    edit.request,
+                    ClientRequest::EditWorkspaceModel {
+                        edit: ModelEdit::CloseConfirmedProject { .. }
+                    }
+                ));
+                write_frame(
+                    &mut server_stream,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(edit.request_id),
+                        proof: peer_proof.clone(),
+                        message: ServerMessage::Error(crate::terminal_ipc::ProtocolError::new(
+                            ProtocolErrorCode::ViewConflict,
+                            "The project's channels changed since they were confirmed",
+                            true,
+                        )),
+                    },
+                )
+                .unwrap();
+            }
+            read_frame::<ClientEnvelope>(&mut server_stream).unwrap()
+        });
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        let result = project_output(
+            &mut client,
+            ResolvedProject::Close {
+                repository,
+                confirmed: true,
+            },
+        );
+        drop(client);
+        assert_eq!(server.join().unwrap(), None, "three attempts, then none");
+        let Err(error) = result else {
+            panic!("a close that never held is not reported as done");
+        };
+        assert_eq!(
+            error.details.unwrap(),
+            json!({"code": ProtocolErrorCode::ViewConflict, "retryable": true})
+        );
+    }
+
+    /// A project whose checkout was removed is still closed, and its channels
+    /// still listed, by the key `project list` printed for it, or by the
+    /// checkout directory that held its `.git`. Nothing on disk has to exist.
+    #[test]
+    fn a_removed_checkout_is_named_by_its_registered_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let checkout = directory.path().canonicalize().unwrap().join("removed");
+        let repository = checkout.join(".git");
+        let folder = directory
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("removed-folder");
+        let mut model = model_with_channels(&repository, &[]);
+        model.projects.push(ModelProject {
+            kind: crate::model::ProjectKind::Folder,
+            repository: folder.clone(),
+            name: "removed-folder".into(),
+            ordinal: 2,
+        });
+        for (named, expected) in [
+            (repository.clone(), &repository),
+            // `project list` output pasted with a trailing slash still names
+            // the row, and the registry's own spelling is what is sent.
+            (
+                PathBuf::from(format!("{}/", repository.display())),
+                &repository,
+            ),
+            (checkout.clone(), &repository),
+            (checkout.join("../removed"), &repository),
+            (folder.clone(), &folder),
+        ] {
+            let ResolvedProject::Close { repository, .. } = (ProjectCommand::Close {
+                path: Some(named.clone()),
+                yes: false,
+            })
+            .resolved_with_model(Some(&model))
+            .unwrap_or_else(|error| panic!("{}: {}", named.display(), error.message)) else {
+                panic!("expected a resolved close");
+            };
+            assert_eq!(&repository, expected, "{}", named.display());
+            assert_eq!(repository.as_os_str(), expected.as_os_str());
+            let ResolvedChannel::List {
+                repository: Some(repository),
+            } = (ChannelCommand::List {
+                repository: Some(named.clone()),
+            })
+            .resolved_with_model(Some(&model))
+            .unwrap()
+            else {
+                panic!("expected a filtered channel list");
+            };
+            assert_eq!(&repository, expected);
+        }
+        // A path the registry does not hold is still discovered, and a missing
+        // one is still refused as one.
+        let Err(error) = (ProjectCommand::Close {
+            path: Some(directory.path().join("never-registered")),
+            yes: true,
+        })
+        .resolved_with_model(Some(&model)) else {
+            panic!("an unknown missing path names no project");
+        };
+        assert_eq!(error.kind, "repository");
+    }
+
+    /// A `..` after a symbolic link in a path that exists climbs out of the
+    /// link's target, as the filesystem resolves it, so the registered project
+    /// the folded spelling would name is not the one closed.
+    #[test]
+    fn an_existing_path_through_a_link_names_the_project_it_resolves_to() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("real/target")).unwrap();
+        std::fs::create_dir_all(root.join("real/sibling")).unwrap();
+        std::os::unix::fs::symlink(root.join("real/target"), root.join("link")).unwrap();
+        let mut model = model_with_channels(&root.join("unrelated/.git"), &[]);
+        // `folded` is what `link/../sibling` would name if its `..` were
+        // folded lexically; `resolved` is the directory it names.
+        let folded = root.join("sibling");
+        let resolved = root.join("real/sibling");
+        for (ordinal, repository) in [(2, &folded), (3, &resolved)] {
+            model.projects.push(ModelProject {
+                kind: crate::model::ProjectKind::Folder,
+                repository: repository.clone(),
+                name: "sibling".into(),
+                ordinal,
+            });
+        }
+        let named = root.join("link/../sibling");
+        let ResolvedProject::Close { repository, .. } = (ProjectCommand::Close {
+            path: Some(named.clone()),
+            yes: false,
+        })
+        .resolved_with_model(Some(&model))
+        .unwrap_or_else(|error| panic!("{}: {}", named.display(), error.message)) else {
+            panic!("expected a resolved close");
+        };
+        assert_eq!(repository, resolved, "{}", named.display());
     }
 
     /// A registry holding one project and the channels named in it.
@@ -8096,6 +8743,55 @@ mod tests {
         }
     }
 
+    /// A connection kept across a wait stops reading as quiet once its daemon
+    /// announces its shutdown or closes it, without asking it anything.
+    #[test]
+    fn a_kept_connection_is_quiet_only_while_its_daemon_serves_it() {
+        fn handshaken() -> (ControlClient, UnixStream) {
+            let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+            let server = thread::spawn(move || {
+                let connect: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                let proof = proof("session", "boot", "incarnation");
+                write_frame(
+                    &mut server_stream,
+                    &connected_envelope(connect.request_id, proof.clone(), proof),
+                )
+                .unwrap();
+                server_stream
+            });
+            let client = ControlClient::from_stream(client_stream).unwrap();
+            (client, server.join().unwrap())
+        }
+
+        // An ordinary exit queues its shutdown notice and closes only once
+        // that is delivered, so the connection is still open meanwhile.
+        let (client, mut server_stream) = handshaken();
+        assert!(client.is_quiet(), "a serving daemon keeps it quiet");
+        write_frame(
+            &mut server_stream,
+            &ServerEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: None,
+                proof: proof("session", "boot", "incarnation"),
+                message: ServerMessage::HostShuttingDown,
+            },
+        )
+        .unwrap();
+        assert!(!client.is_quiet(), "a shutting-down daemon");
+        server_stream.shutdown(std::net::Shutdown::Both).unwrap();
+        assert!(!client.is_quiet(), "a daemon that exited after its notice");
+
+        // A crash closes the connection with nothing said. Shut the socket
+        // itself down: a test process forking concurrently can briefly hold
+        // a duplicate of the descriptor, which would keep a bare drop from
+        // closing the connection.
+        let (client, server_stream) = handshaken();
+        assert!(client.is_quiet());
+        server_stream.shutdown(std::net::Shutdown::Both).unwrap();
+        drop(server_stream);
+        assert!(!client.is_quiet(), "a crashed daemon");
+    }
+
     #[test]
     fn handshake_pins_complete_matching_proof_and_correlates_requests() {
         let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
@@ -8122,6 +8818,7 @@ mod tests {
             let list: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
             assert_eq!(list.request_id, 2);
             assert_eq!(list.proof.as_ref(), Some(&server_proof));
+            assert_eq!(list.request, ClientRequest::ListPage { after: None });
             write_frame(
                 &mut server_stream,
                 &ServerEnvelope {
@@ -8129,8 +8826,9 @@ mod tests {
                     request_id: Some(2),
                     proof: server_proof,
                     message: ServerMessage::Response {
-                        response: ServerResponse::Listed {
+                        response: ServerResponse::ListedPage {
                             terminals: Vec::new(),
+                            complete: true,
                         },
                     },
                 },
@@ -8142,6 +8840,93 @@ mod tests {
         assert_eq!(client.proof(), &expected);
         assert!(client.list().unwrap().is_empty());
         server.join().unwrap();
+    }
+
+    #[test]
+    fn listing_reads_each_page_after_the_last_and_refuses_one_that_does_not_advance() {
+        let recipe = || LaunchRecipe {
+            program: "/bin/sh".into(),
+            arguments: Vec::new(),
+            working_directory: "/".into(),
+            environment: BTreeMap::new(),
+            unset_environment: Default::default(),
+        };
+        let mut terminals = (0..3)
+            .map(|_| TerminalDescriptor::relaunchable(TerminalId::new(), recipe(), None))
+            .collect::<Vec<_>>();
+        terminals.sort_by_key(|terminal| terminal.session.id);
+        let id = |index: usize| terminals[index].session.id;
+        // Each case: the pages the daemon answers with, the `after` it must be
+        // asked for each, and what the listing then returns.
+        let cases = [
+            (
+                vec![
+                    (vec![terminals[0].clone(), terminals[1].clone()], false),
+                    (vec![terminals[2].clone()], true),
+                ],
+                vec![None, Some(id(1))],
+                Some(terminals.clone()),
+            ),
+            // An empty page that claims more follows would never end.
+            (
+                vec![(vec![terminals[0].clone()], false), (Vec::new(), false)],
+                vec![None, Some(id(0))],
+                None,
+            ),
+            // So would a page that goes back to an identity already read.
+            (
+                vec![
+                    (vec![terminals[1].clone()], false),
+                    (vec![terminals[0].clone()], true),
+                ],
+                vec![None, Some(id(1))],
+                None,
+            ),
+        ];
+        for (pages, expected_after, listed) in cases {
+            let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+            let pinned = proof("session", "boot", "incarnation");
+            let server_proof = pinned.clone();
+            let server = thread::spawn(move || {
+                let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                write_frame(
+                    &mut server_stream,
+                    &connected_envelope(1, server_proof.clone(), server_proof.clone()),
+                )
+                .unwrap();
+                let mut asked = Vec::new();
+                for (terminals, complete) in pages {
+                    let page: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                    let ClientRequest::ListPage { after } = page.request else {
+                        panic!("expected a page request, got {:?}", page.request);
+                    };
+                    asked.push(after);
+                    write_frame(
+                        &mut server_stream,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: Some(page.request_id),
+                            proof: server_proof.clone(),
+                            message: ServerMessage::Response {
+                                response: ServerResponse::ListedPage {
+                                    terminals,
+                                    complete,
+                                },
+                            },
+                        },
+                    )
+                    .unwrap();
+                }
+                asked
+            });
+            let mut client = ControlClient::from_stream(client_stream).unwrap();
+            match (client.list(), listed) {
+                (Ok(inventory), Some(expected)) => assert_eq!(inventory, expected),
+                (Err(ControlError::StalledListPage), None) => {}
+                (result, expected) => panic!("listed {result:?}, expected {expected:?}"),
+            }
+            assert_eq!(server.join().unwrap(), expected_after);
+        }
     }
 
     #[test]
@@ -8271,10 +9056,12 @@ mod tests {
 
     #[test]
     fn pre_image_reference_daemon_revision_is_rejected_before_snapshot_or_prompt() {
-        assert!(
-            PROTOCOL_VERSION > 104,
-            "image reference fields require matched positional peers"
-        );
+        const {
+            assert!(
+                PROTOCOL_VERSION > 104,
+                "image reference fields require matched positional peers"
+            )
+        };
         let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
         let server = thread::spawn(move || {
             let hello: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
@@ -8316,8 +9103,9 @@ mod tests {
                     ))
                 } else {
                     ServerMessage::Response {
-                        response: ServerResponse::Listed {
+                        response: ServerResponse::ListedPage {
                             terminals: Vec::new(),
+                            complete: true,
                         },
                     }
                 };
@@ -8363,8 +9151,9 @@ mod tests {
                         request_id: Some(2),
                         proof: proof("different", "boot", "incarnation"),
                         message: ServerMessage::Response {
-                            response: ServerResponse::Listed {
+                            response: ServerResponse::ListedPage {
                                 terminals: Vec::new(),
+                                complete: true,
                             },
                         },
                     }
@@ -8531,7 +9320,10 @@ mod tests {
                 )
                 .unwrap();
                 let list: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
-                assert!(matches!(list.request, ClientRequest::List));
+                assert!(matches!(
+                    list.request,
+                    ClientRequest::ListPage { after: None }
+                ));
                 // Publication succeeded before persistence failed. Its output
                 // still arrives during the fallback's view/inventory reads.
                 write_frame(
@@ -8554,7 +9346,10 @@ mod tests {
                         request_id: Some(list.request_id),
                         proof: pinned,
                         message: ServerMessage::Response {
-                            response: ServerResponse::Listed { terminals: vec![] },
+                            response: ServerResponse::ListedPage {
+                                terminals: vec![],
+                                complete: true,
+                            },
                         },
                     },
                 )
@@ -8650,7 +9445,10 @@ mod tests {
                     .unwrap();
                 }
                 let list: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
-                assert!(matches!(list.request, ClientRequest::List));
+                assert!(matches!(
+                    list.request,
+                    ClientRequest::ListPage { after: None }
+                ));
                 // These genuine terminal-stream message kinds remain legal
                 // after the first attachment replay and during a later RPC.
                 for message in [
@@ -8677,8 +9475,9 @@ mod tests {
                         event_sequence: 1,
                     },
                     ServerMessage::Response {
-                        response: ServerResponse::Listed {
+                        response: ServerResponse::ListedPage {
                             terminals: vec![terminal],
+                            complete: true,
                         },
                     },
                 ] {
@@ -8696,7 +9495,10 @@ mod tests {
                     .unwrap();
                 }
                 let list: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
-                assert!(matches!(list.request, ClientRequest::List));
+                assert!(matches!(
+                    list.request,
+                    ClientRequest::ListPage { after: None }
+                ));
                 let mut envelope = ServerEnvelope {
                     version: PROTOCOL_VERSION,
                     request_id: None,
@@ -9260,13 +10062,19 @@ mod tests {
                         false,
                     )),
                 );
-                assert_eq!(request(&mut server_stream, &pinned, 3), ClientRequest::List);
+                assert_eq!(
+                    request(&mut server_stream, &pinned, 3),
+                    ClientRequest::ListPage { after: None }
+                );
                 reply(
                     &mut server_stream,
                     &pinned,
                     Some(3),
                     ServerMessage::Response {
-                        response: ServerResponse::Listed { terminals: vec![] },
+                        response: ServerResponse::ListedPage {
+                            terminals: vec![],
+                            complete: true,
+                        },
                     },
                 );
                 return;
@@ -9391,7 +10199,7 @@ mod tests {
             }
             assert_eq!(
                 request(&mut server_stream, &pinned, next),
-                ClientRequest::List,
+                ClientRequest::ListPage { after: None },
                 "confirmed retirement must be followed by List, never Detach"
             );
             reply(
@@ -9399,8 +10207,9 @@ mod tests {
                 &pinned,
                 Some(next),
                 ServerMessage::Response {
-                    response: ServerResponse::Listed {
+                    response: ServerResponse::ListedPage {
                         terminals: Vec::new(),
+                        complete: true,
                     },
                 },
             );
@@ -9765,13 +10574,14 @@ mod tests {
             );
             let answer_list = |stream: &mut UnixStream| {
                 let list: ClientEnvelope = read_frame(stream).unwrap().unwrap();
-                assert_eq!(list.request, ClientRequest::List);
+                assert_eq!(list.request, ClientRequest::ListPage { after: None });
                 send(
                     stream,
                     Some(list.request_id),
                     ServerMessage::Response {
-                        response: ServerResponse::Listed {
+                        response: ServerResponse::ListedPage {
                             terminals: Vec::new(),
+                            complete: true,
                         },
                     },
                 );
@@ -10217,7 +11027,7 @@ mod tests {
             let mut client = client;
             client
                 .request_with_deadline(
-                    ClientRequest::List,
+                    ClientRequest::ListPage { after: None },
                     Instant::now() + Duration::from_millis(6100),
                 )
                 .unwrap_err()
@@ -10229,7 +11039,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("the daemon did not answer within 6."),
+                .contains("the daemon did not answer within 6 s"),
             "{error}"
         );
         server.join().unwrap();

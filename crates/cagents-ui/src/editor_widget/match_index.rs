@@ -133,7 +133,7 @@ impl MatchBuilder {
         let Some((run, previous, ordinal)) = self.pending.take() else {
             return;
         };
-        if self.runs % CHECKPOINT_RUNS == 0 {
+        if self.runs.is_multiple_of(CHECKPOINT_RUNS) {
             self.data.checkpoints.push(Checkpoint {
                 ordinal,
                 offset: self.data.bytes.len(),

@@ -3,7 +3,7 @@
 //! https://github.com/openai/codex/tree/rust-v0.153.4/codex-rs/app-server-protocol
 //! Pending requests are replayed to joining connections with the original ID;
 //! the first answer wins (app-server/src/outgoing_message.rs). Never auto-answer.
-use super::{Adapter, ProcessSpec, ServerIdentity, Step, TransportSpec};
+use super::{Adapter, HeldStop, ProcessSpec, ServerIdentity, Step, TransportSpec};
 use crate::account::{self, LiveReport};
 use crate::chat::{
     self, Answer, Attachment, Capabilities, ChangeKind, Choice, Command, CommandAction, Event,
@@ -123,10 +123,9 @@ fn append_display_output(
     // single-line output preserve a UTF-8-safe suffix instead.
     if start > 0
         && let Some(line) = tail[start..].find('\n')
+        && start + line + 1 < tail.len()
     {
-        if start + line + 1 < tail.len() {
-            start += line + 1;
-        }
+        start += line + 1;
     }
     window.omitted = window.omitted.saturating_add(start);
     window.head = head.len();
@@ -159,7 +158,7 @@ fn remote_socket(address: &str) -> Result<Option<PathBuf>, String> {
 /// Record a provider-confirmed rotation in the recipe: rewrites the `resume`
 /// thread ID `create()` validates so a checkpointed launch stays
 /// self-consistent. Only call with the live provider's own identity.
-pub fn align_resume_identity(arguments: &mut Vec<String>, id: &str) -> Result<(), String> {
+pub fn align_resume_identity(arguments: &mut [String], id: &str) -> Result<(), String> {
     let mut index = 0;
     while index < arguments.len() {
         if arguments[index] == "resume" {
@@ -520,6 +519,7 @@ fn create_inner(
             pricing: Default::default(),
             turn_pricing: Default::default(),
             turn: None,
+            held_stop: HeldStop::None,
             notification_turn: None,
             notification_revision: 0,
             busy: false,
@@ -686,6 +686,9 @@ struct Codex {
     pricing: chat::pricing::CostTracker,
     turn_pricing: std::collections::VecDeque<(String, Option<String>, Option<String>)>,
     turn: Option<String>,
+    /// A stop asked for while this thread's `turn/start` was unanswered,
+    /// sent as `turn/interrupt` once the turn's ID is known.
+    held_stop: HeldStop,
     /// Exact live notice authority. Scalar status and paged history must not
     /// replace it; they can arrive after a newer turn's start.
     notification_turn: Option<String>,
@@ -1592,23 +1595,21 @@ impl Codex {
                 return Err("Codex did not return full turn items as requested; history cannot be hydrated safely".into());
             }
             for value in array(turn, "items")? {
-                if !active && value["type"] == "userMessage" {
-                    if let Some(label) = value["content"]
+                if !active
+                    && value["type"] == "userMessage"
+                    && let Some(label) = value["content"]
                         .as_array()
                         .into_iter()
                         .flatten()
                         .find_map(|input| input["text"].as_str())
                         .and_then(crate::account::clean_label)
-                    {
-                        if !self.branch_points.iter().any(|point| point.id == turn_id)
-                            && self.branch_points.len() < 128
-                        {
-                            self.branch_points.push(chat::BranchPoint {
-                                id: turn_id.into(),
-                                label,
-                            });
-                        }
-                    }
+                    && !self.branch_points.iter().any(|point| point.id == turn_id)
+                    && self.branch_points.len() < 128
+                {
+                    self.branch_points.push(chat::BranchPoint {
+                        id: turn_id.into(),
+                        label,
+                    });
                 }
                 if value["type"] == "collabAgentToolCall" {
                     for id in value["receiverThreadIds"]
@@ -2099,6 +2100,7 @@ impl Adapter for Codex {
                 match mode {
                     PromptMode::Send => {
                         if self.busy || self.pending.values().any(|p| matches!(p, Pending::Turn { .. })) { return Err("A Codex turn is active; explicitly steer or queue instead".into()); }
+                        self.held_stop = HeldStop::None;
                         let mut params = json!({"threadId":self.thread,"input":input});
                         if self.selection_dirty { params["model"] = json!(self.selected); params["effort"] = json!(self.reasoning); }
                         self.notification_revision = self.notification_revision.wrapping_add(1);
@@ -2119,10 +2121,13 @@ impl Adapter for Codex {
                     }
                 }
             }
-            Command::Interrupt => {
-                let turn = self.turn.as_ref().ok_or("There is no known active Codex turn to interrupt")?;
-                self.call(&mut step, "turn/interrupt", json!({"threadId":self.thread,"turnId":turn}), Pending::Other)?;
-            }
+            // Codex names a turn only once it has started, so a stop given
+            // while its start is unanswered waits for that name.
+            Command::Interrupt => match self.turn.clone() {
+                Some(turn) => self.call(&mut step, "turn/interrupt", json!({"threadId":self.thread,"turnId":turn}), Pending::Other)?,
+                None if self.starting_turn() => self.held_stop = HeldStop::Waiting,
+                None => return Err("There is no known active Codex turn to interrupt".into()),
+            },
             // The client's form of the model's own `interrupt_agent`: a child
             // is a thread of its own, so interrupting its turn reaches neither
             // the parent nor its siblings. Unlike input, this is not refused
@@ -2230,7 +2235,38 @@ impl Adapter for Codex {
         }
         Ok(step)
     }
+    fn held_stop(&self) -> HeldStop {
+        self.held_stop
+    }
     fn receive(&mut self, frame: Value) -> Result<Step, String> {
+        let mut step = self.receive_frame(frame)?;
+        if self.held_stop == HeldStop::Waiting {
+            if let Some(turn) = self.turn.clone() {
+                self.held_stop = HeldStop::Sent;
+                self.call(
+                    &mut step,
+                    "turn/interrupt",
+                    json!({"threadId":self.thread,"turnId":turn}),
+                    Pending::Other,
+                )?;
+            } else if !self.starting_turn() {
+                // The start failed: there is nothing left to stop.
+                self.held_stop = HeldStop::Dropped;
+            }
+        }
+        Ok(step)
+    }
+}
+
+impl Codex {
+    /// Whether a `turn/start` this thread sent is still unanswered.
+    fn starting_turn(&self) -> bool {
+        self.pending
+            .values()
+            .any(|pending| matches!(pending, Pending::Turn { .. }))
+    }
+
+    fn receive_frame(&mut self, frame: Value) -> Result<Step, String> {
         let mut step = Step::default();
         if !frame.is_object() {
             return Err("Codex sent a non-object JSON-RPC frame".into());
@@ -2805,6 +2841,25 @@ impl Adapter for Codex {
                     let owns_current = notification_revision == self.notification_revision
                         || self.notification_turn.as_deref() == Some(id);
                     let early_completion = early.remove(id);
+                    // The answer names the very turn a stop given while it
+                    // was unanswered was for, whichever lifecycle it now
+                    // belongs to. One that already finished needs none.
+                    if self.held_stop == HeldStop::Waiting {
+                        if early_completion
+                            .as_ref()
+                            .is_some_and(|early| early.completed.is_some())
+                        {
+                            self.held_stop = HeldStop::Dropped;
+                        } else {
+                            self.held_stop = HeldStop::Sent;
+                            self.call(
+                                &mut step,
+                                "turn/interrupt",
+                                json!({"threadId":self.thread,"turnId":id}),
+                                Pending::Other,
+                            )?;
+                        }
+                    }
                     // An active-status update may announce newer work before
                     // its turn ID arrives. The old request's correlation alone
                     // cannot assign that lifecycle to its acknowledged turn.
@@ -3287,12 +3342,10 @@ impl Adapter for Codex {
                     // it. Retain any known terminal proof for that exact ACK.
                     if let Some(Pending::Turn { early, .. }) = self.pending.values_mut().find(|pending|
                         matches!(pending, Pending::Turn { notification_revision, .. } if *notification_revision == self.notification_revision))
-                    {
-                        if let Some(context) = early.get_mut(turn_id) {
+                        && let Some(context) = early.get_mut(turn_id) {
                             step.notification_preview = Some(std::mem::take(&mut context.preview).at_observed_start());
                             context.preview_transferred = true;
                         }
-                    }
                     self.notification_revision = self.notification_revision.wrapping_add(1);
                     self.notification_turn = Some(turn_id.to_owned());
                     self.suggestion_turn = None;
@@ -3514,7 +3567,7 @@ impl Adapter for Codex {
                     };
                     format!("{base}/{kind}/{index}")
                 } else {
-                    base.into()
+                    base
                 };
                 step.events.push(Event::TextDelta {
                     id,
@@ -3580,11 +3633,11 @@ impl Adapter for Codex {
                 // The patch is parsed only once there is an item to hold it, so
                 // a notification for an item this adapter never tracked cannot
                 // fail the session over a patch nothing would render.
-                if let Some(item) = self.active_items.get_mut(&id) {
-                    if let ItemContent::Changes { changes, .. } = &mut item.content {
-                        *changes = file_changes(params)?;
-                        step.events.push(Event::Item(item.clone()));
-                    }
+                if let Some(item) = self.active_items.get_mut(&id)
+                    && let ItemContent::Changes { changes, .. } = &mut item.content
+                {
+                    *changes = file_changes(params)?;
+                    step.events.push(Event::Item(item.clone()));
                 }
             }
             "serverRequest/resolved" => {
@@ -3732,9 +3785,9 @@ impl Adapter for Codex {
             // requests are visibly rejected above.
             _ => {}
         }
-        if step.suppress_current_notification {
-            if let Some(turn) = notification_frame_turn {
-                if let Some(Pending::Turn { early, .. }) = self.pending.values_mut().find(|pending|
+        if step.suppress_current_notification
+            && let Some(turn) = notification_frame_turn
+                && let Some(Pending::Turn { early, .. }) = self.pending.values_mut().find(|pending|
                     matches!(pending, Pending::Turn { notification_revision, .. } if *notification_revision == self.notification_revision))
                 {
                     if !early.contains_key(&turn) && early.len() >= 8 {
@@ -3743,8 +3796,6 @@ impl Adapter for Codex {
                     let context = early.entry(turn).or_default();
                     for event in &step.events { context.preview.observe(event); }
                 }
-            }
-        }
         Ok(step)
     }
 }
@@ -3997,45 +4048,50 @@ fn message_phase(value: &Value) -> Phase {
         _ => Phase::Final,
     }
 }
-/// Codex's own best-effort parse of a shell command, which may decompose into
-/// several actions because a command can be a pipeline. The first classified
-/// action is what the invocation was for; `unknown` entries carry nothing the
-/// view cannot already read off the command itself. The label is what the
-/// action was applied to; the view supplies the verb, from the action.
+/// Codex's own best-effort parse of a shell command, which decomposes a
+/// compound command into an action for each part it kept. A command is a
+/// read, a search or a listing only when that is all of it: every part the
+/// same kind of action on the same target. `cat a.md; cat b.md`, `ls; rg x`
+/// and anything with an `unknown` part run several things, which a label for
+/// one of them would misreport, so they are commands the view names by what
+/// ran. The label is what the action was applied to; the view supplies the
+/// verb, from the action.
 fn command_intent(actions: &Value) -> (CommandAction, String) {
+    let unclassified = (CommandAction::Run, String::new());
     let Some(actions) = actions.as_array() else {
-        return (CommandAction::Run, String::new());
+        return unclassified;
     };
-    for action in actions {
+    let mut intents = actions.iter().map(|action| {
         let path = action["path"].as_str();
         match action["type"].as_str() {
-            Some("read") => {
-                return (
-                    CommandAction::Read,
-                    path.map(str::to_owned).unwrap_or_default(),
-                );
-            }
-            Some("search") => {
-                return (
-                    CommandAction::Search,
-                    match (action["query"].as_str(), path) {
-                        (Some(query), Some(path)) => format!("{query} in {path}"),
-                        (Some(query), None) => query.to_owned(),
-                        (None, Some(path)) => path.to_owned(),
-                        (None, None) => String::new(),
-                    },
-                );
-            }
-            Some("listFiles") => {
-                return (
-                    CommandAction::List,
-                    path.map(str::to_owned).unwrap_or_default(),
-                );
-            }
-            _ => {}
+            Some("read") => Some((
+                CommandAction::Read,
+                path.map(str::to_owned).unwrap_or_default(),
+            )),
+            Some("search") => Some((
+                CommandAction::Search,
+                match (action["query"].as_str(), path) {
+                    (Some(query), Some(path)) => format!("{query} in {path}"),
+                    (Some(query), None) => query.to_owned(),
+                    (None, Some(path)) => path.to_owned(),
+                    (None, None) => String::new(),
+                },
+            )),
+            Some("listFiles") => Some((
+                CommandAction::List,
+                path.map(str::to_owned).unwrap_or_default(),
+            )),
+            _ => None,
         }
+    });
+    let Some(Some(first)) = intents.next() else {
+        return unclassified;
+    };
+    if intents.all(|intent| intent.as_ref() == Some(&first)) {
+        first
+    } else {
+        unclassified
     }
-    (CommandAction::Run, String::new())
 }
 /// Codex keys a patch by the file it read, so an update's `move_path` is where
 /// the file ended up while the entry's own `path` is where it came from.
@@ -4622,15 +4678,14 @@ fn parse_item_with_windows(
         } else {
             MAX_ITEM_BYTES
         };
-        if bytes > MAX_ITEM_BYTES {
-            if let ItemContent::Tool { output, .. } | ItemContent::Command { output, .. } =
+        if bytes > MAX_ITEM_BYTES
+            && let ItemContent::Tool { output, .. } | ItemContent::Command { output, .. } =
                 &mut item.content
-            {
-                let limit = MAX_ITEM_BYTES.saturating_sub(bytes.saturating_sub(output.len()));
-                // Completed items replace streamed items, so apply the same bound.
-                let full = std::mem::take(output);
-                append_display_output(output, &full, limit, &mut window);
-            }
+        {
+            let limit = MAX_ITEM_BYTES.saturating_sub(bytes.saturating_sub(output.len()));
+            // Completed items replace streamed items, so apply the same bound.
+            let full = std::mem::take(output);
+            append_display_output(output, &full, limit, &mut window);
         }
         if item.content.byte_len() > limit {
             return Err("Codex item exceeds native client size bound".into());

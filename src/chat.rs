@@ -43,6 +43,11 @@ pub(crate) fn declines(action: &str) -> bool {
 /// Only explicit authentication failures qualify: a bare HTTP 401 can describe
 /// a tool or service unrelated to the conversation's provider account.
 pub fn requires_sign_in(provider: Provider, message: &str) -> bool {
+    // An ACP conversation words every sign-in failure the same way, from the
+    // protocol's own `auth_required` error.
+    if provider.speaks_acp() {
+        return message.starts_with(ACP_SIGN_IN_PREFIX);
+    }
     if provider != Provider::Codex {
         return false;
     }
@@ -65,6 +70,9 @@ pub fn requires_sign_in(provider: Provider, message: &str) -> bool {
                 .iter()
                 .any(|phrase| lower.contains(phrase)))
 }
+
+/// How an ACP conversation's sign-in failure begins.
+pub const ACP_SIGN_IN_PREFIX: &str = "Authentication required";
 
 const SIGN_IN_VERIFICATION_MARKER: &str = "\nSign-in verification: ";
 
@@ -118,6 +126,109 @@ mod authentication_tests {
         }
         assert!(!requires_sign_in(Provider::Claude, "Not logged in"));
         assert!(!requires_sign_in(Provider::Omp, "Not logged in"));
+    }
+
+    #[test]
+    fn an_acp_provider_needs_sign_in_only_for_its_adapter_s_own_words() {
+        let failure =
+            format!("{ACP_SIGN_IN_PREFIX}: sign in to Antigravity, then try again. (log in first)");
+        assert!(requires_sign_in(Provider::Antigravity, &failure));
+        // The words a tool's output may quote are not the protocol's signal.
+        for message in [
+            "Not logged in",
+            "The deployment said: Authentication required",
+            "Please sign in again",
+        ] {
+            assert!(
+                !requires_sign_in(Provider::Antigravity, message),
+                "{message}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod acp_permission_tests {
+    use super::*;
+
+    fn recipe(arguments: &[&str]) -> LaunchRecipe {
+        LaunchRecipe {
+            program: "agy".into(),
+            arguments: arguments
+                .iter()
+                .map(|argument| (*argument).into())
+                .collect(),
+            working_directory: "/work".into(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        }
+    }
+
+    #[test]
+    fn an_acp_terminal_names_its_mode_in_its_own_words() {
+        let provider = Provider::Antigravity;
+        let mut launch = recipe(&["--model", "m", "--mode=plan"]);
+        assert_eq!(
+            acp_permission_mode(&launch, provider).as_deref(),
+            Some("plan")
+        );
+        assert!(apply_acp_permission_mode(
+            &mut launch,
+            provider,
+            "acceptEdits"
+        ));
+        assert_eq!(launch.arguments, ["--model", "m", "--mode", "accept-edits"]);
+        assert_eq!(
+            acp_permission_mode(&launch, provider).as_deref(),
+            Some("acceptEdits")
+        );
+        // Its default is the absence of the option, which `agy` requires.
+        assert!(apply_acp_permission_mode(&mut launch, provider, "default"));
+        assert_eq!(launch.arguments, ["--model", "m"]);
+        assert_eq!(
+            acp_permission_mode(&launch, provider).as_deref(),
+            Some("default")
+        );
+        // A mode never hides the conversation the command resumes.
+        let mut resume = recipe(&["--model", "m", "--conversation", "c"]);
+        assert!(apply_acp_permission_mode(&mut resume, provider, "plan"));
+        assert_eq!(
+            resume.arguments,
+            ["--model", "m", "--mode", "plan", "--conversation", "c"]
+        );
+        assert_eq!(provider.resume_id(&resume.arguments), Some("c"));
+        // A mode the agent does not have changes nothing.
+        assert!(!apply_acp_permission_mode(
+            &mut launch,
+            provider,
+            "bypassPermissions"
+        ));
+        assert_eq!(launch.arguments, ["--model", "m"]);
+        assert!(!apply_acp_permission_mode(
+            &mut launch,
+            Provider::Codex,
+            "plan"
+        ));
+        assert_eq!(acp_permission_mode(&launch, Provider::Codex), None);
+    }
+
+    #[test]
+    fn a_conversation_returned_to_its_terminal_in_any_mode_is_recognized() {
+        let launch = Launch {
+            provider: Provider::Antigravity,
+            recipe: recipe(&["--mode", "plan", "--model", "m"]),
+            session_id: Some("98608bab-5eb6-4cf5-8f9b-46019bf29df7".into()),
+        };
+        for mode in [None, Some("default"), Some("acceptEdits"), Some("plan")] {
+            let terminal = launch.terminal_recipe_with_permission_mode(mode).unwrap();
+            assert_eq!(
+                Provider::Antigravity.resume_id(&terminal.arguments),
+                launch.session_id.as_deref(),
+                "{mode:?}"
+            );
+            assert!(launch.resumes_in_terminal(&terminal), "{mode:?}");
+        }
+        assert!(!launch.resumes_in_terminal(&recipe(&["--model", "m"])));
     }
 }
 
@@ -223,10 +334,12 @@ impl Launch {
     /// when the user returns from native chat.
     pub fn terminal_recipe_with_permission_mode(&self, mode: Option<&str>) -> Option<LaunchRecipe> {
         let mut recipe = self.terminal_recipe()?;
-        if self.provider == Provider::Claude
-            && let Some(mode) = mode
-        {
-            apply_claude_permission_mode(&mut recipe, mode);
+        if let Some(mode) = mode {
+            if self.provider == Provider::Claude {
+                apply_claude_permission_mode(&mut recipe, mode);
+            } else {
+                apply_acp_permission_mode(&mut recipe, self.provider, mode);
+            }
         }
         Some(recipe)
     }
@@ -237,11 +350,22 @@ impl Launch {
     /// cannot prove which mode was confirmed; it proves the recipe differs from
     /// the resume by nothing else.
     pub fn resumes_in_terminal(&self, recipe: &LaunchRecipe) -> bool {
-        let mode = match recipe.arguments.as_slice() {
-            [.., flag, mode] if flag == "--permission-mode" => Some(mode.as_str()),
-            _ => None,
+        let mode = if self.provider.speaks_acp() {
+            // Its default mode goes unnamed, and any other comes before the
+            // conversation it resumes.
+            if self.terminal_recipe().as_ref() == Some(recipe) {
+                return true;
+            }
+            acp_permission_mode(recipe, self.provider)
+        } else {
+            match recipe.arguments.as_slice() {
+                [.., flag, mode] if flag == "--permission-mode" => Some(mode.clone()),
+                _ => None,
+            }
         };
-        self.terminal_recipe_with_permission_mode(mode).as_ref() == Some(recipe)
+        self.terminal_recipe_with_permission_mode(mode.as_deref())
+            .as_ref()
+            == Some(recipe)
     }
 
     /// Return to the CLI using the current provider-confirmed identity, not a
@@ -303,6 +427,65 @@ pub fn apply_claude_permission_mode(recipe: &mut LaunchRecipe, mode: &str) -> bo
     arguments.extend(["--permission-mode".into(), mode.into()]);
     recipe.arguments = arguments;
     true
+}
+
+/// Names the cagents permission mode `meaning` on an ACP agent's terminal
+/// command line, in the agent's own words, in place of any mode it named.
+/// Returns whether `provider` serves ACP and has such a mode.
+pub fn apply_acp_permission_mode(
+    recipe: &mut LaunchRecipe,
+    provider: Provider,
+    meaning: &str,
+) -> bool {
+    let Some(acp) = provider.acp() else {
+        return false;
+    };
+    let own = acp.own_mode(meaning);
+    if !acp.modes.iter().any(|(mode, _)| *mode == own) {
+        return false;
+    }
+    let mut arguments = Vec::with_capacity(recipe.arguments.len() + 2);
+    let mut original = std::mem::take(&mut recipe.arguments).into_iter();
+    let inline = format!("{}=", acp.mode_option);
+    while let Some(argument) = original.next() {
+        if argument == acp.mode_option {
+            original.next();
+        } else if !argument.starts_with(&inline) {
+            arguments.push(argument);
+        }
+    }
+    // The agent's terminal may not accept its default by name. The mode goes
+    // before a conversation the command resumes, which is read only at the
+    // end of the command.
+    if own != acp.default_mode {
+        let at = match arguments.as_slice() {
+            [.., flag, _] if flag == provider.resume_flag() => arguments.len() - 2,
+            _ => arguments.len(),
+        };
+        arguments.splice(at..at, [acp.mode_option.into(), own.into()]);
+    }
+    recipe.arguments = arguments;
+    true
+}
+
+/// The cagents permission mode an ACP agent's terminal command line starts
+/// it in, for a provider that serves ACP.
+pub fn acp_permission_mode(recipe: &LaunchRecipe, provider: Provider) -> Option<String> {
+    let acp = provider.acp()?;
+    let inline = format!("{}=", acp.mode_option);
+    let mut named = None;
+    let mut arguments = recipe.arguments.iter();
+    while let Some(argument) = arguments.next() {
+        if argument == acp.mode_option {
+            named = arguments.next().map(String::as_str);
+        } else if let Some(mode) = argument.strip_prefix(&inline) {
+            named = Some(mode);
+        }
+    }
+    Some(
+        acp.mode_meaning(named.unwrap_or(acp.default_mode))
+            .to_owned(),
+    )
 }
 
 /// What a card is asking the daemon to do with a conversation.
@@ -400,13 +583,29 @@ pub enum Recovery {
     /// stop being the way back to it, rather than implying either a deletion
     /// or a round trip that is not there.
     Fresh,
+    /// The daemon is still restoring the conversations an update carried
+    /// over, or holds that restore for recovery
+    /// ([`STARTUP_RECOVERY_REFUSAL`]), and refused this before starting
+    /// anything. Nothing about this conversation is wrong: the same request
+    /// is admitted once the daemon's startup recovery has finished, which the
+    /// client learns by asking the daemon's startup state.
+    UpdateRecovery,
+    /// The update's restore restarted this conversation, the restart failed,
+    /// and the daemon stopped it again ([`UPDATE_RESTART_STOPPED`]). Nothing of
+    /// it runs and nothing was resent. Attaching to it again, which is all a
+    /// restore does, only meets the same refusal; an explicit start of the
+    /// saved conversation reopens it, and the reader has to ask for that.
+    UpdateStopped,
 }
 
 impl Recovery {
     /// Whether repeating the same start cannot help until something outside
     /// this card changes.
     pub fn is_blocked(self) -> bool {
-        matches!(self, Self::Blocked | Self::AfterRestart)
+        matches!(
+            self,
+            Self::Blocked | Self::AfterRestart | Self::UpdateRecovery | Self::UpdateStopped
+        )
     }
 }
 
@@ -415,6 +614,26 @@ impl Recovery {
 /// process gone, so a client reads this exact sentence as
 /// [`Recovery::AfterRestart`]. The protocol has no code of its own for it.
 pub const UNPROVEN_OWNER_REFUSAL: &str = "This conversation's earlier Claude process ended without recording its close, and cagents cannot prove that nothing else still holds the conversation, so nothing was started in its place. It can be reopened after you restart this computer.";
+
+/// How the daemon's refusal begins for a conversation whose restart after an
+/// update failed and was stopped again. Nothing of it runs and nothing was
+/// resent, so an ordinary start of its saved conversation reopens it; a client
+/// may read this prefix to offer that instead of treating the card as blocked.
+pub const UPDATE_RESTART_STOPPED: &str =
+    "This conversation could not be restarted after the update";
+
+/// The daemon's full refusal for [`UPDATE_RESTART_STOPPED`], naming the
+/// provider's own reason.
+pub fn update_restart_stopped(reason: &str) -> String {
+    let reason = reason.trim_end_matches('.');
+    format!("{UPDATE_RESTART_STOPPED}. {reason}. It isn't running, and nothing was resent.")
+}
+
+/// How the daemon's refusal under startup recovery's hold on original
+/// ownership begins. The protocol has no code of its own for it, so a client
+/// recognises a non-retryable `TerminalUnavailable` that starts with this
+/// sentence, and can confirm the hold by asking for the startup state.
+pub const STARTUP_RECOVERY_REFUSAL: &str = "Startup recovery retained original ownership";
 
 impl StartFailure {
     pub fn retry(message: impl Into<String>) -> Self {
@@ -568,6 +787,14 @@ impl AttachmentRules {
                 max_image_bytes: 16 * MIB,
                 max_file_bytes: None,
             },
+            // An ACP agent is sent an image inline, when it says it reads
+            // them, and is pointed at any other file, which it reads itself.
+            Provider::Antigravity | Provider::Muse => Self {
+                images_only: false,
+                max_count: None,
+                max_image_bytes: ACP_MAX_IMAGE_BYTES,
+                max_file_bytes: None,
+            },
         }
     }
 
@@ -605,6 +832,9 @@ pub fn is_image_path(path: &std::path::Path) -> bool {
                 .any(|image| extension.eq_ignore_ascii_case(image))
         })
 }
+
+/// The largest image an ACP prompt carries inline.
+pub const ACP_MAX_IMAGE_BYTES: u64 = 16 * MIB;
 
 /// Inline tool images are spooled to private files before entering a snapshot.
 pub const MAX_INLINE_IMAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -862,11 +1092,11 @@ pub fn is_upgrade_identity_learning(source: &Session, replacement: &Session) -> 
         || source.launch.recipe != replacement.launch.recipe
         || !source.has_valid_native_continuity()
         || source.owned_codex_listener.is_some() && !source.owns_codex_listener()
-        || !source
+        || source
             .proof
             .as_ref()
             .zip(replacement.proof.as_ref())
-            .is_some_and(|(old, new)| old.boot_id == new.boot_id)
+            .is_none_or(|(old, new)| old.boot_id != new.boot_id)
         || source.terminal.as_ref().is_some_and(|terminal| {
             terminal.continuity.live_proof().as_ref() != source.proof.as_ref()
         })
@@ -1715,13 +1945,52 @@ pub struct TextCopySource {
     pub bytes: u64,
 }
 
-/// A transcript item's body is presented in parts of at most this many bytes,
-/// so one enormous message or tool output stays pageable.
+/// A message's body is presented in parts of at most this many bytes, so one
+/// enormous message stays pageable. A step's input and output are never cut
+/// into parts: a long one is presented as an excerpt of its start and end.
 pub const TRANSCRIPT_PART_BYTES: usize = 128 * 1024;
 
 /// A transcript window presents items of at most this many bytes in all; the
 /// reader pages to see more.
 pub const TRANSCRIPT_WINDOW_BYTES: usize = 3 * 1024 * 1024;
+
+/// A size in bytes, rounded for reading at a glance: `4.2 MB`, `850 KB`.
+pub fn approximate_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1000.0 && unit + 1 < UNITS.len() {
+        value /= 1000.0;
+        unit += 1;
+    }
+    if unit == 0 || value >= 100.0 {
+        format!("{value:.0} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+const EXCERPT_GAP_OPEN: &str = "\u{22ef} ";
+const EXCERPT_GAP_CLOSE: &str = " not shown \u{22ef}";
+
+/// The line a step's long input or output is shown with between its start
+/// and end, saying how much of it lies between them.
+pub fn excerpt_gap(omitted: u64) -> String {
+    format!(
+        "{EXCERPT_GAP_OPEN}{}{EXCERPT_GAP_CLOSE}\n",
+        approximate_size(omitted)
+    )
+}
+
+/// Whether a step's input or output, as a transcript row presents it, is an
+/// excerpt: it holds a line [`excerpt_gap`] wrote.
+pub fn is_excerpt(text: &str) -> bool {
+    text.match_indices(EXCERPT_GAP_CLOSE).any(|(at, _)| {
+        text[text[..at].rfind('\n').map_or(0, |start| start + 1)..at]
+            .strip_prefix(EXCERPT_GAP_OPEN)
+            .is_some_and(|size| !size.is_empty())
+    })
+}
 
 /// Where a presented part after the first sits in its transcript item. The
 /// first part keeps the item's own ID; each later part's ID names the item,
@@ -2052,6 +2321,31 @@ impl Serialize for ToolStatus {
             Self::Ended => "Ended",
         };
         serializer.serialize_unit_variant("ToolStatus", status as u32, name)
+    }
+}
+
+/// Characters of a task kept in its short name.
+const SHORT_NAME_CHARS: usize = 60;
+
+/// The first non-empty line of the first text that has one, cut to the
+/// length a list of names can show.
+pub(crate) fn short_name<'a>(texts: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let line = texts
+        .into_iter()
+        .find_map(|text| text.lines().map(str::trim).find(|line| !line.is_empty()))?;
+    let mut chars = line.chars();
+    let mut name: String = chars.by_ref().take(SHORT_NAME_CHARS).collect();
+    if chars.next().is_some() {
+        name.push('…');
+    }
+    Some(name)
+}
+
+impl Subagent {
+    /// Whether it holds its conversation apart from the turn: it runs in the
+    /// background, or waits on background work of its own.
+    pub fn outlives_turn(&self) -> bool {
+        self.status == ToolStatus::Waiting || self.background && self.status.is_live()
     }
 }
 
@@ -2434,21 +2728,6 @@ pub struct Item {
     /// when it finished for an item that is no longer being written to.
     #[serde(default)]
     pub at: Option<u64>,
-}
-
-/// A paged command's label or tool's name as the provider gave it.
-#[cfg(feature = "host")]
-pub(crate) fn without_page_mark(label: &str) -> &str {
-    label
-        .rsplit_once(" (part ")
-        .filter(|(_, mark)| {
-            mark.strip_suffix(')')
-                .and_then(|mark| mark.split_once('/'))
-                .is_some_and(|(part, parts)| {
-                    part.parse::<usize>().is_ok() && parts.parse::<usize>().is_ok()
-                })
-        })
-        .map_or(label, |(label, _)| label)
 }
 
 impl Item {
@@ -3983,6 +4262,12 @@ pub fn fresh_session(
             // settings remain under Claude's own handling.
             if let Some(mode) = claude_configured_default_mode(&recipe) {
                 recipe.arguments.extend(["--permission-mode".into(), mode]);
+            }
+        }
+        // An ACP agent opens a new session with no option of its own.
+        Provider::Antigravity | Provider::Muse => {
+            if !provider.has_native_chat() {
+                return Err(provider.native_chat_refusal());
             }
         }
     }

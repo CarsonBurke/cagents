@@ -416,6 +416,7 @@ impl Cagents {
         let emptied = self.close_emptied_channels(&[card]);
         self.retire_lsp_card(card);
         self.sidebar_state.forget_card_attention(card);
+        self.forget_reopening(card);
         self.cards.remove(&card);
         self.lifecycle.remove(card);
         Arc::make_mut(&mut self.durable).card_scopes.remove(&card);
@@ -478,10 +479,9 @@ impl Cagents {
             return cosmic::task::future(async move {
                 let source = session.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    let socket = crate::terminal::ensure_daemon_ready()
-                        .map_err(|error| error.to_string())?;
-                    let mut client =
-                        ControlClient::connect(&socket).map_err(|error| error.to_string())?;
+                    let mut client = crate::terminal::connect_ready_daemon()
+                        .map_err(|error| error.to_string())?
+                        .client;
                     let basis = match authority.read_basis(&mut client, &source) {
                         Err(error) if is_source_close_refusal(&error) => {
                             return Ok(CompletedCloseOutcome::SourceChanged);
@@ -769,8 +769,11 @@ impl Cagents {
             self.close_emptied_channels(&[id])
         };
         // Nothing of a terminal proven gone is left to bring back. Reopening
-        // could only run its saved command again, unasked.
-        if let Some(card) = closed_descriptor.filter(|_| !self.proven_gone_cards.remove(&id)) {
+        // could only run its saved command again, unasked. Nor of a pane
+        // that gave way to another holding its conversation.
+        if let Some(card) = closed_descriptor
+            .filter(|_| !self.proven_gone_cards.remove(&id) && !self.reopen_superseded(id))
+        {
             self.recently_closed
                 .push((card, self.active_workspace_destination()));
             if self.recently_closed.len() > 32 {
@@ -1262,6 +1265,216 @@ fn cancel_id() -> widget::Id {
 
 fn confirm_id() -> widget::Id {
     widget::Id::new("dialog.terminal-close.confirm")
+}
+
+fn is_source_close_refusal(error: &crate::control::ControlError) -> bool {
+    matches!(error, crate::control::ControlError::Remote { code: crate::terminal_ipc::ProtocolErrorCode::InvalidRequest,
+        message, retryable: false } if message == crate::terminal_ipc::TERMINAL_CLOSE_SOURCE_CONFLICT)
+}
+
+fn source_close_outcome(
+    result: Result<TerminalCloseResult, crate::control::ControlError>,
+) -> CloseOutcome {
+    match result {
+        Ok(TerminalCloseResult::Closed) => CloseOutcome::Closed,
+        Ok(TerminalCloseResult::Active) => CloseOutcome::Active,
+        Ok(TerminalCloseResult::Unknown(reason)) => CloseOutcome::Unreachable(reason),
+        Err(error) if is_source_close_refusal(&error) => CloseOutcome::SourceChanged,
+        Err(crate::control::ControlError::Remote {
+            code: crate::terminal_ipc::ProtocolErrorCode::TerminalNotFound,
+            message,
+            retryable: false,
+        }) if message == crate::terminal_ipc::TERMINAL_CLOSE_SOURCE_ABSENT => CloseOutcome::Stale,
+        Err(error) => CloseOutcome::Unreachable(error.to_string()),
+    }
+}
+
+fn revalidate_and_close(
+    intent: &CloseIntent,
+    allow_active: bool,
+    authority: &super::shared_views::TerminalCleanupAuthority,
+) -> CloseOutcome {
+    if let Some(source) = &intent.completed_source {
+        let run = || -> Result<CloseOutcome, String> {
+            let path =
+                crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
+            let mut client = ControlClient::connect(&path).map_err(|error| error.to_string())?;
+            if client.proof() != &intent.proof || !intent.proof.is_complete() {
+                return Ok(CloseOutcome::Stale);
+            }
+            let basis = match authority.read_basis(&mut client, source) {
+                Err(error) if is_source_close_refusal(&error) => {
+                    return Ok(CloseOutcome::SourceChanged);
+                }
+                result => result.map_err(|error| error.to_string())?,
+            };
+            if matches!(
+                basis,
+                crate::workspace_model::views::TerminalRemovalBasis::Absent { .. }
+            ) {
+                return Ok(
+                    match super::daemon_recovery::prove_not_hosted_for(
+                        source,
+                        &intent.leave,
+                        authority,
+                    ) {
+                        Ok(basis) => CloseOutcome::NotHostedWithBasis(basis),
+                        Err(kept) => CloseOutcome::Kept(kept),
+                    },
+                );
+            }
+            if !authority.permits_resolved(&basis) {
+                return Ok(CloseOutcome::SourceChanged);
+            }
+            let result = if authority.capture().is_some() || authority.worker().is_some() {
+                client.close_captured_terminal_source(
+                    source.clone(),
+                    basis.clone(),
+                    true,
+                    allow_active,
+                    authority.capture().cloned(),
+                )
+            } else {
+                client.release_completed_terminal(source.clone(), allow_active)
+            };
+            Ok(match source_close_outcome(result) {
+                CloseOutcome::Closed => CloseOutcome::ClosedWithBasis(authority.receipt(basis)),
+                outcome => outcome,
+            })
+        };
+        return run().unwrap_or_else(CloseOutcome::Unreachable);
+    }
+    let mut basis = None;
+    let outcome = close_or_prove_gone(
+        intent,
+        || {
+            if let (Some(source), Some(basis)) = (intent.saved_source.as_ref(), authority.worker())
+            {
+                close_hosted_terminal_source(
+                    source,
+                    basis,
+                    allow_active,
+                    authority.capture().cloned(),
+                )
+            } else {
+                close_hosted_terminal(intent.terminal, &intent.proof, allow_active)
+            }
+        },
+        |source, leave| {
+            basis = Some(super::daemon_recovery::prove_not_hosted_for(
+                source, leave, authority,
+            )?);
+            Ok(())
+        },
+    );
+    match (outcome, basis) {
+        (CloseOutcome::NotHosted, Some(basis)) => CloseOutcome::NotHostedWithBasis(basis),
+        (outcome, _) => outcome,
+    }
+}
+
+/// `close` is the only route that can stop anything, so a card whose connection
+/// was lost never reaches it. Its `Stale` means the daemon doesn't host the saved
+/// identity. That is what a dead terminal looks like, and also what an unknown
+/// one looks like, so only a positive proof may retire the pane.
+fn close_or_prove_gone(
+    intent: &CloseIntent,
+    close: impl FnOnce() -> CloseOutcome,
+    prove: impl FnOnce(&TerminalSession, &[UnreadableProcess]) -> Result<(), KeptPane>,
+) -> CloseOutcome {
+    if !intent.probe_only {
+        match close() {
+            CloseOutcome::Stale => {}
+            outcome => return outcome,
+        }
+    }
+    let Some(saved) = &intent.saved_source else {
+        return CloseOutcome::Stale;
+    };
+    match prove(saved, &intent.leave) {
+        Ok(()) => CloseOutcome::NotHosted,
+        Err(kept) => CloseOutcome::Kept(kept),
+    }
+}
+
+fn close_hosted_terminal_source(
+    source: &TerminalSession,
+    basis: &crate::workspace_model::views::TerminalRemovalBasis,
+    allow_active: bool,
+    capture: Option<crate::workspace_model::views::CapturedTerminalSource>,
+) -> CloseOutcome {
+    let run = || -> Result<CloseOutcome, String> {
+        let crate::workspace_model::views::TerminalRemovalBasis::Worker { owner, .. } = basis
+        else {
+            return Ok(CloseOutcome::Stale);
+        };
+        let path = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
+        let mut client = ControlClient::connect(&path).map_err(|error| error.to_string())?;
+        if client.proof() != owner || !owner.is_complete() {
+            return Ok(CloseOutcome::Stale);
+        }
+        Ok(source_close_outcome(client.close_captured_terminal_source(
+            source.clone(),
+            basis.clone(),
+            false,
+            allow_active,
+            capture,
+        )))
+    };
+    run().unwrap_or_else(CloseOutcome::Unreachable)
+}
+
+/// Asks the daemon to close `terminal`, provided the daemon is still the one
+/// `proof` names and still hosts it as that session. A terminal that has
+/// already ended counts as closed; one that is gone, or hosted under another
+/// proof, is `Stale` and left alone.
+pub(super) fn close_hosted_terminal(
+    terminal: TerminalId,
+    proof: &HostSessionProof,
+    allow_active: bool,
+) -> CloseOutcome {
+    let run = || -> Result<CloseOutcome, String> {
+        let path = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
+        let mut client = ControlClient::connect(&path).map_err(|error| error.to_string())?;
+        if client.proof() != proof || !proof.is_complete() {
+            return Ok(CloseOutcome::Stale);
+        }
+        let terminals = client.list().map_err(|error| error.to_string())?;
+        let Some(descriptor) = terminals
+            .iter()
+            .find(|descriptor| descriptor.session.id == terminal)
+        else {
+            return Ok(CloseOutcome::Stale);
+        };
+        match &descriptor.session.continuity {
+            TerminalContinuity::Exited { .. }
+            | TerminalContinuity::RelaunchAvailable {
+                last_exit: Some(_), ..
+            } => {
+                return client
+                    .release_completed_terminal(descriptor.session.clone(), allow_active)
+                    .map_err(|error| error.to_string())
+                    .map(|outcome| match outcome {
+                        TerminalCloseResult::Closed => CloseOutcome::Closed,
+                        TerminalCloseResult::Active => CloseOutcome::Active,
+                        TerminalCloseResult::Unknown(error) => CloseOutcome::Unreachable(error),
+                    });
+            }
+            continuity if continuity.live_proof().as_ref() == Some(proof) => {}
+            _ => return Ok(CloseOutcome::Stale),
+        }
+        Ok(
+            match client
+                .close_terminal_checked(terminal, allow_active)
+                .map_err(|error| error.to_string())?
+            {
+                TerminalCloseResult::Closed => CloseOutcome::Closed,
+                TerminalCloseResult::Active => CloseOutcome::Active,
+                TerminalCloseResult::Unknown(detail) => CloseOutcome::Unreachable(detail),
+            },
+        )
+    };
+    run().unwrap_or_else(CloseOutcome::Unreachable)
 }
 
 #[cfg(test)]
@@ -2646,214 +2859,4 @@ pub(in crate::app) mod tests {
         assert!(next.pending);
         assert!(!next.active);
     }
-}
-
-fn is_source_close_refusal(error: &crate::control::ControlError) -> bool {
-    matches!(error, crate::control::ControlError::Remote { code: crate::terminal_ipc::ProtocolErrorCode::InvalidRequest,
-        message, retryable: false } if message == crate::terminal_ipc::TERMINAL_CLOSE_SOURCE_CONFLICT)
-}
-
-fn source_close_outcome(
-    result: Result<TerminalCloseResult, crate::control::ControlError>,
-) -> CloseOutcome {
-    match result {
-        Ok(TerminalCloseResult::Closed) => CloseOutcome::Closed,
-        Ok(TerminalCloseResult::Active) => CloseOutcome::Active,
-        Ok(TerminalCloseResult::Unknown(reason)) => CloseOutcome::Unreachable(reason),
-        Err(error) if is_source_close_refusal(&error) => CloseOutcome::SourceChanged,
-        Err(crate::control::ControlError::Remote {
-            code: crate::terminal_ipc::ProtocolErrorCode::TerminalNotFound,
-            message,
-            retryable: false,
-        }) if message == crate::terminal_ipc::TERMINAL_CLOSE_SOURCE_ABSENT => CloseOutcome::Stale,
-        Err(error) => CloseOutcome::Unreachable(error.to_string()),
-    }
-}
-
-fn revalidate_and_close(
-    intent: &CloseIntent,
-    allow_active: bool,
-    authority: &super::shared_views::TerminalCleanupAuthority,
-) -> CloseOutcome {
-    if let Some(source) = &intent.completed_source {
-        let run = || -> Result<CloseOutcome, String> {
-            let path =
-                crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
-            let mut client = ControlClient::connect(&path).map_err(|error| error.to_string())?;
-            if client.proof() != &intent.proof || !intent.proof.is_complete() {
-                return Ok(CloseOutcome::Stale);
-            }
-            let basis = match authority.read_basis(&mut client, source) {
-                Err(error) if is_source_close_refusal(&error) => {
-                    return Ok(CloseOutcome::SourceChanged);
-                }
-                result => result.map_err(|error| error.to_string())?,
-            };
-            if matches!(
-                basis,
-                crate::workspace_model::views::TerminalRemovalBasis::Absent { .. }
-            ) {
-                return Ok(
-                    match super::daemon_recovery::prove_not_hosted_for(
-                        source,
-                        &intent.leave,
-                        authority,
-                    ) {
-                        Ok(basis) => CloseOutcome::NotHostedWithBasis(basis),
-                        Err(kept) => CloseOutcome::Kept(kept),
-                    },
-                );
-            }
-            if !authority.permits_resolved(&basis) {
-                return Ok(CloseOutcome::SourceChanged);
-            }
-            let result = if authority.capture().is_some() || authority.worker().is_some() {
-                client.close_captured_terminal_source(
-                    source.clone(),
-                    basis.clone(),
-                    true,
-                    allow_active,
-                    authority.capture().cloned(),
-                )
-            } else {
-                client.release_completed_terminal(source.clone(), allow_active)
-            };
-            Ok(match source_close_outcome(result) {
-                CloseOutcome::Closed => CloseOutcome::ClosedWithBasis(authority.receipt(basis)),
-                outcome => outcome,
-            })
-        };
-        return run().unwrap_or_else(CloseOutcome::Unreachable);
-    }
-    let mut basis = None;
-    let outcome = close_or_prove_gone(
-        intent,
-        || {
-            if let (Some(source), Some(basis)) = (intent.saved_source.as_ref(), authority.worker())
-            {
-                close_hosted_terminal_source(
-                    source,
-                    basis,
-                    allow_active,
-                    authority.capture().cloned(),
-                )
-            } else {
-                close_hosted_terminal(intent.terminal, &intent.proof, allow_active)
-            }
-        },
-        |source, leave| {
-            basis = Some(super::daemon_recovery::prove_not_hosted_for(
-                source, leave, authority,
-            )?);
-            Ok(())
-        },
-    );
-    match (outcome, basis) {
-        (CloseOutcome::NotHosted, Some(basis)) => CloseOutcome::NotHostedWithBasis(basis),
-        (outcome, _) => outcome,
-    }
-}
-
-/// `close` is the only route that can stop anything, so a card whose connection
-/// was lost never reaches it. Its `Stale` means the daemon doesn't host the saved
-/// identity. That is what a dead terminal looks like, and also what an unknown
-/// one looks like, so only a positive proof may retire the pane.
-fn close_or_prove_gone(
-    intent: &CloseIntent,
-    close: impl FnOnce() -> CloseOutcome,
-    prove: impl FnOnce(&TerminalSession, &[UnreadableProcess]) -> Result<(), KeptPane>,
-) -> CloseOutcome {
-    if !intent.probe_only {
-        match close() {
-            CloseOutcome::Stale => {}
-            outcome => return outcome,
-        }
-    }
-    let Some(saved) = &intent.saved_source else {
-        return CloseOutcome::Stale;
-    };
-    match prove(saved, &intent.leave) {
-        Ok(()) => CloseOutcome::NotHosted,
-        Err(kept) => CloseOutcome::Kept(kept),
-    }
-}
-
-fn close_hosted_terminal_source(
-    source: &TerminalSession,
-    basis: &crate::workspace_model::views::TerminalRemovalBasis,
-    allow_active: bool,
-    capture: Option<crate::workspace_model::views::CapturedTerminalSource>,
-) -> CloseOutcome {
-    let run = || -> Result<CloseOutcome, String> {
-        let crate::workspace_model::views::TerminalRemovalBasis::Worker { owner, .. } = basis
-        else {
-            return Ok(CloseOutcome::Stale);
-        };
-        let path = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
-        let mut client = ControlClient::connect(&path).map_err(|error| error.to_string())?;
-        if client.proof() != owner || !owner.is_complete() {
-            return Ok(CloseOutcome::Stale);
-        }
-        Ok(source_close_outcome(client.close_captured_terminal_source(
-            source.clone(),
-            basis.clone(),
-            false,
-            allow_active,
-            capture,
-        )))
-    };
-    run().unwrap_or_else(CloseOutcome::Unreachable)
-}
-
-/// Asks the daemon to close `terminal`, provided the daemon is still the one
-/// `proof` names and still hosts it as that session. A terminal that has
-/// already ended counts as closed; one that is gone, or hosted under another
-/// proof, is `Stale` and left alone.
-pub(super) fn close_hosted_terminal(
-    terminal: TerminalId,
-    proof: &HostSessionProof,
-    allow_active: bool,
-) -> CloseOutcome {
-    let run = || -> Result<CloseOutcome, String> {
-        let path = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
-        let mut client = ControlClient::connect(&path).map_err(|error| error.to_string())?;
-        if client.proof() != proof || !proof.is_complete() {
-            return Ok(CloseOutcome::Stale);
-        }
-        let terminals = client.list().map_err(|error| error.to_string())?;
-        let Some(descriptor) = terminals
-            .iter()
-            .find(|descriptor| descriptor.session.id == terminal)
-        else {
-            return Ok(CloseOutcome::Stale);
-        };
-        match &descriptor.session.continuity {
-            TerminalContinuity::Exited { .. }
-            | TerminalContinuity::RelaunchAvailable {
-                last_exit: Some(_), ..
-            } => {
-                return client
-                    .release_completed_terminal(descriptor.session.clone(), allow_active)
-                    .map_err(|error| error.to_string())
-                    .map(|outcome| match outcome {
-                        TerminalCloseResult::Closed => CloseOutcome::Closed,
-                        TerminalCloseResult::Active => CloseOutcome::Active,
-                        TerminalCloseResult::Unknown(error) => CloseOutcome::Unreachable(error),
-                    });
-            }
-            continuity if continuity.live_proof().as_ref() == Some(proof) => {}
-            _ => return Ok(CloseOutcome::Stale),
-        }
-        Ok(
-            match client
-                .close_terminal_checked(terminal, allow_active)
-                .map_err(|error| error.to_string())?
-            {
-                TerminalCloseResult::Closed => CloseOutcome::Closed,
-                TerminalCloseResult::Active => CloseOutcome::Active,
-                TerminalCloseResult::Unknown(detail) => CloseOutcome::Unreachable(detail),
-            },
-        )
-    };
-    run().unwrap_or_else(CloseOutcome::Unreachable)
 }

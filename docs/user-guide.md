@@ -45,7 +45,9 @@ Launch **cagents** from the application menu, or run `cagents ui`.
   opened while it was selected, and its row shows how many when there is more
   than one.
 - Editor tabs use the ceditor mark; recognized agent terminals and native chats
-  use their OMP, Claude, or Codex provider mark.
+  use their provider's mark. Antigravity (`agy`) and Muse terminals are
+  recognized, but run only in a terminal: cagents has no native chat for them
+  yet.
 - Drag a tab title to reorder panes. The
   insertion line previews its new position; releasing the mouse saves the
   order without changing the active pane. Scroll the wheel while dragging to

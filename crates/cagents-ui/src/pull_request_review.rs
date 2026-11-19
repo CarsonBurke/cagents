@@ -2152,14 +2152,13 @@ impl State {
                     let result = tokio::task::spawn_blocking(move || {
                         let mut refused = refused;
                         if cancellation.is_cancelled() { refused = Some("The review revision changed before this chunk was sent.".into()); }
-                        if refused.is_none() {
-                            if let Err(failure) = discussion::verify_authority(api.as_ref(), &git, &authority, &cancellation) {
+                        if refused.is_none()
+                            && let Err(failure) = discussion::verify_authority(api.as_ref(), &git, &authority, &cancellation) {
                                 refused = Some(match failure {
                                     discussion::Outcome::Refused(message) | discussion::Outcome::Unknown(message) => message,
                                     discussion::Outcome::Applied => unreachable!(),
                                 });
                             }
-                        }
                         if refused.is_none() && !crate::github::polling::ready(&repository.authority(), false) {
                             refused = Some("GitHub polling is paused after a failure or rate limit. Retry after the reset.".into());
                         }

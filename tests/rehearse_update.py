@@ -574,6 +574,101 @@ class Comparison(unittest.TestCase):
         after["errors"].append("terminals.json: command refused")
         self.assertTrue(records.compare(before, after)[0]["regression"])
 
+    def test_comparing_desktop_and_no_desktop_records_is_an_evidence_regression(self):
+        for desktop in (True, False):
+            with self.subTest(desktop=desktop):
+                before, after = snapshot(), snapshot()
+                before["desktop"] = after["desktop"] = desktop
+                self.assertEqual(records.compare(before, after), [])
+                after["desktop"] = not desktop
+                message = ("before was recorded with a desktop and after without one" if desktop else
+                           "before was recorded without a desktop and after with one")
+                self.assertEqual(records.compare(before, after), [
+                    {"kind": "evidence", "id": "desktop", "change": message, "regression": True}])
+        with tempfile.TemporaryDirectory(prefix="rehearse-old-snapshot-") as temporary:
+            path = Path(temporary) / "snapshot.json"
+            path.write_text(records.dump(snapshot()))
+            old = records.load_snapshot(path)
+            desktop = {**snapshot(), "desktop": True}
+            self.assertEqual(records.compare(old, desktop), [])
+            self.assertEqual(records.compare(desktop, old), [])
+
+    def empty_record_directory(self, root):
+        out = root / "records/before"
+        out.mkdir(parents=True)
+        for name in records.COLLECTIONS:
+            (out / f"{name}.json").write_text(records.dump({"ok": True, "data": {name: []}}))
+        return out
+
+    def test_a_no_desktop_record_expects_no_windows_or_stores(self):
+        with tempfile.TemporaryDirectory(prefix="rehearse-no-desktop-") as temporary:
+            root = Path(temporary)
+            out = self.empty_record_directory(root)
+            captured = records.record(root, out, None, desktop=False)
+            self.assertEqual(captured["errors"], [])
+            self.assertEqual(captured["windows"], {})
+            self.assertEqual(captured["stores"], {})
+            self.assertIs(captured["desktop"], False)
+            self.assertEqual(records.load_snapshot(out), captured)
+            self.assertFalse((out / "windows.json").exists())
+            with self.assertRaisesRegex(ValueError, "^a no-desktop record has no window observations$"):
+                records.record(root, out, out / "windows.json", desktop=False)
+
+    def test_a_desktop_record_still_reports_missing_windows_and_stores(self):
+        with tempfile.TemporaryDirectory(prefix="rehearse-desktop-") as temporary:
+            root = Path(temporary)
+            out = self.empty_record_directory(root)
+            windows = out / "windows.json"
+            windows.write_text("{}\n")
+            captured = records.record(root, out, windows, desktop=True)
+            self.assertIn("no mapped windows observed", captured["errors"])
+            self.assertIn("no sessions.sqlite3 stores found; pane inventory unavailable", captured["errors"])
+            self.assertIs(captured["desktop"], True)
+
+    def test_a_no_desktop_record_still_reads_an_existing_store(self):
+        with tempfile.TemporaryDirectory(prefix="rehearse-no-desktop-store-") as temporary:
+            root = Path(temporary)
+            out = self.empty_record_directory(root)
+            database = root / "home/.local/share/cagents/sessions.sqlite3"
+            database.parent.mkdir(parents=True)
+            with closing(sqlite3.connect(database)) as db, db:
+                db.execute("CREATE TABLE cards(card_id TEXT, title TEXT, existence_json TEXT, kind_tag TEXT)")
+                db.execute("INSERT INTO cards VALUES ('a', 'Codex agent', '\"open\"', 'chat')")
+                db.commit()
+            captured = records.record(root, out, None, desktop=False)
+            self.assertEqual(captured["errors"], [])
+            self.assertEqual(captured["stores"]["sessions.sqlite3"]["rows"]["cards"], [
+                {"card_id": "a", "title": "Codex agent", "existence": "open", "kind_tag": "chat"}])
+            self.assertIn("sessions.sqlite3:a", records.panes(captured))
+
+    def test_a_no_desktop_record_still_reports_store_errors(self):
+        for corrupt in (False, True):
+            with self.subTest(corrupt=corrupt), tempfile.TemporaryDirectory(prefix="rehearse-bad-store-") as temporary:
+                root = Path(temporary)
+                out = self.empty_record_directory(root)
+                database = root / "home/.local/share/cagents/sessions.sqlite3"
+                database.parent.mkdir(parents=True)
+                if corrupt:
+                    database.write_text("not a sqlite database\n")
+                    message = "sessions.sqlite3: file is not a database"
+                else:
+                    with closing(sqlite3.connect(database)) as db, db:
+                        db.execute("CREATE TABLE other(id TEXT)")
+                    message = "sessions.sqlite3: no cards table; pane inventory unavailable"
+                captured = records.record(root, out, None, desktop=False)
+                self.assertEqual(captured["errors"], [message])
+
+    def test_record_cli_refuses_windows_with_no_desktop(self):
+        with tempfile.TemporaryDirectory(prefix="rehearse-record-arguments-") as temporary:
+            root = Path(temporary)
+            command = [sys.executable, "-I", "-B", str(REPOSITORY / "scripts/rehearse_update_records.py"),
+                       "record", str(root), str(root / "records/before"),
+                       "--windows", str(root / "windows.json"), "--no-desktop"]
+            result = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("not allowed with argument --windows", result.stderr)
+            self.assertFalse((root / "records/before").exists())
+
     def test_record_reads_old_cli_envelopes_and_main_window_database(self):
         with tempfile.TemporaryDirectory(prefix="rehearse-old-") as temporary:
             root = Path(temporary)
@@ -2353,7 +2448,7 @@ else:sys.exit(2)
         harness = tools / "niri-harness"
         harness.write_text("#!/usr/bin/python3\nimport json,os,sys,pathlib\n"
                            "value=json.dumps(dict(os.environ))\n"
-                           "if sys.argv[-2:]==['session','env']:\n"
+                           "if sys.argv[-1:]==['env']:\n"
                            " pathlib.Path(os.environ['HOME'],'seen.json').write_text(value)\n"
                            " print(\"export WAYLAND_DISPLAY='fixture-wayland'\")\n"
                            "else: print(value)\n")

@@ -1614,7 +1614,7 @@ fn align_resume_identity_rewrites_resume_thread() {
     ];
     align_resume_identity(&mut arguments, "new").unwrap();
     assert_eq!(arguments, vec!["app-server", "resume", "new"]);
-    assert!(align_resume_identity(&mut vec!["resume".to_string()], "new").is_err());
+    assert!(align_resume_identity(&mut ["resume".to_string()], "new").is_err());
 }
 
 #[test]
@@ -1932,6 +1932,7 @@ fn adapter() -> Codex {
         pricing: Default::default(),
         turn_pricing: Default::default(),
         turn: None,
+        held_stop: HeldStop::None,
         notification_turn: None,
         notification_revision: 0,
         busy: false,
@@ -2903,6 +2904,133 @@ fn child_terminal_outcomes_survive_idle_and_closure_and_new_turn_restarts_work()
             ..
         }
     )));
+}
+
+/// Codex names a turn only once it has started. A stop given while the
+/// turn's start is unanswered waits for that name, whichever of the start's
+/// answer or its notification brings it first, even once the thread has
+/// reported itself active, and is sent once. A start that
+/// fails leaves nothing to stop.
+#[test]
+fn a_stop_given_before_a_turn_starts_interrupts_it_once_named() {
+    let prompt = |adapter: &mut Codex| {
+        let step = adapter
+            .command(Command::Prompt {
+                text: "Fix the build".into(),
+                attachments: vec![],
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        step.writes
+            .iter()
+            .find(|frame| frame["method"] == "turn/start")
+            .unwrap()["id"]
+            .clone()
+    };
+    let interrupts = |step: &Step| {
+        step.writes
+            .iter()
+            .filter(|frame| frame["method"] == "turn/interrupt")
+            .map(|frame| frame["params"].clone())
+            .collect::<Vec<_>>()
+    };
+    let finish = |id: &str| {
+        json!({"method":"turn/completed","params":{"threadId":"thread-exact",
+        "turn":{"id":id,"status":"interrupted","items":[]}}})
+    };
+
+    let mut adapter = adapter();
+    let request = prompt(&mut adapter);
+    let stop = adapter.command(Command::Interrupt).unwrap();
+    assert!(stop.writes.is_empty(), "no turn to name yet");
+    let answered = adapter
+        .receive(json!({"id":request,"result":{"turn":{"id":"turn-a"}}}))
+        .unwrap();
+    assert_eq!(
+        interrupts(&answered),
+        vec![json!({"threadId":"thread-exact","turnId":"turn-a"})]
+    );
+    assert_eq!(adapter.held_stop(), HeldStop::Sent);
+    adapter.receive(finish("turn-a")).unwrap();
+
+    let request = prompt(&mut adapter);
+    adapter.command(Command::Interrupt).unwrap();
+    let started = adapter
+        .receive(
+            json!({"method":"turn/started","params":{"threadId":"thread-exact",
+            "turn":{"id":"turn-b","status":"inProgress","items":[]}}}),
+        )
+        .unwrap();
+    assert_eq!(
+        interrupts(&started),
+        vec![json!({"threadId":"thread-exact","turnId":"turn-b"})]
+    );
+    let answered = adapter
+        .receive(json!({"id":request,"result":{"turn":{"id":"turn-b"}}}))
+        .unwrap();
+    assert!(interrupts(&answered).is_empty(), "stopped once");
+    adapter.receive(finish("turn-b")).unwrap();
+
+    // The thread can report itself active before the start's answer, which
+    // then no longer owns the lifecycle; the answer still names the turn.
+    let request = prompt(&mut adapter);
+    adapter.command(Command::Interrupt).unwrap();
+    adapter
+        .receive(
+            json!({"method":"thread/status/changed","params":{"threadId":"thread-exact",
+            "status":{"type":"active","activeFlags":[]}}}),
+        )
+        .unwrap();
+    let answered = adapter
+        .receive(json!({"id":request,"result":{"turn":{"id":"turn-c"}}}))
+        .unwrap();
+    assert_eq!(
+        interrupts(&answered),
+        vec![json!({"threadId":"thread-exact","turnId":"turn-c"})]
+    );
+    let started = adapter
+        .receive(
+            json!({"method":"turn/started","params":{"threadId":"thread-exact",
+            "turn":{"id":"turn-c","status":"inProgress","items":[]}}}),
+        )
+        .unwrap();
+    assert!(interrupts(&started).is_empty(), "stopped once");
+    adapter.receive(finish("turn-c")).unwrap();
+    adapter
+        .receive(
+            json!({"method":"thread/status/changed","params":{"threadId":"thread-exact",
+            "status":{"type":"idle"}}}),
+        )
+        .unwrap();
+
+    let request = prompt(&mut adapter);
+    adapter.command(Command::Interrupt).unwrap();
+    let refused = adapter
+        .receive(json!({"id":request,"error":{"code":-32600,"message":"thread is closed"}}))
+        .unwrap();
+    assert!(interrupts(&refused).is_empty());
+    assert_eq!(adapter.held_stop(), HeldStop::Dropped);
+    assert!(
+        adapter.command(Command::Interrupt).is_err(),
+        "nothing left to stop"
+    );
+
+    // A turn that finished before its start was answered needs no stop.
+    let request = prompt(&mut adapter);
+    adapter.command(Command::Interrupt).unwrap();
+    assert_eq!(adapter.held_stop(), HeldStop::Waiting);
+    let finished = adapter
+        .receive(
+            json!({"method":"turn/completed","params":{"threadId":"thread-exact",
+            "turn":{"id":"turn-d","status":"completed","items":[]}}}),
+        )
+        .unwrap();
+    assert!(interrupts(&finished).is_empty());
+    let answered = adapter
+        .receive(json!({"id":request,"result":{"turn":{"id":"turn-d"}}}))
+        .unwrap();
+    assert!(interrupts(&answered).is_empty(), "nothing left to stop");
+    assert_eq!(adapter.held_stop(), HeldStop::Dropped);
 }
 
 /// A child is a thread of its own: stopping it interrupts its turn alone,
@@ -4535,7 +4663,7 @@ fn orchestrating_turn_outlives_the_live_tool_bound() {
     // running until its turn ends, whether it arrives in the turn's
     // history or as it starts.
     let auxiliary = |index: usize| {
-        if index % 2 == 0 {
+        if index.is_multiple_of(2) {
             json!({"id":format!("aux-{index}"),"type":"sleep","durationMs":1000})
         } else {
             json!({"id":format!("aux-{index}"),"type":"subAgentActivity","kind":"started","agentThreadId":"child","agentPath":"/root/review"})
@@ -5033,7 +5161,7 @@ fn an_unrecognized_item_part_or_untracked_patch_cannot_end_the_session() {
 
 #[test]
 fn command_actions_classify_the_command_and_name_its_target() {
-    let read = json!({"id":"0","type":"commandExecution","command":"sed -n '1,20p' src/app.rs","cwd":"/repo","status":"completed","exitCode":0,"durationMs":12,"aggregatedOutput":"fn main() {}","commandActions":[{"type":"unknown","command":"cd /repo"},{"type":"read","command":"sed -n '1,20p' src/app.rs","name":"app.rs","path":"src/app.rs"},{"type":"search","command":"rg main","query":"main","path":"src"}]});
+    let read = json!({"id":"0","type":"commandExecution","command":"sed -n '1,20p' src/app.rs","cwd":"/repo","status":"completed","exitCode":0,"durationMs":12,"aggregatedOutput":"fn main() {}","commandActions":[{"type":"read","command":"sed -n '1,20p' src/app.rs","name":"app.rs","path":"src/app.rs"}]});
     let items = parse_item(&read, true, "turn").unwrap();
     let ItemContent::Command {
         label,
@@ -5073,6 +5201,73 @@ fn command_actions_classify_the_command_and_name_its_target() {
     assert_eq!(*status, ToolStatus::Running);
     assert_eq!(*exit_code, None);
     assert_eq!(*duration_ms, None);
+}
+
+/// A compound command is classified by what all of it does, never by the
+/// one part Codex could name. These are the shapes Codex reports for the
+/// compound commands agents run.
+#[test]
+fn a_compound_command_is_classified_only_when_every_part_does_the_same() {
+    let intent = |command: &str, actions: Value| {
+        let item = json!({"id":"0","type":"commandExecution","command":command,"cwd":"/repo","status":"completed","exitCode":0,"commandActions":actions});
+        let items = parse_item(&item, true, "turn").unwrap();
+        let ItemContent::Command { action, label, .. } = &items[0].content else {
+            panic!("A Codex commandExecution must map to a command");
+        };
+        (*action, label.clone())
+    };
+    let ran = (CommandAction::Run, String::new());
+    // Listing, then reading: neither is what the command is.
+    assert_eq!(
+        intent(
+            "ls docs && sed -n '1,120p' docs/development.md",
+            json!([
+                {"type":"listFiles","command":"ls docs","path":"docs"},
+                {"type":"read","command":"sed -n '1,120p' docs/development.md","name":"development.md","path":"docs/development.md"}
+            ])
+        ),
+        ran
+    );
+    // Two files read is not a read of the first.
+    assert_eq!(
+        intent(
+            "cat CLAUDE.md; cat docs/development.md",
+            json!([
+                {"type":"read","command":"cat CLAUDE.md","name":"CLAUDE.md","path":"CLAUDE.md"},
+                {"type":"read","command":"cat docs/development.md","name":"development.md","path":"docs/development.md"}
+            ])
+        ),
+        ran
+    );
+    // A part Codex could not name, here the issue's `cagents … sessions`.
+    assert_eq!(
+        intent(
+            "ls ~/.config/cagents/; timeout 20 cagents --device fw16 --no-start sessions --json",
+            json!([
+                {"type":"listFiles","command":"ls ~/.config/cagents/","path":"cagents"},
+                {"type":"unknown","command":"timeout 20 cagents --device fw16 --no-start sessions --json"}
+            ])
+        ),
+        ran
+    );
+    // Two views of one file are still a read of it.
+    assert_eq!(
+        intent(
+            "sed -n '1,40p' src/app.rs && sed -n '200,240p' src/app.rs",
+            json!([
+                {"type":"read","command":"sed -n '1,40p' src/app.rs","name":"app.rs","path":"src/app.rs"},
+                {"type":"read","command":"sed -n '200,240p' src/app.rs","name":"app.rs","path":"src/app.rs"}
+            ])
+        ),
+        (CommandAction::Read, "src/app.rs".to_owned())
+    );
+    assert_eq!(
+        intent(
+            "rg -n 'fn main' src",
+            json!([{"type":"search","command":"rg -n 'fn main' src","query":"fn main","path":"src"}])
+        ),
+        (CommandAction::Search, "fn main in src".to_owned())
+    );
 }
 
 #[test]

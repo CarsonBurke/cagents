@@ -606,9 +606,8 @@ impl Excerpt {
 
     fn slice_breaks(&self, start: usize, end: usize) -> Vec<usize> {
         self.endings()
-            .filter_map(|(_, boundary)| {
-                (boundary > start && boundary <= end).then(|| boundary - start)
-            })
+            .filter(|&(_, boundary)| boundary > start && boundary <= end)
+            .map(|(_, boundary)| boundary - start)
             .collect()
     }
 

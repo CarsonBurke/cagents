@@ -6,7 +6,7 @@ use crate::app::account_ui::ChatAccounts;
 use crate::chat::client::{ClientHandle, Wake};
 use crate::chat::{self, Attachment, Command, ItemContent, PromptMode, Snapshot};
 use crate::file_drop;
-use crate::model::SavedQueue;
+use crate::model::{SavedQueue, SentAfter};
 use crate::performance::chat_stage::{self, Stage};
 use base64::Engine as _;
 use cosmic::widget::text_editor;
@@ -79,11 +79,14 @@ mod auth_recovery;
 pub(in crate::app) mod blocked_recovery_tests;
 mod changes;
 mod child_navigation;
+pub(in crate::app) use child_navigation::SubagentTally;
 mod clipboard_image;
 mod close_refusal;
 #[cfg(test)]
 pub(in crate::app) use close_refusal::{close_refusal_dismiss_id, close_refusal_end_id};
 mod closed_draft;
+mod commands;
+use commands::ChosenModel;
 mod completion;
 mod coordination;
 #[cfg(test)]
@@ -100,6 +103,7 @@ mod hover;
 pub(super) mod images;
 mod kept_draft;
 use kept_draft::ConfirmedLoss;
+use revised::Revised;
 mod layout;
 mod literal_content;
 mod logical_prose;
@@ -118,8 +122,10 @@ mod reasoning;
 pub(super) use pull_request_links::Board as PullRequestBoard;
 mod reader_source;
 mod retained;
+mod revised;
 pub(super) use closed_draft::closed_draft_source_matches;
 pub(super) mod blocked_recovery;
+pub(in crate::app) use update_recovery::UpdateWait;
 mod scroll;
 mod selectable_prose;
 mod selection;
@@ -130,6 +136,7 @@ mod thumbnails;
 mod tool_text;
 mod tool_title;
 mod turn;
+mod update_recovery;
 mod view;
 mod virtualized;
 mod warm;
@@ -140,19 +147,6 @@ pub(super) fn invalidate_copy_intent() {
 
 pub(super) fn prune_pasted_images() {
     clipboard_image::prune_cache();
-}
-
-/// Names lead the chat hierarchy; prose and operational metadata keep their
-/// existing scale. Keep this local so workbench labels remain unchanged.
-fn chat_title<'a>(
-    text: impl Into<Cow<'a, str>> + 'a,
-) -> cosmic::widget::text::Text<'a, cosmic::Theme, cosmic::Renderer> {
-    design::body(text)
-        .size(design::TEXT_PROSE)
-        .font(iced::Font {
-            weight: iced::font::Weight::Semibold,
-            ..cosmic::font::default()
-        })
 }
 
 fn action(action: Action) -> Message {
@@ -255,6 +249,21 @@ pub enum CopyPart {
     Change(usize),
 }
 
+/// What a copy of an excerpted step puts ahead of the whole output it reads,
+/// joined as `copy_text` joins a step shown whole: the command or input for
+/// the step's own Copy, nothing for its output's. `None` for a part that has
+/// no whole output to read.
+fn step_copy_prefix(part: &CopyPart, content: &ItemContent) -> Option<String> {
+    match (part, content) {
+        (CopyPart::Text, ItemContent::Command { command, .. }) => Some(command.clone()),
+        (CopyPart::Text, ItemContent::Tool { input, .. }) => Some(input.clone()),
+        (CopyPart::Output, ItemContent::Command { .. } | ItemContent::Tool { .. }) => {
+            Some(String::new())
+        }
+        _ => None,
+    }
+}
+
 /// Why a chat with no daemon handoff did not give its actor up.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReturnRefused {
@@ -268,6 +277,18 @@ pub enum ReturnRefused {
 #[derive(Clone)]
 pub enum Action {
     PreparationAvailable,
+    /// The daemon's answer about its update restore (see `update_recovery`).
+    UpdateRecoveryAnswered(Result<crate::terminal::ipc::StartupState, String>),
+    /// Time to ask the daemon about its update restore again.
+    UpdateRecoveryDue,
+    /// The daemon finished its update restore: release what it refused.
+    UpdateRecoveryReady,
+    /// Sends a first message the update restore refused, once the daemon no
+    /// longer says that refusal stands.
+    SendAgain(Target),
+    /// Starts again a conversation the update stopped (see
+    /// `blocked_recovery::Reopen::UpdateStopped`).
+    ReopenStopped(CardId),
     FlowAvailable,
     FlowRequest(Target, flow_layout::Request),
     FlowReady(
@@ -369,6 +390,9 @@ pub enum Action {
     /// Lets a cancel waiting for its second press lapse, if it is that one.
     DisarmInterrupt(Target, Instant),
     CommandFinished(Target, u64, Result<(), String>),
+    /// Looks again at a message the provider took once its turn has had
+    /// time to begin, as no report may come to show it never will.
+    CommandsDue(Target),
     Toggle(Target, String),
     /// Opens or closes one group's step strip, addressed by the id of the item
     /// that started the group.
@@ -403,6 +427,9 @@ pub enum Action {
     SessionLinkToken(String, TerminalId, Option<String>),
     Copy(Target, String, CopyPart),
     CopyMessage(Target, String, Option<chat::TextCopySource>),
+    /// Copies a step whose row shows only an excerpt of its output, reading
+    /// the whole output from its source.
+    CopyStep(Target, String, CopyPart, chat::TextCopySource),
     MessageCopied(Target, String, text_copy::Request, Result<String, String>),
     /// A complete message read for a window that shows only part of it.
     LogicalProseRead(Target, chat::TextCopySource, Result<String, String>),
@@ -548,6 +575,22 @@ pub enum Action {
     ),
     ToggleBlockedDetails(CardId, chat::Session),
     CopyBlockedDetails(CardId, chat::Session),
+    /// Copies the unsent message an unreachable agent's card would discard.
+    CopyBlockedDraft(CardId, chat::Session),
+    /// The processes of an unreachable agent's conversation the daemon
+    /// proved still running.
+    UnnamedAgentRunning(
+        CardId,
+        chat::Session,
+        Vec<crate::terminal::ipc::ProcessStart>,
+    ),
+    /// What ending an unreachable agent's processes, before its card
+    /// closes, left running.
+    UnnamedAgentEnded(
+        CardId,
+        chat::Session,
+        Result<Vec<crate::terminal::ipc::LostProcess>, String>,
+    ),
     /// Asks the daemon what still runs for a conversation whose Close it
     /// refused.
     AskCloseHolders(Target, chat::Session),
@@ -728,7 +771,13 @@ impl Action {
             | Self::ChangeListScrolled(target, ..)
             | Self::DropHover(target, ..)
             | Self::ClearCopied(target, ..) => Some(LocalScope::Card(target.card)),
-            Self::PreparationAvailable | Self::FlowAvailable | Self::FindAvailable => {
+            // Asking changes nothing, and an answer changes only what the
+            // panes waiting on it say; releasing them is its own action.
+            Self::PreparationAvailable
+            | Self::FlowAvailable
+            | Self::FindAvailable
+            | Self::UpdateRecoveryAnswered(..)
+            | Self::UpdateRecoveryDue => {
                 Some(LocalScope::Visible)
             }
             _ => None,
@@ -739,6 +788,11 @@ impl Action {
     fn name(&self) -> &'static str {
         match self {
             Self::PreparationAvailable => "PreparationAvailable",
+            Self::UpdateRecoveryAnswered(..) => "UpdateRecoveryAnswered",
+            Self::UpdateRecoveryDue => "UpdateRecoveryDue",
+            Self::UpdateRecoveryReady => "UpdateRecoveryReady",
+            Self::SendAgain(..) => "SendAgain",
+            Self::ReopenStopped(..) => "ReopenStopped",
             Self::FlowAvailable => "FlowAvailable",
             Self::FlowRequest(..) => "FlowRequest",
             Self::FlowReady(..) => "FlowReady",
@@ -773,6 +827,9 @@ impl Action {
             Self::FreshCloseFinished(..) => "FreshCloseFinished",
             Self::ToggleBlockedDetails(..) => "ToggleBlockedDetails",
             Self::CopyBlockedDetails(..) => "CopyBlockedDetails",
+            Self::CopyBlockedDraft(..) => "CopyBlockedDraft",
+            Self::UnnamedAgentRunning(..) => "UnnamedAgentRunning",
+            Self::UnnamedAgentEnded(..) => "UnnamedAgentEnded",
             Self::Composer(..) => "Composer",
             Self::ReadComposer(..) => "ReadComposer",
             Self::ComposerUp(..) => "ComposerUp",
@@ -792,6 +849,7 @@ impl Action {
             Self::Interrupt(..) => "Interrupt",
             Self::DisarmInterrupt(..) => "DisarmInterrupt",
             Self::CommandFinished(..) => "CommandFinished",
+            Self::CommandsDue(..) => "CommandsDue",
             Self::Toggle(..) => "Toggle",
             Self::ToggleTurn(..) => "ToggleTurn",
             Self::SelectSubagent(..) => "SelectSubagent",
@@ -812,6 +870,7 @@ impl Action {
             Self::SessionLinkToken(..) => "SessionLinkToken",
             Self::Copy(..) => "Copy",
             Self::CopyMessage(..) => "CopyMessage",
+            Self::CopyStep(..) => "CopyStep",
             Self::MessageCopied(..) => "MessageCopied",
             Self::LogicalProseRead(..) => "LogicalProseRead",
             Self::MarkdownPrepared(..) => "MarkdownPrepared",
@@ -937,6 +996,7 @@ impl Action {
                 | Self::Wake(..)
                 | Self::UpdatesAcknowledged(..)
                 | Self::CommandFinished(..)
+                | Self::CommandsDue(..)
                 | Self::ChangesLoaded(..)
                 | Self::ChangedFileResolved(..)
                 | Self::MessageCopied(..)
@@ -963,6 +1023,8 @@ impl Action {
                 | Self::FreshCloseFinished(..)
                 | Self::CloseHolders(..)
                 | Self::CloseHoldersEnded(..)
+                | Self::UnnamedAgentRunning(..)
+                | Self::UnnamedAgentEnded(..)
                 | Self::Retired(..)
                 | Self::DispatchQueued(..)
                 | Self::ClearCopied(..)
@@ -1127,6 +1189,15 @@ fn draft_start_backend() -> Option<(String, String, String)> {
     })
 }
 
+/// Why an agent's card that never saved its provider's conversation ID can't
+/// reopen it; [`blocked_recovery::Reopen::UnnamedAgent`] says what to do.
+fn unnamed_agent_conversation(session: &chat::Session) -> String {
+    format!(
+        "{} hadn't reported this agent's conversation ID when cagents' background service stopped, so this tab has no saved conversation to reconnect to.",
+        session.launch.provider.label()
+    )
+}
+
 /// Why sending cannot move a conversation to another account yet: a
 /// background subagent holds it, which the daemon would refuse to close.
 fn account_switch_hold(snapshot: &chat::Snapshot) -> Option<String> {
@@ -1235,9 +1306,9 @@ pub(super) struct State {
     /// than the rest to bring back.
     confirmed_losses: HashMap<CardId, (TerminalId, ConfirmedLoss)>,
     /// Cards reopening a conversation with the message their last card was
-    /// still sending as it closed. Their composer drops it once the
-    /// transcript shows it arrived.
-    sending_on_close: HashSet<CardId>,
+    /// still sending as it closed, with what the reader had said before it.
+    /// Their composer drops it once the transcript shows it arrived.
+    sending_on_close: HashMap<CardId, SentAfter>,
     /// Drafts another window started, whose cards are attaching to that
     /// conversation. Their carried-over unsent text may repeat its first
     /// message, which is checked once the transcript shows it.
@@ -1255,6 +1326,9 @@ pub(super) struct State {
     capacity_offers: HashSet<CardId>,
     /// Starts refused as nonretryable before a runtime exists.
     blocked_starts: HashMap<CardId, blocked_recovery::BlockedStart>,
+    /// What the daemon last said about its update restore, for the panes
+    /// that wait on it.
+    update_recovery: update_recovery::Watch,
     /// Expanded diagnostics belong to the exact failed source, never a replacement.
     blocked_details: HashMap<CardId, chat::Session>,
     removed_accounts: HashSet<CardId>,
@@ -1286,13 +1360,14 @@ impl Default for State {
             peer_started: HashMap::new(),
             waiting: HashMap::new(),
             confirmed_losses: HashMap::new(),
-            sending_on_close: HashSet::new(),
+            sending_on_close: HashMap::new(),
             started_elsewhere: HashSet::new(),
             default_chats: HashSet::new(),
             parked: HashMap::new(),
             fresh_offers: HashSet::new(),
             capacity_offers: HashSet::new(),
             blocked_starts: HashMap::new(),
+            update_recovery: update_recovery::Watch::default(),
             blocked_details: HashMap::new(),
             removed_accounts: HashSet::new(),
             restorable_accounts: HashMap::new(),
@@ -1573,23 +1648,25 @@ impl ChangeToken {
 pub(super) fn format_duration(millis: u64) -> String {
     match millis {
         0..1_000 => format!("{millis}ms"),
-        0..60_000 => format!("{:.1}s", millis as f64 / 1_000.0),
+        1_000..60_000 => format!("{:.1}s", millis as f64 / 1_000.0),
         _ => format!("{}m {}s", millis / 60_000, (millis % 60_000) / 1_000),
     }
 }
 
 /// Remember reader choices across bounded history pages without retaining transcript bodies.
-fn reconcile_disclosure(opened: &mut HashMap<String, bool>, turns: &[turn::Turn]) {
+fn reconcile_disclosure(opened: &mut Revised<HashMap<String, bool>>, turns: &[turn::Turn]) {
     if opened.len() > 4096 {
         let keys: HashSet<&str> = turns.iter().map(|turn| turn.key.as_str()).collect();
-        opened.retain(|key, _| keys.contains(key.as_str()));
+        if opened.keys().any(|key| !keys.contains(key.as_str())) {
+            opened.edit().retain(|key, _| keys.contains(key.as_str()));
+        }
     }
 }
 
 /// A page can retain a tool while evicting the prompt that named its group.
 /// Match overlapping stable tool IDs before replacing the bounded snapshot.
 fn carry_step_disclosures(
-    opened: &mut HashMap<String, bool>,
+    opened: &mut Revised<HashMap<String, bool>>,
     search: &mut find::Disclosure,
     previous: &[turn::Turn],
     previous_items: &[Arc<chat::Item>],
@@ -1791,10 +1868,10 @@ fn contains_text(content: &ItemContent, query: &str) -> bool {
             body,
             ..
         } => {
-            find::contains(&from, query)
-                || find::contains(&sender, query)
-                || find::contains(&summary, query)
-                || find::contains(&body, query)
+            find::contains(from, query)
+                || find::contains(sender, query)
+                || find::contains(summary, query)
+                || find::contains(body, query)
         }
     }
 }
@@ -2762,31 +2839,34 @@ struct FinishedStamp {
     outcome: &'static str,
 }
 
-struct PendingCommand {
-    followup: bool,
-    /// The provider's queued message this command asks back, which stops
-    /// being waited for if the request never reaches the provider.
-    take_back: Option<String>,
-    id: u64,
-    draft_revision: Option<u64>,
-    request: Option<String>,
-    /// The first user prompt, used to name a new channel once locally queued.
-    first_prompt: Option<String>,
-    /// The model this command chooses, remembered for new drafts of the
-    /// provider once the provider has accepted it.
-    model: Option<(String, Option<String>)>,
-    /// The message this command sends, kept for the composer's history once
-    /// the provider has accepted it. A rejected send is not history: the
-    /// draft it came from is still in the composer.
-    sent: Option<String>,
-    sent_attachments: Vec<Attachment>,
-    /// Which end of the history this command is extending, where it is a
-    /// page request at all. The transcript says so at the edge the rows will
-    /// appear at, so it has to know which edge is waiting.
-    page: Option<view::Page>,
-    /// The step of a queued first message this command takes, if it is one.
-    queued: Option<QueuedStep>,
+/// [`Action::CommandsDue`] for `target`, once a turn has had time to begin.
+fn commands_due(target: Target) -> Task<Message> {
+    cosmic::task::future(async move {
+        tokio::time::sleep(commands::TURN_PATIENCE).await;
+        Message::ChatUi(Action::CommandsDue(target))
+    })
 }
+
+/// Sends `command` to the conversation `handle` reaches, off the UI thread,
+/// and answers with its outcome. Without one, it is answered as not sent.
+fn run_chat_command(
+    target: Target,
+    id: u64,
+    handle: Option<Arc<ClientHandle>>,
+    command: Command,
+) -> Task<Message> {
+    cosmic::task::future(async move {
+        let result = match handle {
+            Some(handle) => tokio::task::spawn_blocking(move || handle.send(command))
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result),
+            None => Err("The conversation disconnected before this was sent.".to_owned()),
+        };
+        Message::ChatUi(Action::CommandFinished(target, id, result))
+    })
+}
+
 /// What a chat card's conversation runs through.
 enum Connection {
     /// Nothing runs yet. A new conversation starts its CLI when its first
@@ -2816,12 +2896,10 @@ pub enum QueueCopy {
 /// conversation takes it, and returns to the composer if it never does.
 struct Queued {
     /// Immutable local input; never a fabricated provider-history Item.
-    source: Arc<prompt::LocalSource>,
-    presentation: prompt::LocalPresentation,
+    prompt: prompt::LocalPrompt,
     /// Resolve draft skill choices before the provider replaces the draft
     /// catalog; two provider skills may share a name after startup.
     resolved_text: String,
-    attachments: Vec<Attachment>,
     /// The model the draft chose, to be selected before the message is sent.
     /// `None` once it has been, or when the provider's default was chosen.
     model: Option<(String, Option<String>)>,
@@ -2838,8 +2916,8 @@ impl Queued {
     fn submission_text<'a>(&'a self, snapshot: &Snapshot) -> &'a str {
         // A provider command learned during startup takes precedence over a
         // draft skill with the same slash name.
-        if slash_invocation(self.source.text(), snapshot).is_some() {
-            self.source.text()
+        if slash_invocation(self.prompt.text(), snapshot).is_some() {
+            self.prompt.text()
         } else {
             &self.resolved_text
         }
@@ -2932,14 +3010,67 @@ fn unaccounted(
     remaining
 }
 
+/// The reader's messages `snapshot` shows, oldest first, with their item ids.
+fn user_messages(snapshot: &Snapshot) -> impl DoubleEndedIterator<Item = (&str, &str)> {
+    snapshot
+        .items
+        .iter()
+        .filter_map(|item| match &item.content {
+            chat::ItemContent::Text { text, .. } if item.role == chat::Role::User => {
+                Some((item.id.as_str(), text.as_str()))
+            }
+            _ => None,
+        })
+}
+
+/// What follows `message` in `text`, where `text` begins with it as a
+/// message of its own: all of it, or its first lines.
+fn leading<'a>(text: &'a str, message: &str) -> Option<&'a str> {
+    let message = message.trim();
+    if message.is_empty() {
+        return None;
+    }
+    let rest = text.trim_start().strip_prefix(message)?;
+    if rest.trim().is_empty() {
+        return Some("");
+    }
+    rest.strip_prefix('\n')
+}
+
+/// What the reader had said last in `snapshot`'s conversation, as `sent`
+/// goes to it.
+fn sent_after(snapshot: &Snapshot, sent: &str) -> SentAfter {
+    if snapshot.has_later {
+        // The conversation's latest messages are not in view.
+        return SentAfter::Unseen;
+    }
+    if snapshot
+        .queued_messages
+        .iter()
+        .any(|queued| !queued.editable || queued.text.trim() == sent.trim())
+    {
+        // A message the provider still holds may arrive before this one,
+        // and nothing shows where it will: one reading the same would pass
+        // for this one. A preview may not be the whole message, so it may
+        // read the same too.
+        return SentAfter::Unseen;
+    }
+    match user_messages(snapshot).next_back() {
+        Some((id, text)) if text.trim() == sent.trim() => SentAfter::Same(id.to_owned()),
+        Some(_) => SentAfter::Different,
+        None if snapshot.has_earlier => SentAfter::Unseen,
+        None => SentAfter::Different,
+    }
+}
+
 /// Which message of the conversation carried-over unsent text may repeat.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum DraftEcho {
     /// The first, which another window started the conversation with.
     First,
     /// The latest, which the conversation's last card was still sending as it
-    /// closed.
-    Latest,
+    /// closed, after the message this says the reader had sent before it.
+    Latest(SentAfter),
 }
 
 /// What came back to the composer from a provider queue that did not survive.
@@ -2975,10 +3106,18 @@ impl RestoredWaiting {
 
 const CAPACITY_GUIDANCE: &str = "Inspect usage with cagents chat capacity. Check eligibility with cagents chat release ID --dry-run; release requires verified saved history and no protected work. Then retry. Your conversation and draft are kept.";
 
+struct FileCompletionMemo {
+    files: Arc<Vec<String>>,
+    query: String,
+    indices: Vec<usize>,
+}
+
 pub(super) struct Runtime {
     preparation: preparation::State,
     find: Option<String>,
-    find_matches: Vec<String>,
+    /// The groups Find matched, in transcript order. Every turn asks whether
+    /// it is among them on every frame, so membership is a lookup.
+    find_matches: indexmap::IndexSet<String>,
     find_disclosure: find::Disclosure,
     child_find_disclosure: HashMap<String, find::Disclosure>,
     find_index: usize,
@@ -2989,6 +3128,7 @@ pub(super) struct Runtime {
     pub(super) interrupt_armed: Option<Instant>,
     drop_hover: bool,
     files: Option<Arc<Vec<String>>>,
+    file_completion: std::cell::RefCell<Option<FileCompletionMemo>>,
     pub(super) target: Target,
     pub(super) session: chat::Session,
     connection: Connection,
@@ -3005,7 +3145,10 @@ pub(super) struct Runtime {
     queued: Option<Queued>,
     /// Messages held here for the next turn, oldest first.
     followups: Vec<Followup>,
-    next_followup: u64,
+    /// The place of the next thing the reader writes: a held follow-up's ID,
+    /// or a message's, so that what comes back to the composer from both
+    /// comes back in the order written.
+    next_written: u64,
     /// Provider queue entries asked back, until the provider says whether it
     /// let go of each.
     recalling: Vec<Recall>,
@@ -3060,7 +3203,7 @@ pub(super) struct Runtime {
     pull_request_labels_built_from: Option<LabelSources>,
     /// The snapshot's items grouped into stretches of work, rebuilt only when
     /// the snapshot changes rather than once per frame.
-    turns: Vec<turn::Turn>,
+    turns: Revised<Vec<turn::Turn>>,
     selected_subagent: Option<String>,
     observed_scroll: scroll::Observations,
     scroll_memory: scroll::Memory,
@@ -3094,7 +3237,7 @@ pub(super) struct Runtime {
     ///
     /// Explicit reader choices override the configured default and survive
     /// history-page eviction within a bounded disclosure budget.
-    opened: HashMap<String, bool>,
+    opened: Revised<HashMap<String, bool>>,
     pub(super) tool_groups_expanded: bool,
     composer: text_editor::Content<cosmic::Renderer>,
     revision: u64,
@@ -3112,13 +3255,15 @@ pub(super) struct Runtime {
     /// repeat a message the conversation received, and which one. Cleared
     /// once the transcript settles it, or the reader edits the text.
     draft_echo: Option<(u64, DraftEcho)>,
-    expanded: HashSet<String>,
-    child_expanded: HashMap<String, HashSet<String>>,
+    expanded: Revised<HashSet<String>>,
+    /// Each child's own disclosures, stamped separately so pruning departed
+    /// children never disturbs the selected child's.
+    child_expanded: HashMap<String, Revised<HashSet<String>>>,
     child_unfolded: HashMap<String, HashSet<String>>,
     /// Coordination card parts shown in full, as `{item id}#{part}`.
     unfolded: HashSet<String>,
     answers: view::Answers,
-    pending: Option<PendingCommand>,
+    commands: commands::Commands,
     next_command: u64,
     disconnected: bool,
     /// A fingerprint of the models this conversation last listed to the
@@ -3139,6 +3284,9 @@ pub(super) struct Runtime {
     /// The daemon says repeating this start cannot help, and when the
     /// conversation can come back.
     start_blocked: Option<blocked_recovery::Reopen>,
+    /// What the daemon last said about its update restore, which a pane
+    /// waiting on it explains.
+    update_wait: UpdateWait,
     /// Resume may retire this actor before its replacement answers. Keep the
     /// source body until a successful attachment supplies its successor.
     resume_source_pinned: bool,
@@ -3170,7 +3318,7 @@ pub(super) struct Runtime {
     selection_bookmarks: std::cell::RefCell<
         HashMap<Option<String>, std::rc::Rc<std::cell::RefCell<selection::Bookmark>>>,
     >,
-    selection_document: std::cell::RefCell<Option<(u64, Arc<selection::Catalog>)>>,
+    selection_document: std::cell::RefCell<Option<(view::SelectionKey, Arc<selection::Catalog>)>>,
     scroll: view::Scroll,
     subagent_scroll: HashMap<String, view::Scroll>,
     page_request: Option<(view::Page, u64)>,
@@ -3357,10 +3505,21 @@ impl Runtime {
             return None;
         }
         let rows = if token.sigil == '@' {
-            completion::files(
-                self.files.as_deref().map_or(&[][..], Vec::as_slice),
-                &token.query,
-            )
+            if let Some(files) = &self.files {
+                let mut memo = self.file_completion.borrow_mut();
+                if !memo.as_ref().is_some_and(|memo| {
+                    Arc::ptr_eq(&memo.files, files) && memo.query == token.query
+                }) {
+                    *memo = Some(FileCompletionMemo {
+                        files: Arc::clone(files),
+                        query: token.query.clone(),
+                        indices: completion::file_matches(files, &token.query),
+                    });
+                }
+                completion::file_candidates(files, &memo.as_ref().unwrap().indices)
+            } else {
+                Vec::new()
+            }
         } else {
             completion::candidates(&self.snapshot, &token)
         };
@@ -3577,29 +3736,29 @@ impl Runtime {
                 insertion.push(' ');
             }
         }
-        if !insertion.is_empty() {
-            if let Ok(Some(change)) = attachment_draft::edit(
+        if !insertion.is_empty()
+            && let Ok(Some(change)) = attachment_draft::edit(
                 &mut self.composer,
                 text_editor::Edit::Paste(Arc::new(insertion)),
-            ) {
-                for (other_id, other) in &mut self.attachment_bookmarks {
-                    // Equal collapsed anchors follow paste initiation order,
-                    // independent of worker completion order. User caret
-                    // mapping retains its normal left affinity.
-                    let later_at_start = !earlier.contains(other_id)
-                        && other.cursor.selection.is_none()
-                        && other.cursor.position == change.start;
-                    other.changed(&change);
-                    if later_at_start && other.valid {
-                        other.cursor.position = change.inserted_end();
-                    }
+            )
+        {
+            for (other_id, other) in &mut self.attachment_bookmarks {
+                // Equal collapsed anchors follow paste initiation order,
+                // independent of worker completion order. User caret
+                // mapping retains its normal left affinity.
+                let later_at_start = !earlier.contains(other_id)
+                    && other.cursor.selection.is_none()
+                    && other.cursor.position == change.start;
+                other.changed(&change);
+                if later_at_start && other.valid {
+                    other.cursor.position = change.inserted_end();
                 }
-                self.cancel_invalid_attachment_jobs();
-                if current != bookmark.cursor {
-                    if let Some(mapped) = attachment_draft::mapped(current, &change) {
-                        attachment_draft::move_to(&mut self.composer, mapped);
-                    }
-                }
+            }
+            self.cancel_invalid_attachment_jobs();
+            if current != bookmark.cursor
+                && let Some(mapped) = attachment_draft::mapped(current, &change)
+            {
+                attachment_draft::move_to(&mut self.composer, mapped);
             }
         }
         self.merge_attachments(attachments);
@@ -3771,13 +3930,21 @@ impl Runtime {
 
     /// Returns every held follow-up to the composer, in the order written.
     fn restore_followups(&mut self) {
+        if self.return_followups() {
+            let _ = self.present();
+        }
+    }
+
+    /// [`Self::restore_followups`], leaving the pane to be presented by its
+    /// caller. Whether there were any.
+    fn return_followups(&mut self) -> bool {
         if self.followups.is_empty() {
-            return;
+            return false;
         }
         let (text, attachments) = self.combined_followups();
         self.followups.clear();
         self.take_back(&text, attachments, PromptMode::Queue);
-        let _ = self.present();
+        true
     }
 
     /// The held follow-ups as the one prompt they are sent as: their text in
@@ -3808,11 +3975,17 @@ impl Runtime {
         (text, attachments)
     }
 
-    /// Whether a command is carrying the held follow-ups to the provider.
+    /// Whether a command is carrying held follow-ups to the provider.
     fn followups_sending(&self) -> bool {
-        self.pending
-            .as_ref()
-            .is_some_and(|pending| pending.followup)
+        self.commands.carrying_followups()
+    }
+
+    /// Whether the held follow-up `id` is on its way to the provider, and so
+    /// no longer the reader's to take back or remove.
+    fn followup_sending(&self, id: u64) -> bool {
+        self.commands
+            .iter()
+            .any(|pending| pending.followups.contains(&id))
     }
 
     /// Whether `message`, held by the provider, can return to the composer.
@@ -3868,20 +4041,19 @@ impl Runtime {
     /// The waiting message the keyboard takes back: the newest one that can
     /// be. Held follow-ups are sent after everything the provider holds.
     fn newest_take_back(&self) -> Option<QueueEntry> {
-        if self.followups_sending() {
-            return None;
+        match self.followups.last() {
+            // One on its way is no longer the reader's to take back.
+            Some(followup) => {
+                (!self.followup_sending(followup.id)).then_some(QueueEntry::Local(followup.id))
+            }
+            None => self
+                .snapshot
+                .queued_messages
+                .iter()
+                .rev()
+                .find(|message| self.provider_take_back(message))
+                .map(|message| QueueEntry::Provider(message.id.clone())),
         }
-        self.followups
-            .last()
-            .map(|followup| QueueEntry::Local(followup.id))
-            .or_else(|| {
-                self.snapshot
-                    .queued_messages
-                    .iter()
-                    .rev()
-                    .find(|message| self.provider_take_back(message))
-                    .map(|message| QueueEntry::Provider(message.id.clone()))
-            })
     }
 
     /// Records a message the provider accepted. The same message sent twice
@@ -3983,45 +4155,68 @@ impl Runtime {
         self.settle_draft_echo();
     }
 
-    /// Drops the composer text if it is exactly the message it may repeat,
-    /// which the conversation already has, so it is not offered again. Any
-    /// other text is the reader's own and stays.
+    /// Drops from the composer the message it may repeat, which the
+    /// conversation already has, so it is not offered again: the whole text
+    /// where it is exactly that message, or, for one still being sent as its
+    /// chat closed, the lines it leads. Any other text is the reader's own
+    /// and stays.
     fn settle_draft_echo(&mut self) {
-        let Some((revision, echo)) = self.draft_echo else {
+        let Some((revision, echo)) = self.draft_echo.take() else {
             return;
         };
         if revision != self.revision || !self.attachments.is_empty() {
             // Edited since, or more than the text: no longer a copy.
-            self.draft_echo = None;
             return;
         }
         if self.snapshot.history_loading || !self.visible.load(Ordering::Relaxed) {
+            self.draft_echo = Some((revision, echo));
             return;
         }
-        let mut sent = self
-            .snapshot
-            .items
-            .iter()
-            .filter_map(|item| match &item.content {
-                chat::ItemContent::Text { text, .. } if item.role == chat::Role::User => Some(text),
-                _ => None,
-            });
-        let message = match echo {
-            // The first message counts only where the transcript starts.
-            DraftEcho::First => sent.next().filter(|_| !self.snapshot.has_earlier),
-            DraftEcho::Latest => sent.last(),
-        };
-        let Some(message) = message else {
-            if self.snapshot.has_earlier {
-                // The message is not in view, so nothing can be shown to
-                // repeat it.
-                self.draft_echo = None;
+        let composer = self.composer.text();
+        let repeated = {
+            let mut sent = user_messages(&self.snapshot);
+            let message = match &echo {
+                // The first message counts only where the transcript starts.
+                DraftEcho::First => sent.next().filter(|_| !self.snapshot.has_earlier),
+                DraftEcho::Latest(SentAfter::Different) => sent.last(),
+                DraftEcho::Latest(SentAfter::Same(before)) => {
+                    // The message sent before it read the same, so only a
+                    // message shown after that one can be this one. Where that
+                    // one is not in view, or the provider shows it under another
+                    // id, nothing here tells them apart, and the text stays.
+                    let sent = sent.collect::<Vec<_>>();
+                    match sent.iter().position(|(id, _)| id == before) {
+                        Some(index) => match sent[index + 1..].last() {
+                            Some(message) => Some(*message),
+                            None => return,
+                        },
+                        None if sent.is_empty() => None,
+                        None => return,
+                    }
+                }
+                // Nothing told the message apart as it was sent.
+                DraftEcho::Latest(SentAfter::Unseen) => return,
+            };
+            let Some((_, message)) = message else {
+                if !self.snapshot.has_earlier {
+                    // The transcript may yet show it.
+                    self.draft_echo = Some((revision, echo));
+                }
+                // Otherwise the message is not in view, so nothing can be shown
+                // to repeat it.
+                return;
+            };
+            // A message still being sent leads what was written after it,
+            // which is the reader's own however it went.
+            match &echo {
+                DraftEcho::First => (composer.trim() == message.trim()).then(String::new),
+                DraftEcho::Latest(_) => {
+                    leading(&composer, message).map(|rest| rest.trim_end().to_owned())
+                }
             }
-            return;
         };
-        self.draft_echo = None;
-        if self.composer.text().trim() == message.trim() {
-            self.replace_draft(text_editor::Content::new());
+        if let Some(rest) = repeated {
+            self.replace_draft(text_editor::Content::with_text(&rest));
         }
     }
 
@@ -4034,13 +4229,16 @@ impl Runtime {
         self.unsent_with_held(self.queued.as_ref())
     }
 
-    /// The composer's text and attachments, after `queued` and the held
-    /// follow-ups, each part on its own line, every attachment once.
+    /// The composer's text and attachments, after `queued`, the messages on
+    /// their way the provider has not taken yet, and the held follow-ups,
+    /// each part on its own line, every attachment once.
     fn unsent_with_held(&self, queued: Option<&Queued>) -> (String, Vec<Attachment>) {
         let followups = (!self.followups.is_empty()).then(|| self.combined_followups());
         let held = queued
+            .map(|queued| &queued.prompt)
             .into_iter()
-            .map(|queued| (queued.source.text(), queued.attachments.as_slice()))
+            .chain(self.commands.unsent().map(|outgoing| &outgoing.prompt))
+            .map(|prompt| (prompt.text(), prompt.attachments.as_slice()))
             .chain(
                 followups
                     .iter()
@@ -4069,10 +4267,10 @@ impl Runtime {
     fn prompt_suggestion(&self) -> Option<&chat::PromptSuggestion> {
         let suggestion = self.snapshot.prompt_suggestion.as_ref()?;
         if self.disconnected
-            || self.pending.is_some()
+            || !self.commands.is_idle()
             || self.queued.is_some()
             || self.handle().is_none()
-            || self.snapshot.busy
+            || self.turn_under_way()
             || !self.snapshot.ready
             || self.snapshot.exited
             || !self.composer.text().trim_end_matches('\n').is_empty()
@@ -4169,7 +4367,7 @@ impl Runtime {
             agent_addresses: Default::default(),
             queued: None,
             followups: Vec::new(),
-            next_followup: 0,
+            next_written: 0,
             recalling: Vec::new(),
             taken_back: Vec::new(),
             resend: None,
@@ -4184,8 +4382,9 @@ impl Runtime {
             fork_requested: false,
             fork_seen: None,
             files: None,
+            file_completion: Default::default(),
             find: None,
-            find_matches: Vec::new(),
+            find_matches: indexmap::IndexSet::new(),
             find_disclosure: find::Disclosure::default(),
             child_find_disclosure: HashMap::new(),
             find_index: 0,
@@ -4204,7 +4403,7 @@ impl Runtime {
             pull_request_labels: Arc::default(),
             pull_request_inspected: Default::default(),
             pull_request_labels_built_from: None,
-            turns: Vec::new(),
+            turns: Revised::default(),
             selected_subagent: None,
             observed_scroll: Default::default(),
             scroll_memory: Default::default(),
@@ -4215,7 +4414,7 @@ impl Runtime {
             agent_work: Default::default(),
             asked_after: HashSet::new(),
             asked: HashSet::new(),
-            opened: HashMap::new(),
+            opened: Revised::default(),
             tool_groups_expanded: false,
             composer: text_editor::Content::new(),
             revision: 0,
@@ -4229,12 +4428,12 @@ impl Runtime {
             submit_after_paste: None,
             attachment_chooser_pending: None,
             draft_echo: None,
-            expanded: HashSet::new(),
+            expanded: Revised::default(),
             child_expanded: HashMap::new(),
             child_unfolded: HashMap::new(),
             unfolded: HashSet::new(),
             answers: HashMap::new(),
-            pending: None,
+            commands: commands::Commands::default(),
             next_command: 0,
             disconnected: false,
             listed_models: 0,
@@ -4245,6 +4444,7 @@ impl Runtime {
             close_refusal: None,
             resume_failed: false,
             start_blocked: None,
+            update_wait: UpdateWait::default(),
             resume_source_pinned: false,
             failures: Vec::new(),
             unplaced_failures: Vec::new(),
@@ -4285,7 +4485,7 @@ impl Runtime {
         self.child_cache_context = None;
         self.presentation_evicted = false;
         self.last_presented_tail = None;
-        self.turns.clear();
+        self.turns = Revised::default();
         self.selected_subagent = None;
         self.subagent_scroll.clear();
         self.page_request = None;
@@ -4299,8 +4499,8 @@ impl Runtime {
         self.asked.clear();
         self.find_disclosure = find::Disclosure::default();
         self.child_find_disclosure.clear();
-        self.opened.clear();
-        self.expanded.clear();
+        self.opened = Revised::default();
+        self.expanded = Revised::default();
         self.child_expanded.clear();
         self.child_unfolded.clear();
         self.answers.clear();
@@ -4403,19 +4603,19 @@ impl Runtime {
     /// Puts a first message that was never sent back in the composer, ahead
     /// of anything written since, with its attachments.
     fn unqueue(&mut self) -> Option<chat::Session> {
-        let queued = self.queued.take()?;
+        let mut queued = self.queued.take()?;
         self.preparation.clear_local();
         // Nothing waits on the snapshot of a hidden card any more; a
         // connection that has gone has nothing to be told.
         let _ = self.present();
         let written = self.composer.text();
         let text = if written.is_empty() {
-            queued.source.text().to_owned()
+            queued.prompt.text().to_owned()
         } else {
-            format!("{}\n{written}", queued.source.text())
+            format!("{}\n{written}", queued.prompt.text())
         };
         self.replace_draft(text_editor::Content::with_text(&text));
-        let written = self.replace_attachments(queued.attachments);
+        let written = self.replace_attachments(std::mem::take(&mut queued.prompt.attachments));
         self.merge_attachments(written);
         Some(queued.draft)
     }
@@ -4534,13 +4734,13 @@ impl Runtime {
     }
 
     /// Whether the composer takes a message now. A first or queued message
-    /// still waiting goes before anything else is sent.
+    /// still waiting goes before anything else is sent. A command on its way
+    /// never closes it: what is given meanwhile waits behind that command.
     pub(super) fn composer_available(&self, transitioning: bool) -> bool {
         !transitioning
             && !self.closed_elsewhere
             && !self.disconnected
             && !self.snapshot.exited
-            && self.pending.is_none()
             && self.queued.is_none()
     }
 
@@ -4556,7 +4756,6 @@ impl Runtime {
             && (!snapshot.exited || self.has_connected_saved_history(snapshot))
             && !self.closed_elsewhere
             && !self.disconnected
-            && self.pending.is_none()
             && self.queued.is_none()
             && self.attachment_chooser_pending.is_none();
         [
@@ -4595,7 +4794,7 @@ impl Runtime {
     pub(super) fn plan_toggle(&self) -> Option<&str> {
         let modes = &self.snapshot.capabilities.permission_modes;
         modes.iter().any(|mode| mode == PLAN_MODE).then_some(())?;
-        if self.snapshot.permission_mode.as_deref() != Some(PLAN_MODE) {
+        if self.chosen_permission_mode() != Some(PLAN_MODE) {
             return Some(PLAN_MODE);
         }
         let other = |mode: &&String| mode.as_str() != PLAN_MODE;
@@ -4977,13 +5176,15 @@ impl Runtime {
             self.preparation.clear_local();
             return;
         }
-        if let Some(queued) = &self.queued {
-            if queued.presentation.prepared.is_none() {
-                self.preparation
-                    .stage_local(self.target, &queued.source, self.syntax_theme);
+        match self.local_prompt() {
+            Some(prompt) => {
+                if prompt.presentation.prepared.is_none() {
+                    let source = prompt.source.clone();
+                    self.preparation
+                        .stage_local(self.target, &source, self.syntax_theme);
+                }
             }
-        } else {
-            self.preparation.clear_local();
+            None => self.preparation.clear_local(),
         }
     }
 
@@ -5212,11 +5413,22 @@ impl Runtime {
                 // of tiny fences. Every changed prose publication goes to the
                 // worker; the last proven prefix remains visible meanwhile.
                 if !metadata_reused && (pending || !exact || report_reveal) {
-                    let replaced = self.preparation.stage(
+                    let replaced = self.preparation.stage_reusing(
                         item,
                         growing && (!reader_only || coordinated),
                         theme,
                         |old, new| known_append(handle.as_ref(), &self.logical_prose, old, new),
+                        || {
+                            current
+                                .into_iter()
+                                .flat_map(|cached| {
+                                    cached.blocks.iter().filter(|(key, block)| {
+                                        block.is_settled() && Some(**key) != cached.open
+                                    })
+                                })
+                                .map(|(key, block)| (*key, block.settled_clone()))
+                                .collect()
+                        },
                     );
                     // The answer being written, then the rows the reader
                     // returns to, then everything else from the newest back.
@@ -5252,7 +5464,6 @@ impl Runtime {
                     if !cache.contains_key(&item.id) {
                         presentation_changed = true;
                     }
-                    let theme = theme;
                     let cached = cache
                         .entry(item.id.clone())
                         .or_insert_with(|| CachedItem::preparing(item, theme));
@@ -5465,7 +5676,7 @@ impl Runtime {
                 &turns,
                 &self.snapshot.items,
             );
-            self.turns = turns;
+            self.turns = turns.into();
             reconcile_disclosure(&mut self.opened, &self.turns);
         }
         self.presentation_revision = self.presentation_revision.wrapping_add(1);
@@ -5545,6 +5756,7 @@ impl Runtime {
         self.child_ordinals.observe(&snapshot.subagents);
         if !self.presents() {
             self.release_transcript_presentation();
+            self.settle_commands(&snapshot, false);
             Arc::make_mut(&mut snapshot).evict_transcript();
             // Evicted, its agents have no transcripts to scan.
             self.agent_work.observe(&snapshot.subagents);
@@ -5579,10 +5791,7 @@ impl Runtime {
         );
         if self.page_request.is_some_and(|(_, generation)| {
             snapshot.generation > generation && !snapshot.history_loading
-        }) && self
-            .pending
-            .as_ref()
-            .is_none_or(|pending| pending.page.is_none())
+        }) && self.commands.iter().all(|pending| pending.page.is_none())
         {
             self.page_request = None;
             self.earlier_asked = None;
@@ -5633,6 +5842,9 @@ impl Runtime {
         });
         self.scroll_memory.retain_children(&snapshot.subagents);
         self.settle_recalls(&snapshot);
+        if self.settle_commands(&snapshot, true) {
+            self.prepare_local_prompt();
+        }
         self.taken_back.retain(|id| {
             snapshot
                 .queued_messages
@@ -5825,14 +6037,16 @@ impl Runtime {
         let child_disclosures: usize = self
             .child_expanded
             .values()
-            .chain(self.child_unfolded.values())
-            .map(HashSet::len)
+            .map(|choices| choices.len())
+            .chain(self.child_unfolded.values().map(HashSet::len))
             .sum();
         if child_disclosures > 4096 {
             for child in &snapshot.subagents {
                 let live: HashSet<_> = child.items.iter().map(|item| item.id.as_str()).collect();
-                if let Some(expanded) = self.child_expanded.get_mut(&child.id) {
-                    expanded.retain(|id| live.contains(id.as_str()));
+                if let Some(expanded) = self.child_expanded.get_mut(&child.id)
+                    && expanded.iter().any(|id| !live.contains(id.as_str()))
+                {
+                    expanded.edit().retain(|id| live.contains(id.as_str()));
                 }
                 if let Some(unfolded) = self.child_unfolded.get_mut(&child.id) {
                     // The final separator belongs to the part name; opaque
@@ -5849,7 +6063,7 @@ impl Runtime {
             let no_turns = HashMap::new();
             for (child, disclosure) in &mut self.child_find_disclosure {
                 disclosure.retain(
-                    self.child_expanded.get(child).unwrap_or(&empty),
+                    self.child_expanded.get(child).map_or(&empty, |set| &**set),
                     self.child_unfolded.get(child).unwrap_or(&empty),
                     &no_turns,
                 );
@@ -5858,8 +6072,15 @@ impl Runtime {
         // Keep disclosure choices across page eviction, with a bounded budget.
         // Question anchors only describe the currently loaded window.
         let parent_items_pruned = self.expanded.len() > 4096;
-        if parent_items_pruned {
-            self.expanded.retain(|id| live_ids.contains(id.as_str()));
+        if parent_items_pruned
+            && self
+                .expanded
+                .iter()
+                .any(|id| !live_ids.contains(id.as_str()))
+        {
+            self.expanded
+                .edit()
+                .retain(|id| live_ids.contains(id.as_str()));
         }
         self.asked_after.retain(|id| live_ids.contains(id.as_str()));
         let retired_metadata = self.prepare_transcript_cache(&snapshot);
@@ -5958,7 +6179,7 @@ impl Runtime {
             .map(str::to_owned);
         let parent_turns_pruned = self.opened.len() > 4096;
         if let Some(turns) = turns {
-            self.turns = turns;
+            self.turns = turns.into();
             reconcile_disclosure(&mut self.opened, &self.turns);
         }
         if parent_items_pruned || parent_turns_pruned {
@@ -6010,11 +6231,14 @@ impl Runtime {
         self.restore_failure_find();
         self.find_disclosure
             .restore(&mut self.expanded, &mut self.unfolded, &mut self.opened);
+        // Restoring reads a child's disclosures before it writes them; an
+        // absent child has nothing to restore, so give it no entry.
+        let mut no_items = Revised::default();
         for (child, mut disclosure) in self.child_find_disclosure.drain() {
             disclosure.restore(
-                self.child_expanded.entry(child.clone()).or_default(),
+                self.child_expanded.get_mut(&child).unwrap_or(&mut no_items),
                 self.child_unfolded.entry(child).or_default(),
-                &mut HashMap::new(),
+                &mut Revised::default(),
             );
         }
         // A temporary Find reveal owns the report's parsed body too. Drop it
@@ -6045,7 +6269,9 @@ impl Runtime {
         if let Some(child) = &self.selected_subagent {
             collapse_reports(
                 &mut self.child_cache,
-                self.child_expanded.entry(child.clone()).or_default(),
+                self.child_expanded
+                    .get(child)
+                    .map_or(&HashSet::new(), |set| &**set),
                 self.syntax_theme,
             );
         }
@@ -6080,9 +6306,7 @@ impl Runtime {
         if !visible {
             self.find_navigation.cancel_all();
             self.preparation.clear_local();
-            if let Some(queued) = &mut self.queued {
-                queued.presentation = prompt::LocalPresentation::default();
-            }
+            self.forget_local_presentations();
         }
         let changed = self.visible.swap(visible, Ordering::Relaxed) != visible;
         let rewarmed = visible && self.warm.take().is_some();
@@ -6233,9 +6457,7 @@ impl Runtime {
         // choices for the authoritative rehydration.
         self.failure_ui.release_presentation();
         self.provider_queue.borrow_mut().clear();
-        if let Some(queued) = &mut self.queued {
-            queued.presentation = prompt::LocalPresentation::default();
-        }
+        self.forget_local_presentations();
         self.preparation.clear();
         self.cache = HashMap::new();
         self.child_cache = HashMap::new();
@@ -6373,8 +6595,10 @@ impl Runtime {
     fn offers_fresh_conversation(&self) -> bool {
         let source = self.return_session();
         source.launch.session_id.is_some()
-            && (self.start_blocked.is_some()
-                || (self.snapshot.exited && self.snapshot.session_id != source.launch.session_id))
+            && self.start_blocked.map_or(
+                self.snapshot.exited && self.snapshot.session_id != source.launch.session_id,
+                blocked_recovery::Reopen::offers_fresh,
+            )
             && source.fresh_start().is_some()
     }
     /// Whether this card's provider stopped while the daemon that ran it still
@@ -6401,10 +6625,8 @@ impl Runtime {
     fn message_on_its_way(&self) -> bool {
         self.queued.is_some()
             || !self.followups.is_empty()
-            || self
-                .pending
-                .as_ref()
-                .is_some_and(|pending| pending.sent.is_some())
+            || self.commands.unsent().next().is_some()
+            || self.followups_sending()
     }
     /// Ownership can become durable after the initial attachment, including
     /// while the pane is hidden. Preserve that confirmed capability before
@@ -6429,7 +6651,7 @@ impl Runtime {
             Some("Finish or cancel the file chooser before leaving the chat.")
         } else if self.pastes_pending != 0 {
             Some("Wait for the image attachment to finish before leaving the chat.")
-        } else if self.pending.is_some() {
+        } else if !self.commands.is_idle() {
             Some("Wait for the pending chat command to finish before leaving the chat.")
         } else if self.queued.is_some() {
             Some(QUEUED_BLOCKER)
@@ -6516,6 +6738,8 @@ pub(super) fn chat_card_title(provider: Provider) -> &'static str {
         Provider::Omp => "OMP chat",
         Provider::Claude => "Claude chat",
         Provider::Codex => "Codex chat",
+        Provider::Antigravity => "Antigravity chat",
+        Provider::Muse => "Muse chat",
     }
 }
 
@@ -6571,6 +6795,9 @@ pub(super) fn conversion(session: &TerminalSession) -> Result<chat::Session, Str
         })?;
     let provider = Provider::from_program(&recipe.program)
         .ok_or("This terminal is not a supported agent session.")?;
+    if !provider.has_native_chat() {
+        return Err(provider.native_chat_refusal());
+    }
     let identity_flag = provider.resume_flag();
     let session_id = session.agent_resume_recipe().and_then(|recipe| {
         recipe
@@ -6656,6 +6883,20 @@ fn retire_conversation(
     session: Option<chat::Session>,
 ) -> Result<(), String> {
     end_conversation(handle, session, super::channel_ui::close_sessions)
+}
+
+/// Gives up a failed start the card replaced on its own, like
+/// [`retire_conversation`], but never retires an open agent that runs as it:
+/// the card's agent check can predate the agents the daemon reports.
+fn give_up_failed_start(
+    handle: Option<Arc<ClientHandle>>,
+    session: Option<chat::Session>,
+) -> Result<(), String> {
+    end_conversation(
+        handle,
+        session,
+        super::channel_ui::close_sessions_sparing_agents,
+    )
 }
 
 /// Closes a conversation the reader closed, like [`retire_conversation`],
@@ -6834,11 +7075,22 @@ fn draft_snapshot(
                     "bypassPermissions".into(),
                 ],
                 Provider::Codex => vec!["readOnly".into(), "workspaceWrite".into(), "yolo".into()],
+                // An ACP agent's own modes, by what they mean, until its
+                // session lists the ones it offers.
+                Provider::Antigravity | Provider::Muse => provider
+                    .acp()
+                    .into_iter()
+                    .flat_map(|acp| acp.mode_meanings())
+                    .map(str::to_owned)
+                    .collect(),
                 Provider::Omp => Vec::new(),
             },
             skill_reach: match provider {
                 Provider::Codex => chat::SkillReach::Anywhere,
-                Provider::Claude => chat::SkillReach::Leading,
+                // ACP agents expand a command the prompt opens with.
+                Provider::Claude | Provider::Antigravity | Provider::Muse => {
+                    chat::SkillReach::Leading
+                }
                 Provider::Omp => chat::SkillReach::First,
             },
             ..chat::Capabilities::default()
@@ -6848,13 +7100,6 @@ fn draft_snapshot(
         reasoning,
         ..Snapshot::default()
     }
-}
-
-/// The chosen model, including a listed default alias when no explicit model
-/// has been stored yet. A stale explicit choice does not select another model.
-pub(super) fn selected_chat_model(snapshot: &Snapshot) -> Option<&chat::Model> {
-    let selected = snapshot.selected_model.as_deref().unwrap_or("default");
-    snapshot.models.iter().find(|model| model.id == selected)
 }
 
 fn draft_permission_mode(recipe: &LaunchRecipe, provider: Provider) -> Option<String> {
@@ -6896,6 +7141,7 @@ fn draft_permission_mode(recipe: &LaunchRecipe, provider: Provider) -> Option<St
                 .or_else(|| Some("manual".into()))
         }
         Provider::Codex => codex_draft_permission_mode(recipe),
+        Provider::Antigravity | Provider::Muse => chat::acp_permission_mode(recipe, provider),
         Provider::Omp => None,
     }
 }
@@ -7035,6 +7281,9 @@ fn codex_draft_permission_mode(recipe: &LaunchRecipe) -> Option<String> {
 fn set_draft_permission_mode(recipe: &mut LaunchRecipe, provider: Provider, mode: &str) {
     if provider == Provider::Claude {
         chat::apply_claude_permission_mode(recipe, mode);
+        return;
+    }
+    if chat::apply_acp_permission_mode(recipe, provider, mode) {
         return;
     }
     if provider != Provider::Codex || !matches!(mode, "yolo" | "readOnly" | "workspaceWrite") {
@@ -7285,10 +7534,7 @@ impl Cagents {
             _ => return Task::none(),
         };
         let permission_controls = runtime.permission_controls(
-            !runtime.disconnected
-                && !runtime.snapshot.exited
-                && runtime.pending.is_none()
-                && runtime.queued.is_none(),
+            !runtime.disconnected && !runtime.snapshot.exited && runtime.queued.is_none(),
         );
         let focus = match &action {
             Action::AccountPicker(_, true) => Some(card_control_id(card, "chat-account-choice-0")),
@@ -7373,7 +7619,6 @@ impl Cagents {
                 !self.chat_start_pending(card)
                     && !runtime.disconnected
                     && !runtime.snapshot.exited
-                    && runtime.pending.is_none()
                     && runtime.queued.is_none(),
             )
         };
@@ -7885,7 +8130,8 @@ impl Cagents {
                 || runtime.snapshot.waiting
                 || !runtime.snapshot.requests.is_empty()
                 || !runtime.snapshot.queued_messages.is_empty()
-                || runtime.pending.is_some()
+                || !runtime.commands.is_idle()
+                || runtime.turn_under_way()
                 || !runtime.followups.is_empty()
                 || runtime.disconnected
                 || runtime.snapshot.exited)
@@ -8024,9 +8270,7 @@ impl Cagents {
         let Some(CardKind::Chat(source)) = self.card_state(card).map(|state| &state.kind) else {
             return None;
         };
-        if source.launch.session_id.is_none() {
-            return None;
-        }
+        source.launch.session_id.as_ref()?;
         let choices = self
             .chat_accounts(source.launch.provider, &source.launch.recipe)
             .into_iter()
@@ -8094,9 +8338,10 @@ impl Cagents {
                         format!(" · {}", choice.detail)
                     }
                 ))
-                .on_press_maybe(
-                    (!busy).then_some(Message::ChatUi(Action::RecoverAccount(card, choice.id))),
-                )
+                .on_press_maybe((!busy).then_some(Message::ChatUi(Action::RecoverAccount(
+                    card,
+                    choice.id.clone(),
+                ))))
                 .into(),
             );
         }
@@ -8531,7 +8776,7 @@ impl Cagents {
                 && runtime.choosing()
                 && runtime.composer.is_empty()
                 && runtime.attachments.is_empty()
-                && runtime.pending.is_none())
+                && runtime.commands.is_idle())
             && !self.chat_start_pending(card)
     }
 
@@ -8554,12 +8799,15 @@ impl Cagents {
         for card in used {
             self.chat_ui.default_chats.remove(&card);
         }
+        // A pane still reopening holds a conversation nobody knows the
+        // identity of yet; it is saved once it starts.
         let defaults = self
             .chat_ui
             .default_chats
             .iter()
             .copied()
             .chain(self.shared_views.defaults.keys().copied())
+            .chain(self.resume_ui.reopening.keys().copied())
             .collect::<HashSet<_>>();
         let open_cards = self
             .durable
@@ -8887,15 +9135,17 @@ impl Cagents {
     /// Opens a saved conversation in a new card, restoring its manual pane
     /// name before its first shared publication or provider attachment can
     /// report another title. `draft_from` is the card it was closed in, whose
-    /// kept draft the new card takes.
+    /// kept draft the new card takes. With `reopening`, the card waits for
+    /// that preparation, unsaved and unshared, and starts nothing yet.
     pub(super) fn insert_resumed_chat_card(
         &mut self,
         session: chat::Session,
         beside: Option<CardId>,
         user_title: Option<String>,
         draft_from: Option<CardId>,
-    ) -> Task<Message> {
-        self.insert_chat_card_with_lifetime(session, beside, false, draft_from, user_title)
+        reopening: Option<resume_ui::Reopening>,
+    ) -> (CardId, Task<Message>) {
+        self.insert_chat_card_as(session, beside, false, draft_from, user_title, reopening)
     }
 
     fn insert_chat_card_with_lifetime(
@@ -8906,6 +9156,19 @@ impl Cagents {
         draft_from: Option<CardId>,
         user_title: Option<String>,
     ) -> Task<Message> {
+        self.insert_chat_card_as(session, beside, ephemeral, draft_from, user_title, None)
+            .1
+    }
+
+    fn insert_chat_card_as(
+        &mut self,
+        session: chat::Session,
+        beside: Option<CardId>,
+        ephemeral: bool,
+        draft_from: Option<CardId>,
+        user_title: Option<String>,
+        reopening: Option<resume_ui::Reopening>,
+    ) -> (CardId, Task<Message>) {
         let beside = beside.and_then(|source| {
             let index = self.workspace.order().position(|id| id == source)?;
             let durable = self
@@ -8979,15 +9242,12 @@ impl Cagents {
                 self.status = Some(TransientNotice::error(error.to_string()));
                 ViewportUpdate::unchanged()
             });
-        let skills = if session.is_unstarted() {
-            self.open_chat_draft(card_id, session)
-        } else {
-            let intent = if session.native_continuity.retains_provider() {
-                chat::Intent::Restore
-            } else {
-                chat::Intent::Start
-            };
-            self.open_chat(card_id, session, intent)
+        let skills = match reopening {
+            Some(reopening) => {
+                self.resume_ui.reopening.insert(card_id, reopening);
+                Task::none()
+            }
+            None => self.open_placed_chat(card_id, session),
         };
         // An automatic placeholder is neither saved nor shared until someone
         // uses it (see `persistent_workspace`), so opening one, as entering an
@@ -9005,12 +9265,31 @@ impl Cagents {
         };
         // The new pane's input takes the keyboard through the workspace's
         // focus request, now if it is drawn or once it starts.
-        Task::batch([
+        let task = Task::batch([
             skills,
             self.apply_viewport(update, true, DurableChange::None),
             title,
             save,
-        ])
+        ]);
+        (card_id, task)
+    }
+
+    /// Opens the conversation `session` in the card `card` just placed for
+    /// it: its draft, when nothing has ever run it, or else a connection to it.
+    pub(super) fn open_placed_chat(
+        &mut self,
+        card: CardId,
+        session: chat::Session,
+    ) -> Task<Message> {
+        if session.is_unstarted() {
+            return self.open_chat_draft(card, session);
+        }
+        let intent = if session.native_continuity.retains_provider() {
+            chat::Intent::Restore
+        } else {
+            chat::Intent::Start
+        };
+        self.open_chat(card, session, intent)
     }
 
     /// Preserve only the exact explicit launch the failed pane was trying.
@@ -9249,8 +9528,8 @@ impl Cagents {
         }
         if self.chat_ui.started_elsewhere.remove(&card) {
             runtime.await_draft_echo(DraftEcho::First);
-        } else if self.chat_ui.sending_on_close.remove(&card) {
-            runtime.await_draft_echo(DraftEcho::Latest);
+        } else if let Some(after) = self.chat_ui.sending_on_close.remove(&card) {
+            runtime.await_draft_echo(DraftEcho::Latest(after));
         }
     }
 
@@ -9422,6 +9701,8 @@ impl Cagents {
     /// process with nothing able to read it back.
     pub(super) fn chat_discard(&mut self, card: CardId) {
         self.chat_ui.default_chats.remove(&card);
+        // A late preparation answer for it then finds nothing to start.
+        self.forget_reopening(card);
         // A start still in flight is not dropped with the card: whatever it
         // leaves in the daemon is given up when it answers, as for a close.
         match self.chat_ui.phases.remove(&card) {
@@ -9461,23 +9742,43 @@ impl Cagents {
         .then_some(CAPACITY_GUIDANCE)
     }
 
+    /// Whether retrying this card's start would only meet the refusal it has
+    /// already met. One that waits on the update restore stands only while
+    /// the daemon says it does.
     pub(super) fn chat_retry_blocked(&self, card: CardId) -> bool {
+        let stands = |reopen: blocked_recovery::Reopen| {
+            reopen != blocked_recovery::Reopen::UpdateRecovery
+                || self.chat_ui.update_recovery.wait.holds()
+        };
         match self.cards.get(&card) {
-            Some(CardRuntime::Chat(runtime)) => runtime.start_blocked.is_some(),
+            Some(CardRuntime::Chat(runtime)) => runtime.start_blocked.is_some_and(stands),
             _ => self
                 .chat_ui
                 .blocked_starts
                 .get(&card)
                 .is_some_and(|blocked| {
-                    self.card_state(card).is_some_and(|state| {
-                        matches!(&state.kind, CardKind::Chat(current) if *current == blocked.source)
-                    })
+                    stands(blocked.reopen)
+                        && self.card_state(card).is_some_and(|state| {
+                            matches!(&state.kind, CardKind::Chat(current) if *current == blocked.source)
+                        })
                 }),
         }
     }
 
     pub(super) fn chat_start_pending(&self, card: CardId) -> bool {
+        // A reopened conversation still being prepared starts once that ends.
+        self.chat_ui.phases.contains_key(&card) || self.reopen_preparing(card)
+    }
+    /// Whether `card` has begun starting its conversation, as opposed to
+    /// waiting for that start to be allowed.
+    #[cfg(test)]
+    pub(super) fn chat_start_began(&self, card: CardId) -> bool {
         self.chat_ui.phases.contains_key(&card)
+    }
+    /// Unsent text held for a card that has no chat runtime.
+    #[cfg(test)]
+    pub(super) fn held_chat_draft(&self, card: CardId) -> Option<&str> {
+        self.chat_ui.drafts.get(&card).map(String::as_str)
     }
     /// A shared echo may arrive before a starting chat has a runtime. Only
     /// the exact attempted descriptor reserves that attachment; a canonical
@@ -9513,7 +9814,15 @@ impl Cagents {
                 runtime.offers_fresh_conversation()
                     && self.card_state(card).is_some_and(|state| matches!(&state.kind, CardKind::Chat(current) if current == &runtime.session || current == &runtime.return_session()))
             }
-            _ => self.chat_retry_blocked(card) || self.chat_ui.fresh_offers.contains(&card),
+            _ => {
+                (self
+                    .chat_ui
+                    .blocked_starts
+                    .get(&card)
+                    .is_some_and(|blocked| blocked.reopen.offers_fresh())
+                    && self.chat_retry_blocked(card))
+                    || self.chat_ui.fresh_offers.contains(&card)
+            }
         };
         offered
             && self.chat_return_session(card).is_some_and(|source| {
@@ -9546,10 +9855,10 @@ impl Cagents {
         (!self.chat_start_pending(card)
             && !runtime.disconnected
             && !snapshot.exited
-            && runtime.pending.is_none()
+            && runtime.commands.is_idle()
             && runtime.queued.is_none()
             && snapshot.ready
-            && !snapshot.busy
+            && !runtime.turn_under_way()
             && snapshot.read_only_reason.is_none()
             && snapshot.capabilities.branch)
             .then_some(runtime.target)
@@ -9568,9 +9877,20 @@ impl Cagents {
     pub(super) fn chat_switch_available(&self, card: CardId) -> bool {
         match self.card_state(card).map(|state| &state.kind) {
             Some(CardKind::Chat(_)) => true,
-            Some(CardKind::Terminal(session)) => {
-                session.agent_resume_recipe().is_some() || observed_launch(session).is_some()
-            }
+            // Only an agent cagents can run as native chat switches to it,
+            // and an ACP agent's terminal only once it names its
+            // conversation: it publishes no other sign of which one it is in.
+            Some(CardKind::Terminal(session)) => session
+                .agent_resume_recipe()
+                .or_else(|| observed_launch(session))
+                .and_then(|recipe| {
+                    let provider = Provider::from_program(&recipe.program)?;
+                    (provider.has_native_chat()
+                        && (!provider.speaks_acp()
+                            || provider.resume_id(&recipe.arguments).is_some()))
+                    .then_some(())
+                })
+                .is_some(),
             _ => false,
         }
     }
@@ -9621,6 +9941,18 @@ impl Cagents {
                 Phase::Closing { .. } => "The conversation is closing. Wait for it to finish.",
             }));
         }
+        // Returning it to a terminal would retire the actor the service is
+        // preparing, or reopen what nobody has confirmed can be reopened.
+        if self.reopen_preparing(card) {
+            return Some(Cow::Borrowed(
+                "This conversation is reopening. Wait for it to connect.",
+            ));
+        }
+        if self.reopen_failed(card) {
+            return Some(Cow::Borrowed(
+                "This conversation couldn't be reopened. Retry or close it first.",
+            ));
+        }
         let Some(state) = self
             .card_state(card)
             .filter(|state| state.existence.is_open())
@@ -9651,6 +9983,11 @@ impl Cagents {
                 } else {
                     None
                 }
+            }
+            // Only while the card still names the conversation that was
+            // refused: a replacement is judged on its own.
+            CardKind::Chat(_) if self.unnamed_agent(card).is_some() => {
+                Some(Cow::Borrowed(blocked_recovery::UNNAMED_AGENT_TERMINAL))
             }
             CardKind::Chat(_) => match self.cards.get(&card) {
                 Some(CardRuntime::Chat(runtime)) => {
@@ -9764,7 +10101,7 @@ impl Cagents {
             Some(CardRuntime::Chat(runtime)) => runtime
                 .queued
                 .as_ref()
-                .map(|queued| queued.source.text().to_owned()),
+                .map(|queued| queued.prompt.text().to_owned()),
             _ => None,
         }
     }
@@ -9813,6 +10150,12 @@ impl Cagents {
                 .remove(&card);
             return remove;
         }
+        // A reopened conversation still being prepared has started nothing
+        // from this pane, so closing it leaves the conversation as it was
+        // before the reopen; the preparation's answer is then ignored.
+        if self.reopen_pending(card) {
+            return self.remove_chat_card(card, None).unwrap_or_else(Task::none);
+        }
         if self.pane_transfer_pending(card) {
             self.status = Some(TransientNotice::warning(
                 "This pane is moving to a channel. Wait for the move to finish before closing it.",
@@ -9824,6 +10167,11 @@ impl Cagents {
             Some(Phase::Closing { restart: None, .. })
         ) {
             return Task::none();
+        }
+        // Its questions are answered, so "Close and end agent" ends what it
+        // said still runs before the card goes.
+        if let Some(ending) = self.end_unnamed_agent_before_close(card) {
+            return ending;
         }
         if !self.prepare_shared_removal(card) {
             return Task::none();
@@ -9957,11 +10305,15 @@ impl Cagents {
                 return Task::none();
             }
         };
-        if session.launch.provider == Provider::Claude
-            && let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card)
+        if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card)
             && let Some(mode) = runtime.snapshot.permission_mode.as_deref()
         {
-            chat::apply_claude_permission_mode(&mut launch, mode);
+            // The terminal resumes in the mode the conversation is in now.
+            if session.launch.provider == Provider::Claude {
+                chat::apply_claude_permission_mode(&mut launch, mode);
+            } else {
+                chat::apply_acp_permission_mode(&mut launch, session.launch.provider, mode);
+            }
         }
         let resumes = session.launch.session_id.is_some();
         let handle = match self.cards.get(&card) {
@@ -10849,11 +11201,10 @@ impl Cagents {
             return Task::none();
         };
         runtime.preparation.clear_local();
+        let attachments = runtime.take_attachments();
         runtime.queued = Some(Queued {
-            source: prompt::LocalSource::new(pending.text),
-            presentation: prompt::LocalPresentation::default(),
+            prompt: prompt::LocalPrompt::new(pending.text, attachments),
             resolved_text: pending.resolved_text,
-            attachments: runtime.take_attachments(),
             model: pending.model,
             draft: pending.candidate.clone(),
             since: None,
@@ -10904,11 +11255,18 @@ impl Cagents {
         let Some(handle) = runtime.handle().cloned() else {
             return Task::none();
         };
-        if runtime.pending.is_some() || runtime.disconnected {
+        if !runtime.commands.is_idle() || runtime.disconnected {
             return Task::none();
         }
         let latest = handle.snapshot();
-        if latest.ready && !latest.busy && !latest.exited && !runtime.followups.is_empty() {
+        // Held follow-ups wait until a message just sent has shown, which
+        // is when the turn it starts can be seen.
+        if latest.ready
+            && !latest.busy
+            && !latest.exited
+            && !runtime.followups.is_empty()
+            && runtime.commands.outgoing().next().is_none()
+        {
             let (text, attachments) = runtime.combined_followups();
             // A queued message remains a prompt. Resolving it as an idle
             // slash command could discard everything combined after /compact.
@@ -10926,11 +11284,20 @@ impl Cagents {
                     return Task::none();
                 }
             };
+            let ids = runtime
+                .followups
+                .iter()
+                .map(|followup| followup.id)
+                .collect();
+            let message =
+                commands::Outgoing::new(text, attachments, PromptMode::Send, &runtime.snapshot);
+            let sent = runtime.next_command;
             let task = self.chat_send(target, command, false);
             if let Some(runtime) = self.chat_runtime_mut(target)
-                && let Some(pending) = &mut runtime.pending
+                && runtime.next_command != sent
+                && let Some(pending) = runtime.commands.newest_mut()
             {
-                pending.followup = true;
+                pending.carry_followups(ids, message);
             }
             return task;
         }
@@ -10986,7 +11353,7 @@ impl Cagents {
         match submission(
             queued.submission_text(&snapshot),
             &snapshot,
-            &queued.attachments,
+            &queued.prompt.attachments,
             PromptMode::Send,
         ) {
             Ok(command) => self.chat_send_step(
@@ -11075,7 +11442,7 @@ impl Cagents {
         let text = runtime
             .queued
             .take()
-            .map(|queued| (queued.source.text().to_owned(), queued.attachments));
+            .map(|queued| (queued.prompt.text().to_owned(), queued.prompt.attachments));
         let _ = runtime.present();
         // A delivery report about a message that arrived anyway says
         // nothing more the reader can act on.
@@ -11125,7 +11492,8 @@ impl Cagents {
         runtime.session = draft.clone();
         runtime.snapshot = Arc::new(snapshot);
         runtime.forget_transcript();
-        runtime.pending = None;
+        let unsent = runtime.commands.abandon();
+        runtime.restore_outgoing(unsent);
         runtime.disconnected = false;
         runtime.error = error;
         runtime.refresh();
@@ -11149,9 +11517,9 @@ impl Cagents {
         };
         if runtime.queued.is_none()
             || runtime
-                .pending
-                .as_ref()
-                .is_some_and(|pending| pending.queued == Some(QueuedStep::Prompt))
+                .commands
+                .iter()
+                .any(|pending| pending.queued == Some(QueuedStep::Prompt))
         {
             return Task::none();
         }
@@ -11171,7 +11539,7 @@ impl Cagents {
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
-        if runtime.pending.is_some()
+        if !runtime.commands.is_idle()
             || runtime.queued.is_some()
             || runtime.disconnected
             || runtime.selected_subagent.is_some()
@@ -11205,7 +11573,7 @@ impl Cagents {
             }
             HistoryNavigation::Latest => Task::none(),
             HistoryNavigation::NewerEdge
-                if runtime.parent_scroll().at_bottom() && runtime.snapshot.has_later =>
+                if runtime.parent_scroll().prefetch_later() && runtime.snapshot.has_later =>
             {
                 self.chat_send(target, Command::LoadLater, false)
             }
@@ -11213,7 +11581,7 @@ impl Cagents {
                 self.chat_send(target, Command::LoadEarlier, false)
             }
             HistoryNavigation::EarlierEdge
-                if runtime.parent_scroll().at_top() && runtime.snapshot.has_earlier =>
+                if runtime.parent_scroll().prefetch_earlier() && runtime.snapshot.has_earlier =>
             {
                 self.chat_send(target, Command::LoadEarlier, false)
             }
@@ -11252,30 +11620,30 @@ impl Cagents {
             return Task::none();
         }
         // A queued first message goes out ahead of anything else, and
-        // nothing is sent past it while it waits.
-        if runtime.pending.is_some()
-            || runtime.disconnected
+        // nothing is sent past it while it waits. Anything else given while
+        // a command is on its way waits behind it, in order.
+        if runtime.disconnected
             || (runtime.queued.is_some() != step.is_some())
+            || (step.is_some() && !runtime.commands.is_idle())
         {
             return Task::none();
         }
         let Some(handle) = runtime.handle().cloned() else {
             return Task::none();
         };
-        let request = if let Command::Answer {
+        if let Command::Answer {
             request_id, action, ..
         } = &command
-        {
-            if !runtime.snapshot.requests.iter().any(|request| {
+            && !runtime.snapshot.requests.iter().any(|request| {
                 &request.id == request_id
                     && request.actions.iter().any(|choice| &choice.id == action)
-            }) {
-                return Task::none();
-            }
-            Some(request_id.clone())
-        } else {
-            None
-        };
+            })
+        {
+            return Task::none();
+        }
+        if runtime.commands.repeats(&command) {
+            return Task::none();
+        }
         if command == Command::LoadEarlier
             && (runtime.selected_subagent.is_some()
                 || !runtime.snapshot.has_earlier
@@ -11303,13 +11671,22 @@ impl Cagents {
         }
         runtime.next_command = runtime.next_command.wrapping_add(1);
         let id = runtime.next_command;
-        let page = match &command {
-            Command::LoadEarlier => Some(view::Page::Earlier),
-            Command::Refresh => Some(view::Page::Latest),
-            Command::LoadLater => Some(view::Page::Newer),
-            _ => None,
-        };
-        if let Some(page) = page {
+        let mut pending = commands::PendingCommand::new(id, &command);
+        pending.queued = step;
+        if let Some(sent) = &pending.sent {
+            // A message still on its way reading the same may arrive first,
+            // and nothing would tell the two apart.
+            pending.sent_after = if runtime
+                .commands
+                .outgoing()
+                .any(|outgoing| outgoing.prompt.text().trim() == sent.trim())
+            {
+                SentAfter::Unseen
+            } else {
+                sent_after(&runtime.snapshot, sent)
+            };
+        }
+        if let Some(page) = pending.page {
             if page == view::Page::Latest {
                 match latest_reader {
                     LatestReader::Follow => runtime
@@ -11331,44 +11708,43 @@ impl Cagents {
                 }
             }
         }
-        let first_prompt = match &command {
-            Command::Prompt { text, .. } if !text.trim().is_empty() => Some(text.clone()),
-            _ => None,
-        };
-        let sent = match &command {
-            Command::Prompt { text, .. } if !text.trim().is_empty() => Some(text.clone()),
-            Command::Slash { command } => Some(command.clone()),
-            _ => None,
-        };
-        let sent_attachments = match &command {
-            Command::Prompt { attachments, .. } => attachments.clone(),
-            _ => Vec::new(),
-        };
-        let model = match &command {
-            Command::SetModel { model, reasoning } => Some((model.clone(), reasoning.clone())),
-            _ => None,
-        };
-        runtime.pending = Some(PendingCommand {
-            followup: false,
-            take_back: None,
-            id,
-            draft_revision: clear_draft.then_some(runtime.revision),
-            request,
-            first_prompt,
-            model,
-            page,
-            sent,
-            sent_attachments,
-            queued: step,
-        });
+        if clear_draft {
+            // The message leaves the composer now, for where it is going,
+            // rather than when the provider answers: the reader can write
+            // the next one meanwhile, and one the provider refuses comes
+            // back with the reason.
+            let text = runtime.composer.text().trim_end().to_owned();
+            let attachments = runtime.take_attachments();
+            runtime.replace_draft(text_editor::Content::new());
+            let mode = match &command {
+                Command::Prompt { mode, .. } => *mode,
+                _ => PromptMode::Send,
+            };
+            let mut outgoing = commands::Outgoing::new(text, attachments, mode, &runtime.snapshot);
+            outgoing.written = runtime.next_written;
+            runtime.next_written += 1;
+            pending.outgoing = Some(outgoing);
+            runtime.prepare_local_prompt();
+        }
         runtime.error = None;
-        cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || handle.send(command))
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|result| result);
-            Message::ChatUi(Action::CommandFinished(target, id, result))
-        })
+        let snapshot = runtime.snapshot.clone();
+        match runtime.commands.push(pending, command, &snapshot) {
+            Some((id, command)) => run_chat_command(target, id, Some(handle), command),
+            None => Task::none(),
+        }
+    }
+
+    /// Sends the next command waiting behind one the provider has answered.
+    fn next_chat_command(&mut self, target: Target) -> Task<Message> {
+        let Some(runtime) = self.chat_runtime_mut(target) else {
+            return Task::none();
+        };
+        let snapshot = runtime.snapshot.clone();
+        let Some((id, command)) = runtime.commands.next(&snapshot) else {
+            return Task::none();
+        };
+        let handle = runtime.handle().cloned().filter(|_| !runtime.disconnected);
+        run_chat_command(target, id, handle, command)
     }
     /// [`Self::handle_chat_ui`] for the update loop, which also answers how
     /// much of the workspace projection the action changed.
@@ -11501,7 +11877,7 @@ impl Cagents {
             );
             return Task::none();
         }
-        return cosmic::task::future(async move {
+        cosmic::task::future(async move {
             let worker_ticket = id.clone();
             let result = images::run_worker(move || {
                 worker_ticket.check()?;
@@ -11519,7 +11895,7 @@ impl Cagents {
             .await
             .and_then(|r| r);
             Message::ChatUi(Action::AttachmentsPrepared(target, id, result))
-        });
+        })
     }
 
     fn handle_chat_ui_inner(&mut self, action: Action) -> Task<Message> {
@@ -11566,6 +11942,25 @@ impl Cagents {
             return Task::none();
         }
         match action {
+            Action::UpdateRecoveryAnswered(answer) => {
+                return self.update_recovery_answered(answer);
+            }
+            Action::UpdateRecoveryDue => return self.update_recovery_due(),
+            Action::UpdateRecoveryReady => return self.release_update_recovery(),
+            Action::SendAgain(target) => {
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                if runtime.start_blocked != Some(blocked_recovery::Reopen::UpdateRecovery)
+                    || runtime.update_wait.holds()
+                    || !runtime.is_draft()
+                {
+                    return Task::none();
+                }
+                runtime.release_start_block();
+                return self.handle_chat_ui_inner(Action::Submit(target, PromptMode::Send));
+            }
+            Action::ReopenStopped(card) => return self.reopen_stopped(card),
             Action::CopyClosedDraft(target, revision) => {
                 return self.copy_closed_chat_draft(target, revision);
             }
@@ -11637,13 +12032,14 @@ impl Cagents {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.refresh();
                     if runtime.visible.load(Ordering::Relaxed)
-                        && let Some(queued) = runtime.queued.as_mut()
-                        && let Some(prepared) =
-                            runtime
-                                .preparation
-                                .accept_local(target, run, &queued.source, ready)
+                        && let Some(source) =
+                            runtime.local_prompt().map(|prompt| prompt.source.clone())
+                        && let Some(prepared) = runtime
+                            .preparation
+                            .accept_local(target, run, &source, ready)
+                        && let Some(prompt) = runtime.local_prompt_mut()
                     {
-                        prepared.install_local(&mut queued.presentation);
+                        prepared.install_local(&mut prompt.presentation);
                         runtime.presentation_revision =
                             runtime.presentation_revision.wrapping_add(1);
                         runtime.find_navigation.changed_document();
@@ -11914,7 +12310,7 @@ impl Cagents {
                         )));
                     }
                 }
-                return self.update(Message::ChatUi(Action::Ready(target, ready)));
+                return self.dispatch(Message::ChatUi(Action::Ready(target, ready)));
             }
             Action::ResumeCommitted(target, ready, result) => {
                 match result {
@@ -11941,11 +12337,11 @@ impl Cagents {
                         });
                         return Task::batch([
                             retire,
-                            self.update(Message::ChatUi(Action::Ready(target, ready))),
+                            self.dispatch(Message::ChatUi(Action::Ready(target, ready))),
                         ]);
                     }
                 }
-                return self.update(Message::ChatUi(Action::Ready(target, ready)));
+                return self.dispatch(Message::ChatUi(Action::Ready(target, ready)));
             }
             Action::AccountCommitted(target, ready, result) => {
                 match result {
@@ -11966,7 +12362,7 @@ impl Cagents {
                         )));
                     }
                 }
-                return self.update(Message::ChatUi(Action::Ready(target, ready)));
+                return self.dispatch(Message::ChatUi(Action::Ready(target, ready)));
             }
             Action::DraftStartCheckpointed(target, attempt, result) => {
                 return self.draft_start_checkpointed(target, attempt, result);
@@ -12280,9 +12676,7 @@ impl Cagents {
                                 waiting.clear();
                             }
                             runtime.preparation.clear();
-                            if let Some(queued) = &mut runtime.queued {
-                                queued.presentation = prompt::LocalPresentation::default();
-                            }
+                            runtime.forget_local_presentations();
                             if runtime.retains_source_body() {
                                 // The validated successor owns a new source,
                                 // even if its generation and item IDs repeat.
@@ -12295,7 +12689,16 @@ impl Cagents {
                             runtime.account_picker = false;
                             runtime.session = session.clone();
                             runtime.disconnected = false;
-                            runtime.pending = None;
+                            // Whatever the old handle was still sending may
+                            // or may not have arrived. It comes back to the
+                            // composer, which lets go of it if the
+                            // conversation shows it did.
+                            let after = runtime.commands.first_unsent_after();
+                            let unsent = runtime.commands.abandon();
+                            if !unsent.is_empty() {
+                                runtime.restore_outgoing(unsent);
+                                runtime.await_draft_echo(DraftEcho::Latest(after));
+                            }
                             // Request generations belong to the old handle. A
                             // restarted daemon can begin again at generation 1.
                             runtime.page_request = None;
@@ -12451,10 +12854,12 @@ impl Cagents {
                             runtime.start_blocked = blocked_recovery::Reopen::of(failure.recovery);
                             runtime.error = Some(failure.message);
                         }
-                        let restore = if failure.recovery == chat::Recovery::Account {
-                            self.offer_chat_account_restore(target.card, &attempt.session, true)
-                        } else {
-                            Task::none()
+                        let restore = match failure.recovery {
+                            chat::Recovery::Account => {
+                                self.offer_chat_account_restore(target.card, &attempt.session, true)
+                            }
+                            chat::Recovery::UpdateRecovery => self.update_refused(),
+                            _ => Task::none(),
                         };
                         return Task::batch([
                             self.retire_chat(target.card, None, Some(attempt.session)),
@@ -12521,7 +12926,10 @@ impl Cagents {
                             && matches!(
                                 self.card_state(target.card).map(|state| &state.kind),
                                 Some(CardKind::Chat(_))
-                            ) =>
+                            )
+                            // An agent ran there, and giving up its card
+                            // would end the agent and its conversation.
+                            && !self.chat_runs_as_open_agent(target.card, &attempt.session) =>
                     {
                         // A conversation its provider never named, and that
                         // no CLI terminal of the reader's holds, has nothing
@@ -12542,19 +12950,47 @@ impl Cagents {
                         let skills = self.open_chat_draft(target.card, draft);
                         return Task::batch([
                             skills,
-                            self.retire_chat(target.card, None, Some(attempt.session)),
+                            self.end_chat(
+                                target.card,
+                                None,
+                                Some(attempt.session),
+                                give_up_failed_start,
+                            ),
                         ]);
                     }
-                    Err(failure) => {
-                        let blocked = blocked_recovery::Reopen::of(failure.recovery);
+                    Err(mut failure) => {
+                        // Starting over would give up the agent's card, so its
+                        // conversation is refused for good, with Close to end it.
+                        let unnamed_agent = failure.recovery == chat::Recovery::Fresh
+                            && attempt.session.launch.session_id.is_none()
+                            && self.chat_runs_as_open_agent(target.card, &attempt.session);
+                        if unnamed_agent {
+                            failure.recovery = chat::Recovery::Blocked;
+                            failure.message = unnamed_agent_conversation(&attempt.session);
+                        }
+                        let blocked = if unnamed_agent {
+                            Some(blocked_recovery::Reopen::UnnamedAgent)
+                        } else {
+                            blocked_recovery::Reopen::of(failure.recovery)
+                        };
+                        let mut running = Task::none();
+                        let update_refused =
+                            blocked == Some(blocked_recovery::Reopen::UpdateRecovery);
                         if let Some(reopen) = blocked {
                             self.chat_ui.blocked_starts.insert(
                                 target.card,
                                 blocked_recovery::BlockedStart {
                                     source: attempt.session.clone(),
                                     reopen,
+                                    liveness: Default::default(),
                                 },
                             );
+                            if unnamed_agent {
+                                running = self.ask_unnamed_agent_running(
+                                    target.card,
+                                    attempt.session.clone(),
+                                );
+                            }
                         } else {
                             self.chat_ui.blocked_starts.remove(&target.card);
                         }
@@ -12603,26 +13039,38 @@ impl Cagents {
                                 self.chat_ui.capacity_offers.remove(&target.card);
                             }
                             self.fail_runtime(target.card, failure.message.clone());
-                            // The notice says what the reader lost in their
-                            // terms; the pane keeps the daemon's reason, and
-                            // the attempt that succeeds withdraws the notice.
-                            let pane = self
-                                .notice_pane_name(target.card)
-                                .unwrap_or_else(|| "a conversation".to_owned());
-                            // A launch that names no conversation had none to
-                            // reopen: starting it is what failed.
-                            let verb = if attempt.intent == chat::Intent::Start
-                                && attempt.session.launch.session_id.is_none()
+                            if update_refused
+                                || blocked.is_some_and(blocked_recovery::Reopen::reopens)
                             {
-                                "start"
+                                // The pane says what the update did to it and
+                                // offers what works now, so an error that it
+                                // could not reopen would only alarm.
+                                self.resolve_notice(NoticeKey::ChatAttach(target.card));
                             } else {
-                                "reopen"
-                            };
-                            self.status = Some(
-                                TransientNotice::error(format!("Could not {verb} {pane}."))
-                                    .with_details(failure.message)
-                                    .with_key(NoticeKey::ChatAttach(target.card)),
-                            );
+                                // The notice says what the reader lost in their
+                                // terms; the pane keeps the daemon's reason, and
+                                // the attempt that succeeds withdraws the notice.
+                                let pane = self
+                                    .notice_pane_name(target.card)
+                                    .unwrap_or_else(|| "a conversation".to_owned());
+                                // A launch that names no conversation had none to
+                                // reopen: starting it is what failed.
+                                // An agent's conversation that ran is reopened,
+                                // even though it was never named.
+                                let verb = if attempt.intent == chat::Intent::Start
+                                    && attempt.session.launch.session_id.is_none()
+                                    && !unnamed_agent
+                                {
+                                    "start"
+                                } else {
+                                    "reopen"
+                                };
+                                self.status = Some(
+                                    TransientNotice::error(format!("Could not {verb} {pane}."))
+                                        .with_details(failure.message)
+                                        .with_key(NoticeKey::ChatAttach(target.card)),
+                                );
+                            }
                         } else {
                             // Failed recognition/attachment must never replace or
                             // tear down the user's still-running terminal.
@@ -12646,6 +13094,12 @@ impl Cagents {
                         return Task::batch([
                             self.drain_terminal(target.card, 0),
                             cleanup,
+                            running,
+                            if update_refused {
+                                self.update_refused()
+                            } else {
+                                Task::none()
+                            },
                             if terminal_switch {
                                 cosmic::task::message(Message::ChromeUi(
                                     chrome_ui::Action::ShowNoticesFor(target.card),
@@ -12901,6 +13355,9 @@ impl Cagents {
                             refresh_limits,
                             self.list_chat_models(target.card),
                             self.resume_current_find(target, true),
+                            // A command waiting for the turn a message
+                            // starts goes once the conversation shows it.
+                            self.next_chat_command(target),
                             self.dispatch_queued(target),
                             self.resume_history_navigation(target),
                             fork.map_or_else(Task::none, |session| {
@@ -13015,7 +13472,7 @@ impl Cagents {
                     return Task::none();
                 };
                 let session = runtime.session.clone();
-                if runtime.pending.is_some()
+                if !runtime.commands.is_idle()
                     || runtime.attachment_chooser_pending.is_some()
                     || runtime.pastes_pending > 0
                 {
@@ -13051,7 +13508,7 @@ impl Cagents {
                 }
                 if !runtime.is_saved_history_snapshot(&snapshot)
                     || snapshot.history_loading
-                    || runtime.pending.is_some()
+                    || !runtime.commands.is_idle()
                     || runtime.attachment_chooser_pending.is_some()
                 {
                     return Task::none();
@@ -13069,7 +13526,7 @@ impl Cagents {
                 return self.finish_fresh_conversation(target, *source, *requested, result);
             }
             Action::ToggleBlockedDetails(card, source) => {
-                if self.blocked_failure_source(card) == Some(&source) {
+                if self.blocked_details_source(card) == Some(&source) {
                     if self.chat_ui.blocked_details.get(&card) == Some(&source) {
                         self.chat_ui.blocked_details.remove(&card);
                     } else {
@@ -13078,12 +13535,31 @@ impl Cagents {
                 }
             }
             Action::CopyBlockedDetails(card, source) => {
-                if self.blocked_failure_source(card) == Some(&source)
-                    && let Some(CardRuntime::Failed(failure)) = self.cards.get(&card)
+                if self.blocked_details_source(card) == Some(&source)
+                    && let Some(text) = self.blocked_details_text(card)
                 {
                     text_copy::invalidate();
-                    return iced::clipboard::write(failure.message().to_owned())
-                        .map(cosmic::Action::App);
+                    return iced::clipboard::write(text.to_owned()).map(cosmic::Action::App);
+                }
+            }
+            Action::UnnamedAgentRunning(card, source, running) => {
+                self.record_unnamed_agent_running(card, &source, running);
+            }
+            Action::UnnamedAgentEnded(card, source, result) => {
+                return self.unnamed_agent_ended(card, &source, result);
+            }
+            Action::CopyBlockedDraft(card, source) => {
+                if self
+                    .unnamed_agent(card)
+                    .is_some_and(|blocked| blocked.source == source)
+                    && let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card)
+                {
+                    let text = runtime.unsent_text();
+                    if !text.trim().is_empty() {
+                        text_copy::invalidate();
+                        self.status = Some(TransientNotice::success("Copied message"));
+                        return iced::clipboard::write(text).map(cosmic::Action::App);
+                    }
                 }
             }
             Action::ComposerCursor(target, cursor) => {
@@ -13329,20 +13805,20 @@ impl Cagents {
                 }
             }
             Action::AppendProviderDraft(target) => {
-                if let Some(runtime) = self.chat_runtime_mut(target) {
-                    if let Some(provided) = &runtime.snapshot.composer {
-                        let mut text = runtime.composer.text();
-                        if !text.trim().is_empty() {
-                            text.push('\n');
-                        }
-                        text.push_str(provided);
-                        // Appending promotes the recalled prompt to the unsent
-                        // draft, just as typing or completing a word does.
-                        runtime.history_cursor = None;
-                        runtime.history_stash = None;
-                        runtime.history_attachment_stash = None;
-                        runtime.replace_draft(text_editor::Content::with_text(&text));
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && let Some(provided) = &runtime.snapshot.composer
+                {
+                    let mut text = runtime.composer.text();
+                    if !text.trim().is_empty() {
+                        text.push('\n');
                     }
+                    text.push_str(provided);
+                    // Appending promotes the recalled prompt to the unsent
+                    // draft, just as typing or completing a word does.
+                    runtime.history_cursor = None;
+                    runtime.history_stash = None;
+                    runtime.history_attachment_stash = None;
+                    runtime.replace_draft(text_editor::Content::with_text(&text));
                 }
             }
             Action::SubmitControl(target, mode) => {
@@ -13370,7 +13846,10 @@ impl Cagents {
                 };
                 // Match the disabled Send control before account routing,
                 // paste deferral or queue mutation can consume the draft.
+                // Nothing goes past a first message still on its way; the
+                // draft stays as written.
                 if runtime.start_blocked.is_some()
+                    || runtime.queued.is_some()
                     || (!runtime.is_draft()
                         && (runtime.disconnected
                             || runtime.snapshot.exited
@@ -13472,8 +13951,7 @@ impl Cagents {
                 if (!runtime.followups.is_empty() && mode != PromptMode::Steer
                     || mode == PromptMode::Queue
                         && !runtime.snapshot.capabilities.queue
-                        && runtime.snapshot.busy)
-                    && runtime.pending.is_none()
+                        && runtime.turn_under_way())
                     && !runtime.disconnected
                     && !runtime.snapshot.exited
                 {
@@ -13498,8 +13976,8 @@ impl Cagents {
                         );
                         return Task::none();
                     }
-                    let id = runtime.next_followup;
-                    runtime.next_followup += 1;
+                    let id = runtime.next_written;
+                    runtime.next_written += 1;
                     let text = runtime.composer.text().trim_end().to_owned();
                     let followup = Followup {
                         id,
@@ -13511,7 +13989,7 @@ impl Cagents {
                     runtime.replace_draft(text_editor::Content::new());
                     runtime.error = None;
                     let _ = runtime.present();
-                    return if runtime.snapshot.busy {
+                    return if runtime.turn_under_way() {
                         Task::none()
                     } else {
                         self.dispatch_queued(target)
@@ -13519,7 +13997,7 @@ impl Cagents {
                 }
                 if (mode == PromptMode::Steer && !runtime.snapshot.capabilities.steer)
                     || (mode == PromptMode::Queue && !runtime.snapshot.capabilities.queue)
-                    || (mode == PromptMode::Send && runtime.snapshot.busy)
+                    || (mode == PromptMode::Send && runtime.turn_under_way())
                 {
                     return Task::none();
                 }
@@ -13546,7 +14024,7 @@ impl Cagents {
                         .map(cosmic::Action::App);
                 match entry {
                     QueueEntry::Local(id) => {
-                        if runtime.followups_sending() {
+                        if runtime.followup_sending(id) {
                             return Task::none();
                         }
                         let Some(index) = runtime
@@ -13586,7 +14064,7 @@ impl Cagents {
                             self.chat_send(target, Command::RemoveQueued { id: id.clone() }, false);
                         if let Some(runtime) = self.chat_runtime_mut(target)
                             && runtime.next_command != sent
-                            && let Some(pending) = &mut runtime.pending
+                            && let Some(pending) = runtime.commands.newest_mut()
                         {
                             pending.take_back = Some(id);
                             runtime.recalling.push(Recall { message, answered });
@@ -13598,7 +14076,7 @@ impl Cagents {
             Action::RemoveQueued(target, entry) => match entry {
                 QueueEntry::Local(id) => {
                     if let Some(runtime) = self.chat_runtime_mut(target)
-                        && !runtime.followups_sending()
+                        && !runtime.followup_sending(id)
                     {
                         runtime.followups.retain(|followup| followup.id != id);
                         let _ = runtime.present();
@@ -13782,26 +14260,26 @@ impl Cagents {
                     runtime.composer_actions = false;
                     runtime.branch_picker = false;
                 }
-                if command == Command::LoadEarlier {
-                    if let Some(runtime) = self.chat_runtime_mut(target) {
-                        if runtime.selected_subagent.is_some() {
-                            return Task::none();
-                        }
-                        if runtime
-                            .pending
-                            .as_ref()
-                            .is_some_and(|pending| pending.page.is_none())
-                            && runtime.deferred_page != Some(HistoryNavigation::Latest)
-                        {
-                            runtime.deferred_page = Some(HistoryNavigation::EarlierExplicit);
-                            return Task::none();
-                        }
+                if command == Command::LoadEarlier
+                    && let Some(runtime) = self.chat_runtime_mut(target)
+                {
+                    if runtime.selected_subagent.is_some() {
+                        return Task::none();
+                    }
+                    if runtime
+                        .commands
+                        .iter()
+                        .any(|pending| pending.page.is_none())
+                        && runtime.deferred_page != Some(HistoryNavigation::Latest)
+                    {
+                        runtime.deferred_page = Some(HistoryNavigation::EarlierExplicit);
+                        return Task::none();
                     }
                 }
                 if matches!(command, Command::Branch { .. })
                     && let Some(runtime) = self.chat_runtime_mut(target)
-                    && runtime.pending.is_none()
-                    && !runtime.snapshot.busy
+                    && runtime.commands.is_idle()
+                    && !runtime.turn_under_way()
                 {
                     runtime.branch_picker = false;
                     runtime.fork_requested = true;
@@ -13822,6 +14300,10 @@ impl Cagents {
                     });
                 }
                 runtime.interrupt_armed = None;
+                // Before the turn has begun, Stop also takes back what was
+                // lined up behind it. The provider is still told to stop, so
+                // the turn ends as it begins.
+                runtime.withdraw_before_turn();
                 return self.chat_send(target, Command::Interrupt, false);
             }
             Action::DisarmInterrupt(target, at) => {
@@ -14005,7 +14487,7 @@ impl Cagents {
                 // Through the app's own dispatch, so every guard a pressed row
                 // passes, such as a remote device refusing local files, holds
                 // for Enter too.
-                let task = self.update(Message::ChatUi(chosen));
+                let task = self.dispatch(Message::ChatUi(chosen));
                 if !refocus {
                     return task;
                 }
@@ -14067,50 +14549,55 @@ impl Cagents {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
-                if !runtime
-                    .pending
-                    .as_ref()
-                    .is_some_and(|pending| pending.id == id)
-                {
+                let Some(mut pending) = runtime.commands.finish(id) else {
                     return Task::none();
-                }
-                let pending = runtime.pending.take().unwrap();
+                };
                 let provider = runtime.session.launch.provider;
                 if result.is_ok()
-                    && let Some((model, reasoning)) = pending.model.clone()
+                    && let Some(commands::Choice::Model { model, reasoning }) =
+                        pending.choice.clone()
                 {
                     self.remember_chat_model(provider, Some(model), reasoning);
                 }
                 if let Some(step) = pending.queued {
-                    return self.queued_step_finished(target, step, pending.first_prompt, result);
+                    return Task::batch([
+                        self.queued_step_finished(target, step, pending.first_prompt, result),
+                        self.next_chat_command(target),
+                    ]);
                 }
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
                 let mut followups_sent = false;
+                let mut due = Task::none();
                 let first_prompt = match result {
                     Ok(()) => {
-                        if pending.followup {
-                            followups_sent = !runtime.followups.is_empty();
-                            runtime.followups.clear();
+                        if !pending.followups.is_empty() {
+                            let before = runtime.followups.len();
+                            runtime
+                                .followups
+                                .retain(|followup| !pending.followups.contains(&followup.id));
+                            followups_sent = runtime.followups.len() != before;
                             let _ = runtime.present();
                         }
-                        // What the notice described left with this message,
-                        // even when the reader has typed on since.
-                        if pending.draft_revision.is_some() {
-                            runtime.restored_waiting = None;
+                        if let Some(sent) = pending.sent.take() {
+                            runtime.remember_with_attachments(
+                                sent,
+                                std::mem::take(&mut pending.sent_attachments),
+                            );
                         }
-                        if pending.draft_revision == Some(runtime.revision) {
-                            runtime.replace_draft(text_editor::Content::new());
-                            runtime.take_attachments();
-                        }
-                        if let Some(sent) = pending.sent {
-                            runtime.remember_with_attachments(sent, pending.sent_attachments);
-                        }
-                        if let Some(request) = pending.request {
-                            runtime.answers.retain(|(id, _), _| id != &request);
+                        if let Some(request) = &pending.request {
+                            runtime.answers.retain(|(id, _), _| id != request);
                         }
                         runtime.refresh();
+                        let snapshot = runtime.snapshot.clone();
+                        runtime.commands.accept(&mut pending, &snapshot);
+                        let items = runtime.presents();
+                        runtime.settle_commands(&snapshot, items);
+                        runtime.prepare_local_prompt();
+                        if runtime.commands.turn_coming(&snapshot) {
+                            due = commands_due(target);
+                        }
                         if pending.page == Some(view::Page::Latest)
                             && runtime.deferred_page == Some(HistoryNavigation::Latest)
                         {
@@ -14132,6 +14619,8 @@ impl Cagents {
                             }
                             return Task::batch([
                                 snap,
+                                due,
+                                self.next_chat_command(target),
                                 self.dispatch_queued(target),
                                 self.resume_history_navigation(target),
                             ]);
@@ -14148,11 +14637,22 @@ impl Cagents {
                             runtime.earlier_asked = None;
                             runtime.later_asked = None;
                         }
-                        if pending.followup {
-                            runtime.restore_followups();
-                        }
+                        // A message the provider did not take goes back to
+                        // the composer, and so does any written after it:
+                        // sent without it, they would arrive out of order.
+                        // Held follow-ups were written after it too, or are
+                        // what it carried.
+                        let unsent = pending.take_unsent();
                         if let Some(id) = &pending.take_back {
                             runtime.recalling.retain(|recall| &recall.message.id != id);
+                        }
+                        if let Some(outgoing) = unsent {
+                            let mut messages = vec![outgoing];
+                            messages.extend(runtime.commands.withdraw_messages());
+                            runtime.take_back_lined_up(messages);
+                            runtime.prepare_local_prompt();
+                        } else if !pending.followups.is_empty() {
+                            runtime.restore_followups();
                         }
                         runtime.note(error.clone());
                         runtime.fork_requested = false;
@@ -14172,9 +14672,24 @@ impl Cagents {
                 // acknowledgement. No later provider event is guaranteed to
                 // wake the follow-up again once the command releases it.
                 return Task::batch([
+                    due,
+                    self.next_chat_command(target),
                     self.dispatch_queued(target),
                     self.resume_history_navigation(target),
                 ]);
+            }
+            Action::CommandsDue(target) => {
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                let snapshot = runtime.snapshot.clone();
+                let items = runtime.presents();
+                if runtime.settle_commands(&snapshot, items) {
+                    runtime.prepare_local_prompt();
+                }
+                // A conversation still working reports again when it stops,
+                // and its report settles the message then.
+                return Task::batch([self.next_chat_command(target), self.dispatch_queued(target)]);
             }
             Action::Toggle(target, id) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
@@ -14188,8 +14703,13 @@ impl Cagents {
                         runtime.find_disclosure.manual_item(&id);
                         &mut runtime.expanded
                     };
-                    if !expanded.remove(&id) {
+                    let expanded = expanded.edit();
+                    let open = !expanded.remove(&id);
+                    if open {
                         expanded.insert(id.clone());
+                    }
+                    if runtime.selected_subagent.is_none() {
+                        runtime.follow_lone_step(&id, open);
                     }
                     if runtime.active_item(&id).is_some_and(|item| {
                         matches!(
@@ -14240,13 +14760,10 @@ impl Cagents {
                     runtime.find_navigation.cancel();
                     // Invert the visible default on the first toggle, then
                     // remember explicit choices across paging. Ignore stale keys.
-                    if runtime.turns.iter().any(|turn| turn.key == key) {
+                    if let Some(turn) = runtime.turns.iter().find(|turn| turn.key == key) {
+                        let open = !runtime.group_open(turn);
                         runtime.find_disclosure.manual_turn(&key);
-                        let open = runtime
-                            .opened
-                            .entry(key)
-                            .or_insert(runtime.tool_groups_expanded);
-                        *open = !*open;
+                        runtime.opened.edit().insert(key, open);
                     }
                 }
             }
@@ -14259,8 +14776,9 @@ impl Cagents {
                         .any(|incident| incident.key == key)
                 {
                     runtime.failure_ui.find_expanded.remove(&key);
-                    if !runtime.failure_ui.expanded.remove(&key) {
-                        runtime.failure_ui.expanded.insert(key.clone());
+                    let expanded = runtime.failure_ui.expanded.edit();
+                    if !expanded.remove(&key) {
+                        expanded.insert(key.clone());
                         runtime.cache_failure_preview(&key);
                     }
                 }
@@ -14412,7 +14930,16 @@ impl Cagents {
                 }
             }
             Action::CopyMessage(target, id, source) => {
-                return self.start_message_copy(target, id, source);
+                return self.start_message_copy(target, id, source, String::new());
+            }
+            Action::CopyStep(target, id, part, source) => {
+                let prefix = self
+                    .chat_runtime_mut(target)
+                    .and_then(|runtime| runtime.active_item(&id))
+                    .and_then(|item| step_copy_prefix(&part, &item.content));
+                if let Some(prefix) = prefix {
+                    return self.start_message_copy(target, id, Some(source), prefix);
+                }
             }
             Action::MessageCopied(target, id, request, result) => {
                 return self.finish_message_copy(target, id, request, result);
@@ -14434,23 +14961,21 @@ impl Cagents {
                 };
                 // The body itself lives in the snapshot; only the extracted
                 // code blocks are the cache's own.
-                let text = match part {
-                    part => runtime.active_item(&id).and_then(|item| {
-                        let card = runtime
-                            .presentation_cache()
-                            .get(&item.id)
-                            .and_then(|cached| cached.coordination.as_deref())
-                            .filter(|coordinated| coordinated.is_card());
-                        match card {
-                            // A message read from a file copies as the
-                            // command that sent it.
-                            Some(card) if matches!(part, CopyPart::Text) => {
-                                card.copy_text().or_else(|| copy_text(part, &item.content))
-                            }
-                            _ => copy_text(part, &item.content),
+                let text = runtime.active_item(&id).and_then(|item| {
+                    let card = runtime
+                        .presentation_cache()
+                        .get(&item.id)
+                        .and_then(|cached| cached.coordination.as_deref())
+                        .filter(|coordinated| coordinated.is_card());
+                    match card {
+                        // A message read from a file copies as the
+                        // command that sent it.
+                        Some(card) if matches!(part, CopyPart::Text) => {
+                            card.copy_text().or_else(|| copy_text(part, &item.content))
                         }
-                    }),
-                };
+                        _ => copy_text(part, &item.content),
+                    }
+                });
                 if let Some(text) = text {
                     let at = Instant::now();
                     runtime.copied = Some((id, at));
@@ -14656,10 +15181,8 @@ impl Cagents {
                 };
                 let text: Option<Arc<str>> = match source {
                     QueueCopy::Initial(source) => runtime
-                        .queued
-                        .as_ref()
-                        .filter(|queued| source.as_ptr() == Arc::as_ptr(&queued.source))
-                        .map(|queued| Arc::from(queued.source.text())),
+                        .local_prompt_by_source(&source)
+                        .map(|prompt| Arc::from(prompt.text())),
                     QueueCopy::Provider(source, id) => {
                         let current = runtime
                             .provider_queue
@@ -14723,14 +15246,14 @@ impl Cagents {
                 };
                 runtime.find_navigation.cancel();
                 if runtime.selected_subagent.is_none() {
-                    if runtime.pending.is_some() {
+                    if !runtime.commands.is_idle() {
                         runtime
                             .scroll_memory
                             .request_edge(None, scroll::Edge::Latest);
                         if !runtime
-                            .pending
-                            .as_ref()
-                            .is_some_and(|pending| pending.page == Some(view::Page::Latest))
+                            .commands
+                            .iter()
+                            .any(|pending| pending.page == Some(view::Page::Latest))
                         {
                             runtime.deferred_page = Some(HistoryNavigation::Latest);
                         }
@@ -14878,13 +15401,11 @@ impl Cagents {
                             if runtime.pastes_pending >= 2 {
                                 runtime.error = Some("Two attachments are already loading. Dropped files were inserted as paths; wait before attaching more.".into());
                                 rest.extend(files.into_iter().map(file_drop::Item::File));
+                            } else if let Some((id, lease)) = attachment_draft::admit() {
+                                staged = Some((id, files, lease));
                             } else {
-                                if let Some((id, lease)) = attachment_draft::admit() {
-                                    staged = Some((id, files, lease));
-                                } else {
-                                    runtime.error = Some("Two attachments are already loading. Dropped files were inserted as paths; wait before attaching more.".into());
-                                    rest.extend(files.into_iter().map(file_drop::Item::File));
-                                }
+                                runtime.error = Some("Two attachments are already loading. Dropped files were inserted as paths; wait before attaching more.".into());
+                                rest.extend(files.into_iter().map(file_drop::Item::File));
                             }
                         }
                         file_drop::Dropped::Items(rest)
@@ -14927,22 +15448,22 @@ impl Cagents {
                 ]);
             }
             Action::RemoveAttachment(target, index) => {
-                if let Some(runtime) = self.chat_runtime_mut(target) {
-                    if index < runtime.attachments.len() {
-                        let token = runtime.attachments[index]
-                            .reference
-                            .as_ref()
-                            .map(chat::ImageReference::token);
-                        if let Some(token) = token
-                            && !runtime.remove_image_token(&token)
-                        {
-                            return Task::none();
-                        }
-                        runtime.attachments.remove(index);
-                        runtime.thumbnails.sync(&runtime.attachments);
-                        runtime.revision = runtime.revision.wrapping_add(1);
-                        runtime.settle_restored_notice();
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && index < runtime.attachments.len()
+                {
+                    let token = runtime.attachments[index]
+                        .reference
+                        .as_ref()
+                        .map(chat::ImageReference::token);
+                    if let Some(token) = token
+                        && !runtime.remove_image_token(&token)
+                    {
+                        return Task::none();
                     }
+                    runtime.attachments.remove(index);
+                    runtime.thumbnails.sync(&runtime.attachments);
+                    runtime.revision = runtime.revision.wrapping_add(1);
+                    runtime.settle_restored_notice();
                 }
             }
             Action::Model(target, id) => {
@@ -14961,9 +15482,9 @@ impl Cagents {
                     return Task::none();
                 };
                 let reasoning = runtime
-                    .snapshot
+                    .chosen_model()
                     .reasoning
-                    .clone()
+                    .map(str::to_owned)
                     .filter(|reasoning| model.reasoning.contains(reasoning));
                 let command = Command::SetModel {
                     model: id,
@@ -14976,8 +15497,10 @@ impl Cagents {
                     return Task::none();
                 };
                 runtime.model_picker = None;
-                let Some(model) =
-                    selected_chat_model(&runtime.snapshot).filter(|model| model.id == model_id)
+                let Some(model) = runtime
+                    .chosen_model()
+                    .model(&runtime.snapshot)
+                    .filter(|model| model.id == model_id)
                 else {
                     return Task::none();
                 };
@@ -15020,10 +15543,9 @@ impl Cagents {
                 // replaced, whichever control entered it.
                 if mode == PLAN_MODE
                     && let Some(current) = runtime
-                        .snapshot
-                        .permission_mode
-                        .clone()
-                        .filter(|current| current != PLAN_MODE)
+                        .chosen_permission_mode()
+                        .filter(|current| *current != PLAN_MODE)
+                        .map(str::to_owned)
                 {
                     runtime.mode_before_plan = Some(current);
                 }
@@ -15048,8 +15570,8 @@ impl Cagents {
                 return self.chat_send(target, Command::SetPermissionMode { mode }, false);
             }
             Action::Field(target, request, field, value) => {
-                if let Some(runtime) = self.chat_runtime_mut(target) {
-                    if let Some(schema) = runtime
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && let Some(schema) = runtime
                         .snapshot
                         .requests
                         .iter()
@@ -15060,24 +15582,23 @@ impl Cagents {
                                 .iter()
                                 .find(|candidate| candidate.id == field)
                         })
-                    {
-                        let values = runtime.answers.entry((request, field)).or_default();
-                        if schema.multiple {
-                            values.retain(|selected| {
-                                schema.choices.iter().any(|choice| &choice.id == selected)
-                            });
-                        } else {
-                            values.clear();
-                        }
-                        if !value.is_empty() {
-                            values.push(value);
-                        }
+                {
+                    let values = runtime.answers.entry((request, field)).or_default();
+                    if schema.multiple {
+                        values.retain(|selected| {
+                            schema.choices.iter().any(|choice| &choice.id == selected)
+                        });
+                    } else {
+                        values.clear();
+                    }
+                    if !value.is_empty() {
+                        values.push(value);
                     }
                 }
             }
             Action::Choice(target, request, field, value) => {
-                if let Some(runtime) = self.chat_runtime_mut(target) {
-                    if let Some(schema) = runtime
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && let Some(schema) = runtime
                         .snapshot
                         .requests
                         .iter()
@@ -15088,21 +15609,17 @@ impl Cagents {
                                 .iter()
                                 .find(|candidate| candidate.id == field)
                         })
-                    {
-                        if schema.choices.iter().any(|choice| choice.id == value) {
-                            let values = runtime.answers.entry((request, field)).or_default();
-                            if schema.multiple {
-                                if let Some(index) =
-                                    values.iter().position(|selected| selected == &value)
-                                {
-                                    values.remove(index);
-                                } else {
-                                    values.push(value);
-                                }
-                            } else {
-                                *values = vec![value];
-                            }
+                    && schema.choices.iter().any(|choice| choice.id == value)
+                {
+                    let values = runtime.answers.entry((request, field)).or_default();
+                    if schema.multiple {
+                        if let Some(index) = values.iter().position(|selected| selected == &value) {
+                            values.remove(index);
+                        } else {
+                            values.push(value);
                         }
+                    } else {
+                        *values = vec![value];
                     }
                 }
             }
@@ -15376,13 +15893,15 @@ impl Cagents {
                     return Task::none();
                 }
                 runtime.scroll = scroll;
-                let (at_top, at_bottom) = (scroll.at_top(), scroll.at_bottom());
-                if at_bottom && !runtime.snapshot.has_later {
+                if scroll.at_bottom() && !runtime.snapshot.has_later {
                     runtime.unseen_activity = false;
                 }
-                // Leaving an end is what arms the page at it, so a reader who
-                // scrolls away and comes back asks again, while one who stays
-                // put asks once.
+                // Pages are fetched ahead of the reader, within a couple of
+                // screens of a loaded edge rather than at it.
+                let (at_top, at_bottom) = (scroll.prefetch_earlier(), scroll.prefetch_later());
+                // Leaving that reach is what arms the page at it, so a reader
+                // who scrolls away and comes back asks again, while one who
+                // stays put asks once.
                 if !at_top || direction == Some(view::Page::Newer) {
                     if runtime.deferred_page == Some(HistoryNavigation::EarlierEdge) {
                         runtime.deferred_page = None;
@@ -15404,11 +15923,11 @@ impl Cagents {
                     && runtime.snapshot.has_earlier
                     && runtime.earlier_asked != height
                 {
-                    if runtime.pending.is_some() {
+                    if !runtime.commands.is_idle() {
                         if runtime
-                            .pending
-                            .as_ref()
-                            .is_some_and(|pending| pending.page.is_none())
+                            .commands
+                            .iter()
+                            .any(|pending| pending.page.is_none())
                             && runtime
                                 .deferred_page
                                 .is_none_or(|page| page == HistoryNavigation::EarlierEdge)
@@ -15424,7 +15943,7 @@ impl Cagents {
                     && runtime.snapshot.has_later
                     && runtime.later_asked != height
                 {
-                    if runtime.pending.is_some() {
+                    if !runtime.commands.is_idle() {
                         if runtime.deferred_page.is_none() {
                             runtime.deferred_page = Some(HistoryNavigation::NewerEdge);
                         }

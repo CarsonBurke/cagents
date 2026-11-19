@@ -24,7 +24,7 @@ fn assert_saved_with_the_burst(app: &mut Cagents, saved: usize, what: &str) {
 fn toggling_the_projects_sidebar_saves_the_window_view_not_the_workspace() {
     let directory = tempfile::tempdir().unwrap();
     let (session, _) = SessionRuntime::open(
-        &directory.path().join("window.sqlite3"),
+        directory.path().join("window.sqlite3"),
         crate::model::BootId::new("projects-sidebar-toggle"),
     )
     .unwrap();
@@ -93,23 +93,89 @@ fn opening_and_moving_settings_saves_with_the_navigation_burst() {
     assert_saved_with_the_burst(&mut app, saved, "moving settings");
 }
 
+/// The sidebar and the palette go to an open pane the same way, so each
+/// leaves its save to the navigation burst.
 #[test]
-fn going_to_an_open_pane_from_the_sidebar_saves_with_the_navigation_burst() {
+fn going_to_an_open_pane_saves_with_the_navigation_burst() {
+    let entries: [(&str, fn(CardId) -> Message); 2] = [
+        ("the sidebar", |card| {
+            Message::Sidebar(SidebarAction::OpenCard { card })
+        }),
+        ("the palette", |card| {
+            Message::Palette(palette_ui::Action::FocusPane(card))
+        }),
+    ];
+    for (entry, open) in entries {
+        let (mut app, channel) = alt_tab_test_app();
+        drop(app.navigate_to_worktree("/repo".into(), false));
+        finish_burst(&mut app);
+        let feature = app.durable.cards[1].id;
+        let channeled = app.durable.cards[2].id;
+
+        let saved = persists();
+        drop(app.update(open(feature)));
+        assert_eq!(
+            app.active_workspace.as_deref(),
+            Some(Path::new("/repo/feature")),
+            "{entry}"
+        );
+        assert_eq!(app.workspace.focused(), Some(feature), "{entry}");
+        assert_saved_with_the_burst(
+            &mut app,
+            saved,
+            &format!("a pane in another worktree, from {entry}"),
+        );
+
+        let saved = persists();
+        drop(app.update(open(channeled)));
+        assert_eq!(app.durable.active_channel, Some(channel), "{entry}");
+        assert_eq!(app.workspace.focused(), Some(channeled), "{entry}");
+        assert_saved_with_the_burst(
+            &mut app,
+            saved,
+            &format!("a pane in a channel, from {entry}"),
+        );
+    }
+}
+
+/// An agent link whose session has not started opens the agent's channel,
+/// which changes only where the window is.
+#[test]
+fn opening_an_agent_that_has_not_started_saves_its_channel_with_the_navigation_burst() {
+    use crate::agent_execution::{Agent, Origin, Placement, Spec, Surface, Target};
+
     let (mut app, channel) = alt_tab_test_app();
     drop(app.navigate_to_worktree("/repo".into(), false));
     finish_burst(&mut app);
-    let feature = app.durable.cards[1].id;
-    let channeled = app.durable.cards[2].id;
+    let placement = Placement::Channel(channel);
+    let agent = Agent {
+        id: crate::model::AgentId::new(),
+        name: None,
+        origin: Origin::User,
+        spec: Spec {
+            provider: crate::agent::Provider::Claude,
+            account: None,
+            target: Target {
+                repository: "/repo".into(),
+                directory: "/repo".into(),
+                placement: Some(placement.clone()),
+            },
+            surface: Surface::Chat,
+            model: None,
+            permission_mode: None,
+            reasoning_effort: None,
+        },
+        placement,
+        session: None,
+        console: None,
+        created_ms: 0,
+        closed: false,
+    };
+    let prefix = agent.id.to_string();
+    app.workspace_model.agents.push(agent);
 
     let saved = persists();
-    drop(app.update(Message::Sidebar(SidebarAction::OpenCard { card: feature })));
-    assert_eq!(app.active_workspace.as_deref(), Some(Path::new("/repo/feature")));
-    assert_eq!(app.workspace.focused(), Some(feature));
-    assert_saved_with_the_burst(&mut app, saved, "a pane in another worktree");
-
-    let saved = persists();
-    drop(app.update(Message::Sidebar(SidebarAction::OpenCard { card: channeled })));
+    drop(app.update(Message::ChatUi(chat_ui::Action::OpenAgent(prefix))));
     assert_eq!(app.durable.active_channel, Some(channel));
-    assert_eq!(app.workspace.focused(), Some(channeled));
-    assert_saved_with_the_burst(&mut app, saved, "a pane in a channel");
+    assert_saved_with_the_burst(&mut app, saved, "an unstarted agent's channel");
 }

@@ -128,9 +128,12 @@ enum Height {
     Content { height: f32 },
 }
 
-/// The rows of a short list before it scrolls instead of growing. The half
-/// row shows there is more.
-const LIST_ROWS_SHOWN: f32 = 5.5;
+/// The rows the Work list keeps room for, whatever it holds and whether or
+/// not it has arrived, so its arrival never moves the sections beneath it.
+/// Past them it scrolls; the half row shows there is more.
+const WORK_ROWS: f32 = 3.5;
+/// The rows the Mentioned list keeps room for, as [`WORK_ROWS`].
+const MENTIONED_ROWS: f32 = 2.5;
 
 /// A section header's height: a dense row and its padding. Every section,
 /// expanded or not, has one, with a rule after it.
@@ -171,8 +174,10 @@ impl Cagents {
     /// Whether the workspace section is all `card`'s inspector has: no
     /// conversation's pull requests or worktrees lead it. It is then shown
     /// rather than left as a lone collapsed header over an empty panel.
+    /// This depends on the pane and the settings, never on what has loaded,
+    /// so the section does not fold away when a list arrives.
     fn workspace_alone(&self, card: CardId) -> bool {
-        !self.work_listed(card) && !self.mentions_listed(card)
+        !self.work_reserved(card) && !self.mentions_reserved(card)
     }
 
     /// An estimate of the sections' height until they have been laid out:
@@ -259,23 +264,35 @@ impl Cagents {
     ) -> Element<'a, Message> {
         let mut panes = Vec::with_capacity(6);
         let work = self.work_summary(card);
-        if self.work_listed(card) {
+        if self.work_reserved(card) {
             panes.push(self.work_pane(card, &work));
         }
-        if work.mentioned > 0 {
+        if self.mentions_reserved(card) {
             panes.push(self.mentioned_pane(card, &work));
         }
         panes.push(self.workspace_pane(card, width, work.scope.clone()));
         panes.extend(self.language_server_panes(card));
-        if let Some(first) = panes.first_mut() {
-            first.controls.push(
-                widget::container(toggle)
-                    // The row supplies XXS between its existing controls.
-                    // Leave a full standard gap before the inspector toggle.
-                    .padding(Padding::ZERO.left(space::S - space::XXS))
-                    .into(),
-            );
-        }
+        // What the pane's agent is doing leads, and carries the toggle; a
+        // pane without it has the toggle on its first section's header.
+        let activity = match self.inspector_activity(card, toggle) {
+            Ok(activity) => Some(activity),
+            Err(toggle) => {
+                if let Some(first) = panes.first_mut() {
+                    first.controls.push(
+                        widget::container(toggle)
+                            // The row supplies XXS between its existing
+                            // controls. Leave a full standard gap before the
+                            // inspector toggle.
+                            .padding(Padding::ZERO.left(space::S - space::XXS))
+                            .into(),
+                    );
+                }
+                None
+            }
+        };
+        let activity_height = activity
+            .as_ref()
+            .map_or(0.0, |(_, height)| height + design::BORDER_WIDTH);
         let shared = panes
             .iter()
             .any(|pane| pane.body.is_some() && pane.height == Height::Share);
@@ -292,16 +309,21 @@ impl Cagents {
         let mut lead = (!shared).then(|| {
             lead_list_height(
                 self.context_sections_height
-                    .unwrap_or_else(|| self.inspector_body_height()),
+                    .unwrap_or_else(|| self.inspector_body_height())
+                    - activity_height,
                 panes.len(),
                 lists.first().copied().unwrap_or_default(),
                 lists.iter().skip(1).sum(),
             )
         });
-        let mut children: Vec<Element<'_, Message>> = Vec::with_capacity(panes.len() * 3 + 1);
+        let mut children: Vec<Element<'_, Message>> = Vec::with_capacity(panes.len() * 3 + 3);
+        if let Some((activity, _)) = activity {
+            children.push(activity);
+            children.push(design::horizontal_rule());
+        }
         for (index, pane) in panes.into_iter().enumerate() {
             if index > 0 {
-                children.push(design::horizontal_rule().into());
+                children.push(design::horizontal_rule());
             }
             let Pane {
                 section,
@@ -330,9 +352,11 @@ impl Cagents {
                         .width(Length::Fill)
                         .height(Length::Fill)
                         .into(),
+                    // Its own height, not its content's, so a list that
+                    // arrives or changes length never moves what follows.
                     Height::Content { height } => widget::container(body)
                         .width(Length::Fill)
-                        .max_height(lead.take().unwrap_or(height))
+                        .height(lead.take().unwrap_or(height))
                         .into(),
                 });
             }
@@ -340,7 +364,7 @@ impl Cagents {
         // Collapsed sections stay stacked at the top rather than spreading
         // over the height none of them claims.
         if !shared {
-            children.push(design::horizontal_rule().into());
+            children.push(design::horizontal_rule());
             children.push(iced::widget::Space::new().height(Length::Fill).into());
         }
         // The banners beneath the workspace come and go, so the height the
@@ -462,50 +486,130 @@ impl Cagents {
 
     fn work_pane(&self, card: CardId, work: &pull_request_ui::WorkSummary) -> Pane<'_> {
         let open = self.context_sections.is_open(Section::Work);
+        let phase = self.work_phase(card);
+        let listed = phase == pull_request_ui::WorkPhase::Listed;
         let count = work.count;
         Pane {
             section: Section::Work,
             title: "Work".into(),
-            count: (count > 0).then(|| (count.to_string(), design::faint_text as _)),
+            count: (listed && count > 0).then(|| (count.to_string(), design::faint_text as _)),
             scope: None,
             description: None,
             controls: Vec::new(),
-            // The list's own height bounds it, so the leading list need not
-            // leave room for rows not there. Expanding the shown work makes
+            // The same room whether the list is on its way, empty or long.
+            // Unfolding the shown work's details is asked for, so it makes
             // room for itself rather than pushing the rows after it out of
             // view.
             height: Height::Content {
-                height: work
-                    .height
-                    .content
-                    .min(list_height(LIST_ROWS_SHOWN) + work.height.expanded)
+                height: list_height(WORK_ROWS)
+                    + work.height.expanded
                     + 2.0 * pull_request_ui::WORK_LIST_PADDING,
             },
-            body: open.then(|| self.work_section(card, work)),
+            body: open.then(|| match phase {
+                pull_request_ui::WorkPhase::Listed if work.lists_work => {
+                    self.work_section(card, work)
+                }
+                pull_request_ui::WorkPhase::Listed => {
+                    self.unread_notice(card, "Work isn't tracked for this chat")
+                        .unwrap_or_else(|| {
+                            list_notice(
+                                "No pull requests or worktrees yet",
+                                "Pull requests this chat creates or pushes, and worktrees it edits, show here.",
+                            )
+                        })
+                }
+                pull_request_ui::WorkPhase::Reading => list_notice(
+                    "Reading this chat's work…",
+                    "Its pull requests and worktrees show here.",
+                ),
+                pull_request_ui::WorkPhase::Unavailable => {
+                    list_notice("Couldn't load this chat's work", "Retrying automatically.")
+                }
+            }),
+        }
+    }
+
+    /// The height `card`'s Work section keeps for its list, for tests that
+    /// it does not follow what the list holds.
+    #[cfg(test)]
+    pub(super) fn work_section_height(&self, card: CardId) -> f32 {
+        match self.work_pane(card, &self.work_summary(card)).height {
+            Height::Content { height } => height,
+            Height::Share => f32::NAN,
+        }
+    }
+
+    /// Why `card`'s empty Work or Mentioned list may be empty only because
+    /// its conversation was not read, rather than promising rows that will
+    /// never come; `None` when it was read. `untracked` is the section's
+    /// title for a provider whose conversations are never read.
+    fn unread_notice<'a>(
+        &'a self,
+        card: CardId,
+        untracked: &'a str,
+    ) -> Option<Element<'a, Message>> {
+        match self.work_transcript(card)? {
+            crate::work::TranscriptCoverage::Unsupported => Some(list_notice(
+                untracked,
+                "cagents doesn't look through this provider's chats for pull requests or worktrees.",
+            )),
+            // The reason is the system's, so it waits behind a tooltip.
+            crate::work::TranscriptCoverage::Unavailable { reason } => {
+                Some(crate::interaction::tooltip(
+                    list_notice(
+                        "Couldn't read this chat's conversation",
+                        "Its pull requests and worktrees show here once it can be read.",
+                    ),
+                    reason.as_str(),
+                ))
+            }
+            _ => None,
         }
     }
 
     fn mentioned_pane(&self, card: CardId, work: &pull_request_ui::WorkSummary) -> Pane<'_> {
         let open = self.context_sections.is_open(Section::Mentioned);
+        let phase = self.work_phase(card);
+        let listed = phase == pull_request_ui::WorkPhase::Listed;
         let count = work.mentioned;
         Pane {
             section: Section::Mentioned,
             title: "Mentioned".into(),
-            count: Some((count.to_string(), design::faint_text as _)),
+            // As Work's, absent rather than 0 when there is none.
+            count: (listed && count > 0).then(|| (count.to_string(), design::faint_text as _)),
             scope: None,
-            description: Some(format!(
-                "{count} mentioned pull request{}",
-                if count == 1 { "" } else { "s" }
-            )),
+            description: listed.then(|| {
+                format!(
+                    "{count} mentioned pull request{}",
+                    if count == 1 { "" } else { "s" }
+                )
+            }),
             controls: Vec::new(),
             height: Height::Content {
-                height: work
-                    .mentioned_height
-                    .content
-                    .min(list_height(LIST_ROWS_SHOWN) + work.mentioned_height.expanded)
+                height: list_height(MENTIONED_ROWS)
+                    + work.mentioned_height.expanded
                     + 2.0 * pull_request_ui::WORK_LIST_PADDING,
             },
-            body: open.then(|| self.mentioned_section(card, work)),
+            body: open.then(|| match phase {
+                pull_request_ui::WorkPhase::Listed if count > 0 => {
+                    self.mentioned_section(card, work)
+                }
+                pull_request_ui::WorkPhase::Listed => self
+                    .unread_notice(card, "Mentions aren't tracked for this chat")
+                    .unwrap_or_else(|| {
+                        list_notice(
+                            "No mentions",
+                            "Pull requests this chat only names show here.",
+                        )
+                    }),
+                pull_request_ui::WorkPhase::Reading => {
+                    list_notice("Reading this chat's mentions…", "")
+                }
+                pull_request_ui::WorkPhase::Unavailable => list_notice(
+                    "Couldn't load this chat's mentions",
+                    "Retrying automatically.",
+                ),
+            }),
         }
     }
 
@@ -856,6 +960,39 @@ impl Cagents {
     }
 }
 
+/// What a reserved list says in place of rows: a line saying where the list
+/// is, and a caption saying what it will hold. It sits where the first row
+/// would, so the rows replace it without moving.
+fn list_notice<'a>(title: &'a str, detail: &'a str) -> Element<'a, Message> {
+    let mut lines: Vec<Element<'a, Message>> = vec![
+        design::body(title)
+            .wrapping(iced::widget::text::Wrapping::Word)
+            .class(cosmic::theme::Text::Custom(design::muted_text))
+            .width(Length::Fill)
+            .into(),
+    ];
+    if !detail.is_empty() {
+        lines.push(
+            design::caption(detail)
+                .wrapping(iced::widget::text::Wrapping::Word)
+                .class(cosmic::theme::Text::Custom(design::faint_text))
+                .width(Length::Fill)
+                .into(),
+        );
+    }
+    widget::container(
+        widget::column::with_children(lines)
+            .spacing(space::XXS)
+            .width(Length::Fill),
+    )
+    .padding([
+        pull_request_ui::WORK_LIST_PADDING + space::XS,
+        design::list::GUTTER + design::list::INSET,
+    ])
+    .width(Length::Fill)
+    .into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -876,8 +1013,8 @@ mod tests {
 
     #[test]
     fn a_leading_list_takes_the_height_nothing_else_needs_and_never_less_than_its_rows() {
-        let own = list_height(LIST_ROWS_SHOWN);
-        let others = list_height(LIST_ROWS_SHOWN);
+        let own = list_height(WORK_ROWS);
+        let others = list_height(MENTIONED_ROWS);
         // Three headers in an 870 px panel leave room for more than its
         // usual rows, less the other list's height.
         let grown = lead_list_height(870.0, 3, own, others);

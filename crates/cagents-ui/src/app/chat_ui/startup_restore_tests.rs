@@ -159,3 +159,44 @@ fn initial_canonical_upgrade_keeps_existing_only_for_the_authoritative_successor
             .existing_only(card, canonical.id)
     );
 }
+
+/// An initial pane only attaches, and the daemon refuses that for a
+/// conversation the update stopped. The pane keeps no retry of it; the
+/// reader's Reopen conversation is an explicit start, which lifts that rule and
+/// starts it again on its saved conversation.
+#[test]
+fn reopening_a_conversation_the_update_stopped_leaves_the_attach_only_restore() {
+    let (mut app, card, session) = initial_chat();
+    drop(app.start_chat(card, session.clone(), chat::Intent::Restore, None, false));
+    let (target, intent) = scheduled(&app, card);
+    assert_eq!(intent, chat::Intent::RestoreExisting);
+    drop(app.handle_chat_ui(Action::Ready(
+        target,
+        Ready(Arc::new(Mutex::new(Some(Err(chat::StartFailure {
+            message: chat::update_restart_stopped(
+                "Codex server exited before opening its local socket",
+            ),
+            recovery: chat::Recovery::UpdateStopped,
+        }))))),
+    )));
+    assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));
+    assert!(app.chat_retry_blocked(card));
+    assert!(
+        app.blocked_failure(card)
+            .is_some_and(|blocked| blocked.reopen.reopens())
+    );
+    assert!(
+        app.status
+            .as_ref()
+            .is_none_or(|notice| !notice.message.contains("Could not")),
+        "the pane says what stopped it; no error notice repeats it"
+    );
+    drop(app.handle_chat_ui(Action::ReopenStopped(card)));
+    let (_, intent) = scheduled(&app, card);
+    assert_eq!(intent, chat::Intent::Start);
+    assert!(
+        !app.startup_gate
+            .initial_panes
+            .existing_only(card, session.id)
+    );
+}

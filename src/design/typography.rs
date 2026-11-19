@@ -12,6 +12,12 @@
 //! | Description       | [`description`] | 12 / 16         | Regular, muted |
 //! | Caption, metadata | [`caption`]     | 11              | Regular, muted |
 //!
+//! A conversation's transcript is read rather than operated, so it has a
+//! size of its own, [`TEXT_TRANSCRIPT`]: answers, the names in its rows, its
+//! timeline rows and their states are all set at it, through [`transcript`]
+//! and [`transcript_name`]. A row is told from an answer by weight and colour,
+//! never by size. Captions keep their role inside it, as everywhere.
+//!
 //! A label names one thing the reader can change or inspect. Its description
 //! explains it in sentences, so it is set one step above captions: an 11px
 //! paragraph under every setting was hard to read at length. Captions stay
@@ -41,6 +47,18 @@ pub const TEXT_BODY: f32 = 13.0;
 /// Prose that is read at length - an agent's answers and the draft being
 /// written to it - one step above the shell's controls and captions.
 pub const TEXT_PROSE: f32 = 14.0;
+/// The one size a conversation's transcript reads at: an answer, a message,
+/// and every row of its timeline - steps, thoughts, notices, the agents it
+/// started and the states beside them. The shell around it, its sidebar, tabs
+/// and composer controls, stay at [`TEXT_BODY`].
+///
+/// Set at prose size so reading text keeps its size and the timeline steps up
+/// to match; [`TEXT_BODY`] here would set the whole transcript at the shell's.
+pub const TEXT_TRANSCRIPT: f32 = TEXT_PROSE;
+/// The line box a transcript row's text sits in. Six pixels of leading is
+/// about the composer's 1.4 at prose size, on a whole pixel, so a column of
+/// one-line rows keeps whole-pixel pitch.
+pub const LINE_TRANSCRIPT: f32 = TEXT_TRANSCRIPT + 6.0;
 /// Secondary detail beside or beneath a body-sized label.
 pub const TEXT_CAPTION: f32 = 11.0;
 /// A heading is set at body size and told apart by weight, so a pane's
@@ -84,6 +102,24 @@ pub fn caption<'a>(text: impl Into<Cow<'a, str>> + 'a) -> ShellText<'a> {
     cosmic::widget::text::caption(text)
         .size(TEXT_CAPTION)
         .class(cosmic::theme::Text::Custom(muted_text))
+}
+
+/// A line of a conversation's transcript: a row's words or its state.
+pub fn transcript<'a>(text: impl Into<Cow<'a, str>> + 'a) -> ShellText<'a> {
+    body(text)
+        .size(TEXT_TRANSCRIPT)
+        .line_height(LineHeight::Absolute(LINE_TRANSCRIPT.into()))
+}
+
+/// A name in a transcript row, such as the agent it started: emphasised by
+/// weight, at the size of the words around it.
+pub fn transcript_name<'a>(text: impl Into<Cow<'a, str>> + 'a) -> ShellText<'a> {
+    transcript(text).font(transcript_name_font())
+}
+
+/// The face of [`transcript_name`], for a widget that cannot be built from it.
+pub fn transcript_name_font() -> Font {
+    weighted(Weight::Semibold)
 }
 
 /// Body text at medium weight: a pane's heading, a row's name, a button's label.

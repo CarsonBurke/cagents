@@ -684,6 +684,15 @@ pub(crate) const UNSOLICITED_SINCE: &[(&str, &str, u16)] = &[
     ("ServerMessage", "terminal_worker", 183),
 ];
 
+/// Lifecycle requests and their replies that the source clients use only with
+/// a source whose protocol has them, from the protocol that introduced each.
+/// From there they are frozen like the rest of [`LIFECYCLE_VARIANTS`].
+#[cfg(test)]
+pub(crate) const LIFECYCLE_SINCE: &[(&str, &str, u16)] = &[
+    ("ClientRequest", "ListPage", 190),
+    ("ServerResponse", "listed_page", 190),
+];
+
 /// An installed build a live update may start from.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ReleasedSource {
@@ -771,6 +780,18 @@ pub(crate) const RETIRED_SOURCES: &[(u16, &str)] = &[
     (
         186,
         "intermediate #2491 protocol; superseded by 187 without a qualified installed update source",
+    ),
+    (
+        188,
+        "intermediate #3075 protocol; superseded by 189 without a qualified installed update source",
+    ),
+    (
+        189,
+        "intermediate #3149 protocol; superseded by 190 without a qualified installed update source",
+    ),
+    (
+        190,
+        "intermediate #3209 protocol; superseded by 191 without a qualified installed update source",
     ),
 ];
 

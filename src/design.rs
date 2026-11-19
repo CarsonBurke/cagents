@@ -33,9 +33,15 @@ pub const PRIMARY_CONTROL_SIZE: f32 = 30.0;
 pub const SECONDARY_CONTROL_MIN_SIZE: f32 = 30.0;
 
 /// Icons that sit inside a row, beside its text. Every surface that renders
-/// this role - navigation rows, panel rows, header status - uses this token, so
-/// the same role cannot be 16px in one pane and 14px in the next.
+/// this role - panel rows, header status, list rows - uses this token, so the
+/// same role cannot be 16px in one pane and 14px in the next.
 pub const ROW_ICON_SIZE: u16 = 16;
+/// The glyph that leads a line of body text and says what the line is: a
+/// sidebar row's identity, a transcript step's kind or state. One step under
+/// [`ROW_ICON_SIZE`], because these lines are dense and the glyph sits
+/// against the words rather than in a control; [`COMPACT_ICON_SIZE`] beside
+/// 13px text read as a bullet rather than as the line's subject.
+pub const LEADING_ICON_SIZE: u16 = 14;
 pub const TAB_STATUS_ICON_SIZE: u16 = 14;
 pub const WINDOW_CONTROL_SIZE: f32 = 32.0;
 pub const COMMAND_POPOVER_WIDTH: f32 = 292.0;

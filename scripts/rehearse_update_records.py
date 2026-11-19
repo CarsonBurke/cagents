@@ -719,7 +719,7 @@ def decoded_row(row: sqlite3.Row) -> dict:
     return result
 
 
-def stores(home: Path, errors: list[str]) -> dict:
+def stores(home: Path, errors: list[str], *, expect_store: bool = True) -> dict:
     base = home / ".local/share/cagents"
     paths = set(base.glob("windows/*/sessions.sqlite3"))
     if (base / "sessions.sqlite3").is_file():
@@ -749,7 +749,7 @@ def stores(home: Path, errors: list[str]) -> dict:
                                "tables": names, "rows": selected}
         except sqlite3.Error as error:
             errors.append(f"{key}: {error}")
-    if not result:
+    if not result and expect_store:
         errors.append("no sessions.sqlite3 stores found; pane inventory unavailable")
     return result
 
@@ -885,9 +885,11 @@ def namespace_source(root: Path, terminals: Path) -> dict:
     return {**snapshot, 'serving': proof}
 
 
-def record(root: Path, out: Path, windows: Path | None) -> dict:
+def record(root: Path, out: Path, windows: Path | None, *, desktop: bool = True) -> dict:
+    if not desktop and windows is not None:
+        raise ValueError("a no-desktop record has no window observations")
     errors: list[str] = []
-    snapshot = {"schema": 1, "root": str(root), "errors": errors}
+    snapshot = {"schema": 1, "root": str(root), "desktop": desktop, "errors": errors}
     for name in COLLECTIONS:
         rows = cli_rows(out, name, errors)
         if name == "agents":
@@ -910,7 +912,7 @@ def record(root: Path, out: Path, windows: Path | None) -> dict:
     events = root / "logs/codex-provider.jsonl"
     if events.exists():
         snapshot["fixture_events"] = [json.loads(line) for line in events.read_text().splitlines() if line]
-    snapshot["stores"] = stores(root / "home", errors)
+    snapshot["stores"] = stores(root / "home", errors, expect_store=desktop)
     snapshot["processes"] = processes(root, errors)
     snapshot["windows"] = {}
     if windows:
@@ -927,7 +929,7 @@ def record(root: Path, out: Path, windows: Path | None) -> dict:
                 snapshot["windows"][name] = {**payload["window"], "painted": payload.get("painted")}
         except (OSError, ValueError) as error:
             errors.append(f"windows: {error}")
-    else:
+    elif desktop:
         errors.append("window observations unavailable")
     out.mkdir(parents=True, exist_ok=True)
     (out / "snapshot.json").write_text(dump(snapshot))
@@ -1289,6 +1291,10 @@ def paused_codex_reattachments(before: dict, after: dict, paused: set[str], *, o
 
 def compare(before: dict, after: dict) -> list[dict]:
     changes = []
+    if before.get("desktop", True) != after.get("desktop", True):
+        message = ("before was recorded with a desktop and after without one" if before.get("desktop", True) else
+                   "before was recorded without a desktop and after with one")
+        changes.append({"kind": "evidence", "id": "desktop", "change": message, "regression": True})
     paused_chats, paused_terminals = verified_pauses(before, after)
     changes.extend(paused_codex_reattachments(before, after, paused_chats))
     for side, snapshot in (("before", before), ("after", after)):
@@ -1364,7 +1370,9 @@ def main() -> int:
     capture = commands.add_parser("record")
     capture.add_argument("root", type=Path)
     capture.add_argument("out", type=Path)
-    capture.add_argument("--windows", type=Path)
+    desktop = capture.add_mutually_exclusive_group()
+    desktop.add_argument("--windows", type=Path)
+    desktop.add_argument("--no-desktop", action="store_true")
     recovery = commands.add_parser("prepare-recovery")
     recovery.add_argument("root", type=Path)
     recovery.add_argument("out", type=Path)
@@ -1397,7 +1405,7 @@ def main() -> int:
                 print(agent)
             return 0
         if args.command == "record":
-            snapshot = record(args.root.resolve(), args.out, args.windows)
+            snapshot = record(args.root.resolve(), args.out, args.windows, desktop=not args.no_desktop)
             print(args.out / "snapshot.json")
             return int(bool(snapshot["errors"]))
         changes = compare(load_snapshot(args.before), load_snapshot(args.after))

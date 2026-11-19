@@ -459,8 +459,8 @@ run_desktop() {
 }
 
 run_inner() {
-    if ! timeout -k 5 240 niri-harness session start "$session_name" --root "$harness_root" --timeout 180 \
-        --no-window-wait --width 1500 --cmd 'exec sleep infinity' >"$logs/harness.log" 2>&1; then
+    if ! timeout -k 5 240 niri-harness start --name "$session_name" --root "$harness_root" --timeout 180 \
+        --backend window --no-window-wait --width 1500 -- sleep infinity >"$logs/harness.log" 2>&1; then
         printf 'the nested desktop did not start; see %s\n' "$logs/harness.log" >"$desktop/failed"
         return 1
     fi
@@ -471,7 +471,7 @@ run_inner() {
     } >"$desktop/env"
     touch -- "$desktop/ready"
     while [ ! -e "$desktop/stop" ] && kill -0 "$PPID" 2>/dev/null; do sleep 0.5; done
-    timeout -k 5 30 niri-harness session stop "$session_name" >>"$logs/harness.log" 2>&1 || :
+    timeout -k 5 30 niri-harness stop "$session_name" >>"$logs/harness.log" 2>&1 || :
 }
 
 # Resolve the helper once per invocation, before discarding the caller's PATH.
@@ -499,7 +499,7 @@ desktop_variables() {
     desktop_live && [ -e "$desktop/ready" ] || die 'no desktop is running; run: desktop start'
     local harness
     harness=$(resolve_niri_harness)
-    desktop_env timeout -k 5 30 "$harness" --session "$session_name" session env | sed -n 's/^export //p' | grep -E '^(WAYLAND_DISPLAY|NIRI_SOCKET|XDG_CURRENT_DESKTOP|XDG_SESSION_TYPE)='
+    desktop_env timeout -k 5 30 "$harness" --session "$session_name" env | sed -n 's/^export //p' | grep -E '^(WAYLAND_DISPLAY|NIRI_SOCKET|XDG_CURRENT_DESKTOP|XDG_SESSION_TYPE)='
 }
 
 cmd_app() {
@@ -594,10 +594,10 @@ cmd_record() {
     fi
     if desktop_live; then
         /usr/bin/python3 "$tool_root/scripts/rehearse_update_run.py" "$root" "$self" observe "$out/windows.json" || status=$?
+        /usr/bin/python3 "$tool_root/scripts/rehearse_update_records.py" record "$root" "$out" --windows "$out/windows.json" || status=$?
     else
-        printf '{}\n' >"$out/windows.json"
+        /usr/bin/python3 "$tool_root/scripts/rehearse_update_records.py" record "$root" "$out" --no-desktop || status=$?
     fi
-    /usr/bin/python3 "$tool_root/scripts/rehearse_update_records.py" record "$root" "$out" --windows "$out/windows.json" || status=$?
     return "$status"
 }
 

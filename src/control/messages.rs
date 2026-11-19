@@ -27,6 +27,13 @@ pub struct MessageArgs {
 }
 
 impl MessageArgs {
+    /// Whether the message is read from standard input. `--file -` names a
+    /// file called `-`, as [`agents::read_text`] opens it.
+    #[cfg(feature = "ui")]
+    pub(super) fn reads_stdin(&self) -> bool {
+        self.text.as_deref().is_some_and(standard_input)
+    }
+
     fn read(self) -> Result<String, AppError> {
         agents::read_text(
             self.text,
@@ -550,9 +557,7 @@ struct Mailbox {
 
 impl Mailbox {
     fn connect() -> Result<Self, AppError> {
-        let socket = control_daemon_socket()?;
-        let client =
-            ControlClient::connect(&socket).map_err(|e| AppError::new("daemon_connection", e))?;
+        let client = control_daemon_client()?;
         Ok(Self {
             authority: Authority::from_environment(),
             client,

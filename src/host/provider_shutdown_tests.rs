@@ -383,7 +383,7 @@ fn listener_failure_precedes_real_holder_adoption_and_preserves_the_checkpoint()
         restored.set(true);
         Ok(())
     };
-    let error = listener_before_restore(&paths, &restore).unwrap_err();
+    let error = listener_before_restore(&paths, restore).unwrap_err();
     assert!(matches!(error, HostError::Io(ref error) if error.kind() == io::ErrorKind::AddrInUse));
     assert!(!restored.get());
     assert!(HostLease::is_held(&paths).unwrap());
@@ -412,7 +412,7 @@ fn listener_failure_precedes_real_holder_adoption_and_preserves_the_checkpoint()
     );
     assert!(named.file_type().is_socket());
     fs::remove_file(&paths.socket).unwrap();
-    let listener = listener_before_restore(&paths, &restore).unwrap();
+    let listener = listener_before_restore(&paths, restore).unwrap();
     assert!(restored.get());
     assert!(store.load().unwrap().is_none());
     assert_eq!(fs::metadata(&paths.socket).unwrap().mode() & 0o777, 0o600);
@@ -564,10 +564,10 @@ fn cleanup_refusal_is_reported_and_healthy_owners_still_stop() {
     let pty = TerminalHandle::spawn(session.clone(), TerminalConfig::default(), |_| {}).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     let pid: i32 = loop {
-        if let Ok(text) = fs::read_to_string(root.join("root-pid")) {
-            if let Ok(pid) = text.parse() {
-                break pid;
-            }
+        if let Ok(text) = fs::read_to_string(root.join("root-pid"))
+            && let Ok(pid) = text.parse()
+        {
+            break pid;
         }
         assert!(Instant::now() < deadline, "healthy PTY did not start");
         thread::sleep(Duration::from_millis(5));

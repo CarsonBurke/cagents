@@ -20,6 +20,9 @@ person.
 | A long saved chat for paging backward and forward | [`tests/fixtures/claude-long-history.py`](../tests/fixtures/claude-long-history.py)` PROJECT`, run through `scripts/native-evidence env python3 ...`; 260 numbered exchanges exceed the retained history window |
 | A Codex chat that answers offline, with tool rows, subagent errors or terminal escapes | A [Codex peer](#an-offline-codex), installed by `native-evidence start SIDE --codex PEER` |
 | Real Codex app-server ownership, saved-history loading or socket behaviour | [An isolated real executable](#a-real-codex-in-the-fixture), selected by `native-evidence start SIDE --codex-executable /absolute/path/to/codex` |
+| A daemon still restoring after an update, or holding its restore for recovery | [The startup recovery marker](#an-update-restore-in-progress-or-held), `home/.cagents-fixture-startup-recovery` |
+| A conversation whose restart the update stopped | [The stopped-restart marker](#a-conversation-the-update-stopped), `home/.cagents-fixture-update-stopped` |
+| An offline ACP agent shaped like Antigravity or Muse, with tools, approvals, stops, saved sessions and sign-in failures | [`tests/fixtures/fake-acp-agent.py`](#an-offline-acp-agent) |
 | Test a script's contract without a compositor or Cargo | The stubbed Python suites in `tests/*.py`, such as `tests/native_evidence.py` |
 
 From a terminal or chat that cagents hosts, your shell carries
@@ -74,11 +77,12 @@ scripts/native-evidence cli project open "$CAGENTS_EVIDENCE_TASK/fixture/project
 
 Choose **Resume conversation** from the new-tab menu and open **History paging
 checkpoints**. Its 260 numbered exchanges include a 4 MiB Bash result every 32
-turns. These results consume the transcript's byte budget while their collapsed
-command groups can fit inside the viewport. Page backward into one of these
-short rendered windows, then wheel downward to check that newer history loads
-without clicking its fallback button. Check that the visible checkpoint stays
-anchored when the next page arrives. No provider command is executed.
+turns, numbered line by line. Each is one command row whose expanded output
+shows its first and last lines, with a line between them saying how much is
+left out, and whose Copy takes the whole result. Page backward past several of
+them, then wheel downward to check that newer history loads without clicking
+its fallback button. Check that the visible checkpoint stays anchored when the
+next page arrives. No provider command is executed.
 
 Omit `--tool-bytes` for ordinary completed prose. `--scale 64` increases the
 paragraph count enough to exercise provider history paging with prose alone.
@@ -175,7 +179,7 @@ evidence env sh -c 'for _ in $(seq 60); do grep -qs work-answer "$HOME"/.claude/
 evidence drive wait 'Locale cache work' --timeout 30 >/dev/null
 evidence drive click 'Locale cache work' >/dev/null
 evidence drive wait 'Picking' --timeout 30 >/dev/null
-evidence drive move 1,1 >/dev/null
+evidence drive hover 1,1 >/dev/null
 # Open the pane's inspector (Ctrl+Shift+I) unless it already is.
 observed=$(evidence drive observe)
 if ! grep -Eq 'Source control|Work [0-9]' <<<"$observed"; then
@@ -192,7 +196,7 @@ sleep 3
 evidence shot work-populated
 evidence drive click 'Mentioned' >/dev/null
 sleep 1
-evidence drive move 1,1 >/dev/null
+evidence drive hover 1,1 >/dev/null
 evidence shot work-mentioned
 # A seed saved after this should not keep GitHub slow.
 evidence env sh -c 'rm -f "$CAGENTS_EVIDENCE_FIXTURE/home/.config/fixture-forge-delay"'
@@ -255,7 +259,9 @@ Work board's `CagentsAuthoredPullRequests`, use seeded rows too; the board's
 lists `fixture`'s seeds, newest `updatedAt` first, and moves each check run's
 `workflowName` to `checkSuite.workflowRun.workflow.name`, where GraphQL keeps
 it. The open query computes the aggregate check state from the seed's
-`statusCheckRollup`; history omits checks. This exercises the native sidebar's
+`statusCheckRollup`; history omits checks. As GitHub does, the board's open
+search lists a hundred checks per pull request with their total and a cursor,
+and its `CagentsPullRequestChecks` reads the next hundred from there. This exercises the native sidebar's
 actual query and decoder without a GitHub account.
 
 For polling evidence, create `home/.config/fixture-forge-trace`. The forge then
@@ -441,6 +447,13 @@ Remove the marker to report the selected model on the next start/resume.
 to 300 for the peer's busy turn, instead of its usual six-second pause.
 The footer scene uses 20 seconds so native capture can show confirmed running
 work without depending on how quickly OCR and screenshot conversion finish.
+`home/.codex/fixture-turn-start-delay` optionally holds a number of seconds
+from 0 to 30 to hold each `turn/start` response and its turn's notifications.
+Codex learns a turn's id only from those, so this shows a message the daemon has
+accepted whose turn has not begun, and what is sent meanwhile. The peer accepts
+a `turn/steer` naming its active turn. With `home/.codex/fixture-user-items`
+present, the peer reports each prompt and steer as a `userMessage` item of its
+turn, as Codex does, so the reader's own messages appear in the transcript.
 Create `home/.codex/fixture-turn-audit.json` containing `[]` to record the last
 16 accepted turn IDs and the actual requested model/effort fields, including
 only fields present in the request. This private audit excludes prompt input and
@@ -1074,6 +1087,50 @@ host. `pair` can wait 30 minutes for a native slot, so run it in the
 background rather than under a short command timeout, and run `clean` once the
 PR merges to remove the task's checkouts from the host.
 
+## An offline ACP agent
+
+[`tests/fixtures/fake-acp-agent.py`](../tests/fixtures/fake-acp-agent.py)
+speaks the Agent Client Protocol over stdio the way Antigravity's `agy acp`
+does, with its configuration options for model, thinking level and mode and
+its older `models` and `modes` lists. Run as `muse...` or with
+`FAKE_ACP_SHAPE=muse`, it offers Muse's model and mode options instead, with
+no thinking level. It ignores its arguments, so a launch recipe written for
+the real agent runs it unchanged. It contacts no model, account or network.
+
+It keeps sessions as JSON lines under `FAKE_ACP_STATE`, so `session/load`
+replays a conversation from an earlier process and `session/list` finds it.
+Point it at the fixture's own directory; without it, sessions go to a
+directory in the system's temporary directory.
+
+The first of these words a prompt contains chooses what it does:
+
+| Word | The agent |
+| --- | --- |
+| `tools` | updates a plan, runs `ls -1` and edits `notes.md` with a diff |
+| `permission` | asks to edit `config.toml` with allow once, allow always and reject options, then acts on the answer |
+| `hold` | runs a long step and thinks until stopped |
+| `garbage` | writes a line that is not JSON between two parts of its answer |
+| `files` | asks the client to read a file and reports the error it got |
+| `mode` | moves to the next mode and reports it |
+| `title` | names the conversation |
+| `refuse` | ends the turn as a refusal |
+| `auth` | answers that sign-in is required |
+| `/compact`, at the start | compacts the conversation |
+
+Anything else gets a thought and `Fake answer to: ...`. These variables add
+failures:
+
+| Variable | Effect |
+| --- | --- |
+| `FAKE_ACP_AUTH=initialize`, `new`, `load` or `prompt` | that request answers that sign-in is required |
+| `FAKE_ACP_NO_LOAD=1` | the agent does not offer to load a session |
+| `FAKE_ACP_NOISE=1` | a banner line that is not JSON comes before the first reply |
+| `FAKE_ACP_REPLAY=N` | loading a session first replays `N` invented exchanges |
+| `FAKE_ACP_LOG=PATH` | every frame the agent receives is appended to `PATH` |
+
+The ACP adapter's runtime test in `src/chat/runtime/tests.rs` drives it
+through a real pipe.
+
 ## Saved Codex history
 
 For saved Codex turns in the Resume conversation picker, use
@@ -1122,6 +1179,64 @@ Every refusal names its cause and the next command. The common ones:
 If a fixture fails in a way that doesn't point to the fix, that is a fixture
 bug: make the message say what is wrong and what to do, and add a test for it
 beside the others in the fixture's contract suite.
+
+## An update restore in progress or held
+
+After an update, the new daemon restores the conversations the old one ran.
+While it restores, and if a restore fails and is held for recovery, it
+admits only some requests, and windows and panes have to say why. To show
+those states without a failed installed update, create
+`.cagents-fixture-startup-recovery` in the fixture `HOME`:
+
+```sh
+scripts/native-evidence env sh -c 'echo restoring >"$CAGENTS_EVIDENCE_FIXTURE/home/.cagents-fixture-startup-recovery"'
+scripts/native-evidence env sh -c 'echo "retained: Codex server did not open its local socket within 15 seconds" >"$CAGENTS_EVIDENCE_FIXTURE/home/.cagents-fixture-startup-recovery"'
+```
+
+`restoring` reports a restore still in progress. `retained: REASON` reports a
+restore held for recovery with that reason, and `retained` alone reports a
+Codex listener that never opened its socket. While the file exists, a debug
+daemon whose `HOME` is inside a native-evidence task answers `StartupState`
+that way and gates requests as it does for a real startup recovery. The file
+is read on each request, so it can also be written or removed while the
+session runs. Remove it to end the hold; the daemon then reports ready, as one
+that finished restoring does. No owner is actually retained, so this shows
+what clients are told and admitted, not how a real restore adopts its owners.
+Release builds and any other home ignore it. Save a seed with open chats
+first, so panes have saved conversations to wait for.
+
+### A conversation the update stopped
+
+When a conversation's restart after an update fails, the daemon stops it and
+refuses to reattach its pane until the conversation is started again. To show
+that state, start a session with `--codex tool-rows`, create `fixture-rollouts`
+in the fixture's `home/.codex` so the peer can resume the conversation later,
+and open a Codex conversation. Close the app window, so no window reopens the
+conversation by itself, then create `.cagents-fixture-update-stopped` in the
+fixture `HOME`, optionally naming the provider's reason, and stand in for the
+update: checkpoint and stop the daemon, and start the next one, which restores
+from that checkpoint:
+
+```sh
+scripts/native-evidence env sh -c 'echo "Codex server exited before opening its local socket" >"$HOME/.cagents-fixture-update-stopped"'
+scripts/native-evidence cli daemon prepare-upgrade --yes
+scripts/native-evidence cli daemon start
+scripts/native-evidence cli daemon status
+scripts/native-evidence env sh -c 'rm "$HOME/.cagents-fixture-update-stopped"'
+```
+
+While the file exists, every conversation a debug daemon in a native-evidence
+task restarts from an update's checkpoint fails with that reason before
+anything starts. The daemon stops it and records it as it does a real failed
+restart, and `daemon status` names it. Retained conversations, which are
+reattached rather than restarted, are unaffected.
+
+Then `relaunch --restore-existing-only` opens the recovery window that `daemon
+recover-update` opens, which only reattaches; an ordinary window starts the
+conversation again by itself. To capture both sides from the same stopped
+conversation, `stop` the session instead, keep the fixture with `save-seed`,
+and start each side with `--restore-existing-only`, so its first window is
+that recovery window too.
 
 ## A read-only native update review
 

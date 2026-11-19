@@ -878,7 +878,7 @@ mod tests {
             20,
             200,
             Some(origin),
-            b"sleep\0100\0",
+            b"sleep\x00100\0",
         );
         let processes = TerminalProcesses::at(root.path(), crate::daemon::current_uid());
         assert_eq!(

@@ -421,6 +421,64 @@ fn acknowledged_prepare_binds_source_and_every_reviewed_owner() {
 }
 
 #[test]
+fn census_work_in_flight_is_optional_and_names_only_its_own_conversations() {
+    use crate::update::in_flight::InFlight;
+    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let preparation = preparation(root.path());
+    let proof = &preparation.authority.source;
+    let mut census = preparation.authority.census.clone();
+    let chat = Session {
+        id: TerminalId::new(),
+        launch: crate::chat::Launch {
+            provider: crate::agent::Provider::Claude,
+            recipe: census.terminals[0].launch.clone(),
+            session_id: Some("confirmed".into()),
+        },
+        proof: Some(proof.clone()),
+        terminal: None,
+        owned_codex_listener: None,
+        native_continuity: Default::default(),
+    };
+    let mut snapshots = SnapshotCapture::default();
+    snapshots.push(chat.clone(), Default::default()).unwrap();
+    census.chats = vec![chat.clone()];
+    census.snapshots = snapshots.finish();
+    census.validate_evidence(proof).unwrap();
+
+    // Without work in flight, a census is written exactly as before, and one
+    // written before reads with none.
+    let bytes = serde_json::to_value(&census).unwrap();
+    assert!(bytes.get("in_flight").is_none(), "{bytes}");
+    assert_eq!(serde_json::from_value::<Census>(bytes).unwrap(), census);
+
+    let working = InFlight {
+        id: chat.id,
+        turn: true,
+        ..InFlight::default()
+    };
+    census.in_flight = vec![working.clone()];
+    census.validate_evidence(proof).unwrap();
+    let bytes = serde_json::to_vec(&census).unwrap();
+    assert_eq!(serde_json::from_slice::<Census>(&bytes).unwrap(), census);
+
+    for invalid in [
+        vec![InFlight {
+            id: TerminalId::new(),
+            ..working.clone()
+        }],
+        vec![working.clone(), working.clone()],
+        vec![InFlight {
+            id: chat.id,
+            ..InFlight::default()
+        }],
+    ] {
+        let mut changed = census.clone();
+        changed.in_flight = invalid;
+        assert!(changed.validate_evidence(proof).is_err());
+    }
+}
+
+#[test]
 fn paired_census_accepts_only_same_live_owner_attachment_and_hint_projections() {
     let root = tempfile::tempdir_in("/var/tmp").unwrap();
     let preparation = preparation(root.path());
@@ -809,13 +867,13 @@ fn scale_chat(
     super::super::floor::Presentation,
 ) {
     let terminal = &preparation.authority.census.terminals[0];
-    let provider = if index % 3 == 0 {
+    let provider = if index.is_multiple_of(3) {
         crate::agent::Provider::Codex
     } else {
         crate::agent::Provider::Claude
     };
     let mut recipe = terminal.launch.clone();
-    recipe.program = format!("/home/person/.local/bin/{}", provider.executable()).into();
+    recipe.program = format!("/home/person/.local/bin/{}", provider.executable());
     // Eight arguments each provider accepts on an exact resume.
     recipe.arguments = match provider {
         crate::agent::Provider::Codex => [
@@ -956,7 +1014,7 @@ fn scale_census(
 /// Long chats hold 400 entries of 1.5 KiB (600 KiB of transcript each);
 /// every tenth chat is short and must keep its whole page.
 fn long_or_short(index: usize) -> (usize, usize) {
-    if index % 10 == 0 {
+    if index.is_multiple_of(10) {
         (6, 200)
     } else {
         (400, 1536)

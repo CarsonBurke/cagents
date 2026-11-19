@@ -962,7 +962,7 @@ fn a_message_written_while_the_provider_comes_up_waits_in_the_composer() {
     let Some(CardRuntime::Chat(runtime)) = peer.app.cards.get(&peer.card) else {
         panic!("expected a chat runtime");
     };
-    assert!(runtime.pending.is_none());
+    assert!(runtime.commands.is_idle());
     assert!(runtime.error.is_none());
     assert_eq!(runtime.unsent_text(), "from this window");
 }
@@ -1115,16 +1115,11 @@ fn escape_on_the_question_lets_the_next_close_ask() {
         drop(app.begin_card_close(next));
         assert!(app.chat_close_asked(asked));
 
-        let task = app.update(Message::KeyEvent {
+        // Escape answers the question within its own update.
+        drop(app.update(Message::KeyEvent {
             event: crate::app::dialog_ui::tests::key_press(iced::keyboard::key::Named::Escape),
             captured,
-        });
-        let cancel = crate::app::tests::task_app_message(task);
-        assert!(
-            matches!(cancel, Message::CancelChatClose),
-            "captured={captured}"
-        );
-        drop(app.update(cancel));
+        }));
 
         assert!(app.chat_close_asked(next), "captured={captured}");
         assert!(!app.chat_close_owned(asked), "captured={captured}");
@@ -1407,6 +1402,7 @@ fn a_file_queued_behind_this_windows_own_start_comes_along() {
     match peer.app.cards.get(&peer.card) {
         Some(CardRuntime::Chat(runtime)) => assert!(
             runtime.queued.as_ref().is_some_and(|queued| queued
+                .prompt
                 .attachments
                 .iter()
                 .any(|attachment| attachment.path == std::path::Path::new(FILE))),
@@ -1487,12 +1483,10 @@ fn a_working_chat_close_answers_enter_and_escape_and_can_stop_asking() {
 
     // Escape keeps the chat, and a tick only counts once the close goes ahead.
     drop(app.update(Message::DontAskAgain(StopWorkingChat, true)));
-    let escape = crate::app::tests::task_app_message(app.update(Message::KeyEvent {
+    drop(app.update(Message::KeyEvent {
         event: key_press(keyboard::key::Named::Escape),
         captured: false,
     }));
-    assert!(matches!(escape, Message::CancelChatClose));
-    drop(app.update(escape));
     assert!(!app.chat_close_dialog_visible());
     assert!(
         app.card_state(card)

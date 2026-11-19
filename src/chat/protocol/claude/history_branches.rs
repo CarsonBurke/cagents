@@ -309,15 +309,15 @@ pub(super) fn details(frame: &super::Value) -> (Vec<AgentCall>, ResultDetails) {
     let agents = blocks
         .iter()
         .enumerate()
-        .filter_map(|(block, value)| {
-            (string(frame, "type") == "assistant"
+        .filter(|&(_block, value)| {
+            string(frame, "type") == "assistant"
                 && matches!(string(value, "type"), "tool_use" | "server_tool_use")
-                && string(value, "name") == "Agent")
-                .then(|| AgentCall {
-                    block,
-                    name: string(&value["input"], "name").trim().to_owned(),
-                    background: value["input"]["run_in_background"].as_bool() == Some(true),
-                })
+                && string(value, "name") == "Agent"
+        })
+        .map(|(block, value)| AgentCall {
+            block,
+            name: string(&value["input"], "name").trim().to_owned(),
+            background: value["input"]["run_in_background"].as_bool() == Some(true),
         })
         .collect();
     let mut result = ResultDetails {

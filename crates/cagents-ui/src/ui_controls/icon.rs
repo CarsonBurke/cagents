@@ -252,6 +252,8 @@ pub fn provider_artwork(provider: crate::agent::Provider) -> (&'static [u8], boo
         Provider::Omp => (include_bytes!("../icons/omp.svg"), false),
         Provider::Claude => (include_bytes!("../icons/claude.svg"), false),
         Provider::Codex => (include_bytes!("../icons/codex.svg"), true),
+        Provider::Antigravity => (include_bytes!("../icons/antigravity.svg"), false),
+        Provider::Muse => (include_bytes!("../icons/muse.svg"), false),
     }
 }
 

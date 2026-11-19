@@ -10,12 +10,12 @@ use std::{
 use crate::{
     model::HostSessionProof,
     terminal_ipc::{
-        ClientEnvelope, ClientRequest, FrameCodec, FrameError, MAX_CLIENT_FRAME_BYTES,
-        MAX_FRAME_BYTES, MAX_INPUT_BYTES, MAX_RESUME_TERMINALS, PROTOCOL_VERSION, ProtocolError,
-        ProtocolErrorCode, ResumeCursor, SHUTDOWN_VERSION, ServerEnvelope, ServerMessage,
-        ServerResponse, ShutdownOperation, ShutdownOutcome, TerminalScroll, TerminalSnapshot,
-        TerminalVisibility, WireTerminalEvent, is_cli_peer, older_client, read_frame_with_limit,
-        validate_proof,
+        ClientEnvelope, ClientRequest, FrameCodec, FrameError, LIST_PAGE_BYTES,
+        MAX_CLIENT_FRAME_BYTES, MAX_FRAME_BYTES, MAX_INPUT_BYTES, MAX_RESUME_TERMINALS,
+        PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, ResumeCursor, SHUTDOWN_VERSION,
+        ServerEnvelope, ServerMessage, ServerResponse, ShutdownOperation, ShutdownOutcome,
+        TerminalDescriptor, TerminalScroll, TerminalSnapshot, TerminalVisibility,
+        WireTerminalEvent, is_cli_peer, older_client, read_frame_with_limit, validate_proof,
     },
 };
 
@@ -167,6 +167,7 @@ fn may_release_retention(request: &ClientRequest) -> bool {
     !matches!(
         request,
         ClientRequest::List
+            | ClientRequest::ListPage { .. }
             | ClientRequest::Input { .. }
             | ClientRequest::Key { .. }
             | ClientRequest::Mouse { .. }
@@ -325,6 +326,9 @@ fn serve_with<R: Into<crate::terminal_ipc::PreparedResponse>>(
                 break;
             }
             connected = true;
+            // A resumed terminal's live events follow its handshake and replay.
+            // Held messages are not coalesced, so hold only to resume.
+            let hold = (!resume.is_empty()).then(|| delivery.hold_broadcasts());
             let (resumed, replay) = match prepare_resume(&host, client_id, resume) {
                 Ok(prepared) => prepared,
                 Err(error) => {
@@ -346,15 +350,17 @@ fn serve_with<R: Into<crate::terminal_ipc::PreparedResponse>>(
                 break;
             }
             for message in replay {
-                if delivery
-                    .push(ServerEnvelope {
-                        version: PROTOCOL_VERSION,
-                        request_id: None,
-                        proof: proof.clone(),
-                        message,
-                    })
-                    .is_err()
-                {
+                let message = ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: None,
+                    proof: proof.clone(),
+                    message,
+                };
+                let queued = match &hold {
+                    Some(hold) => hold.push(message),
+                    None => delivery.push(message),
+                };
+                if queued.is_err() {
                     break;
                 }
             }
@@ -372,6 +378,9 @@ fn serve_with<R: Into<crate::terminal_ipc::PreparedResponse>>(
         // than the connection. The panic hook has already recorded it.
         let request = envelope.request;
         let releases_retention = may_release_retention(&request);
+        // An attached terminal's live events follow its reply and replay.
+        let hold =
+            matches!(request, ClientRequest::Attach { .. }).then(|| delivery.hold_broadcasts());
         // Register even before ordinary exit starts: its writer can enter
         // after process_request releases control, before this reply is queued.
         // The final HostMutex seal closes acquisition before any handler effect.
@@ -429,15 +438,17 @@ fn serve_with<R: Into<crate::terminal_ipc::PreparedResponse>>(
                     break;
                 }
                 for message in extras {
-                    if delivery
-                        .push(ServerEnvelope {
-                            version: PROTOCOL_VERSION,
-                            request_id: None,
-                            proof: proof.clone(),
-                            message,
-                        })
-                        .is_err()
-                    {
+                    let message = ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: None,
+                        proof: proof.clone(),
+                        message,
+                    };
+                    let queued = match &hold {
+                        Some(hold) => hold.push(message),
+                        None => delivery.push(message),
+                    };
+                    if queued.is_err() {
                         break;
                     }
                 }
@@ -519,6 +530,7 @@ fn ensure_request_open(host: &SharedHost, request: &ClientRequest) -> Result<(),
         ClientRequest::BuildInfo
             | ClientRequest::StartupState
             | ClientRequest::List
+            | ClientRequest::ListPage { .. }
             | ClientRequest::Attach { .. }
             | ClientRequest::Detach { .. }
             | ClientRequest::Snapshot { .. }
@@ -579,48 +591,34 @@ fn disconnect_client(host: &SharedHost, client_id: ClientId) {
 
 type RequestOutcome<R = ServerResponse> = (R, Vec<ServerMessage>, bool);
 
-/// Recovery is deliberately a subset of existing authority-checked operations.
-/// No visibility operation retries adoption, and no new command may race a
-/// retained original whose commit outcome is unknown.
+/// Startup recovery's hold admits only what touches none of its originals;
+/// see [`super::recovery_admission`].
 fn ensure_startup_recovery_request(
     host: &SharedHost,
     request: &ClientRequest,
 ) -> Result<(), ProtocolError> {
-    let state = host.lock().unwrap_or_else(|p| p.into_inner());
-    let Some(detail) = state.startup_recovery() else {
-        return Ok(());
-    };
-    let inspection = matches!(
-        request,
-        ClientRequest::StartupState
-            | ClientRequest::List
-            | ClientRequest::ChatList
-            | ClientRequest::Attach { .. }
-            | ClientRequest::Detach { .. }
-            | ClientRequest::Snapshot { .. }
-            | ClientRequest::TerminalAcknowledge { .. }
-            | ClientRequest::AcknowledgeRedraw { .. }
-            | ClientRequest::WatchTerminals
-            | ClientRequest::Authenticate { .. }
-            | ClientRequest::CloseTerminalChecked { .. }
-            | ClientRequest::CloseTerminalSource { .. }
-            | ClientRequest::ChatCloseRetained { .. }
-            | ClientRequest::ChatLostProcesses { .. }
-    );
-    let shutdown = matches!(
-        request,
-        ClientRequest::Shutdown | ClientRequest::ShutdownV1 { .. }
-    ) && !state.recovery_owns_work();
-    if inspection || shutdown {
-        return Ok(());
+    super::recovery_admission::admit(host, request)
+}
+
+/// The encoded `Listed` reply a frame still holds with room for its envelope.
+const LIST_REPLY_LIMIT: usize = MAX_FRAME_BYTES - 64 * 1024;
+
+/// The whole inventory as one `Listed` reply, which only an older CLI still
+/// asks for, or a refusal once it passes `limit`: past a frame, the writer
+/// would drop the connection without a word.
+fn listed_in_one_reply(
+    terminals: Vec<TerminalDescriptor>,
+    limit: usize,
+) -> Result<ServerResponse, ProtocolError> {
+    let response = ServerResponse::Listed { terminals };
+    match postcard::experimental::serialized_size(&response) {
+        Ok(size) if size <= limit => Ok(response),
+        _ => Err(ProtocolError::new(
+            ProtocolErrorCode::InvalidRequest,
+            "The terminal inventory is too large to list in one reply; update cagents to list it",
+            false,
+        )),
     }
-    Err(ProtocolError::new(
-        ProtocolErrorCode::TerminalUnavailable,
-        format!(
-            "Startup recovery retained original ownership; inspect available sessions or explicitly Close the original actor: {detail}"
-        ),
-        false,
-    ))
 }
 
 fn ensure_terminal_close_open(host: &SharedHost) -> Result<(), ProtocolError> {
@@ -639,13 +637,12 @@ fn retention_pin_generation(
     host: &SharedHost,
     terminal: crate::model::TerminalId,
 ) -> Result<Option<String>, String> {
-    let result = super::agent_execution::registry(host).and_then(|registry| {
+    super::agent_execution::registry(host).and_then(|registry| {
         registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .retention_pin_generation(terminal)
-    });
-    result
+    })
 }
 
 /// Capture the exact native pair before stopping the PTY. Re-resolving only
@@ -1945,7 +1942,25 @@ fn process_admitted_request(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .list(client_id);
-            Ok((ServerResponse::Listed { terminals }, Vec::new(), false))
+            Ok((
+                listed_in_one_reply(terminals, LIST_REPLY_LIMIT)?,
+                Vec::new(),
+                false,
+            ))
+        }
+        ClientRequest::ListPage { after } => {
+            let (terminals, complete) = host
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .list_page(client_id, after, LIST_PAGE_BYTES);
+            Ok((
+                ServerResponse::ListedPage {
+                    terminals,
+                    complete,
+                },
+                Vec::new(),
+                false,
+            ))
         }
         ClientRequest::WatchTerminals => {
             host.lock()

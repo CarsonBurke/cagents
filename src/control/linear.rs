@@ -366,6 +366,19 @@ enum RelationCommand {
 
 #[cfg(feature = "ui")]
 impl LinearCommand {
+    /// Whether the command reads a body from standard input, as [`body`]
+    /// does for `--body-file -`.
+    pub(super) fn reads_stdin(&self) -> bool {
+        let body_file = match &self.command {
+            Operation::Create(save) => &save.body_file,
+            Operation::Comment {
+                command: CommentCommand::Add { body_file, .. },
+            } => body_file,
+            _ => return false,
+        };
+        body_file.as_deref().is_some_and(super::standard_input)
+    }
+
     /// What the command does, as the verb a transcript step opens with, and
     /// what it did it to. Empty where the verb says it all.
     pub(super) fn describe(&self) -> (&'static str, String) {
@@ -564,12 +577,12 @@ fn linked_workspace(
     explicit: Option<String>,
     linked: Option<String>,
 ) -> Result<Option<String>, AppError> {
-    if let Some(a) = &explicit {
-        if !linked.as_ref().is_some_and(|b| a.eq_ignore_ascii_case(b)) {
-            return Err(error(
-                "--workspace conflicts with the linked issue's workspace",
-            ));
-        }
+    if let Some(a) = &explicit
+        && !linked.as_ref().is_some_and(|b| a.eq_ignore_ascii_case(b))
+    {
+        return Err(error(
+            "--workspace conflicts with the linked issue's workspace",
+        ));
     }
     Ok(explicit.or(linked))
 }
@@ -947,7 +960,7 @@ fn validate_date(value: &str) -> Result<(), AppError> {
     Ok(())
 }
 fn body(path: &PathBuf) -> Result<String, AppError> {
-    let mut reader: Box<dyn Read> = if path.as_os_str() == "-" {
+    let mut reader: Box<dyn Read> = if super::standard_input(path) {
         Box::new(std::io::stdin())
     } else {
         Box::new(std::fs::File::open(path).map_err(|e| AppError::new("linear_body", e))?)

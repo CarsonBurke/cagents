@@ -301,6 +301,13 @@ impl Submit {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        // Every agent runs as a native conversation, even one shown in a
+        // terminal.
+        if let Destination::New(spec) = &self.destination
+            && !spec.provider.has_native_chat()
+        {
+            return Err(spec.provider.native_chat_refusal());
+        }
         if let Some(name) = &self.name {
             if !matches!(&self.destination, Destination::New(_)) {
                 return Err("Only a new agent can be named".into());
@@ -904,6 +911,29 @@ mod tests {
         assert!(request.validate().unwrap_err().contains("Only a new agent"));
         request.name = None;
         request.validate().unwrap();
+    }
+
+    #[test]
+    fn agents_start_only_with_providers_that_run_as_native_chat() {
+        for provider in Provider::ALL {
+            let request = Submit {
+                name: None,
+                destination: Destination::New(Spec { provider, ..spec() }),
+                prompt: "work".into(),
+                idempotency_key: "key".into(),
+            };
+            if provider.has_native_chat() {
+                assert_eq!(request.validate(), Ok(()), "{provider:?}");
+            } else {
+                assert_eq!(
+                    request.validate(),
+                    Err(provider.native_chat_refusal()),
+                    "{provider:?}"
+                );
+            }
+        }
+        assert!(!Provider::Antigravity.has_native_chat());
+        assert!(!Provider::Muse.has_native_chat());
     }
 
     #[test]

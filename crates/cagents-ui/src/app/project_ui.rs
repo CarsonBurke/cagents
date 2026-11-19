@@ -1234,7 +1234,7 @@ impl Cagents {
                             if let Some(pr) = row.and_then(|row| row.pull_request()) {
                                 return self.open_clicked_link(pr.url.clone());
                             }
-                            return self.update(Message::Sidebar(
+                            return self.dispatch(Message::Sidebar(
                                 SidebarAction::CreatePullRequest {
                                     project_id,
                                     worktree: Some(target.path),
@@ -1289,7 +1289,7 @@ impl Cagents {
                             }
                             order.get(index + 2).copied()
                         };
-                        return self.update(Message::Sidebar(SidebarAction::ReorderProject {
+                        return self.dispatch(Message::Sidebar(SidebarAction::ReorderProject {
                             project: project_id,
                             before,
                         }));
@@ -1886,28 +1886,31 @@ impl Cagents {
     /// Refuses, and says so, to start a session for `card` while the
     /// worktree it works in is being deleted.
     pub(super) fn refuse_for_deleting_card(&mut self, card: CardId) -> bool {
-        if self.card_state(card).is_some_and(|state| {
-            self.sidebar_model.projects.iter().any(|project| {
-                (self.project_ui.removing.contains_key(&project.repository)
-                    || self.project_ui.closing.contains_key(&project.id))
-                    && self.project_owns_card(
-                        project.id,
-                        state,
-                        &self.project_session_scope(project.id),
-                    )
-            })
-        }) {
-            self.status = Some(TransientNotice::warning("That project is being removed."));
-            return true;
-        }
-        if !self
-            .card_state(card)
-            .is_some_and(|state| self.project_ui.deleting_card(state))
-        {
+        let Some(reason) = self.deleting_card_reason(card) else {
             return false;
-        }
-        self.status = Some(TransientNotice::warning("That worktree is being deleted."));
+        };
+        self.status = Some(TransientNotice::warning(reason));
         true
+    }
+
+    /// Why no session may start for `card`: the project or worktree it works
+    /// in is being removed.
+    pub(super) fn deleting_card_reason(&self, card: CardId) -> Option<&'static str> {
+        let state = self.card_state(card)?;
+        if self.sidebar_model.projects.iter().any(|project| {
+            (self.project_ui.removing.contains_key(&project.repository)
+                || self.project_ui.closing.contains_key(&project.id))
+                && self.project_owns_card(
+                    project.id,
+                    state,
+                    &self.project_session_scope(project.id),
+                )
+        }) {
+            return Some("That project is being removed.");
+        }
+        self.project_ui
+            .deleting_card(state)
+            .then_some("That worktree is being deleted.")
     }
 
     /// Hands focus back to whatever the dialog covered.
@@ -2641,10 +2644,9 @@ fn remove_project_from_cagents(
         &removal.project_sessions,
         None,
     )?;
-    let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
-    let mut client =
-        crate::control::ControlClient::connect(&socket).map_err(|error| error.to_string())?;
-    client
+    crate::terminal::connect_ready_daemon()
+        .map_err(|error| error.to_string())?
+        .client
         .apply_workspace_edit(crate::workspace_model::ModelEdit::CloseProject {
             repository: removal.repository.clone(),
         })
@@ -4661,7 +4663,8 @@ pub(in crate::app) mod tests {
         let mut missing = model;
         missing.projects[1].repository = root.join("missing.git");
         assert!(
-            shared_project_session_scope(&[folder.clone()], &folder, &missing.projects).is_err()
+            shared_project_session_scope(std::slice::from_ref(&folder), &folder, &missing.projects)
+                .is_err()
         );
     }
 

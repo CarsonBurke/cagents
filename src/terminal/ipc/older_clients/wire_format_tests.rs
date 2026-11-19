@@ -328,12 +328,10 @@ impl Comparison<'_> {
                         _ => self.differ(&path, "variant was not traced".into()),
                     }
                 }
-                let appended = new.iter().skip(old.len()).any(|(name, _)| {
-                    !self
-                        .restated
-                        .iter()
-                        .any(|restated| *restated == (current, name.as_str()))
-                });
+                let appended = new
+                    .iter()
+                    .skip(old.len())
+                    .any(|(name, _)| !self.restated.contains(&(current, name.as_str())));
                 if appended && direction == Direction::Reply && gate.is_none() && selected.is_none()
                 {
                     self.differ(
@@ -555,11 +553,13 @@ fn every_older_client_is_proven_against_its_recorded_format() {
     }
 }
 
-/// Appended variants a client of `protocol` is sent as ones it knows, and
-/// added fields it is sent without, as (container, variant or field).
+/// Appended variants a client of `protocol` is sent as ones it knows or never
+/// sent, and added fields it is sent without, as (container, variant or
+/// field).
 fn restated_for(protocol: u16) -> Vec<(&'static str, &'static str)> {
     RESTATED_VARIANTS
         .iter()
+        .chain(WITHHELD_VARIANTS)
         .filter(|(.., since)| protocol < *since)
         .map(|(container, variant, _)| (*container, *variant))
         .chain(
@@ -574,13 +574,16 @@ fn restated_for(protocol: u16) -> Vec<(&'static str, &'static str)> {
 }
 
 /// The lifecycle contract with a source of `protocol`: the frozen variants,
-/// and the unsolicited chat events it already sends.
+/// those its protocol added, and the unsolicited chat events it already sends.
 fn selected_for(protocol: u16) -> Vec<(&'static str, Vec<&'static str>)> {
     let mut selected = crate::update::source::LIFECYCLE_VARIANTS
         .iter()
         .map(|(container, variants)| (*container, variants.to_vec()))
         .collect::<Vec<_>>();
-    for &(container, variant, since) in crate::update::source::UNSOLICITED_SINCE {
+    for &(container, variant, since) in crate::update::source::LIFECYCLE_SINCE
+        .iter()
+        .chain(crate::update::source::UNSOLICITED_SINCE)
+    {
         if protocol < since {
             continue;
         }

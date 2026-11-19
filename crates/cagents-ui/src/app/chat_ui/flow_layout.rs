@@ -999,7 +999,7 @@ fn large_paragraphs_lay_out_inline_code_as_small_paragraphs_do() {
     // Paragraphs past the flow threshold are shaped here rather than by
     // iced; inline code set smaller must keep the same lines either way.
     let spans = super::selectable_prose::inline_code_answer_spans(&cosmic::Theme::dark());
-    let size = iced::Pixels(design::TEXT_PROSE);
+    let size = iced::Pixels(design::TEXT_TRANSCRIPT);
     let pitch = iced::widget::text::LineHeight::default()
         .to_absolute(size)
         .0;
@@ -1724,7 +1724,7 @@ fn continuous_append_publishes_versioned_progress_and_eventually_exact_final_geo
         Arc::new(result)
     }
     let cache = Cache::default();
-    let style = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE).style;
+    let style = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_TRANSCRIPT).style;
     let mut content = markdown::Content::parse(&"word ".repeat(600));
     let mut entry = cache.markdown_entry(7, text(&content), style);
     entry
@@ -2187,7 +2187,7 @@ fn last_geometry_owner_retires_off_thread_after_widget_and_cache_release() {
 
 #[test]
 fn last_flow_entry_request_and_action_retire_real_raw_spans_after_canonical_and_document_owners() {
-    let style = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE).style;
+    let style = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_TRANSCRIPT).style;
     for final_owner in 0..3 {
         let (sent, disposed) = std::sync::mpsc::channel();
         let (canonical, document, bytes, expected, styled) = std::thread::spawn(move || {
@@ -2383,7 +2383,8 @@ fn queued_none_flow_results_hold_admission_through_cancellation_error_and_worker
         let [markdown::Item::Paragraph(text)] = canonical.items() else {
             unreachable!()
         };
-        let style = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE).style;
+        let style =
+            design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_TRANSCRIPT).style;
         let cache = Cache::default();
         let entry = cache.markdown_entry(95, text.clone(), style);
         let target = Target {
@@ -2539,8 +2540,7 @@ fn stale_output_reclamation_wakes_a_deferred_idle_reader_after_actual_permit_rel
         .configure(400.0, iced::Pixels(16.0), iced::Font::DEFAULT);
     let request = entry.borrow_mut().request().unwrap();
     let epoch = run_with_slots(target, request.clone(), slots.clone())
-        .err()
-        .expect("old output owns actual slot");
+        .expect_err("old output owns actual slot");
     entry.borrow_mut().defer(&request, epoch);
     let events = availability_stream();
     let mut events = Box::pin(events);
@@ -2558,8 +2558,7 @@ fn stale_output_reclamation_wakes_a_deferred_idle_reader_after_actual_permit_rel
     // rather than a guessed epoch value, is the control's authority.
     for retry in deferred_requests(target) {
         let epoch = run_with_slots(target, retry.clone(), slots.clone())
-            .err()
-            .expect("stalled destructor still owns admission");
+            .expect_err("stalled destructor still owns admission");
         entry.borrow_mut().defer(&retry, epoch);
     }
     release.send(()).unwrap();

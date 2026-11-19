@@ -139,9 +139,14 @@ fn blocked_app_with(
         app.chat_forget(card);
         app.cards
             .insert(card, CardRuntime::Failed("Daemon proof changed".into()));
-        app.chat_ui
-            .blocked_starts
-            .insert(card, blocked_recovery::BlockedStart { source, reopen });
+        app.chat_ui.blocked_starts.insert(
+            card,
+            blocked_recovery::BlockedStart {
+                source,
+                reopen,
+                liveness: Default::default(),
+            },
+        );
     }
     (app, card)
 }
@@ -392,7 +397,7 @@ fn blocked_runtime_primary_hides_temporal_and_internal_reasons() {
         runtime.error = Some(raw.into());
         runtime.refresh_failure_ui();
         let incident = runtime.failure_ui.incidents.last().unwrap();
-        let (tree, _) = frame(runtime.failure_view(&incident), 900.0, None);
+        let (tree, _) = frame(runtime.failure_view(incident), 900.0, None);
         assert!(labels(&tree).contains(&blocked_recovery::HEADLINE));
         assert!(!labels(&tree).contains(&raw));
         assert!(!runtime.stopped(false, false).guidance.contains("actor"));
@@ -610,7 +615,7 @@ fn typed_remediable_first_message_keeps_send_enabled() {
                 recovery,
             }),
         );
-        assert!(!chat_runtime(&app, card).start_blocked.is_some());
+        assert!(chat_runtime(&app, card).start_blocked.is_none());
         let (tree, _) = frame(app.card_view(card, true, false), 900.0, None);
         assert!(tree.root().iter().chain(tree.children()).any(|node| {
             node.node().role() == Role::Button
@@ -1226,7 +1231,7 @@ fn a_pending_paste_disables_fresh_in_place() {
     ));
     drop(app.handle_chat_ui(Action::StartFresh(card)));
     assert!(
-        app.chat_ui.phases.get(&card).is_none(),
+        !app.chat_ui.phases.contains_key(&card),
         "nothing closes mid-paste"
     );
 }
@@ -1287,4 +1292,409 @@ fn a_closing_chat_keeps_its_draft_in_the_read_only_composer() {
     let composer = &chat_runtime(&app, card).composer;
     assert_eq!(composer.text(), draft);
     assert_eq!(composer.selection().as_deref(), Some(draft.as_str()));
+}
+
+fn startup(state: &str) -> Result<crate::terminal::ipc::StartupState, String> {
+    use crate::terminal::ipc::StartupState;
+    match state {
+        "restoring" => Ok(StartupState::Restoring { awaiting: 1 }),
+        "held" => Ok(StartupState::Retained {
+            detail: "Codex server did not open its local socket within 15 seconds".into(),
+        }),
+        "ready" => Ok(StartupState::Ready),
+        _ => Err("the daemon socket is gone".into()),
+    }
+}
+
+fn update_refusal() -> chat::StartFailure {
+    chat::StartFailure {
+        message: format!(
+            "{}: Original terminal ownership is awaiting its startup outcome",
+            chat::STARTUP_RECOVERY_REFUSAL
+        ),
+        recovery: chat::Recovery::UpdateRecovery,
+    }
+}
+
+/// Every label on the pane, with a runtime's failure incident, whose
+/// headline is drawn apart from the card.
+fn pane_labels(app: &mut Cagents, card: CardId) -> Vec<String> {
+    let mut labels: Vec<String> = labels(&frame(app.card_view(card, true, false), 1200.0, None).0)
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    if let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) {
+        let target = runtime.target;
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.refresh_failure_ui();
+        if let Some(incident) = runtime.failure_ui.incidents.last() {
+            labels.extend(
+                self::labels(&frame(runtime.failure_view(incident), 1200.0, None).0)
+                    .into_iter()
+                    .map(str::to_owned),
+            );
+        }
+    }
+    labels
+}
+
+fn buttons(app: &Cagents, card: CardId) -> Vec<(String, bool)> {
+    let (tree, _) = frame(app.card_view(card, true, false), 1200.0, None);
+    tree.root()
+        .iter()
+        .chain(tree.children())
+        .filter(|node| node.node().role() == Role::Button && !node.node().is_hidden())
+        .filter_map(|node| Some((node.node().label()?.to_owned(), !node.node().is_disabled())))
+        .collect()
+}
+
+/// A saved conversation the daemon refused while it restores, or holds, an
+/// update's restore says which, keeps its way back, and offers neither a
+/// retry that would meet the same refusal nor a new conversation in its
+/// place. It reopens by itself once the daemon says it is ready.
+#[test]
+fn a_conversation_refused_by_the_update_restore_says_which_and_reopens_after_it() {
+    use blocked_recovery::{Reopen, UPDATE_HEADLINE};
+    for runtime in [false, true] {
+        let (mut app, card) = blocked_app_with(true, true, runtime, Reopen::UpdateRecovery);
+        for (state, wait) in [
+            ("restoring", UpdateWait::Restoring),
+            ("held", UpdateWait::Held),
+        ] {
+            drop(app.update_recovery_answered(startup(state)));
+            let case = format!("runtime={runtime}, {state}");
+            assert!(app.chat_retry_blocked(card), "{case}");
+            assert!(!app.chat_offers_fresh_conversation(card), "{case}");
+            let labels = pane_labels(&mut app, card);
+            assert!(
+                labels.iter().any(|l| l == UPDATE_HEADLINE),
+                "{case}: {labels:?}"
+            );
+            assert!(
+                labels.iter().any(|l| l == wait.guidance(false)),
+                "{case}: {labels:?}"
+            );
+            let buttons = buttons(&app, card);
+            assert!(
+                buttons.iter().all(|(label, _)| !label.starts_with("Retry")
+                    && label != "Try again"
+                    && label != "Start a new conversation"),
+                "{case}: {buttons:?}"
+            );
+            assert!(
+                buttons
+                    .iter()
+                    .any(|(label, enabled)| label.starts_with("Close") && *enabled),
+                "{case}: {buttons:?}"
+            );
+        }
+
+        // A daemon that cannot be asked proves nothing either way: trying
+        // again is the reader's to choose.
+        drop(app.update_recovery_answered(startup("unreachable")));
+        assert!(!app.chat_retry_blocked(card), "runtime={runtime}");
+        let labels = pane_labels(&mut app, card);
+        assert!(
+            labels
+                .iter()
+                .any(|l| l == UpdateWait::Unconfirmed.guidance(false)),
+            "runtime={runtime}: {labels:?}"
+        );
+        let retry = if runtime { "Try again" } else { "Retry Chat" };
+        assert!(
+            buttons(&app, card)
+                .iter()
+                .any(|(label, enabled)| label == retry && *enabled),
+            "runtime={runtime}: {:?}",
+            buttons(&app, card)
+        );
+
+        // A Held answer again, then Ready: the release is its own action.
+        drop(app.update_recovery_answered(startup("held")));
+        drop(app.update_recovery_answered(startup("ready")));
+        assert!(app.chat_ui.attempt(card).is_none(), "runtime={runtime}");
+        drop(app.update(Message::ChatUi(Action::UpdateRecoveryReady)));
+        let attempt = app
+            .chat_ui
+            .attempt(card)
+            .unwrap_or_else(|| panic!("runtime={runtime}: Ready reopens it"));
+        assert_eq!(
+            attempt.session.launch.session_id.as_deref(),
+            Some(KNOWN_THREAD),
+            "runtime={runtime}"
+        );
+        if runtime {
+            assert_eq!(chat_runtime(&app, card).start_blocked, None);
+            assert_eq!(
+                chat_runtime(&app, card).composer.text(),
+                "Keep this unsent note."
+            );
+        } else {
+            assert!(!app.chat_ui.blocked_starts.contains_key(&card));
+        }
+    }
+}
+
+/// A first message refused while the daemon restores an update stays in
+/// its box with no Send that would meet the same refusal, and gets its Send
+/// back, not sent on the reader's behalf, once the daemon says it is ready.
+#[test]
+fn a_first_message_refused_by_the_update_restore_waits_for_it() {
+    use blocked_recovery::UPDATE_DRAFT_HEADLINE;
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let storage = tempfile::tempdir().unwrap();
+    let (writer, _) = crate::session::SessionRuntime::open(
+        storage.path().join("update-recovery.sqlite3"),
+        crate::model::BootId::new("update-recovery-test"),
+    )
+    .unwrap();
+    app.session = Some(writer);
+    app.workspace.resize_viewport(1200.0);
+    let card = tests::draft_chat(&mut app);
+    tests::write(&mut app, card, "Keep this unsent note.");
+    tests::submit(&mut app, card);
+    let attempt = tests::chat_runtime_attempt(&app, card);
+    tests::answer_start(&mut app, attempt, Err(update_refusal()));
+    let target = chat_runtime(&app, card).target;
+    // The refusal itself says the restore stood: nothing offers to send
+    // again before the daemon has been asked.
+    assert_eq!(chat_runtime(&app, card).update_wait, UpdateWait::Restoring);
+    assert!(
+        app.status
+            .as_ref()
+            .is_none_or(|notice| !notice.message.contains("Could not")),
+        "the pane explains itself; no notice says it failed"
+    );
+
+    for (state, wait) in [
+        ("restoring", UpdateWait::Restoring),
+        ("held", UpdateWait::Held),
+    ] {
+        drop(app.update_recovery_answered(startup(state)));
+        let labels = pane_labels(&mut app, card);
+        assert!(
+            labels.iter().any(|l| l == UPDATE_DRAFT_HEADLINE),
+            "{state}: {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l == wait.guidance(true)),
+            "{state}: {labels:?}"
+        );
+        assert!(
+            buttons(&app, card)
+                .iter()
+                .all(|(label, enabled)| label != "Send again"
+                    && !(label.starts_with("Send message") && *enabled)),
+            "{state}"
+        );
+        drop(app.handle_chat_ui(Action::SendAgain(target)));
+        assert!(
+            app.chat_ui.attempt(card).is_none(),
+            "{state}: a forged Send again"
+        );
+    }
+
+    // Unanswered, the reader may send it again themselves.
+    drop(app.update_recovery_answered(startup("unreachable")));
+    let labels = pane_labels(&mut app, card);
+    assert!(
+        labels
+            .iter()
+            .any(|l| l == UpdateWait::Unconfirmed.guidance(true)),
+        "{labels:?}"
+    );
+    let (_, mut send) = frame(app.card_view(card, true, false), 1200.0, Some("Send again"));
+    let send = app.update(send.pop().unwrap());
+    let (target, attempt, result) = super::first_start_checkpoint_tests::checkpoint(send);
+    assert!(result.is_ok(), "real Send again checkpoint: {result:?}");
+    drop(app.draft_start_checkpointed(target, attempt, result));
+    assert!(app.chat_ui.attempt(card).is_some(), "Send again starts it");
+}
+
+#[test]
+fn a_first_message_gets_its_send_back_once_the_update_restore_finishes() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    app.workspace.resize_viewport(1200.0);
+    let card = tests::draft_chat(&mut app);
+    tests::write(&mut app, card, "Keep this unsent note.");
+    tests::submit(&mut app, card);
+    let attempt = tests::chat_runtime_attempt(&app, card);
+    tests::answer_start(&mut app, attempt, Err(update_refusal()));
+    drop(app.update_recovery_answered(startup("held")));
+    drop(app.update_recovery_answered(startup("ready")));
+    drop(app.update(Message::ChatUi(Action::UpdateRecoveryReady)));
+    let runtime = chat_runtime(&app, card);
+    assert_eq!(runtime.start_blocked, None);
+    assert_eq!(runtime.error, None);
+    assert_eq!(runtime.composer.text(), "Keep this unsent note.");
+    assert!(
+        app.chat_ui.attempt(card).is_none(),
+        "nothing is sent for the reader"
+    );
+    assert!(
+        buttons(&app, card)
+            .iter()
+            .any(|(label, enabled)| label.starts_with("Send message") && *enabled),
+        "{:?}",
+        buttons(&app, card)
+    );
+}
+
+/// A saved conversation the update refused takes no typing it has nowhere to
+/// send (#2905), but keeps its unsent message readable. One whose pane can
+/// start a new conversation in its place, which carries the message, and a
+/// refused first message stay editable.
+#[test]
+fn a_refused_saved_conversation_keeps_its_message_read_only() {
+    let composer = |app: &Cagents, card| {
+        let (tree, _) = frame(app.card_view(card, true, false), 1200.0, None);
+        tree.root()
+            .iter()
+            .chain(tree.children())
+            .filter(|node| {
+                node.node().role() == Role::MultilineTextInput
+                    && node.node().label() == Some("Message")
+            })
+            .map(|node| node.node().is_read_only())
+            .collect::<Vec<_>>()
+    };
+    for (reopen, read_only) in [
+        (blocked_recovery::Reopen::Unproven, false),
+        (blocked_recovery::Reopen::AfterRestart, false),
+        (blocked_recovery::Reopen::UpdateRecovery, true),
+        (blocked_recovery::Reopen::UpdateStopped, true),
+    ] {
+        let (app, card) = blocked_app_with(true, true, true, reopen);
+        assert_eq!(composer(&app, card), [read_only], "{reopen:?}");
+        assert_eq!(
+            chat_runtime(&app, card).composer.text(),
+            "Keep this unsent note."
+        );
+    }
+
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    app.workspace.resize_viewport(1200.0);
+    let card = tests::draft_chat(&mut app);
+    tests::write(&mut app, card, "Keep this unsent note.");
+    tests::submit(&mut app, card);
+    let attempt = tests::chat_runtime_attempt(&app, card);
+    tests::answer_start(&mut app, attempt, Err(update_refusal()));
+    assert_eq!(
+        composer(&app, card),
+        [false],
+        "a first message stays editable"
+    );
+}
+
+/// A saved pane its workspace has not admitted says that it waits on the
+/// update when that is why, and otherwise only that it reopens when the
+/// workspace reconnects. Neither offers a reopen from history.
+#[test]
+fn a_saved_pane_waiting_for_its_workspace_says_whether_the_update_holds_it() {
+    for (state, title) in [
+        (None, None),
+        (Some("restoring"), Some(update_recovery::RESTORING_TITLE)),
+        (Some("held"), Some(update_recovery::HELD_TITLE)),
+        (Some("ready"), None),
+    ] {
+        let (mut app, card) = blocked_app(true, true, true);
+        let CardKind::Chat(session) = app.card_state(card).unwrap().kind.clone() else {
+            unreachable!()
+        };
+        app.chat_forget(card);
+        app.await_shared_chat_admission(card, session);
+        assert!(app.chat_awaiting_admission(card));
+        if let Some(state) = state {
+            drop(app.update_recovery_answered(startup(state)));
+        }
+        let labels = pane_labels(&mut app, card);
+        let wait = chat_runtime(&app, card).update_wait;
+        let (expected_title, explanation) = wait.admission();
+        assert_eq!(expected_title, title, "{state:?}");
+        if let Some(title) = title {
+            assert!(labels.iter().any(|l| l == title), "{state:?}: {labels:?}");
+        }
+        assert!(labels.contains(&explanation), "{state:?}: {labels:?}");
+        assert!(
+            labels.iter().all(|l| !l.contains("from history")),
+            "{state:?}: {labels:?}"
+        );
+    }
+}
+
+/// A conversation the update stopped says so, offers Reopen conversation as
+/// its next step, and offers neither a retry of the restore it refused nor a
+/// new conversation in its place. Reopen is an explicit start of the same
+/// saved conversation, and the unsent message stays.
+#[test]
+fn a_conversation_the_update_stopped_offers_reopen_and_reopens_on_request() {
+    use blocked_recovery::{REOPEN_LABEL, Reopen, STOPPED_GUIDANCE, STOPPED_HEADLINE};
+    assert_eq!(
+        Reopen::of(chat::Recovery::UpdateStopped),
+        Some(Reopen::UpdateStopped)
+    );
+    assert!(!Reopen::UpdateStopped.waits(), "Reopen is the next step");
+    for runtime in [false, true] {
+        let (mut app, card) = blocked_app_with(true, true, runtime, Reopen::UpdateStopped);
+        let case = format!("runtime={runtime}");
+        assert!(app.chat_retry_blocked(card), "{case}");
+        assert!(!app.chat_offers_fresh_conversation(card), "{case}");
+        let labels = pane_labels(&mut app, card);
+        assert!(
+            labels.iter().any(|l| l == STOPPED_HEADLINE),
+            "{case}: {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l == STOPPED_GUIDANCE),
+            "{case}: {labels:?}"
+        );
+        let buttons = buttons(&app, card);
+        assert!(
+            buttons.iter().all(|(label, _)| !label.starts_with("Retry")
+                && label != "Try again"
+                && label != "Start a new conversation"),
+            "{case}: {buttons:?}"
+        );
+        assert!(
+            buttons
+                .iter()
+                .any(|(label, enabled)| label == REOPEN_LABEL && *enabled),
+            "{case}: {buttons:?}"
+        );
+        assert!(
+            buttons
+                .iter()
+                .any(|(label, enabled)| label.starts_with("Close") && *enabled),
+            "{case}: {buttons:?}"
+        );
+        if runtime {
+            assert!(chat_runtime(&app, card).emphasizes_recovery(), "{case}");
+        }
+
+        // Retrying the restore would only meet the same refusal.
+        drop(app.update(Message::RetryCard(card)));
+        assert!(app.chat_ui.attempt(card).is_none(), "{case}");
+
+        let (_, messages) = frame(app.card_view(card, true, false), 1200.0, Some(REOPEN_LABEL));
+        for message in messages {
+            drop(app.update(message));
+        }
+        let attempt = app.chat_ui.attempt(card).expect("Reopen starts it");
+        assert_eq!(attempt.intent, chat::Intent::Start, "{case}");
+        assert_eq!(
+            attempt.session.launch.session_id.as_deref(),
+            Some(KNOWN_THREAD),
+            "{case}"
+        );
+        if runtime {
+            assert_eq!(chat_runtime(&app, card).start_blocked, None, "{case}");
+            assert_eq!(
+                chat_runtime(&app, card).composer.text(),
+                "Keep this unsent note.",
+                "{case}"
+            );
+        } else {
+            assert!(!app.chat_ui.blocked_starts.contains_key(&card), "{case}");
+        }
+    }
 }

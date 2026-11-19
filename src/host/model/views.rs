@@ -199,25 +199,23 @@ pub(super) fn update_terminal_source(
     if before == after {
         return Ok(());
     }
-    if before == Some(claimed_before) {
-        if let (Some(CardKind::Terminal(before)), Some(CardKind::Terminal(after))) = (before, after)
+    if before == Some(claimed_before)
+        && let (Some(CardKind::Terminal(before)), Some(CardKind::Terminal(after))) = (before, after)
+        && same_terminal_identity(before, after)
+        && ended_terminal(after)
+    {
+        if before
+            .continuity
+            .live_proof()
+            .is_some_and(|proof| proof.is_complete())
         {
-            if same_terminal_identity(before, after) && ended_terminal(after) {
-                if before
-                    .continuity
-                    .live_proof()
-                    .is_some_and(|proof| proof.is_complete())
-                {
-                    return write_terminal_source(db, id, before, after);
-                }
-                if before.continuity == after.continuity {
-                    if let Some((source, ended)) = terminal_source(db, id)? {
-                        if ended == *before {
-                            return write_terminal_source(db, id, &source, after);
-                        }
-                    }
-                }
-            }
+            return write_terminal_source(db, id, before, after);
+        }
+        if before.continuity == after.continuity
+            && let Some((source, ended)) = terminal_source(db, id)?
+            && ended == *before
+        {
+            return write_terminal_source(db, id, &source, after);
         }
     }
     db.execute(
@@ -677,13 +675,12 @@ pub(super) fn apply_recorded(
             if view.revision != *expected_revision {
                 return Err(Registry::VIEW_REVISION_CONFLICT.into());
             }
-            if let Change::UpdateTerminalSource { before, worker, .. } = change {
-                if bindings::read(transaction, before.id)?
+            if let Change::UpdateTerminalSource { before, worker, .. } = change
+                && bindings::read(transaction, before.id)?
                     .and_then(|b| b.basis)
                     .is_some_and(|original| &original != worker)
-                {
-                    return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
-                }
+            {
+                return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
             }
             changed = match change {
                 Change::Transfer {
@@ -960,8 +957,64 @@ pub(super) fn adopt_authenticated_agent_pane_with_console(
     successor: &crate::agent_execution::HostedSession,
     replaced_console: Option<&crate::model::TerminalSession>,
 ) -> Result<bool, String> {
-    use crate::{agent_execution::HostedSession, model::CardKind};
     let id = crate::model::CardId::from_uuid(agent.as_uuid());
+    adopt_authenticated_pane(db, id, retained, successor, replaced_console)
+}
+
+/// The descriptor of the open pane presenting chat `id`, if any.
+pub(super) fn chat_pane_session(
+    db: &Connection,
+    id: crate::model::TerminalId,
+) -> Result<Option<crate::chat::Session>, String> {
+    let Some(pane) = store::chat_pane(db, id)? else {
+        return Ok(None);
+    };
+    let Some(scope) = owner(db, pane)? else {
+        return Ok(None);
+    };
+    let view = read(db, &scope)?;
+    if view.retired.contains(&pane) {
+        return Ok(None);
+    }
+    Ok(view
+        .panes
+        .into_iter()
+        .find(|candidate| candidate.id == pane)
+        .and_then(|candidate| match candidate.kind {
+            crate::model::CardKind::Chat(session) => Some(session),
+            _ => None,
+        }))
+}
+
+/// Saves the provider-confirmed conversation ID to the pane presenting
+/// `source`'s chat, when it still shows exactly that process. The caller has
+/// authenticated `source` and checked that `learned` changes only its ID.
+pub(super) fn learn_chat_pane_identity(
+    db: &Connection,
+    source: &crate::chat::Session,
+    learned: &crate::chat::Session,
+) -> Result<bool, String> {
+    use crate::agent_execution::HostedSession;
+    let Some(id) = store::chat_pane(db, source.id)? else {
+        return Ok(false);
+    };
+    adopt_authenticated_pane(
+        db,
+        id,
+        &[HostedSession::Chat(source.clone())],
+        &HostedSession::Chat(learned.clone()),
+        None,
+    )
+}
+
+fn adopt_authenticated_pane(
+    db: &Connection,
+    id: crate::model::CardId,
+    retained: &[crate::agent_execution::HostedSession],
+    successor: &crate::agent_execution::HostedSession,
+    replaced_console: Option<&crate::model::TerminalSession>,
+) -> Result<bool, String> {
+    use crate::{agent_execution::HostedSession, model::CardKind};
     let Some(scope) = owner(db, id)? else {
         return Ok(false);
     };

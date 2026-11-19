@@ -134,7 +134,7 @@ pub(super) fn decide_at(
             "update preview changed or expired; review the current preview",
         ));
     }
-    publish_decision(&state, job, nonce, choice)
+    publish_decision(state, job, nonce, choice)
 }
 
 /// Serialize cancellation publication with closing its admission. The worker
@@ -201,7 +201,7 @@ fn publish_decision(
         Err(error) if suffix == "cancel" && error.kind() == io::ErrorKind::AlreadyExists => (),
         Err(error) => return Err(error.into()),
     }
-    File::open(&state)?.sync_all()?;
+    File::open(state)?.sync_all()?;
     Ok(())
 }
 
@@ -595,6 +595,7 @@ mod tests {
             log_path: directory.join("worker.log"),
             confirmation: None,
             refusal: None,
+            in_flight: Vec::new(),
         };
         let request = private_create(&directory.join(format!("{}.request", job.id))).unwrap();
         serde_json::to_writer(
@@ -844,6 +845,7 @@ mod tests {
                 expires_at_unix_ms: u64::MAX,
             }),
             refusal: None,
+            in_flight: Vec::new(),
         };
         let mut terminal = Terminal {
             job: job.clone(),

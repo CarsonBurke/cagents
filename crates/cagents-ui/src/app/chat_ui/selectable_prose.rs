@@ -1494,7 +1494,7 @@ pub(super) fn inline_code_answer_spans(
     let markdown::Item::Paragraph(text) = &content.items()[0] else {
         panic!("the answer is one paragraph");
     };
-    text.spans(design::markdown_settings(theme, design::TEXT_PROSE).style)
+    text.spans(design::markdown_settings(theme, design::TEXT_TRANSCRIPT).style)
 }
 
 #[cfg(test)]
@@ -1726,7 +1726,7 @@ mod tests {
             plain: source.into(),
             spans: vec![Span::new(source)].into(),
             matches: vec![].into(),
-            size: design::TEXT_PROSE.into(),
+            size: design::TEXT_TRANSCRIPT.into(),
             font: iced::Font::default(),
             target: Target {
                 card: CardId::new(),
@@ -1802,7 +1802,7 @@ mod tests {
     fn prose_exposes_full_text_and_stable_accessible_identity() {
         let mut element = text(
             vec![Span::new("α first\nβ second")].into(),
-            design::TEXT_PROSE.into(),
+            design::TEXT_TRANSCRIPT.into(),
             iced::Font::default(),
             Target {
                 card: CardId::new(),
@@ -1857,7 +1857,7 @@ mod tests {
             plain: "α first\nβ second".into(),
             spans: spans.clone(),
             matches: vec![].into(),
-            size: design::TEXT_PROSE.into(),
+            size: design::TEXT_TRANSCRIPT.into(),
             font: iced::Font::default(),
             target: Target {
                 card: CardId::new(),
@@ -1898,7 +1898,7 @@ mod tests {
         let identity = 0x1234;
         let mut element = logical_text(
             vec![Span::new(source.to_owned())].into(),
-            design::TEXT_PROSE.into(),
+            design::TEXT_TRANSCRIPT.into(),
             iced::Font::default(),
             Target {
                 card: CardId::new(),
@@ -1961,7 +1961,7 @@ mod tests {
         let limits = layout::Limits::new(Size::ZERO, Size::new(400.0, f32::INFINITY));
         let mut element = text(
             spans(None),
-            design::TEXT_PROSE.into(),
+            design::TEXT_TRANSCRIPT.into(),
             iced::Font::default(),
             target,
             None,
@@ -1976,7 +1976,7 @@ mod tests {
         let republished = spans(None);
         let mut element = text(
             republished.clone(),
-            design::TEXT_PROSE.into(),
+            design::TEXT_TRANSCRIPT.into(),
             iced::Font::default(),
             target,
             None,
@@ -2006,7 +2006,7 @@ mod tests {
         // the link read from the spans is the new one.
         let mut element = text(
             linked(None, "moved.rs"),
-            design::TEXT_PROSE.into(),
+            design::TEXT_TRANSCRIPT.into(),
             iced::Font::default(),
             target,
             None,
@@ -2032,7 +2032,7 @@ mod tests {
         // A kept paragraph still follows the width it is laid out at.
         let mut element = text(
             spans(None),
-            design::TEXT_PROSE.into(),
+            design::TEXT_TRANSCRIPT.into(),
             iced::Font::default(),
             target,
             None,
@@ -2057,7 +2057,7 @@ mod tests {
 
         let mut element = text(
             spans(Some(iced::Color::from_rgb(1.0, 0.0, 0.0))),
-            design::TEXT_PROSE.into(),
+            design::TEXT_TRANSCRIPT.into(),
             iced::Font::default(),
             target,
             None,
@@ -2078,7 +2078,7 @@ mod tests {
         let mut element = text(
             vec![Span::new("linked α prose ".repeat(100)).link(markdown::Uri::from("source.rs"))]
                 .into(),
-            design::TEXT_PROSE.into(),
+            design::TEXT_TRANSCRIPT.into(),
             iced::Font::default(),
             Target {
                 card: CardId::new(),
@@ -2131,7 +2131,7 @@ mod tests {
             plain: source.clone().into(),
             spans,
             matches: vec![].into(),
-            size: design::TEXT_PROSE.into(),
+            size: design::TEXT_TRANSCRIPT.into(),
             font: iced::Font::default(),
             target: Target {
                 card: CardId::new(),
@@ -2201,7 +2201,7 @@ mod tests {
             spans: Some(spans.clone()),
             shape: Some(Shape {
                 bounds: Size::new(110.0, f32::INFINITY),
-                size: design::TEXT_PROSE.into(),
+                size: design::TEXT_TRANSCRIPT.into(),
                 font: iced::Font::default(),
             }),
             ..Default::default()
@@ -2255,7 +2255,7 @@ mod tests {
             plain: "before αβ linked".into(),
             spans,
             matches: vec![].into(),
-            size: design::TEXT_PROSE.into(),
+            size: design::TEXT_TRANSCRIPT.into(),
             font: iced::Font::default(),
             target: Target {
                 card: CardId::new(),
@@ -2302,7 +2302,7 @@ mod tests {
             plain: "Straße CAFÉ".into(),
             spans: vec![Span::new("Stra"), Span::new("ße"), Span::new(" CAFÉ")].into(),
             matches: super::super::find::ranges("Straße CAFÉ", "STRASSE").into(),
-            size: design::TEXT_PROSE.into(),
+            size: design::TEXT_TRANSCRIPT.into(),
             font: iced::Font::default(),
             target: Target {
                 card: CardId::new(),
@@ -2331,7 +2331,7 @@ mod tests {
             plain: "one needle two".into(),
             spans: vec![Span::new("one needle two")].into(),
             matches: vec![4..10].into(),
-            size: design::TEXT_PROSE.into(),
+            size: design::TEXT_TRANSCRIPT.into(),
             font: iced::Font::default(),
             target: Target {
                 card: CardId::new(),
@@ -2359,7 +2359,7 @@ mod tests {
             spans: Some(spans),
             shape: Some(Shape {
                 bounds: Size::new(width, f32::INFINITY),
-                size: design::TEXT_PROSE.into(),
+                size: design::TEXT_TRANSCRIPT.into(),
                 font: iced::Font::default(),
             }),
             ..Default::default()
@@ -2369,7 +2369,7 @@ mod tests {
     #[test]
     fn inline_code_is_smaller_but_keeps_the_prose_line_pitch_and_baseline() {
         let spans = inline_code_answer_spans(&cosmic::Theme::dark());
-        let size = design::TEXT_PROSE;
+        let size = design::TEXT_TRANSCRIPT;
         let pitch = iced::widget::text::LineHeight::default()
             .to_absolute(size.into())
             .0;
@@ -2476,7 +2476,7 @@ mod tests {
                     .into(),
                 spans: spans.clone(),
                 matches: vec![].into(),
-                size: design::TEXT_PROSE.into(),
+                size: design::TEXT_TRANSCRIPT.into(),
                 font: iced::Font::default(),
                 target: Target {
                     card: CardId::new(),
@@ -2527,7 +2527,7 @@ mod tests {
                 pixels[index..index + 4].try_into().unwrap()
             };
             // In the room before the first letter, halfway down: the chip.
-            let x = left + design::inline_code_inline_padding(design::TEXT_PROSE) / 2.0;
+            let x = left + design::inline_code_inline_padding(design::TEXT_TRANSCRIPT) / 2.0;
             assert!(
                 distinct(at(x, top + line_height * 0.6), chip.into_rgba8()) <= 2,
                 "the chip is painted beside its code"

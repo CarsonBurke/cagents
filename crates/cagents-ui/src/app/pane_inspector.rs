@@ -66,8 +66,12 @@ pub(super) enum Availability {
 /// One pane's inspector.
 #[derive(Debug, Clone, Copy, Default)]
 struct PaneState {
-    /// Whether the user left the inspector open. This is what is saved.
+    /// Whether the inspector is open: as the user left it, or, until they
+    /// open or close it, as the default says.
     open: bool,
+    /// Whether the user opened or closed it, so `open` is their choice and
+    /// the default no longer applies. This is what is saved.
+    chosen: bool,
     /// Open, but closed for now because the pane is too narrow for it.
     narrowed: bool,
     /// Open, but hidden for now because it has nothing to show here.
@@ -85,14 +89,26 @@ impl PaneState {
     }
 }
 
+/// The panes whose inspectors the user opened or closed, as a window view
+/// saves them. Every other pane follows the default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub(super) struct Choices {
+    pub(super) opened: Vec<CardId>,
+    pub(super) closed: Vec<CardId>,
+}
+
 /// Every pane's inspector, and which of them draws source control.
 #[derive(Debug, Default)]
 pub(super) struct PaneInspectors {
     panes: HashMap<CardId, PaneState>,
-    /// Panes to open once this window sees them: those saved open, as a
-    /// workspace restored after the window view brings them, and copies of
-    /// panes whose inspectors were open.
-    restored_open: HashSet<CardId>,
+    /// What the user chose for panes this window has not seen yet: those
+    /// saved, as a workspace restored after the window view brings them, and
+    /// copies of panes whose inspectors the user opened or closed.
+    restored: HashMap<CardId, bool>,
+    /// Whether a pane the user has not opened or closed an inspector in has
+    /// it open.
+    open_by_default: bool,
     /// A window saved before inspectors were per pane, with its one
     /// inspector open: the first pane focused opens it.
     legacy_open: bool,
@@ -144,21 +160,23 @@ impl PaneInspectors {
     #[cfg(any(test, feature = "development"))]
     pub(super) fn projection_view(&self) -> String {
         format!(
-            "panes {} restored {} legacy {} source control {:?}",
+            "panes {} restored {} default {} legacy {} source control {:?}",
             super::projection_oracle::sorted_entries(&self.panes),
-            super::projection_oracle::sorted_items(&self.restored_open),
+            super::projection_oracle::sorted_entries(&self.restored),
+            self.open_by_default,
             self.legacy_open,
             self.source_control,
         )
     }
 
-    /// What a window view saved: the panes whose inspectors were open, or,
-    /// from a window saved before they were per pane, whether its one
-    /// inspector was.
+    /// What a window view saved before it kept [`Choices`]: the panes whose
+    /// inspectors the user opened, or, from a window saved before they were
+    /// per pane, whether its one inspector was. Inspectors were closed until
+    /// opened then, so a pane missing from `open` was never closed by choice.
     pub(super) fn restore(open: Option<Vec<CardId>>, legacy_open: bool) -> Self {
         match open {
             Some(open) => Self {
-                restored_open: open.into_iter().collect(),
+                restored: open.into_iter().map(|card| (card, true)).collect(),
                 ..Self::default()
             },
             None => Self {
@@ -168,15 +186,66 @@ impl PaneInspectors {
         }
     }
 
+    /// The inspectors the user opened or closed, as a window view saved them.
+    pub(super) fn restore_choices(choices: Choices) -> Self {
+        let closed = choices.closed.into_iter().map(|card| (card, false));
+        Self {
+            // A pane in both lists, which `choices` never writes, counts
+            // as opened.
+            restored: closed
+                .chain(choices.opened.into_iter().map(|card| (card, true)))
+                .collect(),
+            ..Self::default()
+        }
+    }
+
+    /// Opens the inspector of every pane the user has not opened or closed
+    /// one in, or keeps them closed.
+    pub(super) fn with_default(mut self, open: bool) -> Self {
+        self.open_by_default = open;
+        self
+    }
+
+    /// Opens or closes, at once, the inspector of every pane the user has not
+    /// opened or closed one in, as `open` says, except in the panes
+    /// `availability` says never have one.
+    pub(super) fn set_open_by_default(
+        &mut self,
+        open: bool,
+        availability: impl Fn(CardId) -> Availability,
+    ) {
+        if self.open_by_default == open {
+            return;
+        }
+        self.open_by_default = open;
+        for (card, pane) in &mut self.panes {
+            if pane.chosen || availability(*card) == Availability::Never {
+                continue;
+            }
+            *pane = PaneState {
+                open,
+                ..PaneState::default()
+            };
+        }
+        self.synced = None;
+    }
+
     /// The panes to save as open, in a stable order, among the cards `known`
-    /// says still exist and can have an inspector.
+    /// says still exist and can have an inspector: what a version that saves
+    /// no [`Choices`] reads back. Only those the user opened: that version
+    /// reads every pane listed as opened by choice.
     pub(super) fn saved(&self, known: impl Fn(CardId) -> bool) -> Vec<CardId> {
         let mut open: Vec<CardId> = self
             .panes
             .iter()
-            .filter(|(_, pane)| pane.open)
+            .filter(|(_, pane)| pane.open && pane.chosen)
             .map(|(card, _)| *card)
-            .chain(self.restored_open.iter().copied())
+            .chain(
+                self.restored
+                    .iter()
+                    .filter(|(_, open)| **open)
+                    .map(|(card, _)| *card),
+            )
             .filter(|card| known(*card))
             .collect();
         open.sort_unstable();
@@ -184,11 +253,42 @@ impl PaneInspectors {
         open
     }
 
+    /// The inspectors the user opened or closed, in a stable order, among the
+    /// cards `known` says still exist and can have an inspector.
+    pub(super) fn choices(&self, known: impl Fn(CardId) -> bool) -> Choices {
+        let mut choices = Choices::default();
+        let chosen = self
+            .panes
+            .iter()
+            .filter(|(_, pane)| pane.chosen)
+            .map(|(card, pane)| (*card, pane.open))
+            .chain(self.restored.iter().map(|(card, open)| (*card, *open)));
+        for (card, open) in chosen {
+            if known(card) {
+                if open {
+                    choices.opened.push(card);
+                } else {
+                    choices.closed.push(card);
+                }
+            }
+        }
+        for list in [&mut choices.opened, &mut choices.closed] {
+            list.sort_unstable();
+            list.dedup();
+        }
+        choices
+    }
+
     /// Starts `copy`, a pane split from `source`, with `source`'s inspector
-    /// open or closed.
+    /// as the user left it, or, if they never opened or closed it, as the
+    /// default says.
     pub(super) fn inherit(&mut self, source: CardId, copy: CardId) {
-        if self.is_open(source) {
-            self.restored_open.insert(copy);
+        let choice = match self.panes.get(&source) {
+            Some(pane) => pane.chosen.then_some(pane.open),
+            None => self.restored.get(&source).copied(),
+        };
+        if let Some(open) = choice {
+            self.restored.insert(copy, open);
             self.synced = None;
         }
     }
@@ -243,11 +343,12 @@ impl PaneInspectors {
     ) -> bool {
         let from = self.progress(card, frame);
         let pane = self.panes.entry(card).or_default();
-        self.restored_open.remove(&card);
+        self.restored.remove(&card);
         if pane.shown() == open {
             return false;
         }
         pane.open = open;
+        pane.chosen = true;
         pane.narrowed = false;
         if open {
             pane.opened_narrow = narrow;
@@ -429,16 +530,22 @@ impl PaneInspectors {
             if self.panes.contains_key(card) {
                 continue;
             }
-            let restored = self.restored_open.remove(card);
             let legacy = self.legacy_open && Some(*card) == focused;
             if legacy {
                 self.legacy_open = false;
             }
-            let open = (restored || legacy) && availability(*card) != Availability::Never;
+            let choice = self
+                .restored
+                .remove(card)
+                .or(legacy.then_some(true))
+                .filter(|_| availability(*card) != Availability::Never);
             self.panes.insert(
                 *card,
                 PaneState {
-                    open,
+                    open: choice.unwrap_or(
+                        self.open_by_default && availability(*card) != Availability::Never,
+                    ),
+                    chosen: choice.is_some(),
                     ..PaneState::default()
                 },
             );
@@ -449,6 +556,7 @@ impl PaneInspectors {
             && let Some(pane) = self.panes.get_mut(&focused)
         {
             pane.open = true;
+            pane.chosen = true;
             self.legacy_open = false;
         }
     }
@@ -606,6 +714,14 @@ impl Cagents {
         })
     }
 
+    /// The inspectors the user opened or closed, for a window view to save.
+    pub(super) fn saved_inspector_choices(&self) -> Choices {
+        self.pane_inspectors.choices(|card| {
+            self.card_state(card)
+                .is_some_and(|card| offers_inspector(&card.kind))
+        })
+    }
+
     /// Opens or closes the pane's inspector. A pane without one never opens
     /// it.
     pub(super) fn set_pane_inspector_open(&mut self, card: CardId, open: bool) -> Task<Message> {
@@ -688,6 +804,24 @@ impl Cagents {
 
     /// Runs at the tail of every update, before the source-control rebind;
     /// see [`PaneInspectors::sync`].
+    /// Opens or closes every inspector the user has not opened or closed,
+    /// as the open-by-default setting now says.
+    pub(super) fn set_inspectors_open_by_default(&mut self, open: bool) {
+        let browsers_available = self.active_workspace.is_some();
+        let durable = &self.durable;
+        let card_indices = &self.card_indices;
+        self.pane_inspectors.set_open_by_default(open, |card| {
+            card_indices
+                .get(&card)
+                .and_then(|index| durable.cards.get(*index))
+                .filter(|state| state.id == card)
+                .or_else(|| durable.cards.iter().find(|state| state.id == card))
+                .map_or(Availability::Never, |state| {
+                    kind_availability(&state.kind, browsers_available)
+                })
+        });
+    }
+
     pub(super) fn sync_pane_inspectors(&mut self) {
         let browsers_available = self.active_workspace.is_some();
         let inputs = SyncInputs {
@@ -953,6 +1087,20 @@ fn floating_toggle_style(theme: &cosmic::Theme) -> iced::widget::container::Styl
 }
 
 #[cfg(test)]
+impl Cagents {
+    /// Opens `card`'s inspector and lets its slide finish.
+    pub(super) fn open_pane_inspector_now(&mut self, card: CardId) {
+        drop(self.set_pane_inspector_open(card, true));
+        self.settle_pane_inspectors();
+    }
+
+    /// Finishes every inspector's slide.
+    pub(super) fn settle_pane_inspectors(&mut self) {
+        drop(self.advance_pane_inspector_transitions(Instant::now() + DIALOG_TRANSITION_DURATION));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1056,11 +1204,13 @@ mod tests {
                 1 => (None, true),
                 _ => (None, false),
             };
-            let mut incremental = PaneInspectors::restore(open.clone(), legacy);
-            let mut full = PaneInspectors::restore(open, legacy);
+            let by_default = run % 2 == 0;
+            let mut incremental =
+                PaneInspectors::restore(open.clone(), legacy).with_default(by_default);
+            let mut full = PaneInspectors::restore(open, legacy).with_default(by_default);
             let now = Instant::now();
             for step in 0..200 {
-                match next(12) {
+                match next(13) {
                     0 => {
                         let card = CardId::new();
                         let source = window.cards[next(window.cards.len())].0;
@@ -1138,6 +1288,12 @@ mod tests {
                         }
                         window.geometry += 1;
                     }
+                    // The default flips, as Settings does.
+                    11 => {
+                        let open = !incremental.open_by_default;
+                        incremental.set_open_by_default(open, |card| window.availability(card));
+                        full.set_open_by_default(open, |card| window.availability(card));
+                    }
                     // A card changes kind under the same card list.
                     10 => {
                         let index = next(window.cards.len());
@@ -1164,6 +1320,12 @@ mod tests {
     fn open(inspectors: &mut PaneInspectors, card: CardId) {
         let now = Instant::now();
         assert!(inspectors.set_open(card, true, false, None, now));
+        inspectors.advance(now + DIALOG_TRANSITION_DURATION);
+    }
+
+    fn close(inspectors: &mut PaneInspectors, card: CardId) {
+        let now = Instant::now();
+        assert!(inspectors.set_open(card, false, false, None, now));
         inspectors.advance(now + DIALOG_TRANSITION_DURATION);
     }
 
@@ -1320,6 +1482,105 @@ mod tests {
             |_| true,
         );
         assert!(panes.iter().all(|pane| !closed.is_open(*pane)));
+    }
+
+    #[test]
+    fn inspectors_open_by_default_until_the_user_closes_one_and_that_choice_is_kept() {
+        let panes = cards(3);
+        let sync = |inspectors: &mut PaneInspectors, cards: &[CardId]| {
+            inspectors.sync(
+                cards,
+                cards.first().copied(),
+                |_| Availability::Available,
+                |_| false,
+                |_| true,
+            );
+        };
+        let mut inspectors = PaneInspectors::default().with_default(true);
+        sync(&mut inspectors, &panes);
+        assert!(panes.iter().all(|pane| inspectors.is_open(*pane)));
+        assert_eq!(
+            inspectors.choices(|_| true),
+            Choices::default(),
+            "following the default is not a choice"
+        );
+        close(&mut inspectors, panes[1]);
+        sync(&mut inspectors, &panes);
+        assert!(!inspectors.is_open(panes[1]));
+        let choices = inspectors.choices(|_| true);
+        assert_eq!(choices.closed, vec![panes[1]]);
+        assert!(choices.opened.is_empty());
+
+        // After a restart the closed pane stays closed and the rest follow
+        // the default, whether the workspace arrives before or after.
+        let mut restored = PaneInspectors::restore_choices(choices.clone()).with_default(true);
+        sync(&mut restored, &[]);
+        sync(&mut restored, &panes);
+        assert!(!restored.is_open(panes[1]));
+        assert!(restored.is_open(panes[0]) && restored.is_open(panes[2]));
+        assert_eq!(restored.choices(|_| true), choices);
+
+        // Turning the default off closes only the panes it opened, and a
+        // pane split from one that follows it follows it too.
+        let mut chosen = PaneInspectors::default().with_default(true);
+        sync(&mut chosen, &panes);
+        // Closed, then opened again: the user's choice now.
+        close(&mut chosen, panes[0]);
+        open(&mut chosen, panes[0]);
+        chosen.set_open_by_default(false, |_| Availability::Available);
+        sync(&mut chosen, &panes);
+        assert!(chosen.is_open(panes[0]), "opened by the user");
+        assert!(!chosen.is_open(panes[1]) && !chosen.is_open(panes[2]));
+        let split = CardId::new();
+        chosen.inherit(panes[2], split);
+        sync(&mut chosen, &[panes[0], panes[1], panes[2], split]);
+        assert!(!chosen.is_open(split));
+        chosen.set_open_by_default(true, |_| Availability::Available);
+        sync(&mut chosen, &[panes[0], panes[1], panes[2], split]);
+        assert!(chosen.is_open(split) && chosen.is_open(panes[2]));
+    }
+
+    #[test]
+    fn a_window_saved_before_inspectors_opened_by_default_closes_none_by_choice() {
+        let panes = cards(3);
+        // Inspectors were closed until opened, so the panes missing from an
+        // older save were never closed by the user: they follow the default.
+        let mut restored = PaneInspectors::restore(Some(vec![panes[2]]), false).with_default(true);
+        restored.sync(
+            &panes,
+            Some(panes[0]),
+            |_| Availability::Available,
+            |_| false,
+            |_| true,
+        );
+        assert!(panes.iter().all(|pane| restored.is_open(*pane)));
+        assert_eq!(
+            restored.choices(|_| true),
+            Choices {
+                opened: vec![panes[2]],
+                closed: Vec::new(),
+            }
+        );
+        // As does a window saved with its one inspector closed.
+        let mut legacy = PaneInspectors::restore(None, false).with_default(true);
+        legacy.sync(
+            &panes,
+            Some(panes[1]),
+            |_| Availability::Available,
+            |_| false,
+            |_| true,
+        );
+        assert!(panes.iter().all(|pane| legacy.is_open(*pane)));
+        // A page never has one, whatever the default.
+        let mut pages = PaneInspectors::default().with_default(true);
+        pages.sync(
+            &panes,
+            Some(panes[0]),
+            |_| Availability::Never,
+            |_| false,
+            |_| true,
+        );
+        assert!(panes.iter().all(|pane| !pages.is_open(*pane)));
     }
 
     #[test]
@@ -1966,19 +2227,5 @@ mod tests {
         );
         assert!(!inspectors.is_visible(panes[1]));
         assert!(inspectors.saved(|_| true).is_empty());
-    }
-}
-
-#[cfg(test)]
-impl Cagents {
-    /// Opens `card`'s inspector and lets its slide finish.
-    pub(super) fn open_pane_inspector_now(&mut self, card: CardId) {
-        drop(self.set_pane_inspector_open(card, true));
-        self.settle_pane_inspectors();
-    }
-
-    /// Finishes every inspector's slide.
-    pub(super) fn settle_pane_inspectors(&mut self) {
-        drop(self.advance_pane_inspector_transitions(Instant::now() + DIALOG_TRANSITION_DURATION));
     }
 }

@@ -367,7 +367,7 @@ impl Draft {
             value.advanced = !value.permission.is_empty() || definition.precheck.is_some();
             value.timezone = definition.schedule.timezone.clone();
             value.loaded_timezone = Some(definition.schedule.timezone.clone());
-            value.provider = provider_index(definition.agent.provider);
+            value.provider = provider_index(definition.agent.provider).unwrap_or_default();
             value.account = value
                 .accounts
                 .iter()
@@ -1278,9 +1278,7 @@ impl State {
             return None;
         }
         if let Action::Received { sequence, result } = action {
-            let Some((expected, pending)) = self.pending else {
-                return None;
-            };
+            let (expected, pending) = self.pending?;
             if expected != sequence {
                 return None;
             }
@@ -1462,30 +1460,27 @@ impl State {
                     self.history_next = page.next;
                 }
                 Ok(Response::Audit(mut page)) => {
-                    if let Pending::Lifecycle { id, append } = pending {
-                        if self
+                    if let Pending::Lifecycle { id, append } = pending
+                        && self
                             .selected
                             .as_ref()
                             .is_some_and(|selected| selected.id == id)
-                            && page.events.iter().all(|event| event.automation == id)
-                        {
-                            if append {
-                                if let Some(previous) = self.lifecycle.take() {
-                                    let mut events = previous.events;
-                                    for event in page.events {
-                                        if !events
-                                            .iter()
-                                            .any(|existing| existing.sequence == event.sequence)
-                                        {
-                                            events.push(event);
-                                        }
-                                    }
-                                    events.truncate(crate::automations::MAX_LIFECYCLE_EVENTS);
-                                    page.events = events;
+                        && page.events.iter().all(|event| event.automation == id)
+                    {
+                        if append && let Some(previous) = self.lifecycle.take() {
+                            let mut events = previous.events;
+                            for event in page.events {
+                                if !events
+                                    .iter()
+                                    .any(|existing| existing.sequence == event.sequence)
+                                {
+                                    events.push(event);
                                 }
                             }
-                            self.lifecycle = Some(page);
+                            events.truncate(crate::automations::MAX_LIFECYCLE_EVENTS);
+                            page.events = events;
                         }
+                        self.lifecycle = Some(page);
                     }
                 }
                 Ok(Response::Detail(detail)) => {
@@ -1501,14 +1496,13 @@ impl State {
                 }
                 Ok(Response::Firing(firing)) => {
                     self.refresh_last_outcome(&firing, true);
-                    if let crate::automations::Trigger::Manual { request } = firing.trigger {
-                        if self
+                    if let crate::automations::Trigger::Manual { request } = firing.trigger
+                        && self
                             .manual_requests
                             .get(&firing.automation)
                             .is_some_and(|(_, previous)| *previous == request)
-                        {
-                            self.manual_requests.remove(&firing.automation);
-                        }
+                    {
+                        self.manual_requests.remove(&firing.automation);
                     }
                     self.notice = Some(format!("Run requested: {}", state_label(firing.state)));
                     self.history.insert(0, firing);
@@ -1617,9 +1611,7 @@ impl State {
             );
         }
         if let Action::Confirm(generation) = action {
-            let Some(confirmation) = self.confirmation.take() else {
-                return None;
-            };
+            let confirmation = self.confirmation.take()?;
             if confirmation.generation != generation {
                 self.confirmation = Some(confirmation);
                 return None;
@@ -1812,11 +1804,11 @@ impl State {
                 }
             }
             Action::Target(index) => {
-                if let Some(draft) = &mut self.draft {
-                    if index < draft.targets.len() {
-                        draft.target = Some(index);
-                        draft.preselect_account();
-                    }
+                if let Some(draft) = &mut self.draft
+                    && index < draft.targets.len()
+                {
+                    draft.target = Some(index);
+                    draft.preselect_account();
                 }
             }
             Action::Schedule(index) if index < SCHEDULES.len() => {
@@ -3269,7 +3261,8 @@ fn launch_description<'a>(
         .unwrap_or("Saved account is unavailable");
     let description = format!(
         "Provider: {}\nAccount: {}\nProject: {}\nDirectory: {}\nModel: {}\nReasoning effort: {}\nPermissions: {}\nSession: {}\nSchedule: {} ({})\nRevision: {}",
-        PROVIDERS[provider_index(definition.agent.provider)],
+        provider_index(definition.agent.provider)
+            .map_or(definition.agent.provider.label(), |index| PROVIDERS[index]),
         account,
         definition.agent.target.repository.display(),
         definition.agent.target.directory.display(),
@@ -3528,18 +3521,22 @@ fn firing_state_label(firing: &Firing) -> String {
     }
 }
 
+/// The providers an automation can run, in the order `PROVIDERS` names them:
+/// those with native chat, which every scheduled agent runs as.
+const AUTOMATION_PROVIDERS: [Provider; 3] = [Provider::Claude, Provider::Codex, Provider::Omp];
+
 fn provider(index: usize) -> Provider {
-    [Provider::Claude, Provider::Codex, Provider::Omp]
+    AUTOMATION_PROVIDERS
         .get(index)
         .copied()
         .unwrap_or(Provider::Claude)
 }
-fn provider_index(provider: Provider) -> usize {
-    match provider {
-        Provider::Claude => 0,
-        Provider::Codex => 1,
-        Provider::Omp => 2,
-    }
+/// Where `provider` sits among the automation providers. A definition naming
+/// another provider fails validation, so it never reaches the editor.
+fn provider_index(provider: Provider) -> Option<usize> {
+    AUTOMATION_PROVIDERS
+        .iter()
+        .position(|candidate| *candidate == provider)
 }
 /// Every timezone the schedule can name, read once from the system database.
 fn timezone_names() -> &'static [String] {
@@ -3596,6 +3593,20 @@ impl State {
     pub(crate) fn show_automation_for_test(&mut self) {
         self.pending = None;
         self.selected = Some(tests::automation());
+    }
+}
+pub fn state_label(state: crate::automations::FiringState) -> &'static str {
+    use crate::automations::FiringState::*;
+    match state {
+        Prechecking => "Checking",
+        Accepted => "Queued",
+        Running => "Running",
+        Waiting => "Waiting for input",
+        Succeeded => "Succeeded",
+        Failed => "Failed",
+        Skipped => "Skipped",
+        Cancelled => "Cancelled",
+        Interrupted => "Outcome uncertain",
     }
 }
 
@@ -5752,7 +5763,7 @@ mod tests {
         state.update(Action::Field(Field::Model, "gpt-future".into()));
         assert_eq!(saved_effort(&state), Ok(Some("high".into())));
         // Model IDs and efforts belong to the provider they were chosen for.
-        state.update(Action::Provider(provider_index(Provider::Claude)));
+        state.update(Action::Provider(provider_index(Provider::Claude).unwrap()));
         let draft = state.draft.as_ref().unwrap();
         assert!(draft.model.is_empty() && draft.effort.is_none());
     }
@@ -5817,13 +5828,13 @@ mod tests {
         state.update(Action::Target(1));
         assert_eq!(selected_account(&state), Some("Work"));
         // With no default of its own, a provider's only account is chosen.
-        state.update(Action::Provider(provider_index(Provider::Codex)));
+        state.update(Action::Provider(provider_index(Provider::Codex).unwrap()));
         assert_eq!(selected_account(&state), Some("Codex"));
         // A provider with no account leaves the choice to the reader.
-        state.update(Action::Provider(provider_index(Provider::Omp)));
+        state.update(Action::Provider(provider_index(Provider::Omp).unwrap()));
         assert_eq!(selected_account(&state), None);
         // Changing provider replaced the picked account with a default.
-        state.update(Action::Provider(provider_index(Provider::Claude)));
+        state.update(Action::Provider(provider_index(Provider::Claude).unwrap()));
         assert_eq!(selected_account(&state), Some("Personal"));
     }
 
@@ -8047,8 +8058,10 @@ mod tests {
     #[test]
     fn exact_no_run_receipt_is_read_only_even_without_a_current_definition_and_at_narrow_width() {
         let id = Uuid::new_v4();
-        let mut state = State::default();
-        state.pending = Some((7, Pending::RefreshList));
+        let mut state = State {
+            pending: Some((7, Pending::RefreshList)),
+            ..State::default()
+        };
         assert!(state.show_lifecycle_receipt(id, 42, Ok(notice_page(id, 42))));
         assert_eq!(
             state
@@ -8387,19 +8400,5 @@ mod tests {
             };
             assert_eq!(id, refreshed.id);
         }
-    }
-}
-pub fn state_label(state: crate::automations::FiringState) -> &'static str {
-    use crate::automations::FiringState::*;
-    match state {
-        Prechecking => "Checking",
-        Accepted => "Queued",
-        Running => "Running",
-        Waiting => "Waiting for input",
-        Succeeded => "Succeeded",
-        Failed => "Failed",
-        Skipped => "Skipped",
-        Cancelled => "Cancelled",
-        Interrupted => "Outcome uncertain",
     }
 }

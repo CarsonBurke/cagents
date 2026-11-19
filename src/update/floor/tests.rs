@@ -505,6 +505,7 @@ fn job(directory: &Path) -> UpdateJob {
         log_path: directory.join("worker.log"),
         confirmation: None,
         refusal: None,
+        in_flight: Vec::new(),
     };
     let file = private_create(&directory.join(format!("{}.request", job.id))).unwrap();
     serde_json::to_writer(
@@ -2605,5 +2606,287 @@ fn accepted_prepare_reports_only_interrupted_turns_with_their_reviewed_recovery(
     assert!(
         report.contains("1 background task stopped; it does not resume automatically."),
         "{report}"
+    );
+}
+
+fn running_turn() -> crate::chat::Snapshot {
+    crate::chat::Snapshot {
+        busy: true,
+        ..Default::default()
+    }
+}
+
+fn background_agent() -> crate::chat::Snapshot {
+    crate::chat::Snapshot {
+        subagents: vec![crate::chat::Subagent {
+            id: "child-thread".into(),
+            kind: "Worker".into(),
+            description: "Watch CI".into(),
+            status: crate::chat::ToolStatus::Running,
+            model: None,
+            waiting: false,
+            detail: String::new(),
+            background: true,
+            items: Vec::new(),
+        }],
+        ..Default::default()
+    }
+}
+
+/// Capture the census's work as the update does, from each chat's snapshot.
+fn census_in_flight(
+    survivors: &mut Survivors,
+    source: &FakeSource,
+    snapshots: &[(TerminalId, crate::chat::Snapshot)],
+) {
+    let census = crate::upgrade::recovery::Census {
+        chats: source.inventory.chats.clone(),
+        in_flight: snapshots
+            .iter()
+            .map(|(id, snapshot)| {
+                let chat = source.inventory.chats.iter().find(|chat| chat.id == *id);
+                survivors.observe_in_flight(chat.unwrap(), snapshot)
+            })
+            .filter(|work| !work.is_empty())
+            .collect(),
+        ..Default::default()
+    };
+    survivors.record_census(
+        &source.preview,
+        source.preview.daemon.as_ref().unwrap(),
+        &census,
+    );
+}
+
+#[test]
+fn in_flight_work_survives_only_a_provider_that_was_kept_and_reattached() {
+    use super::super::in_flight::{Fate, TaskKind};
+    use crate::upgrade::handoff::{UnattachedDisposition, UnattachedSummary};
+    let (mut source, interrupted) = interrupt_fixture();
+    source.preview.daemon.as_mut().unwrap().sessions[1].interrupted_subagents =
+        vec!["toolu_agent".into()];
+    let retained = add_chat(&mut source, impact::Disposition::Continues, true);
+    let restarted = add_chat(&mut source, impact::Disposition::Resumes, true);
+    let finished = add_chat(&mut source, impact::Disposition::Resumes, true);
+    let unrestartable = add_chat(&mut source, impact::Disposition::Continues, true);
+    let detached = add_chat(&mut source, impact::Disposition::Continues, true);
+    source
+        .preview
+        .labels
+        .names
+        .insert(restarted, "Watch CI · beta".into());
+    let daemon = source.preview.daemon.clone().unwrap();
+    let mut survivors = Survivors::default();
+    // The interruption settles before the census reads the conversations.
+    survivors.record_interrupt_requests(&source.preview, &daemon);
+    survivors.record_settled_interruptions(&source.preview, &daemon, &[]);
+    census_in_flight(
+        &mut survivors,
+        &source,
+        &[
+            (interrupted, crate::chat::Snapshot::default()),
+            (retained, background_agent()),
+            (restarted, background_agent()),
+            (finished, crate::chat::Snapshot::default()),
+            (unrestartable, running_turn()),
+            (detached, running_turn()),
+        ],
+    );
+    let unattached = |id, disposition| UnattachedSummary {
+        id,
+        provider: crate::agent::Provider::Claude,
+        conversation: None,
+        working_directory: "/repo".into(),
+        reason: "restart failed".into(),
+        disposition,
+    };
+    // Before the source is prepared, the interruption stands and everything
+    // else kept running on the same service.
+    let unprepared = survivors.in_flight_outcomes(|| unreachable!("nothing was restored"));
+    assert_eq!(unprepared.len(), 5);
+    assert!(unprepared.iter().all(|outcome| {
+        outcome.fate
+            == if outcome.work.id == interrupted {
+                Fate::Interrupted
+            } else {
+                Fate::Continued
+            }
+    }));
+    survivors.record_prepared(&source.preview, &daemon);
+    // Without a successor, a provider the prepared source did not retain
+    // exited with it, while a retained one may still be running its work.
+    let unconfirmed: BTreeMap<_, _> = survivors
+        .in_flight_outcomes(|| unreachable!("nothing serves"))
+        .iter()
+        .map(|outcome| (outcome.work.id, outcome.fate))
+        .collect();
+    assert_eq!(
+        unconfirmed,
+        BTreeMap::from([
+            (interrupted, Fate::Interrupted),
+            (retained, Fate::Unknown),
+            (restarted, Fate::Stopped),
+            (unrestartable, Fate::Unknown),
+            (detached, Fate::Unknown),
+        ])
+    );
+    survivors.successor_serving = true;
+    let outcomes = survivors.in_flight_outcomes(|| {
+        vec![
+            unattached(unrestartable, UnattachedDisposition::Stopped),
+            unattached(detached, UnattachedDisposition::Retained),
+        ]
+    });
+    let fates: BTreeMap<_, _> = outcomes
+        .iter()
+        .map(|outcome| (outcome.work.id, outcome.fate))
+        .collect();
+    assert_eq!(
+        fates,
+        BTreeMap::from([
+            (interrupted, Fate::Interrupted),
+            (retained, Fate::Continued),
+            (restarted, Fate::Restarted),
+            (unrestartable, Fate::Stopped),
+            (detached, Fate::Detached),
+        ]),
+        "a conversation whose turn simply finished had nothing in flight"
+    );
+    let lost: BTreeSet<_> = outcomes
+        .iter()
+        .filter(|outcome| outcome.lost())
+        .map(|outcome| outcome.work.id)
+        .collect();
+    assert_eq!(
+        lost,
+        BTreeSet::from([interrupted, restarted, unrestartable])
+    );
+    let restarted = outcomes
+        .iter()
+        .find(|outcome| outcome.work.id == restarted)
+        .unwrap();
+    assert_eq!(restarted.label, "Watch CI · beta");
+    assert_eq!(restarted.work.tasks[0].id, "child-thread");
+    assert_eq!(restarted.work.tasks[0].kind, TaskKind::Subagent);
+    assert_eq!(restarted.work.tasks[0].name, "Worker");
+    let interrupted = outcomes
+        .iter()
+        .find(|outcome| outcome.work.id == interrupted)
+        .unwrap();
+    assert!(interrupted.work.turn);
+    assert_eq!(interrupted.work.tasks[0].id, "toolu_agent");
+}
+
+#[test]
+fn an_update_that_stopped_the_service_ended_every_conversations_work() {
+    use super::super::in_flight::Fate;
+    let mut source = fixture();
+    let working = add_chat(&mut source, impact::Disposition::Blocked, true);
+    let mut survivors = Survivors::default();
+    census_in_flight(&mut survivors, &source, &[(working, running_turn())]);
+    survivors.service_stopped = true;
+    let outcomes = survivors.in_flight_outcomes(|| unreachable!("no restore ran"));
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].fate, Fate::Ended);
+    assert!(outcomes[0].lost());
+}
+
+#[test]
+fn an_interruption_is_recorded_even_when_the_update_went_no_further() {
+    use super::super::in_flight::Fate;
+    let (mut source, interrupted) = interrupt_fixture();
+    let retained = add_chat(&mut source, impact::Disposition::Continues, true);
+    let daemon = source.preview.daemon.clone().unwrap();
+    let mut survivors = Survivors::default();
+    survivors.record_interrupt_requests(&source.preview, &daemon);
+    survivors.record_settled_interruptions(&source.preview, &daemon, &[]);
+    census_in_flight(
+        &mut survivors,
+        &source,
+        &[
+            (interrupted, crate::chat::Snapshot::default()),
+            (retained, running_turn()),
+        ],
+    );
+    // Preparation was refused and the stop review cancelled: the source kept
+    // running everything but the turn the update interrupted.
+    let fates: BTreeMap<_, _> = survivors
+        .in_flight_outcomes(|| unreachable!("nothing was restored"))
+        .into_iter()
+        .map(|outcome| (outcome.work.id, outcome.fate))
+        .collect();
+    assert_eq!(
+        fates,
+        BTreeMap::from([
+            (interrupted, Fate::Interrupted),
+            (retained, Fate::Continued)
+        ])
+    );
+}
+
+#[test]
+fn an_interruption_is_recorded_when_the_update_failed_before_its_census() {
+    use super::super::in_flight::Fate;
+    let (source, interrupted) = interrupt_fixture();
+    let daemon = source.preview.daemon.clone().unwrap();
+    let mut survivors = Survivors::default();
+    survivors.record_interrupt_requests(&source.preview, &daemon);
+    survivors.record_settled_interruptions(&source.preview, &daemon, &[]);
+    let outcomes = survivors.in_flight_outcomes(|| unreachable!("nothing was restored"));
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].work.id, interrupted);
+    assert!(outcomes[0].work.turn);
+    assert_eq!(outcomes[0].fate, Fate::Interrupted);
+    assert!(!outcomes[0].label.is_empty());
+}
+
+#[test]
+fn fates_follow_what_was_prepared_and_restored() {
+    use super::super::in_flight::Fate;
+    let mut source = fixture();
+    let paused = add_chat(&mut source, impact::Disposition::Continues, true);
+    let picker = add_chat(&mut source, impact::Disposition::ResumePicker, true);
+    let later = add_chat(&mut source, impact::Disposition::Continues, true);
+    let mut survivors = Survivors::default();
+    census_in_flight(
+        &mut survivors,
+        &source,
+        &[
+            (paused, running_turn()),
+            (picker, running_turn()),
+            (later, background_agent()),
+        ],
+    );
+    // The source prepared after a later review found the conversation's
+    // provider could no longer be kept.
+    let mut prepared = source.preview.daemon.clone().unwrap();
+    prepared
+        .sessions
+        .iter_mut()
+        .find(|session| session.id == later)
+        .unwrap()
+        .disposition = impact::Disposition::Resumes;
+    survivors.prepared_source = Some(PreparationEvidence {
+        daemon: prepared.clone(),
+        census: Default::default(),
+    });
+    survivors.record_prepared(&source.preview, &prepared);
+    survivors.successor_serving = true;
+    survivors.recovery_outcome = Some(crate::upgrade::recovery::RecoveryOutcome {
+        paused_chats: vec![paused],
+        paused_terminals: Vec::new(),
+    });
+    let fates: BTreeMap<_, _> = survivors
+        .in_flight_outcomes(Vec::new)
+        .into_iter()
+        .map(|outcome| (outcome.work.id, outcome.fate))
+        .collect();
+    assert_eq!(
+        fates,
+        BTreeMap::from([
+            (paused, Fate::Stopped),
+            (picker, Fate::Stopped),
+            (later, Fate::Restarted),
+        ])
     );
 }

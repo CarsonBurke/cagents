@@ -247,6 +247,7 @@ pub(crate) fn seed_store(
         inspector_width: crate::layout_metrics::INSPECTOR_DEFAULT_WIDTH,
         context_inspector_open: false,
         open_inspectors: Some(Vec::new()),
+        inspector_choices: None,
         context_sections: context_sections::Sections::default(),
         // The sidebar keeps its interaction state private; it reads back what
         // it saved, so the seed writes that shape.

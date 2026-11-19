@@ -178,7 +178,7 @@ fn archived_worktree_pr_requires_exact_branch_and_head() {
     }))
     .unwrap();
     assert_eq!(
-        matching_attached_pr(&record, &head, &[pr.clone()]).map(|pr| pr.number),
+        matching_attached_pr(&record, &head, std::slice::from_ref(&pr)).map(|pr| pr.number),
         Some(7)
     );
     let mut duplicate = pr.clone();
@@ -191,7 +191,7 @@ fn archived_worktree_pr_requires_exact_branch_and_head() {
                 ..record.clone()
             },
             &head,
-            &[pr.clone()]
+            std::slice::from_ref(&pr)
         )
         .is_none()
     );
@@ -202,7 +202,7 @@ fn archived_worktree_pr_requires_exact_branch_and_head() {
                 ..record.clone()
             },
             &head,
-            &[pr.clone()]
+            std::slice::from_ref(&pr)
         )
         .is_none()
     );
@@ -259,7 +259,7 @@ fn attached_pr_overrides_reused_branch_without_hiding_unpushed_open_work() {
     apply_attached_worktree_prs(
         &mut project,
         &[(record.clone(), None)],
-        &[open.clone()],
+        std::slice::from_ref(&open),
         &[merged],
     );
     assert_eq!(
@@ -369,12 +369,12 @@ fn pull_request_head_prefers_the_context_worktree() {
     );
 
     assert_eq!(
-        pull_request_head(&[project.clone()], project_id, None),
+        pull_request_head(std::slice::from_ref(&project), project_id, None),
         "",
         "a project-level create must not adopt the first worktree's branch"
     );
     assert_eq!(
-        pull_request_head(&[project.clone()], project_id, Some(&selected)),
+        pull_request_head(std::slice::from_ref(&project), project_id, Some(&selected)),
         "selected"
     );
     assert_eq!(
@@ -2063,9 +2063,24 @@ fn a_window_view_saves_each_open_inspector_and_reads_one_from_before_them() {
         "an older version reads the focused pane's as the window's"
     );
 
+    assert_eq!(
+        view.inspector_choices,
+        Some(pane_inspector::Choices {
+            opened: vec![card],
+            closed: Vec::new(),
+        })
+    );
+
     let mut json = serde_json::to_value(&view).unwrap();
     let read: WindowView = serde_json::from_value(json.clone()).unwrap();
     assert_eq!(read.open_inspectors, Some(vec![card]));
+    assert_eq!(read.inspector_choices, view.inspector_choices);
+    // A view saved while inspectors were closed until opened keeps no
+    // choices; its open ones read back as opened.
+    json.as_object_mut().unwrap().remove("inspector_choices");
+    let unchosen: WindowView = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(unchosen.inspector_choices, None);
+    assert_eq!(unchosen.open_inspectors, Some(vec![card]));
     // A view saved before each pane had its own inspector.
     json.as_object_mut().unwrap().remove("open_inspectors");
     let legacy: WindowView = serde_json::from_value(json).unwrap();
@@ -3019,7 +3034,7 @@ fn empty_workspace_exposes_provider_status_on_real_account_controls() {
         element
             .as_widget()
             .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
-    for provider in crate::agent::Provider::ALL {
+    for provider in crate::account::Account::REPORTED {
         let expected = format!(
             "{} · {} · Manage accounts",
             provider.label(),
@@ -3254,7 +3269,7 @@ fn assert_frame_is_faithful(app: &Cagents, tree: &cosmic::iced::advanced::widget
 /// A repository card whose durable state and runtime both say repository,
 /// with an unsaved buffer and a language server reporting on it - the
 /// state a user is in while editing a file.
-fn editing_repository_app() -> (Cagents, CardId) {
+pub(super) fn editing_repository_app() -> (Cagents, CardId) {
     let mut app = context_inspector_test_app(true);
     let card = app.workspace.focused().expect("a focused card");
     {
@@ -3861,9 +3876,11 @@ fn application_close_advances_only_after_current_durability_fence_resolves() {
 
     let _ = app.update(Message::WindowCloseRequested(window));
     let _ = app.update(Message::DiscardAndCloseRepository(first));
-    assert!(app.dirty_repository_close.as_ref().is_some_and(
-        |close| close.card == first && close.remaining == VecDeque::from([second])
-    ));
+    assert!(
+        app.dirty_repository_close
+            .as_ref()
+            .is_some_and(|close| close.card == first && close.remaining == [second])
+    );
 
     let completion = fixture.durable_retry(&mut app, first);
     let _ = app.update(completion);
@@ -4400,8 +4417,12 @@ fn surfaces_and_rules_reach_a_free_right_edge_while_controls_keep_out_of_its_bor
         app.window_width = width;
         assert_eq!(app.trailing_edge_inset(), border);
         if inspector {
-            // A pane measured wide enough to dock its inspector.
-            drop(app.workspace.resize_viewport(width - border));
+            // A pane measured wide enough to dock its inspector, as the
+            // strip beside the sidebar measures itself, so the inspector
+            // ends where the window does rather than past it.
+            let sidebar =
+                sidebar::effective_width(app.projects_sidebar_mode(), app.settings.sidebar_width);
+            drop(app.workspace.resize_viewport(width - sidebar));
             let card = app.workspace.focused().unwrap();
             app.open_pane_inspector_now(card);
             assert_eq!(
@@ -6098,8 +6119,8 @@ fn restored_agents_attach_one_at_a_time_after_visible_cards_start() {
 #[test]
 fn startup_qualification_attaches_offscreen_shell_omp_and_custom_terminal_owners_serially() {
     let mut app = context_inspector_test_app(false);
-    let terminals = ["/bin/sh", "/usr/bin/omp", "/fixture/custom-wrapper"]
-        .map(|program| restored_live_terminal(program));
+    let terminals =
+        ["/bin/sh", "/usr/bin/omp", "/fixture/custom-wrapper"].map(restored_live_terminal);
     app.durable = Arc::new(WorkspaceState {
         cards: terminals.to_vec().into(),
         ..WorkspaceState::default()
@@ -6721,7 +6742,7 @@ fn workspace_switcher_home_end_hover_and_stale_actions_use_the_frozen_hold() {
     assert_eq!(app.chrome_ui.workspace_switcher_rows.len(), 20);
     let key = |key: keyboard::key::Named| Message::KeyEvent {
         event: keyboard::Event::KeyPressed {
-            key: keyboard::Key::Named(key.clone()),
+            key: keyboard::Key::Named(key),
             modified_key: keyboard::Key::Named(key),
             physical_key: keyboard::key::Physical::Code(keyboard::key::Code::End),
             location: keyboard::Location::Standard,
@@ -7538,6 +7559,284 @@ mod repository_clone_navigation {
         .expect("actual clone file worker and application callbacks finish");
     }
 
+    /// Binds the sidebar to the fixture worktree, as selecting it does.
+    fn bind_sidebar(app: &mut Cagents, fixture: &Fixture, card: CardId) -> ActiveWorktreeKey {
+        let project = runtime(app, card).descriptor.project;
+        app.sidebar_model = SidebarModel::ready(
+            sidebar::SidebarMode::Expanded,
+            vec![SidebarProject::new(
+                project,
+                RepositoryId::new(),
+                "clone navigation fixture".into(),
+                fixture.root.join(".git"),
+                vec![SidebarWorktree::from_durable(
+                    WorktreeId::new(),
+                    fixture.root.clone(),
+                    None,
+                )],
+                Vec::new(),
+            )],
+        );
+        assert!(app.sidebar_state.sync_active_worktree(
+            &app.sidebar_model,
+            &sidebar::SidebarFocus::Repository {
+                worktree: fixture.root.clone(),
+            },
+        ));
+        app.sidebar_state.active_worktree().unwrap().clone()
+    }
+
+    fn edit(app: &mut Cagents, card: CardId) {
+        drop(app.update(Message::FocusCard(card)));
+        drop(
+            app.update(Message::Repository(RepositoryAction::EditorAction {
+                card,
+                action: repository_widget::EditorAction::Edit(
+                    repository_widget::EditorEdit::Insert('!'),
+                ),
+            })),
+        );
+        assert!(runtime(app, card).blocks_navigation());
+    }
+
+    /// Two browsers on the fixture: the first editing current.txt without
+    /// saving and focused, the second clean. other.txt is modified and
+    /// new.txt untracked on disk, and Source Control shows both.
+    async fn dirty_first_browser(
+        fixture: &Fixture,
+    ) -> (Cagents, CardId, CardId, ActiveWorktreeKey) {
+        let (mut app, first) = fixture.app(true, false).await;
+        let task = app.clone_focused_pane();
+        let second = app.workspace.focused().unwrap();
+        settle(&mut app, task).await;
+        assert_ne!(second, first);
+        edit(&mut app, first);
+        assert_eq!(app.workspace.focused(), Some(first));
+        std::fs::write(fixture.root.join("other.txt"), "changed on disk\n").unwrap();
+        std::fs::write(fixture.root.join("new.txt"), "untracked\n").unwrap();
+        let key = bind_sidebar(&mut app, fixture, first);
+        let snapshot = RepositoryService::system("git")
+            .snapshot_with_options(
+                &fixture.root,
+                crate::repository::SnapshotOptions::default(),
+                &CancellationToken::default(),
+            )
+            .unwrap();
+        app.sidebar_model.source_control = Some(SourceControlModel::ready(key.clone(), &snapshot));
+        (app, first, second, key)
+    }
+
+    fn open_change(
+        app: &mut Cagents,
+        key: &ActiveWorktreeKey,
+        path: &str,
+        area: ChangeArea,
+    ) -> Task<Message> {
+        app.update(Message::Sidebar(SidebarAction::OpenChange {
+            key: key.clone(),
+            path: RepoPath::parse(path).unwrap(),
+            area,
+        }))
+    }
+
+    fn open_file(app: &mut Cagents, key: &ActiveWorktreeKey, path: &str) -> Task<Message> {
+        app.update(Message::Sidebar(SidebarAction::OpenFile {
+            key: key.clone(),
+            path: RepoPath::parse(path).unwrap(),
+        }))
+    }
+
+    async fn edit_in_editor(app: &mut Cagents, card: CardId) {
+        let task = app.update(Message::Repository(RepositoryAction::ApplySourceSurface {
+            card,
+            diff: false,
+        }));
+        settle(app, task).await;
+        edit(app, card);
+    }
+
+    fn assert_shows(app: &Cagents, card: CardId, path: &str, basis: &DiffBasis) {
+        let runtime = runtime(app, card);
+        assert_eq!(runtime.selected_path(), Some(Path::new(path)));
+        assert!(runtime.shows_diff(), "{path} is shown as a diff");
+        assert_eq!(runtime.selected_diff_basis(), basis);
+    }
+
+    /// Source Control rows must reach a browser that can navigate. The first
+    /// browser on the worktree refusing navigation used to take the click,
+    /// focus itself and drop the request.
+    #[tokio::test]
+    async fn source_control_changes_skip_browsers_that_refuse_navigation() {
+        let fixture = Fixture::new().await;
+        let (mut app, first, second, key) = dirty_first_browser(&fixture).await;
+
+        let task = open_change(&mut app, &key, "other.txt", ChangeArea::Unstaged);
+        settle(&mut app, task).await;
+        assert_eq!(app.workspace.focused(), Some(second));
+        assert_shows(&app, second, "other.txt", &DiffBasis::IndexToWorktree);
+        assert_eq!(
+            runtime(&app, first).selected_path(),
+            Some(Path::new("current.txt"))
+        );
+        assert!(runtime(&app, first).is_dirty());
+
+        // A change to the file a browser is editing shows that browser's
+        // live comparison rather than a second, stale copy of the file.
+        edit_in_editor(&mut app, second).await;
+        drop(app.update(Message::FocusCard(first)));
+        let task = open_change(&mut app, &key, "other.txt", ChangeArea::Unstaged);
+        settle(&mut app, task).await;
+        assert_eq!(app.workspace.focused(), Some(second));
+        assert_shows(&app, second, "other.txt", &DiffBasis::IndexToWorktree);
+        assert!(runtime(&app, second).is_dirty());
+        assert_eq!(app.repository_browsers(&fixture.root).count(), 2);
+
+        // With every browser refusing navigation, another change opens in a
+        // new browser rather than nowhere.
+        let task = open_change(&mut app, &key, "new.txt", ChangeArea::Untracked);
+        let third = app.workspace.focused().unwrap();
+        settle(&mut app, task).await;
+        assert_eq!(
+            app.repository_browsers(&fixture.root).collect::<Vec<_>>(),
+            [first, second, third]
+        );
+        assert_shows(&app, third, "new.txt", &DiffBasis::IndexToWorktree);
+        for card in [first, second] {
+            assert!(runtime(&app, card).is_dirty());
+        }
+    }
+
+    /// Files rows take the same route, parked until the chosen browser's
+    /// file list lands.
+    #[tokio::test]
+    async fn files_rows_skip_browsers_that_refuse_navigation() {
+        let fixture = Fixture::new().await;
+        let (mut app, first, second, key) = dirty_first_browser(&fixture).await;
+
+        let task = open_file(&mut app, &key, "other.txt");
+        settle(&mut app, task).await;
+        assert_eq!(app.workspace.focused(), Some(second));
+        assert_eq!(
+            runtime(&app, second).selected_path(),
+            Some(Path::new("other.txt"))
+        );
+        assert!(runtime(&app, first).is_dirty());
+
+        // A row for the file a browser is editing focuses those edits.
+        let task = open_file(&mut app, &key, "current.txt");
+        settle(&mut app, task).await;
+        assert_eq!(app.workspace.focused(), Some(first));
+        assert!(app.pending_panel_open.is_none());
+        assert_eq!(app.repository_browsers(&fixture.root).count(), 2);
+
+        // With every browser refusing navigation, the row opens a new one.
+        edit_in_editor(&mut app, second).await;
+        let task = open_file(&mut app, &key, "new.txt");
+        let third = app.workspace.focused().unwrap();
+        settle(&mut app, task).await;
+        assert_eq!(
+            app.repository_browsers(&fixture.root).collect::<Vec<_>>(),
+            [first, second, third]
+        );
+        assert_eq!(
+            runtime(&app, third).selected_path(),
+            Some(Path::new("new.txt"))
+        );
+        for card in [first, second] {
+            assert!(runtime(&app, card).is_dirty());
+        }
+    }
+
+    /// A pane opened through a path that is not canonical, such as a file
+    /// link through a symlink, still counts as editing the file.
+    #[test]
+    fn same_file_sees_through_a_non_canonical_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("real")).unwrap();
+        std::fs::write(root.join("real/file.txt"), "").unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("alias")).unwrap();
+        assert!(super::super::same_file(
+            &root.join("alias/file.txt"),
+            &root.join("real/file.txt")
+        ));
+        std::fs::write(root.join("real/other.txt"), "").unwrap();
+        assert!(!super::super::same_file(
+            &root.join("alias/other.txt"),
+            &root.join("real/file.txt")
+        ));
+    }
+
+    /// History and branch rows open committed comparisons through the same
+    /// route.
+    #[tokio::test]
+    async fn committed_files_skip_browsers_that_refuse_navigation() {
+        let fixture = Fixture::new().await;
+        let (mut app, first, second, key) = dirty_first_browser(&fixture).await;
+        let head = std::process::Command::new("/usr/bin/git")
+            .current_dir(&fixture.root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let head =
+            crate::repository::Oid::parse_object(String::from_utf8(head.stdout).unwrap().trim())
+                .unwrap();
+        let basis = DiffBasis::CommitToParent {
+            oid: head,
+            parent: None,
+        };
+
+        let task = app.open_committed_file(
+            key.clone(),
+            RepoPath::parse("other.txt").unwrap(),
+            None,
+            basis.clone(),
+        );
+        settle(&mut app, task).await;
+        assert_eq!(app.workspace.focused(), Some(second));
+        assert_shows(&app, second, "other.txt", &basis);
+        assert!(runtime(&app, first).is_dirty());
+
+        // The edited file's own commit shows in its browser, beside the
+        // buffer.
+        drop(app.update(Message::FocusCard(second)));
+        let task = app.open_committed_file(
+            key.clone(),
+            RepoPath::parse("current.txt").unwrap(),
+            None,
+            basis.clone(),
+        );
+        settle(&mut app, task).await;
+        assert_eq!(app.workspace.focused(), Some(first));
+        assert_shows(&app, first, "current.txt", &basis);
+        assert!(runtime(&app, first).is_dirty());
+
+        // A rename cannot be compared beside the buffer. The browser keeps
+        // its edits, and the notice says what to do.
+        let task = app.update(Message::Repository(RepositoryAction::ApplySourceSurface {
+            card: first,
+            diff: false,
+        }));
+        settle(&mut app, task).await;
+        drop(app.update(Message::FocusCard(second)));
+        app.status = None;
+        let task = app.open_committed_file(
+            key.clone(),
+            RepoPath::parse("current.txt").unwrap(),
+            Some(RepoPath::parse("previous.txt").unwrap()),
+            basis,
+        );
+        settle(&mut app, task).await;
+        assert_eq!(app.workspace.focused(), Some(first));
+        assert!(!runtime(&app, first).shows_diff());
+        assert!(runtime(&app, first).is_dirty());
+        assert_eq!(
+            app.status.as_ref().map(|notice| notice.message.as_str()),
+            Some("Save or discard your changes to current.txt to open this comparison")
+        );
+        assert_eq!(app.repository_browsers(&fixture.root).count(), 2);
+    }
+
     #[tokio::test]
     async fn browser_clone_loads_live_file_and_independent_navigation() {
         let fixture = Fixture::new().await;
@@ -7587,30 +7886,9 @@ mod repository_clone_navigation {
         // Drive the sidebar row, not a card-addressed repository action:
         // the sidebar must choose the focused clone rather than the first
         // browser, which is still the source.
+        let key = bind_sidebar(&mut app, &fixture, clone);
         let project = runtime(&app, clone).descriptor.project;
-        app.sidebar_model = SidebarModel::ready(
-            sidebar::SidebarMode::Expanded,
-            vec![SidebarProject::new(
-                project,
-                RepositoryId::new(),
-                "clone navigation fixture".into(),
-                fixture.root.join(".git"),
-                vec![SidebarWorktree::from_durable(
-                    WorktreeId::new(),
-                    fixture.root.clone(),
-                    None,
-                )],
-                Vec::new(),
-            )],
-        );
-        assert!(app.sidebar_state.sync_active_worktree(
-            &app.sidebar_model,
-            &sidebar::SidebarFocus::Repository {
-                worktree: fixture.root.clone(),
-            },
-        ));
-        let key = app.sidebar_state.active_worktree().unwrap().clone();
-        assert_eq!(app.repository_card_for(&fixture.root), Some(source));
+        assert_eq!(app.repository_browsers(&fixture.root).next(), Some(source));
         assert_eq!(app.repository_panel_destination(&fixture.root), Some(clone));
         let task = app.update(Message::Sidebar(SidebarAction::OpenFile {
             key,
@@ -8601,7 +8879,7 @@ fn request_test_completion(
 
 fn navigate_find_key(app: &mut Cagents, backwards: bool) {
     let key = keyboard::Key::Named(keyboard::key::Named::F3);
-    let action = task_app_message(app.update(Message::KeyEvent {
+    drop(app.update(Message::KeyEvent {
         event: keyboard::Event::KeyPressed {
             key: key.clone(),
             modified_key: key,
@@ -8617,13 +8895,6 @@ fn navigate_find_key(app: &mut Cagents, backwards: bool) {
         },
         captured: false,
     }));
-    assert!(matches!(
-        &action,
-        Message::Repository(
-            RepositoryAction::FindNext { .. } | RepositoryAction::FindPrevious { .. }
-        )
-    ));
-    drop(app.update(action));
 }
 
 #[test]
@@ -10274,8 +10545,8 @@ pub(super) fn focused_element(
         .as_widget_mut()
         .operate(&mut tree, Layout::new(&node), &renderer, &mut probe);
     let _ = probe.finish();
-    let answer = found.lock().expect("the probe survived").clone();
-    answer
+
+    found.lock().expect("the probe survived").clone()
 }
 
 /// A jump that moves the caret must also hand the editor the keyboard.
@@ -10983,6 +11254,7 @@ pub(super) fn context_inspector_test_app(with_focused_card: bool) -> Cagents {
         card_indices_source: std::sync::Weak::new(),
         terminal_ordinals_source: std::sync::Weak::new(),
         navigation_cache: sidebar::NavigationCache::default(),
+        place_index: inspector_activity::PlaceIndex::default(),
         palette: palette_ui::State::default(),
         recently_closed: Vec::new(),
         presence: HashMap::new(),
@@ -11095,7 +11367,7 @@ pub(super) fn context_inspector_test_app(with_focused_card: bool) -> Cagents {
         source_control_mutations: HashMap::new(),
         operation_recovery: Default::default(),
         device_ui: device_ui::State::default(),
-        account_ui: account_ui::State::default(),
+        account_ui: account_ui::Accounts::default(),
         automation_ui: crate::automation_ui::State::default(),
         work_ui: crate::work_ui::State::default(),
         automation_approval: automation_approval::State::default(),
@@ -11138,6 +11410,8 @@ pub(super) fn context_inspector_test_app(with_focused_card: bool) -> Cagents {
         worktree_operations: HashMap::new(),
         pending_panel_open: None,
         deferred_navigation: VecDeque::new(),
+        owed_projection: None,
+        dispatching: 0,
         frame_clock: FrameClock::default(),
         latency: crate::performance::InteractionLatency::default(),
         latency_focus: None,
@@ -13364,8 +13638,12 @@ fn control_tab_uses_history_and_respects_blocking_surfaces() {
 #[test]
 fn configured_command_takes_priority_over_the_editor_staging_shortcut() {
     let mut app = context_inspector_test_app(true);
+    app.sidebar_model = sidebar::tests::panel_model();
+    app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+    let worktree = app.sidebar_state.active_worktree().unwrap().clone();
     let card = app.workspace.focused().unwrap();
-    let (runtime, _) = RepositoryRuntime::selection_fixture(card, "notes.txt");
+    let (mut runtime, _) = RepositoryRuntime::selection_fixture(card, "notes.txt");
+    runtime.descriptor.worktree = worktree.canonical_path.clone();
     assert!(runtime.selected_staging_selection(true).is_some());
     app.cards
         .insert(card, CardRuntime::Repository(Box::new(runtime)));
@@ -13381,14 +13659,18 @@ fn configured_command_takes_priority_over_the_editor_staging_shortcut() {
         },
         captured: false,
     };
-    assert!(matches!(
-        task_app_message(app.update(key())),
-        Message::Repository(RepositoryAction::StageSelected { card: id, stage: true })
-            if id == card
-    ));
+    // The shortcut stages the selection within its own update.
+    drop(app.update(key()));
+    assert_eq!(
+        app.source_control_mutations[&worktree.canonical_path].kind,
+        MutationKind::Stage
+    );
+    assert!(!app.palette.is_open());
+    app.source_control_mutations.clear();
     app.settings.keyboard_shortcuts.command_palette = settings::parse_chords("Ctrl+Shift+S");
     drop(app.update(key()));
     assert!(app.palette.is_open());
+    assert!(app.source_control_mutations.is_empty(), "nothing is staged");
 }
 
 #[test]

@@ -1299,10 +1299,11 @@ impl RemoteActor {
                         actor.publish_unavailable(error);
                         break;
                     }
-                    if let Ok(Some(state)) = response {
-                        if !actor.publish_resident(state) && actor.0.stop.load(Ordering::Acquire) {
-                            break;
-                        }
+                    if let Ok(Some(state)) = response
+                        && !actor.publish_resident(state)
+                        && actor.0.stop.load(Ordering::Acquire)
+                    {
+                        break;
                     }
                     retry_housekeeping |= actor.reconcile_acknowledged_inputs().is_err();
                     let identities: Vec<_> = actor
@@ -1759,8 +1760,13 @@ impl RemoteActor {
             return Err(RECONNECTING_INPUT.into());
         }
         #[cfg(debug_assertions)]
-        if let Some(outcome) = super::fixture_refusal::take() {
-            return Err(outcome.into());
+        {
+            if let Some(delay) = super::fixture_refusal::take_delay() {
+                std::thread::sleep(delay);
+            }
+            if let Some(outcome) = super::fixture_refusal::take() {
+                return Err(outcome.into());
+            }
         }
         let payload = serde_json::to_value(payload).map_err(|error| error.to_string())?;
         let bytes = serde_json::to_vec(&payload).map_err(|error| error.to_string())?;

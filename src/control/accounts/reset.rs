@@ -18,9 +18,7 @@ pub(super) fn execute(
     let recovery = idempotency_key.is_some();
     let key = idempotency_key.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     validate_key(&key)?;
-    let socket = control_daemon_socket()?;
-    let mut client = ControlClient::connect(&socket)
-        .map_err(|error| AppError::new("daemon_connection", error))?;
+    let mut client = control_daemon_client()?;
     let report = super::read_report(
         &mut client,
         Authority::from_environment(),

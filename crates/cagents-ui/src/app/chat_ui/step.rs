@@ -35,7 +35,7 @@ const RAIL_INSET: f32 = space::M;
 
 /// Where a group's thread line hangs: under the centre of its kind icon.
 const THREAD_RAIL_OFFSET: f32 =
-    GAP_S + design::COMPACT_ICON_SIZE as f32 / 2.0 - design::BORDER_WIDTH / 2.0;
+    GAP_S + design::LEADING_ICON_SIZE as f32 / 2.0 - design::BORDER_WIDTH / 2.0;
 
 /// The glyph that stands for what a step was doing, so a reader scanning the
 /// left edge of a strip can tell reading from running from editing without
@@ -158,6 +158,20 @@ fn change_verb(kind: &ChangeKind) -> &'static str {
     }
 }
 
+/// What the note beneath an input or output shown as an excerpt says,
+/// depending on whether its Copy reads the whole of it.
+pub(super) fn excerpt_note(part: &CopyPart, copies_whole: bool) -> &'static str {
+    match (part, copies_whole) {
+        (CopyPart::Input, _) => {
+            "Only the start and end of this input are shown. Copy includes only what is shown."
+        }
+        (_, true) => "Only the start and end of this output are shown. Copy includes all of it.",
+        (_, false) => {
+            "Only the start and end of this output are shown. Copy includes only what is shown."
+        }
+    }
+}
+
 fn change_view(change: &FileChange) -> Element<'static, Message> {
     let mut rows: Vec<Element<'_, Message>> = vec![
         widget::row::with_children(vec![
@@ -209,7 +223,14 @@ impl Runtime {
         };
         let target = self.target;
         let id = item.id.clone();
-        let copy = Action::Copy(target, id.clone(), part.clone());
+        // A long output's row holds only its start and end; Copy reads the
+        // whole of it.
+        let copy = match (&part, self.excerpted_output_source(item)) {
+            (CopyPart::Output, Some(source)) => {
+                Action::CopyStep(target, id.clone(), CopyPart::Output, source)
+            }
+            _ => Action::Copy(target, id.clone(), part.clone()),
+        };
         // What a command or a tool printed is followed from its end. A patch,
         // an input, and what a read or a search returned are read from the
         // top, whether or not the step is still running.
@@ -254,10 +275,7 @@ impl Runtime {
     /// cannot know.
     #[cfg(test)]
     pub(super) fn strip_summary(&self, turn: &turn::Turn) -> String {
-        match self.strip_headline(turn) {
-            disclosure::Headline::Text(text) => text,
-            disclosure::Headline::Path { verb, path } => format!("{verb} {path}"),
-        }
+        self.strip_headline(turn).plain()
     }
 
     /// A collapsed strip's line as it is drawn. A lone step on one file
@@ -288,6 +306,46 @@ impl Runtime {
         }
     }
 
+    /// Whether a group's strip is open: the reader's choice, or else the
+    /// setting.
+    pub(super) fn group_open(&self, turn: &turn::Turn) -> bool {
+        self.opened
+            .get(&turn.key)
+            .copied()
+            .unwrap_or(self.tool_groups_expanded)
+    }
+
+    /// Carries the reader opening or closing a group's only step, drawn as
+    /// its own row, to the group: when a second step joins it, the strip the
+    /// two share opens over the step the reader was reading, and closing
+    /// that step later folds only the step.
+    pub(super) fn follow_lone_step(&mut self, id: &str, open: bool) {
+        let items = &self.snapshot.items;
+        let Some(key) = self
+            .turns
+            .iter()
+            .find(|turn| match turn.steps.as_slice() {
+                [only] => items.get(only.index).is_some_and(|item| item.id == id),
+                _ => false,
+            })
+            .map(|turn| turn.key.clone())
+        else {
+            return;
+        };
+        self.find_disclosure.manual_turn(&key);
+        if open {
+            self.opened.edit().insert(key, true);
+        } else {
+            self.opened.edit().remove(&key);
+        }
+    }
+
+    /// Whether a group's steps are on screen: a lone step always is, as its
+    /// own row, and the steps of several when their strip is open.
+    pub(super) fn steps_shown(&self, turn: &turn::Turn) -> bool {
+        turn.steps.len() == 1 || self.group_open(turn)
+    }
+
     /// One group's activity: a summary line and how long the work took,
     /// disclosing the individual steps.
     ///
@@ -307,12 +365,7 @@ impl Runtime {
     ) -> Element<'a, Message> {
         let target = self.target;
         let key = turn.key.as_str();
-        // Explicit reader choices override the configured default.
-        let open = self
-            .opened
-            .get(key)
-            .copied()
-            .unwrap_or(self.tool_groups_expanded);
+        let open = self.group_open(turn);
         let elapsed = if turn.running {
             self.source_now_ms()
                 .and_then(|now| turn.duration_label(now))
@@ -320,10 +373,7 @@ impl Runtime {
             turn.duration_label(0)
         };
         let text = self.strip_headline(turn);
-        let name = match &text {
-            disclosure::Headline::Text(text) => text.clone(),
-            disclosure::Headline::Path { verb, path } => format!("{verb} {path}"),
-        };
+        let name = text.plain();
         let mut kinds = turn.steps.iter().filter_map(|step| {
             self.step_items().get(step.index).map(|item| {
                 self.presentation_cache()
@@ -379,8 +429,10 @@ impl Runtime {
                 .into(),
             );
         }
+        // Each nested row brings the air above it, so the strip has none of
+        // its own: its rows are as far apart as any two rows of the
+        // timeline, and so are its last row and the row after the strip.
         widget::column::with_children(content)
-            .spacing(GAP_XS)
             .width(Length::Fill)
             .into()
     }
@@ -392,8 +444,31 @@ impl Runtime {
         cached: &CachedItem,
         settings: markdown::Settings,
     ) -> Element<'static, Message> {
+        self.step_row(item, cached, settings, self.step_status(item))
+    }
+
+    /// A group's only step, drawn in place of the group. A strip over one
+    /// row would repeat that row's title and icon above it, so the row
+    /// stands alone, and carries the activity indicator the strip would have.
+    pub(super) fn lone_step_view(
+        &self,
+        turn: &turn::Turn,
+        item: &chat::Item,
+        cached: &CachedItem,
+        settings: markdown::Settings,
+    ) -> Element<'static, Message> {
+        self.step_row(item, cached, settings, self.strip_status(turn))
+    }
+
+    fn step_row(
+        &self,
+        item: &chat::Item,
+        cached: &CachedItem,
+        settings: markdown::Settings,
+        status: Option<ToolStatus>,
+    ) -> Element<'static, Message> {
         let open = self.item_expanded(&item.id);
-        let mut rows = vec![self.step_header(item, cached, open)];
+        let mut rows = vec![self.step_button(item, cached, open, status)];
         if open {
             rows.push(
                 widget::container(super::view::message_actions(
@@ -414,13 +489,14 @@ impl Runtime {
 
     /// The header occupies the whole row; copy and time-stamp controls remain
     /// available with the expanded detail instead of shifting its chevron.
+    #[cfg(test)]
     pub(super) fn step_header(
         &self,
         item: &chat::Item,
         cached: &CachedItem,
         open: bool,
     ) -> Element<'static, Message> {
-        self.step_button(item, cached, open)
+        self.step_button(item, cached, open, self.step_status(item))
     }
 
     /// The verb and file of a step on one file, the file named the way the
@@ -451,6 +527,7 @@ impl Runtime {
         item: &chat::Item,
         cached: &CachedItem,
         open: bool,
+        status: Option<ToolStatus>,
     ) -> Element<'static, Message> {
         let target = self.target;
         // A step that worked with another agent says what it did in the
@@ -484,6 +561,13 @@ impl Runtime {
             && item.content.status() != Some(ToolStatus::Running)
         {
             said.push_str(&format!(" · {word}"));
+        } else if coordinated.is_some()
+            && item.content.status() == Some(ToolStatus::Running)
+            && status != Some(ToolStatus::Running)
+        {
+            // A coordinating step says what it did in the past tense, so
+            // one still working without the spinner says so in words.
+            said.push_str(" · working");
         }
         let label = if verb.is_empty() {
             said.clone()
@@ -504,7 +588,7 @@ impl Runtime {
             headline,
             name,
             glyph,
-            self.step_status(item),
+            status,
             elapsed,
             Some(open),
             Some(Action::Toggle(target, item.id.clone())),
@@ -525,6 +609,27 @@ impl Runtime {
         item.content
             .status()
             .filter(|status| *status != ToolStatus::Running || newest)
+    }
+
+    /// Says, beneath an input or output shown as an excerpt, that only its
+    /// start and end are shown and what Copy takes, so the line marking the
+    /// gap is not mistaken for something the step printed.
+    fn excerpt_note(&self, item: &chat::Item, part: CopyPart) -> Option<Element<'static, Message>> {
+        let shown = match (&part, &item.content) {
+            (CopyPart::Input, ItemContent::Tool { input, .. }) => input,
+            (
+                CopyPart::Output,
+                ItemContent::Command { output, .. } | ItemContent::Tool { output, .. },
+            ) => output,
+            _ => return None,
+        };
+        let copies_whole =
+            matches!(part, CopyPart::Output) && self.excerpted_output_source(item).is_some();
+        (copies_whole || chat::is_excerpt(shown)).then(|| {
+            design::caption(excerpt_note(&part, copies_whole))
+                .class(cosmic::theme::Text::Custom(design::muted_text))
+                .into()
+        })
     }
 
     /// The bounded height a step's raw output is allowed to occupy before it
@@ -599,6 +704,7 @@ impl Runtime {
                         "Output",
                         Some(Self::OUTPUT_HEIGHT),
                     ));
+                    rows.extend(self.excerpt_note(item, CopyPart::Output));
                 }
             }
             ItemContent::Changes { changes, status } => {
@@ -637,6 +743,7 @@ impl Runtime {
                         "Input",
                         Some(Self::OUTPUT_HEIGHT),
                     ));
+                    rows.extend(self.excerpt_note(item, CopyPart::Input));
                 }
                 if output.is_empty() {
                     rows.push(design::caption("No output.").into());
@@ -648,6 +755,7 @@ impl Runtime {
                         "Output",
                         Some(Self::OUTPUT_HEIGHT),
                     ));
+                    rows.extend(self.excerpt_note(item, CopyPart::Output));
                 }
             }
             ItemContent::Image { path, .. } => {
@@ -756,7 +864,7 @@ mod tests {
         };
         let renderer = crate::app::tests::headless_renderer();
         let viewport = iced::Rectangle::with_size(iced::Size::new(275.0, 1_000.0));
-        let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
+        let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT);
         for group in [false, true] {
             let (mut runtime, _handle) =
                 super::super::view::prepared_runtime_for_test(std::slice::from_ref(&item));
@@ -770,11 +878,11 @@ mod tests {
             };
             let mut tree = Tree::new(build(&runtime).as_widget());
             for (index, open) in [false, true, false].into_iter().enumerate() {
-                runtime.opened.insert(key.clone(), open);
+                runtime.opened.edit().insert(key.clone(), open);
                 if open {
-                    runtime.expanded.insert(item.id.clone());
+                    runtime.expanded.edit().insert(item.id.clone());
                 } else {
-                    runtime.expanded.remove(&item.id);
+                    runtime.expanded.edit().remove(&item.id);
                 }
                 let mut element = build(&runtime);
                 tree.diff(element.as_widget_mut());
