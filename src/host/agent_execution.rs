@@ -727,15 +727,16 @@ fn launch_options(spec: &crate::agent_execution::Spec) -> Vec<String> {
     let acp = spec.provider.acp();
     if let Some(mode) = &spec.permission_mode {
         let flag = match spec.provider {
-            Provider::Claude => Some("--permission-mode"),
-            Provider::Omp => Some("--approval-mode"),
-            Provider::Codex => Some("--ask-for-approval"),
-            Provider::Antigravity | Provider::Muse => acp.map(|acp| acp.mode_option),
+            Provider::Claude => "--permission-mode",
+            Provider::Omp => "--approval-mode",
+            Provider::Codex => "--ask-for-approval",
+            // Muse's own until it names its modes as an ACP agent.
+            Provider::Antigravity | Provider::Muse => {
+                acp.map_or("--approval-mode", |acp| acp.mode_option)
+            }
         };
         let mode = acp.map_or(mode.as_str(), |acp| acp.own_mode(mode));
-        if let Some(flag) = flag
-            && acp.is_none_or(|acp| mode != acp.default_mode)
-        {
+        if acp.is_none_or(|acp| mode != acp.default_mode) {
             arguments.extend([flag.into(), mode.to_owned()]);
         }
     }

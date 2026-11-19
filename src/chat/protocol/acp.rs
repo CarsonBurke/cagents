@@ -1057,13 +1057,20 @@ pub fn align_resume_identity(
     let mut kept = Vec::with_capacity(arguments.len() + 2);
     let mut given = std::mem::take(arguments).into_iter();
     while let Some(argument) = given.next() {
-        let flag = argument
+        let (flag, inline) = argument
             .split_once('=')
-            .map_or(argument.as_str(), |(flag, _)| flag);
+            .map_or((argument.as_str(), false), |(flag, _)| (flag, true));
         if provider.is_identity_option(flag) {
-            if !argument.contains('=') {
+            if !inline {
                 given.next();
             }
+        } else if provider.is_latest_selector(flag) {
+            // The conversation is named, never the most recent one.
+        } else if provider.is_value_option(flag) && !inline {
+            // An option's value is never mistaken for an option.
+            let value = given.next();
+            kept.push(argument);
+            kept.extend(value);
         } else {
             kept.push(argument);
         }

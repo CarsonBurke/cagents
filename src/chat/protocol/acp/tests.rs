@@ -1408,4 +1408,14 @@ fn a_confirmed_identity_replaces_the_conversation_a_terminal_resumes() {
     let mut arguments = ["resume", "old", "--model", "m"].map(String::from).to_vec();
     align_resume_identity(Provider::Muse, &mut arguments, "new".into());
     assert_eq!(arguments, ["resume", "new", "--model", "m"]);
+    // Neither the most recent conversation nor an option's value that reads
+    // like an identity option survives or is taken for one.
+    let mut arguments = ["--continue", "--agent", "--conversation", "-c"]
+        .map(String::from)
+        .to_vec();
+    align_resume_identity(Provider::Antigravity, &mut arguments, "new".into());
+    assert_eq!(
+        arguments,
+        ["--agent", "--conversation", "--conversation", "new"]
+    );
 }
