@@ -11239,9 +11239,30 @@ fn deleted_working_directory_keeps_exact_history_readable_without_a_provider() {
             .unwrap_err()
             .contains("read-only")
     );
+    // A window shows a run of the conversation: its prompts in order, with
+    // none missing or repeated.
+    let prompts = |snapshot: &crate::chat::Snapshot| -> std::ops::Range<usize> {
+        let indices: Vec<usize> = snapshot
+            .items
+            .iter()
+            .filter_map(|item| match &item.content {
+                ItemContent::Text { text, .. } => text
+                    .strip_prefix("Saved prompt ")
+                    .and_then(|index| index.parse().ok()),
+                _ => None,
+            })
+            .collect();
+        let run = indices
+            .first()
+            .map_or(0..0, |first| *first..first + indices.len());
+        assert!(indices.iter().copied().eq(run.clone()), "{indices:?}");
+        run
+    };
+    assert_eq!(prompts(&snapshot), 120..220, "the newest history first");
     // Each earlier page slides the window back by half of it, so the
-    // history is read a window at a time until its start.
-    let mut seen = std::collections::BTreeSet::new();
+    // history is read a window at a time until its start, and every prompt
+    // is shown on the way.
+    let mut seen = std::collections::BTreeSet::from_iter(120..220);
     let mut snapshot = snapshot;
     let mut pages = 0;
     while snapshot.has_earlier {
@@ -11249,17 +11270,10 @@ fn deleted_working_directory_keeps_exact_history_readable_without_a_provider() {
         assert!(pages <= 20, "paging back never reached the start");
         handle.command(Command::LoadEarlier).unwrap();
         snapshot = handle.snapshot(None).unwrap();
-        seen.extend(snapshot.items.iter().filter_map(|item| {
-            match &item.content {
-                ItemContent::Text { text, .. } => text
-                    .strip_prefix("Saved prompt ")
-                    .and_then(|index| index.parse::<usize>().ok()),
-                _ => None,
-            }
-        }));
+        seen.extend(prompts(&snapshot));
     }
-    // Every prompt before the first window was shown on the way.
-    assert!((0..120).all(|index| seen.contains(&index)), "{seen:?}");
+    assert_eq!(prompts(&snapshot).start, 0, "the window reaches the start");
+    assert!(seen.into_iter().eq(0..220), "every prompt was shown");
     handle.close().unwrap();
 
     let mut traversal = launch.clone();
