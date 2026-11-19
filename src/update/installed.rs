@@ -304,11 +304,11 @@ pub(super) fn perform(
         survivors,
         &guard,
     );
-    let handoff_kind = recovery_result?;
+    recovery_result?;
     let reopened = guard
         .relaunch_closed_windows(&reopen.join("bin/cagents-ui"))
         .map_err(UpdateError::from);
-    verify_reopened_service(&recovery, state, job)?;
+    let handoff_kind = verify_reopened_service(&recovery, state, job)?;
     if let Err(error) = reopened {
         return report_recovery_failure(
             state,

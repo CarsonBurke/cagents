@@ -1570,6 +1570,15 @@ pub fn run_worker(job_id: &str) -> Result<(), UpdateError> {
         &mut handoff,
         &mut survivors,
     );
+    finish_worker(&state, &mut job, result, &mut survivors)
+}
+
+fn finish_worker(
+    state: &Path,
+    job: &mut UpdateJob,
+    result: Result<Handoff, UpdateError>,
+    survivors: &mut floor::Survivors,
+) -> Result<(), UpdateError> {
     let settled_failure = job.phase == UpdatePhase::Failed && result.is_err();
     job.phase = if matches!(result, Err(UpdateError::Cancelled)) {
         UpdatePhase::Cancelled
@@ -1580,7 +1589,7 @@ pub fn run_worker(job_id: &str) -> Result<(), UpdateError> {
     };
     job.confirmation = None;
     job.refusal = result.as_ref().err().and_then(UpdateError::refusal);
-    job.message = completion_message(&result, &job, settled_failure);
+    job.message = completion_message(&result, job, settled_failure);
     if !job.message.contains("Ended or stopped:") {
         job.message.push_str(&survivors.recovery_report());
     }
@@ -1599,7 +1608,7 @@ pub fn run_worker(job_id: &str) -> Result<(), UpdateError> {
         job.message.push_str(&unchecked.join("\n"));
     }
     job.in_flight = survivors.in_flight_outcomes(unattached_after_update);
-    if let Err(error) = write_job(&state, &job) {
+    if let Err(error) = write_job(state, job) {
         if result.is_ok() {
             return Err(error);
         }
@@ -1839,11 +1848,11 @@ fn perform_update(
     );
     // Do not let a recovery UI autostart the frozen previous executable while
     // ownership or Prepared recovery is unresolved.
-    let handoff_kind = recovery_result?;
+    recovery_result?;
     let reopen_result = guard
         .relaunch_closed_windows(&installation.prefix.join("current/bin/cagents-ui"))
         .map_err(UpdateError::from);
-    verify_reopened_service(&recovery, state, job)?;
+    let handoff_kind = verify_reopened_service(&recovery, state, job)?;
     if let Err(error) = reopen_result {
         return report_recovery_failure(
             state,
@@ -1860,7 +1869,7 @@ fn verify_reopened_service(
     recovery: &recovery::Context,
     state: &Path,
     job: &mut UpdateJob,
-) -> Result<(), UpdateError> {
+) -> Result<Handoff, UpdateError> {
     let census = recovery
         .census
         .as_ref()
@@ -1886,8 +1895,10 @@ fn verify_reopened_service(
         )?
     };
     receipt.save(&recovery::outcome_path(state, &job.id))?;
-    if receipt.usable() || matches!(receipt.outcome, recovery::Outcome::NoSource) {
-        Ok(())
+    if matches!(receipt.outcome, recovery::Outcome::NoSource) {
+        Ok(Handoff::NoDaemon)
+    } else if receipt.usable() {
+        Ok(Handoff::Served)
     } else {
         report_recovery_failure(state, job, receipt.failure())
     }
@@ -4923,6 +4934,7 @@ finally:
                 "recovery-recording-failure",
                 "start-nonzero-with-service",
                 "first-start-failed-without-source",
+                "reopened-window-starts-daemon",
                 "absent-source-with-prepared-checkpoint",
             ] {
                 // A retained Prepared checkpoint belongs to this one case;
@@ -5088,7 +5100,7 @@ if os.environ['CAGENTS_TEST_RECOVERY_FAILURE']=='start-exit-zero-without-service
 assert 'CAGENTS_DAEMON_LEASE_FD' not in os.environ
 assert not pathlib.Path('/proc/self/fd/199').exists()
 if os.environ['CAGENTS_TEST_RECOVERY_FAILURE']!='recovery-recording-failure':
-    expected = 'Installing' if os.environ['CAGENTS_TEST_RECOVERY_FAILURE']=='installer-success-daemon-exited' else 'Failed'
+    expected = 'Installing' if os.environ['CAGENTS_TEST_RECOVERY_FAILURE'] in ('installer-success-daemon-exited', 'reopened-window-starts-daemon') else 'Failed'
     assert json.loads((root/'status.json').read_text())['phase'] == expected
 os.environ['CAGENTS_TEST_HEADLESS_RECOVERY']='daemon'
 os.environ['CAGENTS_TEST_HEADLESS_ROOT']=str(root)
@@ -5150,7 +5162,9 @@ if os.environ['CAGENTS_TEST_RECOVERY_FAILURE']=='start-nonzero-with-service': sy
         };
         let without_source = matches!(
             failure.as_str(),
-            "first-start-failed-without-source" | "absent-source-with-prepared-checkpoint"
+            "first-start-failed-without-source"
+                | "reopened-window-starts-daemon"
+                | "absent-source-with-prepared-checkpoint"
         );
         let census = if without_source {
             serde_json::from_value(serde_json::json!({"version":1,"transaction":job.id,"source":null,"terminals":[],"chats":[]})).unwrap()
@@ -5262,13 +5276,16 @@ if os.environ['CAGENTS_TEST_RECOVERY_FAILURE']=='start-nonzero-with-service': sy
         }
         let installer_result = if matches!(
             failure.as_str(),
-            "installer-success-daemon-exited" | "first-start-failed-without-source"
+            "installer-success-daemon-exited"
+                | "first-start-failed-without-source"
+                | "reopened-window-starts-daemon"
         ) {
             write_job(root.path(), &job).unwrap();
             Ok(())
         } else {
             Err(invalid(failure.clone()))
         };
+        let mut survivors = floor::Survivors::default();
         let settled = finish_handoff(
             &installation,
             root.path(),
@@ -5276,10 +5293,13 @@ if os.environ['CAGENTS_TEST_RECOVERY_FAILURE']=='start-nonzero-with-service': sy
             &installer_result,
             &mut lease,
             &context,
-            &mut floor::Survivors::default(),
+            &mut survivors,
             &guard,
         );
-        if failure == "first-start-failed-without-source" {
+        if matches!(
+            failure.as_str(),
+            "first-start-failed-without-source" | "reopened-window-starts-daemon"
+        ) {
             assert!(settled.is_ok(), "{settled:?}");
             assert!(matches!(settled, Ok(Handoff::NoDaemon)), "{settled:?}");
             assert!(job.message.contains("will start at graphical login"));
@@ -5290,7 +5310,43 @@ if os.environ['CAGENTS_TEST_RECOVERY_FAILURE']=='start-nonzero-with-service': sy
             .unwrap();
             assert!(matches!(receipt.outcome, recovery::Outcome::NoSource));
             assert!(!receipt.usable());
-            verify_reopened_service(&context, root.path(), &mut job).unwrap();
+            let reopened_window = failure == "reopened-window-starts-daemon";
+            if reopened_window {
+                // Model the daemon start performed by a reopened UI, using
+                // the private fixture service without opening a native window.
+                let mut reopen = Command::new(bin.join("cagents"));
+                reopen.args(["daemon", "start"]);
+                guard.inherit_for_install(&mut reopen).unwrap();
+                assert!(reopen.status().unwrap().success());
+                assert!(HostLease::is_held(&paths).unwrap());
+            }
+            let final_result = settled
+                .and_then(|_| verify_reopened_service(&context, root.path(), &mut job))
+                .and_then(|outcome| installer_result.map(|()| outcome));
+            finish_worker(root.path(), &mut job, final_result, &mut survivors).unwrap();
+            let persisted: UpdateJob =
+                serde_json::from_slice(&fs::read(root.path().join("status.json")).unwrap())
+                    .unwrap();
+            assert_eq!(persisted.phase, UpdatePhase::Complete);
+            assert_eq!(
+                persisted.message,
+                if reopened_window {
+                    "Update installed; saved windows reopened"
+                } else {
+                    NO_DAEMON_INSTALLED
+                }
+            );
+            if reopened_window {
+                fs::write(root.path().join("daemon-exit"), b"exit").unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while HostLease::is_held(&paths).unwrap() {
+                    assert!(Instant::now() < deadline);
+                    thread::sleep(Duration::from_millis(5));
+                }
+            } else {
+                assert!(!HostLease::is_held(&paths).unwrap());
+                assert!(!root.path().join("start-attempts").exists());
+            }
             return;
         }
         if let Some((path, bytes)) = prepared {
