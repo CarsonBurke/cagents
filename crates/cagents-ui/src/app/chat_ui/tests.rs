@@ -20316,6 +20316,7 @@ fn shared_code_copy_keeps_exact_bytes_typed_target_and_clipboard_intent_until_ef
 
 #[test]
 fn logical_message_copy_completion_refuses_destructive_changes_after_last_page() {
+    use iced::futures::StreamExt;
     let _context = text_copy::isolated_context();
     for change in ["rewrite", "remove", "reset"] {
         let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -20347,8 +20348,43 @@ fn logical_message_copy_completion_refuses_destructive_changes_after_last_page()
             request,
             Ok(body),
         )));
+        let task = if change == "rewrite" {
+            // The rewritten source is retried once. This fixture has no
+            // responding peer, so end its read before observing completion.
+            handle.disconnect_for_test();
+            let executor = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            let completion = executor.block_on(async {
+                let mut effects = iced::runtime::task::into_stream(task).expect("rewrite retries");
+                tokio::time::timeout(Duration::from_secs(1), effects.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            });
+            let iced::runtime::Action::Output(cosmic::Action::App(message)) = completion else {
+                panic!("a rewrite must retry without writing stale text");
+            };
+            let Message::ChatUi(Action::MessageCopied(_, _, _, Err(error))) = &message else {
+                panic!("retry must report its canonical read failure");
+            };
+            assert_eq!(error, "Chat is disconnected; text copy is unavailable");
+            app.update(message)
+        } else {
+            task
+        };
         assert_chat_copy_task_has_no_effects(task, change);
-        assert!(app.chat_runtime_mut(target).unwrap().copied.is_none());
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert!(runtime.copied.is_none());
+        assert_eq!(
+            runtime.error.as_deref(),
+            Some(if change == "rewrite" {
+                "Chat is disconnected; text copy is unavailable"
+            } else {
+                "Changed while copying; copy again"
+            })
+        );
     }
 }
 

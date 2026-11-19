@@ -1,6 +1,8 @@
 //! Logical message Copy reads canonical source pages off the UI thread.
 use super::*;
 
+const CHANGED_WHILE_COPYING: &str = "Changed while copying; copy again";
+
 /// All production UI surfaces share one clipboard intent context. A request
 /// owns this context so async task polling never depends on thread-local state.
 #[derive(Clone, Default)]
@@ -64,6 +66,7 @@ pub struct Request {
     handle: Arc<ClientHandle>,
     source: chat::TextCopySource,
     conversation_revision: u64,
+    retried: bool,
     /// What the clipboard holds ahead of the source's text, such as the
     /// command a step's whole copy starts with.
     prefix: String,
@@ -98,6 +101,40 @@ impl FailureRequest {
 }
 
 impl Request {
+    fn read(self, target: Target, id: String) -> Task<Message> {
+        let handle = self.handle.clone();
+        let source = self.source.clone();
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || handle.copy_text(source))
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
+            Message::ChatUi(Action::MessageCopied(target, id, self, result))
+        })
+    }
+
+    fn retry(mut self, snapshot: &Snapshot) -> Option<Self> {
+        if self.retried {
+            return None;
+        }
+        let sources = match &self.source.scope {
+            chat::TextCopyScope::Conversation => &snapshot.text_copy_sources.conversation,
+            chat::TextCopyScope::Subagent { id } => snapshot.text_copy_sources.children.get(id)?,
+        };
+        self.source = sources
+            .iter()
+            .flatten()
+            .find(|source| {
+                source.cache == self.source.cache
+                    && source.scope == self.source.scope
+                    && source.token == self.source.token
+            })?
+            .clone();
+        self.conversation_revision = snapshot.text_copy_sources.conversation_revision;
+        self.retried = true;
+        Some(self)
+    }
+
     fn snapshot_is_current(&self, snapshot: &Snapshot) -> bool {
         match &self.source.scope {
             // Paging and verified appends do not revoke the captured prefix.
@@ -131,6 +168,7 @@ impl Request {
             handle,
             source,
             conversation_revision,
+            retried: false,
             prefix: String::new(),
         }
     }
@@ -323,15 +361,10 @@ impl Cagents {
             handle: handle.clone(),
             source: source.clone(),
             conversation_revision: runtime.snapshot.text_copy_sources.conversation_revision,
+            retried: false,
             prefix,
         };
-        cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || handle.copy_text(source))
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|result| result);
-            Message::ChatUi(Action::MessageCopied(target, id, request, result))
-        })
+        request.read(target, id)
     }
 
     pub(super) fn finish_message_copy(
@@ -361,7 +394,14 @@ impl Cagents {
             chat::TextCopyScope::Conversation => runtime.selected_subagent.is_none(),
             chat::TextCopyScope::Subagent { id } => runtime.selected_subagent.as_ref() == Some(id),
         };
-        if !scope_is_current || !request.snapshot_is_current(&current_snapshot) {
+        if !scope_is_current {
+            return Task::none();
+        }
+        if !request.snapshot_is_current(&current_snapshot) {
+            if let Some(retry) = request.retry(&current_snapshot) {
+                return retry.read(target, id);
+            }
+            runtime.error = Some(CHANGED_WHILE_COPYING.into());
             return Task::none();
         }
         match result {
@@ -386,7 +426,11 @@ impl Cagents {
                 ])
             }
             Err(error) => {
-                runtime.error = Some(error);
+                runtime.error = Some(if error == "This text changed; copy it again" {
+                    CHANGED_WHILE_COPYING.into()
+                } else {
+                    error
+                });
                 Task::none()
             }
         }
@@ -473,6 +517,179 @@ fn compatible(captured: &chat::TextCopySource, current: &chat::TextCopySource) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn copy_fixture(
+        scope: chat::TextCopyScope,
+    ) -> (Cagents, Target, Request, chat::TextCopySource) {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, handle) = super::super::tests::history_fixture(&mut app);
+        app.workspace.focus(card).unwrap();
+        let source = chat::TextCopySource {
+            cache: uuid::Uuid::new_v4(),
+            scope,
+            token: 7,
+            revision: 9,
+            bytes: 300 * 1024,
+        };
+        publish_copy_source(&handle, source.clone());
+        if let chat::TextCopyScope::Subagent { id } = &source.scope {
+            app.chat_runtime_mut(target).unwrap().selected_subagent = Some(id.clone());
+        }
+        let request = Request::for_test(handle, source.clone()).with_prefix("cargo build");
+        (app, target, request, source)
+    }
+
+    fn publish_copy_source(handle: &ClientHandle, source: chat::TextCopySource) {
+        let mut snapshot = (*handle.snapshot()).clone();
+        match &source.scope {
+            chat::TextCopyScope::Conversation => {
+                snapshot.text_copy_sources.conversation = vec![Some(source)];
+                snapshot.text_copy_sources.conversation_revision += 1;
+            }
+            chat::TextCopyScope::Subagent { id } => {
+                snapshot
+                    .text_copy_sources
+                    .children
+                    .insert(id.clone(), vec![Some(source)]);
+            }
+        }
+        snapshot.generation += 1;
+        handle.publish_snapshot_for_test(snapshot);
+    }
+
+    fn retry_request(task: Task<Message>, target: Target) -> Request {
+        use iced::futures::StreamExt;
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        executor.block_on(async {
+            let mut effects = iced::runtime::task::into_stream(task).expect("a retry must read");
+            let effect = tokio::time::timeout(Duration::from_secs(1), effects.next())
+                .await
+                .expect("fixture retry must settle")
+                .expect("retry completion");
+            let iced::runtime::Action::Output(cosmic::Action::App(Message::ChatUi(
+                Action::MessageCopied(actual, id, request, result),
+            ))) = effect
+            else {
+                panic!("a retry must emit its read completion, never stale clipboard bytes");
+            };
+            assert_eq!(actual, target);
+            assert_eq!(id, "output");
+            assert_eq!(
+                result,
+                Err("Chat is disconnected; text copy is unavailable".into())
+            );
+            request
+        })
+    }
+
+    #[test]
+    fn stale_snapshot_retries_once_against_current_source_and_succeeds() {
+        use iced::futures::StreamExt;
+        let _context = isolated_context();
+        for scope in [
+            chat::TextCopyScope::Conversation,
+            chat::TextCopyScope::Subagent { id: "child".into() },
+        ] {
+            let (mut app, target, request, mut current) = copy_fixture(scope);
+            let handle = request.handle.clone();
+            let intent = request.intent;
+            let context = request.context.clone();
+            current.revision += 1;
+            current.bytes = "current raw output λ\r\n".len() as u64;
+            publish_copy_source(&handle, current.clone());
+            // Observe the actual retry task without a live peer, then supply
+            // its successful read completion to exercise the clipboard path.
+            handle.disconnect_for_test();
+            let task = app.finish_message_copy(target, "output".into(), request, Ok("old".into()));
+            assert!(app.chat_runtime_mut(target).unwrap().copied.is_none());
+            let retry = retry_request(task, target);
+            assert!(retry.retried);
+            assert_eq!(retry.source, current);
+            assert_eq!(retry.intent, intent);
+            assert!(Arc::ptr_eq(&retry.context.0, &context.0));
+            assert_eq!(
+                retry.conversation_revision,
+                handle.snapshot().text_copy_sources.conversation_revision
+            );
+            let task = app.finish_message_copy(
+                target,
+                "output".into(),
+                retry,
+                Ok("current raw output λ\r\n".into()),
+            );
+            assert!(app.chat_runtime_mut(target).unwrap().copied.is_some());
+            let executor = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            executor.block_on(async {
+                let mut effects = iced::runtime::task::into_stream(task).unwrap();
+                let effect = tokio::time::timeout(Duration::from_secs(1), effects.next())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let iced::runtime::Action::Clipboard(iced::runtime::clipboard::Action::Write {
+                    contents,
+                    ..
+                }) = effect
+                else {
+                    panic!("the current retry must write the clipboard");
+                };
+                assert_eq!(contents, "cargo build\n\ncurrent raw output λ\r\n");
+            });
+        }
+    }
+
+    #[test]
+    fn stale_retry_shows_changed_while_copying_without_another_read() {
+        let _context = isolated_context();
+        for scope in [
+            chat::TextCopyScope::Conversation,
+            chat::TextCopyScope::Subagent { id: "child".into() },
+        ] {
+            let (mut app, target, request, mut current) = copy_fixture(scope);
+            let handle = request.handle.clone();
+            current.revision += 1;
+            publish_copy_source(&handle, current.clone());
+            handle.disconnect_for_test();
+            let retry = retry_request(
+                app.finish_message_copy(target, "output".into(), request, Ok("old".into())),
+                target,
+            );
+            current.revision += 1;
+            publish_copy_source(&handle, current);
+            let task = app.finish_message_copy(target, "output".into(), retry, Ok("stale".into()));
+            assert!(iced::runtime::task::into_stream(task).is_none());
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            assert_eq!(
+                runtime.error.as_deref(),
+                Some("Changed while copying; copy again")
+            );
+            assert!(runtime.copied.is_none());
+        }
+    }
+
+    #[test]
+    fn store_revision_moved_refusal_shows_changed_while_copying() {
+        let _context = isolated_context();
+        let (mut app, target, request, _) = copy_fixture(chat::TextCopyScope::Conversation);
+        let task = app.finish_message_copy(
+            target,
+            "output".into(),
+            request,
+            Err("This text changed; copy it again".into()),
+        );
+        assert!(iced::runtime::task::into_stream(task).is_none());
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert_eq!(
+            runtime.error.as_deref(),
+            Some("Changed while copying; copy again")
+        );
+        assert!(runtime.copied.is_none());
+    }
 
     #[test]
     fn appended_prefix_is_valid_but_rewrite_scope_and_cache_changes_are_not() {
