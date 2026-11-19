@@ -191,7 +191,7 @@ reveal() {
 # Take shot NAME with the pointer out of the way, so no hover or tooltip
 # shows in it.
 still() {
-    ne drive move 1,1 >/dev/null
+    ne drive hover 1,1 >/dev/null
     sleep 1.5
     ne shot "$1"
 }
@@ -213,7 +213,7 @@ first_breakpoint() {
 
 cmd_shots() { # LABEL, such as dark-wide, prefixes each shot's name
     local label=${1:?a label for the shots, such as dark-wide}
-    ne drive move 1,1 >/dev/null
+    ne drive hover 1,1 >/dev/null
     reveal 'compare the proposed' 900 && still "$label-two-reads"
     reveal 'on my laptop' 500 && still "$label-pasted"
     reveal 'docs/narrow' && still "$label-single"
@@ -223,12 +223,12 @@ cmd_shots() { # LABEL, such as dark-wide, prefixes each shot's name
     local at
     at=$(first_breakpoint)
     [ -n "$at" ] || { printf '%s\n' 'image-gallery-scene: no breakpoint picture' >&2; return 1; }
-    ne drive move "$at" >/dev/null
+    ne drive hover "$at" >/dev/null
     sleep 1.5
     ne shot "$label-hover"
     ne drive click "$at" >/dev/null
     sleep 2
-    ne drive move 1,1 >/dev/null
+    ne drive hover 1,1 >/dev/null
     sleep 1
     ne shot "$label-viewer"
     ne drive key Right >/dev/null
