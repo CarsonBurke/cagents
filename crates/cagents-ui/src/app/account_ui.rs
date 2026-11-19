@@ -1994,9 +1994,14 @@ fn login_arguments(provider: Provider, device: bool) -> Option<&'static [&'stati
         (Provider::Claude, _) => &["auth", "login", "--claudeai"],
         (Provider::Codex, false) => &["login"],
         (Provider::Codex, true) => &["login", "--device-auth"],
-        (Provider::Omp | Provider::Antigravity | Provider::Muse, _) => return None,
+        (Provider::Antigravity, _) => ANTIGRAVITY_LOGIN,
+        (Provider::Omp | Provider::Muse, _) => return None,
     })
 }
+
+/// Antigravity's sign-in, which its ACP server offers a client to run in a
+/// terminal: Google's, in the browser, after which `agy` exits.
+const ANTIGRAVITY_LOGIN: &[&str] = &["acp", "--login", "--disable-telemetry"];
 
 /// The terminal that runs `account`'s login command: the CLI at `program`,
 /// the same executable the probes run, started in the reader's home - not in
@@ -2105,7 +2110,7 @@ pub(super) fn is_sign_in(recipe: &LaunchRecipe) -> bool {
             | ("claude", ["auth", "login", "--claudeai"])
             | ("codex", ["login"])
             | ("codex", ["login", "--device-auth"])
-    )
+    ) || (program == "agy" && arguments == ANTIGRAVITY_LOGIN)
 }
 
 /// The account a conversation's launch runs on, by the home its recipe
@@ -7940,6 +7945,11 @@ mod tests {
         )));
         assert!(is_sign_in(&recipe("codex", &["login"])));
         assert!(is_sign_in(&recipe("codex", &["login", "--device-auth"])));
+        assert!(is_sign_in(&recipe(
+            "/usr/bin/agy",
+            &["acp", "--login", "--disable-telemetry"]
+        )));
+        assert!(!is_sign_in(&recipe("agy", &["acp"])));
         assert!(!is_sign_in(&recipe("claude", &[])));
         assert!(!is_sign_in(&recipe("claude", &["login"])));
         assert!(!is_sign_in(&recipe(

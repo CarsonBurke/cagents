@@ -31,7 +31,6 @@ const LIST_WIDTH: f32 = 240.0;
 /// The most of a narrow pane's height the stacked list takes from the
 /// selection below it, including short split panes.
 const STACKED_LIST_SHARE: f32 = 0.4;
-const PROVIDERS: [&str; 3] = ["Claude", "Codex", "Omp"];
 const SCHEDULES: [&str; 5] = ["Hourly", "Daily", "Weekdays", "Weekly", "Cron"];
 const WEEKDAYS: [&str; 7] = [
     "Monday",
@@ -946,10 +945,9 @@ impl State {
             | Action::Effort(..)
             | Action::Reuse(..)
             | Action::Precheck(..) => self.draft.is_some(),
-            Action::Provider(index) => self
-                .draft
-                .as_ref()
-                .is_some_and(|draft| *index < PROVIDERS.len() && *index != draft.provider),
+            Action::Provider(index) => self.draft.as_ref().is_some_and(|draft| {
+                *index < AUTOMATION_PROVIDERS.len() && *index != draft.provider
+            }),
             Action::Target(index) => self
                 .draft
                 .as_ref()
@@ -1776,7 +1774,7 @@ impl State {
                     }
                 }
             }
-            Action::Provider(index) if index < PROVIDERS.len() => {
+            Action::Provider(index) if index < AUTOMATION_PROVIDERS.len() => {
                 if let Some(draft) = &mut self.draft
                     && draft.provider != index
                 {
@@ -2927,7 +2925,7 @@ impl Draft {
             .into(),
             crate::design::caption("Provider").into(),
             crate::ui_controls::field::select(
-                PROVIDERS.to_vec(),
+                AUTOMATION_PROVIDERS.map(Provider::label).to_vec(),
                 Some(self.provider),
                 Action::Provider,
             )
@@ -3270,7 +3268,9 @@ fn launch_description<'a>(
     let description = format!(
         "Provider: {}\nAccount: {}\nProject: {}\nDirectory: {}\nModel: {}\nReasoning effort: {}\nPermissions: {}\nSession: {}\nSchedule: {} ({})\nRevision: {}",
         provider_index(definition.agent.provider)
-            .map_or(definition.agent.provider.label(), |index| PROVIDERS[index]),
+            .map_or(definition.agent.provider.label(), |index| {
+                AUTOMATION_PROVIDERS[index].label()
+            }),
         account,
         definition.agent.target.repository.display(),
         definition.agent.target.directory.display(),
@@ -3529,9 +3529,14 @@ fn firing_state_label(firing: &Firing) -> String {
     }
 }
 
-/// The providers an automation can run, in the order `PROVIDERS` names them:
+/// The providers an automation can run, in the order the editor lists them:
 /// those with native chat, which every scheduled agent runs as.
-const AUTOMATION_PROVIDERS: [Provider; 3] = [Provider::Claude, Provider::Codex, Provider::Omp];
+const AUTOMATION_PROVIDERS: [Provider; 4] = [
+    Provider::Claude,
+    Provider::Codex,
+    Provider::Antigravity,
+    Provider::Omp,
+];
 
 fn provider(index: usize) -> Provider {
     AUTOMATION_PROVIDERS

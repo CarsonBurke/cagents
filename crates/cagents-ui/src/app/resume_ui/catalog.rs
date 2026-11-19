@@ -490,8 +490,12 @@ mod tests {
     fn discovers_all_provider_history_without_changing_account_or_identity() {
         let root = tempfile::tempdir().unwrap();
         let id = "f0e49307-af96-4edd-b23f-60b185fe4fea";
-        // The others' history isn't listed yet.
-        for provider in Provider::ALL.into_iter().filter(|p| p.has_native_chat()) {
+        // The others' history isn't listed yet: an ACP agent's is its own
+        // database, which only the agent reads.
+        for provider in Provider::ALL
+            .into_iter()
+            .filter(|p| p.has_native_chat() && !p.speaks_acp())
+        {
             let account_home = root.path().join(provider.executable());
             std::fs::create_dir_all(&account_home).unwrap();
             let account = crate::account::Account {

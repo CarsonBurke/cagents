@@ -503,10 +503,12 @@ impl Account {
     /// The system accounts, which every installation reports on whether or
     /// not it added any account of its own. Omp brokers its own accounts,
     /// which are found in its usage record rather than listed here.
-    pub fn system_accounts() -> [Self; 2] {
+    /// Antigravity has only its system sign-in.
+    pub fn system_accounts() -> [Self; 3] {
         [
             Self::system(Provider::Claude),
             Self::system(Provider::Codex),
+            Self::system(Provider::Antigravity),
         ]
     }
 
@@ -515,7 +517,12 @@ impl Account {
     pub const PROVIDERS: [Provider; 2] = [Provider::Claude, Provider::Codex];
 
     /// The providers whose usage is reported, in the order they are listed.
-    pub const REPORTED: [Provider; 3] = [Provider::Claude, Provider::Codex, Provider::Omp];
+    pub const REPORTED: [Provider; 4] = [
+        Provider::Claude,
+        Provider::Codex,
+        Provider::Antigravity,
+        Provider::Omp,
+    ];
 
     pub fn id(&self) -> AccountId {
         let provider = self.provider.executable();
@@ -598,8 +605,8 @@ impl Account {
             | AccountHome::Managed { path, .. }
             | AccountHome::Linked { path, .. } => Some(path.clone()),
             AccountHome::System => {
-                let variable = home_variable(self.provider)?;
-                if let Some(explicit) = environment(variable).filter(|value| !value.is_empty())
+                if let Some(variable) = home_variable(self.provider)
+                    && let Some(explicit) = environment(variable).filter(|value| !value.is_empty())
                     && !inherited_selections(environment).contains(&variable)
                 {
                     return Some(PathBuf::from(explicit));
@@ -608,7 +615,9 @@ impl Account {
                 let directory = match self.provider {
                     Provider::Claude => ".claude",
                     Provider::Codex => ".codex",
-                    Provider::Omp | Provider::Antigravity | Provider::Muse => return None,
+                    // Its sign-in, beside every Gemini CLI's.
+                    Provider::Antigravity => ".gemini",
+                    Provider::Omp | Provider::Muse => return None,
                 };
                 Some(Path::new(&home).join(directory))
             }
@@ -1687,6 +1696,16 @@ mod tests {
             Some(PathBuf::from("/home/a/.codex"))
         );
         assert_eq!(codex.home_directory(&environment(&[])), None);
+        // Antigravity names no variable for its home, and shares Gemini's.
+        let antigravity = Account::system(Provider::Antigravity);
+        assert_eq!(
+            antigravity.home_directory(&environment(&[("HOME", "/home/a")])),
+            Some(PathBuf::from("/home/a/.gemini"))
+        );
+        assert_eq!(
+            antigravity.launch_home_in(&environment(&[("HOME", "/home/a")])),
+            None
+        );
         assert_eq!(claude.probe_environment(), None);
         // The system Claude login exports no home of its own, so the CLI
         // reads `~/.claude.json` as in the reader's shell: an explicit
