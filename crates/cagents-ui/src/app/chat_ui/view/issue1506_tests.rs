@@ -1777,6 +1777,39 @@ fn a_delivery_that_cannot_open_keeps_its_copy_and_time() {
     assert!(runtime.delivery_carries_actions(runtime.active_item("quiet-report").unwrap()));
 }
 
+/// An agent that ended with nothing to report arrives as a notice under a
+/// report's heading. Its row names the agent and its outcome as a report's
+/// does, not the provider's `Agent "…"` wording, and, having nothing to
+/// open, keeps its copy and time.
+#[test]
+fn an_agent_notice_reads_as_its_report() {
+    let mut notice = task_report(
+        "quiet-notice",
+        "Agent \"Quiet\" finished".into(),
+        String::new(),
+    );
+    if let ItemContent::Delivery { kind, .. } = &mut notice.content {
+        *kind = chat::DeliveryKind::Notice;
+    }
+    let (runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&notice));
+    let surface = report_surface(&runtime, "quiet-notice");
+    assert!(
+        surface.text.contains(&"Quiet".to_owned()) && surface.text.contains(&"finished".to_owned()),
+        "{:?}",
+        surface.text
+    );
+    assert!(
+        !surface.text.iter().any(|text| text.contains("Agent \"")),
+        "{:?}",
+        surface.text
+    );
+    assert!(
+        surface.accessible.contains(&"Copy this message".to_owned()),
+        "{:?}",
+        surface.accessible
+    );
+}
+
 #[test]
 fn report_details_and_late_find_prepare_original_markdown_and_restore_disclosure() {
     let needle = "REPORT_LATE_FIND_NEEDLE";

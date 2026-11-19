@@ -6375,10 +6375,16 @@ impl Runtime {
         let monitor = delivery_monitor(*kind, summary);
         let has_body = delivery_has_body(notice, body, remainder, sender);
         // Only explicit command/report outcomes are errors. A peer's prose
-        // mentioning a failure is ordinary delivered content.
-        let report_outcome = (*kind == chat::DeliveryKind::Report)
-            .then(|| delivery_report_outcome(from, first))
-            .flatten();
+        // mentioning a failure is ordinary delivered content. An agent that
+        // ended with nothing to report, or whose result is shown elsewhere,
+        // arrives as a notice under the same heading, and reads as a report.
+        let report_outcome = match kind {
+            chat::DeliveryKind::Report => true,
+            chat::DeliveryKind::Notice => !monitor && delivery_command_outcome(first).is_none(),
+            _ => false,
+        }
+        .then(|| delivery_report_outcome(from, first))
+        .flatten();
         let failed =
             (*kind == chat::DeliveryKind::Notice && !monitor && delivery_command_failed(&heading))
                 || report_outcome.is_some_and(|(_, outcome)| outcome == "failed");
@@ -6395,11 +6401,11 @@ impl Runtime {
             Icon::Chat
         };
         let (title, outcome) = if *kind == chat::DeliveryKind::Notice && !monitor {
-            delivery_command_outcome(first)
-                .map_or((first, None), |(title, outcome)| (title, Some(outcome)))
+            delivery_command_outcome(first).or(report_outcome)
         } else {
-            report_outcome.map_or((first, None), |(title, outcome)| (title, Some(outcome)))
-        };
+            report_outcome
+        }
+        .map_or((first, None), |(title, outcome)| (title, Some(outcome)));
         // Bound synchronous text shaping. The original remains in the tooltip,
         // copy action and expanded detail; fades never introduce an ellipsis.
         let short: String = title.chars().take(1024).collect();
