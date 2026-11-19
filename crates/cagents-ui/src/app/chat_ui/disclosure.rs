@@ -182,6 +182,27 @@ pub(super) fn row(
     )
 }
 
+/// The still mark of a state, in a dot the size of a caption's lowercase
+/// letters: the accent beside a live caption, or in its place, the state's
+/// colour, where a narrow row has no room for its words.
+pub(super) fn state_dot(color: fn(&cosmic::Theme) -> iced::Color) -> Element<'static, Message> {
+    const SIZE: f32 = 6.0;
+    widget::container(widget::Space::new())
+        .width(Length::Fixed(SIZE))
+        .height(Length::Fixed(SIZE))
+        .class(cosmic::theme::Container::custom(move |theme| {
+            widget::container::Style {
+                background: Some(iced::Background::Color(color(theme))),
+                border: iced::Border {
+                    radius: (SIZE / 2.0).into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        }))
+        .into()
+}
+
 /// A row whose accessible name already includes its trailing metadata.
 /// Delivered reports retain their canonical full heading even when the title
 /// and outcome are drawn in separate cells.
@@ -224,16 +245,18 @@ pub(super) fn row_named(
             cells.push(trailing_text(design::caption(elapsed)).into());
         }
         // An outcome gives way to the headline where both no longer fit:
-        // the row's name is what a reader needs, and a failure is still
-        // told by the leading glyph. The outcome stays in the row's
-        // accessible name.
+        // the row's name is what a reader needs. A failure is still told by
+        // the leading glyph, and a stop by a dot in the warning colour, as a
+        // cancelled agent's row marks it. The outcome stays in the row's
+        // accessible name and tooltip.
         Some(Trailing::Outcome(outcome)) => {
             let measure = label.measure();
+            let stopped = matches!(outcome.as_str(), "stopped" | "was stopped");
             cells.push(crate::ui_controls::yielding(
                 label.view(),
                 measure,
                 trailing_text(design::transcript(outcome)),
-                None,
+                stopped.then(|| state_dot(design::warning_color)),
                 step::GAP_S,
             ));
         }
@@ -389,5 +412,41 @@ mod tests {
             words.push(line.children().nth(1).unwrap().bounds().x);
         }
         assert!(words.windows(2).all(|pair| pair[0] == pair[1]), "{words:?}");
+    }
+
+    /// Where an outcome gives way to the name, a stop keeps a warning dot
+    /// in its place, as a cancelled agent's row does, while a finish leaves
+    /// nothing: the two must not read alike in a narrow pane.
+    #[test]
+    fn a_narrow_report_marks_a_stop_but_not_a_finish() {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        fn dots(layout: Layout<'_>) -> usize {
+            let bounds = layout.bounds();
+            usize::from(bounds.width == 6.0 && bounds.height == 6.0)
+                + layout.children().map(dots).sum::<usize>()
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        let drawn = |outcome: &str, width: f32| {
+            let mut element = row_named(
+                Headline::Name("Consolidate the directions".into()),
+                format!("Agent \"Consolidate the directions\" {outcome}"),
+                Icon::Chat,
+                None,
+                Some(Trailing::Outcome(outcome.into())),
+                Some(false),
+                None,
+            );
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 80.0)),
+            );
+            dots(Layout::new(&node))
+        };
+        assert_eq!(drawn("was stopped", 160.0), 1);
+        assert_eq!(drawn("stopped", 160.0), 1);
+        assert_eq!(drawn("finished", 160.0), 0);
+        assert_eq!(drawn("was stopped", 600.0), 0, "wide, the words show");
     }
 }

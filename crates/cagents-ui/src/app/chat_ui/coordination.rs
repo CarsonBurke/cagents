@@ -843,14 +843,14 @@ impl Row {
     /// name where the row cut it, the outcome's reason, what pressing does
     /// where it opens no agent, and then the message or prompt.
     fn described(&self) -> (String, String) {
-        let reason = self
-            .state
-            .detail
-            .as_deref()
-            .map(|detail| match self.state.tone {
-                Tone::Error => format!("{}: {detail}", self.state.text),
-                _ => detail.to_owned(),
-            });
+        // A warning or a failure names itself, as a narrow row keeps only
+        // its mark; a plain state is either drawn or the working dot.
+        let reason = match (self.state.tone, self.state.detail.as_deref()) {
+            (Tone::Plain, detail) => detail.map(str::to_owned),
+            (_, Some(detail)) => Some(format!("{}: {detail}", self.state.text)),
+            (_, None) => Some(self.state.text.to_string()),
+        }
+        .filter(|reason| !reason.trim().is_empty());
         let pressing = match (&self.open, self.several) {
             (Some(_), _) => "Opens the agent",
             (None, false) => OPENS_DETAIL,
@@ -887,27 +887,6 @@ impl Row {
         .join(" · ");
         (tip.join("\n\n"), name)
     }
-}
-
-/// The still mark of a state, in a dot the size of a caption's lowercase
-/// letters: the accent beside a live caption, or in its place, the state's
-/// colour, where a narrow row has no room for its words.
-fn state_dot(color: fn(&cosmic::Theme) -> iced::Color) -> Element<'static, Message> {
-    const SIZE: f32 = 6.0;
-    widget::container(widget::Space::new())
-        .width(Length::Fixed(SIZE))
-        .height(Length::Fixed(SIZE))
-        .class(cosmic::theme::Container::custom(move |theme| {
-            widget::container::Style {
-                background: Some(iced::Background::Color(color(theme))),
-                border: iced::Border {
-                    radius: (SIZE / 2.0).into(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            }
-        }))
-        .into()
 }
 
 /// A row's trailing status: a word or two, with the whole account of it in
@@ -1458,7 +1437,7 @@ impl Runtime {
         let live = row.state.live && matches!(row.state.tone, Tone::Plain);
         let mut state = Vec::new();
         if live {
-            state.push(state_dot(design::accent_color));
+            state.push(disclosure::state_dot(design::accent_color));
         }
         let status =
             design::transcript(row.state.text).wrapping(iced::widget::text::Wrapping::None);
@@ -1471,11 +1450,11 @@ impl Runtime {
         // Where the agent's name and its state no longer both fit, the state
         // keeps only its mark: the dot of work under way, or one in the
         // warning colour. A failure is told by the row's leading glyph, and
-        // a settled state by the absence of either; the words stay in the
-        // row's tooltip and accessible name.
+        // a settled state by the absence of either. A warning's words stay
+        // in the row's tooltip, and every state's in its accessible name.
         let compact = match row.state.tone {
-            Tone::Plain if live => Some(state_dot(design::accent_color)),
-            Tone::Warning => Some(state_dot(design::warning_color)),
+            Tone::Plain if live => Some(disclosure::state_dot(design::accent_color)),
+            Tone::Warning => Some(disclosure::state_dot(design::warning_color)),
             Tone::Plain | Tone::Error => None,
         };
         let content = crate::ui_controls::yielding(
