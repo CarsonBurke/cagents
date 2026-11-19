@@ -205,7 +205,8 @@ still() {
 first_breakpoint() {
     local below
     below=$(top_of 'five breakpoints')
-    ne drive observe 2>/dev/null | rg -- 'bp-360\.png|Click to enlarge' |
+    # OCR may split a long caption, such as "… · Click to enlarge".
+    ne drive observe 2>/dev/null | rg -- 'bp-360\.png|enlarge|attachment' |
         awk -v below="${below:-0}" '{ if (match($0, /[0-9]+, *[0-9]+ +[0-9]+x[0-9]+/)) {
             split(substr($0, RSTART, RLENGTH), p, /[, x]+/)
             if (p[2] <= below) next
