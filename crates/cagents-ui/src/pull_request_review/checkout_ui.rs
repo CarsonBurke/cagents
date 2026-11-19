@@ -210,7 +210,7 @@ impl State {
                             result,
                         }
                     },
-                    |action| super::Action::ExistingCheckout(action),
+                    super::Action::ExistingCheckout,
                 );
             }
             Action::Finished {
@@ -452,7 +452,7 @@ pub(crate) mod tests {
                 &repository,
                 &["config", "fixture.keep", "unrelated configuration"],
             );
-            let head = Oid::parse(&git(&repository, &["rev-parse", "HEAD"])).unwrap();
+            let head = Oid::parse(git(&repository, &["rev-parse", "HEAD"])).unwrap();
             let key = GitHubRepoKey::new("fixture.invalid", None, "owner", "repo").unwrap();
             Self {
                 _directory: directory,
@@ -579,7 +579,7 @@ pub(crate) mod tests {
         );
         assert!(
             git(
-                &repository,
+                repository,
                 &["for-each-ref", "--format=%(upstream)", "refs/heads/feature"]
             )
             .is_empty()
@@ -615,20 +615,20 @@ pub(crate) mod tests {
         );
         assert_eq!(
             git(
-                &repository,
+                repository,
                 &["for-each-ref", "--format=%(upstream)", "refs/heads/feature"]
             ),
             "refs/remotes/origin/feature"
         );
         assert_eq!(
-            git(&repository, &["config", "fixture.keep"]),
+            git(repository, &["config", "fixture.keep"]),
             "unrelated configuration"
         );
         assert!(
             state.take_effects().is_empty(),
             "the user decides when to open the verified result"
         );
-        state.range.as_mut().unwrap().head = Oid::parse(&"b".repeat(40)).unwrap();
+        state.range.as_mut().unwrap().head = Oid::parse("b".repeat(40)).unwrap();
         drop(state.update(super::super::Action::ExistingCheckout(Action::Open)));
         assert!(
             state.take_effects().is_empty(),
@@ -642,12 +642,12 @@ pub(crate) mod tests {
         );
         assert!(state.restart_blocker().is_none());
         std::fs::write(worktree.join("README"), "Reviewed content\nA local fix\n").unwrap();
-        git(&worktree, &["add", "README"]);
-        git(&worktree, &["commit", "-m", "Fix after checkout"]);
-        git(&worktree, &["push"]);
+        git(worktree, &["add", "README"]);
+        git(worktree, &["commit", "-m", "Fix after checkout"]);
+        git(worktree, &["push"]);
         assert_eq!(
-            git(&remote, &["rev-parse", "refs/heads/feature"]),
-            git(&worktree, &["rev-parse", "HEAD"]),
+            git(remote, &["rev-parse", "refs/heads/feature"]),
+            git(worktree, &["rev-parse", "HEAD"]),
             "ordinary git push must publish the existing checkout's fix to its PR head branch"
         );
     }
@@ -700,7 +700,7 @@ pub(crate) mod tests {
         std::fs::write(repository.join("README"), "Reviewed content\n").unwrap();
         git(&repository, &["add", "README"]);
         git(&repository, &["commit", "-m", "Reviewed fixture"]);
-        let reviewed = Oid::parse(&git(&repository, &["rev-parse", "HEAD"])).unwrap();
+        let reviewed = Oid::parse(git(&repository, &["rev-parse", "HEAD"])).unwrap();
         git(&repository, &["checkout", "-b", "feature"]);
         let url = "https://fixture.invalid/owner/repo.git";
         git(&repository, &["remote", "add", "origin", url]);
@@ -725,7 +725,7 @@ pub(crate) mod tests {
         std::fs::write(repository.join("README"), "A committed local fix\n").unwrap();
         git(&repository, &["add", "README"]);
         git(&repository, &["commit", "-m", "Unpublished local fix"]);
-        let local = Oid::parse(&git(&repository, &["rev-parse", "HEAD"])).unwrap();
+        let local = Oid::parse(git(&repository, &["rev-parse", "HEAD"])).unwrap();
         std::fs::write(repository.join("README"), "Staged local work\n").unwrap();
         git(&repository, &["add", "README"]);
         std::fs::write(repository.join("README"), "Unstaged local work\n").unwrap();

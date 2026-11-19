@@ -459,9 +459,7 @@ impl State {
             return label.to_owned();
         }
         let linked_hint = account.account.is_linked().then(|| {
-            account
-                .account
-                .resolved_home()
+            resolved_home(&account.account)
                 .as_deref()
                 .and_then(|home| {
                     let named = if home.file_name().is_some_and(|name| name == "home") {
@@ -648,12 +646,15 @@ impl State {
         self.accounts
             .iter()
             .filter(move |account| account.account.provider == provider)
-            .filter(|account| {
-                !account
-                    .account
-                    .registry_key()
-                    .is_some_and(|key| self.registry.is_archived(key))
-            })
+            .filter(|account| self.listed(account))
+    }
+
+    /// Whether `account` is listed, rather than archived.
+    fn listed(&self, account: &AccountState) -> bool {
+        !account
+            .account
+            .registry_key()
+            .is_some_and(|key| self.registry.is_archived(key))
     }
 
     /// Whether any account of `provider` other than `except` has a probe in
@@ -2069,7 +2070,7 @@ fn signs_in(account: &Account, recipe: &LaunchRecipe) -> bool {
     match named {
         Some(named) => account.resolved_home() == Some(named),
         // An unset home is the CLI's default, which only a system account
-        // exporting no home of its own resolves (as `account_of_recipe`).
+        // exporting no home of its own resolves (as `ProviderChoices::running`).
         None => {
             account.is_system()
                 && (!recipe.unset_environment.contains(variable) || account.launch_home().is_none())
@@ -2108,53 +2109,297 @@ pub(super) fn is_sign_in(recipe: &LaunchRecipe) -> bool {
     )
 }
 
-/// The account a conversation's launch runs on, by the home its recipe
-/// points the provider's CLI at.
-fn account_of_recipe<'a>(
-    accounts: &'a [AccountState],
-    provider: Provider,
-    recipe: &LaunchRecipe,
-) -> Option<&'a AccountState> {
-    let variable = account::home_variable(provider)?;
-    let chosen = recipe
-        .environment
-        .get(variable)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from);
-    let system = accounts
-        .iter()
-        .find(|state| state.account.provider == provider && state.account.is_system());
-    if recipe.unset_environment.contains(variable) {
-        // The CLI resolves its default: the system account's, unless this
-        // window's system account names a home of its own.
-        return system.filter(|state| state.account.launch_home().is_none());
+#[cfg(test)]
+thread_local! { static HOME_RESOLUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+/// How many times this thread has resolved an account's home from the
+/// process environment.
+#[cfg(test)]
+pub(super) fn home_resolutions() -> usize {
+    HOME_RESOLUTIONS.with(std::cell::Cell::get)
+}
+
+/// [`Account::resolved_home`], which reads the process environment.
+fn resolved_home(account: &Account) -> Option<PathBuf> {
+    #[cfg(test)]
+    HOME_RESOLUTIONS.with(|count| count.set(count.get() + 1));
+    account.resolved_home()
+}
+
+/// [`Account::launch_home`], which reads the process environment.
+fn launch_home(account: &Account) -> Option<PathBuf> {
+    #[cfg(test)]
+    HOME_RESOLUTIONS.with(|count| count.set(count.get() + 1));
+    account.launch_home()
+}
+
+/// The home a launch recipe points its provider's CLI at.
+enum RecipeHome<'a> {
+    /// It unsets the home, so the CLI resolves its default.
+    Default,
+    /// It names none, so the CLI is given whatever cagents itself was
+    /// started with.
+    Inherited,
+    Named(&'a Path),
+}
+
+impl<'a> RecipeHome<'a> {
+    /// `None` for a provider without a home variable.
+    fn of(provider: Provider, recipe: &'a LaunchRecipe) -> Option<Self> {
+        let variable = account::home_variable(provider)?;
+        if recipe.unset_environment.contains(variable) {
+            return Some(Self::Default);
+        }
+        Some(
+            recipe
+                .environment
+                .get(variable)
+                .filter(|value| !value.is_empty())
+                .map_or(Self::Inherited, |home| Self::Named(Path::new(home))),
+        )
     }
-    let Some(chosen) = chosen else {
-        return system;
-    };
-    accounts
-        .iter()
-        .filter(|state| state.account.provider == provider)
-        .find(|state| state.account.resolved_home().as_deref() == Some(chosen.as_path()))
-        .or_else(|| {
-            // A home the recipe inherited from cagents' own environment is
-            // the system account, however the reader spelled it.
-            let system_home = system?.account.resolved_home()?;
-            (system_home == chosen).then_some(system?)
-        })
+}
+
+/// The account state, with the choices every conversation's account picker
+/// offers derived from it.
+///
+/// Each view of a conversation offers its provider's accounts, and working
+/// those out names every account and resolves its home from the process
+/// environment, which is too much to do on every frame. They are derived on
+/// the first read after the state last changed instead: reaching the state
+/// mutably forgets them, so no change can leave a picker offering what was.
+/// The process environment they read is settled before the window starts
+/// (see [`account::detach_inherited_selections`]).
+#[derive(Default)]
+pub(super) struct Accounts {
+    state: State,
+    /// One for each way [`AccountUsageDisplay`] states usage, which the
+    /// settings choose between.
+    choices: [std::cell::OnceCell<Choices>; AccountUsageDisplay::ALL.len()],
+}
+
+impl From<State> for Accounts {
+    fn from(state: State) -> Self {
+        Self {
+            state,
+            choices: Default::default(),
+        }
+    }
+}
+
+impl std::ops::Deref for Accounts {
+    type Target = State;
+
+    fn deref(&self) -> &State {
+        &self.state
+    }
+}
+
+impl std::ops::DerefMut for Accounts {
+    fn deref_mut(&mut self) -> &mut State {
+        for choices in &mut self.choices {
+            choices.take();
+        }
+        &mut self.state
+    }
+}
+
+impl Accounts {
+    fn choices(&self, display: AccountUsageDisplay) -> &Choices {
+        let slot = match display {
+            AccountUsageDisplay::Left => 0,
+            AccountUsageDisplay::Used => 1,
+        };
+        self.choices[slot].get_or_init(|| Choices::of(&self.state, display))
+    }
+
+    /// Derives the choices as `display` states usage, so the next frame
+    /// reads them rather than working them out.
+    pub(super) fn settle_choices(&self, display: AccountUsageDisplay) {
+        self.choices(display);
+    }
+}
+
+/// What the conversations of each provider whose accounts cagents can tell
+/// apart could run on.
+struct Choices(BTreeMap<Provider, ProviderChoices>);
+
+impl Choices {
+    fn of(state: &State, display: AccountUsageDisplay) -> Self {
+        Self(
+            Account::PROVIDERS
+                .into_iter()
+                .map(|provider| (provider, ProviderChoices::of(state, provider, display)))
+                .collect(),
+        )
+    }
+}
+
+/// One provider's accounts as a conversation's account picker offers them,
+/// with the homes that tell which of them a conversation runs on.
+struct ProviderChoices {
+    provider: Provider,
+    /// Every account of the provider in list order, archived ones too,
+    /// which a conversation can still be running on.
+    accounts: Vec<Choice>,
+    /// The first account at each home.
+    by_home: BTreeMap<PathBuf, usize>,
+    system: Option<usize>,
+    /// Whether the system account exports a home of its own (see
+    /// [`Account::launch_home`]).
+    system_exports_home: bool,
+    /// How many listed accounts are present.
+    present: usize,
+}
+
+#[derive(Debug)]
+struct Choice {
+    id: AccountId,
+    label: String,
+    detail: String,
+    usage_fraction: Option<f32>,
+    tone: ChipTone,
+    listed: bool,
+    present: bool,
+    system: bool,
+}
+
+impl ProviderChoices {
+    fn of(state: &State, provider: Provider, display: AccountUsageDisplay) -> Self {
+        let mut choices = Self {
+            provider,
+            accounts: Vec::new(),
+            by_home: BTreeMap::new(),
+            system: None,
+            system_exports_home: false,
+            present: 0,
+        };
+        let accounts = state
+            .accounts
+            .iter()
+            .filter(|account| account.account.provider == provider);
+        for (index, account) in accounts.enumerate() {
+            if let Some(home) = resolved_home(&account.account) {
+                choices.by_home.entry(home).or_insert(index);
+            }
+            let system = account.account.is_system();
+            if system && choices.system.is_none() {
+                choices.system = Some(index);
+                choices.system_exports_home = launch_home(&account.account).is_some();
+            }
+            let listed = state.listed(account);
+            if listed && account.present {
+                choices.present += 1;
+            }
+            let mut detail = Vec::new();
+            if let Some(plan) = account.plan() {
+                detail.push(plan);
+            }
+            let window = account.selection_window();
+            let usage = window.map(|window| usage_figure(window.used, display));
+            let tone = window.map_or(ChipTone::Stale, |window| {
+                account.usage_tone(window, state.now_ms)
+            });
+            match (&account.snapshot, &usage) {
+                (_, Some(figure)) => detail.push(figure.text.clone()),
+                (Some(snapshot), None) if snapshot.status == UsageStatus::NeedsLogin => {
+                    detail.push("Signed out".into())
+                }
+                _ => {}
+            }
+            if state.registry.is_default(&account.account) {
+                detail.push("Default".into());
+            }
+            choices.accounts.push(Choice {
+                id: account.id.clone(),
+                label: state.display_name(account),
+                detail: detail.join(" · "),
+                usage_fraction: usage.map(|figure| figure.fraction),
+                tone,
+                listed,
+                present: account.present,
+                system,
+            });
+        }
+        choices
+    }
+
+    /// Which account a conversation launched as `recipe` runs on.
+    fn running(&self, recipe: &LaunchRecipe) -> Option<usize> {
+        match RecipeHome::of(self.provider, recipe)? {
+            // The CLI resolves its default: the system account's, unless
+            // this window's system account names a home of its own.
+            RecipeHome::Default => self.system.filter(|_| !self.system_exports_home),
+            RecipeHome::Inherited => self.system,
+            RecipeHome::Named(chosen) => self.by_home.get(chosen).copied(),
+        }
+    }
 }
 
 /// One account a conversation's composer offers.
-#[derive(Debug, Clone, PartialEq)]
-pub(super) struct ChatAccount {
-    pub id: AccountId,
-    pub label: String,
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct ChatAccount<'a> {
+    pub id: &'a AccountId,
+    pub label: &'a str,
     /// The plan and usage figure, where known: `Max · 62% left` or `Max · 38% used`.
-    pub detail: String,
+    pub detail: &'a str,
     pub selected: bool,
     /// The displayed usage fraction of the selection window, for its ring.
     pub usage_fraction: Option<f32>,
     pub tone: ChipTone,
+}
+
+/// The accounts a conversation's composer offers: its provider's present
+/// accounts, and the one it runs on whether or not that is.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct AccountChoices<'a> {
+    accounts: &'a [Choice],
+    current: Option<usize>,
+}
+
+impl<'a> AccountChoices<'a> {
+    pub(super) fn iter(self) -> AccountChoicesIter<'a> {
+        AccountChoicesIter {
+            accounts: self.accounts.iter().enumerate(),
+            current: self.current,
+        }
+    }
+
+    pub(super) fn len(self) -> usize {
+        self.iter().count()
+    }
+}
+
+impl<'a> IntoIterator for AccountChoices<'a> {
+    type Item = ChatAccount<'a>;
+    type IntoIter = AccountChoicesIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+pub(super) struct AccountChoicesIter<'a> {
+    accounts: std::iter::Enumerate<std::slice::Iter<'a, Choice>>,
+    current: Option<usize>,
+}
+
+impl<'a> Iterator for AccountChoicesIter<'a> {
+    type Item = ChatAccount<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let current = self.current;
+        self.accounts
+            .find(|(index, choice)| choice.listed && (choice.present || current == Some(*index)))
+            .map(|(index, choice)| ChatAccount {
+                id: &choice.id,
+                label: &choice.label,
+                detail: &choice.detail,
+                selected: current == Some(index),
+                usage_fraction: choice.usage_fraction,
+                tone: choice.tone,
+            })
+    }
 }
 
 /// One account the settings pane offers as a provider's default.
@@ -2166,11 +2411,11 @@ pub(super) struct DefaultChoice {
 }
 
 /// The account picker a conversation's composer shows.
-#[derive(Debug, Clone, PartialEq)]
-pub(super) struct ChatAccounts {
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ChatAccounts<'a> {
     /// What the picker's button says: the chosen account's name.
-    pub current: String,
-    pub choices: Vec<ChatAccount>,
+    pub current: &'a str,
+    pub choices: AccountChoices<'a>,
 }
 
 impl Cagents {
@@ -3715,10 +3960,10 @@ impl Cagents {
                 widget::text_input::focus(table::link_id())
             }
             Action::LinkInput(path) => {
-                if !self.account_ui.table.linking {
-                    if let Some((_, draft)) = &mut self.account_ui.table.link {
-                        *draft = path;
-                    }
+                if !self.account_ui.table.linking
+                    && let Some((_, draft)) = &mut self.account_ui.table.link
+                {
+                    *draft = path;
                 }
                 Task::none()
             }
@@ -4343,9 +4588,9 @@ impl Cagents {
             self.report_login_change(id);
             return Task::none();
         }
-        self.account_ui.login_changes_reported.remove(id);
         let learns = identity.email.is_some() && registered.email.is_none()
             || identity.organization.is_some() && registered.organization.is_none();
+        self.account_ui.login_changes_reported.remove(id);
         if !learns {
             return Task::none();
         }
@@ -5522,10 +5767,10 @@ impl Cagents {
         + 'static,
     ) -> Task<Message> {
         self.account_ui.table.close_popups();
-        if !self
+        if self
             .account_ui
             .account(&id)
-            .is_some_and(|state| state.account.registry_key().is_some())
+            .is_none_or(|state| state.account.registry_key().is_none())
             || !self.account_ui.removing.insert(id.clone())
         {
             return Task::none();
@@ -5748,17 +5993,29 @@ impl Cagents {
         provider: Provider,
         recipe: &LaunchRecipe,
     ) -> Option<AccountId> {
-        account_of_recipe(&self.account_ui.accounts, provider, recipe).map(|state| state.id.clone())
+        self.running_account(provider, recipe)
+            .map(|account| account.id.clone())
     }
 
     pub(super) fn resume_account_label(&self, session: &crate::chat::Session) -> String {
-        account_of_recipe(
-            &self.account_ui.accounts,
-            session.launch.provider,
-            &session.launch.recipe,
-        )
-        .map(|state| self.account_ui.display_name(state))
-        .unwrap_or_else(|| "Original account".into())
+        self.running_account(session.launch.provider, &session.launch.recipe)
+            .map_or_else(
+                || "Original account".into(),
+                |account| account.label.clone(),
+            )
+    }
+
+    /// The account a conversation launched as `recipe` runs on, by the home
+    /// its recipe points the provider's CLI at, if it is one cagents knows.
+    fn running_account(&self, provider: Provider, recipe: &LaunchRecipe) -> Option<&Choice> {
+        let offered = self
+            .account_ui
+            .choices(self.settings.account_usage_display)
+            .0
+            .get(&provider)?;
+        offered
+            .running(recipe)
+            .map(|index| &offered.accounts[index])
     }
 
     /// The accounts a conversation launched as `recipe` could run on, for
@@ -5769,61 +6026,26 @@ impl Cagents {
         &self,
         provider: Provider,
         recipe: &LaunchRecipe,
-    ) -> Option<ChatAccounts> {
+    ) -> Option<ChatAccounts<'_>> {
         // Only a provider with accounts cagents can tell apart has a choice.
-        if !Account::PROVIDERS.contains(&provider) {
-            return None;
-        }
-        let state = &self.account_ui;
-        let current = account_of_recipe(&state.accounts, provider, recipe);
-        let choices: Vec<ChatAccount> = state
-            .of(provider)
-            .filter(|account| {
-                account.present || Some(account.id.as_str()) == current.map(|c| c.id.as_str())
-            })
-            .map(|account| {
-                let mut detail = Vec::new();
-                if let Some(plan) = account.plan() {
-                    detail.push(plan);
-                }
-                let window = account.selection_window();
-                let usage = window
-                    .map(|window| usage_figure(window.used, self.settings.account_usage_display));
-                let tone = window.map_or(ChipTone::Stale, |window| {
-                    account.usage_tone(window, state.now_ms)
-                });
-                match (&account.snapshot, &usage) {
-                    (_, Some(figure)) => detail.push(figure.text.clone()),
-                    (Some(snapshot), None) if snapshot.status == UsageStatus::NeedsLogin => {
-                        detail.push("Signed out".into())
-                    }
-                    _ => {}
-                }
-                if state.registry.is_default(&account.account) {
-                    detail.push("Default".into());
-                }
-                ChatAccount {
-                    id: account.id.clone(),
-                    label: state.display_name(account),
-                    detail: detail.join(" · "),
-                    selected: current.is_some_and(|current| current.id == account.id),
-                    usage_fraction: usage.map(|figure| figure.fraction),
-                    tone,
-                }
-            })
-            .collect();
-        let current_label = match current {
-            Some(current) => state.display_name(current),
-            None => "Other home".into(),
-        };
-        if choices.is_empty()
-            || (choices.len() < 2 && current.is_some_and(|current| current.account.is_system()))
-        {
+        let offered = self
+            .account_ui
+            .choices(self.settings.account_usage_display)
+            .0
+            .get(&provider)?;
+        let running = offered.running(recipe);
+        let current = running.map(|index| &offered.accounts[index]);
+        let shown = offered.present
+            + usize::from(current.is_some_and(|current| current.listed && !current.present));
+        if shown == 0 || (shown < 2 && current.is_some_and(|current| current.system)) {
             return None;
         }
         Some(ChatAccounts {
-            current: current_label,
-            choices,
+            current: current.map_or("Other home", |current| current.label.as_str()),
+            choices: AccountChoices {
+                accounts: &offered.accounts,
+                current: running,
+            },
         })
     }
 
@@ -5847,9 +6069,9 @@ impl Cagents {
             .filter(|recipe| {
                 recipe
                     .environment
-                    .get(account::home_variable(provider).unwrap_or_default())
-                    .is_some()
-                    && account_of_recipe(&self.account_ui.accounts, provider, recipe)
+                    .contains_key(account::home_variable(provider).unwrap_or_default())
+                    && self
+                        .running_account(provider, recipe)
                         .is_some_and(|account| &account.id == id)
             })
             .count()
@@ -6373,7 +6595,6 @@ impl Cagents {
                 }),
             format!("Show {label} in the status bar"),
         )
-        .into()
     }
 
     fn account_header<'a>(
@@ -6813,7 +7034,7 @@ mod tests {
             })
             .unwrap();
         let mut app = context_inspector_test_app(false);
-        app.account_ui = State::new(None, Some(store.clone()), None);
+        app.account_ui = State::new(None, Some(store.clone()), None).into();
         app.settings.show_status_bar = false;
         app.refresh_ui.focused = true;
         assert!(!app.account_ui.registry_ready);
@@ -6879,7 +7100,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::at(directory.path());
         let mut app = context_inspector_test_app(false);
-        app.account_ui = State::new(None, Some(store.clone()), None);
+        app.account_ui = State::new(None, Some(store.clone()), None).into();
         app.settings.show_status_bar = false;
         app.refresh_ui.focused = true;
         let id = Account::system(Provider::Codex).id();
@@ -6937,7 +7158,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::at(directory.path());
         let mut app = context_inspector_test_app(false);
-        app.account_ui = State::new(None, Some(store.clone()), None);
+        app.account_ui = State::new(None, Some(store.clone()), None).into();
         app.settings.show_status_bar = false;
         let startup = app.account_ui.discovery_generation;
         app.refresh_ui.focused = true;
@@ -6973,7 +7194,7 @@ mod tests {
     #[test]
     fn failed_initial_registry_reads_stay_unready_until_a_successful_retry() {
         let mut app = context_inspector_test_app(false);
-        app.account_ui = State::new(None, None, None);
+        app.account_ui = State::new(None, None, None).into();
         app.refresh_ui.focused = true;
         let id = Account::system(Provider::Claude).id();
         drop(app.update(Message::AccountUi(Action::RemoteLoaded(
@@ -7045,7 +7266,7 @@ mod tests {
     #[test]
     fn an_explicit_login_can_finish_while_unrelated_initial_probes_wait() {
         let mut app = context_inspector_test_app(false);
-        app.account_ui = State::new(None, None, None);
+        app.account_ui = State::new(None, None, None).into();
         app.refresh_ui.focused = true;
         let id = Account::system(Provider::Codex).id();
         let other = Account::system(Provider::Claude).id();
@@ -7589,7 +7810,7 @@ mod tests {
                 let choice = accounts
                     .choices
                     .iter()
-                    .find(|choice| choice.id == id)
+                    .find(|choice| *choice.id == id)
                     .unwrap();
                 assert!(choice.detail.contains(&format!("{percent}% {suffix}")));
                 assert_eq!(choice.usage_fraction, Some(percent as f32 / 100.0));
@@ -7634,7 +7855,7 @@ mod tests {
                 let choice = accounts
                     .choices
                     .iter()
-                    .find(|choice| choice.id == id)
+                    .find(|choice| *choice.id == id)
                     .unwrap();
                 assert_eq!(choice.tone, ChipTone::Stale);
                 assert_eq!(choice.usage_fraction.is_some(), has_ring);
@@ -7967,9 +8188,11 @@ mod tests {
             working_directory: PathBuf::from("/w"),
             environment: BTreeMap::new(),
         };
+        let choices = ProviderChoices::of(&state, Provider::Claude, AccountUsageDisplay::Left);
         let found = |recipe: &LaunchRecipe| {
-            account_of_recipe(&state.accounts, Provider::Claude, recipe)
-                .map(|state| state.id.clone())
+            choices
+                .running(recipe)
+                .map(|index| choices.accounts[index].id.clone())
         };
         assert_eq!(found(&recipe), Some(Account::system(Provider::Claude).id()));
         recipe
@@ -13910,7 +14133,7 @@ mod app_tests {
         let original = store.load().unwrap();
         let inode = home.metadata().unwrap().ino();
         let mut app = context_inspector_test_app(false);
-        app.account_ui = State::new(None, Some(store.clone()), Some(homes.clone()));
+        app.account_ui = State::new(None, Some(store.clone()), Some(homes.clone())).into();
         app.account_ui.set_registry(original.clone());
         let requests = Arc::new(Mutex::new(Vec::new()));
         let seen = requests.clone();
@@ -14050,7 +14273,7 @@ mod app_tests {
         let original = store.load().unwrap();
         let inode = home.metadata().unwrap().ino();
         let mut app = context_inspector_test_app(false);
-        app.account_ui = State::new(None, Some(store.clone()), Some(homes.clone()));
+        app.account_ui = State::new(None, Some(store.clone()), Some(homes.clone())).into();
         app.account_ui.set_registry(original.clone());
         app.account_ui.logins.push(Login {
             provider: Provider::Codex,

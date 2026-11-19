@@ -324,160 +324,6 @@ mod service {
         }
     }
 
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn a_busy_refusal_reads_as_nothing_stopped_and_others_as_failures() {
-            use crate::terminal_ipc::{DAEMON_BUSY, ProtocolErrorCode};
-            let remote = |message: &str, retryable| ControlError::Remote {
-                code: ProtocolErrorCode::Internal,
-                message: message.into(),
-                retryable,
-            };
-            assert_eq!(stop_refused(remote(DAEMON_BUSY, true)), STOP_REFUSED_BUSY);
-            let other = remote("registry is unavailable", true);
-            let shown = other.to_string();
-            assert_eq!(
-                stop_refused(other),
-                format!("Could not stop the cagents daemon: {shown}")
-            );
-        }
-
-        #[test]
-        fn asynchronous_command_failure_is_visible_and_not_acceptance() {
-            assert_eq!(
-                child_outcome(false, b"", b"daemon restarted").unwrap_err(),
-                "daemon restarted"
-            );
-            assert_eq!(
-                child_outcome(false, b"refused: 2 live\n", b"daemon restarted\n").unwrap_err(),
-                "refused: 2 live; daemon restarted"
-            );
-            assert_eq!(child_outcome(false, b" \n", b"").unwrap_err(), "no output");
-            assert!(confirmation_result("").is_err());
-            assert!(confirmation_result("ready\n").is_err());
-        }
-
-        #[test]
-        fn a_refused_stop_reads_its_report_despite_stderr_noise() {
-            let report = serde_json::to_string(&StopReport::Finished {
-                outcome: ShutdownOutcome::InventoryChanged { current_count: 4 },
-            })
-            .unwrap();
-            let stdout = format!("{report}\n");
-            assert_eq!(
-                confirmation_outcome(false, stdout.as_bytes(), b"Gdk-WARNING: noise\n"),
-                Err("Not stopped: hosted sessions or background tasks changed (4 sessions now). Refresh and try again.".into())
-            );
-            assert_eq!(
-                confirmation_outcome(true, stdout.as_bytes(), b"noise\n"),
-                confirmation_result(&report)
-            );
-            // With no report, the streams explain the failure.
-            assert_eq!(
-                confirmation_outcome(false, b"", b"dialog crashed\n"),
-                Err("Could not stop the cagents daemon: dialog crashed".into())
-            );
-            assert!(confirmation_outcome(true, b"", b"").is_err());
-        }
-
-        #[test]
-        fn shutdown_outcomes_read_as_short_plain_copy() {
-            let line = |report: StopReport| serde_json::to_string(&report).unwrap();
-            assert_eq!(
-                confirmation_result(&line(StopReport::Finished {
-                    outcome: ShutdownOutcome::Accepted {
-                        live_terminals_before: 3,
-                        termination_requested: true,
-                    },
-                })),
-                Ok("Stopping… 3 hosted sessions will close".into())
-            );
-            assert_eq!(
-                confirmation_result(&line(StopReport::Cancelled)),
-                Ok("Stop cancelled; nothing was closed".into())
-            );
-            assert_eq!(
-                confirmation_result(&line(StopReport::Finished {
-                    outcome: ShutdownOutcome::InventoryChanged { current_count: 4 },
-                })),
-                Err("Not stopped: hosted sessions or background tasks changed (4 sessions now). Refresh and try again.".into())
-            );
-            // No outcome is worded with the CLI's field names.
-            for outcome in [
-                ShutdownOutcome::Accepted {
-                    live_terminals_before: 1,
-                    termination_requested: true,
-                },
-                ShutdownOutcome::EmptyRequired { current_count: 2 },
-                ShutdownOutcome::InventoryChanged { current_count: 2 },
-                ShutdownOutcome::Expired,
-                ShutdownOutcome::DaemonRestarted,
-                ShutdownOutcome::InvalidCapability,
-                ShutdownOutcome::AlreadyShuttingDown,
-                ShutdownOutcome::ConfirmationRequired { current_count: 2 },
-            ] {
-                let copy = shutdown_outcome_summary(&outcome);
-                assert!(!copy.contains('_') && !copy.contains('='), "{copy}");
-            }
-        }
-
-        #[test]
-        fn pending_activation_is_not_a_second_click_confirmation() {
-            let (updates, mut results) = mpsc::unbounded_channel();
-            let mut tray = DaemonTray::new(updates);
-            tray.pending = Some("Checking for open terminals…".into());
-            tray.run_action(true);
-            assert_eq!(tray.status(), "Checking for open terminals…");
-            assert!(results.try_recv().is_err());
-        }
-
-        #[test]
-        fn an_action_result_gives_way_to_the_live_status() {
-            let (updates, _results) = mpsc::unbounded_channel();
-            let mut tray = DaemonTray::new(updates);
-            let now = Instant::now();
-            let ttl = tray.finish(Ok("Opened cagents".into()), now);
-            assert_eq!(tray.status(), "Opened cagents");
-            tray.expire(now + ttl / 2);
-            assert_eq!(tray.status(), "Opened cagents");
-            tray.expire(now + ttl);
-            assert_eq!(tray.status(), "Daemon running");
-            // A failure outlasts a success, so a later look still finds it.
-            assert!(tray.finish(Err("Could not open".into()), now) > ttl);
-        }
-
-        #[test]
-        fn the_tooltip_keeps_a_failure_beside_the_agent_counts() {
-            let (updates, _results) = mpsc::unbounded_channel();
-            let mut tray = DaemonTray::new(updates);
-            assert_eq!(tray.tool_tip_description(), "Daemon running");
-            tray.tally = AgentTally {
-                working: 2,
-                waiting: 0,
-            };
-            tray.finish(Err("Could not open".into()), Instant::now());
-            assert_eq!(
-                tray.tool_tip_description(),
-                "Could not open\n2 agents working"
-            );
-        }
-
-        #[test]
-        fn agent_counts_read_as_one_line() {
-            let tally = |working, waiting| AgentTally { working, waiting }.summary();
-            assert_eq!(tally(0, 0), None);
-            assert_eq!(tally(1, 0).as_deref(), Some("1 agent working"));
-            assert_eq!(tally(0, 2).as_deref(), Some("2 agents waiting for you"));
-            assert_eq!(
-                tally(3, 1).as_deref(),
-                Some("3 agents working · 1 waiting for you")
-            );
-        }
-    }
-
     impl ksni::Tray for DaemonTray {
         fn id(&self) -> String {
             instance::APPLICATION_ID.into()
@@ -661,6 +507,160 @@ mod service {
         TrayGuard {
             shutdown: Some(shutdown_tx),
             worker,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_busy_refusal_reads_as_nothing_stopped_and_others_as_failures() {
+            use crate::terminal_ipc::{DAEMON_BUSY, ProtocolErrorCode};
+            let remote = |message: &str, retryable| ControlError::Remote {
+                code: ProtocolErrorCode::Internal,
+                message: message.into(),
+                retryable,
+            };
+            assert_eq!(stop_refused(remote(DAEMON_BUSY, true)), STOP_REFUSED_BUSY);
+            let other = remote("registry is unavailable", true);
+            let shown = other.to_string();
+            assert_eq!(
+                stop_refused(other),
+                format!("Could not stop the cagents daemon: {shown}")
+            );
+        }
+
+        #[test]
+        fn asynchronous_command_failure_is_visible_and_not_acceptance() {
+            assert_eq!(
+                child_outcome(false, b"", b"daemon restarted").unwrap_err(),
+                "daemon restarted"
+            );
+            assert_eq!(
+                child_outcome(false, b"refused: 2 live\n", b"daemon restarted\n").unwrap_err(),
+                "refused: 2 live; daemon restarted"
+            );
+            assert_eq!(child_outcome(false, b" \n", b"").unwrap_err(), "no output");
+            assert!(confirmation_result("").is_err());
+            assert!(confirmation_result("ready\n").is_err());
+        }
+
+        #[test]
+        fn a_refused_stop_reads_its_report_despite_stderr_noise() {
+            let report = serde_json::to_string(&StopReport::Finished {
+                outcome: ShutdownOutcome::InventoryChanged { current_count: 4 },
+            })
+            .unwrap();
+            let stdout = format!("{report}\n");
+            assert_eq!(
+                confirmation_outcome(false, stdout.as_bytes(), b"Gdk-WARNING: noise\n"),
+                Err("Not stopped: hosted sessions or background tasks changed (4 sessions now). Refresh and try again.".into())
+            );
+            assert_eq!(
+                confirmation_outcome(true, stdout.as_bytes(), b"noise\n"),
+                confirmation_result(&report)
+            );
+            // With no report, the streams explain the failure.
+            assert_eq!(
+                confirmation_outcome(false, b"", b"dialog crashed\n"),
+                Err("Could not stop the cagents daemon: dialog crashed".into())
+            );
+            assert!(confirmation_outcome(true, b"", b"").is_err());
+        }
+
+        #[test]
+        fn shutdown_outcomes_read_as_short_plain_copy() {
+            let line = |report: StopReport| serde_json::to_string(&report).unwrap();
+            assert_eq!(
+                confirmation_result(&line(StopReport::Finished {
+                    outcome: ShutdownOutcome::Accepted {
+                        live_terminals_before: 3,
+                        termination_requested: true,
+                    },
+                })),
+                Ok("Stopping… 3 hosted sessions will close".into())
+            );
+            assert_eq!(
+                confirmation_result(&line(StopReport::Cancelled)),
+                Ok("Stop cancelled; nothing was closed".into())
+            );
+            assert_eq!(
+                confirmation_result(&line(StopReport::Finished {
+                    outcome: ShutdownOutcome::InventoryChanged { current_count: 4 },
+                })),
+                Err("Not stopped: hosted sessions or background tasks changed (4 sessions now). Refresh and try again.".into())
+            );
+            // No outcome is worded with the CLI's field names.
+            for outcome in [
+                ShutdownOutcome::Accepted {
+                    live_terminals_before: 1,
+                    termination_requested: true,
+                },
+                ShutdownOutcome::EmptyRequired { current_count: 2 },
+                ShutdownOutcome::InventoryChanged { current_count: 2 },
+                ShutdownOutcome::Expired,
+                ShutdownOutcome::DaemonRestarted,
+                ShutdownOutcome::InvalidCapability,
+                ShutdownOutcome::AlreadyShuttingDown,
+                ShutdownOutcome::ConfirmationRequired { current_count: 2 },
+            ] {
+                let copy = shutdown_outcome_summary(&outcome);
+                assert!(!copy.contains('_') && !copy.contains('='), "{copy}");
+            }
+        }
+
+        #[test]
+        fn pending_activation_is_not_a_second_click_confirmation() {
+            let (updates, mut results) = mpsc::unbounded_channel();
+            let mut tray = DaemonTray::new(updates);
+            tray.pending = Some("Checking for open terminals…".into());
+            tray.run_action(true);
+            assert_eq!(tray.status(), "Checking for open terminals…");
+            assert!(results.try_recv().is_err());
+        }
+
+        #[test]
+        fn an_action_result_gives_way_to_the_live_status() {
+            let (updates, _results) = mpsc::unbounded_channel();
+            let mut tray = DaemonTray::new(updates);
+            let now = Instant::now();
+            let ttl = tray.finish(Ok("Opened cagents".into()), now);
+            assert_eq!(tray.status(), "Opened cagents");
+            tray.expire(now + ttl / 2);
+            assert_eq!(tray.status(), "Opened cagents");
+            tray.expire(now + ttl);
+            assert_eq!(tray.status(), "Daemon running");
+            // A failure outlasts a success, so a later look still finds it.
+            assert!(tray.finish(Err("Could not open".into()), now) > ttl);
+        }
+
+        #[test]
+        fn the_tooltip_keeps_a_failure_beside_the_agent_counts() {
+            let (updates, _results) = mpsc::unbounded_channel();
+            let mut tray = DaemonTray::new(updates);
+            assert_eq!(tray.tool_tip_description(), "Daemon running");
+            tray.tally = AgentTally {
+                working: 2,
+                waiting: 0,
+            };
+            tray.finish(Err("Could not open".into()), Instant::now());
+            assert_eq!(
+                tray.tool_tip_description(),
+                "Could not open\n2 agents working"
+            );
+        }
+
+        #[test]
+        fn agent_counts_read_as_one_line() {
+            let tally = |working, waiting| AgentTally { working, waiting }.summary();
+            assert_eq!(tally(0, 0), None);
+            assert_eq!(tally(1, 0).as_deref(), Some("1 agent working"));
+            assert_eq!(tally(0, 2).as_deref(), Some("2 agents waiting for you"));
+            assert_eq!(
+                tally(3, 1).as_deref(),
+                Some("3 agents working · 1 waiting for you")
+            );
         }
     }
 }

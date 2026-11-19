@@ -199,25 +199,23 @@ pub(super) fn update_terminal_source(
     if before == after {
         return Ok(());
     }
-    if before == Some(claimed_before) {
-        if let (Some(CardKind::Terminal(before)), Some(CardKind::Terminal(after))) = (before, after)
+    if before == Some(claimed_before)
+        && let (Some(CardKind::Terminal(before)), Some(CardKind::Terminal(after))) = (before, after)
+        && same_terminal_identity(before, after)
+        && ended_terminal(after)
+    {
+        if before
+            .continuity
+            .live_proof()
+            .is_some_and(|proof| proof.is_complete())
         {
-            if same_terminal_identity(before, after) && ended_terminal(after) {
-                if before
-                    .continuity
-                    .live_proof()
-                    .is_some_and(|proof| proof.is_complete())
-                {
-                    return write_terminal_source(db, id, before, after);
-                }
-                if before.continuity == after.continuity {
-                    if let Some((source, ended)) = terminal_source(db, id)? {
-                        if ended == *before {
-                            return write_terminal_source(db, id, &source, after);
-                        }
-                    }
-                }
-            }
+            return write_terminal_source(db, id, before, after);
+        }
+        if before.continuity == after.continuity
+            && let Some((source, ended)) = terminal_source(db, id)?
+            && ended == *before
+        {
+            return write_terminal_source(db, id, &source, after);
         }
     }
     db.execute(
@@ -677,13 +675,12 @@ pub(super) fn apply_recorded(
             if view.revision != *expected_revision {
                 return Err(Registry::VIEW_REVISION_CONFLICT.into());
             }
-            if let Change::UpdateTerminalSource { before, worker, .. } = change {
-                if bindings::read(transaction, before.id)?
+            if let Change::UpdateTerminalSource { before, worker, .. } = change
+                && bindings::read(transaction, before.id)?
                     .and_then(|b| b.basis)
                     .is_some_and(|original| &original != worker)
-                {
-                    return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
-                }
+            {
+                return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
             }
             changed = match change {
                 Change::Transfer {

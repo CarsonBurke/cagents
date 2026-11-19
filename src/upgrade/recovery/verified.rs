@@ -688,7 +688,10 @@ pub(super) mod tests {
         for provider in [Provider::Claude, Provider::Codex] {
             let fixture = Fixture::new(provider, true);
             let before = fs::read(&fixture.checkpoint).unwrap();
-            let view = fixture.load(&[fixture.current.clone()]).unwrap().unwrap();
+            let view = fixture
+                .load(std::slice::from_ref(&fixture.current))
+                .unwrap()
+                .unwrap();
             assert!(view.proves_chat(&fixture.source, &fixture.current));
             assert!(!view.paused_chat(&fixture.source));
             for mutation in 0..4 {
@@ -721,7 +724,11 @@ pub(super) mod tests {
         let mut changed = fixture.source.clone();
         changed.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
         assert!(!view.paused_chat(&changed));
-        assert!(fixture.load(&[fixture.current.clone()]).is_err());
+        assert!(
+            fixture
+                .load(std::slice::from_ref(&fixture.current))
+                .is_err()
+        );
     }
 
     #[test]
@@ -749,7 +756,11 @@ pub(super) mod tests {
                 .with_file_name(recovery_name(&fixture.record.checkpoint_hash)),
         )
         .unwrap();
-        assert!(fixture.load(&[fixture.current.clone()]).is_err());
+        assert!(
+            fixture
+                .load(std::slice::from_ref(&fixture.current))
+                .is_err()
+        );
         fixture.save();
         fs::remove_file(bound_capture_path(
             &fixture.checkpoint,
@@ -757,7 +768,10 @@ pub(super) mod tests {
         ))
         .unwrap();
         assert!(
-            fixture.load(&[fixture.current.clone()]).unwrap().is_some(),
+            fixture
+                .load(std::slice::from_ref(&fixture.current))
+                .unwrap()
+                .is_some(),
             "a settled read-only proof uses the immutable reviewed outcome, without minting a prepare receipt from its original capture"
         );
     }
@@ -801,14 +815,26 @@ pub(super) mod tests {
                 .is_none(),
             "archive evidence is never pending prepare authority"
         );
-        let view = fixture.load(&[fixture.current.clone()]).unwrap().unwrap();
+        let view = fixture
+            .load(std::slice::from_ref(&fixture.current))
+            .unwrap()
+            .unwrap();
         assert!(view.proves_chat(&fixture.source, &fixture.current));
         assert!(view.paused_chat(&fixture.record.census.chats[1]));
-        assert!(
-            matches!(crate::update::recovery::compare_with_recovery(&root_census(&fixture), &proof("successor"),
-            &fixture.record.adopted_terminal_descriptors, &[fixture.current.clone()], &Default::default(), Some(&view), None),
-            crate::update::recovery::Outcome::Usable { terminals:1, chats:1, paused_chats, .. } if paused_chats == fixture.record.paused_chats)
+        let outcome = crate::update::recovery::compare_with_recovery(
+            &root_census(&fixture),
+            &proof("successor"),
+            &fixture.record.adopted_terminal_descriptors,
+            std::slice::from_ref(&fixture.current),
+            &Default::default(),
+            Some(&view),
+            None,
         );
+        assert!(matches!(
+            outcome,
+            crate::update::recovery::Outcome::Usable { terminals: 1, chats: 1, paused_chats, .. }
+                if paused_chats == fixture.record.paused_chats
+        ));
     }
 
     #[test]
@@ -829,14 +855,21 @@ pub(super) mod tests {
             !completed_archive(&fixture.checkpoint, &fixture.target, &recovered).unwrap(),
             "canonical proof is not mechanical archive completion"
         );
-        assert!(fixture.load(&[fixture.current.clone()]).unwrap().is_some());
+        assert!(
+            fixture
+                .load(std::slice::from_ref(&fixture.current))
+                .unwrap()
+                .is_some()
+        );
         fs::rename(&fixture.checkpoint, &missing).unwrap();
         assert!(
             archived_proof(&fixture.checkpoint, &fixture.target).is_err(),
             "routing metadata without the actual archive is not archival proof"
         );
         assert!(
-            fixture.load(&[fixture.current.clone()]).is_err(),
+            fixture
+                .load(std::slice::from_ref(&fixture.current))
+                .is_err(),
             "metadata alone cannot prove missing actual archive bytes"
         );
         assert!(
@@ -846,14 +879,32 @@ pub(super) mod tests {
         fs::rename(&missing, &archive.archive_path).unwrap();
         write_private(&archive.archive_path, b"changed actual archive");
         assert!(completed_archive(&fixture.checkpoint, &fixture.target, &recovered).is_err());
-        assert!(fixture.load(&[fixture.current.clone()]).is_err());
+        assert!(
+            fixture
+                .load(std::slice::from_ref(&fixture.current))
+                .is_err()
+        );
         write_private(&archive.archive_path, &original);
-        assert!(fixture.load(&[fixture.current.clone()]).unwrap().is_some());
+        assert!(
+            fixture
+                .load(std::slice::from_ref(&fixture.current))
+                .unwrap()
+                .is_some()
+        );
         let retirement = fs::read(&archive.retirement_path).unwrap();
         write_private(&archive.retirement_path, b"changed immutable retirement");
-        assert!(fixture.load(&[fixture.current.clone()]).is_err());
+        assert!(
+            fixture
+                .load(std::slice::from_ref(&fixture.current))
+                .is_err()
+        );
         write_private(&archive.retirement_path, &retirement);
-        assert!(fixture.load(&[fixture.current.clone()]).unwrap().is_some());
+        assert!(
+            fixture
+                .load(std::slice::from_ref(&fixture.current))
+                .unwrap()
+                .is_some()
+        );
     }
     #[test]
     fn canonical_ready_checkpoint_suppresses_older_archived_recovery_proof() {
@@ -864,7 +915,10 @@ pub(super) mod tests {
         next["phase"] = "Ready".into();
         write_private(&fixture.checkpoint, &serde_json::to_vec(&next).unwrap());
         assert!(
-            fixture.load(&[fixture.current.clone()]).unwrap().is_none(),
+            fixture
+                .load(std::slice::from_ref(&fixture.current))
+                .unwrap()
+                .is_none(),
             "an existing canonical checkpoint prevents falling through to unrelated archived scope"
         );
         assert!(archive.archive_path.exists());

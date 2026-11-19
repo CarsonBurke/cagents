@@ -363,10 +363,10 @@ fn cargo_member(
             continue;
         }
         for path in dependency_paths(&member, workspace_value, &directory, root) {
-            if let Some(path) = budget.directory(&path) {
-                if path.starts_with(root) {
-                    queue.push_back(path);
-                }
+            if let Some(path) = budget.directory(&path)
+                && path.starts_with(root)
+            {
+                queue.push_back(path);
             }
         }
     }
@@ -505,9 +505,9 @@ fn javascript_workspace(
                     return false;
                 };
                 let mut config = directory.join(path);
-                if !config
+                if config
                     .extension()
-                    .is_some_and(|extension| extension == "json")
+                    .is_none_or(|extension| extension != "json")
                 {
                     config.push("tsconfig.json");
                 }
@@ -614,14 +614,11 @@ pub(super) fn discover(
                     .and_then(|package| package.get("workspace"))
                     .and_then(toml::Value::as_str)
                 {
-                    if let Some(root) = budget.directory(&directory.join(explicit)) {
-                        if let Some(workspace) = budget.cargo(&root) {
-                            if cargo_member(&root, &canonical, &workspace, &mut budget)
-                                == Some(true)
-                            {
-                                return Some(root);
-                            }
-                        }
+                    if let Some(root) = budget.directory(&directory.join(explicit))
+                        && let Some(workspace) = budget.cargo(&root)
+                        && cargo_member(&root, &canonical, &workspace, &mut budget) == Some(true)
+                    {
+                        return Some(root);
                     }
                     break;
                 }

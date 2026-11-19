@@ -294,7 +294,7 @@ fn poll_with(
         };
         stored.pending = Some((validator, now));
     }
-    let work = stored.scan.next();
+    let work = stored.scan.next_work();
     let lease = lease()?;
     let reply = polling::with_scope(credentials, || read(&work, lease));
     // A gh auth switch can race a subprocess. Never publish the response under

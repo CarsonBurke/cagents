@@ -478,8 +478,7 @@ async fn unavailable_explicit_file_protection_replaces_pixels_and_fences_old_rea
     let missing = root.join("retired-history");
     assert_eq!(
         crate::worktree_cleanup::protect(&missing)
-            .err()
-            .expect("the real guard must fail")
+            .expect_err("the real guard must fail")
             .kind(),
         std::io::ErrorKind::NotFound
     );
@@ -7344,7 +7343,7 @@ fn a_caret_after_a_stripped_carriage_return_reports_a_position_the_protocol_can_
     // content — while the editor treats the same `\r` as a terminator of
     // its own and will park a caret after it. A column that counted the
     // `\r` would name a character the protocol's line does not have, which
-    // `Snapshot::to_utf16` refuses with `PositionOutOfRange`: every hover,
+    // `Snapshot::utf16_position` refuses with `PositionOutOfRange`: every hover,
     // completion and definition asked from that caret would silently fail.
     assert_eq!(
         position_for_offset("a\r", 2),
@@ -7395,7 +7394,7 @@ fn every_reported_position_lands_inside_its_own_protocol_line() {
             assert!(
                 usize::try_from(at.character).unwrap() <= scalars,
                 "{text:?} offset {offset} reported {at:?}, but that line holds \
-                     {scalars} scalars — `Snapshot::to_utf16` would refuse it"
+                     {scalars} scalars — `Snapshot::utf16_position` would refuse it"
             );
             let addressed =
                 byte_offset(text, at).expect("a reported position addresses a real line");

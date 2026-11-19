@@ -6,6 +6,9 @@ rust-version = "1.93"
 license = "MIT"
 publish = false
 
+[lints]
+workspace = true
+
 [features]
 # The browserless UI. The packaged product selects `integrated-browser`.
 default = []

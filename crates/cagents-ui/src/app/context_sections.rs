@@ -319,11 +319,11 @@ impl Cagents {
         let mut children: Vec<Element<'_, Message>> = Vec::with_capacity(panes.len() * 3 + 3);
         if let Some((activity, _)) = activity {
             children.push(activity);
-            children.push(design::horizontal_rule().into());
+            children.push(design::horizontal_rule());
         }
         for (index, pane) in panes.into_iter().enumerate() {
             if index > 0 {
-                children.push(design::horizontal_rule().into());
+                children.push(design::horizontal_rule());
             }
             let Pane {
                 section,
@@ -364,7 +364,7 @@ impl Cagents {
         // Collapsed sections stay stacked at the top rather than spreading
         // over the height none of them claims.
         if !shared {
-            children.push(design::horizontal_rule().into());
+            children.push(design::horizontal_rule());
             children.push(iced::widget::Space::new().height(Length::Fill).into());
         }
         // The banners beneath the workspace come and go, so the height the

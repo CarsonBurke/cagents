@@ -6923,8 +6923,8 @@ fn project_header_row<'a>(
 /// `RowInteraction::actions`, which narrows it only while they are on screen,
 /// so a long project name reads in full until the moment it would run under
 /// them.
-fn project_identity_row<'a>(
-    project: &'a SidebarProject,
+fn project_identity_row(
+    project: &SidebarProject,
     selected: bool,
     modal_open: bool,
     compact: bool,
@@ -7022,8 +7022,8 @@ fn project_name_label(project: &SidebarProject, query: &str) -> Element<'static,
 /// read and are shown beside the failure. A running creation looks like the
 /// worktree row it is about to become, muted and with a spinner, so a slow
 /// `git worktree add` shows up the moment it is asked for.
-fn operation_rows<'a>(
-    project: &'a SidebarProject,
+fn operation_rows(
+    project: &SidebarProject,
     modal_open: bool,
 ) -> impl Iterator<Item = Element<'static, SidebarAction>> {
     let grid = RowGrid::child(false);
@@ -7079,8 +7079,8 @@ fn operation_rows<'a>(
 
 /// The same operation rows as [`operation_rows`], reduced to the icon rail the
 /// compact sidebar is made of: the one glyph is also the row's one control.
-fn compact_operation_rows<'a>(
-    project: &'a SidebarProject,
+fn compact_operation_rows(
+    project: &SidebarProject,
     modal_open: bool,
 ) -> impl Iterator<Item = Element<'static, SidebarAction>> {
     let grid = RowGrid::child(true);
@@ -7108,14 +7108,14 @@ fn compact_operation_rows<'a>(
 /// The leading glyph: the worktree icon the row will keep, muted, while the
 /// creation runs; a warning once it has failed. The spinner is the status
 /// slot's in a row, and a corner badge's in the rail.
-fn operation_icon<'a>(phase: WorktreeOperationPhase, size: u16) -> Element<'static, SidebarAction> {
+fn operation_icon(phase: WorktreeOperationPhase, size: u16) -> Element<'static, SidebarAction> {
     match phase {
         WorktreeOperationPhase::Working => worktree_glyph_muted(size).into(),
         WorktreeOperationPhase::Failed => toned_icon_sized(Icon::Warning, BadgeTone::Warning, size),
     }
 }
 
-fn operation_status<'a>(phase: WorktreeOperationPhase) -> Option<Element<'static, SidebarAction>> {
+fn operation_status(phase: WorktreeOperationPhase) -> Option<Element<'static, SidebarAction>> {
     match phase {
         WorktreeOperationPhase::Working => Some(crate::ui_controls::activity_spinner(
             f32::from(ROW_ICON_SIZE),
@@ -7145,8 +7145,8 @@ fn gated_operation_action(
     }
 }
 
-fn operation_control<'a>(
-    operation: &'a WorktreeOperationRow,
+fn operation_control(
+    operation: &WorktreeOperationRow,
     modal_open: bool,
 ) -> Option<Element<'static, SidebarAction>> {
     let action = gated_operation_action(operation, modal_open)?;
@@ -8364,7 +8364,7 @@ pub fn attention_indicator<Message: Clone + 'static>(
 
 /// A deletion under way takes the reserved slot: it is the one live thing
 /// about the row, and outranks whatever the row was doing before.
-fn deleting_indicator<'a>() -> Element<'static, SidebarAction> {
+fn deleting_indicator() -> Element<'static, SidebarAction> {
     crate::interaction::tooltip(
         crate::ui_controls::activity_spinner(f32::from(ROW_ICON_SIZE), design::muted_icon_color),
         "Deleting…",
@@ -8412,7 +8412,7 @@ fn deletion_ink(ink: RowInk, deletion: Option<&RowDeletion>) -> RowInk {
 }
 
 /// Mounts a row with the trailing retry a failed deletion offers.
-fn with_deletion_retry<'a>(
+fn with_deletion_retry(
     row: Element<'static, SidebarAction>,
     deletion: Option<&RowDeletion>,
     compact: bool,
@@ -8436,7 +8436,7 @@ fn with_deletion_retry<'a>(
 }
 
 /// A row's accessible name with the deletion it is part of.
-fn with_deletion_name<'a>(
+fn with_deletion_name(
     name: Cow<'static, str>,
     kind: &str,
     label: &str,
@@ -8977,7 +8977,7 @@ fn in_progress_row(
 /// selected row's. The content keeps its whole width either way, so nothing
 /// in the row moves when the pointer enters it. The rail has no room for the
 /// action at all.
-fn row_quick_delete<'a>(
+fn row_quick_delete(
     content: Element<'static, SidebarAction>,
     label: &str,
     action: Option<SidebarAction>,
@@ -9031,7 +9031,7 @@ fn hovered_row_end(selected: bool) -> theme::Container<'static> {
 /// A channel is the only navigation row whose contents exist nowhere else, so
 /// deleting one is destructive and the entry says so with an ellipsis: the
 /// application answers it with a confirmation rather than a removal.
-fn channel_context_controls<'a>(
+fn channel_context_controls(
     content: impl Into<Element<'static, SidebarAction>>,
     channel_id: ChannelId,
     modal_open: bool,
@@ -10264,7 +10264,7 @@ fn worktree_panel<'a>(
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into(),
-            crate::design::horizontal_rule().into(),
+            crate::design::horizontal_rule(),
             footer(false, modal_open),
         ])
         .width(Length::Fill)
@@ -10757,9 +10757,9 @@ fn panel_section<'a>(
         parts.action_name,
     );
     let header: Element<'a, SidebarAction> = if let Some(actions) = actions {
-        RowInteraction::actions(header.into(), actions, 0.0).into()
+        RowInteraction::actions(header, actions, 0.0)
     } else {
-        header.into()
+        header
     };
     let mut column = widget::column::with_capacity(2).push(header);
     if expanded {
@@ -12500,7 +12500,6 @@ fn history_notice(source: &SourceControlModel) -> Option<&'static str> {
 /// Rows use positional widget state. Their accessible name labels them, and
 /// no command addresses an individual row through a widget [`Id`]. Keeping
 /// these rows nameless also avoids retaining state for every filtered entry.
-
 fn panel_row<'a>(
     name: impl Into<Cow<'a, str>>,
     depth: usize,
@@ -13720,7 +13719,7 @@ fn search_label_within(
             cosmic::iced::widget::rich_text(spans)
                 .size(size)
                 .font(font)
-                .class(class.clone())
+                .class(class)
                 .wrapping(cosmic::iced::widget::text::Wrapping::None)
                 .width(Length::Fill),
         )
@@ -14737,41 +14736,41 @@ mod row_interaction {
                         }
                     }
                     Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
-                        if let Some((project, _)) = state.origin.take() {
-                            if state.dragging {
-                                if let Some((before, _)) = state.drop.take().filter(|_| hovered) {
-                                    shell.publish(match (&self.kind, project) {
-                                        (
-                                            Kind::Reorder {
-                                                project: Some(owner),
-                                                ..
-                                            },
-                                            source,
-                                        ) => SidebarAction::ReorderMember {
-                                            project: *owner,
-                                            source,
-                                            before,
+                        if let Some((project, _)) = state.origin.take()
+                            && state.dragging
+                        {
+                            if let Some((before, _)) = state.drop.take().filter(|_| hovered) {
+                                shell.publish(match (&self.kind, project) {
+                                    (
+                                        Kind::Reorder {
+                                            project: Some(owner),
+                                            ..
                                         },
-                                        (_, super::SelectionRow::Project(project)) => {
-                                            SidebarAction::ReorderProject {
-                                                project,
-                                                before: before.and_then(|row| {
-                                                    if let super::SelectionRow::Project(id) = row {
-                                                        Some(id)
-                                                    } else {
-                                                        None
-                                                    }
-                                                }),
-                                            }
+                                        source,
+                                    ) => SidebarAction::ReorderMember {
+                                        project: *owner,
+                                        source,
+                                        before,
+                                    },
+                                    (_, super::SelectionRow::Project(project)) => {
+                                        SidebarAction::ReorderProject {
+                                            project,
+                                            before: before.and_then(|row| {
+                                                if let super::SelectionRow::Project(id) = row {
+                                                    Some(id)
+                                                } else {
+                                                    None
+                                                }
+                                            }),
                                         }
-                                        _ => unreachable!(),
-                                    });
-                                }
-                                state.dragging = false;
-                                shell.request_redraw();
-                                shell.capture_event();
-                                return;
+                                    }
+                                    _ => unreachable!(),
+                                });
                             }
+                            state.dragging = false;
+                            shell.request_redraw();
+                            shell.capture_event();
+                            return;
                         }
                     }
                     Event::Window(window::Event::Unfocused)
@@ -15078,23 +15077,23 @@ mod row_interaction {
                         .draw(tree, renderer, theme, style, layout, cursor, viewport);
                 }
             }
-            if let Some((_, y)) = state.drop {
-                if let Some(clip) = layout.bounds().intersection(viewport) {
-                    renderer.with_layer(clip, |renderer| {
-                        renderer.fill_quad(
-                            renderer::Quad {
-                                bounds: Rectangle {
-                                    x: layout.bounds().x,
-                                    y: y - 1.0,
-                                    width: layout.bounds().width,
-                                    height: 2.0,
-                                },
-                                ..Default::default()
+            if let Some((_, y)) = state.drop
+                && let Some(clip) = layout.bounds().intersection(viewport)
+            {
+                renderer.with_layer(clip, |renderer| {
+                    renderer.fill_quad(
+                        renderer::Quad {
+                            bounds: Rectangle {
+                                x: layout.bounds().x,
+                                y: y - 1.0,
+                                width: layout.bounds().width,
+                                height: 2.0,
                             },
-                            cosmic::iced::Color::from(*theme.cosmic().accent_color()),
-                        );
-                    });
-                }
+                            ..Default::default()
+                        },
+                        cosmic::iced::Color::from(*theme.cosmic().accent_color()),
+                    );
+                });
             }
         }
 

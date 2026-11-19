@@ -889,7 +889,7 @@ pub(crate) fn capture_viewport(
     };
     let mut snapshot = base.clone();
     snapshot.columns = terminal.cols()?;
-    snapshot.rows = rows.max(1).min(500);
+    snapshot.rows = rows.clamp(1, 500);
     snapshot.scroll.total = terminal.total_rows()? as u64;
     snapshot.scroll.mouse_tracking = terminal.is_mouse_tracking()?;
     snapshot.scroll.bracketed_paste =
@@ -969,20 +969,20 @@ pub(crate) fn capture_viewport(
                 }
                 result => result.unwrap_or(0),
             };
-            if let Ok(link) = std::str::from_utf8(&uri[..length]) {
-                if !link.is_empty() {
-                    if let Some(last) = hyperlinks
-                        .last_mut()
-                        .filter(|last| last.end == column && last.uri == link)
-                    {
-                        last.end += 1;
-                    } else {
-                        hyperlinks.push(HyperlinkSpan {
-                            start: column,
-                            end: column + 1,
-                            uri: link.into(),
-                        });
-                    }
+            if let Ok(link) = std::str::from_utf8(&uri[..length])
+                && !link.is_empty()
+            {
+                if let Some(last) = hyperlinks
+                    .last_mut()
+                    .filter(|last| last.end == column && last.uri == link)
+                {
+                    last.end += 1;
+                } else {
+                    hyperlinks.push(HyperlinkSpan {
+                        start: column,
+                        end: column + 1,
+                        uri: link.into(),
+                    });
                 }
             }
         }

@@ -128,7 +128,7 @@ fn trailing_record(line: &[u8]) -> Option<(usize, Value)> {
                 while escapes > 0 && line[escapes - 1] == b'\\' {
                     escapes -= 1;
                 }
-                if (position - escapes) % 2 == 0 {
+                if (position - escapes).is_multiple_of(2) {
                     quoted = !quoted;
                 }
                 // Count every escape run only once during the reverse scan.
@@ -298,7 +298,7 @@ fn launch_model(arguments: &[String]) -> Option<String> {
 /// launched `--resume` ID. Rewrites the same flags `arguments()` validates
 /// so a checkpointed launch stays self-consistent. Forgery checks stay in
 /// `arguments()` — only call this with the live provider's own identity.
-pub fn align_resume_identity(arguments: &mut Vec<String>, id: &str) -> Result<(), String> {
+pub fn align_resume_identity(arguments: &mut [String], id: &str) -> Result<(), String> {
     let mut index = 0;
     while index < arguments.len() {
         let (flag, inline) = match arguments[index].split_once('=') {
@@ -1132,10 +1132,7 @@ impl Claude {
         if text.trim().is_empty() && attachments.is_empty() {
             return Err("A Claude prompt cannot be empty".into());
         }
-        if matches!(
-            text.trim().split_whitespace().next(),
-            Some("/resume" | "/fork")
-        ) {
+        if matches!(text.split_whitespace().next(), Some("/resume" | "/fork")) {
             return Err(
                 "Claude resume/fork commands require opening a separate native session".into(),
             );
@@ -1619,7 +1616,8 @@ impl Claude {
                 let mut aliases: Vec<_> = self
                     .resolved
                     .iter()
-                    .filter_map(|(alias, resolved)| (resolved == id).then(|| alias.clone()))
+                    .filter(|&(_alias, resolved)| resolved == id)
+                    .map(|(alias, _resolved)| alias.clone())
                     .collect();
                 aliases.sort_unstable();
                 aliases.dedup();
@@ -2115,10 +2113,8 @@ impl Claude {
                             // conversation, so only its launch is known.
                             let launched = child.is_none() && async_launch(frame);
                             let ended = self.ended_agent(&tool_id);
-                            if launched {
-                                if ended.is_none() {
-                                    self.background_agents.insert(tool_id.clone());
-                                }
+                            if launched && ended.is_none() {
+                                self.background_agents.insert(tool_id.clone());
                             }
                             let background = self.background_agents.contains(&tool_id);
                             let status = if let Some(ended) =
@@ -2763,12 +2759,11 @@ impl Claude {
                 .get(&ScopedId::new(None, tool))
                 .and_then(|item| item.content.status())
                 .is_some_and(|status| status != ToolStatus::Running)
+                && !self.restarted_agents.iter().any(|known| known == tool)
             {
-                if !self.restarted_agents.iter().any(|known| known == tool) {
-                    self.restarted_agents.push_back(tool.into());
-                    if self.restarted_agents.len() > MAX_TOOLS {
-                        self.restarted_agents.pop_front();
-                    }
+                self.restarted_agents.push_back(tool.into());
+                if self.restarted_agents.len() > MAX_TOOLS {
+                    self.restarted_agents.pop_front();
                 }
             }
             ToolStatus::Running
@@ -3606,14 +3601,14 @@ impl Adapter for Claude {
                 )
             }
             Command::ReadTextCopy { .. } => {
-                return Err("Text copies are served by the transcript cache".into());
+                Err("Text copies are served by the transcript cache".into())
             }
             Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. } => {
-                return Err("File changes are served by the transcript cache".into());
+                Err("File changes are served by the transcript cache".into())
             }
             Command::LoadLater => Err("Newer history is served by the transcript cache".into()),
             Command::ResumeAfterLogin { .. } => {
-                return Err("Live login verification is available for Codex chats".into());
+                Err("Live login verification is available for Codex chats".into())
             }
             Command::Refresh => self.control(json!({"subtype":"get_context_usage"})),
             Command::LoadEarlier => {
@@ -5569,8 +5564,8 @@ fn notification_heads(content: &str) -> Vec<&str> {
                 }
             }
             boundary.or(balanced).or(last)
-        } else if body.starts_with(CLOSE) {
-            Some(&body[CLOSE.len()..])
+        } else if let Some(rest) = body.strip_prefix(CLOSE) {
+            Some(rest)
         } else if body.starts_with("<event>") {
             body.split_once("</event>")
                 .and_then(|(_, tail)| closed(tail).map(|end| &tail[end..]))
@@ -5713,17 +5708,17 @@ fn task_notification(inner: &str) -> ItemContent {
         },
         None => (DeliveryKind::Notice, element("event").unwrap_or_default()),
     };
-    if kind == DeliveryKind::Notice {
-        if let Some((heading, command)) = command_notification(
+    if kind == DeliveryKind::Notice
+        && let Some((heading, command)) = command_notification(
             &summary,
             &element("status").unwrap_or_default(),
             "",
             "",
             false,
-        ) {
-            summary = heading;
-            body = command;
-        }
+        )
+    {
+        summary = heading;
+        body = command;
     }
     ItemContent::Delivery {
         kind,

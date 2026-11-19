@@ -1762,7 +1762,7 @@ pub(super) fn restore_does_not_relaunch_beside_a_process_in_the_saved_unit() {
     let process = directory.path().join("proc/43");
     fs::create_dir_all(&process).unwrap();
     fs::write(process.join("stat"), "43 (sleep) S 1").unwrap();
-    fs::write(process.join("cmdline"), b"sleep\01800\0").unwrap();
+    fs::write(process.join("cmdline"), b"sleep\x001800\0").unwrap();
     fs::write(process.join("environ"), b"").unwrap();
     fs::write(
         process.join("cgroup"),

@@ -804,8 +804,10 @@ mod tests {
 
     #[test]
     fn file_selection_discards_old_requests_and_unrelated_streaming_preserves_patch_cache() {
-        let mut state = State::default();
-        state.open = true;
+        let mut state = State {
+            open: true,
+            ..State::default()
+        };
         state.select(key("first.rs"));
         let old = state.request(true);
         for index in 0..200 {
@@ -852,12 +854,16 @@ mod tests {
         // The query transport routes pages to their requesters; neither
         // query can replace a shared actor-wide response slot.
         assert_ne!(a, b);
-        let mut first_list = chat::FileChangesSummary::default();
-        first_list.request_id = a;
-        first_list.revision = 10;
-        let mut second_list = chat::FileChangesSummary::default();
-        second_list.request_id = b;
-        second_list.revision = 20;
+        let first_list = chat::FileChangesSummary {
+            request_id: a,
+            revision: 10,
+            ..chat::FileChangesSummary::default()
+        };
+        let second_list = chat::FileChangesSummary {
+            request_id: b,
+            revision: 20,
+            ..chat::FileChangesSummary::default()
+        };
         second.complete(b, Ok(chat::FileChangeReply::Files(second_list)));
         first.complete(a, Ok(chat::FileChangeReply::Files(first_list)));
         first.select(key("same.rs"));

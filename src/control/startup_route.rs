@@ -53,14 +53,14 @@ pub(super) fn hold_launch_fence() -> crate::instance::UiUpdateGuard {
 pub(super) fn run_absent(arguments: Vec<OsString>) {
     let socket = daemon_socket_path().unwrap();
     assert!(
-        !matches!(UnixStream::connect(&socket), Ok(_)),
+        UnixStream::connect(&socket).is_err(),
         "the daemon must be gone"
     );
     let _fence = hold_launch_fence();
     let result = run_from_with_staged_lookup(arguments, |_, _| Ok(None));
     assert_eq!(result, ExitCode::FAILURE);
     assert!(
-        !matches!(UnixStream::connect(&socket), Ok(_)),
+        UnixStream::connect(&socket).is_err(),
         "no daemon was started"
     );
 }

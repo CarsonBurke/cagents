@@ -66,6 +66,7 @@ class Doctor(unittest.TestCase):
         result = self.doctor()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("ok   build host: fw16 answers over SSH", result.stdout)
+        self.assertIn("ok   niri-harness: found", result.stdout)
         self.assertIn("ssh -o BatchMode=yes -o ConnectTimeout=10 fw16 true auto=", self.calls())
         # Rust is asked without permission to download a toolchain.
         self.assertTrue(any(call.startswith("rustc --version auto=0") for call in self.calls()))
@@ -152,6 +153,12 @@ class Doctor(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout)
         for line in ("warn wayland:", "warn niri-harness: not found", "warn bwrap: not found"):
             self.assertIn(line, result.stdout)
+
+    def test_an_outdated_niri_harness_is_named(self):
+        self.tool("niri-harness", 'case "$1" in start) exit 2 ;; esac')
+        result = self.doctor()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("warn niri-harness: found, but too old for --instance", result.stdout)
 
     def test_the_build_host_check_can_be_skipped(self):
         self.offload(2)

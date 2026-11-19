@@ -305,8 +305,9 @@ def assess(report, head, since, superseded=()):
     """('wait'|'green'|'failed'|'moved'|'conflict'|'closed', detail) for one status read.
 
     A read fetched before SINCE, when this head was pushed or confirmed, may
-    only confirm this head's own state; one reporting a SUPERSEDED head is
-    GitHub not yet showing a push this run made.
+    only confirm this head's own state and cannot decide draft, closed or
+    conflict state; one reporting a SUPERSEDED head is GitHub not yet showing
+    a push this run made.
     """
     data = report.get("data") or {}
     snapshot = data.get("snapshot")
@@ -326,9 +327,9 @@ def assess(report, head, since, superseded=()):
             return "wait", "waiting for GitHub to report this head"
         return "moved", pr["headRefOid"]
     if pr["state"] != "OPEN":
-        return "closed", pr["state"].lower()
+        return ("closed", pr["state"].lower()) if current else ("wait", "waiting for GitHub to report it open")
     if pr.get("isDraft"):
-        return "closed", "converted to draft"
+        return ("closed", "converted to draft") if current else ("wait", "waiting for GitHub to report it ready")
     if pr.get("mergeable") == "CONFLICTING":
         # Only a current read decides; an older one may predate main's move.
         return ("conflict", "GitHub reports a conflict with main") if current else ("wait", "mergeability unsettled")

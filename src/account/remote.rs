@@ -124,10 +124,10 @@ pub(crate) fn affected_accounts(
     // Register reads the pending home and probes System for duplicate login
     // identity. Reserve both before either probe; an idempotent completed
     // registration has no probe and therefore needs no System reservation.
-    if let Operation::Register { provider, .. } = operation {
-        if !accounts.is_empty() {
-            accounts.push(super::Account::system(*provider));
-        }
+    if let Operation::Register { provider, .. } = operation
+        && !accounts.is_empty()
+    {
+        accounts.push(super::Account::system(*provider));
     }
     Ok(accounts)
 }
@@ -181,7 +181,7 @@ impl ListHeld {
     /// `error` from a non-blocking `flock` of this lock, as this refusal
     /// when the lock was held; any other failure as it stands.
     #[cfg(any(feature = "ui", feature = "host"))]
-    pub(crate) fn from_flock(self, error: std::io::Error) -> std::io::Error {
+    pub(crate) fn flock_error(self, error: std::io::Error) -> std::io::Error {
         if error.kind() == std::io::ErrorKind::WouldBlock {
             std::io::Error::new(std::io::ErrorKind::WouldBlock, self)
         } else {
@@ -828,7 +828,7 @@ mod tests {
         let host = crate::host::AccountReservation::test_host();
         let reservation = crate::host::AccountReservation::test_install(
             &host,
-            &[account.clone()],
+            std::slice::from_ref(&account),
             store.clone(),
             &homes,
         )
@@ -921,7 +921,7 @@ mod tests {
         let account = Account::linked(Provider::Codex, linked_key, linked.clone());
         let reservation = crate::host::AccountReservation::test_install(
             &host,
-            &[account.clone()],
+            std::slice::from_ref(&account),
             store.clone(),
             &homes,
         )

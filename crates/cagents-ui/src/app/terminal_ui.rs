@@ -574,13 +574,12 @@ impl Cagents {
                 && self.ended_terminal(*card).is_none()
                 && !self.terminal_close_pending(*card)
                 && let Some(CardRuntime::Terminal(handle)) = self.cards.get(card)
+                && let Err(error) = handle.paste(&text, crate::terminal::PasteOrigin::Clipboard)
             {
-                if let Err(error) = handle.paste(&text, crate::terminal::PasteOrigin::Clipboard) {
-                    error_notice = cosmic::task::message(Message::TerminalError {
-                        card: *card,
-                        message: error.to_string(),
-                    });
-                }
+                error_notice = cosmic::task::message(Message::TerminalError {
+                    card: *card,
+                    message: error.to_string(),
+                });
             }
             return Task::batch([
                 iced::widget::operation::focus(workspace_widget::card_focus_id(*card))
@@ -888,7 +887,7 @@ impl Cagents {
         };
         Some(
             widget::row::with_children(vec![
-                input.into(),
+                input,
                 widget::text(count).into(),
                 crate::ui_controls::button::quiet("Aa")
                     .instead("Aa ✓", find.case_sensitive)

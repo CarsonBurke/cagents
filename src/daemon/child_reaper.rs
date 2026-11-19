@@ -173,15 +173,14 @@ pub(crate) fn reserve() -> io::Result<Reservation> {
     service.reserve()
 }
 
-/// Explicit recovery uses only already retained original ownership; it never
-/// opens a new pidfd by a remembered numeric PID.
-#[cfg(test)]
+/// The daemon's lifecycle retries every RETENTION_RETRY while an entry is
+/// suspended, using only retained original ownership; it never opens a new
+/// pidfd by a remembered numeric PID.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct RetryReport {
     pub(crate) rearmed: usize,
     pub(crate) retained: usize,
 }
-#[cfg(test)]
 pub(crate) fn retry_preserved() -> io::Result<RetryReport> {
     match SERVICE.get() {
         None => Ok(RetryReport {
@@ -190,6 +189,12 @@ pub(crate) fn retry_preserved() -> io::Result<RetryReport> {
         }),
         Some(service) => service.retry_preserved(),
     }
+}
+
+pub(crate) fn has_suspended_custody() -> bool {
+    SERVICE
+        .get()
+        .is_some_and(|service| service.has_suspended_custody())
 }
 
 /// Pending spawn credits and retained original children are ownership even
@@ -475,7 +480,14 @@ impl Service {
             ticket,
         })
     }
-    #[cfg(test)]
+    fn has_suspended_custody(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.worker_alive
+            && !state.fatal
+            && !state.stopping
+            && state.entries.iter().flatten().any(|entry| entry.suspended)
+    }
+
     fn retry_preserved(&self) -> io::Result<RetryReport> {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         if state.stopping || state.fatal || !state.worker_alive {
@@ -498,20 +510,20 @@ impl Service {
             }
         }
         // As with retain, the worker cannot see a rearm that failed its wake.
-        if !rearmed.is_empty() {
-            if let Err(error) = self.wake() {
-                for slot in rearmed {
-                    state.entries[slot]
-                        .as_mut()
-                        .expect("retained under the state lock")
-                        .suspended = true;
-                }
-                state.failure = Some(format!("Exact-child recovery wake failed: {error}"));
-                self.progress(&mut state);
-                drop(state);
-                crate::daemon::wake();
-                return Err(error);
+        if !rearmed.is_empty()
+            && let Err(error) = self.wake()
+        {
+            for slot in rearmed {
+                state.entries[slot]
+                    .as_mut()
+                    .expect("retained under the state lock")
+                    .suspended = true;
             }
+            state.failure = Some(format!("Exact-child recovery wake failed: {error}"));
+            self.progress(&mut state);
+            drop(state);
+            crate::daemon::wake();
+            return Err(error);
         }
         let retained = state
             .entries
@@ -651,11 +663,11 @@ impl Service {
                 self.fail(error);
                 return;
             }
-            if poll[0].revents != 0 {
-                if let Err(error) = self.drain_wake() {
-                    self.fail(error);
-                    return;
-                }
+            if poll[0].revents != 0
+                && let Err(error) = self.drain_wake()
+            {
+                self.fail(error);
+                return;
             }
             for ((slot, ticket, _), ready) in snapshot.iter().zip(&poll[1..]) {
                 if ready.revents == 0 {
@@ -784,6 +796,9 @@ mod tests {
         }
         pub(crate) fn retained_custody_error(&self) -> Option<String> {
             self.service.retained_custody_error()
+        }
+        pub(crate) fn has_suspended_custody(&self) -> bool {
+            self.service.has_suspended_custody()
         }
     }
     impl Drop for TestService {
@@ -1135,6 +1150,41 @@ mod tests {
         assert!(drain.try_seal_absence());
         assert!(drain.clone().try_seal_absence());
         assert!(reaper.reserve().is_err());
+    }
+
+    #[test]
+    fn suspended_custody_is_reported_until_a_validated_rearm() {
+        let reaper = TestService::new(1);
+        let reservation = reaper.reserve().unwrap();
+        let mut original = DrainChild::spawn();
+        let pidfd = original.pidfd.try_clone().unwrap();
+        reservation.preserve_suspended(original.child.take().unwrap(), Some(pidfd), "fixture");
+        assert!(reaper.has_suspended_custody());
+        assert_eq!(
+            reaper.retry_preserved().unwrap(),
+            RetryReport {
+                rearmed: 1,
+                retained: 0,
+            }
+        );
+        assert!(!reaper.has_suspended_custody());
+        original.stdin.take();
+        reaper.await_free(1);
+        original.assert_original_reaped();
+
+        let reservation = reaper.reserve().unwrap();
+        let mut missing = DrainChild::spawn();
+        reservation.preserve_suspended(missing.child.take().unwrap(), None, "fixture");
+        assert!(reaper.has_suspended_custody());
+        assert_eq!(
+            reaper.retry_preserved().unwrap(),
+            RetryReport {
+                rearmed: 0,
+                retained: 1,
+            }
+        );
+        assert!(reaper.has_suspended_custody());
+        missing.stdin.take();
     }
 
     #[test]

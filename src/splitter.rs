@@ -126,7 +126,6 @@ impl<'a, Message: 'a> Splitter<'a, Message> {
                     state.last_click = Some(now);
                     state.begin_drag(position.x, self.width);
                     shell.capture_event();
-                    return;
                 }
             }
             Event::Mouse(mouse::Event::CursorMoved { position }) => {
@@ -134,14 +133,12 @@ impl<'a, Message: 'a> Splitter<'a, Message> {
                     state.last_click = None;
                     shell.publish(self.resize(width));
                     shell.capture_event();
-                    return;
                 }
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
                 if state.finish_drag() {
                     shell.publish((self.on_finish)());
                     shell.capture_event();
-                    return;
                 }
             }
             Event::Window(window::Event::Unfocused) => {
@@ -159,7 +156,6 @@ impl<'a, Message: 'a> Splitter<'a, Message> {
                 shell.publish(self.resize(origin.width));
                 shell.publish((self.on_finish)());
                 shell.capture_event();
-                return;
             }
             Event::Keyboard(keyboard::Event::KeyPressed {
                 key,
@@ -170,14 +166,12 @@ impl<'a, Message: 'a> Splitter<'a, Message> {
                 if let Some(delta) = state.keyboard_resize(self.keyboard_delta(key)) {
                     shell.publish(self.resize(self.width + delta));
                     shell.capture_event();
-                    return;
                 }
             }
             Event::Keyboard(keyboard::Event::KeyReleased { key, .. }) if state.keyboard_gesture => {
                 if state.finish_keyboard_gesture(self.keyboard_delta(key).is_some()) {
                     shell.publish((self.on_finish)());
                     shell.capture_event();
-                    return;
                 }
             }
             Event::A11y(id, request) if *id == self.id => {
@@ -196,7 +190,6 @@ impl<'a, Message: 'a> Splitter<'a, Message> {
                     _ => {}
                 }
                 shell.capture_event();
-                return;
             }
             _ => {}
         }
