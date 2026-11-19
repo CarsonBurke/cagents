@@ -1898,16 +1898,30 @@ impl Cagents {
     /// close. A fenced pane's saved session is unconfirmed, so nothing is
     /// asked of its agent: deleting the channel retires only the pane.
     pub(super) fn channel_sessions_to_close(&self, cards: &[CardId]) -> Vec<CardKind> {
-        self.durable
-            .cards
-            .iter()
-            .filter(|card| {
-                cards.contains(&card.id)
-                    && card.existence.is_open()
-                    && !self.shared_views.quarantined.contains(&card.id)
-            })
+        self.channel_cards_to_close(cards)
             .map(|card| card.kind.clone())
             .collect()
+    }
+
+    /// Whether deleting a channel of `cards` leaves the daemon a conversation
+    /// to close: whether [`Self::channel_sessions_to_close`] holds a chat or
+    /// a terminal, asked without cloning every card's kind.
+    fn channel_holds_sessions(&self, cards: &[CardId]) -> bool {
+        self.channel_cards_to_close(cards)
+            .any(|card| matches!(card.kind, CardKind::Terminal(_) | CardKind::Chat(_)))
+    }
+
+    /// The open, unfenced cards of `cards`: those whose saved sessions
+    /// deleting their channel asks the daemon to close.
+    fn channel_cards_to_close<'a>(
+        &'a self,
+        cards: &'a [CardId],
+    ) -> impl Iterator<Item = &'a CardState> + 'a {
+        self.durable.cards.iter().filter(move |card| {
+            cards.contains(&card.id)
+                && card.existence.is_open()
+                && !self.shared_views.quarantined.contains(&card.id)
+        })
     }
 
     /// Removes a channel along with everything that existed only inside it.
@@ -1998,11 +2012,7 @@ impl Cagents {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     Message::ChannelUi(Action::RetryDelete(id))
                 }));
-            } else if self
-                .channel_sessions_to_close(&cards)
-                .iter()
-                .any(|kind| matches!(kind, CardKind::Terminal(_) | CardKind::Chat(_)))
-            {
+            } else if self.channel_holds_sessions(&cards) {
                 closing.push(id);
             } else {
                 self.channel_ui.deleting.remove(&id);
@@ -4094,6 +4104,47 @@ pub(in crate::app) mod tests {
         }
         app.refresh_sidebar_channels();
         (app, channels, conversation)
+    }
+
+    /// A member closed before the deletion leaves the channel when the
+    /// workspace leaves it. The close captures the channel as the leave left
+    /// it, so its receipt retires the channel rather than refusing it as
+    /// changed.
+    #[test]
+    fn a_member_the_leave_prunes_does_not_refuse_the_close() {
+        let (mut app, doomed, _survivor, _conversation) = channel_with_a_conversation();
+        let closed = CardId::new();
+        let durable = Arc::make_mut(&mut app.durable);
+        let mut card = durable.cards[0].clone();
+        card.id = closed;
+        card.existence = super::super::project_ui::removed_existence("closed before");
+        durable.cards.push(card);
+        durable
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == doomed)
+            .unwrap()
+            .cards
+            .push(closed);
+
+        drop(app.delete_channel(doomed));
+        assert!(
+            !app.durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == doomed)
+                .unwrap()
+                .cards
+                .contains(&closed),
+            "leaving the channel pruned its closed member"
+        );
+        drop(app.handle_channel_ui(Action::SessionsClosed(
+            doomed,
+            app.channel_ui.close_operation(doomed),
+            Ok(()),
+        )));
+        assert!(!app.channel_ui.failed.contains_key(&doomed));
+        assert!(!channel_exists(&app, doomed), "the channel retired");
     }
 
     /// Closing a project takes all its channels in one pass. However many it
