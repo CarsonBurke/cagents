@@ -87,6 +87,7 @@ JOBS = (
               sources=("scripts/build-host", "scripts/memory-capped", "scripts/cargo-gate-rustc-guard")),
     )),
     Job("build directories", suites=(
+        Suite("Cargo build layout", "tests/cargo_build_layout.py", sources=("scripts/cargo_build_layout.py",)),
         Suite("build directory pruning", "tests/prune_build_dirs.py", sources=("scripts/prune-build-dirs",)),
         Suite("build directory seeding", "tests/seed_build_dir.py", sources=("scripts/seed-build-dir",),
               syntax=(("sh", "scripts/seed-build-dir"),)),
