@@ -582,6 +582,32 @@ impl Commands {
         withdrawn
     }
 
+    /// Takes back the reader's messages for a turn the provider has yet to
+    /// start, as a stop given before it does: those it took whose turn has
+    /// not begun, the one on its way, and those waiting. Returns them in the
+    /// order they were written. One the provider took may still start its
+    /// turn, which the stop then ends.
+    pub(super) fn withdraw_before_turn(&mut self, snapshot: &Snapshot) -> Vec<Outgoing> {
+        let mut withdrawn = Vec::new();
+        for settling in std::mem::take(&mut self.settling) {
+            match settling.effect {
+                Effect::Outgoing(outgoing)
+                    if outgoing.in_transcript() && snapshot.turn_generation == outgoing.turns =>
+                {
+                    withdrawn.push(outgoing);
+                }
+                effect => self.settling.push(Settling { effect, ..settling }),
+            }
+        }
+        withdrawn.extend(
+            self.in_flight
+                .as_mut()
+                .and_then(PendingCommand::take_unsent),
+        );
+        withdrawn.extend(self.withdraw_messages());
+        withdrawn
+    }
+
     /// Forgets every command, as when the conversation they were for is
     /// gone. Returns the messages that had not been accepted, in order.
     pub(super) fn abandon(&mut self) -> Vec<Outgoing> {
@@ -766,6 +792,20 @@ impl Runtime {
     /// on its way is to start, as a conversation reads once it takes one.
     pub(super) fn turn_running(&self) -> bool {
         self.snapshot.busy && !self.commands.turn_coming(&self.snapshot)
+    }
+
+    /// Takes back, into the composer, the reader's messages for a turn the
+    /// provider has yet to start, as Stop does while the conversation waits
+    /// for it: [`Commands::withdraw_before_turn`]. Whether it had any.
+    pub(super) fn withdraw_before_turn(&mut self) -> bool {
+        if !self.snapshot.busy || !self.commands.turn_coming(&self.snapshot) {
+            return false;
+        }
+        let snapshot = self.snapshot.clone();
+        let messages = self.commands.withdraw_before_turn(&snapshot);
+        self.restore_outgoing(messages);
+        self.prepare_local_prompt();
+        true
     }
 
     /// Lets go of what `snapshot` shows of this chat's commands, as
@@ -1320,6 +1360,58 @@ mod tests {
             assert_eq!(runtime.commands.outgoing().count(), 0);
             assert!(runtime.commands.is_idle());
         }
+    }
+
+    /// Stop is offered whenever the conversation works, also while it waits
+    /// for a message's turn to begin, which can be slow or never come.
+    /// Pressed then, it takes what was written for that turn back into the
+    /// composer, in order, and still tells the provider to stop, so a turn
+    /// that begins anyway ends. Nothing reads as refused.
+    #[test]
+    fn stop_before_the_turn_begins_takes_back_what_was_written_for_it() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        publish(&mut app, card, |snapshot| {
+            snapshot.capabilities.steer = true;
+        });
+        sending(&mut app, card, "Look at the logs");
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .replace_draft(text_editor::Content::with_text("Then fix them"));
+        drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Steer))));
+        settle(&mut app, card, Ok(()));
+        publish(&mut app, card, |snapshot| snapshot.busy = true);
+        let runtime = chat_runtime(&app, card);
+        assert!(!runtime.turn_running(), "no turn to steer yet");
+        assert_eq!(runtime.commands.outgoing().count(), 2);
+
+        drop(app.update(Message::ChatUi(Action::Interrupt(target))));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.commands.outgoing().count(), 0);
+        assert_eq!(
+            runtime.composer.text().trim_end(),
+            "Look at the logs\nThen fix them"
+        );
+        let stop = runtime.commands.in_flight().expect("the provider is told");
+        assert_eq!(stop.repeat, Some(Command::Interrupt));
+        assert_eq!(runtime.commands.waiting(), 0);
+        assert!(runtime.error.is_none());
+
+        // A turn that begins anyway shows the message and ends; the text
+        // stays in the composer for the reader to send again or let go.
+        settle(&mut app, card, Ok(()));
+        publish(&mut app, card, |snapshot| {
+            snapshot.turn_generation += 1;
+            snapshot.items.push(user_text("u-logs", "Look at the logs"));
+        });
+        publish(&mut app, card, |snapshot| snapshot.busy = false);
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.commands.is_idle());
+        assert_eq!(
+            runtime.composer.text().trim_end(),
+            "Look at the logs\nThen fix them"
+        );
     }
 
     /// A message written to steer the turn the one before it starts goes as

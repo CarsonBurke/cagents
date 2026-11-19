@@ -2769,8 +2769,6 @@ struct FinishedStamp {
     outcome: &'static str,
 }
 
-/// Sends `command` to the conversation `handle` reaches, off the UI thread,
-/// and answers with its outcome. Without one, it is answered as not sent.
 /// [`Action::CommandsDue`] for `target`, once a turn has had time to begin.
 fn commands_due(target: Target) -> Task<Message> {
     cosmic::task::future(async move {
@@ -2779,6 +2777,8 @@ fn commands_due(target: Target) -> Task<Message> {
     })
 }
 
+/// Sends `command` to the conversation `handle` reaches, off the UI thread,
+/// and answers with its outcome. Without one, it is answered as not sent.
 fn run_chat_command(
     target: Target,
     id: u64,
@@ -13937,6 +13937,10 @@ impl Cagents {
                     });
                 }
                 runtime.interrupt_armed = None;
+                // Before the turn has begun, Stop also takes back what was
+                // written for it. The provider is still told to stop, so a
+                // turn that begins anyway ends.
+                runtime.withdraw_before_turn();
                 return self.chat_send(target, Command::Interrupt, false);
             }
             Action::DisarmInterrupt(target, at) => {

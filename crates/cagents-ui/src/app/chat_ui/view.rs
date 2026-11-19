@@ -3595,10 +3595,10 @@ impl Runtime {
         // a user arrives from works and what the composer already answers to.
         // A dropdown listing them duplicated that path in a control that was
         // permanently present for something used occasionally.
-        // Stop waits for a turn to stop, as the placeholder waits for one to
-        // steer.
+        // Stop is there whenever the conversation works, turn or not: it is
+        // the way out of a turn that is slow to begin.
         let submissions: Vec<Element<'_, Message>> =
-            composer_trailing(modes, self.turn_running(), has_draft)
+            composer_trailing(modes, snapshot.busy, has_draft)
                 .into_iter()
                 .map(|control| match control {
                     Trailing::Submit { mode, slot } => {
@@ -4048,8 +4048,10 @@ impl Runtime {
             Cow::Owned(format!(
                 "Cancel active turn (Esc). This also stops {at_stake} background {subagents}"
             ))
-        } else {
+        } else if self.turn_running() {
             Cow::Borrowed("Cancel active turn (Esc)")
+        } else {
+            Cow::Borrowed("Stop, and take back the message on its way (Esc)")
         };
         let mut control = crate::ui_controls::icon_button(Icon::Stop, tooltip)
             .id(card_control_id(target.card, "chat-stop"))
