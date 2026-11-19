@@ -6463,6 +6463,8 @@ impl Runtime {
         self.presentation_revision = self.presentation_revision.wrapping_add(1);
         self.find_navigation.changed_document();
         self.presentation_evicted = true;
+        // An open viewer keeps only the image it shows.
+        images::sync_viewer(self);
     }
 
     /// Evict disposable body/presentation owners while keeping the small
@@ -13830,18 +13832,26 @@ impl Cagents {
                 // the keyboard itself.
                 // Starting a draft can replace its runtime, so the card, not
                 // the generation, names the composer that keeps the keyboard.
-                let composer = match self.cards.get(&target.card) {
-                    Some(CardRuntime::Chat(runtime)) => !runtime.permission_picker,
-                    _ => false,
+                // An open image takes the keyboard back, as sending with the
+                // keyboard does, so the next Escape closes it rather than
+                // interrupt the reply.
+                let (composer, viewing) = match self.cards.get(&target.card) {
+                    Some(CardRuntime::Chat(runtime)) => (
+                        !runtime.permission_picker,
+                        runtime.image_viewer.is_some() && runtime.child_picker.is_none(),
+                    ),
+                    _ => (false, false),
                 };
                 if self.resume_ui.open || !composer {
                     return submitted;
                 }
-                return Task::batch([
-                    submitted,
+                let focus = if viewing {
+                    self.focus_image_viewer(target)
+                } else {
                     iced::widget::operation::focus(card_control_id(target.card, "chat-composer"))
-                        .map(cosmic::Action::App),
-                ]);
+                        .map(cosmic::Action::App)
+                };
+                return Task::batch([submitted, focus]);
             }
             Action::Submit(target, mode) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {

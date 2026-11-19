@@ -8205,7 +8205,7 @@ pub(super) fn answer_start(
 /// Focus is a widget operation, not a message. Each operation the task
 /// issues is shown two controls the way a widget tree would show them:
 /// the one asked about, and another that holds the keyboard.
-fn task_focuses(task: Task<Message>, control: &widget::Id) -> (bool, bool) {
+pub(super) fn task_focuses(task: Task<Message>, control: &widget::Id) -> (bool, bool) {
     task_focuses_from(task, control, &widget::Id::new("the control in use"))
 }
 

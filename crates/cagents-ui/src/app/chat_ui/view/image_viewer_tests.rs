@@ -2,7 +2,7 @@
 //! the window (#3191). The pane's composer stays usable below it, sending
 //! leaves it open, the rest of the workspace stays interactive, and a key
 //! goes to whatever holds the keyboard.
-use super::super::tests::{chat_runtime, draft_chat, live_chat};
+use super::super::tests::{chat_runtime, draft_chat, live_chat, task_focuses};
 use super::*;
 use crate::app::dialog_ui::tests::{focus_after_key, key_control, key_press};
 use images::{Gallery, ViewerHost, viewer_focus};
@@ -43,12 +43,14 @@ fn show_images(runtime: &mut Runtime, count: u8) -> Vec<(String, iced::advanced:
         .collect()
 }
 
-/// A focused live conversation showing two images, the first one open.
+/// A focused live conversation, shown on screen, with two images, the first
+/// one open.
 fn viewing(app: &mut Cagents) -> (CardId, Target, Vec<(String, iced::advanced::image::Id)>) {
     let card = live_chat(app, Some("session"));
     let target = chat_runtime(app, card).target;
     let runtime = app.chat_runtime_mut(target).unwrap();
     Arc::make_mut(&mut runtime.snapshot).busy = false;
+    runtime.visible.store(true, Ordering::Relaxed);
     let images = show_images(runtime, 2);
     drop(app.update(Message::ChatUi(Action::OpenImage(
         target,
@@ -237,7 +239,7 @@ fn sending_and_new_activity_leave_the_viewer_open() {
     ));
     drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send))));
     let runtime = chat_runtime(&app, card);
-    assert!(runtime.pending.is_some(), "the message went");
+    assert!(runtime.commands.in_flight().is_some(), "the message went");
     assert_eq!(
         shown(&app, target),
         Some(images::ImageRef::Viewer(host, images[1].1))
@@ -316,13 +318,149 @@ fn sending_hands_the_keyboard_back_to_the_image() {
     if let keyboard::Event::KeyPressed { modifiers, .. } = &mut end {
         *modifiers = keyboard::Modifiers::CTRL;
     }
-    let (messages, _) = key_control(app.chat_view(card), composer, end);
+    let (messages, _) = key_control(app.chat_view(card), composer.clone(), end);
     assert!(
         !messages
             .iter()
             .any(|message| matches!(message, Message::ChatUi(Action::Latest(_)))),
         "{messages:?}"
     );
+
+    // So does the Send button, which otherwise hands it to the composer.
+    let task = app.handle_chat_ui(Action::SubmitControl(target, PromptMode::Send));
+    assert!(
+        chat_runtime(&app, card).commands.in_flight().is_some(),
+        "the message went"
+    );
+    assert!(task_focuses(task, &viewer_focus(card)).0);
+}
+
+/// The viewer moves `steps` images forward and returns the one it shows.
+fn step(app: &mut Cagents, target: Target, steps: usize) -> Option<images::ImageRef> {
+    for _ in 0..steps {
+        named(app, Named::ArrowRight, false);
+    }
+    shown(app, target)
+}
+
+/// A reply's image usually finishes decoding after the snapshot that brought
+/// it, and joins the open viewer then.
+#[test]
+fn an_image_decoded_after_its_snapshot_joins_the_viewer() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let (_, target, images) = viewing(&mut app);
+    let host = ViewerHost::Pane(target);
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    let (id, _) = show_images(runtime, 1).pop().unwrap();
+    let item = runtime.snapshot.items.last().unwrap().clone();
+    let cached = runtime.cache.get_mut(&id).unwrap();
+    cached.image = None;
+    cached.image_source = Some(item.clone());
+    cached.image_item = Some(item.clone());
+    images::sync(runtime);
+    let attempt = runtime.cache[&id].image_attempt;
+    assert_eq!(
+        step(&mut app, target, 2),
+        Some(images::ImageRef::Viewer(host, images[0].1)),
+        "an image still decoding can't be shown yet"
+    );
+
+    let handle = iced::widget::image::Handle::from_rgba(1, 1, vec![9, 0, 0, 255]);
+    let decoded = handle.id();
+    drop(app.handle_chat_ui(Action::ImageLoaded(
+        target,
+        item,
+        attempt,
+        images::Loaded::Ready(handle),
+    )));
+    assert_eq!(
+        shown(&app, target),
+        Some(images::ImageRef::Viewer(host, images[0].1))
+    );
+    assert_eq!(
+        step(&mut app, target, 2),
+        Some(images::ImageRef::Viewer(host, decoded))
+    );
+}
+
+/// The viewer holds the pixels of the image it shows, even once newer items
+/// page it out of the transcript, and borrows the rest from the transcript:
+/// an image the transcript lets go leaves the viewer too, as does a paged-out
+/// one once the viewer moves off it.
+#[test]
+fn the_viewer_keeps_its_image_and_borrows_the_rest() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let (_, target, images) = viewing(&mut app);
+    let host = ViewerHost::Pane(target);
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    let (_, arrived) = show_images(runtime, 1).pop().unwrap();
+    Arc::make_mut(&mut runtime.snapshot)
+        .items
+        .retain(|item| item.id != images[0].0);
+    images::sync(runtime);
+    assert_eq!(
+        shown(&app, target),
+        Some(images::ImageRef::Viewer(host, images[0].1)),
+        "the paged-out image stays shown"
+    );
+    assert_eq!(
+        step(&mut app, target, 2),
+        Some(images::ImageRef::Viewer(host, arrived)),
+        "and newer images still join after it"
+    );
+
+    images::sync(app.chat_runtime_mut(target).unwrap());
+    assert_eq!(
+        step(&mut app, target, 1),
+        Some(images::ImageRef::Viewer(host, images[1].1)),
+        "the paged-out image left once the viewer moved off it"
+    );
+    step(&mut app, target, 1);
+
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    runtime.cache.get_mut(&images[1].0).unwrap().image = None;
+    images::sync(runtime);
+    assert_eq!(
+        shown(&app, target),
+        Some(images::ImageRef::Viewer(host, arrived))
+    );
+    assert_eq!(
+        step(&mut app, target, 1),
+        Some(images::ImageRef::Viewer(host, arrived)),
+        "the image the transcript let go is gone from the viewer"
+    );
+}
+
+/// Pixels the transcript sheds, under memory pressure, once its pane is
+/// hidden or as it syncs, leave the viewer at once, not with the next snapshot: it keeps
+/// only the image it shows.
+#[test]
+fn the_viewer_lets_go_of_the_pixels_the_transcript_sheds() {
+    let shed: [fn(&mut Runtime); 3] = [
+        |runtime| assert_eq!(images::evict_ready(runtime, usize::MAX), usize::MAX - 8),
+        Runtime::release_transcript_caches,
+        // A hidden pane's transcript wants no images.
+        |runtime| {
+            runtime.visible.store(false, Ordering::Relaxed);
+            images::sync(runtime);
+        },
+    ];
+    for shed in shed {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (_, target, images) = viewing(&mut app);
+        let host = ViewerHost::Pane(target);
+        shed(app.chat_runtime_mut(target).unwrap());
+        let gallery = app.image_viewer(host).unwrap();
+        assert_eq!(
+            gallery.selected_image(host),
+            images::ImageRef::Viewer(host, images[0].1)
+        );
+        assert_eq!(
+            step(&mut app, target, 1),
+            Some(images::ImageRef::Viewer(host, images[0].1)),
+            "the image the viewer doesn't show is gone from it"
+        );
+    }
 }
 
 #[test]

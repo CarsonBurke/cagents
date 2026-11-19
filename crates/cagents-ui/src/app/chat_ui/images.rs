@@ -633,17 +633,23 @@ fn retire(cached: &mut CachedItem, evicted: bool) {
     cached.image_evicted = evicted;
     cached.image_attempt = cached.image_attempt.wrapping_add(1);
 }
-pub(super) fn sync(runtime: &mut Runtime) {
-    figure::sync(runtime);
-    // The pane viewer covers the transcript its images came from, and keeps
-    // up with the images that arrive in it. Once the pane shows another
-    // transcript, such as a subagent's, the viewer no longer belongs there.
+/// The pane viewer covers the transcript its images came from, and keeps up
+/// with the images that arrive or finish decoding in it. Once the pane shows
+/// another transcript, such as a subagent's, the viewer no longer belongs
+/// there.
+///
+/// It also runs whenever the transcript lets pixels go, so the viewer stops
+/// holding them too.
+pub(super) fn sync_viewer(runtime: &mut Runtime) {
     if let Some(mut gallery) = runtime.image_viewer.take()
         && gallery.transcript == runtime.selected_subagent
     {
         gallery.refresh(runtime);
         runtime.image_viewer = Some(gallery);
     }
+}
+pub(super) fn sync(runtime: &mut Runtime) {
+    figure::sync(runtime);
     if !runtime.visible.load(Ordering::Relaxed)
         || runtime
             .preview_request
@@ -682,6 +688,9 @@ pub(super) fn sync(runtime: &mut Runtime) {
             cached.image_attempt = cached.image_attempt.wrapping_add(1);
         }
     }
+    // After retiring what the transcript no longer wants, so the viewer
+    // doesn't keep those pixels until the next sync.
+    sync_viewer(runtime);
 }
 pub(super) fn request(runtime: &mut Runtime, id: &str) {
     if !runtime.visible.load(Ordering::Relaxed) {
@@ -725,6 +734,7 @@ pub(super) fn evict_ready(runtime: &mut Runtime, mut missing: usize) -> usize {
         .into_iter()
         .map(|item| item.id.clone())
         .collect();
+    let mut evicted = false;
     for id in order.iter().rev() {
         if missing == 0 {
             break;
@@ -734,7 +744,11 @@ pub(super) fn evict_ready(runtime: &mut Runtime, mut missing: usize) -> usize {
         {
             missing = missing.saturating_sub(pixel_bytes(cached));
             retire(cached, true);
+            evicted = true;
         }
+    }
+    if evicted {
+        sync_viewer(runtime);
     }
     missing
 }
@@ -794,10 +808,12 @@ pub(super) fn complete(
             // already admitted. They stay available through Load preview.
             retire(cached, true);
         }
-        return (explicit
-            && missing > 0
-            && cached.image_wait.as_ref().is_some_and(|wait| wait.retained))
-        .then_some(missing);
+        let waiting =
+            explicit && missing > 0 && cached.image_wait.as_ref().is_some_and(|wait| wait.retained);
+        if evicted {
+            sync_viewer(runtime);
+        }
+        return waiting.then_some(missing);
     }
     let cached = runtime.presentation_cache_mut().get_mut(&item.id).unwrap();
     cached.image_source = None;
@@ -812,6 +828,7 @@ pub(super) fn complete(
         _ => None,
     };
     cached.image_size = cached.image.as_ref().and_then(pixel_size);
+    sync_viewer(runtime);
     None
 }
 fn pixel_size(handle: &iced::widget::image::Handle) -> Option<(u32, u32)> {
@@ -841,7 +858,6 @@ pub(super) fn subscriptions(runtime: &Runtime) -> Vec<Subscription<Message>> {
         .collect()
 }
 
-#[derive(Clone)]
 struct Entry {
     id: String,
     managed: bool,
@@ -850,6 +866,40 @@ struct Entry {
     handle: iced::widget::image::Handle,
 }
 impl Entry {
+    /// The viewer's entry for transcript `item`, if it is an image whose
+    /// pixels are decoded.
+    fn decoded(runtime: &Runtime, item: &chat::Item) -> Option<Self> {
+        let ItemContent::Image {
+            path,
+            description,
+            reference,
+        } = &item.content
+        else {
+            return None;
+        };
+        Some(Self {
+            id: item.id.clone(),
+            managed: reference.is_some(),
+            path: if Path::new(path).is_absolute() || path.starts_with("data:image/") {
+                path.clone()
+            } else {
+                runtime
+                    .session
+                    .launch
+                    .recipe
+                    .working_directory
+                    .join(path)
+                    .to_string_lossy()
+                    .into_owned()
+            },
+            label: if description.is_empty() {
+                "Image".into()
+            } else {
+                description.clone()
+            },
+            handle: runtime.presentation_cache().get(&item.id)?.image.clone()?,
+        })
+    }
     /// The entry's literal file path, for Copy image path. Managed snapshot
     /// paths are non-authority hints and inline data has no path.
     fn file_path(&self) -> Option<String> {
@@ -897,7 +947,10 @@ impl Gallery {
         }
     }
     pub(super) fn new(runtime: &Runtime, id: &str) -> Option<Self> {
-        let entries = Self::entries(runtime, &[])?;
+        let entries: Vec<_> = Self::transcript(runtime)?
+            .iter()
+            .filter_map(|item| Entry::decoded(runtime, item))
+            .collect();
         let selected = entries.iter().position(|entry| entry.id == id)?;
         Some(Self {
             entries,
@@ -908,12 +961,10 @@ impl Gallery {
             from_transcript: true,
         })
     }
-    /// The images of the transcript `runtime` shows, in its order. One that
-    /// `kept` already holds keeps those pixels, even if the transcript has
-    /// since let them go; any other is included once it is decoded. `None`
-    /// when the selected subagent's transcript is gone.
-    fn entries(runtime: &Runtime, kept: &[Entry]) -> Option<Vec<Entry>> {
-        let items = match runtime.selected_subagent.as_deref() {
+    /// The items of the transcript `runtime` shows, `None` when the selected
+    /// subagent's is gone.
+    fn transcript(runtime: &Runtime) -> Option<&[Arc<chat::Item>]> {
+        Some(match runtime.selected_subagent.as_deref() {
             Some(agent) => {
                 &runtime
                     .snapshot
@@ -923,64 +974,60 @@ impl Gallery {
                     .items
             }
             None => &runtime.snapshot.items,
-        };
-        Some(
-            items
-                .iter()
-                .filter_map(|item| {
-                    let ItemContent::Image {
-                        path,
-                        description,
-                        reference,
-                    } = &item.content
-                    else {
-                        return None;
-                    };
-                    if let Some(entry) = kept.iter().find(|entry| entry.id == item.id) {
-                        return Some(entry.clone());
-                    }
-                    Some(Entry {
-                        id: item.id.clone(),
-                        managed: reference.is_some(),
-                        path: if Path::new(path).is_absolute() || path.starts_with("data:image/") {
-                            path.clone()
-                        } else {
-                            runtime
-                                .session
-                                .launch
-                                .recipe
-                                .working_directory
-                                .join(path)
-                                .to_string_lossy()
-                                .into_owned()
-                        },
-                        label: if description.is_empty() {
-                            "Image".into()
-                        } else {
-                            description.clone()
-                        },
-                        handle: runtime.presentation_cache().get(&item.id)?.image.clone()?,
-                    })
-                })
-                .collect(),
-        )
+        })
     }
     /// Brings a viewer of the transcript's images up to date with it, so an
-    /// image that arrives while it is open, as a reply to a question sent
-    /// from it, can be browsed to. The shown image and its zoom stay put.
+    /// image that arrives or finishes decoding while it is open, such as one
+    /// a question sent from it brought, can be browsed to.
+    ///
+    /// The other images are the transcript's decoded ones, borrowing its
+    /// pixels, so the viewer holds no more than the transcript does beyond
+    /// the image it shows. That one keeps its pixels and zoom, and stays
+    /// first once the transcript no longer holds it, as when newer items
+    /// page it out: the transcript under the viewer only moves on.
     fn refresh(&mut self, runtime: &Runtime) {
         if !self.from_transcript {
             return;
         }
-        let shown = &self.entries[self.selected].id;
-        // An image the transcript no longer holds, such as one paged out,
-        // leaves the viewer as it is rather than lose what it shows.
-        if let Some(entries) = Self::entries(runtime, &self.entries)
-            && let Some(selected) = entries.iter().position(|entry| &entry.id == shown)
-        {
-            self.entries = entries;
-            self.selected = selected;
+        let Some(items) = Self::transcript(runtime) else {
+            return;
+        };
+        let mut kept: Vec<_> = std::mem::take(&mut self.entries)
+            .into_iter()
+            .map(Some)
+            .collect();
+        let mut shown = kept.swap_remove(self.selected);
+        let mut entries = Vec::with_capacity(kept.len() + 1);
+        for item in items.iter() {
+            if shown.as_ref().is_some_and(|entry| entry.id == item.id) {
+                self.selected = entries.len();
+                entries.extend(shown.take());
+                continue;
+            }
+            let Some(pixels) = runtime
+                .presentation_cache()
+                .get(&item.id)
+                .and_then(|cached| cached.image.as_ref())
+            else {
+                continue;
+            };
+            // An unchanged image moves over as it is, rather than rebuilt
+            // with each snapshot.
+            let same = kept.iter_mut().find(|entry| {
+                entry
+                    .as_ref()
+                    .is_some_and(|entry| entry.id == item.id && entry.handle.id() == pixels.id())
+            });
+            entries.extend(
+                same.and_then(Option::take)
+                    .or_else(|| Entry::decoded(runtime, item)),
+            );
         }
+        if let Some(shown) = shown {
+            self.selected = 0;
+            entries.insert(0, shown);
+        }
+        self.entries = entries;
     }
     pub(in crate::app) fn next(&mut self, forward: bool) {
         self.selected = if forward {
@@ -1289,7 +1336,7 @@ impl Cagents {
             _ => None,
         }
     }
-    fn focus_image_viewer(&self, target: Target) -> Task<Message> {
+    pub(super) fn focus_image_viewer(&self, target: Target) -> Task<Message> {
         if !self.card_holds_keyboard(target.card) {
             return Task::none();
         }
