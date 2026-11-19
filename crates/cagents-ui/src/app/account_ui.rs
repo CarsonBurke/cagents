@@ -2068,12 +2068,12 @@ fn signs_in(account: &Account, recipe: &LaunchRecipe) -> bool {
         .filter(|value| !value.is_empty() && !recipe.unset_environment.contains(variable))
         .map(PathBuf::from);
     match named {
-        Some(named) => account.resolved_home() == Some(named),
+        Some(named) => resolved_home(account) == Some(named),
         // An unset home is the CLI's default, which only a system account
         // exporting no home of its own resolves (as `ProviderChoices::running`).
         None => {
             account.is_system()
-                && (!recipe.unset_environment.contains(variable) || account.launch_home().is_none())
+                && (!recipe.unset_environment.contains(variable) || launch_home(account).is_none())
         }
     }
 }
