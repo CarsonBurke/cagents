@@ -7159,6 +7159,11 @@ fn settle_first_start_checkpoint(app: &mut Cagents, card: CardId, task: Task<Mes
 }
 
 fn submit_target(app: &mut Cagents, target: Target) {
+    start_with(app, target, Action::Submit(target, PromptMode::Send));
+}
+
+/// Takes `action`, which may start `target`'s draft for its first message.
+fn start_with(app: &mut Cagents, target: Target, action: Action) {
     // Existing start/Ready tests exercise the provider boundary, not a
     // fabricated save receipt. Supply and drive the real writer barrier
     // first, while never polling the returned provider-start Task.
@@ -7171,7 +7176,7 @@ fn submit_target(app: &mut Cagents, target: Target) {
         .unwrap();
         app.session = Some(writer);
     }
-    let task = app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send)));
+    let task = app.update(Message::ChatUi(action));
     settle_first_start_checkpoint(app, target.card, task);
     if directory.is_some() {
         drop(app.session.take());
@@ -19251,6 +19256,114 @@ fn auth_recovery_rejects_stale_wrong_account_and_unknown_home_actions() {
         "unsent recovery draft"
     );
     assert!(app.chat_ui.attempt(card).is_none());
+}
+/// An ACP provider reports a missing sign-in when its conversation starts,
+/// not during a turn, so the card goes back to its draft. That draft offers
+/// the sign-in a started conversation gets, on the system account a provider
+/// with no home of its own runs on, and sends its message again after.
+#[test]
+fn a_draft_whose_start_needs_sign_in_offers_sign_in_and_sends_again() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let (card, target) = starting_chat_for_provider(&mut app, Provider::Antigravity);
+    let handle = fixture_handle(&app, card, None);
+    // The adapter has not yet said it takes commands.
+    handle.replace_snapshot_for_test(Snapshot::default());
+    answer_start(&mut app, target, Ok(handle.clone()));
+    let target = chat_runtime(&app, card).target;
+    let failure = format!(
+        "{}: sign in to Antigravity, then try again. (Authentication required)",
+        chat::ACP_SIGN_IN_PREFIX
+    );
+    handle.replace_snapshot_for_test(Snapshot {
+        error: Some(failure.clone()),
+        exited: true,
+        ..Snapshot::default()
+    });
+    let _ = app.update(Message::ChatUi(Action::Wake(target, Wake::Changed)));
+    retired(&mut app, card);
+    let runtime = chat_runtime(&app, card);
+    assert!(runtime.choosing());
+    assert_eq!(runtime.composer.text().trim(), "hello");
+    assert_eq!(runtime.error.as_deref(), Some(failure.as_str()));
+    let target = runtime.target;
+    let system = Account::system(Provider::Antigravity);
+    let recovery = app
+        .chat_auth_recovery(chat_runtime(&app, card))
+        .expect("the draft offers sign-in");
+    assert_eq!(recovery.account, system);
+    assert!(recovery.draft);
+    assert!(app.chat_auth_recovery_enabled(target));
+    assert!(app.chat_auth_resume_enabled(target));
+
+    // Sending again is the draft's own first message, not a resume of a
+    // conversation it never had.
+    start_with(&mut app, target, Action::ResumeAfterSignIn(target));
+    let attempt = app
+        .chat_ui
+        .attempt(card)
+        .expect("sending again starts the conversation anew");
+    assert_ne!(attempt.target, target);
+    assert!(chat_runtime(&app, card).queued.is_some());
+}
+
+/// Recovery needs the draft's message: with nothing left to send, signing in
+/// is still offered but sending again is not.
+#[test]
+fn a_signed_out_draft_with_nothing_to_send_offers_only_sign_in() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = draft_chat_in(
+        &mut app,
+        Provider::Antigravity,
+        Path::new(FIXTURE_DIRECTORY),
+    );
+    let target = chat_runtime(&app, card).target;
+    app.chat_runtime_mut(target).unwrap().error = Some(format!(
+        "{}: sign in to Antigravity, then try again. (log in first)",
+        chat::ACP_SIGN_IN_PREFIX
+    ));
+    assert!(app.chat_auth_recovery_enabled(target));
+    assert!(!app.chat_auth_resume_enabled(target));
+    drop(app.handle_chat_ui(Action::ResumeAfterSignIn(target)));
+    assert!(app.chat_ui.attempt(card).is_none());
+    // Overriding HOME still hides which sign-in the provider would read.
+    app.chat_runtime_mut(target)
+        .unwrap()
+        .session
+        .launch
+        .recipe
+        .environment
+        .insert("HOME".into(), "/unknown/agy-recovery-home".into());
+    assert!(app.chat_auth_recovery(chat_runtime(&app, card)).is_none());
+}
+
+/// A start that stops for any other reason keeps its plain report.
+#[test]
+fn a_draft_whose_start_fails_otherwise_offers_no_sign_in() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let (card, target) = starting_chat_for_provider(&mut app, Provider::Antigravity);
+    let handle = fixture_handle(&app, card, None);
+    // The adapter has not yet said it takes commands.
+    handle.replace_snapshot_for_test(Snapshot::default());
+    answer_start(&mut app, target, Ok(handle.clone()));
+    let target = chat_runtime(&app, card).target;
+    handle.replace_snapshot_for_test(Snapshot {
+        error: Some("fixture: adapter crashed".into()),
+        exited: true,
+        ..Snapshot::default()
+    });
+    let _ = app.update(Message::ChatUi(Action::Wake(target, Wake::Changed)));
+    let runtime = chat_runtime(&app, card);
+    assert!(runtime.choosing());
+    assert_eq!(runtime.composer.text().trim(), "hello");
+    assert_eq!(
+        runtime.error.as_deref(),
+        Some(
+            "The conversation stopped before it took the first message. Its last report: fixture: adapter crashed"
+        )
+    );
+    assert!(runtime.auth_error().is_none());
+    assert!(app.chat_auth_recovery(runtime).is_none());
+    assert!(!app.chat_auth_recovery_enabled(runtime.target));
 }
 #[test]
 fn auth_recovery_reconnect_preserves_session_and_draft_and_rejects_resolved_error() {

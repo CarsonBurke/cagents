@@ -5995,6 +5995,13 @@ impl Cagents {
             .map(|state| state.account.clone())
     }
 
+    /// What the reader calls the known account `id`, as its pickers name it.
+    pub(super) fn account_label(&self, id: &AccountId) -> Option<String> {
+        self.account_ui
+            .account(id)
+            .map(|state| self.account_ui.display_name(state))
+    }
+
     /// The account a conversation launched as `recipe` runs on, if it is
     /// one cagents knows.
     pub(super) fn chat_account(
