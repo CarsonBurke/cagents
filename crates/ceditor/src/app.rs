@@ -561,8 +561,10 @@ pub struct Editor {
     /// Newest generation written per preference file. Storage work runs on the
     /// blocking pool, so two captures of the same file can finish out of
     /// order; the loser is dropped instead of resurrecting stale values.
-    preference_lane: Arc<std::sync::Mutex<[u64; PreferenceFile::COUNT]>>,
+    preference_lane: Arc<std::sync::Mutex<PreferenceLanes>>,
     preference_generation: u64,
+    /// How many times this editor has confirmed Reset all.
+    settings_resets: u64,
 }
 
 /// One write-ordering lane per preference file ceditor owns.
@@ -578,15 +580,74 @@ impl PreferenceFile {
     const COUNT: usize = 4;
 }
 
+struct PreferenceLanes {
+    applied: [u64; PreferenceFile::COUNT],
+    /// The settings this editor last wrote successfully, which a merged save
+    /// compares against to find this editor's own changes.
+    settings_base: AppSettings,
+    /// How many Reset all actions a successful settings write has carried to
+    /// disk.
+    resets_written: u64,
+}
+
+impl PreferenceLanes {
+    /// Claims `file`'s lane for `generation`, or reports that a newer capture
+    /// of it already ran.
+    fn claim(&mut self, file: PreferenceFile, generation: u64) -> bool {
+        let applied = &mut self.applied[file as usize];
+        if *applied >= generation {
+            return false;
+        }
+        *applied = generation;
+        true
+    }
+
+    /// Writes settings.toml unless a newer capture of it, from either kind of
+    /// write that carries it, already ran.
+    fn write_settings(
+        &mut self,
+        path: &Path,
+        generation: u64,
+        SettingsWrite { settings, resets }: SettingsWrite,
+    ) -> Result<(), String> {
+        if !self.claim(PreferenceFile::Settings, generation) {
+            return Ok(());
+        }
+        if self.resets_written < resets {
+            settings::save(path, &settings)
+        } else {
+            settings::save_merged(path, &self.settings_base, &settings)
+        }
+        .map_err(|error| error.to_string())?;
+        self.resets_written = resets;
+        self.settings_base = settings;
+        Ok(())
+    }
+}
+
+/// One capture of settings.toml.
+struct SettingsWrite {
+    settings: AppSettings,
+    /// The Reset all actions confirmed before this capture. Until a write
+    /// carrying the newest one succeeds, settings writes replace the file
+    /// whole: a newer capture supersedes the reset and carries its defaults,
+    /// so merging it against the old base would undo the reset.
+    resets: u64,
+}
+
 /// Captured on the event loop; all storage work runs on the blocking pool.
 ///
-/// `settings::save` takes a blocking `flock` shared with every other cagents
-/// window and fsyncs twice. None of that belongs on the thread driving the
-/// compositor frame.
+/// Settings writes merge only changes from this editor's last successful save
+/// so another editor's preferences survive. Resets replace settings whole.
+/// The settings writer takes a blocking `flock` shared with other editors and
+/// fsyncs twice. None of that belongs on the thread driving the compositor frame.
 enum PreferenceWrite {
-    Settings(AppSettings),
+    Settings(SettingsWrite),
+    /// The assistance flag, with settings.toml, which the shared settings
+    /// writer creates and validates the directory for. That part shares the
+    /// settings lane, so an older capture cannot overwrite newer settings.
     Assistance {
-        settings: AppSettings,
+        settings: SettingsWrite,
         enabled: bool,
     },
     Shortcuts(crate::preferences::EditorShortcuts),
@@ -607,34 +668,31 @@ impl PreferenceWrite {
 struct PreferenceSave {
     path: PathBuf,
     generation: u64,
-    lane: Arc<std::sync::Mutex<[u64; PreferenceFile::COUNT]>>,
+    lane: Arc<std::sync::Mutex<PreferenceLanes>>,
     write: PreferenceWrite,
 }
 
 impl PreferenceSave {
     fn run(self) -> Result<(), String> {
-        let file = self.write.file();
-        let mut lane = self
+        let mut lanes = self
             .lane
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let applied = &mut lane[file as usize];
-        if *applied >= self.generation {
+        // The lanes stay locked across the write so two captures of one file
+        // land in capture order rather than blocking-pool completion order.
+        // A settings write claims its lane itself, as an assistance write's
+        // settings part does.
+        let file = self.write.file();
+        if !matches!(file, PreferenceFile::Settings) && !lanes.claim(file, self.generation) {
             return Ok(());
         }
-        *applied = self.generation;
-        // The lane stays locked across the write so two captures of one file
-        // land in capture order rather than blocking-pool completion order.
         match self.write {
-            PreferenceWrite::Settings(settings) => {
-                settings::save(&self.path, &settings).map_err(|error| error.to_string())
+            PreferenceWrite::Settings(write) => {
+                lanes.write_settings(&self.path, self.generation, write)
             }
             PreferenceWrite::Assistance { settings, enabled } => {
-                settings::save(&self.path, &settings)
-                    .map_err(|error| error.to_string())
-                    .and_then(|()| {
-                        crate::preferences::save_language_server_assistance(&self.path, enabled)
-                    })
+                lanes.write_settings(&self.path, self.generation, settings)?;
+                crate::preferences::save_language_server_assistance(&self.path, enabled)
             }
             PreferenceWrite::Shortcuts(shortcuts) => {
                 crate::preferences::save_shortcuts(&self.path, &shortcuts)
@@ -2180,7 +2238,7 @@ impl Editor {
         })
     }
 
-    fn save_settings(&mut self) -> Task<Message> {
+    fn save_settings(&mut self, reset: bool) -> Task<Message> {
         if !self.settings_writable {
             self.notice = Some(
                 "Settings could not be loaded; repair the settings file before saving preferences."
@@ -2188,10 +2246,26 @@ impl Editor {
             );
             return Task::none();
         }
-        let settings = self.settings.clone();
         // Preference changes are low frequency. One ordered atomic write avoids
         // competing snapshots overwriting newer values.
-        preference_task(self.capture_preference(PreferenceWrite::Settings(settings)))
+        preference_task(self.capture_settings(reset))
+    }
+
+    /// Captures the settings to write; `reset` marks a Reset all, which
+    /// replaces the file whole.
+    fn capture_settings(&mut self, reset: bool) -> PreferenceSave {
+        if reset {
+            self.settings_resets += 1;
+        }
+        let write = self.settings_write();
+        self.capture_preference(PreferenceWrite::Settings(write))
+    }
+
+    fn settings_write(&self) -> SettingsWrite {
+        SettingsWrite {
+            settings: self.settings.clone(),
+            resets: self.settings_resets,
+        }
     }
 
     fn set_language_server_assistance(&mut self, enabled: bool) -> Task<Message> {
@@ -2222,7 +2296,7 @@ impl Editor {
             tasks.push(self.lsp_next());
         }
         if self.settings_writable {
-            let settings = self.settings.clone();
+            let settings = self.settings_write();
             tasks.push(preference_task(self.capture_preference(
                 PreferenceWrite::Assistance { settings, enabled },
             )));
@@ -3058,7 +3132,7 @@ impl Application for Editor {
             notifications: Default::default(),
             active: None,
             selection_epoch: 0,
-            settings,
+            settings: settings.clone(),
             shortcuts,
             shortcut_draft,
             settings_category: SettingsCategory::Editing,
@@ -3099,8 +3173,13 @@ impl Application for Editor {
             sidebar_transition: None,
             document_tone_stale: false,
             sidebar_panel: WorktreePanel::Files,
-            preference_lane: Arc::new(std::sync::Mutex::new([0; PreferenceFile::COUNT])),
+            preference_lane: Arc::new(std::sync::Mutex::new(PreferenceLanes {
+                applied: [0; PreferenceFile::COUNT],
+                settings_base: settings,
+                resets_written: 0,
+            })),
             preference_generation: 0,
+            settings_resets: 0,
         };
         match cagents::notifications::ui::Observer::bind_editor(flags.notification_window.clone()) {
             Ok(mut observer) => {
@@ -3785,7 +3864,7 @@ impl Application for Editor {
                                     .update_find_preferences(tab.id, options, preserve),
                             ));
                         }
-                        tasks.push(self.save_settings());
+                        tasks.push(self.save_settings(false));
                     }
                     tasks.push(self.drain(id));
                     if loaded || saved {
@@ -3857,7 +3936,7 @@ impl Application for Editor {
                         return Task::none();
                     }
                     if matches!(&action, SidebarAction::ResizeFinished) {
-                        return self.save_settings();
+                        return self.save_settings(false);
                     }
                     if let SidebarAction::SetWorktreePanel { panel } = action {
                         self.sidebar_panel = panel;
@@ -4222,7 +4301,7 @@ impl Application for Editor {
                         self.notices_open = false;
                         self.settings_open = !self.settings_open;
                         if self.settings_open {
-                            return self.save_settings();
+                            return self.save_settings(false);
                         }
                     }
                     self.resume_pending_files()
@@ -4278,7 +4357,7 @@ impl Application for Editor {
                     Task::batch([
                         self.set_language_server_assistance(false),
                         self.appearance(),
-                        self.save_settings(),
+                        self.save_settings(true),
                         preference_task(shortcuts),
                         Task::batch(runtime_tasks),
                     ])
@@ -4413,7 +4492,7 @@ impl Application for Editor {
                             repository_task(tab.runtime.auto_save_task(tab.id))
                         })
                         .collect();
-                    tasks.push(self.save_settings());
+                    tasks.push(self.save_settings(false));
                     Task::batch(tasks)
                 }
                 Message::WrapLines(enabled) => {
@@ -4421,7 +4500,7 @@ impl Application for Editor {
                     for tab in &mut self.tabs {
                         tab.runtime.set_wrap_lines(enabled);
                     }
-                    self.save_settings()
+                    self.save_settings(false)
                 }
                 Message::LineHeightChanged(value) => {
                     self.line_height_draft = value.clone();
@@ -4443,7 +4522,7 @@ impl Application for Editor {
                             repository_task(tab.runtime.refresh_diff_presentation(tab.id))
                         })
                         .collect::<Vec<_>>();
-                    Task::batch([self.save_settings(), Task::batch(relaid)])
+                    Task::batch([self.save_settings(false), Task::batch(relaid)])
                 }
                 Message::SyntaxTheme(theme) => {
                     self.settings.editor_syntax_theme = theme;
@@ -4455,18 +4534,18 @@ impl Application for Editor {
                             repository_task(tab.runtime.refresh_diff_presentation(tab.id))
                         })
                         .collect::<Vec<_>>();
-                    Task::batch([self.save_settings(), Task::batch(recoloured)])
+                    Task::batch([self.save_settings(false), Task::batch(recoloured)])
                 }
                 Message::LanguageServerAssistance(enabled) => {
                     self.set_language_server_assistance(enabled)
                 }
                 Message::Theme(theme) => {
                     self.settings.app_theme = theme;
-                    Task::batch([self.save_settings(), self.appearance()])
+                    Task::batch([self.save_settings(false), self.appearance()])
                 }
                 Message::Scale(scale) => {
                     self.set_ui_scale(scale);
-                    Task::batch([self.save_settings(), self.appearance()])
+                    Task::batch([self.save_settings(false), self.appearance()])
                 }
                 Message::FileRevealed(result) => {
                     self.notice = match result {
@@ -6766,8 +6845,13 @@ mod tests {
             sidebar_transition: None,
             document_tone_stale: false,
             sidebar_panel: WorktreePanel::Files,
-            preference_lane: Arc::new(std::sync::Mutex::new([0; PreferenceFile::COUNT])),
+            preference_lane: Arc::new(std::sync::Mutex::new(PreferenceLanes {
+                applied: [0; PreferenceFile::COUNT],
+                settings_base: AppSettings::default(),
+                resets_written: 0,
+            })),
             preference_generation: 0,
+            settings_resets: 0,
         }
     }
 
@@ -7954,14 +8038,11 @@ mod tests {
     /// tests have no executor to drain a `Task`, and the persisted bytes are
     /// the contract under test.
     fn flush_settings(app: &mut Editor) {
-        let settings = app.settings.clone();
-        app.capture_preference(PreferenceWrite::Settings(settings))
-            .run()
-            .unwrap();
+        app.capture_settings(false).run().unwrap();
     }
 
     fn flush_assistance(app: &mut Editor) {
-        let settings = app.settings.clone();
+        let settings = app.settings_write();
         let enabled = app.language_server_assistance;
         app.capture_preference(PreferenceWrite::Assistance { settings, enabled })
             .run()
@@ -7973,6 +8054,251 @@ mod tests {
         app.capture_preference(PreferenceWrite::Session(session))
             .run()
             .unwrap();
+    }
+
+    #[test]
+    fn a_second_editors_preference_save_keeps_the_first_editors_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let defaults = AppSettings::default();
+        settings::save(directory.path().join("settings.toml"), &defaults).unwrap();
+        let mut first = loaded(&directory);
+        let mut second = loaded(&directory);
+
+        first.settings.editor_wrap_lines = !defaults.editor_wrap_lines;
+        flush_settings(&mut first);
+        second.settings.editor_syntax_theme = settings::EditorSyntaxTheme::Mocha;
+        flush_settings(&mut second);
+
+        let persisted = settings::load(&first.settings_path).unwrap();
+        assert_eq!(persisted.editor_wrap_lines, !defaults.editor_wrap_lines);
+        assert_eq!(
+            persisted.editor_syntax_theme,
+            settings::EditorSyntaxTheme::Mocha
+        );
+    }
+
+    #[test]
+    fn a_preference_save_keeps_another_editors_cleared_value() {
+        let directory = tempfile::tempdir().unwrap();
+        let initial = AppSettings {
+            editor_font_size: Some(18.0),
+            ..AppSettings::default()
+        };
+        settings::save(directory.path().join("settings.toml"), &initial).unwrap();
+        let mut first = loaded(&directory);
+        let mut second = loaded(&directory);
+
+        first.settings.editor_font_size = None;
+        flush_settings(&mut first);
+        second.settings.editor_auto_save = !initial.editor_auto_save;
+        flush_settings(&mut second);
+
+        let persisted = settings::load(&first.settings_path).unwrap();
+        assert_eq!(persisted.editor_font_size, None);
+        assert_eq!(persisted.editor_auto_save, !initial.editor_auto_save);
+    }
+
+    #[test]
+    fn the_base_advances_only_after_a_successful_save() {
+        let directory = tempfile::tempdir().unwrap();
+        let defaults = AppSettings::default();
+        settings::save(directory.path().join("settings.toml"), &defaults).unwrap();
+        let mut app = loaded(&directory);
+
+        app.settings.editor_wrap_lines = !defaults.editor_wrap_lines;
+        flush_settings(&mut app);
+        assert_eq!(
+            settings::load(&app.settings_path).unwrap().editor_wrap_lines,
+            !defaults.editor_wrap_lines
+        );
+        app.settings.editor_wrap_lines = defaults.editor_wrap_lines;
+        flush_settings(&mut app);
+        assert_eq!(
+            settings::load(&app.settings_path).unwrap().editor_wrap_lines,
+            defaults.editor_wrap_lines
+        );
+
+        app.settings.editor_wrap_lines = !defaults.editor_wrap_lines;
+        let path = app.settings_path.clone();
+        app.settings_path = directory.path().join("blocked");
+        std::fs::create_dir(&app.settings_path).unwrap();
+        assert!(app.capture_settings(false).run().is_err());
+        app.settings_path = path;
+        flush_settings(&mut app);
+        assert_eq!(
+            settings::load(&app.settings_path).unwrap().editor_wrap_lines,
+            !defaults.editor_wrap_lines
+        );
+    }
+
+    #[test]
+    fn reset_all_settings_replaces_the_file_whole() {
+        let directory = tempfile::tempdir().unwrap();
+        let defaults = AppSettings::default();
+        settings::save(directory.path().join("settings.toml"), &defaults).unwrap();
+        let mut first = loaded(&directory);
+        let mut second = loaded(&directory);
+
+        first.settings.editor_wrap_lines = !defaults.editor_wrap_lines;
+        flush_settings(&mut first);
+        second.settings.editor_auto_save = !defaults.editor_auto_save;
+        flush_settings(&mut second);
+        first.settings_open = true;
+        drop(first.update(Message::ResetSettings));
+        let task = first.update(Message::ResetSettings);
+        run_tasks(&mut first, task);
+
+        let persisted = settings::load(&first.settings_path).unwrap();
+        assert_eq!(
+            toml::Value::try_from(persisted).unwrap(),
+            toml::Value::try_from(defaults).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_save_that_overtakes_a_reset_still_resets() {
+        let directory = tempfile::tempdir().unwrap();
+        let defaults = AppSettings::default();
+        settings::save(directory.path().join("settings.toml"), &defaults).unwrap();
+        let mut first = loaded(&directory);
+        let mut second = loaded(&directory);
+        second.settings.editor_wrap_lines = !defaults.editor_wrap_lines;
+        flush_settings(&mut second);
+
+        first.settings = AppSettings::default();
+        let reset = first.capture_settings(true);
+        first.settings.editor_syntax_theme = settings::EditorSyntaxTheme::Mocha;
+        let newer = first.capture_settings(false);
+        // The blocking pool finishes the newer capture first; the reset it
+        // supersedes is then dropped, so the newer write must carry it.
+        newer.run().unwrap();
+        reset.run().unwrap();
+
+        let persisted = settings::load(&first.settings_path).unwrap();
+        assert_eq!(persisted.editor_wrap_lines, defaults.editor_wrap_lines);
+        assert_eq!(
+            persisted.editor_syntax_theme,
+            settings::EditorSyntaxTheme::Mocha
+        );
+
+        // Once the reset is written, later saves merge again.
+        second.settings.editor_auto_save = !defaults.editor_auto_save;
+        flush_settings(&mut second);
+        first.settings.editor_font_size = Some(17.0);
+        first.capture_settings(false).run().unwrap();
+        let persisted = settings::load(&first.settings_path).unwrap();
+        assert_eq!(persisted.editor_auto_save, !defaults.editor_auto_save);
+        assert_eq!(persisted.editor_font_size, Some(17.0));
+    }
+
+    #[test]
+    fn a_save_after_a_failed_reset_still_resets() {
+        let directory = tempfile::tempdir().unwrap();
+        let defaults = AppSettings::default();
+        settings::save(directory.path().join("settings.toml"), &defaults).unwrap();
+        let mut first = loaded(&directory);
+        let mut second = loaded(&directory);
+        second.settings.editor_wrap_lines = !defaults.editor_wrap_lines;
+        flush_settings(&mut second);
+
+        let path = first.settings_path.clone();
+        first.settings_path = directory.path().join("blocked");
+        std::fs::create_dir(&first.settings_path).unwrap();
+        first.settings = AppSettings::default();
+        assert!(first.capture_settings(true).run().is_err());
+        first.settings_path = path;
+        // The reset never reached the disk, so the next save must still
+        // replace the file rather than merge over another editor's change.
+        first.settings.editor_syntax_theme = settings::EditorSyntaxTheme::Mocha;
+        first.capture_settings(false).run().unwrap();
+
+        let persisted = settings::load(&first.settings_path).unwrap();
+        assert_eq!(persisted.editor_wrap_lines, defaults.editor_wrap_lines);
+        assert_eq!(
+            persisted.editor_syntax_theme,
+            settings::EditorSyntaxTheme::Mocha
+        );
+    }
+
+    #[test]
+    fn an_assistance_save_after_a_failed_reset_completes_the_reset() {
+        let directory = tempfile::tempdir().unwrap();
+        let defaults = AppSettings::default();
+        settings::save(directory.path().join("settings.toml"), &defaults).unwrap();
+        let mut first = loaded(&directory);
+        let mut second = loaded(&directory);
+        second.settings.editor_wrap_lines = !defaults.editor_wrap_lines;
+        flush_settings(&mut second);
+
+        let path = first.settings_path.clone();
+        first.settings_path = directory.path().join("blocked");
+        std::fs::create_dir(&first.settings_path).unwrap();
+        first.settings = AppSettings::default();
+        assert!(first.capture_settings(true).run().is_err());
+        first.settings_path = path;
+        // Storage recovers and the next write this editor makes is the
+        // assistance preference, which also carries settings.toml.
+        first.language_server_assistance = true;
+        flush_assistance(&mut first);
+
+        let persisted = settings::load(&first.settings_path).unwrap();
+        assert_eq!(
+            toml::Value::try_from(persisted).unwrap(),
+            toml::Value::try_from(defaults).unwrap()
+        );
+        assert!(
+            crate::preferences::load_language_server_assistance(&first.settings_path).unwrap()
+        );
+    }
+
+    #[test]
+    fn an_older_assistance_capture_keeps_newer_settings_and_writes_its_flag() {
+        let directory = tempfile::tempdir().unwrap();
+        let defaults = AppSettings::default();
+        settings::save(directory.path().join("settings.toml"), &defaults).unwrap();
+        let mut app = loaded(&directory);
+
+        app.language_server_assistance = true;
+        let settings = app.settings_write();
+        let older = app.capture_preference(PreferenceWrite::Assistance {
+            settings,
+            enabled: true,
+        });
+        app.settings.editor_wrap_lines = !defaults.editor_wrap_lines;
+        let newer = app.capture_settings(false);
+        // The blocking pool finishes the newer settings capture first.
+        newer.run().unwrap();
+        older.run().unwrap();
+
+        assert_eq!(
+            settings::load(&app.settings_path).unwrap().editor_wrap_lines,
+            !defaults.editor_wrap_lines
+        );
+        assert!(crate::preferences::load_language_server_assistance(&app.settings_path).unwrap());
+    }
+
+    #[test]
+    fn an_assistance_save_keeps_another_editors_preference_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let defaults = AppSettings::default();
+        settings::save(directory.path().join("settings.toml"), &defaults).unwrap();
+        let mut first = loaded(&directory);
+        let mut second = loaded(&directory);
+
+        first.settings.editor_wrap_lines = !defaults.editor_wrap_lines;
+        flush_settings(&mut first);
+        second.settings.editor_syntax_theme = settings::EditorSyntaxTheme::Mocha;
+        second.language_server_assistance = true;
+        flush_assistance(&mut second);
+        second.settings.editor_syntax_theme = defaults.editor_syntax_theme;
+        flush_settings(&mut second);
+
+        let persisted = settings::load(&first.settings_path).unwrap();
+        assert_eq!(persisted.editor_wrap_lines, !defaults.editor_wrap_lines);
+        assert_eq!(persisted.editor_syntax_theme, defaults.editor_syntax_theme);
+        assert!(
+            crate::preferences::load_language_server_assistance(&second.settings_path).unwrap()
+        );
     }
 
     #[test]
@@ -9161,6 +9487,14 @@ mod tests {
     fn configured(directory: &tempfile::TempDir) -> Editor {
         let mut app = editor();
         app.settings_path = directory.path().join("settings.toml");
+        app
+    }
+
+    fn loaded(directory: &tempfile::TempDir) -> Editor {
+        let mut app = configured(directory);
+        app.settings = settings::load(&app.settings_path).unwrap();
+        app.preference_lane.lock().unwrap().settings_base = app.settings.clone();
+        app.settings_writable = true;
         app
     }
 
