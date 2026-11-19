@@ -469,6 +469,9 @@ fn run_pair(mode: &str) {
     fs::create_dir(&proc_root).unwrap();
     for generation in 1..=2 {
         let replacement = host(&format!("replacement-{generation}"));
+        replacement.lock().unwrap().install_model(
+            crate::host::model::Registry::at(&cwd.join("replacement-model.sqlite3")).unwrap(),
+        );
         restore_upgrade_from(
             &replacement,
             Store::open(&store_path).unwrap(),
