@@ -404,22 +404,6 @@ impl Cagents {
         part: Option<CopyPart>,
         source: Option<chat::TextCopySource>,
     ) -> Task<Message> {
-        let prefix = match &part {
-            Some(part) => {
-                // By its source: a step's ID may also be a long message's
-                // generated part ID.
-                let Some(prefix) = self
-                    .chat_runtime_mut(target)
-                    .zip(source.as_ref())
-                    .and_then(|(runtime, source)| item_with_source(&runtime.snapshot, source))
-                    .and_then(|item| step_copy_prefix(part, &item.content))
-                else {
-                    return Task::none();
-                };
-                prefix
-            }
-            None => String::new(),
-        };
         let context = current_context();
         let intent = context.advance();
         let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -428,6 +412,20 @@ impl Cagents {
         let Some(source) = source.filter(|source| runtime.contains_copy_source(source)) else {
             runtime.error = Some(UNAVAILABLE.into());
             return Task::none();
+        };
+        let prefix = match &part {
+            // By its source: a step's ID may also be a long message's
+            // generated part ID.
+            Some(part) => match item_with_source(&runtime.snapshot, &source)
+                .and_then(|item| step_copy_prefix(part, &item.content))
+            {
+                Some(prefix) => prefix,
+                None => {
+                    runtime.error = Some(UNAVAILABLE.into());
+                    return Task::none();
+                }
+            },
+            None => String::new(),
         };
         let Some(handle) = runtime.handle().cloned() else {
             runtime.error =
@@ -927,6 +925,34 @@ mod tests {
             let started = read_by(task, target);
             assert_eq!(started.source, request.source, "{scope:?}");
             assert_eq!(started.prefix, "cargo build", "{scope:?}");
+        }
+    }
+
+    /// A step copy captured before a rewrite it is handled after says its
+    /// text is unavailable rather than doing nothing.
+    #[test]
+    fn a_step_copy_rewritten_before_the_copy_was_handled_says_it_is_unavailable() {
+        let _context = isolated_context();
+        for scope in scopes() {
+            let (mut app, target, handle, request) = copy_fixture(scope.clone());
+            publish(
+                &handle,
+                &scope,
+                Some((step("cargo build"), source(&scope, 2))),
+            );
+            app.chat_runtime_mut(target).unwrap().refresh();
+            let task = app.start_message_copy(
+                target,
+                "step".into(),
+                Some(CopyPart::Text),
+                Some(request.source.clone()),
+            );
+            assert!(
+                iced::runtime::task::into_stream(task).is_none(),
+                "{scope:?}"
+            );
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            assert_eq!(runtime.error.as_deref(), Some(UNAVAILABLE), "{scope:?}");
         }
     }
 
