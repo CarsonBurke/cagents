@@ -421,6 +421,11 @@ pub trait Adapter: Send {
     fn initialization_pending(&self) -> bool {
         false
     }
+    /// Whether a stop this adapter accepted is still held, unsent, until
+    /// the provider names the turn it is for.
+    fn stop_held(&self) -> bool {
+        false
+    }
     /// Whether a settled turn's outcome still waits on a provider reply, such
     /// as the acknowledgement of an interrupt sent before its result arrived.
     /// Closing keeps reading the provider until that reply decides it.

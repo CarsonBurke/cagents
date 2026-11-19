@@ -2238,6 +2238,9 @@ impl Adapter for Codex {
         }
         Ok(step)
     }
+    fn stop_held(&self) -> bool {
+        self.stop_on_start
+    }
     fn receive(&mut self, frame: Value) -> Result<Step, String> {
         let mut step = self.receive_frame(frame)?;
         if self.stop_on_start {

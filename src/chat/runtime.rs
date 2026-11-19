@@ -2580,6 +2580,7 @@ impl Actor {
         let mut closing = None;
         let mut partial_started = None;
         let mut interrupt_sent = false;
+        let mut interrupt_held = false;
         let mut interrupt_error = String::new();
         let mut garbage_lines = 0usize;
         let mut garbage_total = 0u64;
@@ -2597,10 +2598,7 @@ impl Actor {
                             // A provider that names a turn only once it has
                             // started holds the stop until then, and sends it
                             // as it drains.
-                            if step.writes.is_empty() {
-                                interrupt_error =
-                                    "the provider had not yet started the turn to stop".into();
-                            }
+                            interrupt_held = self.adapter.stop_held();
                             self.step(step)?;
                             interrupt_sent = true;
                         }
@@ -2621,7 +2619,11 @@ impl Actor {
                     if settled {
                         return Err("The provider settled its turn but did not acknowledge the interruption within 30 seconds, so whether the turn was cancelled is unconfirmed".into());
                     }
-                    let reason = if interrupt_error.is_empty() {
+                    let reason = if interrupt_held && self.adapter.stop_held() {
+                        " (the provider had not yet started the turn to stop)".to_owned()
+                    } else if interrupt_held {
+                        " (the stop was sent once the turn started)".to_owned()
+                    } else if interrupt_error.is_empty() {
                         String::new()
                     } else {
                         format!(" ({interrupt_error})")
