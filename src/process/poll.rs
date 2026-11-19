@@ -445,16 +445,14 @@ pub(super) fn execute(
             },
             _ => unreachable!(),
         };
-        return Err(ProcessFailure {
+        return Err(started_failure(
+            spec,
             kind,
-            program: spec.program.clone(),
-            exit_code: status.as_ref().and_then(ExitStatus::code),
-            signal: status.as_ref().and_then(exit_signal),
-            stdout: failure_excerpt(stdout_read.output),
-            stderr: failure_excerpt(stderr_read.output),
+            status.as_ref(),
+            stdout_read.output,
+            stderr_read.output,
             message,
-            started: true,
-        });
+        ));
     }
     let status = status.ok_or_else(|| {
         process_failure(
@@ -464,22 +462,20 @@ pub(super) fn execute(
             true,
         )
     })?;
-    // A command that exits closes its stdin before its exit can be observed, so
-    // its failure explains a broken pipe. A clean exit still lost input it never read.
+    // A command may exit without reading all its input; its exit status, not the
+    // broken pipe, says whether it succeeded.
     let stdin_error = stdin_error
-        .filter(|error| error.kind() != io::ErrorKind::BrokenPipe || status.success())
+        .filter(|error| error.kind() != io::ErrorKind::BrokenPipe)
         .map(|error| format!("stdin: {error}"));
     if let Some(message) = stdin_error.or(pipe_error) {
-        return Err(ProcessFailure {
-            kind: ProcessFailureKind::Io,
-            program: spec.program.clone(),
-            exit_code: status.code(),
-            signal: exit_signal(&status),
-            stdout: failure_excerpt(stdout_read.output),
-            stderr: failure_excerpt(stderr_read.output),
+        return Err(started_failure(
+            spec,
+            ProcessFailureKind::Io,
+            Some(&status),
+            stdout_read.output,
+            stderr_read.output,
             message,
-            started: true,
-        });
+        ));
     }
     Ok(ProcessOutput::from_parts(
         status,
@@ -488,12 +484,33 @@ pub(super) fn execute(
     ))
 }
 
+fn started_failure(
+    spec: &CommandSpec,
+    kind: ProcessFailureKind,
+    status: Option<&ExitStatus>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    message: String,
+) -> ProcessFailure {
+    ProcessFailure {
+        kind,
+        program: spec.program.clone(),
+        exit_code: status.and_then(ExitStatus::code),
+        signal: status.and_then(exit_signal),
+        stdout: failure_excerpt(stdout),
+        stderr: failure_excerpt(stderr),
+        message,
+        started: true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
     use std::io::{BufRead, BufReader};
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::ExitStatusExt;
 
     fn hold_executable_open_for_writing(path: &Path) -> Child {
         fs::write(path, b"#!/bin/sh\nprintf started\n").unwrap();
@@ -864,7 +881,7 @@ mod tests {
     }
 
     #[test]
-    fn closed_stdin_keeps_both_io_failure_excerpts_bounded() {
+    fn a_clean_exit_that_closes_its_input_succeeds_with_its_full_output() {
         let command = CommandSpec::new("/bin/sh")
             .args([
                 "-c",
@@ -873,12 +890,34 @@ mod tests {
             .stdin(vec![b'x'; 2 * 1024 * 1024])
             .output_limits(512 * 1024, 512 * 1024)
             .timeout(Duration::from_secs(5));
-        let failure = SystemProcessExecutor
+        let output = SystemProcessExecutor
             .execute(&command, &CancellationToken::new())
-            .unwrap_err();
+            .unwrap();
+        assert!(output.success);
+        assert_eq!(output.exit_code, Some(0));
+        assert_eq!(output.stdout.len(), 262144);
+        assert_eq!(output.stderr.len(), 262144);
+        assert!(output.stdout.iter().all(|byte| *byte == 0));
+        assert!(output.stderr.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn started_io_failure_keeps_both_excerpts_bounded() {
+        let command = CommandSpec::new("/bin/sh");
+        let status = ExitStatus::from_raw(0);
+        let failure = started_failure(
+            &command,
+            ProcessFailureKind::Io,
+            Some(&status),
+            vec![0; 262144],
+            vec![0; 262144],
+            "stdin: failed to write whole input".into(),
+        );
         assert_eq!(failure.kind, ProcessFailureKind::Io);
         assert_eq!(failure.exit_code, Some(0));
-        assert!(failure.message.starts_with("stdin:"));
+        assert_eq!(failure.signal, None);
+        assert!(failure.started);
+        assert_eq!(failure.message, "stdin: failed to write whole input");
         assert_eq!(failure.stdout.len(), FAILURE_EXCERPT_LIMIT);
         assert_eq!(failure.stderr.len(), FAILURE_EXCERPT_LIMIT);
         assert!(failure.stdout.iter().all(|byte| *byte == 0));
