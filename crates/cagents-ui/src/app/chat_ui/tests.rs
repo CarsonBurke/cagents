@@ -19264,14 +19264,14 @@ fn auth_recovery_rejects_stale_wrong_account_and_unknown_home_actions() {
 #[test]
 fn a_draft_whose_start_needs_sign_in_offers_sign_in_and_sends_again() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
-    let (card, target) = starting_chat_for_provider(&mut app, Provider::Antigravity);
+    let (card, target) = starting_chat_for_provider(&mut app, Provider::Muse);
     let handle = fixture_handle(&app, card, None);
     // The adapter has not yet said it takes commands.
     handle.replace_snapshot_for_test(Snapshot::default());
     answer_start(&mut app, target, Ok(handle.clone()));
     let target = chat_runtime(&app, card).target;
     let failure = format!(
-        "{}: sign in to Antigravity, then try again. (Authentication required)",
+        "{}: sign in to Muse with `muse login`, then try again. (Authentication required)",
         chat::ACP_SIGN_IN_PREFIX
     );
     handle.replace_snapshot_for_test(Snapshot {
@@ -19286,7 +19286,7 @@ fn a_draft_whose_start_needs_sign_in_offers_sign_in_and_sends_again() {
     assert_eq!(runtime.composer.text().trim(), "hello");
     assert_eq!(runtime.error.as_deref(), Some(failure.as_str()));
     let target = runtime.target;
-    let system = Account::system(Provider::Antigravity);
+    let system = Account::system(Provider::Muse);
     let recovery = app
         .chat_auth_recovery(chat_runtime(&app, card))
         .expect("the draft offers sign-in");
@@ -19311,14 +19311,10 @@ fn a_draft_whose_start_needs_sign_in_offers_sign_in_and_sends_again() {
 #[test]
 fn a_signed_out_draft_with_nothing_to_send_offers_only_sign_in() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
-    let card = draft_chat_in(
-        &mut app,
-        Provider::Antigravity,
-        Path::new(FIXTURE_DIRECTORY),
-    );
+    let card = draft_chat_in(&mut app, Provider::Muse, Path::new(FIXTURE_DIRECTORY));
     let target = chat_runtime(&app, card).target;
     app.chat_runtime_mut(target).unwrap().error = Some(format!(
-        "{}: sign in to Antigravity, then try again. (log in first)",
+        "{}: sign in to Muse with `muse login`, then try again. (log in first)",
         chat::ACP_SIGN_IN_PREFIX
     ));
     assert!(app.chat_auth_recovery_enabled(target));
@@ -19332,7 +19328,7 @@ fn a_signed_out_draft_with_nothing_to_send_offers_only_sign_in() {
         .launch
         .recipe
         .environment
-        .insert("HOME".into(), "/unknown/agy-recovery-home".into());
+        .insert("HOME".into(), "/unknown/muse-recovery-home".into());
     assert!(app.chat_auth_recovery(chat_runtime(&app, card)).is_none());
 }
 
@@ -19340,7 +19336,7 @@ fn a_signed_out_draft_with_nothing_to_send_offers_only_sign_in() {
 #[test]
 fn a_draft_whose_start_fails_otherwise_offers_no_sign_in() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
-    let (card, target) = starting_chat_for_provider(&mut app, Provider::Antigravity);
+    let (card, target) = starting_chat_for_provider(&mut app, Provider::Muse);
     let handle = fixture_handle(&app, card, None);
     // The adapter has not yet said it takes commands.
     handle.replace_snapshot_for_test(Snapshot::default());
