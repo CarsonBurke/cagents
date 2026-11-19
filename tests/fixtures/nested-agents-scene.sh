@@ -1,7 +1,8 @@
 #!/bin/bash
-# A Claude lead conversation whose four background agents start helpers of
-# their own, for native evidence of how many agents the footer and the agent
-# tabs say are running.
+# A Claude lead conversation whose eight background agents start helpers of
+# their own and settle every way an agent can, for native evidence of how
+# many agents the footer and the agent tabs say are running, and of how each
+# agent's row, report and tab say how it stands.
 #
 # Run from a checkout on the build host, with CAGENTS_EVIDENCE_TASK naming a
 # scripts/native-evidence task (see "Native evidence" in docs/development.md),
@@ -14,14 +15,16 @@
 # A synthetic Claude agent (tests/fixtures/chat-composer-claude.sh) replays
 # nested-agents-scene/, frame shapes recorded from Claude Code 2.1.325:
 #
-#   launch  the lead starts a background soak test and four background
-#           agents. Review starts a second opinion, which starts a spot check;
-#           Audit forks a review skill; Trace starts a log reader, which
-#           starts a grep. Claude Code forwards each helper's conversation
-#           under the call that started it.
-#   settle  the helpers, Trace and Rollback finish. Review stops while a
-#           check it started still runs. The soak test ends, but its
-#           notification never arrives; only the background level says so.
+#   launch  the lead starts a background soak test and eight background
+#           agents, one with a long name. Review starts a second opinion,
+#           which starts a spot check; Audit forks a review skill; Trace
+#           starts a log reader, which starts a grep. Claude Code forwards
+#           each helper's conversation under the call that started it.
+#   settle  those helpers, Trace, Rollback and the long-named Upgrade finish;
+#           Migrate fails and Index is stopped. Review stops while a check
+#           it started still runs, and Deploy while a helper it started
+#           still runs. The soak test ends, but its notification never
+#           arrives; only the background level says so.
 #
 # Shots: agents-running after launch, agents-settled after settle, each with
 # the side's prefix as native-evidence adds it.
