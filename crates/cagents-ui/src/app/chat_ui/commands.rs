@@ -1482,6 +1482,33 @@ mod tests {
         }
     }
 
+    /// A refused steer and a follow-up held for the next turn come back
+    /// together in the order they were written, whichever was first.
+    #[test]
+    fn a_refused_steer_comes_back_with_the_held_follow_up_in_written_order() {
+        let steer = ("Then fix them", PromptMode::Steer);
+        let queue = ("And add a test", PromptMode::Queue);
+        for (lined_up, returned) in [
+            ([steer, queue], "Then fix them\nAnd add a test"),
+            ([queue, steer], "And add a test\nThen fix them"),
+        ] {
+            let (mut app, card, _) = waiting_for_its_turn(lined_up);
+            publish(&mut app, card, |snapshot| {
+                snapshot.turn_generation += 1;
+                snapshot.items.push(user_text("u-logs", "Look at the logs"));
+            });
+            assert!(
+                chat_runtime(&app, card).commands.in_flight().is_some(),
+                "the steer goes once its turn has begun"
+            );
+            settle(&mut app, card, Err("Codex is not answering".into()));
+            let runtime = chat_runtime(&app, card);
+            assert!(runtime.followups.is_empty());
+            assert!(runtime.commands.is_idle(), "nothing sent in its place");
+            assert_eq!(runtime.composer.text().trim_end(), returned);
+        }
+    }
+
     /// A turn stopped before it began may never begin. The message the
     /// provider had then shows nowhere, so once its turn has had its time,
     /// it comes back to the composer ahead of what was written after it.
