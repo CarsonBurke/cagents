@@ -1992,6 +1992,7 @@ mod identity_tests {
             if worked {
                 assert_eq!(row.verb, "Started");
                 assert_eq!(row.state.text, "Failed");
+                assert!(tip.starts_with(&format!("Failed: {refusal}")), "{tip}");
                 assert!(row.open.is_some(), "its transcript opens");
             } else {
                 assert_eq!(row.verb, "Couldn't start");
@@ -2000,6 +2001,8 @@ mod identity_tests {
                 assert!(accessible.starts_with("Couldn't start "), "{accessible}");
                 assert!(tip.contains(OPENS_DETAIL), "{tip}");
                 assert_eq!(tip.matches(refusal).count(), 1, "the reason once: {tip}");
+                // A state with no words gives its bare reason, not ": reason".
+                assert!(tip.starts_with(refusal), "{tip}");
             }
         }
     }
