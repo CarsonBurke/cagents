@@ -854,6 +854,23 @@ fn is_typed_text(event: &Event) -> bool {
     )
 }
 
+/// A fresh, unmodified Space press: the key that, with Enter, presses a
+/// focused button. The pinned COSMIC button answers only Enter, so a control
+/// outside a [`focus_scope`] that should answer Space too routes it with
+/// [`focused_key`].
+pub fn is_space_press(event: &cosmic::iced::keyboard::Event) -> bool {
+    use cosmic::iced::keyboard;
+    matches!(
+        event,
+        keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character(character),
+            modifiers,
+            repeat: false,
+            ..
+        } if character.as_str() == " " && modifiers.is_empty()
+    )
+}
+
 /// An unmodified Space press restated as Enter, the key that presses a
 /// focused button.
 fn space_as_enter(event: &Event) -> Option<Event> {
