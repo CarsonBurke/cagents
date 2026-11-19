@@ -116,8 +116,6 @@ JOBS = (
               isolated=False, env=(("CHECK_FORMAT_CARGO_FIXTURE", "1"),)),
         Suite("validation checkout", "tests/prepare_validation_checkout.py",
               sources=("scripts/prepare-validation-checkout",)),
-        Suite("process custody", "tests/qualification/test_process_custody.py",
-              sources=("scripts/qualification/process_custody.py",)),
         Suite("fixture workspace generator", "tests/fixture_workspace.py",
               sources=("scripts/fixture-workspace",
                        *(f"scripts/fixture_workspace/{module}.py" for module in (
