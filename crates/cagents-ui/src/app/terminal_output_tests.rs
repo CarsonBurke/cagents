@@ -24,6 +24,8 @@ thread_local! {
     static CHROME_SYNCS: Cell<usize> = const { Cell::new(0) };
     static CARD_INDEXES: Cell<usize> = const { Cell::new(0) };
     static PERSISTS: Cell<usize> = const { Cell::new(0) };
+    static SOURCE_CONTROL_REBINDS: Cell<usize> = const { Cell::new(0) };
+    static SETTINGS_CAPTURES: Cell<usize> = const { Cell::new(0) };
 }
 pub(super) fn record_projection() {
     if super::projection_oracle::verifying() {
@@ -66,6 +68,27 @@ pub(super) fn record_persist() {
         return;
     }
     PERSISTS.set(PERSISTS.get() + 1);
+}
+pub(super) fn record_source_control_rebind() {
+    if super::projection_oracle::verifying() {
+        return;
+    }
+    SOURCE_CONTROL_REBINDS.set(SOURCE_CONTROL_REBINDS.get() + 1);
+}
+pub(super) fn record_settings_capture() {
+    if super::projection_oracle::verifying() {
+        return;
+    }
+    SETTINGS_CAPTURES.set(SETTINGS_CAPTURES.get() + 1);
+}
+/// How many times this thread has rebound source control to the focus.
+pub(super) fn source_control_rebinds() -> usize {
+    SOURCE_CONTROL_REBINDS.get()
+}
+/// How many settings saves this thread has captured, whether or not the
+/// window could write them.
+pub(super) fn settings_captures() -> usize {
+    SETTINGS_CAPTURES.get()
 }
 /// How many times this thread has handed the workspace to the writer.
 pub(super) fn persists() -> usize {

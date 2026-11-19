@@ -956,7 +956,7 @@ mod tests {
                 .map(|key| key.canonical_path.clone())
         };
         assert_ne!(unpinned, pinned, "the test needs focus elsewhere");
-        drop(app.set_pane_inspector_open(chat, false));
+        drop(app.update(Message::TogglePaneInspector(chat)));
         // The close finishes on an animation frame, which rebinds nothing
         // else; the panels must still let go of the work.
         drop(app.update(Message::Frame(

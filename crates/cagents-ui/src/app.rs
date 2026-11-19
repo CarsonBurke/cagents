@@ -12904,6 +12904,8 @@ impl Cagents {
     /// a session restoring, a project list arriving. Rebinding drops the
     /// previous worktree's model outright, so a stale row can never be pressed.
     fn rebind_source_control(&mut self) -> Task<Message> {
+        #[cfg(test)]
+        terminal_output_tests::record_source_control_rebind();
         // Work chosen in the inspector binds the panel without moving the
         // list's selection, which stays with the focused card.
         self.sidebar_state
@@ -15191,6 +15193,8 @@ impl Cagents {
     }
 
     fn capture_settings_save(&mut self) -> Result<SettingsSave, String> {
+        #[cfg(test)]
+        terminal_output_tests::record_settings_capture();
         if self.settings_write_blocked {
             return Err(
                 "settings were not loaded successfully; use Reset all settings to replace them"
