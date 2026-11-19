@@ -3869,12 +3869,15 @@ mod tests {
                                         resumed: Vec::new(),
                                     }
                                 }
-                                ClientRequest::List => ServerResponse::Listed {
-                                    terminals: Vec::new(),
-                                },
+                                ClientRequest::ListPage { after: None } => {
+                                    ServerResponse::ListedPage {
+                                        terminals: Vec::new(),
+                                        complete: true,
+                                    }
+                                }
                                 request => panic!("unexpected request {request:?}"),
                             };
-                            let listed = matches!(response, ServerResponse::Listed { .. });
+                            let listed = matches!(response, ServerResponse::ListedPage { .. });
                             write_frame(
                                 &mut stream,
                                 &ServerEnvelope {
