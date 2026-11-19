@@ -179,7 +179,7 @@ mod tests {
     use super::*;
     #[test]
     fn callback_precedes_seed_links_and_registry_publication_and_uses_actual_fds() {
-        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let root = crate::test_fixture::tempdir().unwrap();
         let homes = Homes::at(root.path().join("homes"));
         let system = root.path().join("system");
         fs::create_dir(&system).unwrap();
@@ -241,7 +241,7 @@ mod tests {
     }
     #[test]
     fn initializer_failure_retains_files_and_never_publishes_or_seeds() {
-        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let root = crate::test_fixture::tempdir().unwrap();
         let homes = Homes::at(root.path().join("homes"));
         let system = root.path().join("system");
         fs::create_dir(&system).unwrap();
@@ -276,7 +276,7 @@ mod tests {
     }
     #[test]
     fn busy_enrollment_withdraws_only_the_untouched_directory_it_made() {
-        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let root = crate::test_fixture::tempdir().unwrap();
         let homes = Homes::at(root.path().join("homes"));
         let store = crate::account::registry::Store::at(root.path().join("registry"));
         let mut created_path = None;
@@ -353,7 +353,7 @@ mod tests {
     #[test]
     fn replaced_child_or_parent_cannot_rebind_creation_receipt() {
         for replace_parent in [false, true] {
-            let root = tempfile::tempdir_in("/var/tmp").unwrap();
+            let root = crate::test_fixture::tempdir().unwrap();
             let homes = Homes::at(root.path().join("homes"));
             let mut old_path = None;
             let result = homes.create_with_config_initialized(
@@ -388,7 +388,7 @@ mod tests {
     }
     #[test]
     fn existing_directory_never_yields_a_creation_receipt() {
-        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let root = crate::test_fixture::tempdir().unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let key = Uuid::new_v4();
         let created = create(root.path(), Provider::Claude, key).unwrap();
@@ -406,7 +406,7 @@ mod tests {
     }
     #[test]
     fn widened_private_directory_permissions_refuse_publication_and_retain_files() {
-        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let root = crate::test_fixture::tempdir().unwrap();
         let homes = Homes::at(root.path().join("homes"));
         let mut path = None;
         let result = homes.create_with_config_initialized(
