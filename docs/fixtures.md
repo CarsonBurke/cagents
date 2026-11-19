@@ -1283,8 +1283,9 @@ does, and captures the offer. Where the offer exists, it resumes one
 conversation, shows the message that conversation received, and dismisses
 the rest. A session's start reopens the seeded conversations under new ids,
 which is why the update is recorded inside the session that shows it. The
-offer is made once per update: what was resumed or dismissed is kept with the
-window state until the next `start` restores the seed.
+offer is made once per update: what was resumed or dismissed is kept in the
+record every window shares, `update-resume.sqlite3` in the data directory,
+until the next `start` restores the seed.
 
 ## A refused shared-view seed
 
