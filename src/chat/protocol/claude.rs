@@ -649,6 +649,10 @@ struct Claude {
     submissions: HashMap<String, Submission>,
     queued: Vec<chat::QueuedMessage>,
     interruption: Option<bool>,
+    /// The last turn ended because the reader stopped it, which the idle
+    /// state Claude reports after its result must not turn back into a
+    /// finished turn. Cleared when the next turn starts.
+    ended_interrupted: bool,
     /// Whether this turn has shown where it was stopped: Claude Code records
     /// a stop as a user message, which is drawn as the marker in its place.
     stop_marked: bool,
@@ -996,6 +1000,7 @@ impl Claude {
     }
 
     fn start_turn(&mut self, step: &mut Step) {
+        self.ended_interrupted = false;
         if self.started_generation != Some(self.attention_generation) {
             self.suggestion_turn = None;
             step.events.push(Event::PromptSuggestionCleared);
@@ -4563,11 +4568,12 @@ impl Claude {
                 // Background agents have their own status. They must not
                 // prevent new input once the main turn has ended.
                 let busy = !self.pending.is_empty();
+                self.ended_interrupted = !busy && stopped;
                 self.status(
                     busy,
                     if busy {
                         "Claude turn ended; decisions remain"
-                    } else if stopped {
+                    } else if self.ended_interrupted {
                         chat::TURN_INTERRUPTED
                     } else {
                         "Claude turn complete"
@@ -7242,7 +7248,14 @@ impl Claude {
                 let state = string(frame, "state");
                 step.events.push(Event::Waiting(state == "requires_action"));
                 match state {
-                    "idle" => self.status(false, "Claude is idle", step),
+                    "idle" => {
+                        let detail = if self.ended_interrupted {
+                            chat::TURN_INTERRUPTED
+                        } else {
+                            "Claude is idle"
+                        };
+                        self.status(false, detail, step);
+                    }
                     "requires_action" => {
                         self.start_turn(step);
                         self.status(true, "Claude is waiting for your response", step)

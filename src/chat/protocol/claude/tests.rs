@@ -14628,3 +14628,60 @@ fn an_image_no_read_returned_has_no_description() {
         ]
     );
 }
+
+/// Claude reports idle after a stopped turn's result. A reader who sees the
+/// conversation after that frame must still find the turn stopped.
+#[test]
+fn a_stopped_turn_stays_interrupted_once_claude_goes_idle() {
+    let mut adapter = stopped_and_settled();
+    let idle = adapter
+        .receive(json!({"type":"system","subtype":"session_state_changed","state":"idle"}))
+        .unwrap();
+    assert_eq!(last_status(&idle), Some((false, chat::TURN_INTERRUPTED)));
+}
+
+/// The stopped outcome belongs to that turn only: the next one goes idle as
+/// any finished turn does.
+#[test]
+fn the_turn_after_a_stopped_one_goes_idle_as_usual() {
+    let mut adapter = stopped_and_settled();
+    adapter
+        .receive(json!({"type":"system","subtype":"session_state_changed","state":"running"}))
+        .unwrap();
+    let settled = adapter
+        .receive(json!({"type":"result","uuid":"next","subtype":"success","is_error":false}))
+        .unwrap();
+    assert_eq!(last_status(&settled), Some((false, "Claude turn complete")));
+    let idle = adapter
+        .receive(json!({"type":"system","subtype":"session_state_changed","state":"idle"}))
+        .unwrap();
+    assert_eq!(last_status(&idle), Some((false, "Claude is idle")));
+}
+
+/// An adapter whose turn the reader stopped, acknowledged and settled.
+fn stopped_and_settled() -> Claude {
+    let mut adapter = Claude {
+        ready: true,
+        busy: true,
+        ..Claude::default()
+    };
+    let interrupt = adapter.command(Command::Interrupt).unwrap();
+    adapter
+        .receive(reply(
+            interrupt.writes[0]["request_id"].as_str().unwrap(),
+            json!({"still_queued":[]}),
+        ))
+        .unwrap();
+    let settled = adapter
+        .receive(json!({"type":"result","uuid":"done","subtype":"success","is_error":false}))
+        .unwrap();
+    assert_eq!(last_status(&settled), Some((false, chat::TURN_INTERRUPTED)));
+    adapter
+}
+
+fn last_status(step: &Step) -> Option<(bool, &str)> {
+    step.events.iter().rev().find_map(|event| match event {
+        Event::Status { busy, detail } => Some((*busy, detail.as_str())),
+        _ => None,
+    })
+}
