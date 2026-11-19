@@ -601,9 +601,9 @@ impl Acp {
                             Setting::Model(model) => {
                                 self.config.model_changed(model);
                                 // Each model offers its own reasoning levels,
-                                // as Muse's do. A level chosen with the model
-                                // that the new model's options leave out
-                                // stays with the model it was chosen for.
+                                // as Muse's do. A level queued with the model
+                                // that the new model's options leave out is
+                                // dropped rather than sent and refused.
                                 if options.is_some()
                                     && let Some(Setting::Reasoning(level)) = self.settings.front()
                                     && !self.config.offers_reasoning(level)

@@ -167,7 +167,7 @@ fn mode(approval: &str) -> Result<String, String> {
         meaning if MODES.contains(&PROFILE.own_mode(meaning)) => PROFILE.own_mode(meaning),
         _ => {
             return Err(format!(
-                "Muse has no approval mode {approval:?}; choose never, on-request or untrusted."
+                "Muse has no approval mode {approval:?}; choose manual, auto, dontAsk or bypassPermissions, or the terminal's never, on-request or untrusted."
             ));
         }
     };

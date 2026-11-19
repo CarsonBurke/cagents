@@ -1919,9 +1919,12 @@ fn chip_with_window(
                     ChipTone::Attention
                 },
                 essential: true,
+                // Only a window-less limit says why in its detail; another
+                // limit's detail describes its windows, not the limit.
                 tooltip: snapshot
                     .detail
                     .clone()
+                    .filter(|_| window_of(snapshot).is_none())
                     .unwrap_or_else(|| format!("{name} reports usage is limited")),
             }
         }
@@ -1932,9 +1935,7 @@ fn chip_with_window(
                     usage_fraction: None,
                     tone: ChipTone::Current,
                     essential: false,
-                    tooltip: snapshot.detail.clone().unwrap_or_else(|| {
-                        format!("{name} reports no usage limits for this account")
-                    }),
+                    tooltip: format!("{name} reports no usage limits for this account"),
                 };
             };
             let stale = is_stale(snapshot, now);
