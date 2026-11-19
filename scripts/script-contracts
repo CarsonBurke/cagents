@@ -105,6 +105,9 @@ JOBS = (
     )),
     Job("tooling", suites=(
         Suite("Cargo artifacts", "tests/cargo_artifacts.py", sources=("scripts/cargo_artifacts.py",)),
+        Suite("vendored checkout-cache hooks", "tests/checkout_cache_vendor_hooks.py",
+              sources=("scripts/qualify-checkout-cache.py", "Cargo.toml", "vendor/iced-widget/build.rs",
+                       "scripts/cargo_artifacts.py")),
         Suite("lane warnings", "tests/cargo_lane.py", sources=("scripts/cargo-lane", "scripts/cargo_warnings.py")),
         Suite("script contracts", "tests/script_contracts.py", sources=("scripts/script-contracts",)),
         Suite("mise tasks", "tests/mise_tasks.py", sources=("mise.toml", "scripts/main-build-sentinel")),
