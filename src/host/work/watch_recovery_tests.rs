@@ -54,6 +54,32 @@ fn git(root: &Path, arguments: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
+fn fixture_handle() -> Handle {
+    Handle(Arc::new(Inner {
+        host: Weak::new(),
+        shared: Mutex::new(Shared {
+            projects: BTreeMap::new(),
+            pins: BTreeMap::new(),
+            session_activity: HashMap::new(),
+            tickets: BTreeMap::new(),
+            linear_unavailable: None,
+            stale_after_days: crate::work::DEFAULT_STALE_AFTER_DAYS,
+            board_read_at: None,
+            watching: false,
+            restored: BTreeMap::new(),
+        }),
+        updated: Condvar::new(),
+        scanner: Signal::default(),
+        forge: Signal::default(),
+        publisher: Signal::default(),
+        publication: Mutex::new(Publication::default()),
+        jobs: Jobs::default(),
+        store: Mutex::new(None),
+        conversations: conversations::Conversations::default(),
+        cancellation: CancellationToken::new(),
+    }))
+}
+
 fn wait_until(mut ready: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !ready() {
@@ -113,29 +139,7 @@ fn uncovered_periodic_scans_retry_native_watches_without_a_topology_event() {
     let root = root.canonicalize().unwrap();
     let repository = root.join(".git");
     let refs = repository.join("refs");
-    let handle = Handle(Arc::new(Inner {
-        host: Weak::new(),
-        shared: Mutex::new(Shared {
-            projects: BTreeMap::new(),
-            pins: BTreeMap::new(),
-            session_activity: HashMap::new(),
-            tickets: BTreeMap::new(),
-            linear_unavailable: None,
-            stale_after_days: crate::work::DEFAULT_STALE_AFTER_DAYS,
-            board_read_at: None,
-            watching: false,
-            restored: BTreeMap::new(),
-        }),
-        updated: Condvar::new(),
-        scanner: Signal::default(),
-        forge: Signal::default(),
-        publisher: Signal::default(),
-        publication: Mutex::new(Publication::default()),
-        jobs: Jobs::default(),
-        store: Mutex::new(None),
-        conversations: conversations::Conversations::default(),
-        cancellation: CancellationToken::new(),
-    }));
+    let handle = fixture_handle();
     let id = handle.shared().track(&repository, "fixture").id;
     let refuse = Arc::new(AtomicBool::new(true));
     let attempts = Arc::new(AtomicUsize::new(0));
@@ -289,4 +293,114 @@ fn uncovered_periodic_scans_retry_native_watches_without_a_topology_event() {
         3,
         "healthy plans retain their registrations"
     );
+}
+
+#[test]
+fn an_unwatched_change_is_read_while_a_watched_worktree_keeps_changing() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("repository");
+    let linked = directory.path().join("linked");
+    std::fs::create_dir(&root).unwrap();
+    git(&root, &["init", "-q", "-b", "main"]);
+    git(&root, &["config", "user.name", "Watch fixture"]);
+    git(&root, &["config", "user.email", "watch@example.invalid"]);
+    std::fs::write(root.join("README"), "tracked\n").unwrap();
+    git(&root, &["add", "README"]);
+    git(&root, &["commit", "-qm", "fixture"]);
+    git(
+        &root,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "linked",
+            linked.to_str().unwrap(),
+        ],
+    );
+    let repository = root.canonicalize().unwrap().join(".git");
+    let handle = fixture_handle();
+    handle.shared().track(&repository, "fixture");
+    let mut scanner = Scanner {
+        monitor: None,
+        configured: BTreeMap::new(),
+        stamped: HashMap::new(),
+        sampled: None,
+        refreshed: None,
+    };
+    complete_scan(&mut scanner, &handle);
+    let (primary, unwatched) = {
+        let shared = handle.shared();
+        let tracked = &shared.projects[&repository];
+        assert!(!tracked.covered);
+        let local = tracked.local.as_ref().unwrap();
+        assert_eq!(local.worktrees.len(), 2);
+        (
+            local
+                .worktrees
+                .iter()
+                .find(|worktree| worktree.primary)
+                .unwrap()
+                .id,
+            local
+                .worktrees
+                .iter()
+                .find(|worktree| !worktree.primary)
+                .unwrap()
+                .clone(),
+        )
+    };
+    assert_eq!(unwatched.dirty.as_ref().unwrap().paths, 0);
+    std::fs::write(linked.join("unwatched-change"), "new file\n").unwrap();
+
+    for pass in 0..3 {
+        std::fs::write(root.join("watched-change"), format!("edit {pass}\n")).unwrap();
+        {
+            let mut shared = handle.shared();
+            let tracked = shared.projects.get_mut(&repository).unwrap();
+            tracked.pending = Some(git_watch::Change {
+                worktrees: BTreeSet::from([primary]),
+                ..git_watch::Change::default()
+            });
+            tracked.last_scan = Some(Instant::now() - SCAN_SPACING);
+        }
+        complete_scan(&mut scanner, &handle);
+        let shared = handle.shared();
+        let linked = shared.projects[&repository]
+            .local
+            .as_ref()
+            .unwrap()
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.id == unwatched.id)
+            .unwrap();
+        assert_eq!(linked.dirty, unwatched.dirty);
+        assert_eq!(linked.status_read_at, unwatched.status_read_at);
+    }
+
+    {
+        let mut shared = handle.shared();
+        let tracked = shared.projects.get_mut(&repository).unwrap();
+        assert!(tracked.pending.is_none());
+        let mut local = (**tracked.local.as_ref().unwrap()).clone();
+        local
+            .worktrees
+            .iter_mut()
+            .find(|worktree| worktree.id == unwatched.id)
+            .unwrap()
+            .status_read_at = Some(Instant::now() - IDLE_POLL);
+        tracked.local = Some(Arc::new(local));
+        tracked.last_scan = Some(Instant::now() - SCAN_SPACING);
+    }
+    complete_scan(&mut scanner, &handle);
+    let shared = handle.shared();
+    let linked = shared.projects[&repository]
+        .local
+        .as_ref()
+        .unwrap()
+        .worktrees
+        .iter()
+        .find(|worktree| worktree.id == unwatched.id)
+        .unwrap();
+    assert_eq!(linked.dirty.as_ref().unwrap().paths, 1);
 }
