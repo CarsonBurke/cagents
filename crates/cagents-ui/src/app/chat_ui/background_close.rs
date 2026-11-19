@@ -112,6 +112,7 @@ impl Cagents {
             card,
             title,
             refused: None,
+            dismissed: false,
         });
         self.persist();
         ask_to_stop(target, handle, session, false)
@@ -459,14 +460,28 @@ impl Cagents {
         self.place_resumed_conversation(entry, session, None).1
     }
 
+    /// Takes a refused close out of the notices. Its conversation still
+    /// runs, so the record stays: reopening it by any route attaches to what
+    /// runs it, and that reopen takes the record.
     pub(super) fn dismiss_close_failure(&mut self, id: TerminalId) {
-        let _ = self.take_close_failure(id);
+        let Some(failure) = Arc::make_mut(&mut self.durable)
+            .stopping_chats
+            .iter_mut()
+            .find(|stopping| stopping.session.id == id && stopping.refused.is_some())
+        else {
+            return;
+        };
+        if !failure.dismissed {
+            failure.dismissed = true;
+            self.persist();
+        }
     }
 
     fn close_failures(&self) -> impl Iterator<Item = (&StoppingChat, &str)> {
         self.durable
             .stopping_chats
             .iter()
+            .filter(|stopping| !stopping.dismissed)
             .filter_map(|stopping| Some((stopping, stopping.refused.as_deref()?)))
     }
 

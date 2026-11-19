@@ -428,6 +428,11 @@ pub struct StoppingChat {
     /// to come.
     #[serde(default)]
     pub refused: Option<String>,
+    /// Whether the reader dismissed the notice of its refusal. The
+    /// conversation still runs, so reopening it by any route still attaches
+    /// to what runs it rather than starting it again.
+    #[serde(default)]
+    pub dismissed: bool,
 }
 
 /// What a chat had not sent when its card closed: the composer's text and

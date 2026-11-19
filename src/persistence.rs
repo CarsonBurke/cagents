@@ -8517,9 +8517,11 @@ mod tests {
             card: CardId::new(),
             title: "Plan the release".into(),
             refused: None,
+            dismissed: false,
         };
         let refused = StoppingChat {
             refused: Some("the provider did not exit".into()),
+            dismissed: true,
             card: CardId::new(),
             ..pending.clone()
         };

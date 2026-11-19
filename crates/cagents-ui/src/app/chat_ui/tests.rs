@@ -23411,9 +23411,10 @@ fn reopened_pane(app: &Cagents, closed: CardId, source: &chat::Session) -> Vec<C
 
 /// A refused close is reported once its pane has gone, with the
 /// conversation it left running and a way back to it. Dismissing the
-/// notice leaves the conversation alone, and the next close of it waits on
-/// its pane, where a second refusal can be dealt with (see
-/// `a_refused_close_stays_on_its_pane_and_ends_what_holds_it`).
+/// notice leaves the conversation alone: reopening it later, by any route,
+/// still attaches to the provider running it, never a second one, and the
+/// next close of it waits on its pane, where a second refusal can be dealt
+/// with (see `a_refused_close_stays_on_its_pane_and_ends_what_holds_it`).
 #[test]
 fn a_refused_background_close_is_reported_with_a_way_back() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -23444,11 +23445,34 @@ fn a_refused_background_close_is_reported_with_a_way_back() {
 
     let _ = app.update(Message::ChatUi(Action::DismissCloseFailure(source.id)));
     assert!(!app.has_close_failure_notices());
-    assert!(stopping(&app).is_empty());
+    assert!(app.close_failure_notice_views().is_empty());
+    assert_eq!(
+        stopping(&app),
+        vec![(source.id, Some(reason.into()))],
+        "what still runs is remembered"
+    );
+    assert_eq!(
+        app.persistent_workspace().stopping_chats,
+        app.durable.stopping_chats,
+        "and stays dismissed with the window"
+    );
     assert!(
         app.chat_ui.close_refused.contains(&source.id),
         "its next close waits on its pane"
     );
+
+    // Reopened after the dismissal, as /resume would.
+    let _ = app.reopen_closed_pane(card);
+    let reopened = reopened_pane(&app, card, &source);
+    assert_eq!(reopened.len(), 1);
+    assert_eq!(app.chat_return_session(reopened[0]).unwrap().id, source.id);
+    assert_eq!(
+        app.chat_ui.attempt(reopened[0]).unwrap().intent,
+        chat::Intent::Restore,
+        "it goes back to the provider still running"
+    );
+    assert!(stopping(&app).is_empty());
+    assert!(!app.has_close_failure_notices());
 }
 
 /// The notice's Reopen puts the conversation back on a pane attached to the
