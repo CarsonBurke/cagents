@@ -254,7 +254,7 @@ mod tests {
                 kind: DeliveryKind::Notice,
                 from: String::new(),
                 sender: String::new(),
-                summary: "Claude context".into(),
+                summary: "Added to Claude's context".into(),
                 body: body.into(),
             },
             ..item(id, "")

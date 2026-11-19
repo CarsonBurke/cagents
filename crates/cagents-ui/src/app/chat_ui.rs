@@ -461,6 +461,9 @@ pub enum Action {
     RetryThumbnails(Target),
     CloseImage,
     ImageNext(bool),
+    /// The whole picture the viewer, opened as the given serial, shows for
+    /// the entry the string names.
+    ViewerLoaded(u64, String, images::Loaded),
     ImageFit,
     ImageExternal,
     /// A context menu, viewer control or shortcut acting on displayed pixels.
@@ -895,6 +898,7 @@ impl Action {
             Self::RetryThumbnails(..) => "RetryThumbnails",
             Self::CloseImage => "CloseImage",
             Self::ImageNext(..) => "ImageNext",
+            Self::ViewerLoaded(..) => "ViewerLoaded",
             Self::ImageFit => "ImageFit",
             Self::ImageExternal => "ImageExternal",
             Self::Image(..) => "Image",
@@ -1034,6 +1038,7 @@ impl Action {
                 | Self::AccountPicker(_, false)
                 | Self::CloseImage
                 | Self::ImageNext(_)
+                | Self::ViewerLoaded(..)
                 | Self::ImageFit
                 | Self::ImageExternal
                 | Self::Image(images::ImageRef::Viewer(_), _)
@@ -1930,6 +1935,12 @@ struct CachedItem {
     image_attempt: u64,
     image_wait: Option<images::Pressure>,
     image_evicted: bool,
+    /// The size the preview is read at, which is where it is drawn: alone,
+    /// or as a tile beside other pictures.
+    image_fit: Option<images::Fit>,
+    /// Whether the preview's pixels are the whole picture, which fitted the
+    /// size it was read at, so copying it needs no second read.
+    image_whole: bool,
     /// The decoded preview's pixel size, kept after its pixels are released
     /// so the preview's room is held while they are read again.
     image_size: Option<(u32, u32)>,
@@ -2101,6 +2112,8 @@ impl CachedItem {
             cached.image_attempt = previous.image_attempt;
             cached.image_wait = previous.image_wait.clone();
             cached.image_evicted = previous.image_evicted;
+            cached.image_fit = previous.image_fit;
+            cached.image_whole = previous.image_whole;
             cached.image_size = previous.image_size;
         }
         cached
@@ -2253,6 +2266,8 @@ impl CachedItem {
             image_attempt,
             image_wait,
             image_evicted,
+            image_fit,
+            image_whole,
             image_size,
         ) = previous
             .as_ref()
@@ -2267,6 +2282,8 @@ impl CachedItem {
                     cached.image_attempt,
                     cached.image_wait.clone(),
                     cached.image_evicted,
+                    cached.image_fit,
+                    cached.image_whole,
                     cached.image_size,
                 )
             })
@@ -2415,6 +2432,8 @@ impl CachedItem {
             image_attempt,
             image_wait,
             image_evicted,
+            image_fit,
+            image_whole,
             image_size,
             coordination: coordination
                 .map(|prepared| Box::new(coordination::Coordinated::from_prepared(prepared)))
@@ -3192,6 +3211,9 @@ pub(super) struct Runtime {
     last_presented_tail: Option<(String, ChangeToken)>,
     /// Only the latest explicitly requested preview is retained outside recency.
     preview_request: Option<String>,
+    /// The rest of the requested preview's gallery, read with it so a tile
+    /// in an older gallery loads the gallery rather than one tile at a time.
+    preview_gallery: Vec<String>,
     /// The palette the cache's code blocks are highlighted in.
     syntax_theme: crate::settings::EditorSyntaxTheme,
     /// How the conversation's pull request links read, from what the window
@@ -4397,6 +4419,7 @@ impl Runtime {
             presentation_evicted: false,
             last_presented_tail: None,
             preview_request: None,
+            preview_gallery: Vec::new(),
             syntax_theme,
             pull_request_labels: Arc::default(),
             pull_request_inspected: Default::default(),
@@ -15110,14 +15133,21 @@ impl Cagents {
             }
             Action::OpenImage(target, id) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
-                    let gallery = images::Gallery::new(runtime, &id);
-                    self.chat_ui.image_viewer = gallery;
+                    self.chat_ui.image_viewer = images::Gallery::new(runtime, &id);
+                    if let Some(gallery) = &mut self.chat_ui.image_viewer {
+                        return gallery.read();
+                    }
                 }
             }
             Action::CloseImage => self.chat_ui.image_viewer = None,
             Action::ImageNext(forward) => {
                 if let Some(gallery) = &mut self.chat_ui.image_viewer {
-                    gallery.next(forward);
+                    return gallery.next(forward);
+                }
+            }
+            Action::ViewerLoaded(serial, id, loaded) => {
+                if let Some(gallery) = &mut self.chat_ui.image_viewer {
+                    gallery.loaded(serial, &id, loaded);
                 }
             }
             Action::ImageFit => {
@@ -15125,14 +15155,18 @@ impl Cagents {
                     gallery.reset = gallery.reset.wrapping_add(1);
                 }
             }
+            // The file opens elsewhere whether or not its pixels decoded here:
+            // one too large to show is exactly the one to open externally.
             Action::ImageExternal => {
-                if let Some(image) = self
+                if let Some(url) = self
                     .chat_ui
                     .image_viewer
                     .as_ref()
-                    .map(images::Gallery::selected_image)
+                    .and_then(images::Gallery::url)
                 {
-                    return self.image_command(image, images::ImageCommand::OpenExternally);
+                    return cosmic::task::future(async move {
+                        Message::ExternalLinkOpened(images::open_external(url).await)
+                    });
                 }
             }
             Action::Image(image, command) => return self.image_command(image, command),

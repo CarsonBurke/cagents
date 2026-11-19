@@ -3,9 +3,11 @@
 //!
 //! An action names the exact decoded handle the reader acted on, never an
 //! item ID, so a preview replaced or re-decoded in the meantime cannot copy or
-//! open pixels that were not clicked (#1563). Copy encodes those displayed
-//! pixels (already oriented, at full decoded size) as PNG on an image worker;
-//! the UI thread only hands the encoded bytes to the clipboard.
+//! open pixels that were not clicked (#1563). A transcript preview is decoded
+//! only as large as it is drawn, so Copy reads the whole of the picture that
+//! preview shows again; pixels already whole are copied as they are. Either
+//! way they are encoded (already oriented) as PNG on an image worker, and the
+//! UI thread only hands the encoded bytes to the clipboard.
 use super::*;
 use iced::advanced::image::Id;
 use iced::clipboard::mime::AsMimeTypes;
@@ -35,6 +37,9 @@ pub(in crate::app) struct Resolved {
     /// The transcript item, for a preview that opens the viewer.
     pub(in crate::app) item: Option<String>,
     pub(in crate::app) handle: Handle,
+    /// Where the whole picture is read from, when `handle` is a preview of
+    /// it rather than every pixel.
+    pub(in crate::app) source: Option<(Arc<chat::Item>, Origin)>,
     /// A literal file path the reader may copy; never a managed asset hint.
     pub(in crate::app) path: Option<String>,
     pub(in crate::app) url: Option<Url>,
@@ -108,18 +113,45 @@ pub(in crate::app) fn copy(handle: Handle) -> Task<Message> {
     let intent = text_copy::Intent::begin();
     let current = intent.clone();
     cosmic::task::future(async move {
-        let permits = encode_admission(&handle);
-        let result = match budget().decode.clone().acquire_many_owned(permits).await {
-            Ok(memory) => run_worker(move || {
-                let _memory = memory;
-                current.is_current().then(|| encode(&handle)).transpose()
-            })
-            .await
-            .and_then(|result| result),
-            Err(_) => Err("Image memory admission is closed.".into()),
+        let result = encode_admitted(handle, current).await;
+        action(Action::ImageCopied(intent, result))
+    })
+}
+
+/// Start copying the whole of the picture `item` shows, read again first.
+fn copy_whole(item: Arc<chat::Item>, origin: Origin) -> Task<Message> {
+    let intent = text_copy::Intent::begin();
+    let current = intent.clone();
+    cosmic::task::future(async move {
+        let result = match worker(move || load(&item, &origin, Fit::Full)).await {
+            Loaded::Ready(_) if !current.is_current() => Ok(None),
+            Loaded::Ready(handle) => encode_admitted(handle, current).await,
+            Loaded::Failed(error) => Err(error),
+            Loaded::Deferred(_) => {
+                Err("Image memory is busy. Close other images and copy this one again.".into())
+            }
+            Loaded::Unavailable => Err("The image could not be read again to copy it.".into()),
         };
         action(Action::ImageCopied(intent, result))
     })
+}
+
+/// `handle` as PNG, once memory for encoding it is admitted, unless a newer
+/// copy has superseded this one by then.
+async fn encode_admitted(
+    handle: Handle,
+    current: text_copy::Intent,
+) -> Result<Option<Png>, String> {
+    let permits = encode_admission(&handle);
+    match budget().decode.clone().acquire_many_owned(permits).await {
+        Ok(memory) => run_worker(move || {
+            let _memory = memory;
+            current.is_current().then(|| encode(&handle)).transpose()
+        })
+        .await
+        .and_then(|result| result),
+        Err(_) => Err("Image memory admission is closed.".into()),
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -233,7 +265,7 @@ pub(in crate::app) fn copyable_path(runtime: &Runtime, content: &ItemContent) ->
 
 /// The transcript preview currently drawn with `image`, if it still is.
 pub(in crate::app) fn resolve(runtime: &Runtime, image: Id) -> Option<Resolved> {
-    let Some((id, handle)) = runtime
+    let Some((id, handle, whole)) = runtime
         .presentation_cache()
         .iter()
         .find_map(|(id, cached)| {
@@ -241,7 +273,7 @@ pub(in crate::app) fn resolve(runtime: &Runtime, image: Id) -> Option<Resolved> 
                 .image
                 .as_ref()
                 .filter(|handle| handle.id() == image)
-                .map(|handle| (id, handle))
+                .map(|handle| (id, handle, cached.image_whole))
         })
     else {
         // An image an answer's Markdown shows.
@@ -251,6 +283,8 @@ pub(in crate::app) fn resolve(runtime: &Runtime, image: Id) -> Option<Resolved> 
     Some(Resolved {
         item: Some(id.clone()),
         handle: handle.clone(),
+        // A preview reduced to its tile or column is copied whole.
+        source: (!whole).then(|| (item.clone(), Origin::of(runtime))),
         path: copyable_path(runtime, &item.content),
         url: None,
     })
@@ -289,7 +323,10 @@ impl Cagents {
                 self.status = Some(TransientNotice::warning(UNSUPPORTED));
                 Task::none()
             }
-            ImageCommand::Copy => copy(resolved.handle),
+            ImageCommand::Copy => match resolved.source {
+                Some((item, origin)) => copy_whole(item, origin),
+                None => copy(resolved.handle),
+            },
             ImageCommand::CopyPath => match resolved.path {
                 Some(path) => {
                     text_copy::invalidate();

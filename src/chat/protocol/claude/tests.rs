@@ -4387,7 +4387,7 @@ fn synthetic_context_history_preserves_opaque_context_without_rewriting_source()
             .collect::<Vec<_>>(),
         vec!["wire:0", "raw-summary:0", "tail:0"]
     );
-    assert!(contexts.iter().all(|item| matches!(&item.content, ItemContent::Delivery { kind: DeliveryKind::Notice, from, sender, summary, body: original } if from.is_empty() && sender.is_empty() && *summary == if item.id == "raw-summary:0" { COMPACTED } else { "Claude context" } && original.as_bytes() == body.as_bytes())));
+    assert!(contexts.iter().all(|item| matches!(&item.content, ItemContent::Delivery { kind: DeliveryKind::Notice, from, sender, summary, body: original } if from.is_empty() && sender.is_empty() && *summary == if item.id == "raw-summary:0" { COMPACTED } else { CONTEXT } && original.as_bytes() == body.as_bytes())));
     source.rewind().unwrap();
     let mut after = String::new();
     source.read_to_string(&mut after).unwrap();
@@ -13244,4 +13244,104 @@ fn the_nested_agents_scene_counts_only_the_leads_running_agents() {
         .find(|item| item.id == "toolu_soak")
         .unwrap();
     assert_eq!(soak.content.status(), Some(ToolStatus::Ended));
+}
+
+/// Claude Code's own stream for two Reads of large PNGs, recorded from the
+/// real provider: each image comes back in its tool result, followed by a
+/// synthetic note on how Claude scaled it for the model.
+#[test]
+fn read_images_are_named_for_their_files_and_their_scaling_notes_are_not_shown() {
+    let mut adapter = Claude::default();
+    let mut shown = Vec::new();
+    for line in include_str!("../../../../tests/fixtures/claude-read-images-live.jsonl").lines() {
+        let step = adapter
+            .receive(serde_json::from_str(line).unwrap())
+            .unwrap();
+        for event in step.events {
+            if let Event::Item(item) = event {
+                shown.retain(|(id, _, _): &(String, Role, ItemContent)| *id != item.id);
+                shown.push((item.id, item.role, item.content));
+            }
+        }
+    }
+    assert!(
+        !shown.iter().any(|(_, role, _)| *role == Role::System),
+        "the scaling notes are the Reads' own, not context rows: {shown:?}"
+    );
+    let images = shown
+        .iter()
+        .filter_map(|(id, _, content)| match content {
+            ItemContent::Image {
+                path, description, ..
+            } => Some((
+                id.as_str(),
+                description.as_str(),
+                path.starts_with("data:image/png;base64,"),
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        images,
+        vec![
+            (
+                "toolu_012NGrjPMVQA8G3HDzif6xrL:image:0",
+                "big-red.png",
+                true
+            ),
+            (
+                "toolu_019xArHb7CgX2tuV8vGFNnpC:image:0",
+                "big-blue.png",
+                true
+            ),
+        ]
+    );
+    let reads = shown
+        .iter()
+        .filter(|(_, _, content)| {
+            matches!(
+                content,
+                ItemContent::Command {
+                    action: CommandAction::Read,
+                    status: ToolStatus::Succeeded,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(reads, 2);
+}
+
+#[test]
+fn only_a_whole_scaling_note_is_withheld_and_other_context_says_what_it_is() {
+    let note = "[Image: original 2600x1800, displayed at 2306x1596. Multiply coordinates by 1.13 to map to original image.]";
+    for (content, withheld) in [
+        (json!(note), true),
+        (json!([{"type":"text","text":note}]), true),
+        (
+            json!([{"type":"text","text":note},{"type":"text","text":"Also read the README"}]),
+            false,
+        ),
+        (json!(format!("{note}\n{note}")), true),
+        (json!(format!("{note}\nAlso read README [required]")), false),
+        (
+            json!([{"type":"text","text":format!("{note} Also read README [required]")}]),
+            false,
+        ),
+        (json!("[Image: original attachment]"), false),
+        (
+            json!("Base directory for this skill: /skills/example"),
+            false,
+        ),
+    ] {
+        let mut adapter = Claude::default();
+        let step = adapter
+            .receive(json!({"type":"user","uuid":"context","isSynthetic":true,"message":{"role":"user","content":content}}))
+            .unwrap();
+        let notices = items(&step)
+            .into_iter()
+            .filter(|content| matches!(content, ItemContent::Delivery { kind: DeliveryKind::Notice, summary, .. } if summary == CONTEXT))
+            .count();
+        assert_eq!(notices == 0, withheld, "{content}");
+    }
 }
