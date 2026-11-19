@@ -419,20 +419,22 @@ pub(super) fn group<'c, T: Borrow<Item>>(
         thinking_in = None;
         if !renders(&item.content) {
             if matches!(item.content, ItemContent::Text { thinking: true, .. }) {
-                let (lies, after) = match turns.last_mut() {
-                    Some(turn) if state == Open::Taking => {
+                let open = turns.len().checked_sub(1).filter(|_| state == Open::Taking);
+                let (lies, after) = match open {
+                    Some(at) => {
+                        let turn = &mut turns[at];
                         turn.spans(item);
-                        thinking_in = Some(turns.len() - 1);
+                        thinking_in = Some(at);
                         // Thinking after the group's prose fell below its
                         // strip, so the strip does not list it.
                         let lies = if turn.prose.is_empty() {
-                            Lies::Among(turns.len() - 1)
+                            Lies::Among(at)
                         } else {
                             Lies::Unlisted
                         };
                         (lies, turn.steps.len())
                     }
-                    _ => {
+                    None => {
                         unplaced.get_or_insert_default().takes_in(Span::of(item));
                         (Lies::Ahead, 0)
                     }
