@@ -959,10 +959,14 @@ fn bounded<'a>(
     }
 }
 
+/// How a turn the person stopped ended, in the words its stopped step and
+/// the timeline's marker use.
+pub(super) const TURN_STOPPED: &str = "Stopped";
+
 /// How a turn that finished with `snapshot` ended, as its provider said.
 pub(super) fn turn_outcome(snapshot: &chat::Snapshot) -> &'static str {
     match snapshot.detail.as_str() {
-        chat::TURN_INTERRUPTED => "Interrupted",
+        chat::TURN_INTERRUPTED => TURN_STOPPED,
         "Turn failed" => "Failed",
         _ => "Finished",
     }
@@ -2281,7 +2285,7 @@ impl Runtime {
             let label = self.finished_label();
             (
                 Some(match label {
-                    "Interrupted" => Icon::Cancel,
+                    TURN_STOPPED => Icon::Stop,
                     "Finished" => Icon::Check,
                     _ => Icon::Warning,
                 }),

@@ -1179,8 +1179,13 @@ fn conversation_footer_requires_completion_evidence_and_tracks_delegated_waiting
     snapshot.ready = true;
     snapshot.finished_at = Some(42);
     assert_eq!(runtime.conversation_status(false).1, "Finished");
-    Arc::make_mut(&mut runtime.snapshot).detail = "Turn interrupted".into();
-    assert_eq!(runtime.conversation_status(false).1, "Interrupted");
+    // A turn the person stopped says so in the words of its stopped step
+    // and marker, with the marker's glyph.
+    Arc::make_mut(&mut runtime.snapshot).detail = chat::TURN_INTERRUPTED.into();
+    assert_eq!(
+        runtime.conversation_status(false),
+        (Some(Icon::Stop), "Stopped".to_owned())
+    );
     Arc::make_mut(&mut runtime.snapshot).detail = "Turn failed".into();
     assert_eq!(runtime.conversation_status(false).1, "Failed");
     Arc::make_mut(&mut runtime.snapshot).detail.clear();
@@ -1852,7 +1857,7 @@ fn timeline_activity_follows_real_work_and_settles_into_the_finished_stamp() {
     snapshot.finished_at = Some(42);
     snapshot.detail = "Turn interrupted".into();
     assert_eq!(activity(&runtime), None);
-    assert_eq!(runtime.finished_label(), "Interrupted");
+    assert_eq!(runtime.finished_label(), "Stopped");
     Arc::make_mut(&mut runtime.snapshot).detail.clear();
     assert_eq!(runtime.finished_label(), "Finished");
     Arc::make_mut(&mut runtime.snapshot).error = Some("Provider failed".into());
@@ -1863,11 +1868,11 @@ fn timeline_activity_follows_real_work_and_settles_into_the_finished_stamp() {
         at: 42,
         clock: "12:00".into(),
         full: "2026-11-05 12:00".into(),
-        outcome: "Interrupted",
+        outcome: "Stopped",
     });
     Arc::make_mut(&mut runtime.snapshot).detail = "Reconnected".into();
     runtime.error = Some("Could not change the model".into());
-    assert_eq!(runtime.finished_label(), "Interrupted");
+    assert_eq!(runtime.finished_label(), "Stopped");
     // Choosing a model is not a message on its way: it neither reads as
     // sending nor takes the stamp away. A message does.
     runtime.error = None;
@@ -5561,7 +5566,9 @@ fn a_stop_marker_is_one_quiet_row_with_nothing_to_open() {
         .filter_map(|node| node.node().label().map(|label| (node.node().role(), label)))
         .collect();
     assert!(
-        labels.iter().any(|(_, label)| *label == chat::STOPPED),
+        labels
+            .iter()
+            .any(|(_, label)| *label == chat::STOPPED_NOTICE),
         "the marker says the turn stopped: {labels:?}"
     );
     assert!(
