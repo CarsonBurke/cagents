@@ -4953,6 +4953,37 @@ pub(crate) mod tests {
         assert_eq!(visible, vec![2]);
     }
 
+    /// The text the pull request browser shows, as rendered.
+    fn browser_texts(state: &State) -> Vec<String> {
+        use cosmic::iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree},
+        };
+        #[derive(Default)]
+        struct Texts(Vec<String>);
+        impl Operation for Texts {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, text: &str) {
+                self.0.push(text.to_owned());
+            }
+        }
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut element = state.browser(false);
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(900.0, 900.0)),
+        );
+        let mut texts = Texts::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut texts);
+        texts.0
+    }
+
     #[test]
     fn request_only_rows_count_toward_the_matching_caption() {
         use crate::github::review_requests::{
@@ -5004,6 +5035,12 @@ pub(crate) mod tests {
         state.browser_filter = BrowserFilter::NeedsReview;
         assert!(state.browser_matches().is_empty());
         assert_eq!(state.request_only_rows().len(), 2);
+        // The caption the reader sees counts the two request rows it shows.
+        assert!(
+            browser_texts(&state).contains(&"2 matching · 1 loaded".to_owned()),
+            "{:?}",
+            browser_texts(&state)
+        );
         assert_eq!(
             state
                 .request_only_rows()
