@@ -1858,19 +1858,14 @@ impl Claude {
         if fresh_live_carrier && role == Role::User && child.is_none() && !model_only(frame) {
             self.settle_live_notifications(frame, step);
         }
-        // What Claude Code put in front of the model itself. The transcript
-        // marks it isMeta, or with the more specific summary/transcript-only
-        // flags; stream-json folds all of them into isSynthetic. Both are read
-        // by what they say, so a chat reads the same live and reopened.
-        // Only text is read so: a meta frame carrying a tool's result is the
-        // harness's own bookkeeping of that call.
+        // What Claude Code put in front of the model itself. The wire marks
+        // what it streams isSynthetic; the transcript marks that and more
+        // isMeta, or with the more specific summary/transcript-only flags.
+        // Both are read by what they say, and of the meta only what Claude
+        // Code also streams is shown (see `saved_context_shown`), so a chat
+        // reads the same live and reopened.
         let meta = delivered.is_empty() && frame["isMeta"].as_bool() == Some(true);
-        if meta
-            && (role != Role::User
-                || !string(&frame["origin"], "kind").is_empty()
-                || recorded_notification(frame).is_some()
-                || message_text(&frame["message"]["content"]).is_none())
-        {
+        if meta && (role != Role::User || !saved_context_shown(frame)) {
             self.track_carrier(carrier, Vec::new(), child);
             return Ok(());
         }
@@ -4995,29 +4990,23 @@ fn model_only(frame: &Value) -> bool {
     frame["isMeta"].as_bool() == Some(true) && string(&frame["origin"], "kind") != "peer"
 }
 
-/// Whether a record Claude Code saved as meta shows anything once read: the
-/// instructions a skill call loaded, and context that is not for the model
-/// alone, as the same context streamed live does. Instructions naming no
-/// call were expanded from a command the reader typed, which the wire never
-/// streams.
+/// Whether a record Claude Code saved as meta shows anything once read. Only
+/// what Claude Code also streams does, so a reopened chat shows the steps the
+/// live one did: the instructions a skill call loaded, and what a hook said
+/// back. The rest it saves as meta never reaches the wire: a goal's setup
+/// note, a scheduled wakeup's prompt, the prompt resuming a response a
+/// classifier stopped or a stream cut off, and what a typed command expanded
+/// into, whose instructions name no call.
 fn saved_context_shown(frame: &Value) -> bool {
+    let content = &frame["message"]["content"];
     string(frame, "type") == "user"
         && string(&frame["origin"], "kind").is_empty()
         && recorded_notification(frame).is_none()
-        && message_text(&frame["message"]["content"]).is_some()
-        && match injected(&frame["message"]["content"]) {
+        && match injected(content) {
             Injected::Skill { .. } => frame["sourceToolUseID"].is_string(),
             Injected::ModelOnly => false,
-            Injected::Other => true,
+            Injected::Other => message_text(content).is_some_and(|text| hook_feedback(&text)),
         }
-}
-
-/// Whether a record is a prompt the reader typed as a slash command.
-fn typed_command(frame: &Value) -> bool {
-    string(frame, "type") == "user"
-        && !model_only(frame)
-        && message_text(&frame["message"]["content"])
-            .is_some_and(|text| slash_command_prompt(&text).is_some())
 }
 
 /// What Claude Code put in front of the model on its own, by what it says.
@@ -5114,17 +5103,21 @@ fn image_note(text: &str) -> bool {
 /// the agent wrote, kept with the work around it rather than as a notice.
 const CONTEXT_STEP: &str = "Claude context";
 
+/// Whether `text` is what a hook said back to the model, such as a Stop hook
+/// keeping the turn going: `Stop hook feedback:` and what the hook said.
+fn hook_feedback(text: &str) -> bool {
+    text.split_once(" hook feedback:")
+        .is_some_and(|(event, _)| {
+            !event.is_empty() && event.chars().all(|c| c.is_ascii_alphabetic())
+        })
+}
+
 /// Preserve opaque provider context without attributing it to the user, a
 /// particular tool, or another agent: a finished step whose output is the
 /// context itself, read on demand.
 fn context_item(id: String, body: String) -> Item {
-    // What a hook said back, such as a Stop hook keeping the turn going,
-    // names the hook that said it.
-    let hook = body
-        .split_once(" hook feedback:")
-        .is_some_and(|(event, _)| {
-            !event.is_empty() && event.chars().all(|c| c.is_ascii_alphabetic())
-        });
+    // What a hook said back names the hook that said it.
+    let hook = hook_feedback(&body);
     Item {
         id,
         role: Role::Assistant,
@@ -7918,9 +7911,6 @@ impl History {
         let mut task_notices = Vec::new();
         let mut user_prompts = HashSet::new();
         let mut main_message: Option<String> = None;
-        // The prompt a reader typed as a command, or the last record of what
-        // it expanded into.
-        let mut command_tail: Option<String> = None;
         let mut position = 0;
         let mut line = Vec::new();
         let mut tool_ref_bytes = 0_usize;
@@ -8032,15 +8022,9 @@ impl History {
             if let Some(parent) = &parent {
                 parents.insert(parent.clone());
             }
-            // What a typed command expanded into follows it as meta naming
-            // no call. Claude Code never streams it, so it is not shown.
-            let expands_command = model_only(&value)
-                && value["sourceToolUseID"].is_null()
-                && parent.is_some()
-                && parent == command_tail;
             // A manual compaction's output repeats the summary shown above it.
             let visible = message
-                && (!model_only(&value) || (!expands_command && saved_context_shown(&value)))
+                && (!model_only(&value) || saved_context_shown(&value))
                 && main
                 && value["repeatsCompactSummary"].as_bool() != Some(true);
             // A rewritten record keeps what it first said: where it was, the
@@ -8067,7 +8051,6 @@ impl History {
                 });
             if message && main {
                 main_message = Some(uuid.to_owned());
-                command_tail = (expands_command || typed_command(&value)).then(|| uuid.to_owned());
             }
             let compact_record = if !visible {
                 None

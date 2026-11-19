@@ -4590,11 +4590,13 @@ fn a_typed_skill_command_shows_only_its_prompt_live_and_in_history() {
 }
 
 /// Everything else Claude Code puts in front of the model is read by what it
-/// says, so the transcript's isMeta and the wire's isSynthetic agree: notes
-/// for the model alone leave no row, and the rest is one compact context
-/// step, with the same ID, whose output is the text.
+/// says. Notes for the model alone leave no row, live or reopened. What a
+/// hook said back streams as it is saved, so both show it as the same compact
+/// step, whose output is the text. Other context it streams is a step live;
+/// what it saves as meta is not, since most of that never streams (see
+/// `saved_meta_claude_code_never_streams_stays_hidden`).
 #[test]
-fn injected_context_is_classified_alike_live_and_in_history() {
+fn injected_context_is_classified_by_what_it_says() {
     let hidden = [
         json!(
             "[Image: original 2600x1800, displayed at 2306x1596. Multiply coordinates by 1.13 to map to original image.]"
@@ -4611,26 +4613,23 @@ fn injected_context_is_classified_alike_live_and_in_history() {
             "(Re-invocation of /release-notes — the skill instructions were previously loaded; the arguments or dynamic output below are new.)"
         ),
     ];
-    let shown = [
-        (
-            "Stop hook feedback:\n[goal]: The goal is not met.",
-            "Hook context",
-        ),
-        (
-            "<system-reminder>a</system-reminder> and a request",
-            CONTEXT_STEP,
-        ),
-        ("[Image: a diagram the reader described]", CONTEXT_STEP),
-        ("Base directory for nothing in particular", CONTEXT_STEP),
-        ("A reminder about Stop hook feedback: none", CONTEXT_STEP),
+    let hooks = [
+        json!("Stop hook feedback:\n[goal]: The goal is not met."),
+        json!([{"type":"text","text":"SubagentStop hook feedback:\nKeep going."}]),
+    ];
+    let live_only = [
+        json!("<system-reminder>a</system-reminder> and a request"),
+        json!("[Image: a diagram the reader described]"),
+        json!("Base directory for nothing in particular"),
+        json!("A reminder about Stop hook feedback: none"),
     ];
     let prompt = json!({"type":"user","uuid":"prompt","message":{"role":"user","content":"Go"}});
-    for content in hidden
-        .iter()
-        .cloned()
-        .chain(shown.iter().map(|(text, _)| json!(text)))
-    {
-        let text = message_text(&content).unwrap();
+    let step = |items: &[Item], name: &str, text: &str| {
+        matches!(items, [Item { id, role: Role::Assistant, content: ItemContent::Tool { name: shown, input, output, status: ToolStatus::Succeeded }, .. }]
+            if id == "context:0" && shown == name && input.is_empty() && output == text)
+    };
+    for content in hidden.iter().chain(&hooks).chain(&live_only) {
+        let text = message_text(content).unwrap();
         let live = settled_live(&[
             prompt.clone(),
             json!({"type":"user","uuid":"context","isSynthetic":true,"message":{"role":"user","content":content}}),
@@ -4639,16 +4638,45 @@ fn injected_context_is_classified_alike_live_and_in_history() {
             prompt.clone(),
             json!({"type":"user","uuid":"context","isMeta":true,"message":{"role":"user","content":content}}),
         ]);
-        assert_eq!(live, history, "{text}");
-        if let Some((_, step)) = shown.iter().find(|(shown, _)| *shown == text) {
-            assert!(
-                matches!(&live[1..], [Item { id, role: Role::Assistant, content: ItemContent::Tool { name, input, output, status: ToolStatus::Succeeded }, .. }]
-                if id == "context:0" && name == step && input.is_empty() && *output == text),
-                "{live:?}"
-            );
+        if hooks.contains(content) {
+            assert!(step(&live[1..], "Hook context", &text), "{live:?}");
+            assert_eq!(live, history, "{text}");
+        } else if live_only.contains(content) {
+            assert!(step(&live[1..], CONTEXT_STEP, &text), "{live:?}");
+            assert_eq!(history.len(), 1, "{text}: {history:?}");
         } else {
             assert_eq!(live.len(), 1, "{text}: {live:?}");
+            assert_eq!(live, history, "{text}");
         }
+    }
+}
+
+/// A reopened chat shows only the steps the live one did. These are records
+/// Claude Code 2.1.325 saves as meta, shaped as saved, which it never streams
+/// to `--output-format stream-json`: a goal's setup note and a scheduled
+/// wakeup's prompt were observed absent from the wire, and the goal check-in
+/// about background work and the prompts resuming a stopped or cut-off
+/// response were never seen there.
+#[test]
+fn saved_meta_claude_code_never_streams_stays_hidden() {
+    let prompt = json!({"type":"user","uuid":"prompt","message":{"role":"user","content":"Go"}});
+    let answer = json!({"type":"assistant","uuid":"answer","parentUuid":"saved","message":{"id":"msg-answer","role":"assistant","content":[{"type":"text","text":"Done."}]}});
+    for record in [
+        json!({"type":"user","uuid":"saved","parentUuid":"prompt","isMeta":true,"message":{"role":"user","content":"A session-scoped Stop hook is now active with condition: \"the tests pass\". Briefly acknowledge the goal, then immediately start (or continue) working toward it."}}),
+        json!({"type":"user","uuid":"saved","parentUuid":"prompt","isMeta":true,"message":{"role":"user","content":"Goal check-in: «the tests pass» is not met yet, and background work is still running:\n- b1 · shell · cargo test\nCheck on their progress (e.g. read their output)."}}),
+        json!({"type":"user","uuid":"saved","parentUuid":"prompt","isMeta":true,"promptSource":"system","turnOrigin":"scheduled","message":{"role":"user","content":[{"type":"text","text":"Continue from where you left off."}]}}),
+        json!({"type":"user","uuid":"saved","parentUuid":"prompt","isMeta":true,"turnCompanion":true,"refusedMessageId":"msg-refused","message":{"role":"user","content":"Your response above was stopped by a safety classifier — this is not a tool or API error."}}),
+        json!({"type":"user","uuid":"saved","parentUuid":"prompt","isMeta":true,"turnCompanion":true,"message":{"role":"user","content":"Your response above was cut off mid-stream. Resume directly from where it stops — no apology, no recap."}}),
+    ] {
+        let history = settled_history(vec![prompt.clone(), record.clone(), answer.clone()]);
+        assert_eq!(
+            history
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["prompt:0", "msg-answer:0"],
+            "{record}: {history:?}"
+        );
     }
 }
 
