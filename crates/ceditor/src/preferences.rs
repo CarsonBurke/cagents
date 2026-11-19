@@ -19,6 +19,10 @@ pub struct Session {
     /// else renders collapsed, so whole project trees stay cheap to load.
     #[serde(default)]
     pub expanded_directories: BTreeMap<String, Vec<String>>,
+    /// Languages chosen for open files their names do not type, such as an
+    /// untitled note read as Markdown, keyed by file path.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub languages: BTreeMap<String, cagents_ui::editor::language::DocumentLanguage>,
 }
 
 // UTF-8 paths retain the legacy JSON string representation. Unix filenames
@@ -88,6 +92,7 @@ impl Default for Session {
             active: None,
             sidebar_open: default_sidebar_open(),
             expanded_directories: BTreeMap::new(),
+            languages: BTreeMap::new(),
         }
     }
 }
@@ -351,6 +356,10 @@ mod tests {
                 "/project".into(),
                 vec!["src".into(), "src/nested".into()],
             )]),
+            languages: BTreeMap::from([(
+                "/notes/Untitled".into(),
+                cagents_ui::editor::language::DocumentLanguage::PlainText,
+            )]),
         };
         save_session(&settings, &session).unwrap();
         assert_eq!(load_session(&settings).unwrap(), session);
@@ -360,6 +369,7 @@ mod tests {
             active: Some(0),
             sidebar_open: true,
             expanded_directories: BTreeMap::new(),
+            languages: BTreeMap::new(),
         };
         save_session(&settings, &replacement).unwrap();
         assert_eq!(load_session(&settings).unwrap(), replacement);
@@ -480,6 +490,7 @@ mod tests {
             active: Some(0),
             sidebar_open: true,
             expanded_directories: BTreeMap::new(),
+            languages: BTreeMap::new(),
         };
         assert_eq!(
             session.startup_paths(Vec::new()),
