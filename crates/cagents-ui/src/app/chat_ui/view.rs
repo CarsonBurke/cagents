@@ -2922,7 +2922,7 @@ impl Runtime {
                         aliases,
                         // The reader's pictures open an exchange, as their
                         // message would; the subagent's are blocks of its work.
-                        Some(if item.role == chat::Role::User {
+                        Some(if from_reader {
                             Rhythm::Opening
                         } else {
                             Rhythm::Block
