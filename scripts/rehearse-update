@@ -594,10 +594,10 @@ cmd_record() {
     fi
     if desktop_live; then
         /usr/bin/python3 "$tool_root/scripts/rehearse_update_run.py" "$root" "$self" observe "$out/windows.json" || status=$?
+        /usr/bin/python3 "$tool_root/scripts/rehearse_update_records.py" record "$root" "$out" --windows "$out/windows.json" || status=$?
     else
-        printf '{}\n' >"$out/windows.json"
+        /usr/bin/python3 "$tool_root/scripts/rehearse_update_records.py" record "$root" "$out" --no-desktop || status=$?
     fi
-    /usr/bin/python3 "$tool_root/scripts/rehearse_update_records.py" record "$root" "$out" --windows "$out/windows.json" || status=$?
     return "$status"
 }
 
