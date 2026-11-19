@@ -14735,6 +14735,52 @@ fn a_dropped_draft_runtime_comes_back_on_its_own_model() {
     assert_eq!(runtime.snapshot.reasoning.as_deref(), Some("low"));
 }
 
+/// A start that never takes its first message returns the card to the draft
+/// it was sent from, on that draft's model and effort, not on the ones
+/// another draft of the provider chose since.
+#[test]
+fn a_draft_back_from_a_lost_start_keeps_its_own_model() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = reasoning_action_draft(&mut app, Provider::Codex);
+    let target = chat_runtime(&app, card).target;
+    drop(app.update(Message::ChatUi(Action::DraftModel(
+        target,
+        Provider::Codex,
+        Some("other-model".into()),
+    ))));
+    drop(app.update(Message::ChatUi(Action::Reasoning(
+        target,
+        "other-model".into(),
+        Some("low".into()),
+    ))));
+    let other = reasoning_action_draft(&mut app, Provider::Codex);
+    assert_ne!(card, other);
+    assert_eq!(
+        app.chat_ui.last_models[&Provider::Codex],
+        ("fixture-model".into(), Some("high".into()))
+    );
+    write(&mut app, card, "hello");
+    submit(&mut app, card);
+    let started = chat_runtime_attempt(&app, card);
+    let handle = fixture_handle(&app, card, None);
+    handle.replace_snapshot_for_test(Snapshot::default());
+    answer_start(&mut app, started, Ok(handle));
+    let target = chat_runtime(&app, card).target;
+
+    let _ = app.update(Message::ChatUi(Action::Wake(
+        target,
+        Wake::Disconnected("fixture: gone".into()),
+    )));
+
+    let runtime = chat_runtime(&app, card);
+    assert!(runtime.choosing(), "the card is a draft again");
+    assert_eq!(
+        runtime.snapshot.selected_model.as_deref(),
+        Some("other-model")
+    );
+    assert_eq!(runtime.snapshot.reasoning.as_deref(), Some("low"));
+}
+
 #[test]
 fn a_saved_draft_model_for_another_provider_is_ignored() {
     let mut app = crate::app::tests::context_inspector_test_app(false);

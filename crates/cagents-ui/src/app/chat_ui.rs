@@ -2927,6 +2927,9 @@ struct Queued {
     /// The draft as its start was asked for, which the card goes back to if
     /// the conversation never takes the message.
     draft: chat::Session,
+    /// The model and effort that draft showed, which it shows again then,
+    /// rather than whatever another draft of its provider has chosen since.
+    chosen: (Option<String>, Option<String>),
     /// When the provider was first seen ready, from which the wait for it to
     /// list the chosen model is bounded.
     since: Option<Instant>,
@@ -11241,11 +11244,16 @@ impl Cagents {
         };
         runtime.preparation.clear_local();
         let attachments = runtime.take_attachments();
+        let chosen = (
+            runtime.snapshot.selected_model.clone(),
+            runtime.snapshot.reasoning.clone(),
+        );
         runtime.queued = Some(Queued {
             prompt: prompt::LocalPrompt::new(pending.text, attachments),
             resolved_text: pending.resolved_text,
             model: pending.model,
             draft: pending.candidate.clone(),
+            chosen,
             since: None,
             rechecking: false,
         });
@@ -11520,9 +11528,13 @@ impl Cagents {
         let Some(runtime) = self.chat_card_runtime_mut(target) else {
             return Task::none();
         };
+        let Some(chosen) = runtime.queued.as_ref().map(|queued| queued.chosen.clone()) else {
+            return Task::none();
+        };
         let Some(draft) = runtime.unqueue() else {
             return Task::none();
         };
+        (snapshot.selected_model, snapshot.reasoning) = chosen;
         snapshot.permission_mode = draft_permission_mode(&draft.launch.recipe, provider);
         let handle = match std::mem::replace(&mut runtime.connection, Connection::Draft) {
             Connection::Live(handle) => Some(handle),
