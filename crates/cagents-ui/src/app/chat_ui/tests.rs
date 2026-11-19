@@ -6418,6 +6418,54 @@ fn default_pane_keeps_attached_files() {
 }
 
 #[test]
+fn file_completion_reuses_matches_until_files_or_query_change() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = draft_chat(&mut app);
+    write(&mut app, card, "@sr");
+    let target = chat_runtime(&app, card).target;
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    let paths = vec!["src/main.rs".to_owned(), "src/lib.rs".to_owned()];
+    runtime.files = Some(Arc::new(paths.clone()));
+    let before = completion::FILE_MATCHES.with(std::cell::Cell::get);
+    for _ in 0..3 {
+        assert!(runtime.completion().is_some());
+    }
+    assert_eq!(
+        completion::FILE_MATCHES.with(std::cell::Cell::get),
+        before + 1
+    );
+
+    runtime.files = Some(Arc::new(paths));
+    assert!(runtime.completion().is_some());
+    assert_eq!(
+        completion::FILE_MATCHES.with(std::cell::Cell::get),
+        before + 2
+    );
+
+    runtime
+        .composer
+        .perform(text_editor::Action::Edit(text_editor::Edit::Insert('c')));
+    assert!(runtime.completion().is_some());
+    assert_eq!(
+        completion::FILE_MATCHES.with(std::cell::Cell::get),
+        before + 3
+    );
+
+    let files = runtime.files.take();
+    assert!(runtime.completion().is_none());
+    assert_eq!(
+        completion::FILE_MATCHES.with(std::cell::Cell::get),
+        before + 3
+    );
+    runtime.files = files;
+    assert!(runtime.completion().is_some());
+    assert_eq!(
+        completion::FILE_MATCHES.with(std::cell::Cell::get),
+        before + 3
+    );
+}
+
+#[test]
 fn a_draft_completes_a_skill_and_queues_it_without_starting_early() {
     const INVOCATION: &str = "[$review](/skills/review/SKILL.md)";
     let mut app = crate::app::tests::context_inspector_test_app(false);

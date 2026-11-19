@@ -154,38 +154,72 @@ pub(super) enum Kind {
     File,
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static FILE_MATCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Fuzzy subsequence matching preserves path boundaries in the inserted name.
+#[cfg(test)]
 pub(super) fn files<'a>(paths: &'a [String], query: &str) -> Vec<Candidate<'a>> {
+    file_candidates(paths, &file_matches(paths, query))
+}
+
+/// The best matching paths, in the order shown by the completion list.
+pub(super) fn file_matches(paths: &[String], query: &str) -> Vec<usize> {
+    #[cfg(test)]
+    FILE_MATCHES.with(|count| count.set(count.get() + 1));
     let query = query.to_lowercase();
     let mut matches = paths
         .iter()
-        .filter_map(|path| {
-            let lower = path.to_lowercase();
+        .enumerate()
+        .filter_map(|(index, path)| {
             let mut remaining = query.chars();
             let mut next = remaining.next();
             let mut gaps = 0usize;
-            for character in lower.chars() {
-                if next == Some(character) {
-                    next = remaining.next();
-                } else if next.is_some() {
-                    gaps += 1;
+            if path.is_ascii() {
+                for byte in path.bytes() {
+                    if next == Some(char::from(byte.to_ascii_lowercase())) {
+                        next = remaining.next();
+                    } else if next.is_some() {
+                        gaps += 1;
+                    }
+                }
+            } else {
+                let lower = path.to_lowercase();
+                for character in lower.chars() {
+                    if next == Some(character) {
+                        next = remaining.next();
+                    } else if next.is_some() {
+                        gaps += 1;
+                    }
                 }
             }
-            next.is_none().then_some((gaps, path))
+            next.is_none().then_some((gaps, index))
         })
         .collect::<Vec<_>>();
-    matches.sort_by(|(a, path_a), (b, path_b)| {
+    let cmp = |(a, index_a): &(usize, usize), (b, index_b): &(usize, usize)| {
+        let path_a = &paths[*index_a];
+        let path_b = &paths[*index_b];
         a.cmp(b)
             .then_with(|| path_a.len().cmp(&path_b.len()))
             .then_with(|| path_a.cmp(path_b))
-    });
-    matches
-        .into_iter()
-        .take(100)
-        .map(|(_, path)| Candidate {
+    };
+    if matches.len() > 100 {
+        matches.select_nth_unstable_by(99, cmp);
+        matches.truncate(100);
+    }
+    matches.sort_by(cmp);
+    matches.into_iter().map(|(_, index)| index).collect()
+}
+
+pub(super) fn file_candidates<'a>(paths: &'a [String], indices: &[usize]) -> Vec<Candidate<'a>> {
+    indices
+        .iter()
+        .map(|&index| Candidate {
             kind: Kind::File,
-            name: path,
-            insertion: Cow::Borrowed(path),
+            name: &paths[index],
+            insertion: Cow::Borrowed(&paths[index]),
             description: "Worktree file",
         })
         .collect()
@@ -799,6 +833,92 @@ mod tests {
     }
     use super::*;
     use crate::chat::{Capabilities, Skill, SlashCommand};
+
+    fn reference_files<'a>(paths: &'a [String], query: &str) -> Vec<Candidate<'a>> {
+        let query = query.to_lowercase();
+        let mut matches = paths
+            .iter()
+            .filter_map(|path| {
+                let lower = path.to_lowercase();
+                let mut remaining = query.chars();
+                let mut next = remaining.next();
+                let mut gaps = 0usize;
+                for character in lower.chars() {
+                    if next == Some(character) {
+                        next = remaining.next();
+                    } else if next.is_some() {
+                        gaps += 1;
+                    }
+                }
+                next.is_none().then_some((gaps, path))
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(|(a, path_a), (b, path_b)| {
+            a.cmp(b)
+                .then_with(|| path_a.len().cmp(&path_b.len()))
+                .then_with(|| path_a.cmp(path_b))
+        });
+        matches
+            .into_iter()
+            .take(100)
+            .map(|(_, path)| Candidate {
+                kind: Kind::File,
+                name: path,
+                insertion: Cow::Borrowed(path),
+                description: "Worktree file",
+            })
+            .collect()
+    }
+
+    #[test]
+    fn file_matches_keep_the_full_sort_order_and_cap() {
+        let mut paths: Vec<String> = (0..500)
+            .rev()
+            .map(|index| format!("src/main_{index:03}.rs"))
+            .collect();
+        paths.extend(
+            [
+                "docs/ΟΣ/Kelvin\u{212A}.md",
+                "src/Straße.rs",
+                "src/main_000.rs",
+                "src/main_099.rs",
+                "src/MAIN.rs",
+                "assets/src/map.rs",
+                "s-r-c/main.rs",
+                "k",
+                "docs/İstanbul.md",
+            ]
+            .map(str::to_owned),
+        );
+        for query in ["", "s", "src/ma", "ος", "k"] {
+            assert_eq!(
+                files(&paths, query),
+                reference_files(&paths, query),
+                "{query:?}"
+            );
+        }
+        assert_eq!(files(&paths, "").len(), 100);
+    }
+
+    #[test]
+    fn ascii_paths_match_like_unicode_lowercase() {
+        let paths = [
+            "SRC/MAIN.RS",
+            "KEYS.md",
+            "docs/Makefile",
+            "k",
+            "aK",
+            "README.md",
+        ]
+        .map(str::to_owned);
+        for query in ["", "s", "SRC/MA", "k", "\u{212A}", "ος"] {
+            assert_eq!(
+                files(&paths, query),
+                reference_files(&paths, query),
+                "{query:?}"
+            );
+        }
+    }
 
     fn caret(line: usize, column: usize) -> Position {
         Position { line, column }
