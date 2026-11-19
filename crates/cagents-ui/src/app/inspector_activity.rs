@@ -264,6 +264,13 @@ fn grid_row<'a>(
     trailing: Option<Element<'a, Message>>,
     height: f32,
 ) -> Element<'a, Message> {
+    // A trailing control sits where a section header puts the inspector
+    // toggle, at the gutter, so the toggle stays put whichever leads.
+    let right = if trailing.is_some() {
+        0.0
+    } else {
+        design::list::INSET
+    };
     let mut children = vec![
         widget::container(mark)
             .center_x(Length::Fixed(design::list::ICON))
@@ -287,7 +294,7 @@ fn grid_row<'a>(
             .spacing(design::list::GAP)
             .height(Length::Fill),
     )
-    .padding([0.0, design::list::INSET])
+    .padding(Padding::ZERO.left(design::list::INSET).right(right))
     .height(Length::Fixed(height))
     .width(Length::Fill)
     .into()
