@@ -163,10 +163,14 @@ cmd_open() {
     return 1
 }
 
-# The top of TEXT on screen, if it is.
+# The top of TEXT on screen in the transcript, if it is there. The sidebar,
+# left of IMAGE_GALLERY_TRANSCRIPT_LEFT, names the chat with its prompt too.
 top_of() {
     ne drive observe 2>/dev/null | rg -- "$1" |
-        awk '{ if (match($0, /[0-9]+, *[0-9]+ +[0-9]+x[0-9]+/)) { split(substr($0, RSTART, RLENGTH), p, /[, x]+/); print p[2]; exit } }'
+        awk -v left="${IMAGE_GALLERY_TRANSCRIPT_LEFT:-260}" '{ if (match($0, /[0-9]+, *[0-9]+ +[0-9]+x[0-9]+/)) {
+            split(substr($0, RSTART, RLENGTH), p, /[, x]+/)
+            if (p[1] < left) next
+            print p[2]; exit } }'
 }
 
 # Scroll the transcript, from its top, until TEXT is on screen and no lower
@@ -214,8 +218,10 @@ first_breakpoint() {
 cmd_shots() { # LABEL, such as dark-wide, prefixes each shot's name
     local label=${1:?a label for the shots, such as dark-wide}
     ne drive hover 1,1 >/dev/null
-    reveal 'compare the proposed' 900 && still "$label-two-reads"
-    reveal 'on my laptop' 500 && still "$label-pasted"
+    # Short anchors: the screen is read by OCR, which splits a line that
+    # wraps, and a narrow window wraps the longer messages.
+    reveal 'Fixture: compare' 900 && still "$label-two-reads"
+    reveal "Here.s" 500 && still "$label-pasted"
     reveal 'docs/narrow' && still "$label-single"
     reveal 'five breakpoints' && still "$label-five"
     # The first breakpoint, pointed at, then opened, then the next picture
