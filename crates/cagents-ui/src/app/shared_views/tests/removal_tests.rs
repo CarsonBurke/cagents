@@ -815,7 +815,8 @@ fn a_terminal_kept_by_a_refused_close_can_be_closed_again() {
             .clone()
             .expect("the Close asks the daemon to end the terminal");
         let authority = app.terminal_cleanup_authority(card);
-        let receipt = authority.receipt(authority.worker().cloned().unwrap());
+        let worker = authority.worker().cloned().unwrap();
+        let receipt = authority.receipt(worker.clone());
         drop(app.update(Message::TerminalCloseFinished {
             card,
             terminal: intent.terminal,
@@ -841,8 +842,10 @@ fn a_terminal_kept_by_a_refused_close_can_be_closed_again() {
             app.workspace.order().any(|id| id == card),
             "queued={queued}"
         );
+        // Neither half of what hides the ended-terminal footer is left, so
+        // the kept pane shows its ended shell rather than a blank pane.
         assert!(
-            !app.closed_terminal_cards.contains(&card),
+            !app.closed_terminal_cards.contains(&card) && !app.terminal_close_pending(card),
             "queued={queued}: the kept pane is no longer closing"
         );
 
@@ -860,6 +863,40 @@ fn a_terminal_kept_by_a_refused_close_can_be_closed_again() {
             app.status
         );
         assert_eq!(notices(&app), Vec::<String>::new(), "queued={queued}");
+
+        // The second Close goes all the way: the daemon is asked again, and
+        // once it answers the pane leaves this window and its removal is
+        // published again.
+        let again = app
+            .terminal_close
+            .clone()
+            .filter(|intent| intent.card == card)
+            .unwrap_or_else(|| panic!("queued={queued}: the daemon is asked to close it again"));
+        // The ended shell's daemon still hosts it, so the Close reads the
+        // same worker back as the basis for its receipt.
+        let receipt = app.terminal_cleanup_authority(card).receipt(worker);
+        drop(app.update(Message::TerminalCloseFinished {
+            card,
+            terminal: again.terminal,
+            proof: again.proof,
+            generation: again.generation,
+            outcome: CloseOutcome::ClosedWithBasis(receipt),
+        }));
+        drop(app.update(Message::CommitClose(card)));
+        app.publish_view_changes();
+        assert!(
+            !app.workspace.order().any(|id| id == card),
+            "queued={queued}: the pane is removed"
+        );
+        assert!(
+            app.shared_views
+                .pending
+                .iter()
+                .any(|(pending, _, change)| *pending != operation
+                    && matches!(change, Change::RemoveSource { before, .. } if before.id == card)),
+            "queued={queued}: the second Close is published: pending {:?}",
+            app.shared_views.pending
+        );
     }
 }
 
