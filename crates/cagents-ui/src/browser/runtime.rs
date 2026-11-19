@@ -796,8 +796,7 @@ impl Card {
         self.restore.scroll_x = 0.0;
         self.restore.scroll_y = 0.0;
         if let Some(session) = &self.session {
-            session.navigation.borrow_mut().navigate(url.clone());
-            session.webview.load(url);
+            navigate_webview(&session.webview, &session.navigation, url);
         } else {
             self.restore
                 .history
@@ -994,8 +993,18 @@ fn traverse_webview(
             webview.go_forward(1);
         }
         HistoryStep::Load(url) => webview.load(url),
+        HistoryStep::Wait => {}
     }
     true
+}
+
+/// Loads `url` in a live webview as a new entry after the current one, once
+/// any load Servo is still carrying out has committed.
+fn navigate_webview(webview: &servo::WebView, navigation: &RefCell<NavigationState>, url: Url) {
+    let load_now = navigation.borrow_mut().navigate(url.clone());
+    if load_now {
+        webview.load(url);
+    }
 }
 
 /// One card's webview on the shared runtime, together with the Wayland child
@@ -1334,13 +1343,17 @@ impl servo::WebViewDelegate for BrowserDelegate {
         self.guard(|| self.frame_ready.set(true));
     }
 
-    fn notify_history_changed(&self, _webview: servo::WebView, entries: Vec<Url>, current: usize) {
+    fn notify_history_changed(&self, webview: servo::WebView, entries: Vec<Url>, current: usize) {
         self.guard(|| {
-            let (entries, current) = {
+            let (waiting, entries, current) = {
                 let mut navigation = self.navigation.borrow_mut();
-                navigation.servo_history_changed(entries, current);
-                navigation.entries()
+                let waiting = navigation.servo_history_changed(entries, current);
+                let (entries, current) = navigation.entries();
+                (waiting, entries, current)
             };
+            if let Some(url) = waiting {
+                webview.load(url);
+            }
             self.events
                 .semantic(BrowserEvent::HistoryChanged { entries, current });
         });
@@ -2112,6 +2125,8 @@ mod tests {
         )
         .unwrap();
         std::fs::write(directory.join("second.html"), "<!DOCTYPE html>Second").unwrap();
+        std::fs::write(directory.join("third.html"), "<!DOCTYPE html>Third").unwrap();
+        std::fs::write(directory.join("fourth.html"), "<!DOCTYPE html>Fourth").unwrap();
         let first = Url::from_file_path(directory.join("first.html")).unwrap();
         let second = Url::from_file_path(directory.join("second.html")).unwrap();
 
@@ -2208,5 +2223,17 @@ mod tests {
         });
         assert_eq!(navigation.borrow().servo_entries(), both.as_slice());
         assert!(!traverse_webview(&webview, &navigation, 1));
+
+        // Two addresses entered in quick succession: Servo ignores a load
+        // requested while another is loading, so the second waits for the
+        // first and is the page the card ends on.
+        let third = Url::from_file_path(directory.join("third.html")).unwrap();
+        let fourth = Url::from_file_path(directory.join("fourth.html")).unwrap();
+        navigate_webview(&webview, &navigation, third);
+        navigate_webview(&webview, &navigation, fourth.clone());
+        let typed = vec![first.clone(), second.clone(), fourth.clone()];
+        spin_until("the second typed address", &|history, loaded| {
+            *history == (typed.clone(), 2) && loaded && webview.url() == Some(fourth.clone())
+        });
     }
 }

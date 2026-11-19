@@ -11,6 +11,10 @@
 //! not have: `back ++ servo[window_start..] ++ forward`. Entries in Servo before
 //! `window_start` are pages the card's history has since replaced, which Servo
 //! still holds because an embedder cannot remove them.
+//!
+//! Servo ignores a page load requested while another is still loading, so the
+//! card issues one at a time. A page requested meanwhile waits, shown at its
+//! place in the history, and is loaded once Servo commits the one in flight.
 
 use url::Url;
 
@@ -22,6 +26,8 @@ pub(super) enum HistoryStep {
     Forward,
     /// Servo does not hold the target entry: load it as a new page.
     Load(Url),
+    /// The target waits for the load Servo is still carrying out.
+    Wait,
 }
 
 #[derive(Debug)]
@@ -57,6 +63,9 @@ struct PendingLoad {
     /// The entry of Servo's list the load was issued from. Servo commits it
     /// as the entry after that one, discarding any after it.
     from: usize,
+    /// The card asked for `url` after Servo began loading another page, so
+    /// Servo has yet to be asked for it.
+    waiting: bool,
 }
 
 impl NavigationState {
@@ -80,6 +89,7 @@ impl NavigationState {
                 url: url.clone(),
                 window_start: None,
                 from: 0,
+                waiting: false,
             }),
             url,
             restore_scroll: true,
@@ -130,8 +140,15 @@ impl NavigationState {
             .checked_add_signed(delta)
             .filter(|target| *target < entries.len() && *target != current)?;
         self.url = entries[target].clone();
-        if self.pending.is_none()
-            && let Some(servo_target) = self.servo_index.checked_add_signed(delta)
+        if let Some(pending) = &mut self.pending {
+            pending.url = self.url.clone();
+            pending.window_start = None;
+            pending.waiting = true;
+            self.back = entries[..target].to_vec();
+            self.forward = entries[target + 1..].to_vec();
+            return Some(HistoryStep::Wait);
+        }
+        if let Some(servo_target) = self.servo_index.checked_add_signed(delta)
             && (self.window_start..self.servo.len()).contains(&servo_target)
         {
             self.servo_index = servo_target;
@@ -147,21 +164,23 @@ impl NavigationState {
             url: self.url.clone(),
             window_start: None,
             from: self.servo_index,
+            waiting: false,
         });
         Some(HistoryStep::Load(self.url.clone()))
     }
 
-    /// Records a page the card loads as a new entry after the current one.
-    ///
-    /// A load still waiting for Servo is superseded rather than kept: Servo
-    /// abandons a navigation that has not committed when another begins, and
-    /// one that did commit first is reported as an entry of its own.
-    pub(super) fn navigate(&mut self, url: Url) {
+    /// Records a page the card loads as a new entry after the current one,
+    /// returning whether to ask Servo for it now. A page that has not loaded
+    /// yet is replaced by this one, which waits for Servo to finish it.
+    #[must_use]
+    pub(super) fn navigate(&mut self, url: Url) -> bool {
         self.forward.clear();
         self.url = url.clone();
         if let Some(pending) = &mut self.pending {
             pending.url = url;
-            return;
+            pending.window_start = None;
+            pending.waiting = true;
+            return false;
         }
         let (mut entries, current) = self.all_entries();
         entries.truncate(current + 1);
@@ -170,13 +189,21 @@ impl NavigationState {
             url,
             window_start: Some(self.window_start),
             from: self.servo_index,
+            waiting: false,
         });
+        true
     }
 
-    /// Applies Servo's report of its history for this webview.
-    pub(super) fn servo_history_changed(&mut self, entries: Vec<Url>, current: usize) {
+    /// Applies Servo's report of its history for this webview, returning a
+    /// page that was waiting and should now be loaded.
+    #[must_use]
+    pub(super) fn servo_history_changed(
+        &mut self,
+        entries: Vec<Url>,
+        current: usize,
+    ) -> Option<Url> {
         let Some(last) = entries.len().checked_sub(1) else {
-            return;
+            return None;
         };
         let current = current.min(last);
         // A traversal leaves Servo's list as it was, and a redirect or
@@ -206,47 +233,66 @@ impl NavigationState {
                 None
             }
         };
-        if let Some(pending) = committed {
-            // What Servo holds in front of the committed page is the card's
-            // history only when the load continued the window and Servo kept
-            // the window's entries up to it.
-            self.window_start = current;
-            if let Some(start) = pending.window_start
-                && let Some(kept) = current.checked_sub(start)
-                && let Some(back_len) = self.back.len().checked_sub(kept)
-                && entries[start..current] == self.back[back_len..]
-            {
-                self.back.truncate(back_len);
-                self.window_start = start;
+        match committed {
+            Some(pending) if pending.waiting => {
+                // Servo committed a page the card has since moved away from.
+                // It is not part of the card's history; the page that waited
+                // is next.
+                self.servo = entries;
+                self.servo_index = current;
+                self.window_start = current;
+                self.pending = Some(PendingLoad {
+                    url: pending.url.clone(),
+                    window_start: None,
+                    from: current,
+                    waiting: false,
+                });
+                return Some(pending.url);
             }
-        } else {
-            // Anything else is a new navigation from the page, such as a
-            // followed link, and that discards every forward entry, including
-            // the card's own.
-            if !same_list {
-                self.forward.clear();
+            Some(pending) => {
+                // What Servo holds in front of the committed page is the
+                // card's history only when the load continued the window and
+                // Servo kept the window's entries up to it.
+                self.window_start = current;
+                if let Some(start) = pending.window_start
+                    && let Some(kept) = current.checked_sub(start)
+                    && let Some(back_len) = self.back.len().checked_sub(kept)
+                    && entries[start..current] == self.back[back_len..]
+                {
+                    self.back.truncate(back_len);
+                    self.window_start = start;
+                }
             }
-            // The page a typed load continues from rewrote its own entry, which
-            // the card holds as the last entry behind the load.
-            if same_list
-                && current == self.servo_index
-                && let Some(PendingLoad {
-                    window_start: Some(_),
-                    ..
-                }) = self.pending
-                && let Some(departed) = self.back.last_mut()
-            {
-                departed.clone_from(&entries[current]);
+            None => {
+                // Anything else is a new navigation from the page, such as a
+                // followed link, and that discards every forward entry,
+                // including the card's own.
+                if !same_list {
+                    self.forward.clear();
+                }
+                // The page a typed load continues from rewrote its own entry,
+                // which the card holds as the last entry behind the load.
+                if same_list
+                    && current == self.servo_index
+                    && let Some(PendingLoad {
+                        window_start: Some(_),
+                        ..
+                    }) = self.pending
+                    && let Some(departed) = self.back.last_mut()
+                {
+                    departed.clone_from(&entries[current]);
+                }
+                // Page script can traverse into the entries this card
+                // replaced. They are part of its history again.
+                self.window_start = self.window_start.min(current);
             }
-            // Page script can traverse into the entries this card replaced.
-            // They are part of its history again.
-            self.window_start = self.window_start.min(current);
         }
         if self.pending.is_none() {
             self.url = entries[current].clone();
         }
         self.servo = entries;
         self.servo_index = current;
+        None
     }
 
     /// Servo's history as last reported.
@@ -278,6 +324,11 @@ mod tests {
         NavigationState::restored(&history[index], history, index)
     }
 
+    /// Applies a report from Servo that leaves no waiting page to load.
+    fn report(state: &mut NavigationState, paths: &[&str], current: usize) {
+        assert_eq!(state.servo_history_changed(urls(paths), current), None);
+    }
+
     fn shown(state: &NavigationState) -> (Vec<Url>, usize) {
         state.entries()
     }
@@ -285,7 +336,7 @@ mod tests {
     /// A fresh card on `a`, with Servo's first report in.
     fn started_on_a() -> NavigationState {
         let mut state = restored(&urls(&["a"]), 0);
-        state.servo_history_changed(urls(&["a"]), 0);
+        report(&mut state, &["a"], 0);
         state
     }
 
@@ -293,18 +344,18 @@ mod tests {
     fn a_followed_link_can_be_traversed_back_and_forward_in_servo() {
         let mut state = started_on_a();
         // The page navigates by itself: no command from the card announced it.
-        state.servo_history_changed(urls(&["a", "b"]), 1);
+        report(&mut state, &["a", "b"], 1);
         assert_eq!(shown(&state), (urls(&["a", "b"]), 1));
 
         assert_eq!(state.traverse(-1), Some(HistoryStep::Back));
         assert_eq!(state.url(), &url("a"));
         assert_eq!(shown(&state), (urls(&["a", "b"]), 0));
-        state.servo_history_changed(urls(&["a", "b"]), 0);
+        report(&mut state, &["a", "b"], 0);
         assert_eq!(shown(&state), (urls(&["a", "b"]), 0));
         assert_eq!(state.traverse(-1), None);
 
         assert_eq!(state.traverse(1), Some(HistoryStep::Forward));
-        state.servo_history_changed(urls(&["a", "b"]), 1);
+        report(&mut state, &["a", "b"], 1);
         assert_eq!(shown(&state), (urls(&["a", "b"]), 1));
         assert_eq!(state.url(), &url("b"));
         assert_eq!(state.traverse(1), None);
@@ -313,13 +364,13 @@ mod tests {
     #[test]
     fn a_second_back_before_servo_answers_counts_from_the_first() {
         let mut state = started_on_a();
-        state.servo_history_changed(urls(&["a", "b"]), 1);
-        state.servo_history_changed(urls(&["a", "b", "c"]), 2);
+        report(&mut state, &["a", "b"], 1);
+        report(&mut state, &["a", "b", "c"], 2);
         assert_eq!(state.traverse(-1), Some(HistoryStep::Back));
         assert_eq!(state.traverse(-1), Some(HistoryStep::Back));
         assert_eq!(state.traverse(-1), None);
-        state.servo_history_changed(urls(&["a", "b", "c"]), 1);
-        state.servo_history_changed(urls(&["a", "b", "c"]), 0);
+        report(&mut state, &["a", "b", "c"], 1);
+        report(&mut state, &["a", "b", "c"], 0);
         assert_eq!(shown(&state), (urls(&["a", "b", "c"]), 0));
     }
 
@@ -328,22 +379,22 @@ mod tests {
         let mut state = restored(&urls(&["a", "b", "c"]), 1);
         assert_eq!(shown(&state), (urls(&["a", "b", "c"]), 1));
         // Servo knows only the page it was started on.
-        state.servo_history_changed(urls(&["b"]), 0);
+        report(&mut state, &["b"], 0);
         assert_eq!(shown(&state), (urls(&["a", "b", "c"]), 1));
 
         assert_eq!(state.traverse(-1), Some(HistoryStep::Load(url("a"))));
         assert_eq!(shown(&state), (urls(&["a", "b", "c"]), 0));
-        state.servo_history_changed(urls(&["b", "a"]), 1);
+        report(&mut state, &["b", "a"], 1);
         assert_eq!(shown(&state), (urls(&["a", "b", "c"]), 0));
         assert_eq!(state.traverse(-1), None);
 
         // `b` is in Servo, but before the page that replaced it: loading it
         // again keeps the card's order instead of Servo's.
         assert_eq!(state.traverse(1), Some(HistoryStep::Load(url("b"))));
-        state.servo_history_changed(urls(&["b", "a", "b"]), 2);
+        report(&mut state, &["b", "a", "b"], 2);
         assert_eq!(shown(&state), (urls(&["a", "b", "c"]), 1));
         assert_eq!(state.traverse(1), Some(HistoryStep::Load(url("c"))));
-        state.servo_history_changed(urls(&["b", "a", "b", "c"]), 3);
+        report(&mut state, &["b", "a", "b", "c"], 3);
         assert_eq!(shown(&state), (urls(&["a", "b", "c"]), 2));
         assert_eq!(state.traverse(1), None);
     }
@@ -351,8 +402,8 @@ mod tests {
     #[test]
     fn a_link_from_a_restored_entry_keeps_the_history_behind_it() {
         let mut state = restored(&urls(&["a", "b", "c"]), 1);
-        state.servo_history_changed(urls(&["b"]), 0);
-        state.servo_history_changed(urls(&["b", "d"]), 1);
+        report(&mut state, &["b"], 0);
+        report(&mut state, &["b", "d"], 1);
         assert_eq!(shown(&state), (urls(&["a", "b", "d"]), 2));
         assert_eq!(state.traverse(-1), Some(HistoryStep::Back));
         assert_eq!(state.traverse(-1), Some(HistoryStep::Load(url("a"))));
@@ -361,22 +412,22 @@ mod tests {
     #[test]
     fn a_redirect_of_the_restored_page_keeps_its_saved_neighbours() {
         let mut state = restored(&urls(&["a", "b", "c"]), 1);
-        state.servo_history_changed(urls(&["b-redirected"]), 0);
+        report(&mut state, &["b-redirected"], 0);
         assert_eq!(shown(&state), (urls(&["a", "b-redirected", "c"]), 1));
-        state.servo_history_changed(urls(&["b-replaced"]), 0);
+        report(&mut state, &["b-replaced"], 0);
         assert_eq!(shown(&state), (urls(&["a", "b-replaced", "c"]), 1));
     }
 
     #[test]
     fn navigating_after_back_discards_the_forward_entries() {
         let mut state = started_on_a();
-        state.servo_history_changed(urls(&["a", "b"]), 1);
+        report(&mut state, &["a", "b"], 1);
         state.traverse(-1);
-        state.servo_history_changed(urls(&["a", "b"]), 0);
+        report(&mut state, &["a", "b"], 0);
 
-        state.navigate(url("typed"));
+        assert!(state.navigate(url("typed")));
         assert_eq!(shown(&state), (urls(&["a", "typed"]), 1));
-        state.servo_history_changed(urls(&["a", "typed"]), 1);
+        report(&mut state, &["a", "typed"], 1);
         assert_eq!(shown(&state), (urls(&["a", "typed"]), 1));
         assert_eq!(state.traverse(1), None);
         // Servo kept `a` in front of the typed page, so Back traverses to it.
@@ -386,9 +437,9 @@ mod tests {
     #[test]
     fn navigating_from_a_loaded_entry_keeps_the_entries_servo_lacks() {
         let mut state = restored(&urls(&["a", "b"]), 1);
-        state.servo_history_changed(urls(&["b"]), 0);
-        state.navigate(url("typed"));
-        state.servo_history_changed(urls(&["b", "typed"]), 1);
+        report(&mut state, &["b"], 0);
+        assert!(state.navigate(url("typed")));
+        report(&mut state, &["b", "typed"], 1);
         assert_eq!(shown(&state), (urls(&["a", "b", "typed"]), 2));
         assert_eq!(state.traverse(-1), Some(HistoryStep::Back));
         assert_eq!(state.traverse(-1), Some(HistoryStep::Load(url("a"))));
@@ -397,26 +448,26 @@ mod tests {
     #[test]
     fn a_link_discards_restored_forward_entries() {
         let mut state = restored(&urls(&["a", "b", "c"]), 0);
-        state.servo_history_changed(urls(&["a"]), 0);
-        state.servo_history_changed(urls(&["a", "d"]), 1);
+        report(&mut state, &["a"], 0);
+        report(&mut state, &["a", "d"], 1);
         assert_eq!(shown(&state), (urls(&["a", "d"]), 1));
     }
 
     #[test]
     fn a_back_servo_reports_while_a_load_is_pending_does_not_commit_it() {
         let mut state = restored(&urls(&["a", "b"]), 1);
-        state.servo_history_changed(urls(&["b"]), 0);
-        state.servo_history_changed(urls(&["b", "d"]), 1);
+        report(&mut state, &["b"], 0);
+        report(&mut state, &["b", "d"], 1);
         assert_eq!(shown(&state), (urls(&["a", "b", "d"]), 2));
         // Two quick Backs: the first is Servo's, the second leaves its list.
         assert_eq!(state.traverse(-1), Some(HistoryStep::Back));
         assert_eq!(state.traverse(-1), Some(HistoryStep::Load(url("a"))));
 
         // Servo reports the first Back only after the second was asked for.
-        state.servo_history_changed(urls(&["b", "d"]), 0);
+        report(&mut state, &["b", "d"], 0);
         assert_eq!(shown(&state), (urls(&["a", "b", "d"]), 0));
         assert_eq!(state.url(), &url("a"));
-        state.servo_history_changed(urls(&["b", "a"]), 1);
+        report(&mut state, &["b", "a"], 1);
         assert_eq!(shown(&state), (urls(&["a", "b", "d"]), 0));
         assert_eq!(state.traverse(1), Some(HistoryStep::Load(url("b"))));
     }
@@ -424,56 +475,83 @@ mod tests {
     #[test]
     fn a_page_rewriting_its_entry_while_a_typed_load_is_pending_keeps_servo_history() {
         let mut state = started_on_a();
-        state.servo_history_changed(urls(&["a", "b"]), 1);
-        state.navigate(url("x"));
+        report(&mut state, &["a", "b"], 1);
+        assert!(state.navigate(url("x")));
         // The page being left calls `history.replaceState`.
-        state.servo_history_changed(urls(&["a", "b2"]), 1);
+        report(&mut state, &["a", "b2"], 1);
         assert_eq!(shown(&state), (urls(&["a", "b2", "x"]), 2));
-        state.servo_history_changed(urls(&["a", "b2", "x"]), 2);
+        report(&mut state, &["a", "b2", "x"], 2);
         assert_eq!(shown(&state), (urls(&["a", "b2", "x"]), 2));
         assert_eq!(state.traverse(-1), Some(HistoryStep::Back));
         assert_eq!(state.traverse(-1), Some(HistoryStep::Back));
     }
 
     #[test]
-    fn a_second_typed_load_supersedes_one_servo_has_not_committed() {
+    fn a_page_typed_while_another_loads_waits_for_it() {
         let mut state = started_on_a();
-        state.navigate(url("x"));
-        state.navigate(url("y"));
+        assert!(state.navigate(url("x")));
+        // Servo would ignore a second load, so the card holds it back.
+        assert!(!state.navigate(url("y")));
         assert_eq!(shown(&state), (urls(&["a", "y"]), 1));
-        state.servo_history_changed(urls(&["a", "y"]), 1);
+        assert_eq!(state.url(), &url("y"));
+
+        // Servo commits the first page, and the waiting one is loaded next.
+        assert_eq!(
+            state.servo_history_changed(urls(&["a", "x"]), 1),
+            Some(url("y"))
+        );
         assert_eq!(shown(&state), (urls(&["a", "y"]), 1));
-        assert_eq!(state.traverse(-1), Some(HistoryStep::Back));
+        report(&mut state, &["a", "x", "y"], 2);
+        assert_eq!(shown(&state), (urls(&["a", "y"]), 1));
+        assert_eq!(state.url(), &url("y"));
+        assert_eq!(state.traverse(-1), Some(HistoryStep::Load(url("a"))));
     }
 
     #[test]
-    fn a_superseded_typed_load_that_did_commit_stays_in_the_history() {
-        let mut state = started_on_a();
-        state.navigate(url("x"));
-        state.navigate(url("y"));
-        state.servo_history_changed(urls(&["a", "x"]), 1);
-        state.servo_history_changed(urls(&["a", "x", "y"]), 2);
-        assert_eq!(shown(&state), (urls(&["a", "x", "y"]), 2));
-        assert_eq!(state.traverse(-1), Some(HistoryStep::Back));
-        assert_eq!(state.traverse(-1), Some(HistoryStep::Back));
+    fn a_second_back_across_entries_servo_lacks_waits_for_the_first() {
+        let mut state = restored(&urls(&["a", "b", "c"]), 2);
+        report(&mut state, &["c"], 0);
+        assert_eq!(state.traverse(-1), Some(HistoryStep::Load(url("b"))));
+        assert_eq!(state.traverse(-1), Some(HistoryStep::Wait));
+        assert_eq!(shown(&state), (urls(&["a", "b", "c"]), 0));
+
+        assert_eq!(
+            state.servo_history_changed(urls(&["c", "b"]), 1),
+            Some(url("a"))
+        );
+        assert_eq!(shown(&state), (urls(&["a", "b", "c"]), 0));
+        report(&mut state, &["c", "b", "a"], 2);
+        assert_eq!(shown(&state), (urls(&["a", "b", "c"]), 0));
+        assert_eq!(state.url(), &url("a"));
+        assert_eq!(state.traverse(-1), None);
+    }
+
+    #[test]
+    fn back_during_a_restored_card_s_first_load_waits_for_it() {
+        let mut state = restored(&urls(&["a", "b", "c"]), 2);
+        assert_eq!(state.traverse(-1), Some(HistoryStep::Wait));
+        assert_eq!(state.servo_history_changed(urls(&["c"]), 0), Some(url("b")));
+        report(&mut state, &["c", "b"], 1);
+        assert_eq!(shown(&state), (urls(&["a", "b", "c"]), 1));
+        assert_eq!(state.url(), &url("b"));
     }
 
     #[test]
     fn a_load_servo_commits_over_an_identical_entry_still_commits() {
         // A restored page links back to the entry saved before it.
         let mut state = restored(&urls(&["home", "article"]), 1);
-        state.servo_history_changed(urls(&["article"]), 0);
-        state.servo_history_changed(urls(&["article", "home"]), 1);
+        report(&mut state, &["article"], 0);
+        report(&mut state, &["article", "home"], 1);
         assert_eq!(shown(&state), (urls(&["home", "article", "home"]), 2));
         assert_eq!(state.traverse(-1), Some(HistoryStep::Back));
-        state.servo_history_changed(urls(&["article", "home"]), 0);
+        report(&mut state, &["article", "home"], 0);
         assert_eq!(state.traverse(-1), Some(HistoryStep::Load(url("home"))));
         // Servo's list after the load equals the one before it.
-        state.servo_history_changed(urls(&["article", "home"]), 1);
+        report(&mut state, &["article", "home"], 1);
         assert_eq!(shown(&state), (urls(&["home", "article", "home"]), 0));
 
         // The load committed, so a link from it starts a fresh forward.
-        state.servo_history_changed(urls(&["article", "home", "x"]), 2);
+        report(&mut state, &["article", "home", "x"], 2);
         assert_eq!(shown(&state), (urls(&["home", "x"]), 1));
         assert_eq!(state.traverse(-1), Some(HistoryStep::Back));
     }
