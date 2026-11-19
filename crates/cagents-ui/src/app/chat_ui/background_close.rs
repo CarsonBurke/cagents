@@ -58,16 +58,31 @@ fn shares_conversation(a: &chat::Session, b: &chat::Session) -> bool {
 }
 
 impl Cagents {
-    /// Saves what the provider has confirmed about the conversation in `card`
-    /// before it closes, so the closed pane, and anything reopening it,
-    /// resume that conversation rather than the one the card was saved with.
+    /// Saves what the provider has confirmed about the conversation of the
+    /// closed pane `card`, so reopening it resumes that conversation rather
+    /// than the one the card was saved with. The pane has already left its
+    /// views, which hold what it was saved with, so only the closed card
+    /// changes.
     pub(super) fn install_closing_identity(&mut self, card: CardId, session: &chat::Session) {
-        let confirms = matches!(
-            self.card_state(card).map(|state| &state.kind),
-            Some(CardKind::Chat(saved)) if saved != session && only_confirms(saved, session)
-        );
-        if confirms {
-            let _ = self.install_chat_session(card, session.clone());
+        let confirms = |state: &CardState| {
+            state.id == card
+                && matches!(&state.kind, CardKind::Chat(saved)
+                    if saved != session && only_confirms(saved, session))
+        };
+        // What reopening the pane restores, recorded as it closed.
+        if let Some((closed, _)) = self
+            .recently_closed
+            .iter_mut()
+            .rev()
+            .find(|(state, _)| confirms(state))
+        {
+            closed.kind = CardKind::Chat(session.clone());
+        }
+        if let Some(state) = self.card_state_mut(card)
+            && confirms(state)
+        {
+            state.kind = CardKind::Chat(session.clone());
+            self.persist();
         }
     }
 

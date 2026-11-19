@@ -10366,14 +10366,16 @@ impl Cagents {
                 Message::ChatUi(Action::HeldCloseFinished(target, session, result))
             });
         }
-        // The descriptor the pane closes with is what reopening resumes.
-        self.install_closing_identity(card, &session);
         let title = self
             .card_state(card)
             .map(|state| self.card_display_title(state).to_owned());
         let Some(remove) = self.remove_chat_card(card, None) else {
             return Task::none();
         };
+        // The descriptor the pane closes with is what reopening resumes. It
+        // goes in once the removal has been taken from the pane its views
+        // hold, which they would refuse as another source.
+        self.install_closing_identity(card, &session);
         let retire = if pending {
             Task::none()
         } else {
@@ -16116,10 +16118,11 @@ impl Cagents {
                     return self.refuse_chat_close(target.card, current, error);
                 }
                 self.chat_ui.close_refused.remove(&current.id);
-                self.install_closing_identity(target.card, &current);
-                return self
-                    .remove_chat_card(target.card, None)
-                    .unwrap_or_else(Task::none);
+                let removed = self.remove_chat_card(target.card, None);
+                if removed.is_some() {
+                    self.install_closing_identity(target.card, &current);
+                }
+                return removed.unwrap_or_else(Task::none);
             }
             Action::AskCloseHolders(target, session) => {
                 return self.ask_close_holders(target, session);

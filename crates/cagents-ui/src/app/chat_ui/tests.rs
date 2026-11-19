@@ -12248,6 +12248,114 @@ fn share_close_source(app: &mut Cagents, card: CardId) -> crate::workspace_model
     original
 }
 
+/// A chat whose provider confirmed its conversation after the pane was last
+/// saved closes from the pane its view holds: the removal names that pane, so
+/// the view accepts it rather than bring the pane back, and the closed card,
+/// and what reopening it restores, keep what was confirmed. That holds for a
+/// first close, which takes the pane away at once, and for a close after a
+/// refusal, which waits on its pane for the daemon.
+#[test]
+fn a_chat_close_removes_the_pane_its_view_holds_and_keeps_its_confirmed_identity() {
+    use crate::workspace_model::{
+        ModelChannel, ModelEdit, ModelProject,
+        views::{Change, Pane, Scope, View},
+    };
+    for held in [false, true] {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let channel = crate::model::ChannelId::new();
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.channels.push(crate::model::ProjectChannel {
+            id: channel,
+            project_id: crate::model::ProjectId::new(),
+            title: "shared".into(),
+            title_source: Default::default(),
+            ordinal: 1,
+            shared: true,
+            cards: vec![],
+            focused: None,
+        });
+        durable.active_channel = Some(channel);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let confirmed = app.chat_return_session(card).unwrap();
+        assert!(confirmed.launch.session_id.is_some());
+        // The provider confirmed its conversation after the pane was saved.
+        if let Some(CardKind::Chat(saved)) = app.card_state_mut(card).map(|state| &mut state.kind) {
+            saved.launch.session_id = None;
+        }
+        // The channel's view holds the pane as it was last saved.
+        let original = Pane::from_card(app.card_state(card).unwrap(), None).unwrap();
+        let mut view = View::empty(channel);
+        view.revision = 1;
+        view.panes.push(original.clone());
+        app.workspace_model.identity = uuid::Uuid::new_v4();
+        app.workspace_model.projects = vec![ModelProject {
+            repository: FIXTURE_DIRECTORY.into(),
+            name: "Fixture".into(),
+            kind: Default::default(),
+            ordinal: 1,
+        }];
+        app.workspace_model.channels = vec![ModelChannel {
+            id: channel,
+            repository: FIXTURE_DIRECTORY.into(),
+            title: "shared".into(),
+            title_source: Default::default(),
+            ordinal: 1,
+        }];
+        app.workspace_model.views = vec![view.clone()];
+        app.shared_views
+            .initialize(Scope::Channel(channel), view.panes.clone());
+        drop(app.reconcile_shared_views());
+        let (tx, published) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        if held {
+            refused_once(&mut app, card);
+        }
+        drop(app.begin_chat_close(card));
+        if held {
+            let Some(Phase::Closing { target, .. }) = app.chat_ui.phases.get(&card) else {
+                panic!("a close after a refusal waits on its pane");
+            };
+            let target = *target;
+            assert!(app.card_state(card).unwrap().existence.is_open());
+            drop(app.handle_chat_ui(Action::HeldCloseFinished(target, confirmed.clone(), Ok(()))));
+        }
+        app.publish_view_changes();
+        let changes = std::iter::from_fn(|| published.try_recv().ok())
+            .filter_map(|edit| match edit.edit {
+                ModelEdit::ChangeView { change, .. } => Some(change),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        // The view still holds the pane it was shown, so nothing rewrites it
+        // ahead of the removal, which names that pane.
+        assert!(
+            !changes
+                .iter()
+                .any(|change| matches!(change, Change::Update { pane, .. } if pane.id == card)),
+            "held: {held}, {changes:?}"
+        );
+        assert!(
+            changes.iter().any(|change| matches!(change,
+                Change::RemoveSource { before, .. } if *before == original)),
+            "held: {held}, {changes:?}"
+        );
+        let closed = app.card_state(card).unwrap();
+        assert!(!closed.existence.is_open(), "held: {held}");
+        assert_eq!(
+            closed.kind,
+            CardKind::Chat(confirmed.clone()),
+            "held: {held}"
+        );
+        let reopened = app
+            .recently_closed
+            .iter()
+            .rev()
+            .find(|(state, _)| state.id == card)
+            .map(|(state, _)| &state.kind);
+        assert_eq!(reopened, Some(&CardKind::Chat(confirmed)), "held: {held}");
+    }
+}
+
 #[test]
 fn retained_shared_chat_close_never_recaptures_a_replacement_after_cleanup() {
     use crate::workspace_model::{ModelEdit, views::Change};
